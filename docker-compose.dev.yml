@@ -1,86 +1,169 @@
-version: "3.8"
+version: "3.9"
 
 services:
+  # Automated schema initialization service
+  schema-init:
+    image: scylladb/scylla:5.2.0
+    container_name: schema-init
+    depends_on:
+      scylla:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/init-schema.sh"]
+    volumes:
+      - ./internal/repository/scylla/scylla_migrations.cql:/schema/migrations.cql:ro
+      - ./scripts/init-schema.sh:/init-schema.sh:ro
+    restart: "no"
+    networks:
+      - dev-net
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
-      # Switch to 8443 for prod HTTPS
-      # - "8443:8443"
+      - "8443:8443"
+    env_file:
+      - .env
     environment:
-      - ENVIRONMENT=${ENVIRONMENT:-development}
-      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=development
+      - SERVER_PORT=8080
+      - SERVER_ENABLE_TLS=true
+      - SERVER_TLS_PORT=8443
+      - SERVER_AUTO_CERT=false
+      - SERVER_DOMAIN=localhost
+      - SERVER_AUTO_CERT_DIR=/app/certs
+      - SERVER_EMAIL=admin@localhost
+      - REDIS_URL=rediss://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - SCYLLA_NODES=scylla:9042
+      - SCYLLA_KEYSPACE=auth_service
+      - SCYLLA_USERNAME=${SCYLLA_USERNAME}
+      - SCYLLA_PASSWORD=${SCYLLA_PASSWORD}
       - KAFKA_BROKERS=kafka:9092
       - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - JWT_SECRET=${JWT_SECRET}
+      - API_KEY=${API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      - TLS_CA_FILE=/app/certs/ca.pem
+      - TLS_CERT_FILE=/app/certs/server.pem
+      - TLS_KEY_FILE=/app/certs/server.key
     volumes:
-      - .:/app
-      - ./certs:/app/certs:ro
+      - ./scripts/certs:/app/certs:ro
     depends_on:
       redis:
         condition: service_healthy
       scylla:
         condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-  
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "--no-check-certificate", "https://localhost:8443/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - dev-net
+
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    container_name: redis
+    command:
+      [
+        "redis-server",
+        "--tls-port", "6379",
+        "--port", "0",
+        "--tls-cert-file", "/certs/redis.crt",
+        "--tls-key-file", "/certs/redis.key",
+        "--tls-ca-cert-file", "/certs/ca.crt",
+        "--tls-auth-clients", "no",
+        "--requirepass", "${REDIS_PASSWORD}"
+      ]
+
     volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
+      - ./scripts/certs:/certs:ro
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--tls", "--cacert", "/certs/ca.crt", "-a", "${REDIS_PASSWORD}", "-h", "redis", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    ports:
+      - "6379:6379"
+    networks:
+      - dev-net
+
 
   scylla:
     image: scylladb/scylla:5.2.0
     ports:
       - "9042:9042"
-    command: --memory 512M --smp 1 --developer-mode 1
+    command: --memory 2G --smp 2 --developer-mode 1
     volumes:
       - scylla_data:/var/lib/scylla
     healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
-      interval: 10s
-      timeout: 10s
+      test: ["CMD-SHELL", "until cqlsh -u ${SCYLLA_USERNAME:-cassandra} -p ${SCYLLA_PASSWORD:-cassandra} -e 'describe keyspaces'; do echo waiting for Scylla; sleep 5; done"]
+      interval: 15s
+      timeout: 30s
       retries: 10
-      start_period: 30s
+      start_period: 40s
+    networks:
+      - dev-net
+
 
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     hostname: kafka
     ports:
       - "9092:9092"
+      - "9093:9093"
     environment:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "localhost:9092"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 40s
+    networks:
+      - dev-net
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
+    container_name: auth-service-zookeeper-1
     ports:
       - "2181:2181"
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: ruok,stat,conf,cons
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - dev-net
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.9.0
@@ -97,6 +180,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - dev-net
 
   kibana:
     image: docker.elastic.co/kibana/kibana:8.9.0
@@ -106,6 +191,8 @@ services:
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     depends_on:
       - elasticsearch
+    networks:
+      - dev-net
 
   clickhouse:
     image: clickhouse/clickhouse-server:23.8
@@ -119,9 +206,17 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - dev-net
 
 volumes:
   redis_data:
   scylla_data:
   elasticsearch_data:
   clickhouse_data:
+
+networks:
+  dev-net:
+    driver: bridge
+  default:
+    driver: bridge
