@@ -69,6 +69,8 @@ type ClickhouseConfig struct {
     Username string
     Password string
     Database string
+    CAFile   string `mapstructure:"ca_file"`
+
 }
 
 type SecurityConfig struct {
@@ -140,6 +142,8 @@ func LoadConfig() *Config {
                 Username: getEnv("CLICKHOUSE_USER", "default"),
                 Password: getEnv("CLICKHOUSE_PASSWORD", ""),
                 Database: getEnv("CLICKHOUSE_DATABASE", "default"),
+                CAFile:   getEnv("CLICKHOUSE_CA_FILE", ""),
+
             },
             Security: SecurityConfig{
                 JWTSecret:    getEnv("JWT_SECRET", "default-insecure-secret-change-in-production"),

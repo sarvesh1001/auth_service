@@ -1,0 +1,15 @@
+FROM scylladb/scylla:5.2.0
+
+# Install Python3, cqlsh, and curl for multi-database initialization
+RUN apt-get update && \
+    apt-get install -y python3 python3-pip curl && \
+    pip3 install cqlsh && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy both init scripts
+COPY ./scripts/init-schema.sh /init-schema.sh
+RUN chmod +x /init-schema.sh
+
+ENTRYPOINT ["/bin/bash", "/init-schema.sh"]

@@ -1,27 +1,35 @@
 # Build stage
 FROM golang:1.25.1-alpine AS builder
 WORKDIR /app
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Set Go build cache to a safe writable location
+ENV GOCACHE=/tmp/go-build
 
 # Download dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy all source code
+# Copy source code
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main ./cmd/server
 
+# Build the server binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o main ./cmd/server
 # Runtime stage
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates wget
+RUN apk --no-cache add ca-certificates tzdata wget
 
-WORKDIR /root/
+WORKDIR /app
 
 # Copy the compiled binary
 COPY --from=builder /app/main .
 
-# Copy certs from your project (scripts/certs)
+# Copy certs
 COPY scripts/certs ./certs
+
+# Optional: create non-root user
+RUN addgroup -S appuser && adduser -S appuser -G appuser
+USER appuser
 
 EXPOSE 8443
 
@@ -29,6 +37,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider https://localhost:8443/health || exit 1
 
 CMD ["./main"]
+
 # # Build stage
 # FROM golang:1.21-alpine AS builder
 # WORKDIR /app

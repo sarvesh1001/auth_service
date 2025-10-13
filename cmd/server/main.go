@@ -53,72 +53,29 @@ func main() {
 }
 
 // ==================== INITIALIZATION ====================
-
 func (app *Application) initializeClients() error {
-    util.Info("Initializing database and service clients...")
+    util.Info("Initializing core clients...")
 
+    // Initialize ScyllaDB
     if _, err := app.clientFactory.GetScyllaClient(); err != nil {
-        return err
+        return fmt.Errorf("failed to initialize ScyllaDB client: %w", err)
     }
     util.Info("ScyllaDB client initialized successfully")
 
+    // Initialize Redis
     if _, err := app.clientFactory.GetRedisClient(); err != nil {
-        return err
+        return fmt.Errorf("failed to initialize Redis client: %w", err)
     }
     util.Info("Redis client initialized successfully")
 
-    if _, err := app.clientFactory.GetUserRepository(); err != nil {
-        util.Warn("User repository initialization failed", zap.Error(err))
-    } else {
-        util.Info("User repository initialized successfully")
+    // Initialize ClickHouse for analytics (500M users scale)
+    if _, err := app.clientFactory.GetClickHouseClient(); err != nil {
+        return fmt.Errorf("failed to initialize ClickHouse client: %w", err)
     }
-
-    if _, err := app.clientFactory.GetOTPRepository(); err != nil {
-        util.Warn("OTP repository initialization failed", zap.Error(err))
-    } else {
-        util.Info("OTP repository initialized successfully")
-    }
-
-    if _, err := app.clientFactory.GetMPINRepository(); err != nil {
-        util.Warn("MPIN repository initialization failed", zap.Error(err))
-    } else {
-        util.Info("MPIN repository initialized successfully")
-    }
-
-    if _, err := app.clientFactory.GetSessionRepository(); err != nil {
-        util.Warn("Session repository initialization failed", zap.Error(err))
-    } else {
-        util.Info("Session repository initialized successfully")
-    }
-
-    if _, err := app.clientFactory.GetOTPCache(); err != nil {
-        util.Warn("OTP cache initialization failed", zap.Error(err))
-    } else {
-        util.Info("OTP cache initialized successfully")
-    }
-
-    if _, err := app.clientFactory.GetMPINCache(); err != nil {
-        util.Warn("MPIN cache initialization failed", zap.Error(err))
-    } else {
-        util.Info("MPIN cache initialized successfully")
-    }
-
-    if _, err := app.clientFactory.GetSessionCache(); err != nil {
-        util.Warn("Session cache initialization failed", zap.Error(err))
-    } else {
-        util.Info("Session cache initialized successfully")
-    }
-
-    if _, err := app.clientFactory.GetRateLimitCache(); err != nil {
-        util.Warn("Rate limit cache initialization failed", zap.Error(err))
-    } else {
-        util.Info("Rate limit cache initialized successfully")
-    }
+    util.Info("ClickHouse client initialized successfully for analytics")
 
     return nil
-}
-
-// ==================== HEALTH CHECK ====================
+}// ==================== HEALTH CHECK ====================
 
 func (app *Application) healthCheck(ctx context.Context) error {
     util.Info("Performing initial service health check...")
@@ -221,8 +178,8 @@ func (app *Application) createRouter() http.Handler {
         healthStatus := app.clientFactory.HealthCheck(ctx)
         allHealthy := true
 
-        for service, status := range healthStatus {
-            if status != "healthy" && service != "elasticsearch" && service != "kafka" {
+        for _, status := range healthStatus {
+            if status != "healthy" {
                 allHealthy = false
                 break
             }

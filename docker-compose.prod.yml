@@ -1,11 +1,31 @@
 services:
   # Automated schema initialization service for production
+  clickhouse-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.clickhouse-init
+    container_name: clickhouse-init-prod
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+    networks:
+      - default
+    restart: "no"
+
+
   schema-init:
     image: scylladb/scylla:5.2.0
     container_name: schema-init-prod
     depends_on:
       scylla1:
-        condition: service_healthy
+        condition: service_healthy      
+      clickhouse-init:
+        condition: service_completed_successfully
+
     entrypoint: ["/bin/bash", "/init-schema.sh"]
     environment:
       - SCYLLA_USERNAME=${SCYLLA_USERNAME}
@@ -223,22 +243,25 @@ services:
   # ClickHouse with Security
   clickhouse:
     image: clickhouse/clickhouse-server:23.8
+    container_name: clickhouse-prod
     ports:
       - "8123:8123"
       - "9000:9000"
     environment:
-      - CLICKHOUSE_DB=auth_service
+      - CLICKHOUSE_DB=auth_analytics
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
     volumes:
       - clickhouse_data_prod:/var/lib/clickhouse
       - ./scripts/clickhouse-users.xml:/etc/clickhouse-server/users.d/users.xml:ro
+      - ./scripts/init-clickhouse.sh:/docker-entrypoint-initdb.d/init-clickhouse.sh:ro
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 60s
 
 volumes:
   redis_data_prod:

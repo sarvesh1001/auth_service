@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,17 +21,15 @@ type RedisClient struct {
 	config *config.RedisConfig
 }
 
-// NewRedisClient initializes a Redis client with TLS support for dev & prod
+// NewRedisClient initializes a Redis client with TLS support
 func NewRedisClient(cfg *config.Config, logger *zap.Logger) (*RedisClient, error) {
 	redisConfig := cfg.Redis
 
-	// Parse redis:// or rediss://
 	opts, err := redis.ParseURL(redisConfig.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Redis URL: %w", err)
 	}
 
-	// Only set password if not already in URL
 	if opts.Password == "" && redisConfig.Password != "" {
 		opts.Password = redisConfig.Password
 	}
@@ -50,12 +47,11 @@ func NewRedisClient(cfg *config.Config, logger *zap.Logger) (*RedisClient, error
 	opts.ConnMaxIdleTime = 5 * time.Minute
 	opts.ConnMaxLifetime = 0
 
-	// ----------- TLS CONFIGURATION -----------
+	// TLS configuration
 	if strings.HasPrefix(redisConfig.URL, "rediss://") {
-		// Paths inside container (mounted volume)
-		caFile := getEnv("REDIS_TLS_CA_FILE", "/app/certs/ca.crt")
-		certFile := getEnv("REDIS_TLS_CERT_FILE", "/app/certs/redis.crt")
-		keyFile := getEnv("REDIS_TLS_KEY_FILE", "/app/certs/redis.key")
+		caFile := util.GetEnv("REDIS_TLS_CA_FILE", "/app/certs/ca.crt")
+		certFile := util.GetEnv("REDIS_TLS_CERT_FILE", "/app/certs/redis.crt")
+		keyFile := util.GetEnv("REDIS_TLS_KEY_FILE", "/app/certs/redis.key")
 
 		caCert, err := os.ReadFile(caFile)
 		if err != nil {
@@ -75,16 +71,14 @@ func NewRedisClient(cfg *config.Config, logger *zap.Logger) (*RedisClient, error
 			Certificates:       []tls.Certificate{cert},
 			RootCAs:            caCertPool,
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: false, // always verify
+			InsecureSkipVerify: false,
 		}
 	}
-	// -----------------------------------------
 
 	client := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
@@ -92,7 +86,8 @@ func NewRedisClient(cfg *config.Config, logger *zap.Logger) (*RedisClient, error
 	util.Info("Redis client initialized",
 		zap.String("url", redisConfig.URL),
 		zap.Int("db", redisConfig.DB),
-		zap.Int("pool_size", redisConfig.PoolSize))
+		zap.Int("pool_size", redisConfig.PoolSize),
+	)
 
 	return &RedisClient{
 		Client: client,
@@ -100,7 +95,7 @@ func NewRedisClient(cfg *config.Config, logger *zap.Logger) (*RedisClient, error
 	}, nil
 }
 
-// Graceful close
+// Close gracefully closes the Redis connection
 func (r *RedisClient) Close() error {
 	if r.Client != nil {
 		err := r.Client.Close()
@@ -120,7 +115,7 @@ func (r *RedisClient) HealthCheck(ctx context.Context) error {
 	}
 
 	testKey := "healthcheck"
-	testValue := strconv.FormatInt(time.Now().Unix(), 10)
+	testValue := fmt.Sprintf("%d", time.Now().Unix())
 	if err := r.Client.Set(ctx, testKey, testValue, 10*time.Second).Err(); err != nil {
 		return fmt.Errorf("redis set operation failed: %w", err)
 	}
@@ -167,126 +162,111 @@ func (r *RedisClient) Del(ctx context.Context, keys ...string) error {
 }
 
 func (r *RedisClient) Exists(ctx context.Context, key string) (bool, error) {
-    count, err := r.Client.Exists(ctx, key).Result()
-    if err != nil {
-        return false, err
-    }
-    return count > 0, nil
+	count, err := r.Client.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (r *RedisClient) Incr(ctx context.Context, key string) (int64, error) {
-    return r.Client.Incr(ctx, key).Result()
+	return r.Client.Incr(ctx, key).Result()
 }
 
 func (r *RedisClient) IncrBy(ctx context.Context, key string, value int64) (int64, error) {
-    return r.Client.IncrBy(ctx, key, value).Result()
+	return r.Client.IncrBy(ctx, key, value).Result()
 }
 
 func (r *RedisClient) Expire(ctx context.Context, key string, expiration time.Duration) error {
-    return r.Client.Expire(ctx, key, expiration).Err()
+	return r.Client.Expire(ctx, key, expiration).Err()
 }
 
 func (r *RedisClient) TTL(ctx context.Context, key string) (time.Duration, error) {
-    return r.Client.TTL(ctx, key).Result()
+	return r.Client.TTL(ctx, key).Result()
 }
 
 // ===================== ADVANCED OPS =====================
-
 func (r *RedisClient) SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) (bool, error) {
-    return r.Client.SetNX(ctx, key, value, expiration).Result()
+	return r.Client.SetNX(ctx, key, value, expiration).Result()
 }
 
 func (r *RedisClient) IncrWithExpire(ctx context.Context, key string, expiration time.Duration) (int64, error) {
-    pipe := r.Client.TxPipeline()
-    incrCmd := pipe.Incr(ctx, key)
-    pipe.Expire(ctx, key, expiration)
-    _, err := pipe.Exec(ctx)
-    if err != nil {
-        return 0, err
-    }
-    return incrCmd.Val(), nil
+	pipe := r.Client.TxPipeline()
+	incrCmd := pipe.Incr(ctx, key)
+	pipe.Expire(ctx, key, expiration)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return incrCmd.Val(), nil
 }
 
 // ===================== PIPELINES & SCRIPTS =====================
-
 func (r *RedisClient) Pipeline() redis.Pipeliner {
-    return r.Client.Pipeline()
+	return r.Client.Pipeline()
 }
 
 func (r *RedisClient) TxPipeline() redis.Pipeliner {
-    return r.Client.TxPipeline()
+	return r.Client.TxPipeline()
 }
 
 func (r *RedisClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) (interface{}, error) {
-    return r.Client.Eval(ctx, script, keys, args...).Result()
+	return r.Client.Eval(ctx, script, keys, args...).Result()
 }
 
-// ===================== HASH & SET & MONITORING =====================
-
+// ===================== HASH & SET & SCAN =====================
 func (r *RedisClient) HSet(ctx context.Context, key string, values ...interface{}) error {
-    return r.Client.HSet(ctx, key, values...).Err()
+	return r.Client.HSet(ctx, key, values...).Err()
 }
 
 func (r *RedisClient) HGet(ctx context.Context, key, field string) (string, error) {
-    val, err := r.Client.HGet(ctx, key, field).Result()
-    if err != nil {
-        if err == redis.Nil {
-            return "", fmt.Errorf("field not found: %s in key: %s", field, key)
-        }
-        return "", err
-    }
-    return val, nil
+	val, err := r.Client.HGet(ctx, key, field).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", fmt.Errorf("field not found: %s in key: %s", field, key)
+		}
+		return "", err
+	}
+	return val, nil
 }
 
 func (r *RedisClient) HGetAll(ctx context.Context, key string) (map[string]string, error) {
-    return r.Client.HGetAll(ctx, key).Result()
+	return r.Client.HGetAll(ctx, key).Result()
 }
 
 func (r *RedisClient) HDel(ctx context.Context, key string, fields ...string) error {
-    return r.Client.HDel(ctx, key, fields...).Err()
+	return r.Client.HDel(ctx, key, fields...).Err()
 }
 
 func (r *RedisClient) SAdd(ctx context.Context, key string, members ...interface{}) error {
-    return r.Client.SAdd(ctx, key, members...).Err()
+	return r.Client.SAdd(ctx, key, members...).Err()
 }
 
 func (r *RedisClient) SMembers(ctx context.Context, key string) ([]string, error) {
-    return r.Client.SMembers(ctx, key).Result()
+	return r.Client.SMembers(ctx, key).Result()
 }
 
 func (r *RedisClient) SRem(ctx context.Context, key string, members ...interface{}) error {
-    return r.Client.SRem(ctx, key, members...).Err()
+	return r.Client.SRem(ctx, key, members...).Err()
 }
 
 func (r *RedisClient) Info(ctx context.Context, section ...string) (string, error) {
-    return r.Client.Info(ctx, section...).Result()
+	return r.Client.Info(ctx, section...).Result()
 }
 
 func (r *RedisClient) PoolStats() *redis.PoolStats {
-    return r.Client.PoolStats()
+	return r.Client.PoolStats()
 }
-// ===================== SCAN SUPPORT =====================
 
-// Scan performs a Redis SCAN operation, returning a batch of keys and the next cursor.
-// It's safe for large datasets (like 500M users) because it avoids blocking Redis.
+// Scan support
 func (r *RedisClient) Scan(ctx context.Context, cursor uint64, pattern string, count int64) ([]string, uint64, error) {
-    var keys []string
-
-    iter := r.Client.Scan(ctx, cursor, pattern, count).Iterator()
-    for iter.Next(ctx) {
-        keys = append(keys, iter.Val())
-    }
-
-    if err := iter.Err(); err != nil {
-        return nil, 0, err
-    }
-
-    // Redis SCAN iterator automatically handles cursor internally; return 0 to indicate end
-    return keys, 0, nil
-}
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+	var keys []string
+	iter := r.Client.Scan(ctx, cursor, pattern, count).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
 	}
-	return defaultValue
+	if err := iter.Err(); err != nil {
+		return nil, 0, err
+	}
+	return keys, 0, nil
 }
