@@ -1,234 +1,170 @@
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "net/http"
-    "os"
-    "os/signal"
-    "strconv"
-    "syscall"
-    "time"
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    "auth-service/internal/config"
-    "auth-service/internal/factory"
-    "auth-service/internal/tls"
-    "auth-service/internal/util"
-
-    "go.uber.org/zap"
+	"auth-service/internal/config"
+	"auth-service/internal/factory"
+	"auth-service/internal/handler"
+	"auth-service/internal/util"
 )
 
-type Application struct {
-    config        *config.Config
-    clientFactory *factory.ClientFactory
-    httpsServer   *http.Server
-}
-
 func main() {
-    util.Init("development", "info", "console")
-    defer util.Sync()
+	// Initialize factory (which loads config and initializes all clients)
+	f, err := factory.NewFactory()
+	if err != nil {
+		util.Fatal("Failed to initialize factory", util.ErrorField(err))
+	}
+	defer f.Close()
 
-    cfg := config.LoadConfig()
-    util.Init(cfg.Environment, cfg.Logging.Level, cfg.Logging.Format)
+	cfg := f.Config()
 
-    app := &Application{
-        config: cfg,
-    }
+	// Setup HTTP router with handlers using Chi
+	router := setupRouter(f)
 
-    app.clientFactory = factory.NewClientFactory(cfg, util.Get())
+	// Determine server address based on TLS config
+	var serverAddr string
+	if cfg.Server.EnableTLS {
+		serverAddr = fmt.Sprintf(":%d", cfg.Server.TLSPort)
+	} else {
+		serverAddr = cfg.GetServerAddress()
+	}
 
-    if err := app.initializeClients(); err != nil {
-        util.Fatal("Failed to initialize clients", zap.Error(err))
-    }
+	// Create HTTP server with configured timeouts
+	server := &http.Server{
+		Addr:         serverAddr,
+		Handler:      router,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
+	}
 
-    // ✅ Pass context to health check
-    ctx := context.Background()
-    if err := app.healthCheck(ctx); err != nil {
-        util.Fatal("Health check failed", zap.Error(err))
-    }
+	// TLS configuration
+	if cfg.Server.EnableTLS {
+		tlsManager := f.TLSManager()
+		server.TLSConfig = tlsManager.GetTLSConfig()
 
-    go app.startServer()
-    app.waitForShutdown()
+		// In production with AutoCert, handle redirect and cert management
+		if cfg.IsProduction() && cfg.Server.AutoCert {
+			startProductionServerWithAutoCert(f, server, cfg, router)
+			return
+		}
+
+		util.Info("Starting HTTPS server",
+			util.String("environment", cfg.Environment),
+			util.Int("port", cfg.Server.TLSPort),
+			util.Bool("auto_cert", cfg.Server.AutoCert),
+		)
+	} else {
+		util.Warn("Starting HTTP server - TLS is disabled",
+			util.String("environment", cfg.Environment),
+			util.Int("port", cfg.Server.Port),
+		)
+	}
+
+	// Start server based on TLS configuration
+	startServer(f, server, cfg)
 }
 
-// ==================== INITIALIZATION ====================
-func (app *Application) initializeClients() error {
-    util.Info("Initializing core clients...")
-
-    // Initialize ScyllaDB
-    if _, err := app.clientFactory.GetScyllaClient(); err != nil {
-        return fmt.Errorf("failed to initialize ScyllaDB client: %w", err)
-    }
-    util.Info("ScyllaDB client initialized successfully")
-
-    // Initialize Redis
-    if _, err := app.clientFactory.GetRedisClient(); err != nil {
-        return fmt.Errorf("failed to initialize Redis client: %w", err)
-    }
-    util.Info("Redis client initialized successfully")
-
-    // Initialize ClickHouse for analytics (500M users scale)
-    if _, err := app.clientFactory.GetClickHouseClient(); err != nil {
-        return fmt.Errorf("failed to initialize ClickHouse client: %w", err)
-    }
-    util.Info("ClickHouse client initialized successfully for analytics")
-
-    return nil
-}// ==================== HEALTH CHECK ====================
-
-func (app *Application) healthCheck(ctx context.Context) error {
-    util.Info("Performing initial service health check...")
-    health := app.clientFactory.HealthCheck(ctx)
-    unhealthy := false
-
-    for svc, status := range health {
-        util.Info(fmt.Sprintf("Health check: %s = %s", svc, status))
-        if status != "healthy" {
-            unhealthy = true
-        }
-    }
-
-    if unhealthy {
-        return fmt.Errorf("one or more services unhealthy")
-    }
-    return nil
+// setupRouter creates the HTTP router with all handlers using Chi
+func setupRouter(f *factory.Factory) http.Handler {
+	serviceFactory := f.ServiceFactory()
+	userService := serviceFactory.UserService()
+	userHandler := handler.NewUserHandler(userService, util.Get())
+	return handler.NewRouter(userHandler, util.Get())
 }
 
-// ==================== SERVER ====================
+func startProductionServerWithAutoCert(f *factory.Factory, server *http.Server, cfg *config.Config, router http.Handler) {
+	tlsManager := f.TLSManager()
+	autoCertManager := tlsManager.GetAutocertManager()
+	if autoCertManager == nil {
+		util.Fatal("AutoCert manager is not available in production")
+	}
 
-func (app *Application) startServer() {
-    handler := app.createRouter()
+	// HTTP server for ACME challenge and redirect only
+	httpServer := &http.Server{
+		Addr:    ":80",
+		Handler: autoCertManager.HTTPHandler(nil),
+	}
 
-    tlsManager := tls.NewTLSManager(&tls.TLSConfig{
-        EnableTLS:   app.config.Server.EnableTLS,
-        AutoCert:    app.config.Server.AutoCert,
-        Domain:      app.config.Server.Domain,
-        CertFile:    app.config.Server.CertFile,
-        KeyFile:     app.config.Server.KeyFile,
-        AutoCertDir: app.config.Server.AutoCertDir,
-        Email:       app.config.Server.Email,
-        Environment: app.config.Environment,
-    })
+	// HTTPS server for API
+	httpsServer := &http.Server{
+		Addr:      ":443",
+		Handler:   router,
+		TLSConfig: server.TLSConfig,
+	}
 
-    app.httpsServer = &http.Server{
-        Addr:         ":" + strconv.Itoa(app.config.Server.TLSPort),
-        Handler:      handler,
-        ReadTimeout:  app.config.Server.ReadTimeout,
-        WriteTimeout: app.config.Server.WriteTimeout,
-        IdleTimeout:  app.config.Server.IdleTimeout,
-        TLSConfig:    tlsManager.GetTLSConfig(),
-    }
+	go func() {
+		util.Info("Starting HTTP redirect server on port 80")
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			util.Error("HTTP redirect server failed", util.ErrorField(err))
+		}
+	}()
 
-    util.Info("Starting HTTPS-only server",
-        zap.String("address", app.httpsServer.Addr),
-        zap.Bool("auto_cert", app.config.Server.AutoCert),
-        zap.String("domain", app.config.Server.Domain),
-    )
+	go func() {
+		util.Info("Starting HTTPS server with AutoCert on port 443",
+			util.String("domain", cfg.Server.Domain),
+		)
+		if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			util.Error("HTTPS AutoCert server failed", util.ErrorField(err))
+		}
+	}()
 
-    var err error
-    if app.config.Server.AutoCert && tlsManager.GetAutocertManager() != nil {
-        err = app.httpsServer.Serve(tlsManager.GetAutocertManager().Listener())
-    } else if app.config.Server.CertFile != "" && app.config.Server.KeyFile != "" {
-        err = app.httpsServer.ListenAndServeTLS(app.config.Server.CertFile, app.config.Server.KeyFile)
-    } else {
-        err = app.httpsServer.ListenAndServeTLS("", "")
-    }
-
-    if err != nil && err != http.ErrServerClosed {
-        util.Fatal("HTTPS server failed", zap.Error(err))
-    }
+	waitForShutdown(f, httpsServer, httpServer)
 }
 
-// ==================== ROUTER ====================
+func startServer(f *factory.Factory, server *http.Server, cfg *config.Config) {
+	go func() {
+		var err error
+		if cfg.Server.EnableTLS {
+			if cfg.Server.AutoCert {
+				err = server.ListenAndServeTLS("", "")
+			} else if cfg.Server.CertFile != "" && cfg.Server.KeyFile != "" {
+				err = server.ListenAndServeTLS(cfg.Server.CertFile, cfg.Server.KeyFile)
+			} else {
+				err = server.ListenAndServeTLS("", "")
+			}
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			util.Fatal("Server failed to start", util.ErrorField(err))
+		}
+	}()
 
-func (app *Application) createRouter() http.Handler {
-    mux := http.NewServeMux()
+	util.Info("Server started successfully",
+		util.String("environment", cfg.Environment),
+		util.Bool("tls_enabled", cfg.Server.EnableTLS),
+		util.String("address", server.Addr),
+	)
 
-    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        ctx := r.Context()
-        healthStatus := map[string]string{
-            "status":      "healthy",
-            "timestamp":   time.Now().UTC().Format(time.RFC3339),
-            "environment": app.config.Environment,
-        }
-
-        factoryHealth := app.clientFactory.HealthCheck(ctx)
-        for service, status := range factoryHealth {
-            healthStatus[service] = status
-            if status != "healthy" {
-                healthStatus["status"] = "degraded"
-            }
-        }
-
-        w.Header().Set("Content-Type", "application/json")
-        if healthStatus["status"] != "healthy" {
-            w.WriteHeader(http.StatusServiceUnavailable)
-        }
-        json.NewEncoder(w).Encode(healthStatus)
-    })
-
-    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        w.Write([]byte("Auth Service is running (HTTPS Only)"))
-    })
-
-    mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-        ctx := r.Context()
-        healthStatus := app.clientFactory.HealthCheck(ctx)
-        allHealthy := true
-
-        for _, status := range healthStatus {
-            if status != "healthy" {
-                allHealthy = false
-                break
-            }
-        }
-
-        w.Header().Set("Content-Type", "application/json")
-        if allHealthy {
-            w.WriteHeader(http.StatusOK)
-            json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-        } else {
-            w.WriteHeader(http.StatusServiceUnavailable)
-            json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
-        }
-    })
-
-    mux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusOK)
-        json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-    })
-
-    return mux
+	waitForShutdown(f, server, nil)
 }
 
-// ==================== SHUTDOWN ====================
+func waitForShutdown(f *factory.Factory, servers ...*http.Server) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
-func (app *Application) waitForShutdown() {
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    <-quit
+	sig := <-signalChan
+	util.Info("Received shutdown signal", util.String("signal", sig.String()))
 
-    util.Info("Shutdown signal received, initiating graceful shutdown...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-
-    if app.httpsServer != nil {
-        util.Info("Shutting down HTTPS server...")
-        if err := app.httpsServer.Shutdown(ctx); err != nil {
-            util.Error("HTTPS server shutdown error", zap.Error(err))
-        } else {
-            util.Info("HTTPS server stopped gracefully")
-        }
-    }
-
-    if app.clientFactory != nil {
-        util.Info("Closing all client connections...")
-        app.clientFactory.CloseAll()
-    }
-
-    util.Info("Application shutdown completed")
+	for _, srv := range servers {
+		if srv != nil {
+			if err := srv.Shutdown(ctx); err != nil {
+				util.Error("Failed to shutdown server gracefully", util.ErrorField(err))
+			} else {
+				util.Info("Server shutdown completed")
+			}
+		}
+	}
+	f.Close()
 }

@@ -2,6 +2,7 @@ package util
 
 import (
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -22,7 +23,7 @@ func Init(environment, level, format string) *zap.Logger {
 			config.Level = zap.NewAtomicLevelAt(parseLogLevel(level))
 			config.EncoderConfig.TimeKey = "timestamp"
 			config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-			
+
 			// Production optimizations
 			config.DisableStacktrace = true
 			config.Sampling = &zap.SamplingConfig{
@@ -110,10 +111,37 @@ func Warn(msg string, fields ...zap.Field) {
 	Get().Warn(msg, fields...)
 }
 
+// Error function for logging error messages
 func Error(msg string, fields ...zap.Field) {
 	Get().Error(msg, fields...)
 }
 
 func Fatal(msg string, fields ...zap.Field) {
 	Get().Fatal(msg, fields...)
+}
+
+// Common field helpers
+func String(key, value string) zap.Field {
+	return zap.String(key, value)
+}
+
+func Bool(key string, value bool) zap.Field {
+	return zap.Bool(key, value)
+}
+
+func Int(key string, value int) zap.Field {
+	return zap.Int(key, value)
+}
+
+// ErrorField creates an error field (renamed to avoid conflict)
+func ErrorField(err error) zap.Field {
+	return zap.Error(err)
+}
+
+func Any(key string, value interface{}) zap.Field {
+	return zap.Any(key, value)
+}
+
+func Duration(key string, value time.Duration) zap.Field {
+	return zap.Duration(key, value)
 }

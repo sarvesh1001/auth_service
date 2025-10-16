@@ -21,7 +21,7 @@ RUN apk --no-cache add ca-certificates tzdata wget
 
 WORKDIR /app
 
-# Copy the compiled binary
+# Copy the compiled binaryß
 COPY --from=builder /app/main .
 
 # Copy certs
@@ -34,7 +34,7 @@ USER appuser
 EXPOSE 8443
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider https://localhost:8443/health || exit 1
+  CMD ["sh", "-c", "curl -f -X GET https://localhost:8443/health || exit 1"]
 
 CMD ["./main"]
 

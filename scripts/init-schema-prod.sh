@@ -42,7 +42,7 @@ echo "✅ Keyspace created/verified with 3x replication"
 
 # Run migrations
 echo "📊 Running database migrations..."
-if cqlsh scylla 9042 $SCYLLA_AUTH -k auth_service -f /schema/migrations.cql; then
+if cqlsh scylla 9042 $SCYLLA_AUTH -k auth_service -f /schema/core_auth_migration.cql; then
     echo "✅ Migrations executed successfully"
 else
     echo "⚠️  Some migrations failed (this might be normal for existing tables)"

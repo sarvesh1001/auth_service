@@ -215,3 +215,12 @@ VALUES ('employee', 'Support Agent', {'verify_kyc', 'ban_users'}, true);
 
 INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required)
 VALUES ('support', 'Read Only Support', {'view_user_data'}, false);
+-- Users by KYC status (avoids filtering on base table)
+CREATE MATERIALIZED VIEW IF NOT EXISTS users_by_kyc_status AS
+    SELECT 
+        kyc_status,
+        user_bucket,
+        user_id
+    FROM users
+    WHERE kyc_status IS NOT NULL AND user_bucket IS NOT NULL AND user_id IS NOT NULL
+    PRIMARY KEY ((kyc_status), user_bucket, user_id);
