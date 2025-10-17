@@ -165,25 +165,31 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
 		return nil, fmt.Errorf("failed to encrypt phone: %w", err)
 	}
 
+	// Parse KeyID string to UUID
+	keyID, err := uuid.Parse(encryptedPhone.KeyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse key ID: %w", err)
+	}
+
 	// Create user model
 	now := time.Now().UTC()
 	user := &models.User{
 		UserBucket:        s.bucketingMgr.GetUserBucket(userID), // Calculate bucket
-		UserID:            userID.String(),
+		UserID:            userID,
 		PhoneHash:         phoneHash,
 		PhoneEncrypted:    []byte(encryptedPhone.EncryptedValue),
-		PhoneKeyID:        encryptedPhone.KeyID,
+		PhoneKeyID:        keyID, // Use parsed UUID
 		DeviceID:          req.DeviceID,
 		DeviceFingerprint: req.DeviceFingerprint,
 		KYCStatus:         "pending",
 		KYCLevel:          "basic",
 		KYCVerifiedAt:     nil,
-		KYCVerifiedBy:     uuid.Nil.String(), // Fix: was ""
-		ProfileServiceID:  uuid.Nil.String(), // Fix: was ""
+		KYCVerifiedBy:     uuid.Nil,
+		ProfileServiceID:  uuid.Nil,
 		IsVerified:        false,
 		IsBlocked:         false,
 		IsBanned:          false,
-		BannedBy:          uuid.Nil.String(), // Fix: was ""
+		BannedBy:          uuid.Nil,
 		BannedReason:      "",
 		BannedAt:          nil,
 		CreatedAt:         now,
@@ -203,7 +209,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
 	s.cacheUser(user)
 
 	// Cache phone to user mapping
-	s.phoneCache.Store(phoneHash, userID.String())
+	s.phoneCache.Store(phoneHash, userID)
 
 	s.logger.Info("User created successfully",
 		util.String("user_id", userID.String()),
@@ -218,7 +224,7 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
 // GetUserByID retrieves a user by ID with caching
 func (s *UserService) GetUserByID(ctx context.Context, userID uuid.UUID) (*models.User, error) {
 	// Try cache first
-	if cachedUser := s.getCachedUser(userID.String()); cachedUser != nil {
+	if cachedUser := s.getCachedUser(userID); cachedUser != nil {
 		return cachedUser, nil
 	}
 
@@ -248,7 +254,7 @@ func (s *UserService) GetUserByPhone(ctx context.Context, phoneNumber string) (*
 
 	// Try cache first
 	if userID, ok := s.phoneCache.Load(phoneHash); ok {
-		return s.GetUserByID(ctx, uuid.MustParse(userID.(string)))
+		return s.GetUserByID(ctx, userID.(uuid.UUID))
 	}
 
 	user, err := s.userRepo.GetUserByPhoneHash(ctx, phoneHash)
@@ -279,7 +285,11 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 		user.DeviceFingerprint = *req.DeviceFingerprint
 	}
 	if req.ProfileServiceID != nil {
-		user.ProfileServiceID = *req.ProfileServiceID
+		profileID, err := uuid.Parse(*req.ProfileServiceID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid profile service ID format: %w", err)
+		}
+		user.ProfileServiceID = profileID
 	}
 	if req.DataRegion != nil {
 		user.DataRegion = *req.DataRegion
@@ -317,7 +327,7 @@ func (s *UserService) UpdateUserProfile(ctx context.Context, userID uuid.UUID, p
 	}
 
 	// Update cache
-	user.ProfileServiceID = profileServiceID.String()
+	user.ProfileServiceID = profileServiceID
 	now := time.Now().UTC()
 	user.UpdatedAt = &now
 	s.cacheUser(user)
@@ -473,7 +483,7 @@ func (s *UserService) GetUsersByIDBatch(ctx context.Context, userIDs []uuid.UUID
 	missingIDs := make([]uuid.UUID, 0)
 
 	for _, userID := range userIDs {
-		if user := s.getCachedUser(userID.String()); user != nil {
+		if user := s.getCachedUser(userID); user != nil {
 			cachedUsers = append(cachedUsers, user)
 		} else {
 			missingIDs = append(missingIDs, userID)
@@ -567,7 +577,7 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 	user.KYCStatus = req.Status
 	user.KYCLevel = req.Level
 	user.KYCVerifiedAt = &now
-	user.KYCVerifiedBy = req.VerifiedBy.String()
+	user.KYCVerifiedBy = req.VerifiedBy
 	user.UpdatedAt = &now
 
 	// Auto-verify user if KYC is verified
@@ -658,7 +668,7 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
 
 	// Update cache
 	user.IsBanned = true
-	user.BannedBy = req.BannedBy.String()
+	user.BannedBy = req.BannedBy
 	user.BannedReason = req.Reason
 	now := time.Now().UTC()
 	user.BannedAt = &now
@@ -693,7 +703,7 @@ func (s *UserService) UnbanUser(ctx context.Context, userID uuid.UUID) error {
 
 	// Update cache
 	user.IsBanned = false
-	user.BannedBy = ""
+	user.BannedBy = uuid.Nil
 	user.BannedReason = ""
 	user.BannedAt = nil
 	now := time.Now().UTC()
@@ -752,7 +762,7 @@ func (s *UserService) cacheUser(user *models.User) {
 }
 
 // getCachedUser retrieves a user from cache
-func (s *UserService) getCachedUser(userID string) *models.User {
+func (s *UserService) getCachedUser(userID uuid.UUID) *models.User {
 	s.cache.mutex.RLock()
 	defer s.cache.mutex.RUnlock()
 

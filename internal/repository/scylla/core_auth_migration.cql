@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
     phone_encrypted blob,         -- Encrypted phone number
     phone_key_id uuid,            -- Key ID for decryption
     device_id text,
+    phone_encrypted_dek text;
+
     device_fingerprint text,
     
     -- Enhanced KYC fields
@@ -54,6 +56,18 @@ CREATE TABLE IF NOT EXISTS users (
     'compaction_window_size': '1',
     'compaction_window_unit': 'DAYS'
 } AND compression = {'sstable_compression': 'LZ4Compressor'};
+
+
+
+-- Add this BEFORE the materialized view
+CREATE TABLE IF NOT EXISTS phone_to_user (
+    phone_hash text,
+    user_bucket int,
+    user_id uuid,
+    created_at timestamp,
+    PRIMARY KEY (phone_hash)
+) WITH compaction = {'class': 'LeveledCompactionStrategy'}
+  AND compression = {'sstable_compression': 'LZ4Compressor'};
 
 -- Phone lookup materialized view (✅ fixed null filtering)
 CREATE MATERIALIZED VIEW IF NOT EXISTS users_by_phone_hash AS
@@ -224,3 +238,41 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS users_by_kyc_status AS
     FROM users
     WHERE kyc_status IS NOT NULL AND user_bucket IS NOT NULL AND user_id IS NOT NULL
     PRIMARY KEY ((kyc_status), user_bucket, user_id);
+-- Banned users materialized view
+-- Banned users materialized view for efficient querying
+CREATE MATERIALIZED VIEW IF NOT EXISTS banned_users AS
+SELECT
+    is_banned,
+    user_bucket,
+    user_id,
+    phone_hash,
+    phone_encrypted,
+    phone_key_id,
+    device_id,
+    device_fingerprint,
+    kyc_status,
+    kyc_level,
+    kyc_verified_at,
+    kyc_verified_by,
+    profile_service_id,
+    is_verified,
+    is_blocked,
+    banned_by,
+    banned_reason,
+    banned_at,
+    created_at,
+    last_login,
+    updated_at,
+    consent_agreed,
+    consent_version,
+    data_region
+FROM users
+WHERE is_banned IS NOT NULL 
+    AND user_bucket IS NOT NULL 
+    AND user_id IS NOT NULL
+PRIMARY KEY ((is_banned), user_bucket, user_id)
+WITH compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_size': '1',
+    'compaction_window_unit': 'DAYS'
+} AND compression = {'sstable_compression': 'LZ4Compressor'};

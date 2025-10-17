@@ -135,7 +135,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 
 	h.respondWithJSON(w, http.StatusCreated, successResponse(user, "User created successfully"))
 	h.logger.Info("User created via HTTP",
-		util.String("user_id", user.UserID),
+		util.String("user_id", user.UserID.String()),
 		util.Duration("duration", time.Since(startTime)),
 		util.String("method", "CreateUser"),
 	)
@@ -975,6 +975,6 @@ func (h *UserHandler) getStatusCode(err error) int {
 func (h *UserHandler) sanitizeUser(user *models.User) {
 	// Clear encrypted phone data
 	user.PhoneEncrypted = nil
-	user.PhoneKeyID = ""
+	user.PhoneKeyID = uuid.Nil
 	// Note: We keep phone hash for identification but not the encrypted version
 }
