@@ -9,6 +9,10 @@ import (
     "strconv"
     "time"
 
+	"regexp"
+	"strings"
+
+	"github.com/go-playground/validator/v10"
 
     "auth-service/internal/models"
     "auth-service/internal/service"
@@ -20,6 +24,14 @@ import (
     "go.uber.org/zap"
 )
 
+var validate = validator.New()
+
+func init() {
+	// Custom validation for alphanumeric + dash + underscore
+	validate.RegisterValidation("alphanumdash", func(fl validator.FieldLevel) bool {
+		return regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(fl.Field().String())
+	})
+}
 
 // UserHandler handles HTTP requests for user operations
 type UserHandler struct {
@@ -136,21 +148,50 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
 
-
     var req service.UserCreateRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
         return
     }
 
+    // =========================
+    // 🧹 1. Sanitize Inputs
+    // =========================
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.DataRegion = strings.ToUpper(util.SanitizeInput(req.DataRegion))
+    req.PhoneNumber = strings.TrimSpace(req.PhoneNumber)
+    req.ConsentVersion = strings.TrimSpace(req.ConsentVersion)
 
+    // =========================
+    // ✅ 2. Validate Inputs
+    // =========================
+    if err := validate.Struct(req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
+        return
+    }
+
+    // =========================
+    // ⚠️ 3. Check & Block Suspicious Patterns
+    // =========================
+    if util.ContainsSuspicious(req.DeviceID) || util.ContainsSuspicious(req.DeviceFingerprint) {
+        h.logger.Warn("Blocked suspicious input",
+            util.String("device_id", req.DeviceID),
+            util.String("fingerprint", req.DeviceFingerprint),
+        )
+		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("suspicious input detected"), "Suspicious input detected")
+		return       
+    }
+
+    // =========================
+    // 🧩 4. Continue as before
+    // =========================
     user, err := h.userService.CreateUser(ctx, &req)
     if err != nil {
         statusCode := h.getStatusCode(err)
         h.respondWithError(w, statusCode, err, "Failed to create user")
         return
     }
-
 
     h.respondWithJSON(w, http.StatusCreated, successResponse(user, "User created successfully"))
     h.logger.Info("User created via HTTP",
