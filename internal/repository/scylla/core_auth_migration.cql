@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS users (
     phone_encrypted blob,         -- Encrypted phone number
     phone_key_id uuid,            -- Key ID for decryption
     device_id text,
-    phone_encrypted_dek text;
+    phone_encrypted_dek text,
 
     device_fingerprint text,
     
@@ -248,6 +248,7 @@ SELECT
     phone_hash,
     phone_encrypted,
     phone_key_id,
+    phone_encrypted_dek,
     device_id,
     device_fingerprint,
     kyc_status,

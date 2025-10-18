@@ -66,31 +66,32 @@ func (r *UserRepositoryImpl) CreateUser(ctx context.Context, user *models.User) 
         return fmt.Errorf("failed to encrypt phone: %w", err)
     }
 
-    // Insert into users
+    // Insert into users table with encrypted DEK
     query := r.client.Session.Query(`
         INSERT INTO users (
-            user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id,
+            user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
             device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
             kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
             banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
             consent_agreed, consent_version, data_region
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         user.UserBucket,
-        gocql.UUID(user.UserID), // Convert to gocql.UUID
+        gocql.UUID(user.UserID),
         user.PhoneHash,
         encryptedPhone.EncryptedValue,
         encryptedPhone.KeyID,
+        encryptedPhone.EncryptedDEK, // Added phone_encrypted_dek
         user.DeviceID,
         user.DeviceFingerprint,
         user.KYCStatus,
         user.KYCLevel,
         user.KYCVerifiedAt,
-        gocql.UUID(user.KYCVerifiedBy), // Convert to gocql.UUID
-        gocql.UUID(user.ProfileServiceID), // Convert to gocql.UUID
+        gocql.UUID(user.KYCVerifiedBy),
+        gocql.UUID(user.ProfileServiceID),
         user.IsVerified,
         user.IsBlocked,
         user.IsBanned,
-        gocql.UUID(user.BannedBy), // Convert to gocql.UUID
+        gocql.UUID(user.BannedBy),
         user.BannedReason,
         user.BannedAt,
         user.CreatedAt,
@@ -104,13 +105,13 @@ func (r *UserRepositoryImpl) CreateUser(ctx context.Context, user *models.User) 
         return fmt.Errorf("failed to create user: %w", err)
     }
 
-    // Insert into phone_to_user
+    // Insert into phone_to_user lookup table
     phoneQuery := r.client.Session.Query(`
         INSERT INTO phone_to_user (phone_hash, user_bucket, user_id, created_at)
         VALUES (?, ?, ?, ?)`,
         user.PhoneHash,
         user.UserBucket,
-        gocql.UUID(user.UserID), // Convert to gocql.UUID
+        gocql.UUID(user.UserID),
         user.CreatedAt,
     )
     if err := r.client.ExecuteWithRetry(phoneQuery.WithContext(ctx), 3); err != nil {
@@ -134,17 +135,19 @@ func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) 
     bucket := r.bucketingManager.GetUserBucket(userID)
 
     query := r.client.Session.Query(`
-        SELECT user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id,
-               device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
-               kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
-               banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
-               consent_agreed, consent_version, data_region
+        SELECT
+          user_bucket, user_id, phone_hash,
+          phone_encrypted, phone_key_id, phone_encrypted_dek,
+          device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
+          kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
+          banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
+          consent_agreed, consent_version, data_region
         FROM users WHERE user_bucket = ? AND user_id = ?`,
         bucket, gocqlUserID,
     )
 
     var user models.User
-    var encryptedPhone, phoneKeyID string
+    var encryptedPhone, phoneKeyID, encryptedDEK string
     var scannedID, scannedKYCVerifiedBy, scannedProfileServiceID, scannedBannedBy gocql.UUID
 
     err := r.client.ScanWithRetry(query.WithContext(ctx),
@@ -153,6 +156,7 @@ func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) 
         &user.PhoneHash,
         &encryptedPhone,
         &phoneKeyID,
+        &encryptedDEK, // Added phone_encrypted_dek
         &user.DeviceID,
         &user.DeviceFingerprint,
         &user.KYCStatus,
@@ -190,6 +194,7 @@ func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) 
     if encryptedPhone != "" {
         encData := &encryption.EncryptedData{
             EncryptedValue: encryptedPhone,
+            EncryptedDEK:   encryptedDEK, // Include encrypted DEK
             KeyID:          phoneKeyID,
         }
         if decrypted, err := r.encryptionManager.DecryptField(ctx, encData); err == nil {
@@ -256,11 +261,13 @@ func (r *UserRepositoryImpl) UpdateUser(ctx context.Context, user *models.User) 
         }
         batch.Query(`
             UPDATE users SET
-                phone_encrypted = ?,
-                phone_key_id    = ?
+                phone_encrypted      = ?,
+                phone_key_id         = ?,
+                phone_encrypted_dek  = ?
             WHERE user_bucket = ? AND user_id = ?`,
             encData.EncryptedValue,
             encData.KeyID,
+            encData.EncryptedDEK, // Added phone_encrypted_dek
             user.UserBucket,
             gocql.UUID(user.UserID),
         )
@@ -337,17 +344,18 @@ func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*mode
 
         batch.Query(`
             INSERT INTO users (
-                user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id,
+                user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
                 device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
                 kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
                 banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
                 consent_agreed, consent_version, data_region
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             user.UserBucket,
             gocql.UUID(user.UserID),
             user.PhoneHash,
             encPhone.EncryptedValue,
             encPhone.KeyID,
+            encPhone.EncryptedDEK, // Added phone_encrypted_dek
             user.DeviceID,
             user.DeviceFingerprint,
             user.KYCStatus,
@@ -409,7 +417,7 @@ func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*mode
     for _, user := range users {
         user.UpdatedAt = &now
 
-        var encPhoneVal, phoneKeyID string
+        var encPhoneVal, phoneKeyID, phoneEncryptedDEK string
         if len(user.PhoneEncrypted) > 0 {
             encData, err := r.encryptionManager.EncryptField(ctx, string(user.PhoneEncrypted), "phone")
             if err != nil {
@@ -417,17 +425,19 @@ func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*mode
             }
             encPhoneVal = encData.EncryptedValue
             phoneKeyID = encData.KeyID
+            phoneEncryptedDEK = encData.EncryptedDEK // Added phone_encrypted_dek
         }
 
         batch.Query(`
             UPDATE users SET 
-                phone_encrypted = ?, phone_key_id = ?, device_id = ?, device_fingerprint = ?,
+                phone_encrypted = ?, phone_key_id = ?, phone_encrypted_dek = ?, 
+                device_id = ?, device_fingerprint = ?,
                 kyc_status = ?, kyc_level = ?, kyc_verified_at = ?, kyc_verified_by = ?,
                 profile_service_id = ?, is_verified = ?, is_blocked = ?, is_banned = ?, 
                 banned_by = ?, banned_reason = ?, banned_at = ?, last_login = ?, 
                 updated_at = ?, consent_agreed = ?, consent_version = ?, data_region = ?
             WHERE user_bucket = ? AND user_id = ?`,
-            encPhoneVal, phoneKeyID,
+            encPhoneVal, phoneKeyID, phoneEncryptedDEK, // Added phone_encrypted_dek
             user.DeviceID, user.DeviceFingerprint,
             user.KYCStatus, user.KYCLevel, user.KYCVerifiedAt, gocql.UUID(user.KYCVerifiedBy),
             gocql.UUID(user.ProfileServiceID), user.IsVerified, user.IsBlocked, user.IsBanned,
@@ -619,7 +629,6 @@ func (r *UserRepositoryImpl) UnbanUser(ctx context.Context, userID uuid.UUID) er
     return r.client.ExecuteWithRetry(query.WithContext(ctx), 3)
 }
 
-// GetBannedUsers retrieves banned users with pagination
 // GetBannedUsers retrieves banned users with pagination using materialized view
 func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, pageState []byte) ([]*models.User, []byte, error) {
     if limit <= 0 || limit > 1000 {
@@ -628,7 +637,7 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, page
 
     // Use the materialized view for banned users
     query := r.client.Session.Query(`
-        SELECT user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id,
+        SELECT user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
                device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
                kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
                banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
@@ -643,7 +652,7 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, page
     var users []*models.User
     for {
         var u models.User
-        var encryptedPhone, phoneKeyID string
+        var encryptedPhone, phoneKeyID, encryptedDEK string
         var scannedID, scannedKYCVerifiedBy, scannedProfileServiceID, scannedBannedBy gocql.UUID
         
         if !iter.Scan(
@@ -652,6 +661,7 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, page
             &u.PhoneHash,
             &encryptedPhone,
             &phoneKeyID,
+            &encryptedDEK, // Added phone_encrypted_dek
             &u.DeviceID,
             &u.DeviceFingerprint,
             &u.KYCStatus,
@@ -688,6 +698,7 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, page
     }
     return users, iter.PageState(), nil
 }
+
 // HealthCheck performs a health check on the repository
 func (r *UserRepositoryImpl) HealthCheck(ctx context.Context) error {
     var count int

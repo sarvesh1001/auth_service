@@ -27,4 +27,6 @@ type User struct {
     ConsentAgreed     bool       `db:"consent_agreed"`
     ConsentVersion    string     `db:"consent_version"`
     DataRegion        string     `db:"data_region"`
+    PhoneEncryptedDEK string    `db:"phone_encrypted_dek"`
+
 }
