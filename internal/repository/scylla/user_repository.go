@@ -3,6 +3,7 @@ package scylla
 import (
     "context"
     "fmt"
+    "sync"
     "time"
 
     "auth-service/internal/bucketing"
@@ -14,6 +15,14 @@ import (
     "github.com/gocql/gocql"
     "github.com/google/uuid"
     "go.uber.org/zap"
+    "golang.org/x/sync/errgroup"
+)
+
+// Constants for 500M scale optimization
+const (
+    MaxBatchSize        = 100  // Increased from 50
+    MaxConcurrentReads  = 50   // Increased from 10
+    MaxConcurrentWrites = 20   // For batch write operations
 )
 
 // UserRepository handles all user-related database operations
@@ -23,6 +32,12 @@ type UserRepositoryImpl struct {
     encryptionManager *encryption.EncryptionManager
     bucketingManager  *bucketing.BucketingManager
     logger            *zap.Logger
+    
+    // Prepared statements for frequently used queries
+    stmtGetUserByID       *gocql.Query
+    stmtUpdateLastLogin   *gocql.Query
+    stmtUpdateUserStatus  *gocql.Query
+    stmtMutex             sync.RWMutex
 }
 
 // UserStatusUpdate represents a batch user status update
@@ -42,13 +57,44 @@ func NewUserRepository(
     bucketingManager *bucketing.BucketingManager,
     logger *zap.Logger,
 ) UserRepository {
-    return &UserRepositoryImpl{
+    repo := &UserRepositoryImpl{
         client:            client,
         hasher:            hasher,
         encryptionManager: encryptionManager,
         bucketingManager:  bucketingManager,
         logger:            logger,
     }
+    
+    // Prepare frequently used statements
+    repo.prepareStatements()
+    
+    return repo
+}
+
+// prepareStatements prepares frequently used queries for better performance
+func (r *UserRepositoryImpl) prepareStatements() {
+    r.stmtMutex.Lock()
+    defer r.stmtMutex.Unlock()
+    
+    // Prepare GetUserByID query (most frequent)
+    r.stmtGetUserByID = r.client.Session.Query(`
+        SELECT user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
+               device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
+               kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
+               banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
+               consent_agreed, consent_version, data_region
+        FROM users WHERE user_bucket = ? AND user_id = ?`)
+    
+    // Prepare UpdateLastLogin query
+    r.stmtUpdateLastLogin = r.client.Session.Query(`
+        UPDATE users SET last_login = ? WHERE user_bucket = ? AND user_id = ?`)
+    
+    // Prepare UpdateUserStatus query
+    r.stmtUpdateUserStatus = r.client.Session.Query(`
+        UPDATE users SET is_verified = ?, is_blocked = ?, is_banned = ?, updated_at = ?
+        WHERE user_bucket = ? AND user_id = ?`)
+    
+    r.logger.Info("Prepared statements initialized for user repository")
 }
 
 // CreateUser creates a new user with proper bucketing and encryption
@@ -80,7 +126,7 @@ func (r *UserRepositoryImpl) CreateUser(ctx context.Context, user *models.User) 
         user.PhoneHash,
         encryptedPhone.EncryptedValue,
         encryptedPhone.KeyID,
-        encryptedPhone.EncryptedDEK, // Added phone_encrypted_dek
+        encryptedPhone.EncryptedDEK,
         user.DeviceID,
         user.DeviceFingerprint,
         user.KYCStatus,
@@ -129,22 +175,15 @@ func (r *UserRepositoryImpl) CreateUser(ctx context.Context, user *models.User) 
     return nil
 }
 
-// GetUserByID retrieves a user by their ID with proper bucketing
+// GetUserByID retrieves a user by their ID with proper bucketing using prepared statement
 func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) (*models.User, error) {
     gocqlUserID := gocql.UUID(userID)
     bucket := r.bucketingManager.GetUserBucket(userID)
 
-    query := r.client.Session.Query(`
-        SELECT
-          user_bucket, user_id, phone_hash,
-          phone_encrypted, phone_key_id, phone_encrypted_dek,
-          device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
-          kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
-          banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
-          consent_agreed, consent_version, data_region
-        FROM users WHERE user_bucket = ? AND user_id = ?`,
-        bucket, gocqlUserID,
-    )
+    // Use prepared statement
+    r.stmtMutex.RLock()
+    query := r.stmtGetUserByID.Bind(bucket, gocqlUserID)
+    r.stmtMutex.RUnlock()
 
     var user models.User
     var encryptedPhone, phoneKeyID, encryptedDEK string
@@ -156,7 +195,7 @@ func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) 
         &user.PhoneHash,
         &encryptedPhone,
         &phoneKeyID,
-        &encryptedDEK, // Added phone_encrypted_dek
+        &encryptedDEK,
         &user.DeviceID,
         &user.DeviceFingerprint,
         &user.KYCStatus,
@@ -194,7 +233,7 @@ func (r *UserRepositoryImpl) GetUserByID(ctx context.Context, userID uuid.UUID) 
     if encryptedPhone != "" {
         encData := &encryption.EncryptedData{
             EncryptedValue: encryptedPhone,
-            EncryptedDEK:   encryptedDEK, // Include encrypted DEK
+            EncryptedDEK:   encryptedDEK,
             KeyID:          phoneKeyID,
         }
         if decrypted, err := r.encryptionManager.DecryptField(ctx, encData); err == nil {
@@ -267,7 +306,7 @@ func (r *UserRepositoryImpl) UpdateUser(ctx context.Context, user *models.User) 
             WHERE user_bucket = ? AND user_id = ?`,
             encData.EncryptedValue,
             encData.KeyID,
-            encData.EncryptedDEK, // Added phone_encrypted_dek
+            encData.EncryptedDEK,
             user.UserBucket,
             gocql.UUID(user.UserID),
         )
@@ -295,43 +334,41 @@ func (r *UserRepositoryImpl) UpdateUserProfile(ctx context.Context, userID uuid.
     return r.client.ExecuteWithRetry(query.WithContext(ctx), 3)
 }
 
-// UpdateUserStatus updates user verification and status flags
+// UpdateUserStatus updates user verification and status flags using prepared statement
 func (r *UserRepositoryImpl) UpdateUserStatus(ctx context.Context, userID uuid.UUID, isVerified, isBlocked, isBanned bool) error {
     bucket := r.bucketingManager.GetUserBucket(userID)
     now := time.Now().UTC()
 
-    query := r.client.Session.Query(`
-        UPDATE users SET is_verified = ?, is_blocked = ?, is_banned = ?, updated_at = ?
-        WHERE user_bucket = ? AND user_id = ?`,
-        isVerified, isBlocked, isBanned, now,
-        bucket, gocql.UUID(userID),
-    )
+    // Use prepared statement
+    r.stmtMutex.RLock()
+    query := r.stmtUpdateUserStatus.Bind(isVerified, isBlocked, isBanned, now, bucket, gocql.UUID(userID))
+    r.stmtMutex.RUnlock()
+
     return r.client.ExecuteWithRetry(query.WithContext(ctx), 3)
 }
 
-// UpdateLastLogin updates user's last login timestamp
+// UpdateLastLogin updates user's last login timestamp using prepared statement
 func (r *UserRepositoryImpl) UpdateLastLogin(ctx context.Context, userID uuid.UUID, timestamp time.Time) error {
     bucket := r.bucketingManager.GetUserBucket(userID)
 
-    query := r.client.Session.Query(`
-        UPDATE users SET last_login = ? WHERE user_bucket = ? AND user_id = ?`,
-        timestamp,
-        bucket,
-        gocql.UUID(userID),
-    )
+    // Use prepared statement
+    r.stmtMutex.RLock()
+    query := r.stmtUpdateLastLogin.Bind(timestamp, bucket, gocql.UUID(userID))
+    r.stmtMutex.RUnlock()
+
     return r.client.ExecuteWithRetry(query.WithContext(ctx), 3)
 }
 
 // Batch Operations
 
-// CreateUsersBatch creates multiple users in a batch
+// CreateUsersBatch creates multiple users in a batch with increased batch size
 func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*models.User) error {
     if len(users) == 0 {
         return nil
     }
+    
     batch := r.client.Batch(gocql.UnloggedBatch)
     batchSize := 0
-    maxBatchSize := 50
 
     for _, user := range users {
         userBucket := r.bucketingManager.GetUserBucket(user.UserID)
@@ -355,7 +392,7 @@ func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*mode
             user.PhoneHash,
             encPhone.EncryptedValue,
             encPhone.KeyID,
-            encPhone.EncryptedDEK, // Added phone_encrypted_dek
+            encPhone.EncryptedDEK,
             user.DeviceID,
             user.DeviceFingerprint,
             user.KYCStatus,
@@ -387,7 +424,7 @@ func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*mode
         )
 
         batchSize += 2
-        if batchSize >= maxBatchSize {
+        if batchSize >= MaxBatchSize { // Now 100 instead of 50
             if err := r.client.ExecuteBatch(batch); err != nil {
                 return fmt.Errorf("failed to execute user batch: %w", err)
             }
@@ -395,24 +432,26 @@ func (r *UserRepositoryImpl) CreateUsersBatch(ctx context.Context, users []*mode
             batchSize = 0
         }
     }
+    
     if batchSize > 0 {
         if err := r.client.ExecuteBatch(batch); err != nil {
             return fmt.Errorf("failed to execute final user batch: %w", err)
         }
     }
+    
     r.logger.Info("Batch user creation completed", util.Int("users_created", len(users)))
     return nil
 }
 
-// UpdateUsersBatch updates multiple users in batch
+// UpdateUsersBatch updates multiple users in batch with increased batch size
 func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*models.User) error {
     if len(users) == 0 {
         return nil
     }
+    
     batch := r.client.Batch(gocql.UnloggedBatch)
     now := time.Now().UTC()
     batchSize := 0
-    maxBatchSize := 50
 
     for _, user := range users {
         user.UpdatedAt = &now
@@ -425,7 +464,7 @@ func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*mode
             }
             encPhoneVal = encData.EncryptedValue
             phoneKeyID = encData.KeyID
-            phoneEncryptedDEK = encData.EncryptedDEK // Added phone_encrypted_dek
+            phoneEncryptedDEK = encData.EncryptedDEK
         }
 
         batch.Query(`
@@ -437,7 +476,7 @@ func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*mode
                 banned_by = ?, banned_reason = ?, banned_at = ?, last_login = ?, 
                 updated_at = ?, consent_agreed = ?, consent_version = ?, data_region = ?
             WHERE user_bucket = ? AND user_id = ?`,
-            encPhoneVal, phoneKeyID, phoneEncryptedDEK, // Added phone_encrypted_dek
+            encPhoneVal, phoneKeyID, phoneEncryptedDEK,
             user.DeviceID, user.DeviceFingerprint,
             user.KYCStatus, user.KYCLevel, user.KYCVerifiedAt, gocql.UUID(user.KYCVerifiedBy),
             gocql.UUID(user.ProfileServiceID), user.IsVerified, user.IsBlocked, user.IsBanned,
@@ -447,7 +486,7 @@ func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*mode
         )
 
         batchSize++
-        if batchSize >= maxBatchSize {
+        if batchSize >= MaxBatchSize { // Now 100 instead of 50
             if err := r.client.ExecuteBatch(batch); err != nil {
                 return fmt.Errorf("failed to execute update batch: %w", err)
             }
@@ -455,59 +494,60 @@ func (r *UserRepositoryImpl) UpdateUsersBatch(ctx context.Context, users []*mode
             batchSize = 0
         }
     }
+    
     if batchSize > 0 {
         if err := r.client.ExecuteBatch(batch); err != nil {
             return fmt.Errorf("failed to execute final update batch: %w", err)
         }
     }
+    
     return nil
 }
 
-// GetUsersByIDBatch retrieves multiple users by their IDs
+// GetUsersByIDBatch retrieves multiple users by their IDs with increased concurrency
 func (r *UserRepositoryImpl) GetUsersByIDBatch(ctx context.Context, userIDs []uuid.UUID) ([]*models.User, error) {
     if len(userIDs) == 0 {
         return []*models.User{}, nil
     }
+    
     users := make([]*models.User, 0, len(userIDs))
-    errorsCh := make(chan error, len(userIDs))
-    results := make(chan *models.User, len(userIDs))
-    semaphore := make(chan struct{}, 10)
-
+    usersMu := sync.Mutex{}
+    
+    // Use errgroup for better concurrency control
+    g, gctx := errgroup.WithContext(ctx)
+    g.SetLimit(MaxConcurrentReads) // Now 50 instead of 10
+    
     for _, id := range userIDs {
-        go func(uid uuid.UUID) {
-            semaphore <- struct{}{}
-            defer func() { <-semaphore }()
-            u, err := r.GetUserByID(ctx, uid)
+        id := id // capture
+        g.Go(func() error {
+            u, err := r.GetUserByID(gctx, id)
             if err != nil {
-                errorsCh <- err
-                return
+                r.logger.Warn("Failed to get user in batch", 
+                    util.ErrorField(err), 
+                    util.String("user_id", id.String()))
+                return nil // Continue with other users
             }
-            results <- u
-        }(id)
-    }
-
-    for i := 0; i < len(userIDs); i++ {
-        select {
-        case u := <-results:
+            
+            usersMu.Lock()
             users = append(users, u)
-        case err := <-errorsCh:
-            r.logger.Warn("Failed to get user in batch", util.ErrorField(err))
-        case <-ctx.Done():
-            return nil, ctx.Err()
-        }
+            usersMu.Unlock()
+            return nil
+        })
     }
+    
+    _ = g.Wait() // Ignore errors as we log them individually
     return users, nil
 }
 
-// UpdateUserStatusBatch updates status for multiple users
+// UpdateUserStatusBatch updates status for multiple users with increased batch size
 func (r *UserRepositoryImpl) UpdateUserStatusBatch(ctx context.Context, updates []UserStatusUpdate) error {
     if len(updates) == 0 {
         return nil
     }
+    
     batch := r.client.Batch(gocql.UnloggedBatch)
     now := time.Now().UTC()
     batchSize := 0
-    maxBatchSize := 50
 
     for _, update := range updates {
         bucket := r.bucketingManager.GetUserBucket(update.UserID)
@@ -519,7 +559,7 @@ func (r *UserRepositoryImpl) UpdateUserStatusBatch(ctx context.Context, updates 
             bucket, gocql.UUID(update.UserID),
         )
         batchSize++
-        if batchSize >= maxBatchSize {
+        if batchSize >= MaxBatchSize { // Now 100 instead of 50
             if err := r.client.ExecuteBatch(batch); err != nil {
                 return fmt.Errorf("failed to execute status update batch: %w", err)
             }
@@ -527,11 +567,13 @@ func (r *UserRepositoryImpl) UpdateUserStatusBatch(ctx context.Context, updates 
             batchSize = 0
         }
     }
+    
     if batchSize > 0 {
         if err := r.client.ExecuteBatch(batch); err != nil {
             return fmt.Errorf("failed to execute final status update batch: %w", err)
         }
     }
+    
     return nil
 }
 
@@ -548,41 +590,52 @@ func (r *UserRepositoryImpl) UpdateKYCStatus(ctx context.Context, userID uuid.UU
     return r.client.ExecuteWithRetry(query.WithContext(ctx), 3)
 }
 
-// GetUsersByKYCStatus retrieves users by KYC status with pagination (via MV)
+// GetUsersByKYCStatus retrieves users by KYC status with pagination and larger page size
+// GetUsersByKYCStatus retrieves users by KYC status with pagination and streaming for large result sets
 func (r *UserRepositoryImpl) GetUsersByKYCStatus(ctx context.Context, status string, limit int, pageState []byte) ([]*models.User, []byte, error) {
     if limit <= 0 || limit > 1000 {
         limit = 100
     }
-    r.logger.Debug("Querying users_by_kyc_status MV", util.String("status", status), util.Int("limit", limit))
+
+    r.logger.Debug("Querying users_by_kyc_status MV",
+        util.String("status", status),
+        util.Int("limit", limit),
+    )
+
     q := r.client.Session.Query(`
         SELECT kyc_status, user_bucket, user_id
         FROM users_by_kyc_status
         WHERE kyc_status = ?
-        LIMIT ?`, status, limit).PageState(pageState)
+        LIMIT ?`, status, limit).
+        PageSize(1000).       // Larger page size for efficiency
+        PageState(pageState)  // Resume from previous page
 
     iter := q.WithContext(ctx).Iter()
     defer iter.Close()
 
-    var ids []uuid.UUID
-    rowCount := 0
-    for {
-        var s string
-        var bucket int
-        var idG gocql.UUID
-        if !iter.Scan(&s, &bucket, &idG) {
-            break
-        }
-        rowCount++
+    // Pre-allocate slice
+    ids := make([]uuid.UUID, 0, limit)
+    var s string
+    var bucket int
+    var idG gocql.UUID
+
+    for iter.Scan(&s, &bucket, &idG) {
         ids = append(ids, uuid.UUID(idG))
     }
     if err := iter.Close(); err != nil {
         return nil, nil, fmt.Errorf("failed to iterate KYC MV: %w", err)
     }
-    r.logger.Info("MV scan completed", util.Int("rows_found", rowCount), util.Int("ids_collected", len(ids)))
+
+    r.logger.Info("MV scan completed",
+        util.Int("ids_collected", len(ids)),
+    )
+
     next := iter.PageState()
     if len(ids) == 0 {
         return []*models.User{}, next, nil
     }
+
+    // Hydrate user models in parallel
     users, err := r.GetUsersByIDBatch(ctx, ids)
     if err != nil {
         return nil, nil, fmt.Errorf("failed to hydrate users: %w", err)
@@ -635,18 +688,21 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, page
         limit = 100
     }
 
-    // Use the materialized view for banned users
-    query := r.client.Session.Query(`
+    r.logger.Debug("Querying banned_users MV", util.Int("limit", limit))
+
+    q := r.client.Session.Query(`
         SELECT user_bucket, user_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
                device_id, device_fingerprint, kyc_status, kyc_level, kyc_verified_at,
                kyc_verified_by, profile_service_id, is_verified, is_blocked, is_banned,
                banned_by, banned_reason, banned_at, created_at, last_login, updated_at,
                consent_agreed, consent_version, data_region
-        FROM banned_users 
+        FROM banned_users
         WHERE is_banned = true
-        LIMIT ?`, limit).PageState(pageState)
+        LIMIT ?`, limit).
+        PageSize(1000).
+        PageState(pageState)
 
-    iter := query.WithContext(ctx).Iter()
+    iter := q.WithContext(ctx).Iter()
     defer iter.Close()
 
     var users []*models.User
@@ -654,49 +710,48 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit int, page
         var u models.User
         var encryptedPhone, phoneKeyID, encryptedDEK string
         var scannedID, scannedKYCVerifiedBy, scannedProfileServiceID, scannedBannedBy gocql.UUID
-        
+
         if !iter.Scan(
-            &u.UserBucket,
-            &scannedID,
-            &u.PhoneHash,
-            &encryptedPhone,
-            &phoneKeyID,
-            &encryptedDEK, // Added phone_encrypted_dek
-            &u.DeviceID,
-            &u.DeviceFingerprint,
-            &u.KYCStatus,
-            &u.KYCLevel,
-            &u.KYCVerifiedAt,
-            &scannedKYCVerifiedBy,
-            &scannedProfileServiceID,
-            &u.IsVerified,
-            &u.IsBlocked,
-            &u.IsBanned,
-            &scannedBannedBy,
-            &u.BannedReason,
-            &u.BannedAt,
-            &u.CreatedAt,
-            &u.LastLogin,
-            &u.UpdatedAt,
-            &u.ConsentAgreed,
-            &u.ConsentVersion,
-            &u.DataRegion,
+            &u.UserBucket, &scannedID, &u.PhoneHash, &encryptedPhone, &phoneKeyID, &encryptedDEK,
+            &u.DeviceID, &u.DeviceFingerprint, &u.KYCStatus, &u.KYCLevel, &u.KYCVerifiedAt,
+            &scannedKYCVerifiedBy, &scannedProfileServiceID, &u.IsVerified, &u.IsBlocked,
+            &u.IsBanned, &scannedBannedBy, &u.BannedReason, &u.BannedAt, &u.CreatedAt,
+            &u.LastLogin, &u.UpdatedAt, &u.ConsentAgreed, &u.ConsentVersion, &u.DataRegion,
         ) {
             break
         }
-        
-        // Convert gocql.UUID to uuid.UUID
+
         u.UserID = uuid.UUID(scannedID)
         u.KYCVerifiedBy = uuid.UUID(scannedKYCVerifiedBy)
         u.ProfileServiceID = uuid.UUID(scannedProfileServiceID)
         u.BannedBy = uuid.UUID(scannedBannedBy)
-        
         users = append(users, &u)
     }
+
     if err := iter.Close(); err != nil {
-        return nil, nil, fmt.Errorf("failed to iterate banned users: %w", err)
+        return nil, nil, fmt.Errorf("failed to iterate banned users MV: %w", err)
     }
-    return users, iter.PageState(), nil
+
+    next := iter.PageState()
+    if len(users) == 0 {
+        return []*models.User{}, next, nil
+    }
+
+    // Hydrate user details
+    detailed, err := r.GetUsersByIDBatch(ctx, extractIDs(users))
+    if err != nil {
+        return nil, nil, fmt.Errorf("failed to hydrate banned users: %w", err)
+    }
+    return detailed, next, nil
+}
+
+// Helper to extract IDs from a slice of models.User
+func extractIDs(users []*models.User) []uuid.UUID {
+    ids := make([]uuid.UUID, len(users))
+    for i, u := range users {
+        ids[i] = u.UserID
+    }
+    return ids
 }
 
 // HealthCheck performs a health check on the repository
@@ -716,5 +771,8 @@ func (r *UserRepositoryImpl) GetRepositoryStats(ctx context.Context) (map[string
     }
     stats["user_buckets"] = r.bucketingManager.GetUserBuckets()
     stats["event_buckets"] = r.bucketingManager.GetEventBuckets()
+    stats["max_concurrent_reads"] = MaxConcurrentReads
+    stats["max_concurrent_writes"] = MaxConcurrentWrites
+    stats["max_batch_size"] = MaxBatchSize
     return stats, nil
 }

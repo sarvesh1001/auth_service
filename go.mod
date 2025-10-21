@@ -13,6 +13,7 @@ require (
 	github.com/go-playground/validator/v10 v10.28.0
 	github.com/gocql/gocql v1.7.0
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.14.0
 	github.com/segmentio/kafka-go v0.4.49
