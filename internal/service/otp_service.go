@@ -2,112 +2,111 @@
 package service
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
-	"fmt"
-	"net"
-	"strings"
-	"sync"
-	"time"
+    "context"
+    "crypto/sha256"
+    "encoding/hex"
+    "errors"
+    "fmt"
+    "math"
+    "net"
+    "strings"
+    "sync"
+    "time"
 
-	"auth-service/internal/models"
-	"auth-service/internal/repository/scylla"
-	"auth-service/internal/util"
+    "auth-service/internal/config"
+    "auth-service/internal/hashing"
+    "auth-service/internal/models"
+    "auth-service/internal/repository/scylla"
+    "auth-service/internal/util"
 
-	lru "github.com/hashicorp/golang-lru/v2"
-	"go.uber.org/zap"
+    lru "github.com/hashicorp/golang-lru/v2"
+    "go.uber.org/zap"
 )
 
 var (
-	ErrOTPNotFound          = errors.New("OTP not found")
-	ErrOTPExpired           = errors.New("OTP has expired")
-	ErrOTPInvalid           = errors.New("invalid OTP")
-	ErrOTPAttemptsExceeded  = errors.New("max OTP attempts exceeded")
-	ErrOTPRateLimitExceeded = errors.New("OTP rate limit exceeded")
-	ErrOTPAlreadyUsed       = errors.New("OTP has already been used")
+    ErrOTPNotFound          = errors.New("OTP not found")
+    ErrOTPExpired           = errors.New("OTP has expired")
+    ErrOTPInvalid           = errors.New("invalid OTP")
+    ErrOTPAttemptsExceeded  = errors.New("max OTP attempts exceeded")
+    ErrOTPRateLimitExceeded = errors.New("OTP rate limit exceeded")
+    ErrOTPAlreadyUsed       = errors.New("OTP has already been used")
 )
 
 const (
-	// Rate limiting constants
-	OTPSendLimit1Min         = 2  // Max 2 OTP sends per minute per phone
-	OTPSendLimit5Min         = 3  // Max 3 OTP sends per 5 minutes per phone
-	OTPSendLimitHour         = 10 // Max 10 OTP sends per hour per phone
-	OTPVerifyLimit30Sec      = 3  // Max 3 verify attempts per 30 seconds
-	OTPVerifyLimitMin        = 5  // Max 5 verify attempts per minute
-	
-	// OTP configurations
-	OTPExpiryDuration        = 5 * time.Minute
-	OTPCacheDuration         = 6 * time.Minute
-	OTPRateLimitCacheDuration = 1 * time.Hour
-	
-	// Lockout configurations
-	AccountLockoutDuration   = 30 * time.Minute
-	AccountLockoutThreshold  = 5 // Failed attempts before lockout
+    OTPSendLimit1Min         = 2
+    OTPSendLimit5Min         = 3
+    OTPSendLimitHour         = 10
+    OTPVerifyLimit30Sec      = 3
+    OTPVerifyLimitMin        = 5
+    OTPResendCooldown        = 60 * time.Second
+
+    OTPExpiryDuration        = 5 * time.Minute
+    OTPCacheDuration         = 6 * time.Minute
+    OTPRateLimitCacheDuration = 1 * time.Hour
+
+    AccountLockoutDuration   = 30 * time.Minute
+    AccountLockoutThreshold  = 5
 )
 
-// OTPService handles all OTP-related business logic
+// OTPService handles OTP logic
 type OTPService struct {
-	otpRepo       scylla.OTPRepository
-	hasher        *hashing.Hasher
-	logger        *zap.Logger
-	distCache     *DistributedCache
-	
-	// Local LRU cache for rate limiting
-	sendRateCache    *lru.Cache[string, *TokenBucket]
-	verifyRateCache  *lru.Cache[string, *TokenBucket]
-	lockoutCache     *lru.Cache[string, time.Time]
-	
-	rateLimitMutex   sync.RWMutex
+    otpRepo         scylla.OTPRepository
+    hasher          *hashing.Hasher
+    config          *config.Config
+    logger          *zap.Logger
+    distCache       *DistributedCache
+    sendRateCache   *lru.Cache[string, *TokenBucket]
+    verifyRateCache *lru.Cache[string, *TokenBucket]
+    lockoutCache    *lru.Cache[string, time.Time]
+    mu              sync.RWMutex
 }
 
-// TokenBucket implements token bucket rate limiting algorithm
+// TokenBucket implements rate limiting
 type TokenBucket struct {
-	Tokens         float64
-	MaxTokens      float64
-	RefillRate     float64 // Tokens per second
-	LastRefillTime time.Time
-	mu             sync.Mutex
+    Tokens         float64
+    MaxTokens      float64
+    RefillRate     float64
+    LastRefillTime time.Time
+    mu             sync.Mutex
 }
 
-// OTPSendRequest represents OTP send request
+// Request/Response types
 type OTPSendRequest struct {
-	PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
-	Purpose     string `json:"purpose" validate:"required,oneof=login registration verification password_reset"`
-	IPAddress   string `json:"ip_address"`
-	DeviceID    string `json:"device_id"`
-	Provider    string `json:"provider,omitempty"` // SMS provider name
+    PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
+    Purpose     string `json:"purpose" validate:"required,oneof=login registration verification password_reset"`
+    IPAddress   string `json:"ip_address"`
+    DeviceID    string `json:"device_id"`
+    Provider    string `json:"provider,omitempty"`
 }
 
-// OTPVerifyRequest represents OTP verification request
 type OTPVerifyRequest struct {
-	PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
-	OTP         string `json:"otp" validate:"required,len=6,numeric"`
-	Purpose     string `json:"purpose" validate:"required"`
-	IPAddress   string `json:"ip_address"`
+    PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
+    OTP         string `json:"otp" validate:"required,len=6,numeric"`
+    Purpose     string `json:"purpose" validate:"required"`
+    IPAddress   string `json:"ip_address"`
 }
 
-// OTPResendRequest represents OTP resend request
 type OTPResendRequest struct {
-	PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
-	Purpose     string `json:"purpose" validate:"required"`
-	IPAddress   string `json:"ip_address"`
+    PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
+    Purpose     string `json:"purpose" validate:"required"`
+    IPAddress   string `json:"ip_address"`
 }
 
-// OTPResponse represents OTP operation response
 type OTPResponse struct {
-	Success      bool      `json:"success"`
-	Message      string    `json:"message"`
-	ExpiresAt    time.Time `json:"expires_at,omitempty"`
-	AttemptsLeft int       `json:"attempts_left,omitempty"`
-	RetryAfter   int       `json:"retry_after,omitempty"` // Seconds to wait before retry
+    Success      bool      `json:"success"`
+    Message      string    `json:"message"`
+    ExpiresAt    time.Time `json:"expires_at,omitempty"`
+    AttemptsLeft int       `json:"attempts_left,omitempty"`
+    RetryAfter   int       `json:"retry_after,omitempty"`
+    OTPValue     string    `json:"otp_value,omitempty"` // NEW: only in dev
 }
 
 // NewOTPService creates a new OTP service
 func NewOTPService(
 	otpRepo scylla.OTPRepository,
 	hasher *hashing.Hasher,
+	cfg *config.Config,        // ADD THIS
+
 	distCache *DistributedCache,
 	logger *zap.Logger,
 ) *OTPService {
@@ -120,6 +119,8 @@ func NewOTPService(
 		hasher:          hasher,
 		logger:          logger,
 		distCache:       distCache,
+		config: cfg,  // ADD THIS
+
 		sendRateCache:   sendCache,
 		verifyRateCache: verifyCache,
 		lockoutCache:    lockoutCache,
@@ -148,7 +149,7 @@ func (tb *TokenBucket) TakeToken() bool {
 	// Refill tokens based on elapsed time
 	now := time.Now()
 	elapsed := now.Sub(tb.LastRefillTime).Seconds()
-	tb.Tokens = min(tb.MaxTokens, tb.Tokens+elapsed*tb.RefillRate)
+	tb.Tokens = math.Min(tb.MaxTokens, tb.Tokens+elapsed*tb.RefillRate) // Fixed: use math.Min
 	tb.LastRefillTime = now
 	
 	if tb.Tokens >= 1.0 {
@@ -178,279 +179,323 @@ func (tb *TokenBucket) TimeUntilToken() int {
 // ============================================
 
 // SendOTP generates and sends an OTP to a phone number
+// SendOTP generates and sends an OTP to a phone number
 func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResponse, error) {
-	startTime := time.Now()
-	
-	// Validate and sanitize input
-	if err := s.validateSendRequest(req); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
-	}
-	
-	// Generate phone hash
-	phoneHash := s.generatePhoneHash(req.PhoneNumber)
-	
-	// Check account lockout
-	if locked, until := s.isAccountLocked(phoneHash); locked {
-		retryAfter := int(time.Until(until).Seconds())
-		return &OTPResponse{
-			Success:    false,
-			Message:    "Account temporarily locked due to excessive attempts",
-			RetryAfter: retryAfter,
-		}, ErrOTPRateLimitExceeded
-	}
-	
-	// Check rate limits with token bucket
-	if !s.checkSendRateLimit(phoneHash) {
-		bucket := s.getSendTokenBucket(phoneHash)
-		retryAfter := bucket.TimeUntilToken()
-		
-		s.logger.Warn("OTP send rate limit exceeded",
-			util.String("phone_hash", phoneHash),
-			util.String("purpose", req.Purpose),
-			util.Int("retry_after", retryAfter),
-		)
-		
-		return &OTPResponse{
-			Success:    false,
-			Message:    "Too many OTP requests. Please try again later.",
-			RetryAfter: retryAfter,
-		}, ErrOTPRateLimitExceeded
-	}
-	
-	// Additional database-backed rate limiting check
-	if err := s.checkDatabaseRateLimit(ctx, phoneHash); err != nil {
-		return nil, err
-	}
-	
-	// Generate OTP
-	otp, err := scylla.GenerateOTP(6)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate OTP: %w", err)
-	}
-	
-	// Generate salt and hash OTP
-	salt, err := scylla.GenerateSalt()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate salt: %w", err)
-	}
-	
-	otpHash := scylla.HashOTP(otp, salt)
-	
-	// Parse IP address
-	var ipAddr net.IP
-	if req.IPAddress != "" {
-		ipAddr = net.ParseIP(req.IPAddress)
-	}
-	
-	// Create OTP verification record
-	now := time.Now().UTC()
-	expiresAt := now.Add(OTPExpiryDuration)
-	
-	otpVerification := &models.OTPVerification{
-		PhoneHash:     phoneHash,
-		CreatedAt:     now,
-		OTPHash:       otpHash,
-		OTPSalt:       salt,
-		HashAlgorithm: "sha256",
-		PepperVersion: s.hasher.GetCurrentPepperVersion(),
-		Purpose:       req.Purpose,
-		Attempts:      0,
-		ExpiresAt:     expiresAt,
-		IPAddress:     ipAddr,
-		ProviderUsed:  req.Provider,
-	}
-	
-	// Save to database
-	if err := s.otpRepo.CreateOTP(ctx, otpVerification); err != nil {
-		return nil, fmt.Errorf("failed to create OTP: %w", err)
-	}
-	
-	// Cache OTP in Redis for fast verification
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
-		if err := s.distCache.SetOTPVerification(ctx, cacheKey, otpVerification, OTPCacheDuration); err != nil {
-			s.logger.Warn("Failed to cache OTP in Redis",
-				util.ErrorField(err),
-				util.String("phone_hash", phoneHash),
-			)
-		}
-	}
-	
-	// TODO: Send OTP via SMS/Email provider
-	// This is where you'd integrate with Twilio, AWS SNS, MSG91, etc.
-	s.sendOTPViaSMS(ctx, req.PhoneNumber, otp, req.Provider)
-	
-	s.logger.Info("OTP sent successfully",
-		util.String("phone_hash", phoneHash),
-		util.String("purpose", req.Purpose),
-		util.Duration("duration", time.Since(startTime)),
-	)
-	
-	// In development, log the OTP (REMOVE IN PRODUCTION)
-	if s.isDevEnvironment() {
-		s.logger.Debug("OTP Generated (DEV ONLY)",
-			util.String("phone", req.PhoneNumber),
-			util.String("otp", otp),
-		)
-	}
-	
-	return &OTPResponse{
-		Success:      true,
-		Message:      "OTP sent successfully",
-		ExpiresAt:    expiresAt,
-		AttemptsLeft: scylla.OTPMaxAttempts,
-	}, nil
+    startTime := time.Now()
+
+    // Validate and sanitize input
+    if err := s.validateSendRequest(req); err != nil {
+        return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+    }
+
+    // Generate phone hash
+    phoneHash := s.generatePhoneHash(req.PhoneNumber)
+
+    // Check account lockout
+    if locked, until := s.isAccountLocked(phoneHash); locked {
+        retryAfter := int(time.Until(until).Seconds())
+        return &OTPResponse{
+            Success:    false,
+            Message:    "Account temporarily locked due to excessive attempts",
+            RetryAfter: retryAfter,
+        }, ErrOTPRateLimitExceeded
+    }
+
+    // Check rate limits with token bucket (FAST - in-memory)
+    if !s.checkSendRateLimit(phoneHash) {
+        bucket := s.getSendTokenBucket(phoneHash)
+        retryAfter := bucket.TimeUntilToken()
+
+        s.logger.Warn("OTP send rate limit exceeded",
+            util.String("phone_hash", phoneHash),
+            util.String("purpose", req.Purpose),
+            util.Int("retry_after", retryAfter),
+        )
+
+        return &OTPResponse{
+            Success:    false,
+            Message:    "Too many OTP requests. Please try again later.",
+            RetryAfter: retryAfter,
+        }, ErrOTPRateLimitExceeded
+    }
+
+    // REMOVED: Database-backed rate limiting check (too slow)
+    // Token bucket rate limiting is sufficient for 500M scale
+    
+    // Generate OTP
+    otp, err := scylla.GenerateOTP(6)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate OTP: %w", err)
+    }
+
+    // Generate salt and hash OTP
+    salt, err := scylla.GenerateSalt()
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate salt: %w", err)
+    }
+
+    otpHash := scylla.HashOTP(otp, salt)
+
+    // Parse IP address
+    var ipAddr net.IP
+    if req.IPAddress != "" {
+        ipAddr = net.ParseIP(req.IPAddress)
+    }
+
+    // Create OTP verification record
+    now := time.Now().UTC()
+    expiresAt := now.Add(OTPExpiryDuration)
+
+    otpVerification := &models.OTPVerification{
+        PhoneHash:     phoneHash,
+        CreatedAt:     now,
+        OTPHash:       otpHash,
+        OTPSalt:       salt,
+        HashAlgorithm: "sha256",
+        PepperVersion: s.hasher.GetCurrentPepperVersion(),
+        Purpose:       req.Purpose,
+        Attempts:      0,
+        ExpiresAt:     expiresAt,
+        IPAddress:     ipAddr,
+        ProviderUsed:  req.Provider,
+    }
+
+    // Save to database (PRIMARY)
+    if err := s.otpRepo.CreateOTP(ctx, otpVerification); err != nil {
+        return nil, fmt.Errorf("failed to create OTP: %w", err)
+    }
+
+    // Cache OTP in Redis ASYNCHRONOUSLY (non-blocking)
+    if s.distCache != nil {
+        go func() {
+            // Use background context with timeout to avoid blocking
+            cacheCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+            defer cancel()
+            
+            cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
+            if err := s.distCache.SetOTPVerification(cacheCtx, cacheKey, otpVerification, OTPCacheDuration); err != nil {
+                s.logger.Warn("Failed to cache OTP in Redis (non-critical)",
+                    util.ErrorField(err),
+                    util.String("phone_hash", phoneHash),
+                )
+            }
+        }()
+    }
+
+    // Send OTP via SMS/Email provider (TODO: Make this async too)
+    s.sendOTPViaSMS(ctx, req.PhoneNumber, otp, req.Provider)
+
+    s.logger.Info("OTP sent successfully",
+        util.String("phone_hash", phoneHash),
+        util.String("purpose", req.Purpose),
+        util.Duration("duration", time.Since(startTime)),
+    )
+
+    // Prepare response
+    resp := &OTPResponse{
+        Success:      true,
+        Message:      "OTP sent successfully",
+        ExpiresAt:    expiresAt,
+        AttemptsLeft: scylla.OTPMaxAttempts,
+    }
+
+    // Include OTP value in development mode
+    if s.config.IsDevelopment() && s.config.OTP.LogOTPInDev {
+        resp.OTPValue = otp
+        s.logger.Info("🔐 DEVELOPMENT: OTP Generated (DO NOT USE IN PRODUCTION)",
+            zap.String("phone", req.PhoneNumber),
+            zap.String("otp", otp),
+            zap.String("purpose", req.Purpose),
+            zap.Time("expires_at", expiresAt),
+        )
+    }
+
+    return resp, nil
 }
 
 // VerifyOTP verifies an OTP for a phone number
+// VerifyOTP verifies an OTP for a phone number
 func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTPResponse, error) {
-	startTime := time.Now()
-	
-	// Validate input
-	if err := s.validateVerifyRequest(req); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
-	}
-	
-	phoneHash := s.generatePhoneHash(req.PhoneNumber)
-	
-	// Check account lockout
-	if locked, until := s.isAccountLocked(phoneHash); locked {
-		retryAfter := int(time.Until(until).Seconds())
-		return &OTPResponse{
-			Success:    false,
-			Message:    "Account temporarily locked",
-			RetryAfter: retryAfter,
-		}, ErrOTPRateLimitExceeded
-	}
-	
-	// Check verification rate limit
-	if !s.checkVerifyRateLimit(phoneHash) {
-		bucket := s.getVerifyTokenBucket(phoneHash)
-		retryAfter := bucket.TimeUntilToken()
-		
-		s.logger.Warn("OTP verification rate limit exceeded",
-			util.String("phone_hash", phoneHash),
-			util.Int("retry_after", retryAfter),
-		)
-		
-		return &OTPResponse{
-			Success:    false,
-			Message:    "Too many verification attempts",
-			RetryAfter: retryAfter,
-		}, ErrOTPRateLimitExceeded
-	}
-	
-	// Try to get OTP from cache first
-	var otpRecord *models.OTPVerification
-	var err error
-	
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
-		otpRecord, err = s.distCache.GetOTPVerification(ctx, cacheKey)
-		if err != nil {
-			// Cache miss, fetch from database
-			otpRecord, err = s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
-		}
-	} else {
-		otpRecord, err = s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
-	}
-	
-	if err != nil {
-		s.incrementFailedAttempts(phoneHash)
-		return nil, ErrOTPNotFound
-	}
-	
-	// Check expiry
-	if time.Now().After(otpRecord.ExpiresAt) {
-		s.incrementFailedAttempts(phoneHash)
-		return nil, ErrOTPExpired
-	}
-	
-	// Check attempts
-	if otpRecord.Attempts >= scylla.OTPMaxAttempts {
-		s.lockAccount(phoneHash)
-		return nil, ErrOTPAttemptsExceeded
-	}
-	
-	// Hash the provided OTP
-	providedHash := scylla.HashOTP(req.OTP, otpRecord.OTPSalt)
-	
-	// Validate OTP
-	_, err = s.otpRepo.ValidateOTP(ctx, phoneHash, providedHash, req.Purpose)
-	if err != nil {
-		s.incrementFailedAttempts(phoneHash)
-		
-		attemptsLeft := scylla.OTPMaxAttempts - (otpRecord.Attempts + 1)
-		
-		return &OTPResponse{
-			Success:      false,
-			Message:      "Invalid OTP",
-			AttemptsLeft: attemptsLeft,
-		}, ErrOTPInvalid
-	}
-	
-	// OTP is valid - invalidate it
-	if err := s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose); err != nil {
-		s.logger.Warn("Failed to invalidate OTP after successful verification",
-			util.ErrorField(err),
-			util.String("phone_hash", phoneHash),
-		)
-	}
-	
-	// Remove from cache
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
-		_ = s.distCache.DeleteOTPVerification(ctx, cacheKey)
-	}
-	
-	// Clear failed attempts
-	s.clearFailedAttempts(phoneHash)
-	
-	s.logger.Info("OTP verified successfully",
-		util.String("phone_hash", phoneHash),
-		util.String("purpose", req.Purpose),
-		util.Duration("duration", time.Since(startTime)),
-	)
-	
-	return &OTPResponse{
-		Success: true,
-		Message: "OTP verified successfully",
-	}, nil
+    startTime := time.Now()
+    
+    // Validate input
+    if err := s.validateVerifyRequest(req); err != nil {
+        return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+    }
+    
+    phoneHash := s.generatePhoneHash(req.PhoneNumber)
+    
+    // Check account lockout
+    if locked, until := s.isAccountLocked(phoneHash); locked {
+        retryAfter := int(time.Until(until).Seconds())
+        return &OTPResponse{
+            Success:    false,
+            Message:    "Account temporarily locked",
+            RetryAfter: retryAfter,
+        }, ErrOTPRateLimitExceeded
+    }
+    
+    // Check verification rate limit
+    if !s.checkVerifyRateLimit(phoneHash) {
+        bucket := s.getVerifyTokenBucket(phoneHash)
+        retryAfter := bucket.TimeUntilToken()
+        
+        s.logger.Warn("OTP verification rate limit exceeded",
+            util.String("phone_hash", phoneHash),
+            util.Int("retry_after", retryAfter),
+        )
+        
+        return &OTPResponse{
+            Success:    false,
+            Message:    "Too many verification attempts",
+            RetryAfter: retryAfter,
+        }, ErrOTPRateLimitExceeded
+    }
+    
+    // Try to get OTP from cache first
+    var otpRecord *models.OTPVerification
+    var err error
+    
+    if s.distCache != nil {
+        cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
+        otpRecord, err = s.distCache.GetOTPVerification(ctx, cacheKey)
+        if err != nil {
+            // Cache miss, fetch from database
+            otpRecord, err = s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
+        }
+    } else {
+        otpRecord, err = s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
+    }
+    
+    if err != nil {
+        s.incrementFailedAttempts(phoneHash)
+        return &OTPResponse{
+            Success: false,
+            Message: "OTP not found",
+        }, ErrOTPNotFound
+    }
+    
+    // Check expiry
+    if time.Now().After(otpRecord.ExpiresAt) {
+        s.incrementFailedAttempts(phoneHash)
+        return &OTPResponse{
+            Success:   false,
+            Message:   "OTP has expired",
+            ExpiresAt: otpRecord.ExpiresAt,
+        }, ErrOTPExpired
+    }
+    
+    // Check attempts BEFORE validation
+    if otpRecord.Attempts >= scylla.OTPMaxAttempts {
+        s.lockAccount(phoneHash)
+        return &OTPResponse{
+            Success:      false,
+            Message:      "Max OTP verification attempts exceeded",
+            AttemptsLeft: 0,
+        }, ErrOTPAttemptsExceeded
+    }
+    
+    // Hash the provided OTP
+    providedHash := scylla.HashOTP(req.OTP, otpRecord.OTPSalt)
+    
+    // Validate OTP - this will increment attempts on failure and return updated OTP
+    validatedOTP, err := s.otpRepo.ValidateOTP(ctx, phoneHash, providedHash, req.Purpose)
+    if err != nil {
+        s.incrementFailedAttempts(phoneHash)
+        
+        // Calculate attempts left from the UPDATED OTP record
+        attemptsLeft := scylla.OTPMaxAttempts
+        if validatedOTP != nil {
+            attemptsLeft = scylla.OTPMaxAttempts - validatedOTP.Attempts
+        }
+        
+        // If this was the last attempt, lock the account
+        if attemptsLeft <= 0 {
+            s.lockAccount(phoneHash)
+        }
+        
+        return &OTPResponse{
+            Success:      false,
+            Message:      "Invalid OTP",
+            AttemptsLeft: attemptsLeft,
+            ExpiresAt:    otpRecord.ExpiresAt,
+        }, ErrOTPInvalid
+    }
+    
+    // OTP is valid - invalidate it
+    if err := s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose); err != nil {
+        s.logger.Warn("Failed to invalidate OTP after successful verification",
+            util.ErrorField(err),
+            util.String("phone_hash", phoneHash),
+        )
+    }
+    
+    // Remove from cache
+    if s.distCache != nil {
+        cacheKey := fmt.Sprintf("otp:%s:%s", phoneHash, req.Purpose)
+        _ = s.distCache.DeleteOTPVerification(ctx, cacheKey)
+    }
+    
+    // Clear failed attempts
+    s.clearFailedAttempts(phoneHash)
+    
+    s.logger.Info("OTP verified successfully",
+        util.String("phone_hash", phoneHash),
+        util.String("purpose", req.Purpose),
+        util.Duration("duration", time.Since(startTime)),
+    )
+    
+    return &OTPResponse{
+        Success: true,
+        Message: "OTP verified successfully",
+    }, nil
 }
 
 // ResendOTP resends an OTP with stricter rate limiting
+// ResendOTP invalidates and resends an OTP efficiently without ALLOW FILTERING
 func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTPResponse, error) {
-	// Resend has stricter rate limits - only 1 resend per 2 minutes
-	phoneHash := s.generatePhoneHash(req.PhoneNumber)
-	
-	// Check if there's an active OTP
-	activeOTP, err := s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
-	if err != nil {
-		return nil, fmt.Errorf("no active OTP to resend: %w", err)
-	}
-	
-	// Check if OTP was created less than 1 minute ago
-	if time.Since(activeOTP.CreatedAt) < 60*time.Second {
-		waitTime := 60 - int(time.Since(activeOTP.CreatedAt).Seconds())
-		return &OTPResponse{
-			Success:    false,
-			Message:    "Please wait before requesting a new OTP",
-			RetryAfter: waitTime,
-		}, ErrOTPRateLimitExceeded
-	}
-	
-	// Invalidate old OTP
-	_ = s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose)
-	
-	// Send new OTP with original request structure
-	sendReq := &OTPSendRequest{
-		PhoneNumber: req.PhoneNumber,
-		Purpose:     req.Purpose,
-		IPAddress:   req.IPAddress,
-		Provider:    "resend",
-	}
-	
-	return s.SendOTP(ctx, sendReq)
+    // Validate input
+    if err := s.validateResendRequest(req); err != nil {
+        return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
+    }
+
+    phoneHash := s.generatePhoneHash(req.PhoneNumber)
+
+    // Retrieve active OTP using prepared statement (no filtering)
+    otpRecord, err := s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
+    if err != nil {
+        return nil, fmt.Errorf("no active OTP to resend: %w", err)
+    }
+
+    // Enforce resend cooldown
+    if time.Since(otpRecord.CreatedAt) < OTPResendCooldown {
+        retry := int((OTPResendCooldown - time.Since(otpRecord.CreatedAt)).Seconds())
+        return &OTPResponse{
+            Success:    false,
+            Message:    "Please wait before requesting a new OTP",
+            RetryAfter: retry,
+        }, ErrOTPRateLimitExceeded
+    }
+
+    // Invalidate the old OTP
+    _ = s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose)
+
+    // Issue a new OTP via SendOTP
+    sendReq := &OTPSendRequest{
+        PhoneNumber: req.PhoneNumber,
+        Purpose:     req.Purpose,
+        IPAddress:   req.IPAddress,
+        Provider:    "resend",
+    }
+    return s.SendOTP(ctx, sendReq)
+}
+
+// validateResendRequest checks required fields for resend
+func (s *OTPService) validateResendRequest(req *OTPResendRequest) error {
+    if req.PhoneNumber == "" || req.Purpose == "" {
+        return fmt.Errorf("phone_number and purpose are required")
+    }
+    return nil
 }
 
 // ============================================
@@ -459,8 +504,8 @@ func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTP
 
 // getSendTokenBucket gets or creates a token bucket for OTP sending
 func (s *OTPService) getSendTokenBucket(phoneHash string) *TokenBucket {
-	s.rateLimitMutex.Lock()
-	defer s.rateLimitMutex.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	
 	if bucket, ok := s.sendRateCache.Get(phoneHash); ok {
 		return bucket
@@ -474,8 +519,8 @@ func (s *OTPService) getSendTokenBucket(phoneHash string) *TokenBucket {
 
 // getVerifyTokenBucket gets or creates a token bucket for OTP verification
 func (s *OTPService) getVerifyTokenBucket(phoneHash string) *TokenBucket {
-	s.rateLimitMutex.Lock()
-	defer s.rateLimitMutex.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	
 	if bucket, ok := s.verifyRateCache.Get(phoneHash); ok {
 		return bucket
@@ -558,7 +603,7 @@ func (s *OTPService) lockAccount(phoneHash string) {
 	
 	s.logger.Warn("Account locked due to excessive failed attempts",
 		util.String("phone_hash", phoneHash),
-		util.Time("lock_until", lockUntil),
+		util.String("lock_until", lockUntil.Format(time.RFC3339)), // Fixed: use String with RFC3339 format
 	)
 }
 
@@ -705,10 +750,11 @@ func (s *OTPService) Cleanup() {
 	s.lockoutCache.Purge()
 }
 
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
 
+// CleanupExpiredOTPs is not needed - TTL handles expiry automatically
+func (s *OTPService) CleanupExpiredOTPs(ctx context.Context, batchSize int) (int, error) {
+    // ScyllaDB TTL handles expiry automatically
+    // This is a no-op - cleanup happens automatically
+    s.logger.Info("Cleanup skipped - TTL handles expiry automatically")
+    return 0, nil
+}

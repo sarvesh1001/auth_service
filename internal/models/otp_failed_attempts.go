@@ -1,4 +1,6 @@
 package models
+import ("net" 
+"time")
 type OTPFailedAttempt struct {
     PhoneHash   string    `db:"phone_hash"`
     TimeBucket  int64     `db:"time_bucket"`

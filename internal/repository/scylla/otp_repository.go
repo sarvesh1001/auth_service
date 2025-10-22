@@ -1,4 +1,3 @@
-
 // internal/repository/scylla/otp_repository.go
 package scylla
 
@@ -31,6 +30,7 @@ const (
 	OTPMaxAttempts          = 3                // Max verification attempts
 	OTPCleanupBatchSize     = 1000             // Cleanup batch size
 	OTPLength               = 6                // 6-digit OTP
+	OTPBucketWindowSeconds  = 3600             // 1 hour bucketing
 )
 
 // OTPRepository handles all OTP-related database operations
@@ -44,7 +44,7 @@ type OTPRepositoryImpl struct {
 	stmtCreateOTP       *gocql.Query
 	stmtGetActiveOTP    *gocql.Query
 	stmtInvalidateOTP   *gocql.Query
-	stmtIncrementAttempt *gocql.Query
+	// stmtIncrementAttempt *gocql.Query
 	stmtMutex           sync.RWMutex
 }
 
@@ -55,7 +55,7 @@ type OTPRepository interface {
 	GetActiveOTP(ctx context.Context, phoneHash string, purpose string) (*models.OTPVerification, error)
 	ValidateOTP(ctx context.Context, phoneHash, otpHash, purpose string) (*models.OTPVerification, error)
 	InvalidateOTP(ctx context.Context, phoneHash string, purpose string) error
-	IncrementOTPAttempts(ctx context.Context, phoneHash string, createdAt time.Time) error
+	IncrementOTPAttempts(ctx context.Context, phoneHash string, purpose string, createdAt time.Time) (int, error)
 	
 	// Rate Limiting & Analytics
 	GetOTPAttemptsByPhone(ctx context.Context, phoneHash string, timeWindow time.Duration) (int, error)
@@ -92,41 +92,43 @@ func NewOTPRepository(
 }
 
 // prepareStatements prepares frequently used queries for better performance
+// prepareStatements prepares frequently used queries for better performance
 func (r *OTPRepositoryImpl) prepareStatements() {
-	r.stmtMutex.Lock()
-	defer r.stmtMutex.Unlock()
-	
-	// Prepare CreateOTP query
-	r.stmtCreateOTP = r.client.Session.Query(`
-		INSERT INTO otp_verifications (
-			phone_hash, time_bucket, created_at, otp_hash, otp_salt,
-			hash_algorithm, pepper_version, purpose, attempts, expires_at,
-			ip_address, provider_used
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		USING TTL ?`)
-	
-	// Prepare GetActiveOTP query
-	r.stmtGetActiveOTP = r.client.Session.Query(`
-		SELECT phone_hash, time_bucket, created_at, otp_hash, otp_salt,
-			   hash_algorithm, pepper_version, purpose, attempts, expires_at,
-			   ip_address, provider_used
-		FROM otp_verifications
-		WHERE phone_hash = ? AND time_bucket = ? AND purpose = ?
-		ORDER BY created_at DESC
-		LIMIT 1`)
-	
-	// Prepare InvalidateOTP query
-	r.stmtInvalidateOTP = r.client.Session.Query(`
-		DELETE FROM otp_verifications
-		WHERE phone_hash = ? AND time_bucket = ? AND created_at = ? AND purpose = ?`)
-	
-	// Prepare IncrementAttempt query
-	r.stmtIncrementAttempt = r.client.Session.Query(`
-		UPDATE otp_verifications
-		SET attempts = attempts + 1
-		WHERE phone_hash = ? AND time_bucket = ? AND created_at = ? AND purpose = ?`)
-	
-	r.logger.Info("Prepared statements initialized for OTP repository")
+    r.stmtMutex.Lock()
+    defer r.stmtMutex.Unlock()
+    
+    // Prepare CreateOTP query
+    r.stmtCreateOTP = r.client.Session.Query(`
+        INSERT INTO otp_verifications (
+            phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
+            hash_algorithm, pepper_version, attempts, expires_at,
+            ip_address, provider_used
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        USING TTL ?`)
+    
+    // Prepare GetActiveOTP query
+    r.stmtGetActiveOTP = r.client.Session.Query(`
+        SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
+               hash_algorithm, pepper_version, attempts, expires_at,
+               ip_address, provider_used
+        FROM otp_verifications
+        WHERE phone_hash = ? AND purpose = ? AND time_bucket = ?
+        ORDER BY created_at DESC
+        LIMIT 1`)
+    
+    // Prepare InvalidateOTP query
+    r.stmtInvalidateOTP = r.client.Session.Query(`
+        DELETE FROM otp_verifications
+        WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`)
+    
+    // Note: IncrementAttempt uses read-modify-write pattern, no prepared statement
+    
+    r.logger.Info("Prepared statements initialized for OTP repository")
+}
+
+// Helper function to calculate time bucket from timestamp
+func (r *OTPRepositoryImpl) getTimeBucketFromTime(t time.Time) int64 {
+	return t.Unix() / OTPBucketWindowSeconds
 }
 
 // ============================================
@@ -137,8 +139,8 @@ func (r *OTPRepositoryImpl) prepareStatements() {
 func (r *OTPRepositoryImpl) CreateOTP(ctx context.Context, otp *models.OTPVerification) error {
 	startTime := time.Now()
 	
-	// Calculate time bucket (hourly bucketing for even distribution)
-	otp.TimeBucket = otp.CreatedAt.Unix() / 3600
+	// Calculate time bucket using bucketingManager
+	otp.TimeBucket = r.getTimeBucketFromTime(otp.CreatedAt)
 	
 	// Calculate TTL in seconds
 	ttlSeconds := int(time.Until(otp.ExpiresAt).Seconds())
@@ -146,17 +148,26 @@ func (r *OTPRepositoryImpl) CreateOTP(ctx context.Context, otp *models.OTPVerifi
 		ttlSeconds = int(OTPDefaultTTL.Seconds())
 	}
 	
-	// Use prepared statement
+	// Log for debugging
+	r.logger.Info("Creating OTP in database",
+		util.String("phone_hash", otp.PhoneHash),
+		util.String("purpose", otp.Purpose),
+		util.Int64("time_bucket", otp.TimeBucket),
+		util.Time("created_at", otp.CreatedAt),
+		util.Int("ttl_seconds", ttlSeconds),
+	)
+	
+	// Use prepared statement - UPDATED with purpose field
 	r.stmtMutex.RLock()
 	query := r.stmtCreateOTP.Bind(
 		otp.PhoneHash,
+		otp.Purpose,        // NEW: purpose field
 		otp.TimeBucket,
 		otp.CreatedAt,
 		otp.OTPHash,
 		otp.OTPSalt,
 		otp.HashAlgorithm,
 		otp.PepperVersion,
-		otp.Purpose,
 		otp.Attempts,
 		otp.ExpiresAt,
 		otp.IPAddress,
@@ -181,24 +192,31 @@ func (r *OTPRepositoryImpl) CreateOTP(ctx context.Context, otp *models.OTPVerifi
 
 // GetActiveOTP retrieves the most recent active OTP for a phone number
 func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, purpose string) (*models.OTPVerification, error) {
-	// Calculate current time bucket
-	timeBucket := time.Now().Unix() / 3600
+	// Calculate current time bucket using bucketing manager
+	timeBucket := r.bucketingManager.GetTimeBucket(OTPBucketWindowSeconds)
+	
+	// Log for debugging
+	r.logger.Info("Querying active OTP",
+		util.String("phone_hash", phoneHash),
+		util.String("purpose", purpose),
+		util.Int64("time_bucket", timeBucket),
+	)
 	
 	// Use prepared statement
 	r.stmtMutex.RLock()
-	query := r.stmtGetActiveOTP.Bind(phoneHash, timeBucket, purpose)
+	query := r.stmtGetActiveOTP.Bind(phoneHash, purpose, timeBucket)
 	r.stmtMutex.RUnlock()
 	
 	var otp models.OTPVerification
 	err := r.client.ScanWithRetry(query.WithContext(ctx),
 		&otp.PhoneHash,
+		&otp.Purpose,
 		&otp.TimeBucket,
 		&otp.CreatedAt,
 		&otp.OTPHash,
 		&otp.OTPSalt,
 		&otp.HashAlgorithm,
 		&otp.PepperVersion,
-		&otp.Purpose,
 		&otp.Attempts,
 		&otp.ExpiresAt,
 		&otp.IPAddress,
@@ -207,10 +225,54 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 	
 	if err != nil {
 		if err == gocql.ErrNotFound {
-			return nil, fmt.Errorf("no active OTP found for phone hash: %s", phoneHash)
+			// Try previous bucket (for OTPs created near bucket boundary)
+			prevBucket := r.getTimeBucketFromTime(time.Now().Add(-time.Hour))
+			
+			r.logger.Info("Trying previous time bucket",
+				util.String("phone_hash", phoneHash),
+				util.String("purpose", purpose),
+				util.Int64("prev_bucket", prevBucket),
+			)
+			
+			r.stmtMutex.RLock()
+			prevQuery := r.stmtGetActiveOTP.Bind(phoneHash, purpose, prevBucket)
+			r.stmtMutex.RUnlock()
+			
+			err = r.client.ScanWithRetry(prevQuery.WithContext(ctx),
+				&otp.PhoneHash,
+				&otp.Purpose,
+				&otp.TimeBucket,
+				&otp.CreatedAt,
+				&otp.OTPHash,
+				&otp.OTPSalt,
+				&otp.HashAlgorithm,
+				&otp.PepperVersion,
+				&otp.Attempts,
+				&otp.ExpiresAt,
+				&otp.IPAddress,
+				&otp.ProviderUsed,
+			)
+			
+			if err != nil {
+				r.logger.Warn("No active OTP found in current or previous bucket",
+					util.String("phone_hash", phoneHash),
+					util.String("purpose", purpose),
+					util.Int64("current_bucket", timeBucket),
+					util.Int64("prev_bucket", prevBucket),
+				)
+				return nil, fmt.Errorf("no active OTP found for phone hash: %s", phoneHash)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to get active OTP: %w", err)
 		}
-		return nil, fmt.Errorf("failed to get active OTP: %w", err)
 	}
+	
+	r.logger.Info("Found active OTP",
+		util.String("phone_hash", phoneHash),
+		util.String("purpose", purpose),
+		util.Time("created_at", otp.CreatedAt),
+		util.Int("attempts", otp.Attempts),
+	)
 	
 	// Check if OTP is expired
 	if time.Now().After(otp.ExpiresAt) {
@@ -226,25 +288,40 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 }
 
 // ValidateOTP validates an OTP and returns the OTP record if valid
+// ValidateOTP validates an OTP and returns the OTP record if valid
+// ValidateOTP validates an OTP and returns the OTP record if valid
 func (r *OTPRepositoryImpl) ValidateOTP(ctx context.Context, phoneHash, otpHash, purpose string) (*models.OTPVerification, error) {
-	otp, err := r.GetActiveOTP(ctx, phoneHash, purpose)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Compare OTP hashes (constant-time comparison to prevent timing attacks)
-	if !secureCompare(otp.OTPHash, otpHash) {
-		// Increment attempt count
-		if err := r.IncrementOTPAttempts(ctx, phoneHash, otp.CreatedAt); err != nil {
-			r.logger.Warn("Failed to increment OTP attempts",
-				util.ErrorField(err),
-				util.String("phone_hash", phoneHash),
-			)
-		}
-		return nil, fmt.Errorf("invalid OTP")
-	}
-	
-	return otp, nil
+    otp, err := r.GetActiveOTP(ctx, phoneHash, purpose)
+    if err != nil {
+        return nil, err
+    }
+    
+    r.logger.Info("Validating OTP hash",
+        util.String("phone_hash", phoneHash),
+        util.String("purpose", purpose),
+        util.String("stored_hash", otp.OTPHash[:20]+"..."),
+        util.String("provided_hash", otpHash[:20]+"..."),
+    )
+    
+    // Compare OTP hashes (constant-time comparison to prevent timing attacks)
+    if !secureCompare(otp.OTPHash, otpHash) {
+        // Increment attempt count and get the new value
+        newAttempts, err := r.IncrementOTPAttempts(ctx, phoneHash, purpose, otp.CreatedAt)
+        if err != nil {
+            r.logger.Warn("Failed to increment OTP attempts",
+                util.ErrorField(err),
+                util.String("phone_hash", phoneHash),
+            )
+        } else {
+            // Update the OTP object with new attempts for response
+            otp.Attempts = newAttempts
+        }
+        
+        // Return the OTP with updated attempts count even on failure
+        return otp, fmt.Errorf("invalid OTP")
+    }
+    
+    return otp, nil
 }
 
 // InvalidateOTP marks an OTP as used by deleting it
@@ -259,9 +336,9 @@ func (r *OTPRepositoryImpl) InvalidateOTP(ctx context.Context, phoneHash string,
 	r.stmtMutex.RLock()
 	query := r.stmtInvalidateOTP.Bind(
 		phoneHash,
+		purpose,
 		otp.TimeBucket,
 		otp.CreatedAt,
-		purpose,
 	)
 	r.stmtMutex.RUnlock()
 	
@@ -278,39 +355,54 @@ func (r *OTPRepositoryImpl) InvalidateOTP(ctx context.Context, phoneHash string,
 }
 
 // IncrementOTPAttempts increments the attempt counter for an OTP
-func (r *OTPRepositoryImpl) IncrementOTPAttempts(ctx context.Context, phoneHash string, createdAt time.Time) error {
-	timeBucket := createdAt.Unix() / 3600
-	
-	// Get the OTP to find its purpose
-	query := r.client.Session.Query(`
-		SELECT purpose FROM otp_verifications
-		WHERE phone_hash = ? AND time_bucket = ? AND created_at = ?
-		LIMIT 1`,
-		phoneHash, timeBucket, createdAt,
-	)
-	
-	var purpose string
-	if err := r.client.ScanWithRetry(query.WithContext(ctx), &purpose); err != nil {
-		return fmt.Errorf("failed to get OTP purpose: %w", err)
-	}
-	
-	// Use prepared statement
-	r.stmtMutex.RLock()
-	updateQuery := r.stmtIncrementAttempt.Bind(
-		phoneHash,
-		timeBucket,
-		createdAt,
-		purpose,
-	)
-	r.stmtMutex.RUnlock()
-	
-	if err := r.client.ExecuteWithRetry(updateQuery.WithContext(ctx), 3); err != nil {
-		return fmt.Errorf("failed to increment OTP attempts: %w", err)
-	}
-	
-	return nil
+// IncrementOTPAttempts increments the attempt counter for an OTP
+// IncrementOTPAttempts increments the attempt counter for an OTP
+// In implementation
+func (r *OTPRepositoryImpl) IncrementOTPAttempts(ctx context.Context, phoneHash string, purpose string, createdAt time.Time) (int, error) {
+    timeBucket := r.getTimeBucketFromTime(createdAt)
+    
+    r.logger.Info("Incrementing OTP attempts",
+        util.String("phone_hash", phoneHash),
+        util.String("purpose", purpose),
+        util.Int64("time_bucket", timeBucket),
+        util.Time("created_at", createdAt),
+    )
+    
+    // First, read the current attempts value
+    var currentAttempts int
+    selectQuery := r.client.Session.Query(`
+        SELECT attempts FROM otp_verifications
+        WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`,
+        phoneHash, purpose, timeBucket, createdAt,
+    )
+    
+    if err := r.client.ScanWithRetry(selectQuery.WithContext(ctx), &currentAttempts); err != nil {
+        return 0, fmt.Errorf("failed to get current attempts: %w", err)
+    }
+    
+    // Increment and update with the new value
+    newAttempts := currentAttempts + 1
+    
+    updateQuery := r.client.Session.Query(`
+        UPDATE otp_verifications
+        SET attempts = ?
+        WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`,
+        newAttempts, phoneHash, purpose, timeBucket, createdAt,
+    )
+    
+    if err := r.client.ExecuteWithRetry(updateQuery.WithContext(ctx), 3); err != nil {
+        return 0, fmt.Errorf("failed to increment OTP attempts: %w", err)
+    }
+    
+    r.logger.Info("OTP attempts incremented successfully",
+        util.String("phone_hash", phoneHash),
+        util.String("purpose", purpose),
+        util.Int("old_attempts", currentAttempts),
+        util.Int("new_attempts", newAttempts),
+    )
+    
+    return newAttempts, nil  // Return the new attempts count
 }
-
 // ============================================
 // RATE LIMITING & ANALYTICS
 // ============================================
@@ -331,27 +423,28 @@ func (r *OTPRepositoryImpl) GetOTPAttemptsByPhone(ctx context.Context, phoneHash
 // GetOTPsByTimeRange retrieves all OTPs for a phone number within a time range
 func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash string, start, end time.Time) ([]*models.OTPVerification, error) {
 	// Calculate time buckets for the range
-	startBucket := start.Unix() / 3600
-	endBucket := end.Unix() / 3600
+	startBucket := r.getTimeBucketFromTime(start)
+	endBucket := r.getTimeBucketFromTime(end)
 	
 	var allOTPs []*models.OTPVerification
 	var mu sync.Mutex
 	
 	// Query each time bucket in parallel
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(10) // Limit concurrent queries
+	g.SetLimit(10)
 	
 	for bucket := startBucket; bucket <= endBucket; bucket++ {
 		bucket := bucket
 		g.Go(func() error {
+			// Query by partition key prefix (phone_hash)
+			// We'll need to query all purposes for this phone in this bucket
 			query := r.client.Session.Query(`
-				SELECT phone_hash, time_bucket, created_at, otp_hash, otp_salt,
-					   hash_algorithm, pepper_version, purpose, attempts, expires_at,
+				SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
+					   hash_algorithm, pepper_version, attempts, expires_at,
 					   ip_address, provider_used
 				FROM otp_verifications
-				WHERE phone_hash = ? AND time_bucket = ? AND created_at >= ? AND created_at <= ?
-				ALLOW FILTERING`,
-				phoneHash, bucket, start, end,
+				WHERE phone_hash = ? AND time_bucket = ?`,
+				phoneHash, bucket,
 			)
 			
 			iter := query.WithContext(gctx).Iter()
@@ -362,13 +455,13 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 				var otp models.OTPVerification
 				if !iter.Scan(
 					&otp.PhoneHash,
+					&otp.Purpose,
 					&otp.TimeBucket,
 					&otp.CreatedAt,
 					&otp.OTPHash,
 					&otp.OTPSalt,
 					&otp.HashAlgorithm,
 					&otp.PepperVersion,
-					&otp.Purpose,
 					&otp.Attempts,
 					&otp.ExpiresAt,
 					&otp.IPAddress,
@@ -376,7 +469,11 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 				) {
 					break
 				}
-				bucketOTPs = append(bucketOTPs, &otp)
+				
+				// Filter by timestamp in application layer
+				if otp.CreatedAt.After(start) && otp.CreatedAt.Before(end) {
+					bucketOTPs = append(bucketOTPs, &otp)
+				}
 			}
 			
 			if err := iter.Close(); err != nil {
@@ -397,80 +494,116 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 	
 	return allOTPs, nil
 }
-
-// CleanupExpiredOTPs removes expired OTPs (backup cleanup in case TTL fails)
+// CleanupExpiredOTPs removes expired OTPs (backup cleanup - TTL handles most cases)
 func (r *OTPRepositoryImpl) CleanupExpiredOTPs(ctx context.Context, batchSize int) (int, error) {
-	if batchSize <= 0 || batchSize > OTPCleanupBatchSize {
-		batchSize = OTPCleanupBatchSize
-	}
-	
-	// Note: With TTL, this is mostly a backup cleanup
-	// In production, ScyllaDB TTL handles expiry automatically
-	now := time.Now()
-	deletedCount := 0
-	
-	// Query expired OTPs from recent time buckets (last 24 hours)
-	startBucket := now.Add(-24*time.Hour).Unix() / 3600
-	endBucket := now.Unix() / 3600
-	
-	batch := r.client.Batch(gocql.UnloggedBatch)
-	batchCount := 0
-	
-	for bucket := startBucket; bucket <= endBucket; bucket++ {
-		query := r.client.Session.Query(`
-			SELECT phone_hash, time_bucket, created_at, purpose, expires_at
-			FROM otp_verifications
-			WHERE time_bucket = ?`,
-			bucket,
-		)
-		
-		iter := query.WithContext(ctx).Iter()
-		
-		var phoneHash, purpose string
-		var timeBucket int64
-		var createdAt, expiresAt time.Time
-		
-		for iter.Scan(&phoneHash, &timeBucket, &createdAt, &purpose, &expiresAt) {
-			if now.After(expiresAt) {
-				batch.Query(`
-					DELETE FROM otp_verifications
-					WHERE phone_hash = ? AND time_bucket = ? AND created_at = ? AND purpose = ?`,
-					phoneHash, timeBucket, createdAt, purpose,
-				)
-				
-				batchCount++
-				deletedCount++
-				
-				if batchCount >= batchSize {
-					if err := r.client.ExecuteBatch(batch); err != nil {
-						r.logger.Error("Failed to execute cleanup batch",
-							util.ErrorField(err),
-						)
-					}
-					batch = r.client.Batch(gocql.UnloggedBatch)
-					batchCount = 0
-				}
-			}
-		}
-		
-		iter.Close()
-	}
-	
-	// Execute remaining batch
-	if batchCount > 0 {
-		if err := r.client.ExecuteBatch(batch); err != nil {
-			r.logger.Error("Failed to execute final cleanup batch",
-				util.ErrorField(err),
-			)
-		}
-	}
-	
-	r.logger.Info("OTP cleanup completed",
-		util.Int("deleted_count", deletedCount),
-	)
-	
-	return deletedCount, nil
+    if batchSize <= 0 || batchSize > OTPCleanupBatchSize {
+        batchSize = OTPCleanupBatchSize
+    }
+    
+    now := time.Now()
+    deletedCount := 0
+    
+    // Only scan last 2 hours (not 24!) - TTL handles the rest automatically
+    startBucket := r.getTimeBucketFromTime(now.Add(-2 * time.Hour))
+    endBucket := r.bucketingManager.GetTimeBucket(OTPBucketWindowSeconds)
+    
+    // Limit max deletes to prevent long-running cleanup
+    maxDeletes := 100
+    
+    batch := r.client.Batch(gocql.UnloggedBatch)
+    batchCount := 0
+    
+    r.logger.Info("Starting OTP cleanup",
+        util.Int64("start_bucket", startBucket),
+        util.Int64("end_bucket", endBucket),
+        util.Int("max_deletes", maxDeletes),
+    )
+    
+    for bucket := startBucket; bucket <= endBucket; bucket++ {
+        // Stop if we've hit max deletes
+        if deletedCount >= maxDeletes {
+            r.logger.Info("Reached max deletes limit, stopping cleanup",
+                util.Int("deleted_count", deletedCount),
+            )
+            break
+        }
+        
+        // Add LIMIT to prevent scanning too many rows
+        query := r.client.Session.Query(`
+            SELECT phone_hash, purpose, time_bucket, created_at, expires_at
+            FROM otp_verifications
+            WHERE time_bucket = ?
+            LIMIT ?`,
+            bucket, batchSize,
+        )
+        
+        iter := query.WithContext(ctx).Iter()
+        
+        var phoneHash, purpose string
+        var timeBucket int64
+        var createdAt, expiresAt time.Time
+        
+        for iter.Scan(&phoneHash, &purpose, &timeBucket, &createdAt, &expiresAt) {
+            // Only delete if expired
+            if now.After(expiresAt) {
+                batch.Query(`
+                    DELETE FROM otp_verifications
+                    WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`,
+                    phoneHash, purpose, timeBucket, createdAt,
+                )
+                
+                batchCount++
+                deletedCount++
+                
+                // Execute batch when full
+                if batchCount >= batchSize {
+                    if err := r.client.ExecuteBatch(batch); err != nil {
+                        r.logger.Error("Failed to execute cleanup batch",
+                            util.ErrorField(err),
+                        )
+                    }
+                    batch = r.client.Batch(gocql.UnloggedBatch)
+                    batchCount = 0
+                }
+            }
+            
+            // Stop if reached max deletes
+            if deletedCount >= maxDeletes {
+                break
+            }
+        }
+        
+        if err := iter.Close(); err != nil {
+            r.logger.Warn("Error closing iterator during cleanup",
+                util.ErrorField(err),
+                util.Int64("bucket", bucket),
+            )
+        }
+        
+        // Stop if reached max deletes
+        if deletedCount >= maxDeletes {
+            break
+        }
+    }
+    
+    // Execute remaining batch
+    if batchCount > 0 {
+        if err := r.client.ExecuteBatch(batch); err != nil {
+            r.logger.Error("Failed to execute final cleanup batch",
+                util.ErrorField(err),
+            )
+        }
+    }
+    
+    r.logger.Info("OTP cleanup completed",
+        util.Int("deleted_count", deletedCount),
+        util.String("note", "TTL handles most expiry automatically - this is backup only"),
+        util.String("scanned_window", "last 2 hours"),
+    )
+    
+    return deletedCount, nil
 }
+
 
 // ============================================
 // BULK OPERATIONS
@@ -486,7 +619,7 @@ func (r *OTPRepositoryImpl) CreateOTPsBatch(ctx context.Context, otps []*models.
 	batchSize := 0
 	
 	for _, otp := range otps {
-		otp.TimeBucket = otp.CreatedAt.Unix() / 3600
+		otp.TimeBucket = r.getTimeBucketFromTime(otp.CreatedAt)
 		ttlSeconds := int(time.Until(otp.ExpiresAt).Seconds())
 		if ttlSeconds <= 0 {
 			ttlSeconds = int(OTPDefaultTTL.Seconds())
@@ -494,13 +627,13 @@ func (r *OTPRepositoryImpl) CreateOTPsBatch(ctx context.Context, otps []*models.
 		
 		batch.Query(`
 			INSERT INTO otp_verifications (
-				phone_hash, time_bucket, created_at, otp_hash, otp_salt,
-				hash_algorithm, pepper_version, purpose, attempts, expires_at,
+				phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
+				hash_algorithm, pepper_version, attempts, expires_at,
 				ip_address, provider_used
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			USING TTL ?`,
-			otp.PhoneHash, otp.TimeBucket, otp.CreatedAt, otp.OTPHash, otp.OTPSalt,
-			otp.HashAlgorithm, otp.PepperVersion, otp.Purpose, otp.Attempts, otp.ExpiresAt,
+			otp.PhoneHash, otp.Purpose, otp.TimeBucket, otp.CreatedAt, otp.OTPHash, otp.OTPSalt,
+			otp.HashAlgorithm, otp.PepperVersion, otp.Attempts, otp.ExpiresAt,
 			otp.IPAddress, otp.ProviderUsed, ttlSeconds,
 		)
 		
@@ -583,7 +716,7 @@ func (r *OTPRepositoryImpl) GetOTPStats(ctx context.Context) (map[string]interfa
 	stats := make(map[string]interface{})
 	
 	// Count active OTPs in current time bucket
-	currentBucket := time.Now().Unix() / 3600
+	currentBucket := r.bucketingManager.GetTimeBucket(OTPBucketWindowSeconds)
 	var count int64
 	
 	query := r.client.Session.Query(`
@@ -601,6 +734,7 @@ func (r *OTPRepositoryImpl) GetOTPStats(ctx context.Context) (map[string]interfa
 	stats["max_concurrent_reads"] = OTPMaxConcurrentReads
 	stats["max_concurrent_writes"] = OTPMaxConcurrentWrites
 	stats["otp_length"] = OTPLength
+	stats["bucket_window_seconds"] = OTPBucketWindowSeconds
 	stats["timestamp"] = time.Now().UTC()
 	
 	return stats, nil

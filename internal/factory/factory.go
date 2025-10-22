@@ -37,6 +37,8 @@ type Factory struct {
     once              sync.Once
     closeOnce         sync.Once
     closed            chan struct{}
+    otpRepository    scylla.OTPRepository
+	otpService       *service.OTPService
     logger            *zap.Logger
 }
 
@@ -305,6 +307,40 @@ func (f *Factory) Close() error {
         util.Info("Factory shutdown completed")
     })
     return nil
+}
+
+
+// Add this method to Factory
+func (f *Factory) OTPRepository() scylla.OTPRepository {
+	if f.otpRepository == nil {
+		f.otpRepository = scylla.NewOTPRepository(
+			f.ScyllaClient(),
+			f.Hasher(),
+			f.BucketingManager(),
+			f.logger,
+		)
+	}
+	return f.otpRepository
+}
+
+// Add this method to Factory
+
+// CHANGE TO:
+func (f *Factory) GetOTPService() *service.OTPService {
+    if f.otpService == nil {
+        repo := f.OTPRepository()
+        hasher := f.Hasher()
+        cfg := f.Config()              // ADD THIS
+        logger := f.logger
+        
+        var distCache *service.DistributedCache
+        if f.redisClient != nil {
+            distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+        }
+        
+        f.otpService = service.NewOTPService(repo, hasher, cfg, distCache, logger)  // ADD cfg
+    }
+    return f.otpService
 }
 
 // Getters

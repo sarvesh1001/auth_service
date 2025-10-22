@@ -231,3 +231,9 @@ func (h *Hasher) Benchmark(iterations int) time.Duration {
 
 	return time.Since(start)
 }
+// GetCurrentPepperVersion returns the current pepper version
+func (h *Hasher) GetCurrentPepperVersion() int {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+    return h.currentPepper.Version
+}

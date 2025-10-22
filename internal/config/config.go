@@ -34,6 +34,7 @@ type Config struct {
 	RateLimiting  RateLimitingConfig
 	Bucketing     BucketingConfig
 	KMS           KMSConfig
+	OTP           OTPConfig // NEW
 }
 
 type ServerConfig struct {
@@ -129,6 +130,42 @@ type KMSConfig struct {
 	Enabled  bool   `mapstructure:"enabled"`
 }
 
+// OTPConfig contains OTP-related configuration
+type OTPConfig struct {
+	// OTP Settings
+	Length         int           `json:"length"`
+	ExpiryDuration time.Duration `json:"expiry_duration"`
+	MaxAttempts    int           `json:"max_attempts"`
+	ResendCooldown time.Duration `json:"resend_cooldown"`
+
+	// Rate Limiting
+	SendLimit1Min    int `json:"send_limit_1min"`
+	SendLimit5Min    int `json:"send_limit_5min"`
+	SendLimitHour    int `json:"send_limit_hour"`
+	VerifyLimit30Sec int `json:"verify_limit_30sec"`
+	VerifyLimitMin   int `json:"verify_limit_min"`
+
+	// Lockout Settings
+	LockoutThreshold int           `json:"lockout_threshold"`
+	LockoutDuration  time.Duration `json:"lockout_duration"`
+
+	// Cache Settings
+	CacheTTL          time.Duration `json:"cache_ttl"`
+	RateLimitCacheTTL time.Duration `json:"rate_limit_cache_ttl"`
+
+	// SMS Provider Settings
+	SMSProvider   string `json:"sms_provider"`
+	SMSEnabled    bool   `json:"sms_enabled"`
+	SMSAPIKEY     string `json:"-"` // Hidden in JSON
+	SMSAPISecret  string `json:"-"` // Hidden in JSON
+	SMSFromNumber string `json:"sms_from_number"`
+	SMSTemplateID string `json:"sms_template_id"`
+
+	// Development Settings
+	LogOTPInDev        bool `json:"log_otp_in_dev"`
+	BypassRateLimitDev bool `json:"bypass_rate_limit_dev"`
+}
+
 var (
 	cfg       *Config
 	once      sync.Once
@@ -140,9 +177,10 @@ var (
 func LoadConfig() *Config {
 	once.Do(func() {
 		environment := getEnv("ENVIRONMENT", "development")
+		isDev := environment == "development"
 
 		// Load .env file only in development
-		if environment == "development" {
+		if isDev {
 			if err := godotenv.Load(".env"); err != nil {
 				util.Info("No .env file found, using system environment variables")
 			}
@@ -156,8 +194,8 @@ func LoadConfig() *Config {
 				ReadTimeout:  getEnvAsDuration("SERVER_READ_TIMEOUT", 30*time.Second),
 				WriteTimeout: getEnvAsDuration("SERVER_WRITE_TIMEOUT", 30*time.Second),
 				IdleTimeout:  getEnvAsDuration("SERVER_IDLE_TIMEOUT", 60*time.Second),
-				EnableTLS:    getEnvAsBool("SERVER_ENABLE_TLS", environment == "production"),
-				AutoCert:     getEnvAsBool("SERVER_AUTO_CERT", environment == "production"),
+				EnableTLS:    getEnvAsBool("SERVER_ENABLE_TLS", !isDev),
+				AutoCert:     getEnvAsBool("SERVER_AUTO_CERT", !isDev),
 				AutoCertDir:  getEnv("SERVER_AUTO_CERT_DIR", "/app/certs"),
 				CertFile:     getEnv("SERVER_CERT_FILE", ""),
 				KeyFile:      getEnv("SERVER_KEY_FILE", ""),
@@ -228,8 +266,9 @@ func LoadConfig() *Config {
 				KeyID:    getEnv("KMS_KEY_ID", ""),
 				Region:   getEnv("KMS_REGION", "us-east-1"),
 				Endpoint: getEnv("KMS_ENDPOINT", ""),
-				Enabled:  environment == "production",
+				Enabled:  !isDev,
 			},
+			OTP: loadOTPConfig(environment), // NEW
 		}
 
 		// Initialize KMS client for production after basic config is loaded
@@ -249,10 +288,52 @@ func LoadConfig() *Config {
 			zap.Bool("kms_enabled", cfg.KMS.Enabled),
 			zap.Int("user_buckets", cfg.Bucketing.UserBuckets),
 			zap.Int("event_buckets", cfg.Bucketing.EventBuckets),
+			zap.Bool("otp_sms_enabled", cfg.OTP.SMSEnabled),
+			zap.String("otp_provider", cfg.OTP.SMSProvider),
 		)
 	})
 
 	return cfg
+}
+
+// loadOTPConfig loads OTP-specific configuration
+func loadOTPConfig(env string) OTPConfig {
+	isDev := env == "development"
+
+	return OTPConfig{
+		// OTP Settings
+		Length:         getEnvAsInt("OTP_LENGTH", 6),
+		ExpiryDuration: getEnvAsDuration("OTP_EXPIRY_DURATION", 5*time.Minute),
+		MaxAttempts:    getEnvAsInt("OTP_MAX_ATTEMPTS", 3),
+		ResendCooldown: getEnvAsDuration("OTP_RESEND_COOLDOWN", 60*time.Second),
+
+		// Rate Limiting (more lenient in dev)
+		SendLimit1Min:    getEnvAsInt("RATE_LIMIT_OTP_SEND_1MIN", ifInt(isDev, 5, 2)),
+		SendLimit5Min:    getEnvAsInt("RATE_LIMIT_OTP_SEND_5MIN", ifInt(isDev, 10, 3)),
+		SendLimitHour:    getEnvAsInt("RATE_LIMIT_OTP_SEND_HOUR", ifInt(isDev, 50, 10)),
+		VerifyLimit30Sec: getEnvAsInt("RATE_LIMIT_OTP_VERIFY_30SEC", ifInt(isDev, 10, 3)),
+		VerifyLimitMin:   getEnvAsInt("RATE_LIMIT_OTP_VERIFY_MIN", ifInt(isDev, 20, 5)),
+
+		// Lockout Settings (disabled in dev by default)
+		LockoutThreshold: getEnvAsInt("OTP_LOCKOUT_THRESHOLD", ifInt(isDev, 100, 5)),
+		LockoutDuration:  getEnvAsDuration("OTP_LOCKOUT_DURATION", ifDuration(isDev, 5*time.Minute, 30*time.Minute)),
+
+		// Cache Settings
+		CacheTTL:          getEnvAsDuration("OTP_CACHE_TTL", 6*time.Minute),
+		RateLimitCacheTTL: getEnvAsDuration("OTP_RATE_LIMIT_CACHE_TTL", 1*time.Hour),
+
+		// SMS Provider Settings
+		SMSProvider:   getEnv("SMS_PROVIDER", ifString(isDev, "mock", "twilio")),
+		SMSEnabled:    getEnvAsBool("SMS_ENABLED", !isDev),
+		SMSAPIKEY:     getSecureEnv("SMS_API_KEY", ""),
+		SMSAPISecret:  getSecureEnv("SMS_API_SECRET", ""),
+		SMSFromNumber: getEnv("SMS_FROM_NUMBER", ""),
+		SMSTemplateID: getEnv("SMS_TEMPLATE_ID", ""),
+
+		// Development Settings
+		LogOTPInDev:        isDev,
+		BypassRateLimitDev: getEnvAsBool("OTP_BYPASS_RATE_LIMIT_DEV", isDev),
+	}
 }
 
 // initKMSClient initializes AWS KMS client for production using SDK v2
@@ -377,6 +458,17 @@ func validateConfig(cfg *Config) {
 		if cfg.Elasticsearch.Password == "" {
 			util.Warn("ELASTIC_PASSWORD is not set - this may be insecure for production")
 		}
+
+		// Validate OTP configuration for production
+		if cfg.OTP.SMSEnabled && cfg.OTP.SMSAPIKEY == "" {
+			util.Warn("SMS_API_KEY is not set but SMS is enabled")
+		}
+		if cfg.OTP.SMSEnabled && cfg.OTP.SMSFromNumber == "" {
+			util.Warn("SMS_FROM_NUMBER is not set but SMS is enabled")
+		}
+		if cfg.OTP.LogOTPInDev {
+			util.Warn("OTP logging is enabled in production - this is a security risk")
+		}
 	}
 
 	// Validate hashing parameters
@@ -385,7 +477,7 @@ func validateConfig(cfg *Config) {
 	}
 }
 
-// Helper functions (unchanged)
+// Helper functions
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -425,6 +517,28 @@ func getEnvAsSlice(key string, defaultValue []string, separator string) []string
 	return strings.Split(strValue, separator)
 }
 
+// Conditional helper functions
+func ifInt(condition bool, trueVal, falseVal int) int {
+	if condition {
+		return trueVal
+	}
+	return falseVal
+}
+
+func ifString(condition bool, trueVal, falseVal string) string {
+	if condition {
+		return trueVal
+	}
+	return falseVal
+}
+
+func ifDuration(condition bool, trueVal, falseVal time.Duration) time.Duration {
+	if condition {
+		return trueVal
+	}
+	return falseVal
+}
+
 // Utility methods
 func (c *Config) IsDevelopment() bool {
 	return c.Environment == "development"
@@ -437,6 +551,20 @@ func (c *Config) IsProduction() bool {
 func (c *Config) GetServerAddress() string {
 	return ":" + strconv.Itoa(c.Server.Port)
 }
+
 func (c *Config) GetTLSServerAddress() string {
 	return ":" + strconv.Itoa(c.Server.TLSPort)
+}
+
+// Validate validates the OTP configuration
+func (c *Config) Validate() error {
+	if c.IsProduction() {
+		if c.OTP.SMSEnabled && c.OTP.SMSAPIKEY == "" {
+			util.Warn("SMS_API_KEY is required in production when SMS is enabled")
+		}
+		if c.OTP.SMSEnabled && c.OTP.SMSFromNumber == "" {
+			util.Warn("SMS_FROM_NUMBER is required in production when SMS is enabled")
+		}
+	}
+	return nil
 }

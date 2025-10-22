@@ -1,6 +1,13 @@
 package models
+
+import ("github.com/google/uuid"
+        "net"
+        "time"
+    )
+
+
 type OTPEvent struct {
-    EventID      gocql.UUID         `db:"event_id"`
+    EventID      uuid.UUID         `db:"event_id"`
     EventType    string             `db:"event_type"`
     PhoneHash    string             `db:"phone_hash"`
     Purpose      string             `db:"purpose"`

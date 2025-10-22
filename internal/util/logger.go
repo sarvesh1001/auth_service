@@ -145,3 +145,10 @@ func Any(key string, value interface{}) zap.Field {
 func Duration(key string, value time.Duration) zap.Field {
 	return zap.Duration(key, value)
 }
+func Int64(key string, value int64) zap.Field {
+	return zap.Int64(key, value)
+}
+// Time creates a time.Time field
+func Time(key string, value time.Time) zap.Field {
+    return zap.Time(key, value)
+}
