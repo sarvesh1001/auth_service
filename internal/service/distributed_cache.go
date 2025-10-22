@@ -90,3 +90,11 @@ func (dc *DistributedCache) InvalidatePhone(ctx context.Context, phoneHash strin
     }
     return nil
 }
+func (dc *DistributedCache) Delete(ctx context.Context, key string) error {
+    err := dc.redis.Del(ctx, key).Err()
+    if err != nil {
+        dc.logger.Warn("Redis Delete failed", util.String("key", key), util.ErrorField(err))
+        return err
+    }
+    return nil
+}

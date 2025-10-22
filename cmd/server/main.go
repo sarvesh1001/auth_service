@@ -32,9 +32,10 @@ func main() {
     // Create handlers
     userHandler := handler.NewUserHandler(f.GetUserService(), logger)
     otpHandler := handler.NewOTPHandler(f.GetOTPService(), logger)
+    mpinHandler := handler.NewMPINHandler(f.GetMPINService(), logger)  // NEW - Create MPIN handler
 
-    // Setup router with both handlers
-    router := handler.NewRouter(userHandler, otpHandler, logger)
+    // Setup router with all handlers
+    router := handler.NewRouter(userHandler, otpHandler, mpinHandler, logger)  // NEW - Add mpinHandler
 
     // Determine server address
     var addr string
@@ -76,6 +77,8 @@ func main() {
 
     startServer(f, server, cfg)
 }
+
+// ... rest of the main.go remains the same ...
 
 // startProductionServerWithAutoCert starts HTTP redirect and HTTPS with autocert
 func startProductionServerWithAutoCert(f *factory.Factory, server *http.Server, cfg *config.Config, router http.Handler) {

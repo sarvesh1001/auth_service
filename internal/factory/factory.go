@@ -37,6 +37,9 @@ type Factory struct {
     once              sync.Once
     closeOnce         sync.Once
     closed            chan struct{}
+    mpinRepository    scylla.MPINRepository    // NEW
+    mpinService       *service.MPINService     // NEW
+
     otpRepository    scylla.OTPRepository
 	otpService       *service.OTPService
     logger            *zap.Logger
@@ -226,6 +229,13 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
     } else {
         errs["redis"] = fmt.Errorf("redis client not initialized")
     }
+    if f.mpinRepository != nil {
+        if err := f.mpinRepository.HealthCheck(ctx); err != nil {
+            errs["mpin_repository"] = err
+        }
+    } else {
+        errs["mpin_repository"] = fmt.Errorf("mpin repository not initialized")
+    }
     if f.scyllaClient != nil {
         if err := f.scyllaClient.HealthCheck(); err != nil {
             errs["scylla"] = err
@@ -351,3 +361,36 @@ func (f *Factory) ScyllaClient() *scylla.ScyllaClient            { return f.scyl
 func (f *Factory) Hasher() *hashing.Hasher                       { return f.hasher }
 func (f *Factory) EncryptionManager() *encryption.EncryptionManager { return f.encryptionManager }
 func (f *Factory) BucketingManager() *bucketing.BucketingManager { return f.bucketingManager }
+// Add this method to Factory
+func (f *Factory) MPINRepository() scylla.MPINRepository {
+    if f.mpinRepository == nil {
+        f.mpinRepository = scylla.NewMPINRepository(
+            f.ScyllaClient(),
+            f.logger,
+        )
+    }
+    return f.mpinRepository
+}
+
+// NEW:
+func (f *Factory) GetMPINService() *service.MPINService {
+    if f.mpinService == nil {
+        mpinRepo := f.MPINRepository()
+        userRepo := f.UserRepository()
+        hasher := f.Hasher()
+        cfg := f.Config()
+        logger := f.logger
+
+        var distCache *service.DistributedCache
+        if f.redisClient != nil {
+            distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+        }
+
+        f.mpinService = service.NewMPINService(mpinRepo, userRepo, hasher, cfg, logger) // pass cfg
+
+        if distCache != nil {
+            f.mpinService.SetDistributedCache(distCache)
+        }
+    }
+    return f.mpinService
+}

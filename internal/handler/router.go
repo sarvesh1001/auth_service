@@ -13,7 +13,7 @@ import (
     "go.uber.org/zap"
 )
 
-// requireHTTPS rejects any request that wasn’t made over TLS
+// requireHTTPS rejects any request that wasn't made over TLS
 func requireHTTPS(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         if r.TLS == nil {
@@ -30,6 +30,7 @@ func requireHTTPS(next http.Handler) http.Handler {
 func NewRouter(
     userHandler *UserHandler,
     otpHandler *OTPHandler,
+    mpinHandler *MPINHandler,  // NEW - Add MPIN handler parameter
     logger *zap.Logger,
 ) chi.Router {
     router := chi.NewRouter()
@@ -66,6 +67,7 @@ func NewRouter(
     router.Route("/api/v1", func(r chi.Router) {
         userHandler.RegisterRoutes(r)
         otpHandler.RegisterRoutes(r)
+        mpinHandler.RegisterRoutes(r)  // NEW - Register MPIN routes
     })
 
     // 404 handler

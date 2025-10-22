@@ -20,7 +20,7 @@ done
 
 echo "✅ ScyllaDB is ready!"
 
-# Create new keyspace for core_auth
+# Create keyspace for core_auth
 echo "📝 Creating keyspace core_auth..."
 cqlsh scylla 9042 -e "
 CREATE KEYSPACE IF NOT EXISTS core_auth 
@@ -30,29 +30,24 @@ WITH REPLICATION = {
 } AND DURABLE_WRITES = true;" 2>/dev/null || {
     echo "⚠️  Keyspace creation failed or already exists"
 }
-
 echo "✅ Keyspace created/verified"
 
-# Path to new migration file
-MIGRATIONS_PATH="/app/internal/repository/scylla/core_auth_migration.cql"
+# Run all CQL migration files dynamically
+CQL_DIR="/app/internal/repository/scylla"
+echo "📂 Looking for .cql migration files in $CQL_DIR..."
+CQL_FILES=$(find "$CQL_DIR" -maxdepth 1 -type f -name "*.cql" | sort)
 
-echo "🔍 Checking migration file at: $MIGRATIONS_PATH"
-
-# If file missing, show what exists for debugging
-if [ ! -f "$MIGRATIONS_PATH" ]; then
-    echo "❌ Migration file not found at $MIGRATIONS_PATH"
-    echo "📂 Listing /app/internal/repository/scylla/ for debugging:"
-    ls -lah /app/internal/repository/scylla/ || echo "⚠️  Could not list directory contents"
+if [ -z "$CQL_FILES" ]; then
+    echo "❌ No .cql migration files found in $CQL_DIR"
     exit 1
 fi
 
-# Run new migrations
-echo "📊 Running database migrations from $MIGRATIONS_PATH..."
-if cqlsh scylla 9042 -k core_auth -f "$MIGRATIONS_PATH"; then
-    echo "✅ Migrations executed successfully"
-else
-    echo "⚠️  Some migrations failed (this might be normal if tables already exist)"
-fi
+for FILE in $CQL_FILES; do
+    echo "📊 Running migration: $FILE"
+    cqlsh scylla 9042 -k core_auth -f "$FILE"
+    echo "⏳ Waiting 5s for schema agreement..."
+    sleep 5
+done
 
 # Verify schema setup
 echo "🔍 Verifying schema setup..."

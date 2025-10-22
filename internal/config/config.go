@@ -35,6 +35,40 @@ type Config struct {
 	Bucketing     BucketingConfig
 	KMS           KMSConfig
 	OTP           OTPConfig // NEW
+	MPIN		  MPINConfig // NEW
+
+}
+type MPINConfig struct {
+    // Basic Settings
+    MinLength     int           `json:"min_length"`
+    MaxLength     int           `json:"max_length"`
+    MaxAttempts   int           `json:"max_attempts"`
+    LockDuration  time.Duration `json:"lock_duration"`
+    
+    // Rate Limiting
+    VerifyLimit30Sec     int `json:"verify_limit_30sec"`
+    VerifyLimitMin       int `json:"verify_limit_min"`
+    SetupLimitHour       int `json:"setup_limit_hour"`
+    ChangeLimitDay       int `json:"change_limit_day"`
+    
+    // Security Settings
+    RequireDeviceBinding bool `json:"require_device_binding"`
+    AutoUnlockExpired    bool `json:"auto_unlock_expired"`
+    LogWeakAttempts      bool `json:"log_weak_attempts"`
+    EnforceComplexity    bool `json:"enforce_complexity"`
+    
+    // Cache Settings
+    CacheTTL               time.Duration `json:"cache_ttl"`
+    FailedAttemptsCacheTTL time.Duration `json:"failed_attempts_cache_ttl"`
+    
+    // Cleanup Settings
+    CleanupInterval time.Duration `json:"cleanup_interval"`
+    CleanupBatchSize int          `json:"cleanup_batch_size"`
+    
+    // Development Settings
+    LogVerificationInDev bool `json:"log_verification_in_dev"`
+    BypassComplexityDev  bool `json:"bypass_complexity_dev"`
+    AllowWeakPinsDev     bool `json:"allow_weak_pins_dev"`
 }
 
 type ServerConfig struct {
@@ -172,7 +206,6 @@ var (
 	kmsClient *kms.Client
 	awsCfg    aws.Config
 )
-
 // LoadConfig loads configuration from environment variables or KMS
 func LoadConfig() *Config {
 	once.Do(func() {
@@ -268,7 +301,9 @@ func LoadConfig() *Config {
 				Endpoint: getEnv("KMS_ENDPOINT", ""),
 				Enabled:  !isDev,
 			},
-			OTP: loadOTPConfig(environment), // NEW
+			OTP: loadOTPConfig(environment),
+			MPIN: loadMPINConfig(environment),
+			// NEW
 		}
 
 		// Initialize KMS client for production after basic config is loaded
@@ -295,7 +330,42 @@ func LoadConfig() *Config {
 
 	return cfg
 }
+func loadMPINConfig(env string) MPINConfig {
+    isDev := env == "development"
 
+    return MPINConfig{
+        // Basic Settings
+        MinLength:    getEnvAsInt("MPIN_MIN_LENGTH", 4),
+        MaxLength:    getEnvAsInt("MPIN_MAX_LENGTH", 8),
+        MaxAttempts:  getEnvAsInt("MPIN_MAX_ATTEMPTS", ifInt(isDev, 5, 3)),
+        LockDuration: getEnvAsDuration("MPIN_LOCK_DURATION", 30*time.Minute),
+        
+        // Rate Limiting (more lenient in dev)
+        VerifyLimit30Sec: getEnvAsInt("RATE_LIMIT_MPIN_VERIFY_30SEC", ifInt(isDev, 10, 3)),
+        VerifyLimitMin:   getEnvAsInt("RATE_LIMIT_MPIN_VERIFY_MIN", ifInt(isDev, 15, 5)),
+        SetupLimitHour:   getEnvAsInt("RATE_LIMIT_MPIN_SETUP_PER_USER_HOUR", ifInt(isDev, 3, 2)),
+        ChangeLimitDay:   getEnvAsInt("RATE_LIMIT_MPIN_CHANGE_PER_USER_DAY", ifInt(isDev, 5, 3)),
+        
+        // Security Settings
+        RequireDeviceBinding: getEnvAsBool("MPIN_REQUIRE_DEVICE_BINDING", true),
+        AutoUnlockExpired:    getEnvAsBool("MPIN_AUTO_UNLOCK_EXPIRED", true),
+        LogWeakAttempts:      getEnvAsBool("MPIN_LOG_WEAK_ATTEMPTS", true),
+        EnforceComplexity:    getEnvAsBool("MPIN_ENFORCE_COMPLEXITY", !isDev),
+        
+        // Cache Settings
+        CacheTTL:               getEnvAsDuration("MPIN_CACHE_TTL", ifDuration(isDev, 10*time.Minute, 5*time.Minute)),
+        FailedAttemptsCacheTTL: getEnvAsDuration("MPIN_FAILED_ATTEMPTS_CACHE_TTL", ifDuration(isDev, 1*time.Hour, 30*time.Minute)),
+        
+        // Cleanup Settings
+        CleanupInterval:  getEnvAsDuration("MPIN_CLEANUP_INTERVAL", ifDuration(isDev, 1*time.Hour, 30*time.Minute)),
+        CleanupBatchSize: getEnvAsInt("MPIN_CLEANUP_BATCH_SIZE", ifInt(isDev, 100, 50)),
+        
+        // Development Settings
+        LogVerificationInDev: getEnvAsBool("MPIN_LOG_VERIFICATION_IN_DEV", isDev),
+        BypassComplexityDev:  getEnvAsBool("MPIN_BYPASS_COMPLEXITY_DEV", false),
+        AllowWeakPinsDev:     getEnvAsBool("MPIN_ALLOW_WEAK_PINS_DEV", false),
+    }
+}
 // loadOTPConfig loads OTP-specific configuration
 func loadOTPConfig(env string) OTPConfig {
 	isDev := env == "development"
@@ -442,7 +512,21 @@ func validateConfig(cfg *Config) {
 		if cfg.KMS.Enabled && cfg.KMS.KeyID == "" {
 			util.Warn("KMS_KEY_ID is not set - secure encryption will not work")
 		}
-
+		if cfg.MPIN.MinLength < 4 {
+            util.Warn("MPIN_MIN_LENGTH is less than 4 - this may be insecure for production")
+        }
+        if cfg.MPIN.MaxAttempts < 3 {
+            util.Warn("MPIN_MAX_ATTEMPTS is very low - consider increasing to at least 3")
+        }
+        if cfg.MPIN.LockDuration < 15*time.Minute {
+            util.Warn("MPIN_LOCK_DURATION is less than 15 minutes - consider increasing for security")
+        }
+        if !cfg.MPIN.RequireDeviceBinding {
+            util.Warn("MPIN_REQUIRE_DEVICE_BINDING is disabled - this may reduce security")
+        }
+        if !cfg.MPIN.EnforceComplexity {
+            util.Warn("MPIN_ENFORCE_COMPLEXITY is disabled - this may reduce security")
+        }
 		// Validate secrets are not using default values
 		if cfg.Security.JWTSecret == "default-insecure-secret-change-in-production" {
 			util.Warn("JWT_SECRET is using default value - this is insecure for production")
