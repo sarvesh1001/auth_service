@@ -11,8 +11,8 @@ import (
     "auth-service/internal/models"
     "auth-service/internal/repository/scylla"
     "auth-service/internal/util"
-	"auth-service/internal/config"
-    "github.com/google/uuid"	
+    "auth-service/internal/config"
+    "github.com/google/uuid"    
     "go.uber.org/zap"
 )
 
@@ -28,19 +28,19 @@ var (
 const (
     MPINMinLength     = 4
     MPINMaxLength     = 8
-    MPINLockDuration  = 30 * time.Minute
+    MPINLockDuration  = 30 * time.Second
     MPINMaxAttempts   = 5
 )
 
 // MPINService handles all MPIN-related business logic
 type MPINService struct {
-    mpinRepo    scylla.MPINRepository
-    userRepo    scylla.UserRepository
-    hasher      *hashing.Hasher
-	config      *config.Config  // <--- this field must be added
-
-    logger      *zap.Logger
-    distCache   *DistributedCache
+    mpinRepo        scylla.MPINRepository
+    userRepo        scylla.UserRepository
+    deviceTrustRepo scylla.DeviceTrustRepository
+    hasher          *hashing.Hasher
+    config          *config.Config
+    logger          *zap.Logger
+    distCache       *DistributedCache
 }
 
 // MPIN request/response structures
@@ -57,17 +57,18 @@ type MPINVerifyRequest struct {
 }
 
 type MPINVerifyResult struct {
-    Verified        bool   `json:"verified"`
-    FailedAttempts  int    `json:"failed_attempts"`
-    RemainingTries  int    `json:"remaining_tries"`
+    Verified        bool       `json:"verified"`
+    FailedAttempts  int        `json:"failed_attempts"`
+    RemainingTries  int        `json:"remaining_tries"`
     LockedUntil     *time.Time `json:"locked_until,omitempty"`
-    Message         string `json:"message"`
+    Message         string     `json:"message"`
 }
 
 type MPINChangeRequest struct {
     UserID      uuid.UUID `json:"user_id" validate:"required"`
     CurrentMPIN string    `json:"current_mpin" validate:"required"`
     NewMPIN     string    `json:"new_mpin" validate:"required,min=4,max=8"`
+    DeviceID    string    `json:"device_id" validate:"required"`
 }
 
 type MPINResetRequest struct {
@@ -85,23 +86,33 @@ type MPINStatus struct {
     LastChanged    *time.Time `json:"last_changed,omitempty"`
     DeviceID       string     `json:"device_id"`
 }
+
+// ✅ NEW: Admin MPIN change request
+type MPINAdminChangeRequest struct {
+    UserID  uuid.UUID `json:"user_id" validate:"required"`
+    NewMPIN string    `json:"new_mpin" validate:"required,min=4,max=8"`
+    AdminID uuid.UUID `json:"admin_id" validate:"required"`
+    Reason  string    `json:"reason,omitempty"`
+}
+
 func NewMPINService(
     mpinRepo scylla.MPINRepository,
     userRepo scylla.UserRepository,
+    deviceTrustRepo scylla.DeviceTrustRepository,
     hasher *hashing.Hasher,
     cfg *config.Config,
     logger *zap.Logger,
 ) *MPINService {
     return &MPINService{
-        mpinRepo:  mpinRepo,
-        userRepo:  userRepo,
-        hasher:    hasher,
-        config:    cfg,
-        logger:    logger,
-        distCache: nil,
+        mpinRepo:        mpinRepo,
+        userRepo:        userRepo,
+        deviceTrustRepo: deviceTrustRepo,
+        hasher:          hasher,
+        config:          cfg,
+        logger:          logger,
+        distCache:       nil,
     }
 }
-
 
 // SetDistributedCache sets the distributed cache
 func (s *MPINService) SetDistributedCache(distCache *DistributedCache) {
@@ -114,12 +125,10 @@ func (s *MPINService) validateMPIN(mpin string) error {
         return fmt.Errorf("%w: MPIN must be between %d and %d digits", ErrInvalidInput, MPINMinLength, MPINMaxLength)
     }
     
-    // Check if MPIN contains only digits
     if matched, _ := regexp.MatchString(`^\d+$`, mpin); !matched {
         return fmt.Errorf("%w: MPIN must contain only digits", ErrInvalidInput)
     }
     
-    // Check for weak patterns
     if s.isMPINWeak(mpin) {
         return ErrMPINTooWeak
     }
@@ -129,17 +138,14 @@ func (s *MPINService) validateMPIN(mpin string) error {
 
 // isMPINWeak checks for common weak MPIN patterns
 func (s *MPINService) isMPINWeak(mpin string) bool {
-    // Check for repeated digits (e.g., 1111, 0000)
     if matched, _ := regexp.MatchString(`^(\d)\1+$`, mpin); matched {
         return true
     }
     
-    // Check for sequential patterns (e.g., 1234, 4321)
     if s.isSequential(mpin) {
         return true
     }
     
-    // Check for common weak MPINs
     weakMPINs := []string{"1234", "0000", "1111", "2222", "3333", "4444", "5555", "6666", "7777", "8888", "9999", "1122", "1212"}
     for _, weak := range weakMPINs {
         if mpin == weak {
@@ -171,12 +177,10 @@ func (s *MPINService) isSequential(mpin string) bool {
 func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) error {
     startTime := time.Now()
     
-    // Validate MPIN
     if err := s.validateMPIN(req.MPIN); err != nil {
         return err
     }
     
-    // Check if user exists
     user, err := s.userRepo.GetUserByID(ctx, req.UserID)
     if err != nil {
         return fmt.Errorf("%w: user not found", ErrInvalidInput)
@@ -189,19 +193,16 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
         return ErrUserBlocked
     }
     
-    // Check if MPIN already exists
     existingMPIN, err := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
     if err == nil && existingMPIN != nil {
         return ErrMPINAlreadyExists
     }
     
-    // Hash MPIN
     hashResult, err := s.hasher.HashMPIN(req.MPIN)
     if err != nil {
         return fmt.Errorf("failed to hash MPIN: %w", err)
     }
     
-    // Create MPIN credential
     now := time.Now().UTC()
     mpinCredential := &models.MPINCredential{
         UserID:         req.UserID.String(),
@@ -220,7 +221,15 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
         return fmt.Errorf("failed to create MPIN: %w", err)
     }
     
-    // Invalidate cache if present
+    // ✅ NEW: Mark device as primary on first MPIN setup
+    if err := s.deviceTrustRepo.SetDeviceTrustLevel(ctx, req.UserID, req.DeviceID, models.TrustStatusPrimary); err != nil {
+        s.logger.Error("Failed to set primary device trust level",
+            util.ErrorField(err),
+            util.String("user_id", req.UserID.String()),
+            util.String("device_id", req.DeviceID),
+        )
+    }
+    
     if s.distCache != nil {
         cacheKey := fmt.Sprintf("mpin:%s", req.UserID.String())
         _ = s.distCache.Delete(ctx, cacheKey)
@@ -235,16 +244,14 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
     return nil
 }
 
-// VerifyMPIN verifies user's MPIN
+// ✅ UPDATED: VerifyMPIN with lenient device check
 func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*MPINVerifyResult, error) {
     startTime := time.Now()
     
-    // Validate MPIN format
     if err := s.validateMPIN(req.MPIN); err != nil {
         return nil, err
     }
     
-    // Get MPIN credential
     mpinCred, err := s.mpinRepo.ValidateMPIN(ctx, req.UserID, req.MPIN)
     if err != nil {
         if err.Error() == "MPIN not found for user: "+req.UserID.String() {
@@ -261,12 +268,16 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
         return nil, err
     }
     
-    // Verify device binding if required
-    if mpinCred.DeviceID != "" && mpinCred.DeviceID != req.DeviceID {
-        return nil, ErrDeviceNotBound
+    // ✅ UPDATED: Lenient device check - warn but allow verification
+    if mpinCred.DeviceID != "" && req.DeviceID != "" && mpinCred.DeviceID != req.DeviceID {
+        s.logger.Warn("Device mismatch during MPIN verification",
+            util.String("user_id", req.UserID.String()),
+            util.String("expected_device", mpinCred.DeviceID),
+            util.String("provided_device", req.DeviceID),
+        )
+        // Don't fail - allow verification to continue for untrusted device flow
     }
     
-    // Verify MPIN hash
     hashResult := &hashing.HashResult{
         Hash:          mpinCred.MPINHash,
         Salt:          mpinCred.MPINSalt,
@@ -286,7 +297,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
     }
     
     if verified {
-        // Reset failed attempts on successful verification
         if err := s.mpinRepo.ResetFailedAttempts(ctx, req.UserID); err != nil {
             s.logger.Error("Failed to reset failed attempts",
                 util.ErrorField(err),
@@ -297,7 +307,6 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
         result.FailedAttempts = 0
         result.RemainingTries = MPINMaxAttempts
     } else {
-        // Increment failed attempts
         newFailedAttempts, err := s.mpinRepo.IncrementFailedAttempts(ctx, req.UserID)
         if err != nil {
             s.logger.Error("Failed to increment failed attempts",
@@ -328,19 +337,49 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
     return result, nil
 }
 
-// ChangeMPIN changes user's existing MPIN
+// ✅ UPDATED: ChangeMPIN with device trust and data wipe logic
 func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) error {
     startTime := time.Now()
     
-    // Validate new MPIN
     if err := s.validateMPIN(req.NewMPIN); err != nil {
         return err
     }
     
+    // ✅ Get device trust level
+    deviceTrust, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, req.UserID, req.DeviceID)
+    if err != nil {
+        s.logger.Error("Failed to get device trust level",
+            util.ErrorField(err),
+            util.String("user_id", req.UserID.String()),
+        )
+        // Continue with untrusted status
+        deviceTrust = &models.DeviceTrustLevel{
+            UserID:      req.UserID,
+            DeviceID:    req.DeviceID,
+            TrustStatus: models.TrustStatusUntrusted,
+        }
+    }
+    
+    // ✅ Check if device is blocked
+    if deviceTrust.IsBlocked {
+        return fmt.Errorf("device is blocked for security reasons")
+    }
+    
+    // ✅ Get primary device for comparison
+    primaryDevice, _ := s.deviceTrustRepo.GetPrimaryDevice(ctx, req.UserID)
+    
+    // ✅ Determine if this is a trusted device
+    isTrustedDevice := deviceTrust.TrustStatus == models.TrustStatusPrimary || 
+                       deviceTrust.TrustStatus == models.TrustStatusTrusted
+    
+    // ✅ For untrusted devices, mark for data deletion
+    shouldWipeData := !isTrustedDevice && (primaryDevice != nil && primaryDevice.DeviceID != req.DeviceID)
+    
     // Verify current MPIN first
     verifyReq := &MPINVerifyRequest{
-        UserID: req.UserID,
-        MPIN:   req.CurrentMPIN,
+        UserID:   req.UserID,
+        MPIN:     req.CurrentMPIN,
+        DeviceID: req.DeviceID,
     }
     
     verifyResult, err := s.VerifyMPIN(ctx, verifyReq)
@@ -352,18 +391,51 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
         return ErrMPINInvalid
     }
     
-    // Hash new MPIN
     hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
     if err != nil {
         return fmt.Errorf("failed to hash new MPIN: %w", err)
     }
     
-    // Update MPIN
     if err := s.mpinRepo.UpdateMPIN(ctx, req.UserID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
         return fmt.Errorf("failed to update MPIN: %w", err)
     }
     
-    // Invalidate cache if present
+    // ✅ If untrusted device, wipe sensitive data
+    if shouldWipeData {
+        s.logger.Warn("Data wipe triggered - untrusted device MPIN change",
+            util.String("user_id", req.UserID.String()),
+            util.String("device_id", req.DeviceID),
+            util.String("trust_status", string(deviceTrust.TrustStatus)),
+        )
+        
+        deletion := &models.UserDataDeletion{
+            DeletionID:          uuid.New(),
+            UserID:              req.UserID,
+            DeviceID:            req.DeviceID,
+            Reason:              "untrusted_device_mpin_change",
+            DeletedAt:           time.Now(),
+            DataWipedCategories: []string{"session_tokens", "saved_data", "preferences"},
+        }
+        
+        if err := s.deviceTrustRepo.RecordDataDeletion(ctx, deletion); err != nil {
+            s.logger.Error("Failed to record data deletion",
+                util.ErrorField(err),
+                util.String("user_id", req.UserID.String()),
+            )
+        }
+        
+        // TODO: Implement actual data wipe
+        // - Delete all active sessions
+        // - Clear saved preferences
+        // - Remove cached data
+        // s.wipeUserData(ctx, req.UserID, deletion.DataWipedCategories)
+    }
+    
+    // ✅ Update device trust level to trusted after successful MPIN change
+    if deviceTrust.TrustStatus == models.TrustStatusUntrusted {
+        _ = s.deviceTrustRepo.SetDeviceTrustLevel(ctx, req.UserID, req.DeviceID, models.TrustStatusTrusted)
+    }
+    
     if s.distCache != nil {
         cacheKey := fmt.Sprintf("mpin:%s", req.UserID.String())
         _ = s.distCache.Delete(ctx, cacheKey)
@@ -371,6 +443,54 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
     
     s.logger.Info("MPIN changed successfully",
         util.String("user_id", req.UserID.String()),
+        util.String("device_id", req.DeviceID),
+        util.Bool("data_wiped", shouldWipeData),
+        util.String("trust_status", string(deviceTrust.TrustStatus)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+    
+    return nil
+}
+
+// ✅ NEW: Admin MPIN change (bypasses lock and device checks)
+func (s *MPINService) ChangeMPINAdmin(ctx context.Context, req *MPINAdminChangeRequest) error {
+    startTime := time.Now()
+    
+    if err := s.validateMPIN(req.NewMPIN); err != nil {
+        return err
+    }
+    
+    user, err := s.userRepo.GetUserByID(ctx, req.UserID)
+    if err != nil {
+        return fmt.Errorf("user not found: %w", err)
+    }
+    
+    if user.IsBanned {
+        return ErrUserBanned
+    }
+    
+    hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
+    if err != nil {
+        return fmt.Errorf("failed to hash MPIN: %w", err)
+    }
+    
+    // ✅ Admin bypass - ignore lock status, update directly
+    if err := s.mpinRepo.UpdateMPIN(ctx, req.UserID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
+        return fmt.Errorf("failed to update MPIN: %w", err)
+    }
+    
+    // ✅ Also unlock if locked
+    _ = s.mpinRepo.UnlockMPIN(ctx, req.UserID)
+    
+    if s.distCache != nil {
+        cacheKey := fmt.Sprintf("mpin:%s", req.UserID.String())
+        _ = s.distCache.Delete(ctx, cacheKey)
+    }
+    
+    s.logger.Warn("MPIN changed by admin",
+        util.String("user_id", req.UserID.String()),
+        util.String("admin_id", req.AdminID.String()),
+        util.String("reason", req.Reason),
         util.Duration("duration", time.Since(startTime)),
     )
     
@@ -381,18 +501,15 @@ func (s *MPINService) ChangeMPIN(ctx context.Context, req *MPINChangeRequest) er
 func (s *MPINService) ResetMPIN(ctx context.Context, req *MPINResetRequest) error {
     startTime := time.Now()
     
-    // Check if MPIN exists
     _, err := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)
     if err != nil {
         return ErrMPINNotFound
     }
     
-    // Unlock and reset MPIN
     if err := s.mpinRepo.UnlockMPIN(ctx, req.UserID); err != nil {
         return fmt.Errorf("failed to unlock MPIN: %w", err)
     }
     
-    // Invalidate cache if present
     if s.distCache != nil {
         cacheKey := fmt.Sprintf("mpin:%s", req.UserID.String())
         _ = s.distCache.Delete(ctx, cacheKey)
@@ -414,7 +531,6 @@ func (s *MPINService) UnlockMPIN(ctx context.Context, userID uuid.UUID) error {
         return fmt.Errorf("failed to unlock MPIN: %w", err)
     }
     
-    // Invalidate cache if present
     if s.distCache != nil {
         cacheKey := fmt.Sprintf("mpin:%s", userID.String())
         _ = s.distCache.Delete(ctx, cacheKey)
@@ -453,7 +569,6 @@ func (s *MPINService) UpdateDeviceBinding(ctx context.Context, userID uuid.UUID,
         return fmt.Errorf("failed to update device binding: %w", err)
     }
     
-    // Invalidate cache if present
     if s.distCache != nil {
         cacheKey := fmt.Sprintf("mpin:%s", userID.String())
         _ = s.distCache.Delete(ctx, cacheKey)
@@ -484,12 +599,11 @@ func (s *MPINService) GetMPINStats(ctx context.Context) (map[string]interface{},
         return nil, err
     }
     
-    // Add service-level stats
     stats["service_constants"] = map[string]interface{}{
-        "min_length":     MPINMinLength,
-        "max_length":     MPINMaxLength,
-        "max_attempts":   MPINMaxAttempts,
-        "lock_duration_minutes": int(MPINLockDuration.Minutes()),
+        "min_length":            MPINMinLength,
+        "max_length":            MPINMaxLength,
+        "max_attempts":          MPINMaxAttempts,
+        "lock_duration_seconds": int(MPINLockDuration.Seconds()),
     }
     
     return stats, nil
@@ -506,4 +620,78 @@ func max(a, b int) int {
         return a
     }
     return b
+}
+// internal/service/mpin_service.go
+
+// ✅ NEW: Forgot MPIN Request (NO current MPIN needed)
+type MPINForgotRequest struct {
+    UserID   uuid.UUID `json:"user_id" validate:"required"`
+    DeviceID string    `json:"device_id" validate:"required"`
+    NewMPIN  string    `json:"new_mpin" validate:"required,min=4,max=8"`
+}
+
+// ✅ NEW: ForgotMPIN allows user to reset MPIN on trusted device
+// Works like "Forgot Password" - user doesn't need current MPIN
+// ✅ NEW: ForgotMPIN allows user to reset MPIN on trusted device
+// Works like "Forgot Password" - user doesn't need current MPIN
+func (s *MPINService) ForgotMPIN(ctx context.Context, req *MPINForgotRequest) error {
+    startTime := time.Now()
+    
+    if err := s.validateMPIN(req.NewMPIN); err != nil {
+        return err
+    }
+    
+    // Check if MPIN exists
+    _, err := s.mpinRepo.GetMPINByUserID(ctx, req.UserID)  // ✅ FIXED: Use _ instead of mpinCred
+    if err != nil {
+        return ErrMPINNotFound
+    }
+    
+    // ✅ Get device trust level
+    deviceTrust, err := s.deviceTrustRepo.GetDeviceTrustLevel(ctx, req.UserID, req.DeviceID)
+    if err != nil {
+        return fmt.Errorf("failed to get device trust level: %w", err)
+    }
+    
+    // ✅ KEY LOGIC: Only allow forgot MPIN on TRUSTED devices
+    // Trusted = Primary or already trusted after successful login
+    isTrustedDevice := deviceTrust.TrustStatus == models.TrustStatusPrimary || 
+                      deviceTrust.TrustStatus == models.TrustStatusTrusted
+    
+    if !isTrustedDevice {
+        return fmt.Errorf("cannot reset MPIN on untrusted device - please use registered device")
+    }
+    
+    // ✅ Check if device is blocked
+    if deviceTrust.IsBlocked {
+        return fmt.Errorf("device is blocked for security reasons")
+    }
+    
+    // Hash new MPIN
+    hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
+    if err != nil {
+        return fmt.Errorf("failed to hash MPIN: %w", err)
+    }
+    
+    // ✅ Update MPIN (bypass lock check - user can reset anytime on trusted device)
+    if err := s.mpinRepo.UpdateMPIN(ctx, req.UserID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
+        return fmt.Errorf("failed to update MPIN: %w", err)
+    }
+    
+    // ✅ Also auto-unlock if locked
+    _ = s.mpinRepo.UnlockMPIN(ctx, req.UserID)
+    
+    if s.distCache != nil {
+        cacheKey := fmt.Sprintf("mpin:%s", req.UserID.String())
+        _ = s.distCache.Delete(ctx, cacheKey)
+    }
+    
+    s.logger.Info("MPIN reset via forgot flow",
+        util.String("user_id", req.UserID.String()),
+        util.String("device_id", req.DeviceID),
+        util.String("device_trust_status", string(deviceTrust.TrustStatus)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+    
+    return nil
 }

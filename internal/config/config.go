@@ -338,7 +338,7 @@ func loadMPINConfig(env string) MPINConfig {
         MinLength:    getEnvAsInt("MPIN_MIN_LENGTH", 4),
         MaxLength:    getEnvAsInt("MPIN_MAX_LENGTH", 8),
         MaxAttempts:  getEnvAsInt("MPIN_MAX_ATTEMPTS", ifInt(isDev, 5, 3)),
-        LockDuration: getEnvAsDuration("MPIN_LOCK_DURATION", 30*time.Minute),
+        LockDuration: getEnvAsDuration("MPIN_LOCK_DURATION", 30*time.Second),
         
         // Rate Limiting (more lenient in dev)
         VerifyLimit30Sec: getEnvAsInt("RATE_LIMIT_MPIN_VERIFY_30SEC", ifInt(isDev, 10, 3)),

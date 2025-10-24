@@ -216,3 +216,30 @@ AND compaction = {'class': 'LeveledCompactionStrategy'}
 AND gc_grace_seconds = 86400
 AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
 AND comment = 'Stores user MPIN credentials with device binding';
+-- Add to core_auth keyspace
+
+-- Device Trust Levels Table
+CREATE TABLE IF NOT EXISTS device_trust_levels (
+    user_id uuid,
+    device_id text,
+    trust_status text,              -- 'primary', 'trusted', 'untrusted'
+    first_successful_login timestamp,
+    last_login timestamp,
+    ip_address inet,
+    user_agent text,
+    is_blocked boolean,
+    PRIMARY KEY (user_id, device_id)
+) WITH compaction = {'class': 'LeveledCompactionStrategy'};
+
+-- User Data Deletion Audit
+CREATE TABLE IF NOT EXISTS user_data_deletions (
+    deletion_id uuid,
+    user_id uuid,
+    device_id text,
+    reason text,                    -- 'untrusted_device_mpin_change', 'admin_wipe', etc
+    deleted_at timestamp,
+    data_wiped_categories set<text>,
+    deleted_by uuid,                -- admin_id if admin action
+    PRIMARY KEY (deletion_id, user_id)
+) WITH default_time_to_live = 7776000  -- 90 days
+AND compression = {'sstable_compression': 'LZ4Compressor'};

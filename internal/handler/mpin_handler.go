@@ -1,3 +1,5 @@
+// internal/handler/mpin_handler.go
+
 package handler
 
 import (
@@ -5,6 +7,7 @@ import (
     "errors"
     "net/http"
     "strconv"
+    "strings"
     "time"
 
     "auth-service/internal/service"
@@ -34,13 +37,15 @@ func (h *MPINHandler) RegisterRoutes(router chi.Router) {
     router.Route("/mpin", func(r chi.Router) {
         // Public routes
         r.Get("/health", h.HealthCheck)
+        r.Get("/stats", h.GetMPINStats)
         
         // Protected routes (require authentication)
         r.Group(func(r chi.Router) {
-            // Add auth middleware here in production
+            // User operations
             r.Post("/setup", h.SetupMPIN)
             r.Post("/verify", h.VerifyMPIN)
             r.Post("/change", h.ChangeMPIN)
+            r.Post("/forgot", h.ForgotMPIN)  // ✅ NEW: Forgot MPIN endpoint
             r.Post("/reset", h.ResetMPIN)
             r.Post("/{userID}/unlock", h.UnlockMPIN)
             r.Get("/{userID}/status", h.GetMPINStatus)
@@ -49,24 +54,12 @@ func (h *MPINHandler) RegisterRoutes(router chi.Router) {
             // Administrative operations
             r.Get("/locked", h.GetLockedMPINs)
             r.Post("/cleanup", h.CleanupExpiredLocks)
-            r.Get("/stats", h.GetMPINStats)
             r.Get("/device/{deviceID}", h.GetMPINsByDevice)
         })
     })
 }
 
 // SetupMPIN handles MPIN setup for new users
-// @Summary Setup MPIN
-// @Description Setup MPIN for a user
-// @Tags mpin
-// @Accept json
-// @Produce json
-// @Param request body service.MPINSetupRequest true "MPIN setup request"
-// @Success 201 {object} Response
-// @Failure 400 {object} Response
-// @Failure 409 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/setup [post]
 func (h *MPINHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -77,7 +70,6 @@ func (h *MPINHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
         return
     }
     
-    // Sanitize inputs
     req.MPIN = util.SanitizeInput(req.MPIN)
     req.DeviceID = util.SanitizeInput(req.DeviceID)
     
@@ -96,18 +88,7 @@ func (h *MPINHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 }
 
 // VerifyMPIN handles MPIN verification
-// @Summary Verify MPIN
-// @Description Verify user's MPIN
-// @Tags mpin
-// @Accept json
-// @Produce json
-// @Param request body service.MPINVerifyRequest true "MPIN verify request"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 401 {object} Response
-// @Failure 423 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/verify [post]
+// ✅ FIXED: VerifyMPIN handles MPIN verification
 func (h *MPINHandler) VerifyMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -118,7 +99,6 @@ func (h *MPINHandler) VerifyMPIN(w http.ResponseWriter, r *http.Request) {
         return
     }
     
-    // Sanitize inputs
     req.MPIN = util.SanitizeInput(req.MPIN)
     req.DeviceID = util.SanitizeInput(req.DeviceID)
     
@@ -129,27 +109,25 @@ func (h *MPINHandler) VerifyMPIN(w http.ResponseWriter, r *http.Request) {
         return
     }
     
-    h.respondWithJSON(w, http.StatusOK, successResponse(result, "MPIN verified successfully"))
-    h.logger.Info("MPIN verified via HTTP",
+    // ✅ FIX: Use different message based on verification result
+    var message string
+    if result.Verified {
+        message = "MPIN verified successfully"
+    } else {
+        message = "MPIN verification failed: " + result.Message
+    }
+    
+    h.respondWithJSON(w, http.StatusOK, successResponse(result, message))
+    h.logger.Info("MPIN verification result",
         util.String("user_id", req.UserID.String()),
         util.Bool("verified", result.Verified),
+        util.Int("failed_attempts", result.FailedAttempts),
         util.Duration("duration", time.Since(startTime)),
         util.String("method", "VerifyMPIN"),
     )
 }
 
-// ChangeMPIN handles MPIN change
-// @Summary Change MPIN
-// @Description Change user's existing MPIN
-// @Tags mpin
-// @Accept json
-// @Produce json
-// @Param request body service.MPINChangeRequest true "MPIN change request"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 401 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/change [post]
+// ChangeMPIN handles MPIN change (requires current MPIN)
 func (h *MPINHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -160,9 +138,9 @@ func (h *MPINHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
         return
     }
     
-    // Sanitize inputs
     req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
     req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
     
     if err := h.mpinService.ChangeMPIN(ctx, &req); err != nil {
         statusCode := h.getStatusCode(err)
@@ -173,23 +151,59 @@ func (h *MPINHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN changed successfully"))
     h.logger.Info("MPIN changed via HTTP",
         util.String("user_id", req.UserID.String()),
+        util.String("device_id", req.DeviceID),
         util.Duration("duration", time.Since(startTime)),
         util.String("method", "ChangeMPIN"),
     )
 }
 
-// ResetMPIN handles MPIN reset (admin operation)
-// @Summary Reset MPIN
-// @Description Reset user's MPIN (admin operation)
+// ✅ NEW: ForgotMPIN handles forgot MPIN request (no current MPIN needed, trusted device only)
+// @Summary Forgot MPIN
+// @Description Reset MPIN on trusted device without knowing current MPIN
 // @Tags mpin
 // @Accept json
 // @Produce json
-// @Param request body service.MPINResetRequest true "MPIN reset request"
+// @Param request body service.MPINForgotRequest true "Forgot MPIN request"
 // @Success 200 {object} Response
 // @Failure 400 {object} Response
 // @Failure 403 {object} Response
+// @Failure 404 {object} Response
 // @Failure 500 {object} Response
-// @Router /mpin/reset [post]
+// @Router /mpin/forgot [post]
+func (h *MPINHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+    
+    var req service.MPINForgotRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+    
+    req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    
+    if err := h.mpinService.ForgotMPIN(ctx, &req); err != nil {
+        statusCode := h.getForgotMPINStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
+        h.logger.Error("ForgotMPIN error",
+            util.ErrorField(err),
+            util.String("user_id", req.UserID.String()),
+            util.String("device_id", req.DeviceID),
+        )
+        return
+    }
+    
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully on trusted device"))
+    h.logger.Info("MPIN reset via forgot flow",
+        util.String("user_id", req.UserID.String()),
+        util.String("device_id", req.DeviceID),
+        util.Duration("duration", time.Since(startTime)),
+        util.String("method", "ForgotMPIN"),
+    )
+}
+
+// ResetMPIN handles MPIN reset (admin operation)
 func (h *MPINHandler) ResetMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -216,16 +230,6 @@ func (h *MPINHandler) ResetMPIN(w http.ResponseWriter, r *http.Request) {
 }
 
 // UnlockMPIN handles MPIN unlock
-// @Summary Unlock MPIN
-// @Description Unlock a locked MPIN
-// @Tags mpin
-// @Produce json
-// @Param userID path string true "User ID"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 404 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/{userID}/unlock [post]
 func (h *MPINHandler) UnlockMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -252,16 +256,6 @@ func (h *MPINHandler) UnlockMPIN(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetMPINStatus handles MPIN status retrieval
-// @Summary Get MPIN status
-// @Description Get MPIN status for a user
-// @Tags mpin
-// @Produce json
-// @Param userID path string true "User ID"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 404 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/{userID}/status [get]
 func (h *MPINHandler) GetMPINStatus(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -289,18 +283,6 @@ func (h *MPINHandler) GetMPINStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // UpdateDeviceBinding handles device binding updates
-// @Summary Update device binding
-// @Description Update MPIN device binding
-// @Tags mpin
-// @Accept json
-// @Produce json
-// @Param userID path string true "User ID"
-// @Param request body map[string]string true "Device binding request"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 404 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/{userID}/device [patch]
 func (h *MPINHandler) UpdateDeviceBinding(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -338,21 +320,12 @@ func (h *MPINHandler) UpdateDeviceBinding(w http.ResponseWriter, r *http.Request
 }
 
 // GetLockedMPINs handles locked MPINs retrieval
-// @Summary Get locked MPINs
-// @Description Get list of locked MPINs with pagination
-// @Tags mpin
-// @Produce json
-// @Param limit query int false "Page size (default: 100, max: 1000)"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/locked [get]
 func (h *MPINHandler) GetLockedMPINs(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
     
     limitStr := r.URL.Query().Get("limit")
-    limit := 100 // default
+    limit := 100
     if limitStr != "" {
         parsedLimit, err := strconv.Atoi(limitStr)
         if err != nil || parsedLimit <= 0 || parsedLimit > 1000 {
@@ -377,13 +350,6 @@ func (h *MPINHandler) GetLockedMPINs(w http.ResponseWriter, r *http.Request) {
 }
 
 // CleanupExpiredLocks handles expired lock cleanup
-// @Summary Cleanup expired locks
-// @Description Cleanup expired MPIN locks
-// @Tags mpin
-// @Produce json
-// @Success 200 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/cleanup [post]
 func (h *MPINHandler) CleanupExpiredLocks(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -407,13 +373,6 @@ func (h *MPINHandler) CleanupExpiredLocks(w http.ResponseWriter, r *http.Request
 }
 
 // GetMPINStats handles MPIN statistics
-// @Summary Get MPIN statistics
-// @Description Get MPIN service statistics and metrics
-// @Tags mpin
-// @Produce json
-// @Success 200 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/stats [get]
 func (h *MPINHandler) GetMPINStats(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     
@@ -427,15 +386,6 @@ func (h *MPINHandler) GetMPINStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetMPINsByDevice handles device-based MPIN retrieval
-// @Summary Get MPINs by device
-// @Description Get all MPINs associated with a device
-// @Tags mpin
-// @Produce json
-// @Param deviceID path string true "Device ID"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/device/{deviceID} [get]
 func (h *MPINHandler) GetMPINsByDevice(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
@@ -464,12 +414,6 @@ func (h *MPINHandler) GetMPINsByDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 // HealthCheck handles service health check
-// @Summary Health check
-// @Description Check if the MPIN service is healthy
-// @Tags mpin
-// @Produce json
-// @Success 200 {object} Response
-// @Router /mpin/health [get]
 func (h *MPINHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     
@@ -481,7 +425,7 @@ func (h *MPINHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN service is healthy"))
 }
 
-// Helper Methods
+// ========== Helper Methods ==========
 
 // respondWithJSON sends a JSON response
 func (h *MPINHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
@@ -520,4 +464,22 @@ func (h *MPINHandler) getStatusCode(err error) int {
     default:
         return http.StatusInternalServerError
     }
+}
+
+// ✅ NEW: getForgotMPINStatusCode determines status code for forgot MPIN errors
+func (h *MPINHandler) getForgotMPINStatusCode(err error) int {
+    errMsg := err.Error()
+    
+    // Check for specific error messages from ForgotMPIN service
+    if strings.Contains(errMsg, "untrusted device") {
+        return http.StatusForbidden  // 403 - Can't reset on untrusted device
+    }
+    if strings.Contains(errMsg, "blocked") {
+        return http.StatusForbidden  // 403 - Device is blocked
+    }
+    if strings.Contains(errMsg, "not found") {
+        return http.StatusNotFound   // 404 - MPIN not found
+    }
+    
+    return http.StatusInternalServerError // 500 - Generic error
 }

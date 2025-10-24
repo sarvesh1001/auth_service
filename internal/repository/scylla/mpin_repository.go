@@ -17,7 +17,7 @@ import (
 // Constants for 500M scale optimization
 const (
     MPINMaxFailedAttempts = 5
-    MPINLockoutDuration   = 30 * time.Minute
+    MPINLockoutDuration   = 30 * time.Second  // ✅ 30 seconds
     MPINBatchSize         = 100
 )
 
@@ -28,10 +28,10 @@ type MPINRepositoryImpl struct {
     
     // Prepared statements for frequently used queries
     stmtGetMPINByUserID       *gocql.Query
-    stmtUpdateFailedAttempts  *gocql.Query
+    // stmtUpdateFailedAttempts  *gocql.Query
     stmtLockMPIN             *gocql.Query
     stmtUnlockMPIN           *gocql.Query
-    stmtResetFailedAttempts  *gocql.Query
+    // stmtResetFailedAttempts  *gocql.Query
     stmtMutex                sync.RWMutex
 }
 
@@ -49,6 +49,7 @@ func NewMPINRepository(client *ScyllaClient, logger *zap.Logger) MPINRepository 
 }
 
 // prepareStatements prepares frequently used queries for better performance
+// prepareStatements prepares frequently used queries for better performance
 func (r *MPINRepositoryImpl) prepareStatements() {
     r.stmtMutex.Lock()
     defer r.stmtMutex.Unlock()
@@ -58,11 +59,6 @@ func (r *MPINRepositoryImpl) prepareStatements() {
         SELECT user_id, mpin_hash, mpin_salt, pepper_version, hash_algorithm,
                device_id, last_changed, failed_attempts, is_locked, locked_until
         FROM mpin_credentials WHERE user_id = ?`)
-    
-    // Prepare increment failed attempts
-    r.stmtUpdateFailedAttempts = r.client.Session.Query(`
-        UPDATE mpin_credentials SET failed_attempts = failed_attempts + 1
-        WHERE user_id = ?`)
     
     // Prepare lock MPIN
     r.stmtLockMPIN = r.client.Session.Query(`
@@ -74,14 +70,13 @@ func (r *MPINRepositoryImpl) prepareStatements() {
         UPDATE mpin_credentials SET is_locked = false, locked_until = null, failed_attempts = 0
         WHERE user_id = ?`)
     
-    // Prepare reset failed attempts
-    r.stmtResetFailedAttempts = r.client.Session.Query(`
-        UPDATE mpin_credentials SET failed_attempts = 0
-        WHERE user_id = ?`)
+    // ❌ REMOVE THIS LINE - We'll use dynamic query instead
+    // r.stmtResetFailedAttempts = r.client.Session.Query(`
+    //     UPDATE mpin_credentials SET failed_attempts = 0
+    //     WHERE user_id = ?`)
     
     r.logger.Info("Prepared statements initialized for MPIN repository")
 }
-
 // CreateMPIN creates a new MPIN credential
 func (r *MPINRepositoryImpl) CreateMPIN(ctx context.Context, mpin *models.MPINCredential) error {
     startTime := time.Now()
@@ -218,34 +213,65 @@ func (r *MPINRepositoryImpl) ValidateMPIN(ctx context.Context, userID uuid.UUID,
 }
 
 // IncrementFailedAttempts increments failed attempts counter using prepared statement
+// IncrementFailedAttempts - Optimized batch version
 func (r *MPINRepositoryImpl) IncrementFailedAttempts(ctx context.Context, userID uuid.UUID) (int, error) {
-    r.stmtMutex.RLock()
-    query := r.stmtUpdateFailedAttempts.Bind(gocql.UUID(userID))
-    r.stmtMutex.RUnlock()
+    startTime := time.Now()
     
-    if err := r.client.ExecuteWithRetry(query.WithContext(ctx), 3); err != nil {
-        return 0, fmt.Errorf("failed to increment failed attempts: %w", err)
-    }
-    
-    // Get updated count
+    // Get current MPIN data
     mpin, err := r.GetMPINByUserID(ctx, userID)
     if err != nil {
-        return 0, err
+        return 0, fmt.Errorf("failed to get current MPIN: %w", err)
     }
     
-    // Auto-lock if max attempts reached
-    if mpin.FailedAttempts >= MPINMaxFailedAttempts {
-        if err := r.LockMPIN(ctx, userID, MPINLockoutDuration); err != nil {
-            r.logger.Error("Failed to auto-lock MPIN",
-                util.ErrorField(err),
-                util.String("user_id", userID.String()),
-            )
-        }
+    // Calculate new failed attempts count
+    newFailedAttempts := mpin.FailedAttempts + 1
+    shouldLock := newFailedAttempts >= MPINMaxFailedAttempts
+    
+    // Use batch for atomic update + lock if needed
+    batch := r.client.Session.NewBatch(gocql.LoggedBatch).WithContext(ctx)
+    
+    // Always increment failed attempts
+    batch.Query(`
+        UPDATE mpin_credentials 
+        SET failed_attempts = ?, last_changed = ?
+        WHERE user_id = ?`,
+        newFailedAttempts,
+        time.Now(),
+        gocql.UUID(userID),
+    )
+    
+    // Add lock operation if max attempts reached
+    if shouldLock {
+        lockedUntil := time.Now().Add(MPINLockoutDuration)
+        batch.Query(`
+            UPDATE mpin_credentials 
+            SET is_locked = true, locked_until = ?
+            WHERE user_id = ?`,
+            lockedUntil,
+            gocql.UUID(userID),
+        )
+        
+        r.logger.Warn("Max MPIN attempts reached, locking account in batch",
+            util.String("user_id", userID.String()),
+            util.Int("failed_attempts", newFailedAttempts),
+            util.Time("locked_until", lockedUntil),
+        )
     }
     
-    return mpin.FailedAttempts, nil
+    // Execute batch
+    if err := r.client.Session.ExecuteBatch(batch); err != nil {
+        return 0, fmt.Errorf("failed to increment failed attempts (batch): %w", err)
+    }
+    
+    r.logger.Debug("Failed attempts incremented",
+        util.String("user_id", userID.String()),
+        util.Int("new_count", newFailedAttempts),
+        util.Bool("locked", shouldLock),
+        util.Duration("duration", time.Since(startTime)),
+    )
+    
+    return newFailedAttempts, nil
 }
-
 // LockMPIN locks MPIN for specified duration using prepared statement
 func (r *MPINRepositoryImpl) LockMPIN(ctx context.Context, userID uuid.UUID, lockDuration time.Duration) error {
     lockedUntil := time.Now().Add(lockDuration)
@@ -268,16 +294,21 @@ func (r *MPINRepositoryImpl) LockMPIN(ctx context.Context, userID uuid.UUID, loc
 }
 
 // UnlockMPIN unlocks MPIN and resets failed attempts using prepared statement
+// UnlockMPIN unlocks MPIN and resets failed attempts using prepared statement
 func (r *MPINRepositoryImpl) UnlockMPIN(ctx context.Context, userID uuid.UUID) error {
     r.stmtMutex.RLock()
     query := r.stmtUnlockMPIN.Bind(gocql.UUID(userID))
     r.stmtMutex.RUnlock()
     
     if err := r.client.ExecuteWithRetry(query.WithContext(ctx), 3); err != nil {
+        r.logger.Error("Failed to unlock MPIN",
+            util.ErrorField(err),
+            util.String("user_id", userID.String()),
+        )
         return fmt.Errorf("failed to unlock MPIN: %w", err)
     }
     
-    r.logger.Info("MPIN unlocked",
+    r.logger.Info("MPIN unlocked successfully",
         util.String("user_id", userID.String()),
     )
     
@@ -285,12 +316,34 @@ func (r *MPINRepositoryImpl) UnlockMPIN(ctx context.Context, userID uuid.UUID) e
 }
 
 // ResetFailedAttempts resets failed attempts counter using prepared statement
+// ResetFailedAttempts resets failed attempts counter using prepared statement
+// ResetFailedAttempts resets failed attempts counter to 0
 func (r *MPINRepositoryImpl) ResetFailedAttempts(ctx context.Context, userID uuid.UUID) error {
-    r.stmtMutex.RLock()
-    query := r.stmtResetFailedAttempts.Bind(gocql.UUID(userID))
-    r.stmtMutex.RUnlock()
+    startTime := time.Now()
     
-    return r.client.ExecuteWithRetry(query.WithContext(ctx), 3)
+    // Use explicit value update instead of counter syntax
+    query := r.client.Session.Query(`
+        UPDATE mpin_credentials 
+        SET failed_attempts = 0, last_changed = ?
+        WHERE user_id = ?`,
+        time.Now(),
+        gocql.UUID(userID),
+    )
+    
+    if err := query.WithContext(ctx).Exec(); err != nil {
+        r.logger.Error("Failed to reset failed attempts in DB",
+            util.ErrorField(err),
+            util.String("user_id", userID.String()),
+        )
+        return fmt.Errorf("failed to reset failed attempts: %w", err)
+    }
+    
+    r.logger.Debug("Failed attempts reset successfully",
+        util.String("user_id", userID.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+    
+    return nil
 }
 
 // UpdateMPINDeviceBinding updates device binding for MPIN

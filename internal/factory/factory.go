@@ -39,7 +39,7 @@ type Factory struct {
     closed            chan struct{}
     mpinRepository    scylla.MPINRepository    // NEW
     mpinService       *service.MPINService     // NEW
-
+    deviceTrustRepo scylla.DeviceTrustRepository  // ✅ ADD THIS
     otpRepository    scylla.OTPRepository
 	otpService       *service.OTPService
     logger            *zap.Logger
@@ -373,10 +373,12 @@ func (f *Factory) MPINRepository() scylla.MPINRepository {
 }
 
 // NEW:
+// ✅ FIXED: GetMPINService with deviceTrustRepo
 func (f *Factory) GetMPINService() *service.MPINService {
     if f.mpinService == nil {
         mpinRepo := f.MPINRepository()
         userRepo := f.UserRepository()
+        deviceTrustRepo := f.GetDeviceTrustRepository()  // ✅ ADD THIS
         hasher := f.Hasher()
         cfg := f.Config()
         logger := f.logger
@@ -386,11 +388,27 @@ func (f *Factory) GetMPINService() *service.MPINService {
             distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
         }
 
-        f.mpinService = service.NewMPINService(mpinRepo, userRepo, hasher, cfg, logger) // pass cfg
+        // ✅ Pass deviceTrustRepo as 3rd parameter
+        f.mpinService = service.NewMPINService(
+            mpinRepo, 
+            userRepo, 
+            deviceTrustRepo,  // ✅ ADDED
+            hasher, 
+            cfg, 
+            logger,
+        )
 
         if distCache != nil {
             f.mpinService.SetDistributedCache(distCache)
         }
     }
     return f.mpinService
+}
+
+// ✅ FIXED: Use Factory instead of ClientFactory
+func (f *Factory) GetDeviceTrustRepository() scylla.DeviceTrustRepository {
+    if f.deviceTrustRepo == nil {
+        f.deviceTrustRepo = scylla.NewDeviceTrustRepository(f.scyllaClient, f.logger)
+    }
+    return f.deviceTrustRepo
 }
