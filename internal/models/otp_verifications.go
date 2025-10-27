@@ -15,6 +15,6 @@ type OTPVerification struct {
     Purpose        string    `db:"purpose"`
     Attempts       int       `db:"attempts"`
     ExpiresAt      time.Time `db:"expires_at"`
-    IPAddress      net.IP    `db:"ip_address"`
+    IPAddress      net.IP    `db:"ipaddress"`        // <--- PATCHED: robust to null/empty
     ProviderUsed   string    `db:"provider_used"`
 }

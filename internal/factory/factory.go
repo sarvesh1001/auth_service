@@ -378,7 +378,9 @@ func (f *Factory) GetMPINService() *service.MPINService {
     if f.mpinService == nil {
         mpinRepo := f.MPINRepository()
         userRepo := f.UserRepository()
-        deviceTrustRepo := f.GetDeviceTrustRepository()  // ✅ ADD THIS
+        deviceTrustRepo := f.GetDeviceTrustRepository()
+        otpService := f.GetOTPService()                  // Add this
+        encryptionMgr := f.EncryptionManager()            // Add this
         hasher := f.Hasher()
         cfg := f.Config()
         logger := f.logger
@@ -388,13 +390,14 @@ func (f *Factory) GetMPINService() *service.MPINService {
             distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
         }
 
-        // ✅ Pass deviceTrustRepo as 3rd parameter
         f.mpinService = service.NewMPINService(
-            mpinRepo, 
-            userRepo, 
-            deviceTrustRepo,  // ✅ ADDED
-            hasher, 
-            cfg, 
+            mpinRepo,
+            userRepo,
+            deviceTrustRepo,
+            otpService,         // Pass otpService here
+            encryptionMgr,      // Pass encryptionMgr here
+            hasher,
+            cfg,
             logger,
         )
 

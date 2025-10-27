@@ -179,6 +179,12 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
     if err != nil {
         return nil, fmt.Errorf("failed to encrypt phone: %w", err)
     }
+    s.logger.Info("Encrypted phone debug",
+    util.String("EncryptedValue", encryptedPhone.EncryptedValue),
+    util.String("EncryptedDEK", encryptedPhone.EncryptedDEK),
+    util.String("KeyID", encryptedPhone.KeyID),
+    util.String("UserID", userID.String()),
+    )
 
     keyID, err := uuid.Parse(encryptedPhone.KeyID)
     if err != nil {
@@ -190,8 +196,10 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
         UserBucket:        s.bucketingMgr.GetUserBucket(userID),
         UserID:            userID,
         PhoneHash:         phoneHash,
-        PhoneEncrypted:    []byte(encryptedPhone.EncryptedValue),
+        PhoneEncrypted:    encryptedPhone.EncryptedValue,  // Already a string
         PhoneKeyID:        keyID,
+        PhoneEncryptedDEK: encryptedPhone.EncryptedDEK,    // Encrypted DEK (string, base64)
+
         DeviceID:          req.DeviceID,
         DeviceFingerprint: req.DeviceFingerprint,
         KYCStatus:         "pending",

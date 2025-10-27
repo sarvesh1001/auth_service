@@ -1101,7 +1101,7 @@ func (h *UserHandler) getStatusCode(err error) int {
 // sanitizeUser removes sensitive data from user before sending in response
 func (h *UserHandler) sanitizeUser(user *models.User) {
     // Clear encrypted phone data
-    user.PhoneEncrypted = nil
+    user.PhoneEncrypted = ""
     user.PhoneKeyID = uuid.Nil
     // Note: We keep phone hash for identification but not the encrypted version
 }

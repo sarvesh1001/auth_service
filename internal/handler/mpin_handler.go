@@ -1,5 +1,3 @@
-// internal/handler/mpin_handler.go
-
 package handler
 
 import (
@@ -18,13 +16,11 @@ import (
     "go.uber.org/zap"
 )
 
-// MPINHandler handles HTTP requests for MPIN operations
 type MPINHandler struct {
     mpinService *service.MPINService
     logger      *zap.Logger
 }
 
-// NewMPINHandler creates a new MPIN handler
 func NewMPINHandler(mpinService *service.MPINService, logger *zap.Logger) *MPINHandler {
     return &MPINHandler{
         mpinService: mpinService,
@@ -32,26 +28,21 @@ func NewMPINHandler(mpinService *service.MPINService, logger *zap.Logger) *MPINH
     }
 }
 
-// RegisterRoutes registers all MPIN routes
 func (h *MPINHandler) RegisterRoutes(router chi.Router) {
     router.Route("/mpin", func(r chi.Router) {
-        // Public routes
         r.Get("/health", h.HealthCheck)
         r.Get("/stats", h.GetMPINStats)
-        
-        // Protected routes (require authentication)
         r.Group(func(r chi.Router) {
-            // User operations
             r.Post("/setup", h.SetupMPIN)
             r.Post("/verify", h.VerifyMPIN)
             r.Post("/change", h.ChangeMPIN)
-            r.Post("/forgot", h.ForgotMPIN)  // ✅ NEW: Forgot MPIN endpoint
+            r.Post("/forgot/send-otp", h.SendForgotMPINOTP)
+            r.Post("/forgot/verify-otp", h.VerifyForgotMPINOTP)
+            r.Post("/forgot", h.ForgotMPIN)
             r.Post("/reset", h.ResetMPIN)
             r.Post("/{userID}/unlock", h.UnlockMPIN)
             r.Get("/{userID}/status", h.GetMPINStatus)
             r.Patch("/{userID}/device", h.UpdateDeviceBinding)
-            
-            // Administrative operations
             r.Get("/locked", h.GetLockedMPINs)
             r.Post("/cleanup", h.CleanupExpiredLocks)
             r.Get("/device/{deviceID}", h.GetMPINsByDevice)
@@ -59,26 +50,21 @@ func (h *MPINHandler) RegisterRoutes(router chi.Router) {
     })
 }
 
-// SetupMPIN handles MPIN setup for new users
 func (h *MPINHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
-    
     var req service.MPINSetupRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
         return
     }
-    
     req.MPIN = util.SanitizeInput(req.MPIN)
     req.DeviceID = util.SanitizeInput(req.DeviceID)
-    
     if err := h.mpinService.SetupMPIN(ctx, &req); err != nil {
         statusCode := h.getStatusCode(err)
         h.respondWithError(w, statusCode, err, "Failed to setup MPIN")
         return
     }
-    
     h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "MPIN setup successfully"))
     h.logger.Info("MPIN setup via HTTP",
         util.String("user_id", req.UserID.String()),
@@ -87,36 +73,28 @@ func (h *MPINHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
     )
 }
 
-// VerifyMPIN handles MPIN verification
-// ✅ FIXED: VerifyMPIN handles MPIN verification
 func (h *MPINHandler) VerifyMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
-    
     var req service.MPINVerifyRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
         return
     }
-    
     req.MPIN = util.SanitizeInput(req.MPIN)
     req.DeviceID = util.SanitizeInput(req.DeviceID)
-    
     result, err := h.mpinService.VerifyMPIN(ctx, &req)
     if err != nil {
         statusCode := h.getStatusCode(err)
         h.respondWithError(w, statusCode, err, "MPIN verification failed")
         return
     }
-    
-    // ✅ FIX: Use different message based on verification result
     var message string
     if result.Verified {
         message = "MPIN verified successfully"
     } else {
         message = "MPIN verification failed: " + result.Message
     }
-    
     h.respondWithJSON(w, http.StatusOK, successResponse(result, message))
     h.logger.Info("MPIN verification result",
         util.String("user_id", req.UserID.String()),
@@ -127,27 +105,22 @@ func (h *MPINHandler) VerifyMPIN(w http.ResponseWriter, r *http.Request) {
     )
 }
 
-// ChangeMPIN handles MPIN change (requires current MPIN)
 func (h *MPINHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
-    
     var req service.MPINChangeRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
         return
     }
-    
     req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
     req.NewMPIN = util.SanitizeInput(req.NewMPIN)
     req.DeviceID = util.SanitizeInput(req.DeviceID)
-    
     if err := h.mpinService.ChangeMPIN(ctx, &req); err != nil {
         statusCode := h.getStatusCode(err)
         h.respondWithError(w, statusCode, err, "Failed to change MPIN")
         return
     }
-    
     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN changed successfully"))
     h.logger.Info("MPIN changed via HTTP",
         util.String("user_id", req.UserID.String()),
@@ -157,32 +130,58 @@ func (h *MPINHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
     )
 }
 
-// ✅ NEW: ForgotMPIN handles forgot MPIN request (no current MPIN needed, trusted device only)
-// @Summary Forgot MPIN
-// @Description Reset MPIN on trusted device without knowing current MPIN
-// @Tags mpin
-// @Accept json
-// @Produce json
-// @Param request body service.MPINForgotRequest true "Forgot MPIN request"
-// @Success 200 {object} Response
-// @Failure 400 {object} Response
-// @Failure 403 {object} Response
-// @Failure 404 {object} Response
-// @Failure 500 {object} Response
-// @Router /mpin/forgot [post]
+// === New endpoints for forgot via OTP ===
+
+func (h *MPINHandler) SendForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    var req struct {
+        UserID string `json:"user_id"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "invalid request")
+        return
+    }
+    userID, err := uuid.Parse(req.UserID)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "invalid user ID")
+        return
+    }
+    requestID, err := h.mpinService.SendForgotMPINOTP(ctx, userID)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "failed to send OTP")
+        return
+    }
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]string{
+        "request_id": requestID,
+        "message":    "OTP sent to registered phone number",
+    }, "OTP sent successfully"))
+}
+
+func (h *MPINHandler) VerifyForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    var req service.MPINForgotWithOTPRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "invalid request")
+        return
+    }
+    if err := h.mpinService.VerifyForgotMPINOTP(ctx, &req); err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "failed to verify OTP and reset MPIN")
+        return
+    }
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
+}
+
+// Also support legacy forgot for trusted devices (direct forgot, not via OTP)
 func (h *MPINHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
     startTime := time.Now()
-    
     var req service.MPINForgotRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
         return
     }
-    
     req.NewMPIN = util.SanitizeInput(req.NewMPIN)
     req.DeviceID = util.SanitizeInput(req.DeviceID)
-    
     if err := h.mpinService.ForgotMPIN(ctx, &req); err != nil {
         statusCode := h.getForgotMPINStatusCode(err)
         h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
@@ -193,7 +192,6 @@ func (h *MPINHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
         )
         return
     }
-    
     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully on trusted device"))
     h.logger.Info("MPIN reset via forgot flow",
         util.String("user_id", req.UserID.String()),
@@ -427,16 +425,15 @@ func (h *MPINHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 
 // ========== Helper Methods ==========
 
-// respondWithJSON sends a JSON response
+
+// (Other handlers remain unchanged...)
+
 func (h *MPINHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(statusCode)
-    if err := json.NewEncoder(w).Encode(data); err != nil {
-        h.logger.Error("Failed to encode JSON response", util.ErrorField(err))
-    }
+    _ = json.NewEncoder(w).Encode(data)
 }
 
-// respondWithError sends an error response
 func (h *MPINHandler) respondWithError(w http.ResponseWriter, statusCode int, err error, message string) {
     h.logger.Warn("MPIN HTTP error response",
         util.ErrorField(err),
@@ -446,7 +443,6 @@ func (h *MPINHandler) respondWithError(w http.ResponseWriter, statusCode int, er
     h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }
 
-// getStatusCode determines the appropriate HTTP status code for an error
 func (h *MPINHandler) getStatusCode(err error) int {
     switch {
     case errors.Is(err, service.ErrMPINNotFound):
@@ -466,20 +462,13 @@ func (h *MPINHandler) getStatusCode(err error) int {
     }
 }
 
-// ✅ NEW: getForgotMPINStatusCode determines status code for forgot MPIN errors
 func (h *MPINHandler) getForgotMPINStatusCode(err error) int {
     errMsg := err.Error()
-    
-    // Check for specific error messages from ForgotMPIN service
-    if strings.Contains(errMsg, "untrusted device") {
-        return http.StatusForbidden  // 403 - Can't reset on untrusted device
-    }
-    if strings.Contains(errMsg, "blocked") {
-        return http.StatusForbidden  // 403 - Device is blocked
+    if strings.Contains(errMsg, "untrusted device") || strings.Contains(errMsg, "blocked") {
+        return http.StatusForbidden
     }
     if strings.Contains(errMsg, "not found") {
-        return http.StatusNotFound   // 404 - MPIN not found
+        return http.StatusNotFound
     }
-    
-    return http.StatusInternalServerError // 500 - Generic error
+    return http.StatusInternalServerError
 }

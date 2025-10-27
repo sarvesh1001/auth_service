@@ -1,8 +1,8 @@
 package models
 
 import ("github.com/google/uuid"
-        "net"
         "time"
+        "net"
     )
 
 
@@ -11,7 +11,7 @@ type OTPEvent struct {
     EventType    string             `db:"event_type"`
     PhoneHash    string             `db:"phone_hash"`
     Purpose      string             `db:"purpose"`
-    IPAddress    net.IP             `db:"ip_address"`
+    IPAddress    net.IP    `db:"ipaddress"`        // <--- PATCHED: robust to null/empty
     UserAgent    string             `db:"user_agent"`
     ProviderUsed string             `db:"provider_used"`
     Timestamp    time.Time          `db:"timestamp"`

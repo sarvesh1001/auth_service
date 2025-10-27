@@ -36,7 +36,7 @@ type Config struct {
 	KMS           KMSConfig
 	OTP           OTPConfig // NEW
 	MPIN		  MPINConfig // NEW
-
+    Encryption    EncryptionConfig  // ✅ ADD THIS LINE
 }
 type MPINConfig struct {
     // Basic Settings
@@ -70,6 +70,14 @@ type MPINConfig struct {
     BypassComplexityDev  bool `json:"bypass_complexity_dev"`
     AllowWeakPinsDev     bool `json:"allow_weak_pins_dev"`
 }
+
+// Add this new struct
+type EncryptionConfig struct {
+    MasterKey  string `json:"-"` // Hidden in JSON for security
+    KMSEnabled bool   `json:"kms_enabled"`
+    KEKEnabled bool   `json:"kek_enabled"`
+}
+
 
 type ServerConfig struct {
 	Port         int
@@ -303,9 +311,15 @@ func LoadConfig() *Config {
 			},
 			OTP: loadOTPConfig(environment),
 			MPIN: loadMPINConfig(environment),
-			// NEW
+			Encryption: EncryptionConfig{  // ✅ FIXED
+				MasterKey:  getEnv("ENCRYPTION_MASTER_KEY", ""),
+				KMSEnabled: getEnvAsBool("ENCRYPTION_KMS_ENABLED", false),
+				KEKEnabled: getEnvAsBool("ENCRYPTION_KEK_ENABLED", false),
+			},
 		}
-
+		
+		
+	
 		// Initialize KMS client for production after basic config is loaded
 		if cfg.KMS.Enabled {
 			if err := initKMSClient(cfg); err != nil {

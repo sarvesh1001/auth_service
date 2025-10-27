@@ -6,7 +6,7 @@ type User struct {
     UserBucket        int        `db:"user_bucket"`
     UserID            uuid.UUID  `db:"user_id"`
     PhoneHash         string     `db:"phone_hash"`
-    PhoneEncrypted    []byte     `db:"phone_encrypted"`
+    PhoneEncrypted    string     `db:"phone_encrypted"`      // ✅ CHANGED: []byte -> string
     PhoneKeyID        uuid.UUID  `db:"phone_key_id"`
     DeviceID          string     `db:"device_id"`
     DeviceFingerprint string     `db:"device_fingerprint"`
