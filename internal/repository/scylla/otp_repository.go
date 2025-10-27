@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"net"
 	"sync"
 	"time"
 
@@ -44,7 +45,6 @@ type OTPRepositoryImpl struct {
 	stmtCreateOTP       *gocql.Query
 	stmtGetActiveOTP    *gocql.Query
 	stmtInvalidateOTP   *gocql.Query
-	// stmtIncrementAttempt *gocql.Query
 	stmtMutex           sync.RWMutex
 }
 
@@ -92,7 +92,6 @@ func NewOTPRepository(
 }
 
 // prepareStatements prepares frequently used queries for better performance
-// prepareStatements prepares frequently used queries for better performance
 func (r *OTPRepositoryImpl) prepareStatements() {
     r.stmtMutex.Lock()
     defer r.stmtMutex.Unlock()
@@ -121,8 +120,6 @@ func (r *OTPRepositoryImpl) prepareStatements() {
         DELETE FROM otp_verifications
         WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`)
     
-    // Note: IncrementAttempt uses read-modify-write pattern, no prepared statement
-    
     r.logger.Info("Prepared statements initialized for OTP repository")
 }
 
@@ -148,20 +145,29 @@ func (r *OTPRepositoryImpl) CreateOTP(ctx context.Context, otp *models.OTPVerifi
 		ttlSeconds = int(OTPDefaultTTL.Seconds())
 	}
 	
+	// ✅ FIX: Ensure valid IP address for inet column
+	var ipToStore net.IP
+	if otp.IPAddress != nil {
+		ipToStore = otp.IPAddress
+	} else {
+		ipToStore = net.ParseIP("0.0.0.0")
+	}
+	
 	// Log for debugging
 	r.logger.Info("Creating OTP in database",
 		util.String("phone_hash", otp.PhoneHash),
 		util.String("purpose", otp.Purpose),
 		util.Int64("time_bucket", otp.TimeBucket),
 		util.Time("created_at", otp.CreatedAt),
+		util.String("ip_address", ipToStore.String()),
 		util.Int("ttl_seconds", ttlSeconds),
 	)
 	
-	// Use prepared statement - UPDATED with purpose field
+	// Use prepared statement
 	r.stmtMutex.RLock()
 	query := r.stmtCreateOTP.Bind(
 		otp.PhoneHash,
-		otp.Purpose,        // NEW: purpose field
+		otp.Purpose,
 		otp.TimeBucket,
 		otp.CreatedAt,
 		otp.OTPHash,
@@ -170,7 +176,7 @@ func (r *OTPRepositoryImpl) CreateOTP(ctx context.Context, otp *models.OTPVerifi
 		otp.PepperVersion,
 		otp.Attempts,
 		otp.ExpiresAt,
-		otp.IPAddress,
+		ipToStore, // Use the validated IP
 		otp.ProviderUsed,
 		ttlSeconds,
 	)
@@ -208,6 +214,7 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 	r.stmtMutex.RUnlock()
 	
 	var otp models.OTPVerification
+	
 	err := r.client.ScanWithRetry(query.WithContext(ctx),
 		&otp.PhoneHash,
 		&otp.Purpose,
@@ -219,7 +226,7 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 		&otp.PepperVersion,
 		&otp.Attempts,
 		&otp.ExpiresAt,
-		&otp.IPAddress,
+		&otp.IPAddress, // ✅ FIX: Scan directly into net.IP
 		&otp.ProviderUsed,
 	)
 	
@@ -249,7 +256,7 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 				&otp.PepperVersion,
 				&otp.Attempts,
 				&otp.ExpiresAt,
-				&otp.IPAddress,
+				&otp.IPAddress, // ✅ FIX: For previous bucket too
 				&otp.ProviderUsed,
 			)
 			
@@ -267,11 +274,17 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 		}
 	}
 	
+	// ✅ FIX: Ensure IP address is never nil
+	if otp.IPAddress == nil {
+		otp.IPAddress = net.ParseIP("0.0.0.0")
+	}
+	
 	r.logger.Info("Found active OTP",
 		util.String("phone_hash", phoneHash),
 		util.String("purpose", purpose),
 		util.Time("created_at", otp.CreatedAt),
 		util.Int("attempts", otp.Attempts),
+		util.String("ip_address", otp.IPAddress.String()),
 	)
 	
 	// Check if OTP is expired
@@ -287,8 +300,6 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 	return &otp, nil
 }
 
-// ValidateOTP validates an OTP and returns the OTP record if valid
-// ValidateOTP validates an OTP and returns the OTP record if valid
 // ValidateOTP validates an OTP and returns the OTP record if valid
 func (r *OTPRepositoryImpl) ValidateOTP(ctx context.Context, phoneHash, otpHash, purpose string) (*models.OTPVerification, error) {
     otp, err := r.GetActiveOTP(ctx, phoneHash, purpose)
@@ -355,9 +366,6 @@ func (r *OTPRepositoryImpl) InvalidateOTP(ctx context.Context, phoneHash string,
 }
 
 // IncrementOTPAttempts increments the attempt counter for an OTP
-// IncrementOTPAttempts increments the attempt counter for an OTP
-// IncrementOTPAttempts increments the attempt counter for an OTP
-// In implementation
 func (r *OTPRepositoryImpl) IncrementOTPAttempts(ctx context.Context, phoneHash string, purpose string, createdAt time.Time) (int, error) {
     timeBucket := r.getTimeBucketFromTime(createdAt)
     
@@ -370,13 +378,21 @@ func (r *OTPRepositoryImpl) IncrementOTPAttempts(ctx context.Context, phoneHash 
     
     // First, read the current attempts value
     var currentAttempts int
+    var scannedIP net.IP
+    var providerUsed string
+    
     selectQuery := r.client.Session.Query(`
-        SELECT attempts FROM otp_verifications
+        SELECT attempts, ip_address, provider_used FROM otp_verifications
         WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`,
         phoneHash, purpose, timeBucket, createdAt,
     )
     
-    if err := r.client.ScanWithRetry(selectQuery.WithContext(ctx), &currentAttempts); err != nil {
+    // ✅ FIX: Scan directly into net.IP
+    if err := r.client.ScanWithRetry(selectQuery.WithContext(ctx), 
+        &currentAttempts, 
+        &scannedIP, // Use net.IP directly
+        &providerUsed,
+    ); err != nil {
         return 0, fmt.Errorf("failed to get current attempts: %w", err)
     }
     
@@ -401,8 +417,9 @@ func (r *OTPRepositoryImpl) IncrementOTPAttempts(ctx context.Context, phoneHash 
         util.Int("new_attempts", newAttempts),
     )
     
-    return newAttempts, nil  // Return the new attempts count
+    return newAttempts, nil
 }
+
 // ============================================
 // RATE LIMITING & ANALYTICS
 // ============================================
@@ -437,7 +454,6 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 		bucket := bucket
 		g.Go(func() error {
 			// Query by partition key prefix (phone_hash)
-			// We'll need to query all purposes for this phone in this bucket
 			query := r.client.Session.Query(`
 				SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
 					   hash_algorithm, pepper_version, attempts, expires_at,
@@ -453,6 +469,7 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 			var bucketOTPs []*models.OTPVerification
 			for {
 				var otp models.OTPVerification
+				
 				if !iter.Scan(
 					&otp.PhoneHash,
 					&otp.Purpose,
@@ -464,10 +481,15 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 					&otp.PepperVersion,
 					&otp.Attempts,
 					&otp.ExpiresAt,
-					&otp.IPAddress,
+					&otp.IPAddress, // ✅ FIX: Use net.IP directly
 					&otp.ProviderUsed,
 				) {
 					break
+				}
+				
+				// ✅ FIX: Ensure IP address is never nil
+				if otp.IPAddress == nil {
+					otp.IPAddress = net.ParseIP("0.0.0.0")
 				}
 				
 				// Filter by timestamp in application layer
@@ -494,6 +516,7 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 	
 	return allOTPs, nil
 }
+
 // CleanupExpiredOTPs removes expired OTPs (backup cleanup - TTL handles most cases)
 func (r *OTPRepositoryImpl) CleanupExpiredOTPs(ctx context.Context, batchSize int) (int, error) {
     if batchSize <= 0 || batchSize > OTPCleanupBatchSize {
@@ -604,7 +627,6 @@ func (r *OTPRepositoryImpl) CleanupExpiredOTPs(ctx context.Context, batchSize in
     return deletedCount, nil
 }
 
-
 // ============================================
 // BULK OPERATIONS
 // ============================================
@@ -625,6 +647,14 @@ func (r *OTPRepositoryImpl) CreateOTPsBatch(ctx context.Context, otps []*models.
 			ttlSeconds = int(OTPDefaultTTL.Seconds())
 		}
 		
+		// ✅ FIX: Ensure valid IP address for each OTP
+		var ipToStore net.IP
+		if otp.IPAddress != nil {
+			ipToStore = otp.IPAddress
+		} else {
+			ipToStore = net.ParseIP("0.0.0.0")
+		}
+		
 		batch.Query(`
 			INSERT INTO otp_verifications (
 				phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
@@ -634,7 +664,7 @@ func (r *OTPRepositoryImpl) CreateOTPsBatch(ctx context.Context, otps []*models.
 			USING TTL ?`,
 			otp.PhoneHash, otp.Purpose, otp.TimeBucket, otp.CreatedAt, otp.OTPHash, otp.OTPSalt,
 			otp.HashAlgorithm, otp.PepperVersion, otp.Attempts, otp.ExpiresAt,
-			otp.IPAddress, otp.ProviderUsed, ttlSeconds,
+			ipToStore, otp.ProviderUsed, ttlSeconds,
 		)
 		
 		batchSize++
