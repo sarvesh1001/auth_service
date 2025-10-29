@@ -30,7 +30,9 @@ func requireHTTPS(next http.Handler) http.Handler {
 func NewRouter(
     userHandler *UserHandler,
     otpHandler *OTPHandler,
-    mpinHandler *MPINHandler,  // NEW - Add MPIN handler parameter
+    mpinHandler *MPINHandler,
+    sessionHandler *SessionHandler,
+    deviceHandler *DeviceHandler,      // ✅ ADD DEVICE HANDLER
     logger *zap.Logger,
 ) chi.Router {
     router := chi.NewRouter()
@@ -67,7 +69,9 @@ func NewRouter(
     router.Route("/api/v1", func(r chi.Router) {
         userHandler.RegisterRoutes(r)
         otpHandler.RegisterRoutes(r)
-        mpinHandler.RegisterRoutes(r)  // NEW - Register MPIN routes
+        mpinHandler.RegisterRoutes(r)
+        sessionHandler.RegisterRoutes(r)
+        deviceHandler.RegisterRoutes(r)    // ✅ REGISTER DEVICE ROUTES
     })
 
     // 404 handler

@@ -41,3 +41,10 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS banned_users AS
         'compaction_window_unit': 'DAYS'
     };
 
+-- DEVICE BINDINGS BY DEVICE ID (FIXED)
+CREATE MATERIALIZED VIEW IF NOT EXISTS device_bindings_by_device_id AS
+    SELECT user_id, device_id, bound_at, bind_token, action_timestamp
+    FROM user_device_binding_history
+    WHERE device_id IS NOT NULL AND user_id IS NOT NULL AND action_timestamp IS NOT NULL AND bound_at IS NOT NULL
+    PRIMARY KEY ((device_id), action_timestamp, bound_at, user_id)
+    WITH CLUSTERING ORDER BY (action_timestamp DESC, bound_at DESC);

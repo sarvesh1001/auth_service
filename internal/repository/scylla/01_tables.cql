@@ -216,13 +216,14 @@ AND compaction = {'class': 'LeveledCompactionStrategy'}
 AND gc_grace_seconds = 86400
 AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
 AND comment = 'Stores user MPIN credentials with device binding';
--- Add to core_auth keyspace
 
--- Device Trust Levels Table
+-- ===============================
+-- DEVICE TRUST LEVELS TABLE
+-- ===============================
 CREATE TABLE IF NOT EXISTS device_trust_levels (
     user_id uuid,
     device_id text,
-    trust_status text,              -- 'primary', 'trusted', 'untrusted'
+    trust_status text,
     first_successful_login timestamp,
     last_login timestamp,
     ip_address inet,
@@ -231,15 +232,35 @@ CREATE TABLE IF NOT EXISTS device_trust_levels (
     PRIMARY KEY (user_id, device_id)
 ) WITH compaction = {'class': 'LeveledCompactionStrategy'};
 
--- User Data Deletion Audit
+-- ===============================
+-- USER DATA DELETIONS TABLE
+-- ===============================
 CREATE TABLE IF NOT EXISTS user_data_deletions (
     deletion_id uuid,
     user_id uuid,
     device_id text,
-    reason text,                    -- 'untrusted_device_mpin_change', 'admin_wipe', etc
+    reason text,
     deleted_at timestamp,
     data_wiped_categories set<text>,
-    deleted_by uuid,                -- admin_id if admin action
+    deleted_by uuid,
     PRIMARY KEY (deletion_id, user_id)
-) WITH default_time_to_live = 7776000  -- 90 days
+) WITH default_time_to_live = 7776000
 AND compression = {'sstable_compression': 'LZ4Compressor'};
+
+-- ===============================
+-- USER DEVICE BINDING HISTORY TABLE
+-- ===============================
+CREATE TABLE IF NOT EXISTS user_device_binding_history (
+    user_id uuid,
+    bound_at timestamp,
+    device_id text,
+    session_id uuid,
+    bind_token text,
+    action text,
+    action_timestamp timestamp,
+    PRIMARY KEY ((user_id), action_timestamp, bound_at)
+) WITH CLUSTERING ORDER BY (action_timestamp DESC, bound_at DESC)
+AND compaction = {'class': 'TimeWindowCompactionStrategy', 'compaction_window_size': '7', 'compaction_window_unit': 'DAYS'}
+AND default_time_to_live = 7776000
+AND compression = {'sstable_compression': 'LZ4Compressor'}
+AND comment = 'Audit trail for device binding and unbinding events with 90-day retention';
