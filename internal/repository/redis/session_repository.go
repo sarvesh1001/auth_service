@@ -1,441 +1,585 @@
-// internal/repository/redis/session_repository.go
+// internal/repository/redis/session_repository.go - UPDATED WITH SESSION_TYPE SUPPORT
 package redis
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "net"
-    "strings"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
+	"time"
 
-    "auth-service/internal/models"
-    "auth-service/internal/util"
+	"auth-service/internal/models"
+	"auth-service/internal/util"
 
-    "github.com/google/uuid"
-    "github.com/redis/go-redis/v9"
-    "go.uber.org/zap"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 const (
-    sessionKeyPrefix       = "session:user:"
-    sessionTokenKeyPrefix  = "session:token:"
-    sessionDeviceKeyPrefix = "session:device:"
-    sessionCountKeyPrefix  = "session:count:"
-    sessionTTL            = 30 * 24 * time.Hour // 30 days
+	sessionKeyPrefix       = "session:user:"
+	sessionTokenKeyPrefix  = "session:token:"
+	sessionDeviceKeyPrefix = "session:device:"
+	sessionCountKeyPrefix  = "session:count:"
+	sessionTypeKeyPrefix   = "session:type:"  // ✅ NEW: Session type prefix
+	adminSessionKeyPrefix  = "admin:session:" // ✅ NEW: Admin session prefix
+	sessionTTL             = 30 * 24 * time.Hour // 30 days
+	adminSessionTTL        = 7 * 24 * time.Hour  // ✅ NEW: 7 days for admin sessions
 )
 
 type SessionRepositoryImpl struct {
-    client *redis.Client
-    logger *zap.Logger
+	client *redis.Client
+	logger *zap.Logger
 }
 
 // NewSessionRepository creates a new session repository
 func NewSessionRepository(client *redis.Client, logger *zap.Logger) SessionRepository {
-    return &SessionRepositoryImpl{
-        client: client,
-        logger: logger,
-    }
+	return &SessionRepositoryImpl{
+		client: client,
+		logger: logger,
+	}
 }
+
+// ===== USER SESSIONS =====
 
 // CreateSession creates a new session
 func (r *SessionRepositoryImpl) CreateSession(ctx context.Context, session *models.ActiveSession) error {
-    startTime := time.Now()
+	startTime := time.Now()
 
-    // Serialize session
-    sessionData, err := json.Marshal(session)
-    if err != nil {
-        return fmt.Errorf("failed to serialize session: %w", err)
-    }
+	// Serialize session
+	sessionData, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("failed to serialize session: %w", err)
+	}
 
-    pipe := r.client.Pipeline()
+	// ✅ NEW: Get TTL based on session type
+	ttl := sessionTTL // Default 30 days
+	if session.SessionType == "admin" {
+		ttl = adminSessionTTL // 7 days for admin
+	}
 
-    // Store session by user ID
-    userKey := fmt.Sprintf("%s%s", sessionKeyPrefix, session.UserID)
-    pipe.Set(ctx, userKey, sessionData, sessionTTL)
+	pipe := r.client.Pipeline()
 
-    // Store session by token for quick lookup
-    tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, session.SessionToken)
-    pipe.Set(ctx, tokenKey, session.UserID, sessionTTL)
+	// Store session by user ID
+	userKey := fmt.Sprintf("%s%s", sessionKeyPrefix, session.UserID)
+	pipe.Set(ctx, userKey, sessionData, ttl)
 
-    // Add to device sessions set
-    if session.DeviceID != "" {
-        deviceKey := fmt.Sprintf("%s%s", sessionDeviceKeyPrefix, session.DeviceID)
-        pipe.SAdd(ctx, deviceKey, session.UserID)
-        pipe.Expire(ctx, deviceKey, sessionTTL)
-    }
+	// Store session by token for quick lookup
+	tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, session.SessionToken)
+	pipe.Set(ctx, tokenKey, session.UserID, ttl)
 
-    // Increment active sessions count
-    countKey := fmt.Sprintf("%s%s", sessionCountKeyPrefix, session.UserID)
-    pipe.Incr(ctx, countKey)
-    pipe.Expire(ctx, countKey, sessionTTL)
+	// ✅ NEW: Store session type for quick lookup
+	typeKey := fmt.Sprintf("%s%s", sessionTypeKeyPrefix, session.SessionToken)
+	pipe.Set(ctx, typeKey, session.SessionType, ttl)
 
-    if _, err := pipe.Exec(ctx); err != nil {
-        return fmt.Errorf("failed to create session: %w", err)
-    }
+	// Add to device sessions set
+	if session.DeviceID != "" {
+		deviceKey := fmt.Sprintf("%s%s", sessionDeviceKeyPrefix, session.DeviceID)
+		pipe.SAdd(ctx, deviceKey, session.UserID)
+		pipe.Expire(ctx, deviceKey, ttl)
+	}
 
-    r.logger.Debug("Session created",
-        util.String("user_id", session.UserID),
-        util.String("device_id", session.DeviceID),
-        util.Duration("duration", time.Since(startTime)),
-    )
+	// Increment active sessions count
+	countKey := fmt.Sprintf("%s%s", sessionCountKeyPrefix, session.UserID)
+	pipe.Incr(ctx, countKey)
+	pipe.Expire(ctx, countKey, ttl)
 
-    return nil
+	// ✅ NEW: Store in admin sessions index if admin session
+	if session.SessionType == "admin" {
+		adminKey := fmt.Sprintf("%s%s", adminSessionKeyPrefix, session.UserID)
+		pipe.SAdd(ctx, adminKey, session.SessionToken)
+		pipe.Expire(ctx, adminKey, adminSessionTTL)
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to create session: %w", err)
+	}
+
+	r.logger.Debug("Session created",
+		util.String("user_id", session.UserID),
+		util.String("device_id", session.DeviceID),
+		util.String("session_type", session.SessionType), // ✅ NEW: Log session type
+		util.Duration("duration", time.Since(startTime)),
+	)
+
+	return nil
 }
 
 // GetSessionByUserID retrieves a session by user ID
 func (r *SessionRepositoryImpl) GetSessionByUserID(ctx context.Context, userID uuid.UUID) (*models.ActiveSession, error) {
-    key := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
+	key := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
 
-    data, err := r.client.Get(ctx, key).Bytes()
-    if err != nil {
-        if err == redis.Nil {
-            return nil, fmt.Errorf("session not found for user: %s", userID)
-        }
-        return nil, fmt.Errorf("failed to get session: %w", err)
-    }
+	data, err := r.client.Get(ctx, key).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("session not found for user: %s", userID)
+		}
+		return nil, fmt.Errorf("failed to get session: %w", err)
+	}
 
-    var session models.ActiveSession
-    if err := json.Unmarshal(data, &session); err != nil {
-        return nil, fmt.Errorf("failed to deserialize session: %w", err)
-    }
+	var session models.ActiveSession
+	if err := json.Unmarshal(data, &session); err != nil {
+		return nil, fmt.Errorf("failed to deserialize session: %w", err)
+	}
 
-    // Check if expired
-    if time.Now().After(session.ExpiresAt) {
-        r.InvalidateSession(ctx, userID)
-        return nil, fmt.Errorf("session expired")
-    }
+	// Check if expired
+	if time.Now().After(session.ExpiresAt) {
+		r.InvalidateSession(ctx, userID)
+		return nil, fmt.Errorf("session expired")
+	}
 
-    return &session, nil
+	return &session, nil
 }
 
 // GetSessionByToken retrieves a session by session token
 func (r *SessionRepositoryImpl) GetSessionByToken(ctx context.Context, sessionToken string) (*models.ActiveSession, error) {
-    // First get user ID from token
-    tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, sessionToken)
-    userID, err := r.client.Get(ctx, tokenKey).Result()
-    if err != nil {
-        if err == redis.Nil {
-            return nil, fmt.Errorf("session not found for token")
-        }
-        return nil, fmt.Errorf("failed to get session token: %w", err)
-    }
+	// First get user ID from token
+	tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, sessionToken)
+	userID, err := r.client.Get(ctx, tokenKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("session not found for token")
+		}
+		return nil, fmt.Errorf("failed to get session token: %w", err)
+	}
 
-    // Then get full session
-    uid, err := uuid.Parse(userID)
-    if err != nil {
-        return nil, fmt.Errorf("invalid user ID in session: %w", err)
-    }
+	// Then get full session
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user ID in session: %w", err)
+	}
 
-    return r.GetSessionByUserID(ctx, uid)
+	return r.GetSessionByUserID(ctx, uid)
+}
+
+// ✅ NEW: GetSessionType retrieves the session type quickly without full session
+func (r *SessionRepositoryImpl) GetSessionType(ctx context.Context, sessionToken string) (string, error) {
+	typeKey := fmt.Sprintf("%s%s", sessionTypeKeyPrefix, sessionToken)
+	sessionType, err := r.client.Get(ctx, typeKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", fmt.Errorf("session type not found for token")
+		}
+		return "", fmt.Errorf("failed to get session type: %w", err)
+	}
+	return sessionType, nil
+}
+
+// ✅ NEW: IsAdminSession checks if a token is for an admin session
+func (r *SessionRepositoryImpl) IsAdminSession(ctx context.Context, sessionToken string) (bool, error) {
+	sessionType, err := r.GetSessionType(ctx, sessionToken)
+	if err != nil {
+		return false, err
+	}
+	return sessionType == "admin", nil
 }
 
 // UpdateSessionActivity updates session activity timestamp
 func (r *SessionRepositoryImpl) UpdateSessionActivity(ctx context.Context, userID uuid.UUID, lastActivity time.Time, ipAddress net.IP) error {
-    session, err := r.GetSessionByUserID(ctx, userID)
-    if err != nil {
-        return err
-    }
+	session, err := r.GetSessionByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
 
-    session.LastActivity = lastActivity
-    session.IPAddress = ipAddress
+	session.LastActivity = lastActivity
+	session.IPAddress = ipAddress
 
-    sessionData, err := json.Marshal(session)
-    if err != nil {
-        return fmt.Errorf("failed to serialize session: %w", err)
-    }
+	sessionData, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("failed to serialize session: %w", err)
+	}
 
-    key := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
-    if err := r.client.Set(ctx, key, sessionData, sessionTTL).Err(); err != nil {
-        return fmt.Errorf("failed to update session activity: %w", err)
-    }
+	// ✅ NEW: Use appropriate TTL based on session type
+	ttl := sessionTTL
+	if session.SessionType == "admin" {
+		ttl = adminSessionTTL
+	}
 
-    return nil
+	key := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
+	if err := r.client.Set(ctx, key, sessionData, ttl).Err(); err != nil {
+		return fmt.Errorf("failed to update session activity: %w", err)
+	}
+
+	return nil
 }
 
 // InvalidateSession invalidates a session by user ID
 func (r *SessionRepositoryImpl) InvalidateSession(ctx context.Context, userID uuid.UUID) error {
-    session, err := r.GetSessionByUserID(ctx, userID)
-    if err != nil {
-        // Session might not exist, which is okay
-        return nil
-    }
+	session, err := r.GetSessionByUserID(ctx, userID)
+	if err != nil {
+		// Session might not exist, which is okay
+		return nil
+	}
 
-    pipe := r.client.Pipeline()
+	pipe := r.client.Pipeline()
 
-    // Delete session by user ID
-    userKey := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
-    pipe.Del(ctx, userKey)
+	// Delete session by user ID
+	userKey := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
+	pipe.Del(ctx, userKey)
 
-    // Delete session by token
-    tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, session.SessionToken)
-    pipe.Del(ctx, tokenKey)
+	// Delete session by token
+	tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, session.SessionToken)
+	pipe.Del(ctx, tokenKey)
 
-    // Remove from device sessions
-    if session.DeviceID != "" {
-        deviceKey := fmt.Sprintf("%s%s", sessionDeviceKeyPrefix, session.DeviceID)
-        pipe.SRem(ctx, deviceKey, userID.String())
-    }
+	// ✅ NEW: Delete session type
+	typeKey := fmt.Sprintf("%s%s", sessionTypeKeyPrefix, session.SessionToken)
+	pipe.Del(ctx, typeKey)
 
-    // Decrement active sessions count
-    countKey := fmt.Sprintf("%s%s", sessionCountKeyPrefix, userID.String())
-    pipe.Decr(ctx, countKey)
+	// Remove from device sessions
+	if session.DeviceID != "" {
+		deviceKey := fmt.Sprintf("%s%s", sessionDeviceKeyPrefix, session.DeviceID)
+		pipe.SRem(ctx, deviceKey, userID.String())
+	}
 
-    if _, err := pipe.Exec(ctx); err != nil {
-        return fmt.Errorf("failed to invalidate session: %w", err)
-    }
+	// Decrement active sessions count
+	countKey := fmt.Sprintf("%s%s", sessionCountKeyPrefix, userID.String())
+	pipe.Decr(ctx, countKey)
 
-    r.logger.Info("Session invalidated",
-        util.String("user_id", userID.String()),
-    )
+	// ✅ NEW: Remove from admin sessions if admin session
+	if session.SessionType == "admin" {
+		adminKey := fmt.Sprintf("%s%s", adminSessionKeyPrefix, userID.String())
+		pipe.SRem(ctx, adminKey, session.SessionToken)
+	}
 
-    return nil
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to invalidate session: %w", err)
+	}
+
+	r.logger.Info("Session invalidated",
+		util.String("user_id", userID.String()),
+		util.String("session_type", session.SessionType), // ✅ NEW: Log session type
+	)
+
+	return nil
 }
 
 // InvalidateSessionByToken invalidates a session by session token
 func (r *SessionRepositoryImpl) InvalidateSessionByToken(ctx context.Context, sessionToken string) error {
-    tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, sessionToken)
-    userID, err := r.client.Get(ctx, tokenKey).Result()
-    if err != nil {
-        if err == redis.Nil {
-            return nil // Session doesn't exist
-        }
-        return fmt.Errorf("failed to get session token: %w", err)
-    }
+	tokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, sessionToken)
+	userID, err := r.client.Get(ctx, tokenKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil // Session doesn't exist
+		}
+		return fmt.Errorf("failed to get session token: %w", err)
+	}
 
-    uid, err := uuid.Parse(userID)
-    if err != nil {
-        return fmt.Errorf("invalid user ID: %w", err)
-    }
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user ID: %w", err)
+	}
 
-    return r.InvalidateSession(ctx, uid)
+	return r.InvalidateSession(ctx, uid)
 }
 
 // RefreshSession refreshes a session with a new token and expiry
 func (r *SessionRepositoryImpl) RefreshSession(ctx context.Context, userID uuid.UUID, newToken string, expiresAt time.Time) error {
-    session, err := r.GetSessionByUserID(ctx, userID)
-    if err != nil {
-        return err
-    }
+	session, err := r.GetSessionByUserID(ctx, userID)
+	if err != nil {
+		return err
+	}
 
-    // Delete old token
-    oldTokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, session.SessionToken)
-    r.client.Del(ctx, oldTokenKey)
+	// Delete old token
+	oldTokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, session.SessionToken)
+	r.client.Del(ctx, oldTokenKey)
 
-    // Update session
-    session.SessionToken = newToken
-    session.ExpiresAt = expiresAt
+	// ✅ NEW: Delete old type mapping
+	oldTypeKey := fmt.Sprintf("%s%s", sessionTypeKeyPrefix, session.SessionToken)
+	r.client.Del(ctx, oldTypeKey)
 
-    sessionData, err := json.Marshal(session)
-    if err != nil {
-        return fmt.Errorf("failed to serialize session: %w", err)
-    }
+	// Update session
+	session.SessionToken = newToken
+	session.ExpiresAt = expiresAt
 
-    pipe := r.client.Pipeline()
+	sessionData, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("failed to serialize session: %w", err)
+	}
 
-    // Update session by user ID
-    userKey := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
-    pipe.Set(ctx, userKey, sessionData, sessionTTL)
+	// ✅ NEW: Get appropriate TTL
+	ttl := sessionTTL
+	if session.SessionType == "admin" {
+		ttl = adminSessionTTL
+	}
 
-    // Create new token mapping
-    newTokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, newToken)
-    pipe.Set(ctx, newTokenKey, userID.String(), sessionTTL)
+	pipe := r.client.Pipeline()
 
-    if _, err := pipe.Exec(ctx); err != nil {
-        return fmt.Errorf("failed to refresh session: %w", err)
-    }
+	// Update session by user ID
+	userKey := fmt.Sprintf("%s%s", sessionKeyPrefix, userID.String())
+	pipe.Set(ctx, userKey, sessionData, ttl)
 
-    r.logger.Info("Session refreshed",
-        util.String("user_id", userID.String()),
-    )
+	// Create new token mapping
+	newTokenKey := fmt.Sprintf("%s%s", sessionTokenKeyPrefix, newToken)
+	pipe.Set(ctx, newTokenKey, userID.String(), ttl)
 
-    return nil
+	// ✅ NEW: Create new type mapping
+	newTypeKey := fmt.Sprintf("%s%s", sessionTypeKeyPrefix, newToken)
+	pipe.Set(ctx, newTypeKey, session.SessionType, ttl)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to refresh session: %w", err)
+	}
+
+	r.logger.Info("Session refreshed",
+		util.String("user_id", userID.String()),
+		util.String("session_type", session.SessionType), // ✅ NEW: Log session type
+	)
+
+	return nil
 }
 
 // InvalidateSessionsBatch invalidates multiple sessions
 func (r *SessionRepositoryImpl) InvalidateSessionsBatch(ctx context.Context, userIDs []uuid.UUID) error {
-    if len(userIDs) == 0 {
-        return nil
-    }
+	if len(userIDs) == 0 {
+		return nil
+	}
 
-    for _, userID := range userIDs {
-        if err := r.InvalidateSession(ctx, userID); err != nil {
-            r.logger.Warn("Failed to invalidate session in batch",
-                util.ErrorField(err),
-                util.String("user_id", userID.String()),
-            )
-        }
-    }
+	for _, userID := range userIDs {
+		if err := r.InvalidateSession(ctx, userID); err != nil {
+			r.logger.Warn("Failed to invalidate session in batch",
+				util.ErrorField(err),
+				util.String("user_id", userID.String()),
+			)
+		}
+	}
 
-    r.logger.Info("Batch session invalidation completed",
-        util.Int("count", len(userIDs)),
-    )
+	r.logger.Info("Batch session invalidation completed",
+		util.Int("count", len(userIDs)),
+	)
 
-    return nil
+	return nil
 }
 
 // GetSessionsBatch retrieves multiple sessions
 func (r *SessionRepositoryImpl) GetSessionsBatch(ctx context.Context, userIDs []uuid.UUID) ([]*models.ActiveSession, error) {
-    if len(userIDs) == 0 {
-        return []*models.ActiveSession{}, nil
-    }
+	if len(userIDs) == 0 {
+		return []*models.ActiveSession{}, nil
+	}
 
-    sessions := make([]*models.ActiveSession, 0, len(userIDs))
+	sessions := make([]*models.ActiveSession, 0, len(userIDs))
 
-    for _, userID := range userIDs {
-        session, err := r.GetSessionByUserID(ctx, userID)
-        if err != nil {
-            r.logger.Debug("Session not found in batch",
-                util.String("user_id", userID.String()),
-            )
-            continue
-        }
-        sessions = append(sessions, session)
-    }
+	for _, userID := range userIDs {
+		session, err := r.GetSessionByUserID(ctx, userID)
+		if err != nil {
+			r.logger.Debug("Session not found in batch",
+				util.String("user_id", userID.String()),
+			)
+			continue
+		}
+		sessions = append(sessions, session)
+	}
 
-    return sessions, nil
+	return sessions, nil
 }
 
 // CleanupExpiredSessions cleans up expired sessions (Redis TTL handles this automatically)
 func (r *SessionRepositoryImpl) CleanupExpiredSessions(ctx context.Context, batchSize int) (int, error) {
-    // Redis TTL handles automatic cleanup, but we can scan for any orphaned keys
-    cleaned := 0
+	// Redis TTL handles automatic cleanup, but we can scan for any orphaned keys
+	cleaned := 0
 
-    // Scan for session keys
-    iter := r.client.Scan(ctx, 0, sessionKeyPrefix+"*", int64(batchSize)).Iterator()
+	// Scan for session keys
+	iter := r.client.Scan(ctx, 0, sessionKeyPrefix+"*", int64(batchSize)).Iterator()
 
-    for iter.Next(ctx) {
-        key := iter.Val()
+	for iter.Next(ctx) {
+		key := iter.Val()
 
-        // Get the session
-        data, err := r.client.Get(ctx, key).Bytes()
-        if err != nil {
-            continue
-        }
+		// Get the session
+		data, err := r.client.Get(ctx, key).Bytes()
+		if err != nil {
+			continue
+		}
 
-        var session models.ActiveSession
-        if err := json.Unmarshal(data, &session); err != nil {
-            continue
-        }
+		var session models.ActiveSession
+		if err := json.Unmarshal(data, &session); err != nil {
+			continue
+		}
 
-        // Check if expired
-        if time.Now().After(session.ExpiresAt) {
-            userID := strings.TrimPrefix(key, sessionKeyPrefix)
-            uid, err := uuid.Parse(userID)
-            if err != nil {
-                continue
-            }
+		// Check if expired
+		if time.Now().After(session.ExpiresAt) {
+			userID := strings.TrimPrefix(key, sessionKeyPrefix)
+			uid, err := uuid.Parse(userID)
+			if err != nil {
+				continue
+			}
 
-            r.InvalidateSession(ctx, uid)
-            cleaned++
-        }
-    }
+			r.InvalidateSession(ctx, uid)
+			cleaned++
+		}
+	}
 
-    if err := iter.Err(); err != nil {
-        return cleaned, fmt.Errorf("error scanning sessions: %w", err)
-    }
+	if err := iter.Err(); err != nil {
+		return cleaned, fmt.Errorf("error scanning sessions: %w", err)
+	}
 
-    r.logger.Info("Expired sessions cleanup completed",
-        util.Int("cleaned", cleaned),
-    )
+	r.logger.Info("Expired sessions cleanup completed",
+		util.Int("cleaned", cleaned),
+	)
 
-    return cleaned, nil
+	return cleaned, nil
 }
 
 // GetSessionsByDevice retrieves sessions for a specific device
 func (r *SessionRepositoryImpl) GetSessionsByDevice(ctx context.Context, deviceID string, limit int) ([]*models.ActiveSession, error) {
-    deviceKey := fmt.Sprintf("%s%s", sessionDeviceKeyPrefix, deviceID)
+	deviceKey := fmt.Sprintf("%s%s", sessionDeviceKeyPrefix, deviceID)
 
-    userIDs, err := r.client.SMembers(ctx, deviceKey).Result()
-    if err != nil {
-        if err == redis.Nil {
-            return []*models.ActiveSession{}, nil
-        }
-        return nil, fmt.Errorf("failed to get device sessions: %w", err)
-    }
+	userIDs, err := r.client.SMembers(ctx, deviceKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return []*models.ActiveSession{}, nil
+		}
+		return nil, fmt.Errorf("failed to get device sessions: %w", err)
+	}
 
-    // Limit results
-    if limit > 0 && len(userIDs) > limit {
-        userIDs = userIDs[:limit]
-    }
+	// Limit results
+	if limit > 0 && len(userIDs) > limit {
+		userIDs = userIDs[:limit]
+	}
 
-    sessions := make([]*models.ActiveSession, 0, len(userIDs))
-    for _, userIDStr := range userIDs {
-        uid, err := uuid.Parse(userIDStr)
-        if err != nil {
-            continue
-        }
+	sessions := make([]*models.ActiveSession, 0, len(userIDs))
+	for _, userIDStr := range userIDs {
+		uid, err := uuid.Parse(userIDStr)
+		if err != nil {
+			continue
+		}
 
-        session, err := r.GetSessionByUserID(ctx, uid)
-        if err != nil {
-            continue
-        }
+		session, err := r.GetSessionByUserID(ctx, uid)
+		if err != nil {
+			continue
+		}
 
-        sessions = append(sessions, session)
-    }
+		sessions = append(sessions, session)
+	}
 
-    return sessions, nil
+	return sessions, nil
 }
 
 // InvalidateDeviceSessions invalidates all sessions for a device
 func (r *SessionRepositoryImpl) InvalidateDeviceSessions(ctx context.Context, deviceID string) error {
-    sessions, err := r.GetSessionsByDevice(ctx, deviceID, 0)
-    if err != nil {
-        return err
-    }
+	sessions, err := r.GetSessionsByDevice(ctx, deviceID, 0)
+	if err != nil {
+		return err
+	}
 
-    for _, session := range sessions {
-        uid, err := uuid.Parse(session.UserID)
-        if err != nil {
-            continue
-        }
-        r.InvalidateSession(ctx, uid)
-    }
+	for _, session := range sessions {
+		uid, err := uuid.Parse(session.UserID)
+		if err != nil {
+			continue
+		}
+		r.InvalidateSession(ctx, uid)
+	}
 
-    r.logger.Info("Device sessions invalidated",
-        util.String("device_id", deviceID),
-        util.Int("count", len(sessions)),
-    )
+	r.logger.Info("Device sessions invalidated",
+		util.String("device_id", deviceID),
+		util.Int("count", len(sessions)),
+	)
 
-    return nil
+	return nil
+}
+
+// ✅ NEW: GetAdminSessions retrieves all admin sessions for a user
+func (r *SessionRepositoryImpl) GetAdminSessions(ctx context.Context, userID uuid.UUID) ([]*models.ActiveSession, error) {
+	adminKey := fmt.Sprintf("%s%s", adminSessionKeyPrefix, userID.String())
+
+	tokens, err := r.client.SMembers(ctx, adminKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return []*models.ActiveSession{}, nil
+		}
+		return nil, fmt.Errorf("failed to get admin sessions: %w", err)
+	}
+
+	sessions := make([]*models.ActiveSession, 0, len(tokens))
+	for _, token := range tokens {
+		session, err := r.GetSessionByToken(ctx, token)
+		if err != nil {
+			continue
+		}
+		sessions = append(sessions, session)
+	}
+
+	return sessions, nil
+}
+
+// ✅ NEW: InvalidateAdminSessions invalidates all admin sessions for a user
+func (r *SessionRepositoryImpl) InvalidateAdminSessions(ctx context.Context, userID uuid.UUID) error {
+	sessions, err := r.GetAdminSessions(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	for _, session := range sessions {
+		r.InvalidateSessionByToken(ctx, session.SessionToken)
+	}
+
+	r.logger.Info("Admin sessions invalidated for user",
+		util.String("user_id", userID.String()),
+		util.Int("count", len(sessions)),
+	)
+
+	return nil
 }
 
 // GetActiveSessionsCount gets the count of active sessions for a user
 func (r *SessionRepositoryImpl) GetActiveSessionsCount(ctx context.Context, userID uuid.UUID) (int, error) {
-    countKey := fmt.Sprintf("%s%s", sessionCountKeyPrefix, userID.String())
+	countKey := fmt.Sprintf("%s%s", sessionCountKeyPrefix, userID.String())
 
-    count, err := r.client.Get(ctx, countKey).Int()
-    if err != nil {
-        if err == redis.Nil {
-            return 0, nil
-        }
-        return 0, fmt.Errorf("failed to get session count: %w", err)
-    }
+	count, err := r.client.Get(ctx, countKey).Int()
+	if err != nil {
+		if err == redis.Nil {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to get session count: %w", err)
+	}
 
-    return count, nil
+	return count, nil
+}
+
+// ✅ NEW: GetActiveAdminSessionsCount gets count of admin sessions for a user
+func (r *SessionRepositoryImpl) GetActiveAdminSessionsCount(ctx context.Context, userID uuid.UUID) (int, error) {
+	adminKey := fmt.Sprintf("%s%s", adminSessionKeyPrefix, userID.String())
+
+	count, err := r.client.SCard(ctx, adminKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to get admin session count: %w", err)
+	}
+
+	return int(count), nil
 }
 
 // HealthCheck performs a health check on the repository
 func (r *SessionRepositoryImpl) HealthCheck(ctx context.Context) error {
-    if err := r.client.Ping(ctx).Err(); err != nil {
-        return fmt.Errorf("session repository health check failed: %w", err)
-    }
-    return nil
+	if err := r.client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("session repository health check failed: %w", err)
+	}
+	return nil
 }
 
 // GetRepositoryStats returns repository statistics
 func (r *SessionRepositoryImpl) GetRepositoryStats(ctx context.Context) (map[string]interface{}, error) {
-    stats := make(map[string]interface{})
+	stats := make(map[string]interface{})
 
-    // Count active sessions
-    iter := r.client.Scan(ctx, 0, sessionKeyPrefix+"*", 1000).Iterator()
-    count := 0
-    for iter.Next(ctx) {
-        count++
-    }
+	// Count active sessions
+	iter := r.client.Scan(ctx, 0, sessionKeyPrefix+"*", 1000).Iterator()
+	count := 0
+	for iter.Next(ctx) {
+		count++
+	}
 
-    stats["active_sessions"] = count
-    stats["session_ttl_hours"] = int(sessionTTL.Hours())
+	// ✅ NEW: Count admin sessions
+	adminIter := r.client.Scan(ctx, 0, adminSessionKeyPrefix+"*", 1000).Iterator()
+	adminCount := 0
+	for adminIter.Next(ctx) {
+		adminCount++
+	}
 
-    return stats, nil
+	stats["active_sessions"] = count
+	stats["active_admin_sessions"] = adminCount       // ✅ NEW
+	stats["session_ttl_hours"] = int(sessionTTL.Hours())
+	stats["admin_session_ttl_hours"] = int(adminSessionTTL.Hours()) // ✅ NEW
+
+	return stats, nil
 }

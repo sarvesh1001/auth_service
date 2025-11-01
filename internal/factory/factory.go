@@ -1,4 +1,6 @@
-// internal/factory/factory.go
+// internal/factory/factory.go - REFACTORED
+// ✅ AdminRepository now receives hasher + encryptionManager
+
 package factory
 
 import (
@@ -48,7 +50,16 @@ type Factory struct {
 	sessionService    *service.SessionService
 	deviceRepository  scylla.DeviceRepository
 	deviceService     *service.DeviceService
-	deviceHistoryRepo *scylla.DeviceHistoryRepositoryImpl // ✅ ADD THIS
+	deviceHistoryRepo *scylla.DeviceHistoryRepositoryImpl
+
+	// ✅ Admin repositories and services
+	adminRepository  scylla.AdminRepository
+	adminService     *service.AdminService
+
+	// ✅ Audit repositories and services
+	auditRepository  scylla.AuditRepository
+	auditService     *service.AuditService
+
 	logger            *zap.Logger
 }
 
@@ -260,6 +271,32 @@ func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryIm
 }
 
 // ========================================================================
+// ✅ REFACTORED: ADMIN & AUDIT REPOSITORY GETTERS
+// ========================================================================
+
+// AdminRepository returns the admin repository
+// ✅ NOW INJECTS hasher and encryptionManager for consistent phone hashing
+func (f *Factory) AdminRepository() scylla.AdminRepository {
+    if f.adminRepository == nil {
+        f.adminRepository = scylla.NewAdminRepository(
+            f.ScyllaClient(),
+            f.logger,
+        )
+    }
+    return f.adminRepository
+}
+
+// AuditRepository returns the audit repository
+// AuditRepository returns the audit repository
+func (f *Factory) AuditRepository() scylla.AuditRepository {
+    if f.auditRepository == nil {
+        f.auditRepository = scylla.NewAuditRepository(
+            f.ScyllaClient(),
+            f.logger,
+        )
+    }
+    return f.auditRepository
+}// ========================================================================
 // SERVICE GETTERS
 // ========================================================================
 
@@ -389,6 +426,36 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 }
 
 // ========================================================================
+// ✅ REFACTORED: ADMIN & AUDIT SERVICE GETTERS
+// ========================================================================
+
+// GetAdminService returns the admin service
+// ✅ REFACTORED - AdminRepository now has hasher + encryptionManager
+func (f *Factory) GetAdminService() *service.AdminService {
+    if f.adminService == nil {
+        f.adminService = service.NewAdminService(
+            f.AdminRepository(),
+            f.AuditRepository(),
+            f.UserRepository(),
+			f.GetSessionService(),    // ✅ ADD THIS LINE - SessionService dependency
+            f.Hasher(),              // ✅ ADDED: Missing argument
+            f.EncryptionManager(),   // ✅ ADDED: Missing argument
+            f.logger,
+        )
+    }
+    return f.adminService
+}
+// GetAuditService returns the audit service
+func (f *Factory) GetAuditService() *service.AuditService {
+    if f.auditService == nil {
+        f.auditService = service.NewAuditService(
+            f.AuditRepository(),
+            f.logger,
+        )
+    }
+    return f.auditService
+}
+// ========================================================================
 // HEALTH CHECK
 // ========================================================================
 
@@ -484,6 +551,24 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		}
 	} else {
 		errs["device_history_repository"] = fmt.Errorf("device history repository not initialized")
+	}
+
+	// ✅ ADMIN REPOSITORY HEALTH CHECK
+	if f.adminRepository != nil {
+		if err := f.adminRepository.HealthCheck(ctx); err != nil {
+			errs["admin_repository"] = err
+		}
+	} else {
+		errs["admin_repository"] = fmt.Errorf("admin repository not initialized")
+	}
+
+	// ✅ AUDIT REPOSITORY HEALTH CHECK
+	if f.auditRepository != nil {
+		if err := f.auditRepository.HealthCheck(ctx); err != nil {
+			errs["audit_repository"] = err
+		}
+	} else {
+		errs["audit_repository"] = fmt.Errorf("audit repository not initialized")
 	}
 
 	return errs

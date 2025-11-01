@@ -152,3 +152,7 @@ func Int64(key string, value int64) zap.Field {
 func Time(key string, value time.Time) zap.Field {
     return zap.Time(key, value)
 }
+// Strings creates a string slice field
+func Strings(key string, value []string) zap.Field {
+    return zap.Strings(key, value)
+}

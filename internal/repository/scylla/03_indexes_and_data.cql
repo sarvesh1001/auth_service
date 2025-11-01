@@ -24,3 +24,8 @@ INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUE
 
 INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
 ('support', 'Read Only Support', {'view_user_data'}, false);
+
+-- Create secondary indexes for admin queries
+CREATE INDEX IF NOT EXISTS admin_users_role_level_idx ON admin_users (admin_role_level);
+CREATE INDEX IF NOT EXISTS admin_users_phone_hash_idx ON admin_users (phone_hash);
+CREATE INDEX IF NOT EXISTS admin_users_is_active_idx ON admin_users (is_active);

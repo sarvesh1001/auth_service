@@ -10,8 +10,6 @@ import (
 
     "github.com/google/uuid"
 )
-
-// SessionRepository defines the interface for session repository operations
 type SessionRepository interface {
     // Core Operations
     CreateSession(ctx context.Context, session *models.ActiveSession) error
@@ -31,6 +29,13 @@ type SessionRepository interface {
     GetSessionsByDevice(ctx context.Context, deviceID string, limit int) ([]*models.ActiveSession, error)
     InvalidateDeviceSessions(ctx context.Context, deviceID string) error
     GetActiveSessionsCount(ctx context.Context, userID uuid.UUID) (int, error)
+
+    // ✅ NEW: Admin Session Support
+    GetSessionType(ctx context.Context, sessionToken string) (string, error)
+    IsAdminSession(ctx context.Context, sessionToken string) (bool, error)
+    GetAdminSessions(ctx context.Context, userID uuid.UUID) ([]*models.ActiveSession, error)
+    InvalidateAdminSessions(ctx context.Context, userID uuid.UUID) error
+    GetActiveAdminSessionsCount(ctx context.Context, userID uuid.UUID) (int, error)
 
     // Health & Monitoring
     HealthCheck(ctx context.Context) error
