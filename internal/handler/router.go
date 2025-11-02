@@ -39,8 +39,7 @@ func NewRouter(
 	sessionHandler *SessionHandler,
 	deviceHandler *DeviceHandler,
 	adminHandler *AdminHandler,
-	auditHandler *AuditHandler,
-	sessionService *service.SessionService, // ✅ ADD THIS
+	sessionService *service.SessionService, // ✅ REMOVED: auditHandler parameter
 	logger *zap.Logger,
 ) chi.Router {
 	router := chi.NewRouter()
@@ -110,11 +109,7 @@ func NewRouter(
 			})
 		})
 
-		// ✅ Audit routes (all protected)
-		r.Route("/audit", func(r chi.Router) {
-			r.Use(AdminAuthMiddleware(sessionService, logger))
-			auditHandler.RegisterRoutes(r)
-		})
+		// ❌ REMOVED: Audit routes completely
 	})
 
 	// 404 handler

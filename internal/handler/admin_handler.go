@@ -735,6 +735,7 @@ func isValidRoleLevel(role string) bool {
 		return false
 	}
 }
+
 // ===== HELPER FUNCTIONS =====
 
 // getRequesterAdminID extracts admin ID from request context (set by middleware)
@@ -755,8 +756,6 @@ func getRequesterRole(r *http.Request) (string, error) {
 	return role, nil
 }
 
-// ... rest of your existing code ...
-
 // getClientIP extracts client IP from request
 func (h *AdminHandler) getClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -767,5 +766,3 @@ func (h *AdminHandler) getClientIP(r *http.Request) string {
 	}
 	return r.RemoteAddr
 }
-
-// ===== RESPONSE STRUCTURES =====

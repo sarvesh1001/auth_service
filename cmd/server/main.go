@@ -40,7 +40,8 @@ func main() {
 
 	// ✅ FIXED: Pass pointers directly (services already return pointers)
 	adminHandler := handler.NewAdminHandler(f.GetAdminService(), logger)
-	auditHandler := handler.NewAuditHandler(f.GetAuditService(), logger)
+
+	// ❌ REMOVED: auditHandler creation
 
 	// ✅ GET SESSION SERVICE FOR MIDDLEWARE
 	sessionService := f.GetSessionService()
@@ -57,7 +58,6 @@ func main() {
 		sessionHandler,
 		deviceHandler,
 		adminHandler,
-		auditHandler,
 		sessionService, // ✅ ADD THIS LINE
 		logger,
 	)

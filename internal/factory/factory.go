@@ -1,6 +1,4 @@
 // internal/factory/factory.go - REFACTORED
-// ✅ AdminRepository now receives hasher + encryptionManager
-
 package factory
 
 import (
@@ -56,9 +54,9 @@ type Factory struct {
 	adminRepository  scylla.AdminRepository
 	adminService     *service.AdminService
 
-	// ✅ Audit repositories and services
-	auditRepository  scylla.AuditRepository
-	auditService     *service.AuditService
+	// ❌ REMOVED: Audit repositories and services
+	// auditRepository  scylla.AuditRepository
+	// auditService     *service.AuditService
 
 	logger            *zap.Logger
 }
@@ -271,11 +269,10 @@ func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryIm
 }
 
 // ========================================================================
-// ✅ REFACTORED: ADMIN & AUDIT REPOSITORY GETTERS
+// ✅ REFACTORED: ADMIN REPOSITORY GETTERS
 // ========================================================================
 
 // AdminRepository returns the admin repository
-// ✅ NOW INJECTS hasher and encryptionManager for consistent phone hashing
 func (f *Factory) AdminRepository() scylla.AdminRepository {
     if f.adminRepository == nil {
         f.adminRepository = scylla.NewAdminRepository(
@@ -286,17 +283,9 @@ func (f *Factory) AdminRepository() scylla.AdminRepository {
     return f.adminRepository
 }
 
-// AuditRepository returns the audit repository
-// AuditRepository returns the audit repository
-func (f *Factory) AuditRepository() scylla.AuditRepository {
-    if f.auditRepository == nil {
-        f.auditRepository = scylla.NewAuditRepository(
-            f.ScyllaClient(),
-            f.logger,
-        )
-    }
-    return f.auditRepository
-}// ========================================================================
+// ❌ REMOVED: AuditRepository getter completely
+
+// ========================================================================
 // SERVICE GETTERS
 // ========================================================================
 
@@ -426,16 +415,15 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 }
 
 // ========================================================================
-// ✅ REFACTORED: ADMIN & AUDIT SERVICE GETTERS
+// ✅ REFACTORED: ADMIN SERVICE GETTERS
 // ========================================================================
 
 // GetAdminService returns the admin service
-// ✅ REFACTORED - AdminRepository now has hasher + encryptionManager
+// ✅ REFACTORED - Removed audit repository dependency
 func (f *Factory) GetAdminService() *service.AdminService {
     if f.adminService == nil {
         f.adminService = service.NewAdminService(
             f.AdminRepository(),
-            f.AuditRepository(),
             f.UserRepository(),
 			f.GetSessionService(),    // ✅ ADD THIS LINE - SessionService dependency
             f.Hasher(),              // ✅ ADDED: Missing argument
@@ -445,16 +433,9 @@ func (f *Factory) GetAdminService() *service.AdminService {
     }
     return f.adminService
 }
-// GetAuditService returns the audit service
-func (f *Factory) GetAuditService() *service.AuditService {
-    if f.auditService == nil {
-        f.auditService = service.NewAuditService(
-            f.AuditRepository(),
-            f.logger,
-        )
-    }
-    return f.auditService
-}
+
+// ❌ REMOVED: GetAuditService completely
+
 // ========================================================================
 // HEALTH CHECK
 // ========================================================================
@@ -562,14 +543,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_repository"] = fmt.Errorf("admin repository not initialized")
 	}
 
-	// ✅ AUDIT REPOSITORY HEALTH CHECK
-	if f.auditRepository != nil {
-		if err := f.auditRepository.HealthCheck(ctx); err != nil {
-			errs["audit_repository"] = err
-		}
-	} else {
-		errs["audit_repository"] = fmt.Errorf("audit repository not initialized")
-	}
+	// ❌ REMOVED: Audit repository health check
 
 	return errs
 }

@@ -19,7 +19,6 @@ import (
 // AdminService handles admin related business logic
 type AdminService struct {
     adminRepo     scylla.AdminRepository
-    auditRepo     scylla.AuditRepository
     userRepo      scylla.UserRepository
     sessionService *SessionService
     hasher        *hashing.Hasher
@@ -30,7 +29,6 @@ type AdminService struct {
 // NewAdminService creates admin service with injected dependencies
 func NewAdminService(
     adminRepo scylla.AdminRepository,
-    auditRepo scylla.AuditRepository,
     userRepo scylla.UserRepository,
     sessionService *SessionService,
     hasher *hashing.Hasher,
@@ -39,7 +37,6 @@ func NewAdminService(
 ) *AdminService {
     return &AdminService{
         adminRepo:      adminRepo,
-        auditRepo:      auditRepo,
         userRepo:       userRepo,
         sessionService: sessionService,
         hasher:         hasher,
@@ -103,9 +100,6 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
     if err := s.adminRepo.CreateAdmin(ctx, owner); err != nil {
         return nil, fmt.Errorf("failed to create owner: %w", err)
     }
-
-    s.logAuditAction(ctx, owner.AdminID, models.ActionPromoteAdmin, models.ResourceTypeAdmin,
-        owner.AdminID, models.StatusSuccess, "System owner initialized", "")
 
     s.logger.Info("Owner initialized", util.String("admin_id", owner.AdminID.String()))
 
@@ -206,11 +200,9 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
         util.String("new_phone_hash", newPhoneHash),
     )
 
-    s.logAuditAction(ctx, ownerID, "CHANGE_OWNER_PHONE", models.ResourceTypeAdmin,
-        ownerID, models.StatusSuccess, "Owner phone number changed", "")
-
     return nil
 }
+
 // InviteAdmin invites a user as admin - NO USER REGISTRATION CHECK
 func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel string, requesterID uuid.UUID, requesterRole string) (*models.AdminUser, error) {
     requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
@@ -274,9 +266,6 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
     if err := s.adminRepo.CreateAdmin(ctx, admin); err != nil {
         return nil, fmt.Errorf("failed to invite user as admin: %w", err)
     }
-
-    s.logAuditAction(ctx, requesterID, models.ActionPromoteAdmin, models.ResourceTypeAdmin,
-        admin.AdminID, models.StatusSuccess, fmt.Sprintf("User invited as %s", roleLevel), "")
 
     s.logger.Info("User invited as admin",
         util.String("admin_id", admin.AdminID.String()),
@@ -360,10 +349,6 @@ func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newR
         return fmt.Errorf("failed to update permissions: %w", err)
     }
 
-    // Log audit
-    s.logAuditAction(ctx, promotedBy, models.ActionUpdatePermissions, models.ResourceTypeAdmin,
-        adminID, models.StatusSuccess, fmt.Sprintf("Promoted from %s to %s", oldRole, newRole), "")
-
     s.logger.Info("Admin promoted",
         util.String("admin_id", adminID.String()),
         util.String("old_role", oldRole),
@@ -403,10 +388,6 @@ func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, remov
         return fmt.Errorf("failed to remove admin: %w", err)
     }
 
-    // Log audit
-    s.logAuditAction(ctx, removedBy, "REMOVE_ADMIN", models.ResourceTypeAdmin,
-        adminID, models.StatusSuccess, "Admin removed", "")
-
     s.logger.Info("Admin removed",
         util.String("admin_id", adminID.String()),
         util.String("removed_by", removedBy.String()),
@@ -435,10 +416,6 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
         return fmt.Errorf("failed to deactivate admin: %w", err)
     }
 
-    // Log audit
-    s.logAuditAction(ctx, deactivatedBy, "DEACTIVATE_ADMIN", models.ResourceTypeAdmin,
-        adminID, models.StatusSuccess, "Admin deactivated", "")
-
     s.logger.Info("Admin deactivated",
         util.String("admin_id", adminID.String()),
     )
@@ -460,10 +437,6 @@ func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, act
     if err := s.adminRepo.ActivateAdmin(ctx, adminID); err != nil {
         return fmt.Errorf("failed to activate admin: %w", err)
     }
-
-    // Log audit
-    s.logAuditAction(ctx, activatedBy, "ACTIVATE_ADMIN", models.ResourceTypeAdmin,
-        adminID, models.StatusSuccess, "Admin activated", "")
 
     s.logger.Info("Admin activated",
         util.String("admin_id", adminID.String()),
@@ -506,18 +479,13 @@ func (s *AdminService) UpdateAdminPermissions(ctx context.Context, adminID uuid.
         return fmt.Errorf("unauthorized: cannot update permissions for %s role", admin.AdminRoleLevel)
     }
 
-    // Store old permissions for audit
-    oldPermissions := admin.AdminPermissions
+    // ✅ FIXED: Remove unused oldPermissions variable
+    // oldPermissions := admin.AdminPermissions
 
     // Update permissions
     if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, permissions); err != nil {
         return fmt.Errorf("failed to update permissions: %w", err)
     }
-
-    // Log audit
-    changedFieldsMsg := fmt.Sprintf("Old: %v, New: %v", oldPermissions, permissions)
-    s.logAuditAction(ctx, updatedBy, models.ActionUpdatePermissions, models.ResourceTypeAdmin,
-        adminID, models.StatusSuccess, "Permissions updated", changedFieldsMsg)
 
     s.logger.Info("Admin permissions updated",
         util.String("admin_id", adminID.String()),
@@ -541,10 +509,6 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
         )
     }
 
-    // Log audit
-    s.logAuditAction(ctx, adminID, models.ActionAdminLogin, models.ResourceTypeAdmin,
-        adminID, models.StatusSuccess, "Admin login", "")
-
     return nil
 }
 
@@ -567,10 +531,6 @@ func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID)
                 util.ErrorField(err),
             )
         }
-
-        // Log audit
-        s.logAuditAction(ctx, adminID, "ADMIN_LOCKOUT", models.ResourceTypeAdmin,
-            adminID, models.StatusSuccess, fmt.Sprintf("Admin locked out after %d failed attempts", maxAttempts), "")
     }
 
     return shouldLockout, attempts, nil
@@ -622,24 +582,6 @@ func (s *AdminService) getPermissionsForRole(roleLevel string) []string {
     }
 }
 
-// logAuditAction logs an admin action to audit trail
-func (s *AdminService) logAuditAction(ctx context.Context, adminID uuid.UUID, actionType, resourceType string,
-    resourceID uuid.UUID, status, reason, changes string) {
-    audit := models.NewAuditLog(adminID, actionType, resourceType, resourceID, status)
-    audit.Reason = reason
-
-    if changes != "" {
-        audit.Changes = changes
-    }
-
-    if err := s.auditRepo.LogAdminAction(ctx, audit); err != nil {
-        s.logger.Warn("Failed to log audit action",
-            util.String("action", actionType),
-            util.ErrorField(err),
-        )
-    }
-}
-
 // HealthCheck verifies admin service health
 func (s *AdminService) HealthCheck(ctx context.Context) error {
     return s.adminRepo.HealthCheck(ctx)
@@ -680,10 +622,6 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
             util.ErrorField(err),
         )
     }
-
-    // 4. Log audit action
-    s.logAuditAction(ctx, admin.AdminID, models.ActionAdminLogin, models.ResourceTypeAdmin,
-        admin.AdminID, models.StatusSuccess, "Admin login with session", "")
 
     // 5. Return both admin and session token
     return admin, session.SessionToken, nil
