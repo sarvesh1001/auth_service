@@ -1,3 +1,6 @@
+# File: docker-compose.dev.yml
+# Updated & validated for Kafka topic initialization and YAML correctness
+
 services:
   # ===============================
   # ClickHouse Database
@@ -82,10 +85,10 @@ services:
     ports:
       - "2181:2181"
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-      ZOOKEEPER_SYNC_LIMIT: 2
-      ZOOKEEPER_4LW_COMMANDS_WHITELIST: ruok,stat,conf,cons
+      - ZOOKEEPER_CLIENT_PORT=2181
+      - ZOOKEEPER_TICK_TIME=2000
+      - ZOOKEEPER_SYNC_LIMIT=2
+      - ZOOKEEPER_4LW_COMMANDS_WHITELIST=ruok,stat,conf,cons
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
       interval: 15s
@@ -102,12 +105,12 @@ services:
       - "9092:9092"
       - "9093:9093"
     environment:
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -117,6 +120,29 @@ services:
       timeout: 10s
       retries: 8
       start_period: 40s
+    networks:
+      - dev-net
+
+  # ===============================
+  # Kafka Topic Initialization
+  # ===============================
+  kafka-topic-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-topic-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        chmod +x /scripts/init-kafka-topics.sh
+        /scripts/init-kafka-topics.sh
+    volumes:
+      - ./scripts/init-kafka-topics.sh:/scripts/init-kafka-topics.sh:ro
+    environment:
+      - KAFKA_HOST=kafka
+      - KAFKA_PORT=9092
+      - KAFKA_BOOTSTRAP_SERVER=kafka:9092
     networks:
       - dev-net
 
@@ -165,7 +191,7 @@ services:
       scylla:
         condition: service_healthy
       clickhouse:
-        condition: service_started  # Changed from service_healthy
+        condition: service_started
     volumes:
       - .:/app:ro
     restart: "no"
@@ -201,10 +227,10 @@ services:
       - KAFKA_BROKERS=kafka:9092
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_URL=clickhouse:9000
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
-      - ENCRYPTION_MASTER_KEY=${ENCRYPTION_MASTER_KEY}  # ← ADD THIS LINE
+      - ENCRYPTION_MASTER_KEY=${ENCRYPTION_MASTER_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - API_KEY=${API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-info}
@@ -221,8 +247,8 @@ services:
         condition: service_healthy
       schema-init:
         condition: service_completed_successfully
-      kafka:
-        condition: service_healthy
+      kafka-topic-init:
+        condition: service_completed_successfully
       elasticsearch:
         condition: service_healthy
       clickhouse:
@@ -236,7 +262,38 @@ services:
     networks:
       - dev-net
 
-# =============================== 
+  # ===============================
+  # ClickHouse + ES Consumer
+  # ===============================
+  clickhouse-es-consumer:
+    build:
+      context: .
+      dockerfile: scripts/consumer/Dockerfile
+    container_name: clickhouse-es-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kafka-topic-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-clickhouse:9000}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-auth_svc_user}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-Vu8eeS4ahtha3Aithae1ie2IeMae4ee1oo1o}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-auth_analytics}
+      ES_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
+    command: ["/consumer", "-duration", "0"]
+    restart: unless-stopped
+    networks:
+      - dev-net
+
+# =============================== 
 # Volumes & Networks
 # ===============================
 volumes:

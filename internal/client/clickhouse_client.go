@@ -159,3 +159,7 @@ func extractHostname(url string) string {
 	hostPort := extractHostPort(url)
 	return strings.Split(hostPort, ":")[0]
 }
+// Conn returns the underlying ClickHouse connection
+func (c *ClickHouseClient) Conn() driver.Conn {
+	return c.conn
+}

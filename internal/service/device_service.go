@@ -1,3 +1,4 @@
+// File: internal/service/device_service.go
 package service
 
 import (
@@ -19,8 +20,9 @@ import (
 // DeviceService handles device management business logic
 type DeviceService struct {
 	deviceRepo   scylla.DeviceRepository
-	historyRepo  *scylla.DeviceHistoryRepositoryImpl // ✅ ADD THIS
+	historyRepo  *scylla.DeviceHistoryRepositoryImpl
 	distCache    *DistributedCache
+	logProducer  *LogProducerService
 	config       config.Config
 	logger       *zap.Logger
 }
@@ -43,6 +45,11 @@ func NewDeviceService(
 // SetHistoryRepository sets the history repository for tracking device binding changes
 func (s *DeviceService) SetHistoryRepository(historyRepo *scylla.DeviceHistoryRepositoryImpl) {
 	s.historyRepo = historyRepo
+}
+
+// SetLogProducerService sets the log producer service
+func (s *DeviceService) SetLogProducerService(logProducer *LogProducerService) {
+	s.logProducer = logProducer
 }
 
 // Request/Response types
@@ -79,15 +86,41 @@ func (s *DeviceService) BindDevice(
 	// Generate cryptographically secure bind token
 	bindToken, err := s.generateBindToken()
 	if err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       req.UserID.String(),
+				DeviceID:     req.DeviceID,
+				Action:       "bind",
+				Status:       "failed",
+				ErrorCode:    "TOKEN_GENERATION_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 		return nil, fmt.Errorf("failed to generate bind token: %w", err)
 	}
 
 	// Bind device in repository
 	if err := s.deviceRepo.BindUserDevice(ctx, req.UserID, req.DeviceID, bindToken); err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       req.UserID.String(),
+				DeviceID:     req.DeviceID,
+				Action:       "bind",
+				Status:       "failed",
+				ErrorCode:    "BIND_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 		return nil, fmt.Errorf("failed to bind device: %w", err)
 	}
 
-	// Record in history ✅ ADD THIS
+	// Record in history
 	if s.historyRepo != nil {
 		if err := s.historyRepo.RecordBinding(ctx, req.UserID, req.DeviceID, nil, bindToken, "bind"); err != nil {
 			s.logger.Warn("Failed to record binding in history",
@@ -96,6 +129,19 @@ func (s *DeviceService) BindDevice(
 				util.String("device_id", req.DeviceID))
 			// Don't fail the request if history recording fails
 		}
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil {
+		event := &models.DeviceLogEvent{
+			UserID:    req.UserID.String(),
+			DeviceID:  req.DeviceID,
+			Action:    "bind",
+			Status:    "success",
+			BindToken: bindToken,
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	// Invalidate cache
@@ -148,25 +194,63 @@ func (s *DeviceService) GetActiveDevice(
 
 // UnbindDevice removes a device binding
 func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) error {
-	// Get device before unbinding for history ✅ ADD THIS
+	startTime := time.Now()
+
+	// Get device before unbinding for history
 	device, err := s.deviceRepo.GetActiveDevice(ctx, userID)
 	if err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       userID.String(),
+				Action:       "unbind",
+				Status:       "failed",
+				ErrorCode:    "GET_DEVICE_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 		return fmt.Errorf("failed to get active device: %w", err)
 	}
 
 	if err := s.deviceRepo.UnbindUserDevice(ctx, userID); err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil && device != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       userID.String(),
+				DeviceID:     device.DeviceID,
+				Action:       "unbind",
+				Status:       "failed",
+				ErrorCode:    "UNBIND_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 		return fmt.Errorf("failed to unbind device: %w", err)
 	}
 
-	// Record unbind in history ✅ ADD THIS
+	// Record unbind in history
 	if device != nil && s.historyRepo != nil {
 		if err := s.historyRepo.RecordBinding(ctx, userID, device.DeviceID, nil, device.BindToken, "unbind"); err != nil {
 			s.logger.Warn("Failed to record unbind in history",
 				util.ErrorField(err),
 				util.String("user_id", userID.String()),
 				util.String("device_id", device.DeviceID))
-			// Don't fail the request if history recording fails
 		}
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil && device != nil {
+		event := &models.DeviceLogEvent{
+			UserID:   userID.String(),
+			DeviceID: device.DeviceID,
+			Action:   "unbind",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	// Invalidate cache
@@ -184,8 +268,34 @@ func (s *DeviceService) UpdateDeviceSession(
 	ctx context.Context,
 	userID, sessionID uuid.UUID,
 ) error {
+	startTime := time.Now()
+
 	if err := s.deviceRepo.UpdateDeviceSession(ctx, userID, sessionID); err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       userID.String(),
+				Action:       "update_session",
+				Status:       "failed",
+				ErrorCode:    "UPDATE_SESSION_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 		return fmt.Errorf("failed to update device session: %w", err)
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil {
+		event := &models.DeviceLogEvent{
+			UserID:    userID.String(),
+			Action:    "update_session",
+			Status:    "success",
+			SessionID: sessionID.String(),
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	// Invalidate cache
@@ -202,6 +312,8 @@ func (s *DeviceService) ValidateDevice(
 	ctx context.Context,
 	req ValidateDeviceRequest,
 ) (*ValidateDeviceResponse, error) {
+	startTime := time.Now()
+
 	isValid, err := s.deviceRepo.ValidateDeviceBinding(
 		ctx,
 		req.UserID,
@@ -209,22 +321,59 @@ func (s *DeviceService) ValidateDevice(
 		req.BindToken,
 	)
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate device: %w", err)
-	}
-
 	response := &ValidateDeviceResponse{
 		IsValid: isValid,
 	}
 
+	if err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       req.UserID.String(),
+				DeviceID:     req.DeviceID,
+				Action:       "validate",
+				Status:       "failed",
+				ErrorCode:    "VALIDATION_ERROR",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+		return nil, fmt.Errorf("failed to validate device: %w", err)
+	}
+
 	if !isValid {
 		response.Message = "Invalid device binding"
+		// ✅ Log validation failure
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:    req.UserID.String(),
+				DeviceID:  req.DeviceID,
+				Action:    "validate",
+				Status:    "failed",
+				ErrorCode: "INVALID_BINDING",
+				Duration:  int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+	} else {
+		// ✅ Log validation success
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:   req.UserID.String(),
+				DeviceID: req.DeviceID,
+				Action:   "validate",
+				Status:   "success",
+				Duration: int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 	}
 
 	return response, nil
 }
 
-// GetDeviceBindingHistory retrieves device history from history table ✅ UPDATED
+// GetDeviceBindingHistory retrieves device history from history table
 func (s *DeviceService) GetDeviceBindingHistory(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -248,7 +397,7 @@ func (s *DeviceService) GetDeviceBindingHistory(
 	return []*models.UserActiveDevice{device}, nil
 }
 
-// GetUsersByDevice finds all users for a device ✅ UPDATED
+// GetUsersByDevice finds all users for a device
 func (s *DeviceService) GetUsersByDevice(
 	ctx context.Context,
 	deviceID string,
@@ -267,10 +416,33 @@ func (s *DeviceService) CleanupOrphanedDevices(
 	ctx context.Context,
 	olderThan time.Duration,
 ) (int, error) {
+	startTime := time.Now()
+
 	cutoffTime := time.Now().Add(-olderThan)
 	count, err := s.deviceRepo.CleanupOrphanedDevices(ctx, cutoffTime)
 	if err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				Action:       "cleanup_orphaned",
+				Status:       "failed",
+				ErrorCode:    "CLEANUP_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
 		return 0, fmt.Errorf("failed to cleanup orphaned devices: %w", err)
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil && count > 0 {
+		event := &models.DeviceLogEvent{
+			Action:   "cleanup_orphaned",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	s.logger.Info("Cleaned up orphaned devices",
@@ -280,7 +452,7 @@ func (s *DeviceService) CleanupOrphanedDevices(
 	return count, nil
 }
 
-// HealthCheck checks service health ✅ UPDATED
+// HealthCheck checks service health
 func (s *DeviceService) HealthCheck(ctx context.Context) error {
 	if err := s.deviceRepo.HealthCheck(ctx); err != nil {
 		return err

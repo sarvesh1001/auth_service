@@ -1,3 +1,4 @@
+// File: internal/handler/device_handler.go
 package handler
 
 import (
@@ -20,8 +21,18 @@ type DeviceHandler struct {
     logger        *zap.Logger
 }
 
-// NewDeviceHandler creates a new device handler
-func NewDeviceHandler(deviceService *service.DeviceService, logger *zap.Logger) *DeviceHandler {
+// ✅ UPDATE CONSTRUCTOR: Add LogProducerService parameter
+func NewDeviceHandler(
+    deviceService *service.DeviceService, 
+    logProducer *service.LogProducerService, // ✅ ADD THIS
+    logger *zap.Logger,
+) *DeviceHandler {
+    
+    // ✅ SET LOG PRODUCER ON SERVICE
+    if logProducer != nil {
+        deviceService.SetLogProducerService(logProducer)
+    }
+    
     return &DeviceHandler{
         deviceService: deviceService,
         logger:        logger,
@@ -43,6 +54,7 @@ func (h *DeviceHandler) RegisterRoutes(r chi.Router) {
     })
 }
 
+// ... rest of the handler methods remain the same ...
 // BindDevice handles device binding
 func (h *DeviceHandler) BindDevice(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()

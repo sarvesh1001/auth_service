@@ -1,4 +1,6 @@
-// internal/factory/factory.go - REFACTORED
+// File: internal/factory/factory.go - FULLY FIXED BUILD ERROR
+// ✅ FIXED: ESConsumer now returns (consumer, error) - handle both values
+
 package factory
 
 import (
@@ -10,6 +12,7 @@ import (
 	"auth-service/internal/bucketing"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
+	"auth-service/internal/consumer"
 	"auth-service/internal/encryption"
 	"auth-service/internal/hashing"
 	"auth-service/internal/repository/redis"
@@ -49,17 +52,61 @@ type Factory struct {
 	deviceRepository  scylla.DeviceRepository
 	deviceService     *service.DeviceService
 	deviceHistoryRepo *scylla.DeviceHistoryRepositoryImpl
+	kafkaLoggingMgr   *KafkaLoggingManager
 
 	// ✅ Admin repositories and services
-	adminRepository  scylla.AdminRepository
-	adminService     *service.AdminService
+	adminRepository scylla.AdminRepository
+	adminService    *service.AdminService
 
-	// ❌ REMOVED: Audit repositories and services
-	// auditRepository  scylla.AuditRepository
-	// auditService     *service.AuditService
-
-	logger            *zap.Logger
+	logger *zap.Logger
 }
+
+// ============================================================================
+// KAFKA LOGGING MANAGER STRUCT
+// ============================================================================
+
+type KafkaLoggingManager struct {
+	producer   *service.LogProducerService
+	esConsumer *consumer.ESConsumer
+	chConsumer *consumer.ClickHouseConsumer
+	cancelCtx  context.CancelFunc
+	wg         sync.WaitGroup
+	logger     *zap.Logger
+}
+
+func (m *KafkaLoggingManager) Shutdown() error {
+	if m == nil {
+		return nil
+	}
+
+	m.logger.Info("Shutting down Kafka logging manager...")
+
+	// Cancel the context to stop consumers
+	if m.cancelCtx != nil {
+		m.cancelCtx()
+	}
+
+	// Wait for consumers to finish
+	m.wg.Wait()
+
+	// Close the producer
+	if m.producer != nil {
+		if err := m.producer.Close(); err != nil {
+			m.logger.Error("Failed to close log producer", zap.Error(err))
+		}
+	}
+
+	m.logger.Info("Kafka logging manager shut down successfully")
+	return nil
+}
+
+func (m *KafkaLoggingManager) GetLogProducerService() *service.LogProducerService {
+	return m.producer
+}
+
+// ============================================================================
+// FACTORY INITIALIZATION
+// ============================================================================
 
 func NewFactory() (*Factory, error) {
 	cfg := config.LoadConfig()
@@ -91,14 +138,130 @@ func NewFactory() (*Factory, error) {
 	}
 	f.initializeManagers()
 
+	// ✅ ADD THIS - Initialize Kafka logging after all clients are ready
+	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
+	if err != nil {
+		logger.Error("failed to initialize Kafka logging", zap.Error(err))
+		// Don't fail - logging should not break service startup
+	}
+	f.kafkaLoggingMgr = kafkaLoggingMgr
+
 	util.Info("Factory initialized successfully",
 		util.String("environment", cfg.Environment),
 		util.Bool("tls_enabled", cfg.Server.EnableTLS),
 		util.Bool("kms_enabled", cfg.KMS.Enabled),
+		util.Bool("kafka_logging_enabled", f.kafkaLoggingMgr != nil),
 	)
 
 	return f, nil
 }
+
+// ============================================================================
+// KAFKA LOGGING INITIALIZATION
+// ============================================================================
+
+// InitializeKafkaLogging sets up Kafka producer and consumers
+// Call this AFTER all clients are initialized
+func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
+	logger := util.Get()
+
+	if len(f.config.Kafka.Brokers) == 0 {
+		logger.Warn("Kafka brokers not configured, logging to stdout only")
+		return nil, nil
+	}
+
+	kafkaProducer, err := client.NewKafkaProducer(f.config, logger)
+	if err != nil {
+		logger.Error("failed to initialize Kafka producer", zap.Error(err))
+		return nil, err
+	}
+
+	logProducer := service.NewLogProducerService(
+		kafkaProducer,
+		f.config.Environment,
+		"v1.0.0", // ✅ FIXED - config has no Version field
+	)
+
+	consumerCtx, cancel := context.WithCancel(context.Background())
+
+	mgr := &KafkaLoggingManager{
+		producer:  logProducer,
+		cancelCtx: cancel,
+		logger:    logger,
+	}
+
+	// ✅ Elasticsearch Consumer
+	// ⚠️ FIXED: NewESConsumer now returns (consumer, error)
+	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
+		kafkaConsumerES, err := client.NewKafkaConsumer(
+			f.config,
+			"otp-events",
+			"es-consumer-group",
+			logger,
+		)
+		if err == nil {
+			// ✅ FIXED: Handle error return from NewESConsumer
+			esConsumer, err := consumer.NewESConsumer(kafkaConsumerES, f.esClient.Client)
+			if err != nil {
+				logger.Error("failed to create Elasticsearch consumer", zap.Error(err))
+			} else {
+				mgr.esConsumer = esConsumer
+
+				mgr.wg.Add(1)
+				go func() {
+					defer mgr.wg.Done()
+					if err := esConsumer.Start(consumerCtx); err != nil {
+						logger.Error("ES consumer error", zap.Error(err))
+					}
+				}()
+				logger.Info("Elasticsearch consumer started")
+			}
+		} else {
+			logger.Error("failed to create Elasticsearch Kafka consumer", zap.Error(err))
+		}
+	}
+
+	// ✅ ClickHouse Consumer
+	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
+		kafkaConsumerCH, err := client.NewKafkaConsumer(
+			f.config,
+			"otp-events",
+			"ch-consumer-group",
+			logger,
+		)
+		if err == nil {
+			chConsumer := consumer.NewClickHouseConsumer(
+				kafkaConsumerCH,
+				f.clickhouseClient.Conn(), // ✅ return underlying clickhouse.Conn
+				1000,
+				5*time.Second,
+			)
+			mgr.chConsumer = chConsumer
+
+			mgr.wg.Add(1)
+			go func() {
+				defer mgr.wg.Done()
+				if err := chConsumer.Start(consumerCtx); err != nil {
+					logger.Error("ClickHouse consumer error", zap.Error(err))
+				}
+			}()
+			logger.Info("ClickHouse consumer started")
+		} else {
+			logger.Error("failed to create ClickHouse Kafka consumer", zap.Error(err))
+		}
+	}
+
+	logger.Info("Kafka logging system initialized",
+		zap.Bool("es_enabled", mgr.esConsumer != nil),
+		zap.Bool("ch_enabled", mgr.chConsumer != nil),
+	)
+
+	return mgr, nil
+}
+
+// ============================================================================
+// CLIENT INITIALIZATION
+// ============================================================================
 
 func (f *Factory) initializeClients() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -191,6 +354,18 @@ func (f *Factory) initializeManagers() {
 	)
 }
 
+// ============================================================================
+// LOG PRODUCER SERVICE GETTER
+// ============================================================================
+
+// GetLogProducerService returns the log producer service for use in handlers/services
+func (f *Factory) GetLogProducerService() *service.LogProducerService {
+	if f.kafkaLoggingMgr == nil {
+		return nil
+	}
+	return f.kafkaLoggingMgr.GetLogProducerService()
+}
+
 // ========================================================================
 // REPOSITORY GETTERS
 // ========================================================================
@@ -274,16 +449,14 @@ func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryIm
 
 // AdminRepository returns the admin repository
 func (f *Factory) AdminRepository() scylla.AdminRepository {
-    if f.adminRepository == nil {
-        f.adminRepository = scylla.NewAdminRepository(
-            f.ScyllaClient(),
-            f.logger,
-        )
-    }
-    return f.adminRepository
+	if f.adminRepository == nil {
+		f.adminRepository = scylla.NewAdminRepository(
+			f.ScyllaClient(),
+			f.logger,
+		)
+	}
+	return f.adminRepository
 }
-
-// ❌ REMOVED: AuditRepository getter completely
 
 // ========================================================================
 // SERVICE GETTERS
@@ -388,7 +561,7 @@ func (f *Factory) GetSessionService() *service.SessionService {
 	return f.sessionService
 }
 
-// ✅ DEVICE SERVICE WITH HISTORY
+// ✅ DEVICE SERVICE WITH HISTORY AND LOG PRODUCER
 func (f *Factory) GetDeviceService() *service.DeviceService {
 	if f.deviceService == nil {
 		deviceRepo := f.DeviceRepository()
@@ -410,6 +583,12 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 		// ✅ SET HISTORY REPOSITORY
 		historyRepo := f.GetDeviceHistoryRepository()
 		f.deviceService.SetHistoryRepository(historyRepo)
+
+		// ✅ SET LOG PRODUCER
+		logProducer := f.GetLogProducerService()
+		if logProducer != nil {
+			f.deviceService.SetLogProducerService(logProducer)
+		}
 	}
 	return f.deviceService
 }
@@ -421,20 +600,18 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 // GetAdminService returns the admin service
 // ✅ REFACTORED - Removed audit repository dependency
 func (f *Factory) GetAdminService() *service.AdminService {
-    if f.adminService == nil {
-        f.adminService = service.NewAdminService(
-            f.AdminRepository(),
-            f.UserRepository(),
-			f.GetSessionService(),    // ✅ ADD THIS LINE - SessionService dependency
-            f.Hasher(),              // ✅ ADDED: Missing argument
-            f.EncryptionManager(),   // ✅ ADDED: Missing argument
-            f.logger,
-        )
-    }
-    return f.adminService
+	if f.adminService == nil {
+		f.adminService = service.NewAdminService(
+			f.AdminRepository(),
+			f.UserRepository(),
+			f.GetSessionService(), // ✅ ADD THIS LINE - SessionService dependency
+			f.Hasher(),            // ✅ ADDED: Missing argument
+			f.EncryptionManager(), // ✅ ADDED: Missing argument
+			f.logger,
+		)
+	}
+	return f.adminService
 }
-
-// ❌ REMOVED: GetAuditService completely
 
 // ========================================================================
 // HEALTH CHECK
@@ -543,19 +720,25 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_repository"] = fmt.Errorf("admin repository not initialized")
 	}
 
-	// ❌ REMOVED: Audit repository health check
-
 	return errs
 }
 
 // ========================================================================
-// CLEANUP
+// CLEANUP - UPDATED WITH KAFKA LOGGING SHUTDOWN
 // ========================================================================
 
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)
 		util.Info("Shutting down factory...")
+
+		// ✅ ADD THIS - Shutdown Kafka logging first
+		if f.kafkaLoggingMgr != nil {
+			if err := f.kafkaLoggingMgr.Shutdown(); err != nil {
+				util.Error("Failed to shutdown Kafka logging", util.ErrorField(err))
+			}
+			util.Info("Kafka logging system shut down")
+		}
 
 		if f.clickhouseClient != nil {
 			f.clickhouseClient.Close()
@@ -603,8 +786,8 @@ func (f *Factory) Close() error {
 // ========================================================================
 
 func (f *Factory) Config() *config.Config                           { return f.config }
-func (f *Factory) TLSManager() *tls.TLSManager                       { return f.tlsManager }
-func (f *Factory) ScyllaClient() *scylla.ScyllaClient                { return f.scyllaClient }
-func (f *Factory) Hasher() *hashing.Hasher                           { return f.hasher }
+func (f *Factory) TLSManager() *tls.TLSManager                      { return f.tlsManager }
+func (f *Factory) ScyllaClient() *scylla.ScyllaClient               { return f.scyllaClient }
+func (f *Factory) Hasher() *hashing.Hasher                          { return f.hasher }
 func (f *Factory) EncryptionManager() *encryption.EncryptionManager { return f.encryptionManager }
-func (f *Factory) BucketingManager() *bucketing.BucketingManager     { return f.bucketingManager }
+func (f *Factory) BucketingManager() *bucketing.BucketingManager    { return f.bucketingManager }

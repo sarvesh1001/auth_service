@@ -36,12 +36,16 @@ func main() {
 	otpHandler := handler.NewOTPHandler(f.GetOTPService(), logger)
 	mpinHandler := handler.NewMPINHandler(f.GetMPINService(), logger)
 	sessionHandler := handler.NewSessionHandler(f.GetSessionService(), logger)
-	deviceHandler := handler.NewDeviceHandler(f.GetDeviceService(), logger)
+	
+	// ✅ UPDATED: Device handler with LogProducerService
+	deviceHandler := handler.NewDeviceHandler(
+		f.GetDeviceService(), 
+		f.GetLogProducerService(), // ✅ ADD THIS LINE
+		logger,
+	)
 
 	// ✅ FIXED: Pass pointers directly (services already return pointers)
 	adminHandler := handler.NewAdminHandler(f.GetAdminService(), logger)
-
-	// ❌ REMOVED: auditHandler creation
 
 	// ✅ GET SESSION SERVICE FOR MIDDLEWARE
 	sessionService := f.GetSessionService()
@@ -109,6 +113,7 @@ func main() {
 	startServer(f, server, cfg)
 }
 
+// ... rest of the file remains the same ...
 // startProductionServerWithAutoCert starts HTTP redirect and HTTPS with autocert
 func startProductionServerWithAutoCert(f *factory.Factory, server *http.Server, cfg *config.Config, router http.Handler) {
 	tlsMgr := f.TLSManager()
@@ -168,6 +173,7 @@ func startServer(f *factory.Factory, server *http.Server, cfg *config.Config) {
 		util.String("environment", cfg.Environment),
 		util.Bool("tls_enabled", cfg.Server.EnableTLS),
 		util.String("address", server.Addr),
+		util.Bool("kafka_logging_enabled", f.GetLogProducerService() != nil),
 	)
 
 	waitForShutdown(f, server)

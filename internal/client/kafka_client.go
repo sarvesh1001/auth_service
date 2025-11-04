@@ -1,8 +1,11 @@
+// File: client/kafka.go (FIXED)
+// Kafka producer and consumer clients
+// ✅ FIXED: Removed health-check topic pollution, proper connectivity check
+
 package client
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"time"
 
@@ -47,17 +50,11 @@ func NewKafkaProducer(cfg *config.Config, logger *zap.Logger) (*KafkaProducer, e
 		},
 	}
 
-	// Test connectivity with health check
+	// ✅ FIXED: Proper connectivity check without topic pollution
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := writer.WriteMessages(ctx, kafka.Message{
-		Topic: "health-check",
-		Key:   []byte("test"),
-		Value: []byte("health check message"),
-	})
-
-	if err != nil && !isConnectivityError(err) {
+	if err := healthCheckKafka(ctx, kafkaConfig.Brokers[0]); err != nil {
 		return nil, fmt.Errorf("failed to connect to Kafka brokers: %w", err)
 	}
 
@@ -67,7 +64,7 @@ func NewKafkaProducer(cfg *config.Config, logger *zap.Logger) (*KafkaProducer, e
 
 	return &KafkaProducer{
 		Writer: writer,
-		config: cfg, // Store full config, not just Kafka config
+		config: cfg,
 		logger: logger,
 	}, nil
 }
@@ -96,7 +93,7 @@ func NewKafkaConsumer(cfg *config.Config, topic string, groupID string, logger *
 
 	return &KafkaConsumer{
 		Reader: reader,
-		config: cfg, // Store full config, not just Kafka config
+		config: cfg,
 		logger: logger,
 	}, nil
 }
@@ -168,32 +165,29 @@ func (c *KafkaConsumer) ConsumeMessage(ctx context.Context) (*kafka.Message, err
 	return &msg, nil
 }
 
+// ✅ FIXED: Proper health check without creating topics
 func (p *KafkaProducer) HealthCheck(ctx context.Context) error {
+	return healthCheckKafka(ctx, p.config.Kafka.Brokers[0])
+}
+
+// ✅ FIXED: Proper Kafka connectivity check using Dialer
+func healthCheckKafka(ctx context.Context, broker string) error {
 	dialer := &kafka.Dialer{
-		TLS: &tls.Config{
-			// Use the stored config's environment check
-			InsecureSkipVerify: p.config.IsDevelopment(),
-		},
 		Timeout:   5 * time.Second,
 		DualStack: true,
 	}
 
-	conn, err := dialer.DialContext(ctx, "tcp", p.config.Kafka.Brokers[0])
+	conn, err := dialer.DialContext(ctx, "tcp", broker)
 	if err != nil {
-		return fmt.Errorf("failed to connect to kafka broker (TLS dialer): %w", err)
+		return fmt.Errorf("failed to connect to kafka broker: %w", err)
 	}
 	defer conn.Close()
 
+	// Read partitions to verify connectivity
 	_, err = conn.ReadPartitions()
 	if err != nil {
 		return fmt.Errorf("failed to read Kafka partitions: %w", err)
 	}
-	return nil
-}
 
-func isConnectivityError(err error) bool {
-	return err != nil &&
-		(err.Error() == "leader not available" ||
-			err.Error() == "topic authorization failed" ||
-			err.Error() == "unknown topic or partition")
+	return nil
 }

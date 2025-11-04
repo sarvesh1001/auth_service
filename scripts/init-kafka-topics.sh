@@ -1,0 +1,150 @@
+#!/bin/bash
+# ===============================================
+# File: scripts/init-kafka-topics.sh
+# Purpose: Automatically create all required Kafka topics on startup
+# ===============================================
+
+set -e
+
+echo "🔧 Starting Kafka topics initialization..."
+
+# Configuration from environment or defaults
+KAFKA_HOST="${KAFKA_HOST:-kafka}"
+KAFKA_PORT="${KAFKA_PORT:-9092}"
+KAFKA_BOOTSTRAP_SERVER="${KAFKA_BOOTSTRAP_SERVER:-$KAFKA_HOST:$KAFKA_PORT}"
+
+# Validate configuration
+if [ -z "$KAFKA_BOOTSTRAP_SERVER" ]; then
+    echo "❌ KAFKA_BOOTSTRAP_SERVER not set"
+    exit 1
+fi
+
+# Wait for Kafka to be ready with better connection test
+echo "⏳ Waiting for Kafka to be ready at $KAFKA_BOOTSTRAP_SERVER..."
+MAX_ATTEMPTS=30
+ATTEMPT=1
+while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+    # Use timeout to prevent hanging
+    if timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list > /dev/null 2>&1; then
+        echo "✅ Kafka is ready!"
+        break
+    fi
+
+    echo "   Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+    if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+        echo "❌ Failed to connect to Kafka after $MAX_ATTEMPTS attempts"
+        exit 1
+    fi
+
+    sleep 2
+    ATTEMPT=$((ATTEMPT + 1))
+done
+
+# -----------------------------------------------
+# Helper: create topic safely
+# -----------------------------------------------
+create_topic() {
+    local topic=$1
+    local partitions=${2:-3}
+    local replication_factor=${3:-1}
+    local retention_ms=${4:-2592000000}  # 30 days
+    local compression=${5:-gzip}
+
+    echo "📝 Creating topic: $topic (partitions=$partitions, retention=${retention_ms}ms)"
+
+    # Check if topic exists with timeout
+    if timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list 2>/dev/null | grep -q "^${topic}$"; then
+        echo "   ✅ Topic already exists, skipping"
+        return 0
+    fi
+
+    local retry=0
+    local max_retries=3
+    
+    while [ $retry -lt $max_retries ]; do
+        if timeout 15s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" \
+            --create \
+            --topic "$topic" \
+            --partitions "$partitions" \
+            --replication-factor "$replication_factor" \
+            --config "retention.ms=$retention_ms" \
+            --config "compression.type=$compression" \
+            --config "cleanup.policy=delete" \
+            --config "segment.ms=86400000" \
+            --config "min.insync.replicas=1" \
+            --config "retention.bytes=-1" \
+            --config "max.message.bytes=1048588" \
+            2>&1; then
+            echo "   ✅ Created successfully"
+            return 0
+        fi
+
+        retry=$((retry + 1))
+        echo "   ⚠️  Attempt $retry failed, retrying..."
+        sleep 3
+    done
+
+    echo "   ❌ Failed to create topic $topic after $max_retries attempts"
+    return 1
+}
+
+echo ""
+echo "🚀 Creating Kafka topics..."
+echo ""
+
+# -----------------------------------------------
+# Create all required topics with custom configurations
+# -----------------------------------------------
+declare -A TOPIC_CONFIGS=(
+    # Topic: [partitions, replication, retention_ms, compression]
+    ["otp-events"]="3 1 604800000 gzip"           # 7 days retention
+    ["mpin-events"]="3 1 2592000000 gzip"        # 30 days
+    ["security-events"]="3 1 7776000000 gzip"    # 90 days
+    ["admin-events"]="3 1 15552000000 gzip"      # 180 days
+    ["session-events"]="3 1 604800000 gzip"      # 7 days
+    ["user-events"]="3 1 2592000000 gzip"        # 30 days
+    ["device-events"]="3 1 2592000000 gzip"      # 30 days
+)
+
+FAILED_TOPICS=()
+
+for topic in "${!TOPIC_CONFIGS[@]}"; do
+    config=(${TOPIC_CONFIGS[$topic]})
+    if ! create_topic "$topic" "${config[0]}" "${config[1]}" "${config[2]}" "${config[3]}"; then
+        FAILED_TOPICS+=("$topic")
+    fi
+    echo ""
+done
+
+echo "📊 Verifying topics..."
+echo ""
+
+# -----------------------------------------------
+# Verify topic creation with detailed info
+# -----------------------------------------------
+TOPICS=$(timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list 2>/dev/null)
+
+ALL_SUCCESS=true
+for topic in "${!TOPIC_CONFIGS[@]}"; do
+    if echo "$TOPICS" | grep -q "^${topic}$"; then
+        echo "✅ $topic"
+    else
+        echo "❌ $topic - MISSING"
+        ALL_SUCCESS=false
+    fi
+done
+
+echo ""
+
+if [ "$ALL_SUCCESS" = true ]; then
+    echo "✅ All Kafka topics created successfully!"
+    echo ""
+    echo "📋 Topic Configuration Summary:"
+    timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --describe 2>/dev/null | head -30
+    echo "🎉 Kafka topic initialization completed!"
+    exit 0
+else
+    echo "❌ Some topics failed to create: ${FAILED_TOPICS[*]}"
+    echo "⚠️  Continuing startup, but some features may not work properly"
+    exit 1
+fi
