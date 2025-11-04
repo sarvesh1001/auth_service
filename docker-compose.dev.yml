@@ -262,36 +262,36 @@ services:
     networks:
       - dev-net
 
-  # ===============================
-  # ClickHouse + ES Consumer
-  # ===============================
-  clickhouse-es-consumer:
-    build:
-      context: .
-      dockerfile: scripts/consumer/Dockerfile
-    container_name: clickhouse-es-consumer
-    depends_on:
-      kafka:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-      elasticsearch:
-        condition: service_healthy
-      kafka-topic-init:
-        condition: service_completed_successfully
-    env_file:
-      - .env
-    environment:
-      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
-      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-clickhouse:9000}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-auth_svc_user}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-Vu8eeS4ahtha3Aithae1ie2IeMae4ee1oo1o}
-      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-auth_analytics}
-      ES_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
-    command: ["/consumer", "-duration", "0"]
-    restart: unless-stopped
-    networks:
-      - dev-net
+  # # ===============================
+  # # ClickHouse + ES Consumer
+  # # ===============================
+  # clickhouse-es-consumer:
+  #   build:
+  #     context: .
+  #     dockerfile: scripts/consumer/Dockerfile
+  #   container_name: clickhouse-es-consumer
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     clickhouse:
+  #       condition: service_healthy
+  #     elasticsearch:
+  #       condition: service_healthy
+  #     kafka-topic-init:
+  #       condition: service_completed_successfully
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+  #     CLICKHOUSE_URL: ${CLICKHOUSE_URL:-clickhouse:9000}
+  #     CLICKHOUSE_USER: ${CLICKHOUSE_USER:-auth_svc_user}
+  #     CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-Vu8eeS4ahtha3Aithae1ie2IeMae4ee1oo1o}
+  #     CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-auth_analytics}
+  #     ES_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
+  #   command: ["/consumer", "-duration", "0"]
+  #   restart: unless-stopped
+  #   networks:
+  #     - dev-net
 
 # =============================== 
 # Volumes & Networks

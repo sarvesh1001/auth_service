@@ -1,6 +1,5 @@
-// File: client/kafka.go (FIXED)
-// Kafka producer and consumer clients
-// ✅ FIXED: Removed health-check topic pollution, proper connectivity check
+// File: internal/client/kafka_client.go (FIXED - Manual Commit Control)
+// ✅ CRITICAL FIX: Changed from auto-commit ReadMessage to manual FetchMessage + CommitMessages
 
 package client
 
@@ -36,7 +35,7 @@ func NewKafkaProducer(cfg *config.Config, logger *zap.Logger) (*KafkaProducer, e
 		Balancer:     &kafka.LeastBytes{},
 		MaxAttempts:  3,
 		BatchSize:    100,
-		BatchBytes:   1048576, // 1MB
+		BatchBytes:   1048576,
 		BatchTimeout: 10 * time.Millisecond,
 		RequiredAcks: kafka.RequireOne,
 		Async:        false,
@@ -50,7 +49,6 @@ func NewKafkaProducer(cfg *config.Config, logger *zap.Logger) (*KafkaProducer, e
 		},
 	}
 
-	// ✅ FIXED: Proper connectivity check without topic pollution
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -78,14 +76,14 @@ func NewKafkaConsumer(cfg *config.Config, topic string, groupID string, logger *
 		GroupID:        groupID,
 		MinBytes:       10e3,
 		MaxBytes:       10e6,
-		CommitInterval: time.Second,
+		CommitInterval: 0, // ✅ CRITICAL: Disable auto-commit, we'll commit manually
 		StartOffset:    kafka.FirstOffset,
 		MaxWait:        5 * time.Second,
 		ReadBackoffMin: 100 * time.Millisecond,
 		ReadBackoffMax: 1 * time.Second,
 	})
 
-	logger.Info("Kafka consumer initialized",
+	logger.Info("Kafka consumer initialized with manual commit",
 		zap.Strings("brokers", kafkaConfig.Brokers),
 		zap.String("topic", topic),
 		zap.String("group_id", groupID),
@@ -149,28 +147,73 @@ func (p *KafkaProducer) ProduceMessage(ctx context.Context, topic string, key, v
 	return nil
 }
 
+// ✅ CRITICAL FIX: Changed from ReadMessage (auto-commit) to FetchMessage (manual commit)
 func (c *KafkaConsumer) ConsumeMessage(ctx context.Context) (*kafka.Message, error) {
-	msg, err := c.Reader.ReadMessage(ctx)
+	msg, err := c.Reader.FetchMessage(ctx) // Fetch WITHOUT committing
 	if err != nil {
-		return nil, fmt.Errorf("failed to read kafka message: %w", err)
+		return nil, fmt.Errorf("failed to fetch kafka message: %w", err)
 	}
 
-	c.logger.Debug("Consumed kafka message",
+	c.logger.Debug("Fetched kafka message (not yet committed)",
 		zap.String("topic", msg.Topic),
 		zap.ByteString("key", msg.Key),
 		zap.Int("value_size", len(msg.Value)),
+		zap.Int64("offset", msg.Offset),
 		zap.Time("time", msg.Time),
 	)
 
 	return &msg, nil
 }
 
-// ✅ FIXED: Proper health check without creating topics
+// ✅ NEW: Explicit commit method - call ONLY after successful processing
+func (c *KafkaConsumer) CommitMessage(ctx context.Context, msg *kafka.Message) error {
+	if msg == nil {
+		return fmt.Errorf("cannot commit nil message")
+	}
+
+	if err := c.Reader.CommitMessages(ctx, *msg); err != nil {
+		return fmt.Errorf("failed to commit kafka message: %w", err)
+	}
+
+	c.logger.Debug("Committed kafka message",
+		zap.String("topic", msg.Topic),
+		zap.Int64("offset", msg.Offset),
+		zap.Int("partition", msg.Partition),
+	)
+
+	return nil
+}
+
+// ✅ NEW: Batch commit for efficiency
+func (c *KafkaConsumer) CommitMessages(ctx context.Context, msgs ...*kafka.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	// Convert to value slice for CommitMessages
+	valueMsgs := make([]kafka.Message, len(msgs))
+	for i, msg := range msgs {
+		if msg == nil {
+			continue
+		}
+		valueMsgs[i] = *msg
+	}
+
+	if err := c.Reader.CommitMessages(ctx, valueMsgs...); err != nil {
+		return fmt.Errorf("failed to commit %d messages: %w", len(msgs), err)
+	}
+
+	c.logger.Debug("Committed message batch",
+		zap.Int("count", len(msgs)),
+	)
+
+	return nil
+}
+
 func (p *KafkaProducer) HealthCheck(ctx context.Context) error {
 	return healthCheckKafka(ctx, p.config.Kafka.Brokers[0])
 }
 
-// ✅ FIXED: Proper Kafka connectivity check using Dialer
 func healthCheckKafka(ctx context.Context, broker string) error {
 	dialer := &kafka.Dialer{
 		Timeout:   5 * time.Second,
@@ -183,7 +226,6 @@ func healthCheckKafka(ctx context.Context, broker string) error {
 	}
 	defer conn.Close()
 
-	// Read partitions to verify connectivity
 	_, err = conn.ReadPartitions()
 	if err != nil {
 		return fmt.Errorf("failed to read Kafka partitions: %w", err)

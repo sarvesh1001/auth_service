@@ -1,5 +1,5 @@
 // File: internal/models/log_events.go
-// Kafka event models for logging system — SAFE VERSION (no duplicates)
+// Kafka event models for logging system — SIMPLIFIED VERSION (only used fields)
 
 package models
 
@@ -41,7 +41,7 @@ type LogEnvelope struct {
 	Message     string                 `json:"message"`
 }
 
-// OTPLogEvent - OTP specific logs (renamed to avoid conflict)
+// OTPLogEvent - OTP specific logs
 type OTPLogEvent struct {
 	LogEnvelope
 	UserID        string `json:"user_id"`
@@ -129,7 +129,7 @@ type UserLogEvent struct {
 	Duration    int64                  `json:"duration_ms,omitempty"`
 }
 
-// DeviceLogEvent - Device binding and validation logs
+// DeviceLogEvent - Device binding and validation logs (SIMPLIFIED - only used fields)
 type DeviceLogEvent struct {
 	LogEnvelope
 	UserID       string `json:"user_id"`

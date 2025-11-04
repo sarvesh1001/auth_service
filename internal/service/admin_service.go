@@ -626,3 +626,24 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
     // 5. Return both admin and session token
     return admin, session.SessionToken, nil
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

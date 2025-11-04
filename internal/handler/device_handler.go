@@ -3,8 +3,10 @@ package handler
 
 import (
     "encoding/json"
+    "net"
     "net/http"
     "strconv"
+    "strings"
     "time"
     
     "auth-service/internal/service"
@@ -54,7 +56,67 @@ func (h *DeviceHandler) RegisterRoutes(r chi.Router) {
     })
 }
 
-// ... rest of the handler methods remain the same ...
+// getClientIP extracts the client IP address from the request
+func (h *DeviceHandler) getClientIP(r *http.Request) string {
+    // Check for forwarded IP first (load balancer, proxy, etc.)
+    if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+        // X-Forwarded-For can be a list of IPs, take the first one
+        if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+            ip := strings.TrimSpace(ips[0])
+            // Validate IP format
+            if parsedIP := net.ParseIP(ip); parsedIP != nil {
+                return ip
+            }
+        }
+    }
+    
+    // Check for other common headers
+    if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+        if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+            return realIP
+        }
+    }
+    
+    if cfConnectingIP := r.Header.Get("CF-Connecting-IP"); cfConnectingIP != "" {
+        if parsedIP := net.ParseIP(cfConnectingIP); parsedIP != nil {
+            return cfConnectingIP
+        }
+    }
+    
+    // Check Forwarded header (RFC 7239)
+    if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
+        // Parse: for=192.0.2.60;proto=http;by=203.0.113.43
+        if strings.Contains(forwarded, "for=") {
+            parts := strings.Split(forwarded, ";")
+            for _, part := range parts {
+                part = strings.TrimSpace(part)
+                if strings.HasPrefix(part, "for=") {
+                    ip := strings.TrimPrefix(part, "for=")
+                    // Remove quotes and port if present
+                    ip = strings.Trim(ip, `"`)
+                    if idx := strings.LastIndex(ip, ":"); idx != -1 {
+                        // Check if it's a port (not IPv6)
+                        if !strings.Contains(ip, "]") {
+                            ip = ip[:idx]
+                        }
+                    }
+                    if parsedIP := net.ParseIP(ip); parsedIP != nil {
+                        return ip
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fall back to RemoteAddr
+    host, _, err := net.SplitHostPort(r.RemoteAddr)
+    if err != nil {
+        // If SplitHostPort fails, try to use RemoteAddr as-is
+        return r.RemoteAddr
+    }
+    return host
+}
+
 // BindDevice handles device binding
 func (h *DeviceHandler) BindDevice(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
@@ -66,6 +128,10 @@ func (h *DeviceHandler) BindDevice(w http.ResponseWriter, r *http.Request) {
         return
     }
     
+    // ✅ EXTRACT IP ADDRESS AND USER AGENT
+    req.IPAddress = h.getClientIP(r)
+    req.UserAgent = r.UserAgent()
+    
     response, err := h.deviceService.BindDevice(ctx, req)
     if err != nil {
         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to bind device")
@@ -76,6 +142,7 @@ func (h *DeviceHandler) BindDevice(w http.ResponseWriter, r *http.Request) {
     
     h.logger.Info("Device bound via HTTP",
         util.String("user_id", req.UserID.String()),
+        util.String("ip_address", req.IPAddress),
         util.Duration("duration", time.Since(startTime)))
 }
 
@@ -88,6 +155,9 @@ func (h *DeviceHandler) ValidateDevice(w http.ResponseWriter, r *http.Request) {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
         return
     }
+    
+    // ✅ EXTRACT IP ADDRESS
+    req.IPAddress = h.getClientIP(r)
     
     response, err := h.deviceService.ValidateDevice(ctx, req)
     if err != nil {
@@ -134,7 +204,10 @@ func (h *DeviceHandler) UnbindDevice(w http.ResponseWriter, r *http.Request) {
         return
     }
     
-    if err := h.deviceService.UnbindDevice(ctx, userID); err != nil {
+    // ✅ EXTRACT IP ADDRESS
+    ipAddress := h.getClientIP(r)
+    
+    if err := h.deviceService.UnbindDevice(ctx, userID, ipAddress); err != nil {
         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to unbind device")
         return
     }

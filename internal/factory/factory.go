@@ -220,21 +220,20 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 			logger.Error("failed to create Elasticsearch Kafka consumer", zap.Error(err))
 		}
 	}
-
 	// ✅ ClickHouse Consumer
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
 		kafkaConsumerCH, err := client.NewKafkaConsumer(
 			f.config,
-			"otp-events",
-			"ch-consumer-group",
+			"device-events", // Kafka topic name
+			"clickhouse-consumer-group", // group ID
 			logger,
 		)
 		if err == nil {
 			chConsumer := consumer.NewClickHouseConsumer(
 				kafkaConsumerCH,
-				f.clickhouseClient.Conn(), // ✅ return underlying clickhouse.Conn
-				1000,
-				5*time.Second,
+				f.clickhouseClient.Conn(), // clickhouse driver connection
+				1000,                      // batch size
+				5*time.Second,             // flush interval
 			)
 			mgr.chConsumer = chConsumer
 
@@ -245,11 +244,41 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 					logger.Error("ClickHouse consumer error", zap.Error(err))
 				}
 			}()
-			logger.Info("ClickHouse consumer started")
+			logger.Info("✅ ClickHouse consumer started")
 		} else {
 			logger.Error("failed to create ClickHouse Kafka consumer", zap.Error(err))
 		}
 	}
+
+	// ✅ ClickHouse Consumer
+	// if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
+	// 	kafkaConsumerCH, err := client.NewKafkaConsumer(
+	// 		f.config,
+	// 		"device-events",  // ✅ CHANGED THIS LINE
+	// 		"ch-consumer-group",
+	// 		logger,
+	// 	)
+	// 	if err == nil {
+	// 		chConsumer := consumer.NewClickHouseConsumer(
+	// 			kafkaConsumerCH,
+	// 			f.clickhouseClient.Conn(), // ✅ return underlying clickhouse.Conn
+	// 			1000,
+	// 			5*time.Second,
+	// 		)
+	// 		mgr.chConsumer = chConsumer
+
+	// 		mgr.wg.Add(1)
+	// 		go func() {
+	// 			defer mgr.wg.Done()
+	// 			if err := chConsumer.Start(consumerCtx); err != nil {
+	// 				logger.Error("ClickHouse consumer error", zap.Error(err))
+	// 			}
+	// 		}()
+	// 		logger.Info("ClickHouse consumer started")
+	// 	} else {
+	// 		logger.Error("failed to create ClickHouse Kafka consumer", zap.Error(err))
+	// 	}
+	// }
 
 	logger.Info("Kafka logging system initialized",
 		zap.Bool("es_enabled", mgr.esConsumer != nil),

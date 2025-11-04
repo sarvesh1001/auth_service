@@ -55,61 +55,7 @@ clickhouse-client $AUTH_STR --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" 
 CREATE DATABASE IF NOT EXISTS auth_analytics;
 
 -- ========================================================================
--- LEGACY AUTH TABLES
--- ========================================================================
-
-CREATE TABLE IF NOT EXISTS auth_analytics.auth_events (
-    event_date Date,
-    event_time DateTime64(3),
-    user_id UUID,
-    event_type String,
-    device_id String,
-    ip_address String,
-    risk_score UInt8,
-    session_id UUID,
-    processing_time_ms UInt32,
-    region String,
-    app_version String,
-    country_code String,
-    user_agent String
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(event_date)
-ORDER BY (event_date, event_type, user_id, device_id)
-TTL event_date + INTERVAL 90 DAY
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE IF NOT EXISTS auth_analytics.user_behavior (
-    event_date Date,
-    user_id UUID,
-    login_count UInt32,
-    failed_attempts UInt32,
-    devices Array(String),
-    locations Array(String),
-    avg_session_minutes Float32,
-    last_seen Date,
-    total_sessions UInt32
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(event_date)
-ORDER BY (event_date, user_id)
-TTL event_date + INTERVAL 365 DAY
-SETTINGS index_granularity = 8192;
-
-CREATE TABLE IF NOT EXISTS auth_analytics.fraud_signals (
-    detection_time DateTime,
-    user_id UUID,
-    signal_type String,
-    confidence Float32,
-    factors Array(String),
-    action_taken String,
-    severity UInt8
-) ENGINE = MergeTree()
-ORDER BY (detection_time, signal_type, user_id)
-PARTITION BY toYYYYMM(detection_time)
-TTL detection_time + INTERVAL 30 DAY
-SETTINGS index_granularity = 8192;
-
--- ========================================================================
--- KAFKA LOG EVENT TABLES
+-- KAFKA LOG EVENT TABLES - SIMPLIFIED TO MATCH ACTUAL USAGE
 -- ========================================================================
 
 CREATE TABLE IF NOT EXISTS auth_analytics.otp_events (
@@ -251,39 +197,32 @@ ORDER BY (timestamp, user_id, action)
 TTL timestamp + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
 
+DROP TABLE IF EXISTS auth_analytics.device_events;
+
 CREATE TABLE IF NOT EXISTS auth_analytics.device_events (
-    event_id String,
-    event_type String,
-    timestamp DateTime,
-    user_id String,
-    device_id String,
-    device_fingerprint String,
-    device_type Nullable(String),
-    device_os Nullable(String),
-    device_browser Nullable(String),
-    device_manufacturer Nullable(String),
-    device_model Nullable(String),
-    action String,
-    status String,
-    trust_level String,
-    ip_address Nullable(String),
-    location Nullable(String),
-    user_agent Nullable(String),
-    is_trusted UInt8,
-    trust_expiry DateTime NULL,
-    error_code Nullable(String),
+    event_id      String,
+    event_type    String,
+    timestamp     DateTime,
+    user_id       String,
+    device_id     String,
+    action        String,
+    status        String,
+    bind_token    Nullable(String),
+    error_code    Nullable(String),
     error_message Nullable(String),
-    duration_ms UInt64,
-    environment String,
-    version String,
-    message String,
-    service_name String
-) ENGINE = MergeTree()
+    ip_address    Nullable(String),
+    session_id    Nullable(String),
+    duration_ms   UInt64,
+    environment   String,
+    version       String,
+    message       String,
+    service_name  String
+)
+ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, user_id, device_id, action)
+ORDER BY (event_id)
 TTL timestamp + INTERVAL 30 DAY
 SETTINGS index_granularity = 8192;
-
 EOL
 
 echo "✅ Base tables created successfully!"
@@ -291,25 +230,57 @@ echo "📊 Creating materialized views..."
 
 clickhouse-client $AUTH_STR --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --multiquery <<'EOL'
 
--- (all other materialized views same as before...)
-
--- ✅ FIXED: Device Trust Analytics View (nullable key error fixed)
-CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.device_trust_analytics
+-- ✅ SIMPLIFIED: Device events daily summary (no trust analytics since we don't have that data)
+CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.device_events_daily
 ENGINE = SummingMergeTree()
 PARTITION BY toYYYYMM(event_date)
-ORDER BY (event_date, device_type, trust_level)
+ORDER BY (event_date, action, status)
 SETTINGS allow_nullable_key = 1 AS
 SELECT
     toDate(timestamp) AS event_date,
-    device_type,
-    trust_level,
+    action,
+    status,
     count() AS total_events,
-    countIf(action = 'trusted') AS trust_actions,
-    countIf(action = 'untrusted') AS untrust_actions,
-    countIf(is_trusted = 1) AS currently_trusted,
+    uniq(device_id) AS unique_devices,
+    uniq(user_id) AS unique_users,
+    avg(duration_ms) AS avg_duration_ms
+FROM auth_analytics.device_events
+GROUP BY event_date, action, status;
+
+-- ✅ Device binding success rate
+CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.device_binding_analytics
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, action)
+SETTINGS allow_nullable_key = 1 AS
+SELECT
+    toDate(timestamp) AS event_date,
+    action,
+    count() AS total_attempts,
+    countIf(status = 'success') AS success_count,
+    countIf(status = 'failed') AS failure_count,
+    uniq(user_id) AS unique_users
+FROM auth_analytics.device_events
+WHERE action IN ('bind', 'unbind', 'validate')
+GROUP BY event_date, action;
+
+-- ✅ IP-based device analytics
+CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.device_ip_analytics
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, ip_address, action)
+SETTINGS allow_nullable_key = 1 AS
+SELECT
+    toDate(timestamp) AS event_date,
+    ip_address,
+    action,
+    status,
+    count() AS total_events,
+    uniq(user_id) AS unique_users,
     uniq(device_id) AS unique_devices
 FROM auth_analytics.device_events
-GROUP BY event_date, device_type, trust_level;
+WHERE ip_address != ''
+GROUP BY event_date, ip_address, action, status;
 
 EOL
 

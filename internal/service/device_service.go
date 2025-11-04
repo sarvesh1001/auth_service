@@ -55,8 +55,10 @@ func (s *DeviceService) SetLogProducerService(logProducer *LogProducerService) {
 // Request/Response types
 
 type BindDeviceRequest struct {
-	UserID   uuid.UUID `json:"user_id" validate:"required"`
-	DeviceID string    `json:"device_id" validate:"required"`
+	UserID    uuid.UUID `json:"user_id" validate:"required"`
+	DeviceID  string    `json:"device_id" validate:"required"`
+	IPAddress string    `json:"ip_address,omitempty"`
+	UserAgent string    `json:"user_agent,omitempty"`
 }
 
 type BindDeviceResponse struct {
@@ -69,6 +71,7 @@ type ValidateDeviceRequest struct {
 	UserID    uuid.UUID `json:"user_id" validate:"required"`
 	DeviceID  string    `json:"device_id" validate:"required"`
 	BindToken string    `json:"bind_token" validate:"required"`
+	IPAddress string    `json:"ip_address,omitempty"`
 }
 
 type ValidateDeviceResponse struct {
@@ -95,6 +98,7 @@ func (s *DeviceService) BindDevice(
 				Status:       "failed",
 				ErrorCode:    "TOKEN_GENERATION_FAILED",
 				ErrorMessage: err.Error(),
+				IPAddress:    req.IPAddress,
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -113,6 +117,7 @@ func (s *DeviceService) BindDevice(
 				Status:       "failed",
 				ErrorCode:    "BIND_FAILED",
 				ErrorMessage: err.Error(),
+				IPAddress:    req.IPAddress,
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -139,6 +144,7 @@ func (s *DeviceService) BindDevice(
 			Action:    "bind",
 			Status:    "success",
 			BindToken: bindToken,
+			IPAddress: req.IPAddress,
 			Duration:  int64(time.Since(startTime).Milliseconds()),
 		}
 		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -153,6 +159,7 @@ func (s *DeviceService) BindDevice(
 	s.logger.Info("Device bound successfully",
 		util.String("user_id", req.UserID.String()),
 		util.String("device_id", req.DeviceID),
+		util.String("ip_address", req.IPAddress),
 		util.Duration("duration", time.Since(startTime)))
 
 	return &BindDeviceResponse{
@@ -193,7 +200,7 @@ func (s *DeviceService) GetActiveDevice(
 }
 
 // UnbindDevice removes a device binding
-func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) error {
+func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID, ipAddress string) error {
 	startTime := time.Now()
 
 	// Get device before unbinding for history
@@ -207,6 +214,7 @@ func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) erro
 				Status:       "failed",
 				ErrorCode:    "GET_DEVICE_FAILED",
 				ErrorMessage: err.Error(),
+				IPAddress:    ipAddress,
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -224,6 +232,7 @@ func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) erro
 				Status:       "failed",
 				ErrorCode:    "UNBIND_FAILED",
 				ErrorMessage: err.Error(),
+				IPAddress:    ipAddress,
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -244,11 +253,12 @@ func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) erro
 	// ✅ Log success event
 	if s.logProducer != nil && device != nil {
 		event := &models.DeviceLogEvent{
-			UserID:   userID.String(),
-			DeviceID: device.DeviceID,
-			Action:   "unbind",
-			Status:   "success",
-			Duration: int64(time.Since(startTime).Milliseconds()),
+			UserID:    userID.String(),
+			DeviceID:  device.DeviceID,
+			Action:    "unbind",
+			Status:    "success",
+			IPAddress: ipAddress,
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		}
 		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
@@ -259,7 +269,9 @@ func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) erro
 		s.distCache.DeleteKey(ctx, cacheKey)
 	}
 
-	s.logger.Info("Device unbound successfully", util.String("user_id", userID.String()))
+	s.logger.Info("Device unbound successfully", 
+		util.String("user_id", userID.String()),
+		util.String("ip_address", ipAddress))
 	return nil
 }
 
@@ -267,6 +279,7 @@ func (s *DeviceService) UnbindDevice(ctx context.Context, userID uuid.UUID) erro
 func (s *DeviceService) UpdateDeviceSession(
 	ctx context.Context,
 	userID, sessionID uuid.UUID,
+	ipAddress string,
 ) error {
 	startTime := time.Now()
 
@@ -279,6 +292,7 @@ func (s *DeviceService) UpdateDeviceSession(
 				Status:       "failed",
 				ErrorCode:    "UPDATE_SESSION_FAILED",
 				ErrorMessage: err.Error(),
+				IPAddress:    ipAddress,
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -293,6 +307,7 @@ func (s *DeviceService) UpdateDeviceSession(
 			Action:    "update_session",
 			Status:    "success",
 			SessionID: sessionID.String(),
+			IPAddress: ipAddress,
 			Duration:  int64(time.Since(startTime).Milliseconds()),
 		}
 		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -335,6 +350,7 @@ func (s *DeviceService) ValidateDevice(
 				Status:       "failed",
 				ErrorCode:    "VALIDATION_ERROR",
 				ErrorMessage: err.Error(),
+				IPAddress:    req.IPAddress,
 				Duration:     int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -352,6 +368,7 @@ func (s *DeviceService) ValidateDevice(
 				Action:    "validate",
 				Status:    "failed",
 				ErrorCode: "INVALID_BINDING",
+				IPAddress: req.IPAddress,
 				Duration:  int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
@@ -360,11 +377,12 @@ func (s *DeviceService) ValidateDevice(
 		// ✅ Log validation success
 		if s.logProducer != nil {
 			event := &models.DeviceLogEvent{
-				UserID:   req.UserID.String(),
-				DeviceID: req.DeviceID,
-				Action:   "validate",
-				Status:   "success",
-				Duration: int64(time.Since(startTime).Milliseconds()),
+				UserID:    req.UserID.String(),
+				DeviceID:  req.DeviceID,
+				Action:    "validate",
+				Status:    "success",
+				IPAddress: req.IPAddress,
+				Duration:  int64(time.Since(startTime).Milliseconds()),
 			}
 			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 		}
