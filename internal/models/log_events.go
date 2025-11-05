@@ -100,6 +100,7 @@ type AdminLogEvent struct {
 	Changes      map[string]interface{} `json:"changes"`
 	Status       string                 `json:"status"`
 	ErrorCode    string                 `json:"error_code,omitempty"`
+	ErrorMessage string                 `json:"error_message,omitempty"` // ✅ ADD THIS LINE
 	Duration     int64                  `json:"duration_ms,omitempty"`
 }
 

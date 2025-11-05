@@ -23,6 +23,7 @@ type AdminService struct {
     sessionService *SessionService
     hasher        *hashing.Hasher
     encryptionMgr *encryption.EncryptionManager
+    logProducer   *LogProducerService  // ✅ ADD KAFKA LOG PRODUCER
     logger        *zap.Logger
 }
 
@@ -45,6 +46,11 @@ func NewAdminService(
     }
 }
 
+// ✅ ADD LOG PRODUCER SETTER METHOD
+func (s *AdminService) SetLogProducerService(logProducer *LogProducerService) {
+    s.logProducer = logProducer
+}
+
 // GeneratePhoneHash generates a secure hash of phone number (same as UserService)
 func (s *AdminService) GeneratePhoneHash(phoneNumber string) string {
     normalized := strings.ReplaceAll(phoneNumber, " ", "")
@@ -58,11 +64,54 @@ func (s *AdminService) GeneratePhoneHash(phoneNumber string) string {
 
 // InitializeOwner creates the first owner of the system
 func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*models.AdminUser, error) {
+    startTime := time.Now()
+
     exists, err := s.adminRepo.IsOwnerExists(ctx)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production", // This should come from config
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to check owner existence",
+                },
+                Action:    "initialize_owner",
+                Status:    "failed",
+                ErrorCode: "CHECK_OWNER_EXISTS_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:  int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("failed to check owner existence: %w", err)
     }
     if exists {
+        // ✅ LOG FAILURE EVENT - OWNER ALREADY EXISTS
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Owner already exists",
+                },
+                Action:    "initialize_owner",
+                Status:    "failed",
+                ErrorCode: "OWNER_ALREADY_EXISTS",
+                Duration:  int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("system already has an owner")
     }
 
@@ -70,6 +119,27 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
     phoneHash := s.GeneratePhoneHash(phone)
     encryptedResult, err := s.encryptionMgr.EncryptField(ctx, phone, "phone")
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to encrypt phone for owner",
+                },
+                Action:    "initialize_owner",
+                Status:    "failed",
+                ErrorCode: "PHONE_ENCRYPTION_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:  int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("failed to encrypt phone: %w", err)
     }
 
@@ -98,7 +168,50 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
     }
 
     if err := s.adminRepo.CreateAdmin(ctx, owner); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to create owner in database",
+                },
+                Action:    "initialize_owner",
+                Status:    "failed",
+                ErrorCode: "CREATE_OWNER_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:  int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("failed to create owner: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Owner initialized successfully",
+            },
+            AdminID:    ownerID.String(),
+            AdminRole:  models.RoleLevelOwner,
+            Action:     "initialize_owner",
+            Status:     "success",
+            Duration:   int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Owner initialized", util.String("admin_id", owner.AdminID.String()))
@@ -107,9 +220,10 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
 }
 
 // ChangeOwnerPhone allows owner to update their phone
-// ChangeOwnerPhone allows owner to update their phone - FIXED VERSION
 func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, newPhone string) error {
-    // ✅ ADD: Input validation first
+    startTime := time.Now()
+
+    // ✅ Input validation first
     if ownerID == uuid.Nil {
         return fmt.Errorf("invalid owner ID")
     }
@@ -129,6 +243,28 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
             util.String("owner_id", ownerID.String()),
             util.ErrorField(err),
         )
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to get owner",
+                },
+                AdminID:    ownerID.String(),
+                Action:     "change_owner_phone",
+                Status:     "failed",
+                ErrorCode:  "GET_OWNER_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to get owner: %w", err)
     }
 
@@ -137,6 +273,27 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
         s.logger.Error("Owner not found in database",
             util.String("owner_id", ownerID.String()),
         )
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Owner not found",
+                },
+                AdminID:    ownerID.String(),
+                Action:     "change_owner_phone",
+                Status:     "failed",
+                ErrorCode:  "OWNER_NOT_FOUND",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("owner not found in system")
     }
 
@@ -151,6 +308,27 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
             util.String("requester_id", ownerID.String()),
             util.String("actual_owner_id", owner.AdminID.String()),
         )
+        // ✅ LOG FAILURE EVENT - UNAUTHORIZED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Unauthorized phone change attempt",
+                },
+                AdminID:    ownerID.String(),
+                Action:     "change_owner_phone",
+                Status:     "failed",
+                ErrorCode:  "UNAUTHORIZED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("unauthorized: only owner can change phone")
     }
 
@@ -164,6 +342,27 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
     // ✅ Check if new phone is already used by another admin
     existingAdmin, err := s.adminRepo.GetAdminByPhoneHash(ctx, newPhoneHash)
     if err == nil && existingAdmin != nil && existingAdmin.AdminID != ownerID {
+        // ✅ LOG FAILURE EVENT - PHONE ALREADY USED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Phone already used by another admin",
+                },
+                AdminID:    ownerID.String(),
+                Action:     "change_owner_phone",
+                Status:     "failed",
+                ErrorCode:  "PHONE_ALREADY_USED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("phone number is already used by another admin")
     }
 
@@ -173,6 +372,28 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
             util.String("owner_id", ownerID.String()),
             util.ErrorField(err),
         )
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to encrypt new phone",
+                },
+                AdminID:    ownerID.String(),
+                Action:     "change_owner_phone",
+                Status:     "failed",
+                ErrorCode:  "PHONE_ENCRYPTION_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to encrypt new phone: %w", err)
     }
 
@@ -192,7 +413,51 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
             util.String("owner_id", ownerID.String()),
             util.ErrorField(err),
         )
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to update owner phone in database",
+                },
+                AdminID:    ownerID.String(),
+                Action:     "change_owner_phone",
+                Status:     "failed",
+                ErrorCode:  "UPDATE_PHONE_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to update owner phone: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Owner phone updated successfully",
+            },
+            AdminID:  ownerID.String(),
+            AdminRole: models.RoleLevelOwner,
+            Action:   "change_owner_phone",
+            Status:   "success",
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Owner phone updated successfully",
@@ -205,19 +470,106 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 
 // InviteAdmin invites a user as admin - NO USER REGISTRATION CHECK
 func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel string, requesterID uuid.UUID, requesterRole string) (*models.AdminUser, error) {
+    startTime := time.Now()
+
     requester, err := s.adminRepo.GetAdminByID(ctx, requesterID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Requester not found",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "REQUESTER_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("requester not found: %w", err)
     }
     if !requester.IsActive {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Requester is not active",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "REQUESTER_INACTIVE",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("requester is not active")
     }
 
     // ✅ FIXED: Validate role-based permissions
     if requester.IsEmployee() {
+        // ✅ LOG FAILURE EVENT - UNAUTHORIZED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Employee cannot invite admins",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "UNAUTHORIZED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("employees cannot invite admins")
     }
     if requester.IsSuperEmployee() && roleLevel != models.RoleLevelEmployee {
+        // ✅ LOG FAILURE EVENT - UNAUTHORIZED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Super employee can only invite as employee",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "UNAUTHORIZED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("super employees can only invite as employee")
     }
 
@@ -226,11 +578,54 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
     // ✅ Check if phone is already an admin
     existingAdmin, err := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
     if err == nil && existingAdmin != nil {
+        // ✅ LOG FAILURE EVENT - PHONE ALREADY ADMIN
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Phone already an admin",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "PHONE_ALREADY_ADMIN",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("phone number is already an admin")
     }
 
     encryptedResult, err := s.encryptionMgr.EncryptField(ctx, phone, "phone")
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to encrypt phone",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "PHONE_ENCRYPTION_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("failed to encrypt phone: %w", err)
     }
 
@@ -264,7 +659,54 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
     }
 
     if err := s.adminRepo.CreateAdmin(ctx, admin); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to create admin in database",
+                },
+                AdminID:    requesterID.String(),
+                Action:     "invite_admin",
+                Status:     "failed",
+                ErrorCode:  "CREATE_ADMIN_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("failed to invite user as admin: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin invited successfully",
+            },
+            AdminID:        adminID.String(),
+            AdminRole:      roleLevel,
+            TargetUserID:   phone, // Using phone as target identifier
+            Action:         "invite_admin",
+            ResourceType:   "admin_user",
+            ResourceID:     adminID.String(),
+            Status:         "success",
+            Duration:       int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("User invited as admin",
@@ -285,12 +727,56 @@ func (s *AdminService) GetAdminByPhone(ctx context.Context, phone string) (*mode
 
 // AuthenticateAdmin authenticates an admin by phone - ONLY CHECKS ADMIN TABLE
 func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*models.AdminUser, error) {
+    startTime := time.Now()
+
     phoneHash := s.GeneratePhoneHash(phone)
     admin, err := s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Admin authentication failed",
+                },
+                Action:       "authenticate_admin",
+                Status:       "failed",
+                ErrorCode:    "AUTHENTICATION_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:     int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("authentication failed: %w", err)
     }
     if !admin.IsActive {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Admin account deactivated",
+                },
+                AdminID:    admin.AdminID.String(),
+                Action:     "authenticate_admin",
+                Status:     "failed",
+                ErrorCode:  "ACCOUNT_DEACTIVATED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, fmt.Errorf("admin account is deactivated")
     }
     if err := s.adminRepo.UpdateLastLogin(ctx, admin.AdminID); err != nil {
@@ -299,6 +785,29 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
             util.ErrorField(err),
         )
     }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin authenticated successfully",
+            },
+            AdminID:    admin.AdminID.String(),
+            AdminRole:  admin.AdminRoleLevel,
+            Action:     "authenticate_admin",
+            Status:     "success",
+            Duration:   int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
+    }
+
     return admin, nil
 }
 
@@ -318,20 +827,87 @@ func (s *AdminService) getDefaultDataAccessScope(roleLevel string) []string {
 
 // PromoteAdmin promotes an admin to higher role
 func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newRole string, promotedBy uuid.UUID) error {
+    startTime := time.Now()
+
     // Get current admin
     admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Admin not found for promotion",
+                },
+                AdminID:    promotedBy.String(),
+                Action:     "promote_admin",
+                Status:     "failed",
+                ErrorCode:  "ADMIN_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin not found: %w", err)
     }
 
     // Get promoter
     promoter, err := s.adminRepo.GetAdminByID(ctx, promotedBy)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Promoter not found",
+                },
+                AdminID:    promotedBy.String(),
+                Action:     "promote_admin",
+                Status:     "failed",
+                ErrorCode:  "PROMOTER_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("promoter not found: %w", err)
     }
 
     // Check permission to promote
     if !promoter.CanPromoteToRole(newRole) {
+        // ✅ LOG FAILURE EVENT - UNAUTHORIZED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Unauthorized promotion attempt",
+                },
+                AdminID:    promotedBy.String(),
+                Action:     "promote_admin",
+                Status:     "failed",
+                ErrorCode:  "UNAUTHORIZED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("unauthorized: cannot promote to %s role", newRole)
     }
 
@@ -340,13 +916,86 @@ func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newR
 
     // Update role level
     if err := s.adminRepo.UpdateAdminRoleLevel(ctx, adminID, newRole, promotedBy); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to update admin role",
+                },
+                AdminID:    promotedBy.String(),
+                Action:     "promote_admin",
+                Status:     "failed",
+                ErrorCode:  "UPDATE_ROLE_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to promote admin: %w", err)
     }
 
     // Update permissions based on new role
     newPermissions := s.getPermissionsForRole(newRole)
     if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissions); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to update admin permissions",
+                },
+                AdminID:    promotedBy.String(),
+                Action:     "promote_admin",
+                Status:     "failed",
+                ErrorCode:  "UPDATE_PERMISSIONS_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to update permissions: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin promoted successfully",
+            },
+            AdminID:        adminID.String(),
+            AdminRole:      newRole,
+            TargetUserID:   adminID.String(),
+            Action:         "promote_admin",
+            ResourceType:   "admin_user",
+            ResourceID:     adminID.String(),
+            Status:         "success",
+            Changes: map[string]interface{}{
+                "old_role": oldRole,
+                "new_role": newRole,
+            },
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Admin promoted",
@@ -361,31 +1010,166 @@ func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newR
 
 // RemoveAdmin removes an admin (soft delete - sets is_active = false)
 func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, removedBy uuid.UUID) error {
+    startTime := time.Now()
+
     // Get admin to remove
     admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Admin not found for removal",
+                },
+                AdminID:    removedBy.String(),
+                Action:     "remove_admin",
+                Status:     "failed",
+                ErrorCode:  "ADMIN_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin not found: %w", err)
     }
 
     // Get remover
     remover, err := s.adminRepo.GetAdminByID(ctx, removedBy)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Remover not found",
+                },
+                AdminID:    removedBy.String(),
+                Action:     "remove_admin",
+                Status:     "failed",
+                ErrorCode:  "REMOVER_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("remover not found: %w", err)
     }
 
     // Check permission to remove
     if !remover.CanManageEmployee(admin.AdminRoleLevel) {
+        // ✅ LOG FAILURE EVENT - UNAUTHORIZED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Unauthorized removal attempt",
+                },
+                AdminID:    removedBy.String(),
+                Action:     "remove_admin",
+                Status:     "failed",
+                ErrorCode:  "UNAUTHORIZED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("unauthorized: cannot remove admin with role %s", admin.AdminRoleLevel)
     }
 
     // Cannot remove owner
     if admin.IsOwner() {
+        // ✅ LOG FAILURE EVENT - CANNOT REMOVE OWNER
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Cannot remove owner admin",
+                },
+                AdminID:    removedBy.String(),
+                Action:     "remove_admin",
+                Status:     "failed",
+                ErrorCode:  "CANNOT_REMOVE_OWNER",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("cannot remove owner admin")
     }
 
     // Soft delete
     if err := s.adminRepo.RemoveAdmin(ctx, adminID, removedBy); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to remove admin",
+                },
+                AdminID:    removedBy.String(),
+                Action:     "remove_admin",
+                Status:     "failed",
+                ErrorCode:  "REMOVE_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to remove admin: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin removed successfully",
+            },
+            AdminID:        adminID.String(),
+            AdminRole:      admin.AdminRoleLevel,
+            TargetUserID:   adminID.String(),
+            Action:         "remove_admin",
+            ResourceType:   "admin_user",
+            ResourceID:     adminID.String(),
+            Status:         "success",
+            Duration:       int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Admin removed",
@@ -398,22 +1182,135 @@ func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, remov
 
 // DeactivateAdmin deactivates an admin (temporary suspend)
 func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, deactivatedBy uuid.UUID) error {
+    startTime := time.Now()
+
     admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Admin not found for deactivation",
+                },
+                AdminID:    deactivatedBy.String(),
+                Action:     "deactivate_admin",
+                Status:     "failed",
+                ErrorCode:  "ADMIN_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin not found: %w", err)
     }
 
     if !admin.IsActive {
+        // ✅ LOG FAILURE EVENT - ALREADY INACTIVE
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Admin already inactive",
+                },
+                AdminID:    deactivatedBy.String(),
+                Action:     "deactivate_admin",
+                Status:     "failed",
+                ErrorCode:  "ALREADY_INACTIVE",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin is already inactive")
     }
 
     // Cannot deactivate owner
     if admin.IsOwner() {
+        // ✅ LOG FAILURE EVENT - CANNOT DEACTIVATE OWNER
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Cannot deactivate owner admin",
+                },
+                AdminID:    deactivatedBy.String(),
+                Action:     "deactivate_admin",
+                Status:     "failed",
+                ErrorCode:  "CANNOT_DEACTIVATE_OWNER",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("cannot deactivate owner admin")
     }
 
     if err := s.adminRepo.DeactivateAdmin(ctx, adminID); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to deactivate admin",
+                },
+                AdminID:    deactivatedBy.String(),
+                Action:     "deactivate_admin",
+                Status:     "failed",
+                ErrorCode:  "DEACTIVATE_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to deactivate admin: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin deactivated successfully",
+            },
+            AdminID:        adminID.String(),
+            AdminRole:      admin.AdminRoleLevel,
+            TargetUserID:   adminID.String(),
+            Action:         "deactivate_admin",
+            ResourceType:   "admin_user",
+            ResourceID:     adminID.String(),
+            Status:         "success",
+            Duration:       int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Admin deactivated",
@@ -425,17 +1322,109 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
 
 // ActivateAdmin reactivates a deactivated admin
 func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, activatedBy uuid.UUID) error {
+    startTime := time.Now()
+
     admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Admin not found for activation",
+                },
+                AdminID:    activatedBy.String(),
+                Action:     "activate_admin",
+                Status:     "failed",
+                ErrorCode:  "ADMIN_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin not found: %w", err)
     }
 
     if admin.IsActive {
+        // ✅ LOG FAILURE EVENT - ALREADY ACTIVE
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Admin already active",
+                },
+                AdminID:    activatedBy.String(),
+                Action:     "activate_admin",
+                Status:     "failed",
+                ErrorCode:  "ALREADY_ACTIVE",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin is already active")
     }
 
     if err := s.adminRepo.ActivateAdmin(ctx, adminID); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to activate admin",
+                },
+                AdminID:    activatedBy.String(),
+                Action:     "activate_admin",
+                Status:     "failed",
+                ErrorCode:  "ACTIVATE_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to activate admin: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin activated successfully",
+            },
+            AdminID:        adminID.String(),
+            AdminRole:      admin.AdminRoleLevel,
+            TargetUserID:   adminID.String(),
+            Action:         "activate_admin",
+            ResourceType:   "admin_user",
+            ResourceID:     adminID.String(),
+            Status:         "success",
+            Duration:       int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Admin activated",
@@ -462,29 +1451,147 @@ func (s *AdminService) GetAdminsByRole(ctx context.Context, roleLevel string) ([
 
 // UpdateAdminPermissions updates admin permissions
 func (s *AdminService) UpdateAdminPermissions(ctx context.Context, adminID uuid.UUID, permissions []string, updatedBy uuid.UUID) error {
+    startTime := time.Now()
+
     // Get admin
     admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Admin not found for permission update",
+                },
+                AdminID:    updatedBy.String(),
+                Action:     "update_admin_permissions",
+                Status:     "failed",
+                ErrorCode:  "ADMIN_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("admin not found: %w", err)
     }
 
     // Get updater
     updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Updater not found",
+                },
+                AdminID:    updatedBy.String(),
+                Action:     "update_admin_permissions",
+                Status:     "failed",
+                ErrorCode:  "UPDATER_NOT_FOUND",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("updater not found: %w", err)
     }
 
     // Check permission
     if !updater.CanManageEmployee(admin.AdminRoleLevel) {
+        // ✅ LOG FAILURE EVENT - UNAUTHORIZED
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Unauthorized permission update attempt",
+                },
+                AdminID:    updatedBy.String(),
+                Action:     "update_admin_permissions",
+                Status:     "failed",
+                ErrorCode:  "UNAUTHORIZED",
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("unauthorized: cannot update permissions for %s role", admin.AdminRoleLevel)
     }
 
     // ✅ FIXED: Remove unused oldPermissions variable
-    // oldPermissions := admin.AdminPermissions
+    oldPermissions := admin.AdminPermissions
 
     // Update permissions
     if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, permissions); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to update admin permissions",
+                },
+                AdminID:    updatedBy.String(),
+                Action:     "update_admin_permissions",
+                Status:     "failed",
+                ErrorCode:  "UPDATE_PERMISSIONS_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to update permissions: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin permissions updated successfully",
+            },
+            AdminID:        adminID.String(),
+            AdminRole:      admin.AdminRoleLevel,
+            TargetUserID:   adminID.String(),
+            Action:         "update_admin_permissions",
+            ResourceType:   "admin_user",
+            ResourceID:     adminID.String(),
+            Status:         "success",
+            Changes: map[string]interface{}{
+                "old_permissions": oldPermissions,
+                "new_permissions": permissions,
+            },
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     s.logger.Info("Admin permissions updated",
@@ -497,8 +1604,53 @@ func (s *AdminService) UpdateAdminPermissions(ctx context.Context, adminID uuid.
 
 // RecordAdminLogin records admin login attempt
 func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) error {
+    startTime := time.Now()
+
     if err := s.adminRepo.UpdateLastLogin(ctx, adminID); err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "warning",
+                    Message:     "Failed to record admin login",
+                },
+                AdminID:    adminID.String(),
+                Action:     "record_admin_login",
+                Status:     "failed",
+                ErrorCode:  "RECORD_LOGIN_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return fmt.Errorf("failed to record login: %w", err)
+    }
+
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin login recorded successfully",
+            },
+            AdminID:    adminID.String(),
+            Action:     "record_admin_login",
+            Status:     "success",
+            Duration:   int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     // Reset failed attempts on successful login
@@ -514,8 +1666,32 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
 
 // RecordFailedLogin records failed login attempt and checks for lockout
 func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID) (bool, int, error) {
+    startTime := time.Now()
+
     attempts, err := s.adminRepo.IncrementFailedLoginAttempts(ctx, adminID)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to record failed login",
+                },
+                AdminID:    adminID.String(),
+                Action:     "record_failed_login",
+                Status:     "failed",
+                ErrorCode:  "RECORD_FAILED_LOGIN_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return false, 0, fmt.Errorf("failed to increment attempts: %w", err)
     }
 
@@ -530,7 +1706,71 @@ func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID)
                 util.String("admin_id", adminID.String()),
                 util.ErrorField(err),
             )
+            // ✅ LOG FAILURE EVENT FOR LOCKOUT
+            if s.logProducer != nil {
+                event := &models.AdminLogEvent{
+                    LogEnvelope: models.LogEnvelope{
+                        EventID:     uuid.New().String(),
+                        EventType:   "admin",
+                        ServiceName: "auth-service",
+                        Timestamp:   time.Now(),
+                        Environment: "production",
+                        Version:     "v1.0.0",
+                        Level:       "warning",
+                        Message:     "Failed to deactivate admin after lockout",
+                    },
+                    AdminID:    adminID.String(),
+                    Action:     "admin_lockout",
+                    Status:     "failed",
+                    ErrorCode:  "DEACTIVATE_AFTER_LOCKOUT_FAILED",
+                    ErrorMessage: err.Error(),
+                    Duration:   int64(time.Since(startTime).Milliseconds()),
+                }
+                _ = s.logProducer.ProduceAdminEvent(ctx, event)
+            }
+        } else {
+            // ✅ LOG SUCCESS EVENT FOR LOCKOUT
+            if s.logProducer != nil {
+                event := &models.AdminLogEvent{
+                    LogEnvelope: models.LogEnvelope{
+                        EventID:     uuid.New().String(),
+                        EventType:   "admin",
+                        ServiceName: "auth-service",
+                        Timestamp:   time.Now(),
+                        Environment: "production",
+                        Version:     "v1.0.0",
+                        Level:       "warning",
+                        Message:     "Admin locked out due to failed attempts",
+                    },
+                    AdminID:    adminID.String(),
+                    Action:     "admin_lockout",
+                    Status:     "success",
+                    Duration:   int64(time.Since(startTime).Milliseconds()),
+                }
+                _ = s.logProducer.ProduceAdminEvent(ctx, event)
+            }
         }
+    }
+
+    // ✅ LOG FAILED LOGIN ATTEMPT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Admin failed login attempt",
+            },
+            AdminID:    adminID.String(),
+            Action:     "failed_login_attempt",
+            Status:     "success",
+            Duration:   int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
     }
 
     return shouldLockout, attempts, nil
@@ -594,6 +1834,8 @@ func (s *AdminService) GetStats(ctx context.Context) (map[string]interface{}, er
 
 // ✅ FIXED: AuthenticateAdminWithSession - Only checks admin table
 func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone string, deviceID string, ipAddress string) (*models.AdminUser, string, error) {
+    startTime := time.Now()
+
     // 1. Authenticate admin (checks only admin_users table)
     admin, err := s.AuthenticateAdmin(ctx, phone)
     if err != nil {
@@ -612,6 +1854,28 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
 
     session, err := s.sessionService.CreateAdminSession(ctx, sessionReq)
     if err != nil {
+        // ✅ LOG FAILURE EVENT
+        if s.logProducer != nil {
+            event := &models.AdminLogEvent{
+                LogEnvelope: models.LogEnvelope{
+                    EventID:     uuid.New().String(),
+                    EventType:   "admin",
+                    ServiceName: "auth-service",
+                    Timestamp:   time.Now(),
+                    Environment: "production",
+                    Version:     "v1.0.0",
+                    Level:       "error",
+                    Message:     "Failed to create admin session",
+                },
+                AdminID:    admin.AdminID.String(),
+                Action:     "authenticate_admin_with_session",
+                Status:     "failed",
+                ErrorCode:  "CREATE_SESSION_FAILED",
+                ErrorMessage: err.Error(),
+                Duration:   int64(time.Since(startTime).Milliseconds()),
+            }
+            _ = s.logProducer.ProduceAdminEvent(ctx, event)
+        }
         return nil, "", fmt.Errorf("failed to create admin session: %w", err)
     }
 
@@ -623,27 +1887,28 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
         )
     }
 
+    // ✅ LOG SUCCESS EVENT
+    if s.logProducer != nil {
+        event := &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "info",
+                Message:     "Admin authenticated with session successfully",
+            },
+            AdminID:    admin.AdminID.String(),
+            AdminRole:  admin.AdminRoleLevel,
+            Action:     "authenticate_admin_with_session",
+            Status:     "success",
+            Duration:   int64(time.Since(startTime).Milliseconds()),
+        }
+        _ = s.logProducer.ProduceAdminEvent(ctx, event)
+    }
+
     // 5. Return both admin and session token
     return admin, session.SessionToken, nil
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

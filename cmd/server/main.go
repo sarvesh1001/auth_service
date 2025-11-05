@@ -38,15 +38,19 @@ func main() {
 	sessionHandler := handler.NewSessionHandler(f.GetSessionService(), logger)
 	
 	// ✅ UPDATED: Device handler with LogProducerService
+	
 	deviceHandler := handler.NewDeviceHandler(
 		f.GetDeviceService(), 
-		f.GetLogProducerService(), // ✅ ADD THIS LINE
+		// f.GetLogProducerService(), // ✅ ADD THIS LINE
 		logger,
 	)
 
 	// ✅ FIXED: Pass pointers directly (services already return pointers)
-	adminHandler := handler.NewAdminHandler(f.GetAdminService(), logger)
-
+	adminHandler := handler.NewAdminHandler(
+		f.GetAdminService(), 
+		// f.GetLogProducerService(), // ✅ ADD THIS LINE
+		logger,
+	)
 	// ✅ GET SESSION SERVICE FOR MIDDLEWARE
 	sessionService := f.GetSessionService()
 

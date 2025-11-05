@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===============================================
 # File: scripts/init-kafka-topics.sh
-# Purpose: Automatically create all required Kafka topics on startup
+# Purpose: Automatically create all required Kafka topics for optimized event distribution
 # ===============================================
 
 set -e
@@ -89,21 +89,26 @@ create_topic() {
 }
 
 echo ""
-echo "🚀 Creating Kafka topics..."
+echo "🚀 Creating Kafka topics with optimized event distribution..."
 echo ""
 
 # -----------------------------------------------
-# Create all required topics with custom configurations
+# Create topics with optimized configurations for each storage system
 # -----------------------------------------------
 declare -A TOPIC_CONFIGS=(
+    # 🔍 Elasticsearch Topics (Search & Analytics)
     # Topic: [partitions, replication, retention_ms, compression]
-    ["otp-events"]="3 1 604800000 gzip"           # 7 days retention
-    ["mpin-events"]="3 1 2592000000 gzip"        # 30 days
-    ["security-events"]="3 1 7776000000 gzip"    # 90 days
-    ["admin-events"]="3 1 15552000000 gzip"      # 180 days
-    ["session-events"]="3 1 604800000 gzip"      # 7 days
-    ["user-events"]="3 1 2592000000 gzip"        # 30 days
-    ["device-events"]="3 1 2592000000 gzip"      # 30 days
+    ["admin-events"]="3 1 15552000000 gzip"      # 180 days - Audit trails
+    ["user-events"]="3 1 2592000000 gzip"        # 30 days - User behavior
+    ["session-events"]="3 1 604800000 gzip"      # 7 days - Session analytics
+    
+    # 📊 ClickHouse Topics (Time-Series & Metrics)
+    ["device-events"]="3 1 2592000000 gzip"      # 30 days - Device metrics
+    ["mpin-events"]="3 1 2592000000 gzip"        # 30 days - Auth patterns  
+    ["otp-events"]="3 1 604800000 gzip"          # 7 days - Delivery metrics
+    
+    # 🔄 Dual-Purpose Topics (Both ES & ClickHouse)
+    ["security-events"]="3 1 7776000000 gzip"    # 90 days - Fraud detection + investigation
 )
 
 FAILED_TOPICS=()
@@ -125,11 +130,34 @@ echo ""
 TOPICS=$(timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list 2>/dev/null)
 
 ALL_SUCCESS=true
-for topic in "${!TOPIC_CONFIGS[@]}"; do
+echo "🔍 Elasticsearch Topics (Search & Analytics):"
+for topic in "admin-events" "user-events" "session-events"; do
     if echo "$TOPICS" | grep -q "^${topic}$"; then
-        echo "✅ $topic"
+        echo "   ✅ $topic"
     else
-        echo "❌ $topic - MISSING"
+        echo "   ❌ $topic - MISSING"
+        ALL_SUCCESS=false
+    fi
+done
+
+echo ""
+echo "📊 ClickHouse Topics (Time-Series & Metrics):"
+for topic in "device-events" "mpin-events" "otp-events"; do
+    if echo "$TOPICS" | grep -q "^${topic}$"; then
+        echo "   ✅ $topic"
+    else
+        echo "   ❌ $topic - MISSING"
+        ALL_SUCCESS=false
+    fi
+done
+
+echo ""
+echo "🔄 Dual-Purpose Topics (Both ES & ClickHouse):"
+for topic in "security-events"; do
+    if echo "$TOPICS" | grep -q "^${topic}$"; then
+        echo "   ✅ $topic"
+    else
+        echo "   ❌ $topic - MISSING"
         ALL_SUCCESS=false
     fi
 done

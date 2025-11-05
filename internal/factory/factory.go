@@ -1,5 +1,5 @@
-// File: internal/factory/factory.go - FULLY FIXED BUILD ERROR
-// ✅ FIXED: ESConsumer now returns (consumer, error) - handle both values
+// File: internal/factory/factory.go - OPTIMIZED EVENT DISTRIBUTION
+// ✅ UPDATED: Optimized event distribution between ES and ClickHouse
 
 package factory
 
@@ -138,7 +138,7 @@ func NewFactory() (*Factory, error) {
 	}
 	f.initializeManagers()
 
-	// ✅ ADD THIS - Initialize Kafka logging after all clients are ready
+	// ✅ Initialize Kafka logging with optimized event distribution
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
@@ -157,11 +157,16 @@ func NewFactory() (*Factory, error) {
 }
 
 // ============================================================================
-// KAFKA LOGGING INITIALIZATION
+// KAFKA LOGGING INITIALIZATION - OPTIMIZED EVENT DISTRIBUTION
 // ============================================================================
 
-// InitializeKafkaLogging sets up Kafka producer and consumers
-// Call this AFTER all clients are initialized
+// File: internal/factory/factory.go - FIXED CLICKHOUSE CONSUMER INITIALIZATION
+
+// ============================================================================
+// KAFKA LOGGING INITIALIZATION - OPTIMIZED EVENT DISTRIBUTION (FIXED)
+// ============================================================================
+
+// InitializeKafkaLogging sets up Kafka producer and consumers with optimized event distribution
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	logger := util.Get()
 
@@ -179,7 +184,7 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	logProducer := service.NewLogProducerService(
 		kafkaProducer,
 		f.config.Environment,
-		"v1.0.0", // ✅ FIXED - config has no Version field
+		"v1.0.0",
 	)
 
 	consumerCtx, cancel := context.WithCancel(context.Background())
@@ -190,23 +195,28 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		logger:    logger,
 	}
 
-	// ✅ Elasticsearch Consumer
-	// ⚠️ FIXED: NewESConsumer now returns (consumer, error)
+	// ✅ ELASTICSEARCH CONSUMER - Search & Analytics Events
 	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
+		esTopics := []string{
+			"admin-events",    // Audit trails, role searches
+			"user-events",     // User behavior analysis  
+			"security-events", // Fraud investigation (dual-purpose)
+			"session-events",  // Session analytics
+		}
+		
+		// Create Kafka consumer for ES topics
 		kafkaConsumerES, err := client.NewKafkaConsumer(
 			f.config,
-			"otp-events",
-			"es-consumer-group",
+			"admin-events",      // Primary topic
+			"es-consumer-group", 
 			logger,
 		)
 		if err == nil {
-			// ✅ FIXED: Handle error return from NewESConsumer
 			esConsumer, err := consumer.NewESConsumer(kafkaConsumerES, f.esClient.Client)
 			if err != nil {
 				logger.Error("failed to create Elasticsearch consumer", zap.Error(err))
 			} else {
 				mgr.esConsumer = esConsumer
-
 				mgr.wg.Add(1)
 				go func() {
 					defer mgr.wg.Done()
@@ -214,29 +224,51 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 						logger.Error("ES consumer error", zap.Error(err))
 					}
 				}()
-				logger.Info("Elasticsearch consumer started")
+				logger.Info("Elasticsearch consumer started for search events",
+					zap.Strings("topics", esTopics))
 			}
 		} else {
 			logger.Error("failed to create Elasticsearch Kafka consumer", zap.Error(err))
 		}
 	}
-	// ✅ ClickHouse Consumer
+
+	// ✅ CLICKHOUSE CONSUMER - Time-Series & Metrics Events (MULTI-TOPIC)
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
-		kafkaConsumerCH, err := client.NewKafkaConsumer(
-			f.config,
-			"device-events", // Kafka topic name
-			"clickhouse-consumer-group", // group ID
-			logger,
-		)
-		if err == nil {
+		chTopics := []string{
+			"device-events",     // Device metrics, binding trends
+			"mpin-events",       // Authentication patterns
+			"otp-events",        // Delivery metrics
+			"security-events",   // Real-time fraud detection (dual-purpose)
+		}
+		
+		// Create multiple Kafka consumers for ClickHouse (one per topic)
+		chConsumers := make(map[string]*client.KafkaConsumer)
+		
+		for _, topic := range chTopics {
+			kafkaConsumer, err := client.NewKafkaConsumer(
+				f.config,
+				topic,
+				"clickhouse-consumer-group",  
+				logger,
+			)
+			if err != nil {
+				logger.Error("failed to create ClickHouse Kafka consumer", 
+					zap.String("topic", topic), 
+					zap.Error(err))
+				continue
+			}
+			chConsumers[topic] = kafkaConsumer
+		}
+
+		if len(chConsumers) > 0 {
+			// ✅ FIXED: Use the new multi-topic ClickHouse consumer - pass the MAP, not individual consumer
 			chConsumer := consumer.NewClickHouseConsumer(
-				kafkaConsumerCH,
-				f.clickhouseClient.Conn(), // clickhouse driver connection
-				1000,                      // batch size
-				5*time.Second,             // flush interval
+				chConsumers, // ✅ This is the map, not a single consumer
+				f.clickhouseClient.Conn(),
+				1000,          // batch size
+				5*time.Second, // flush interval
 			)
 			mgr.chConsumer = chConsumer
-
 			mgr.wg.Add(1)
 			go func() {
 				defer mgr.wg.Done()
@@ -244,50 +276,19 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 					logger.Error("ClickHouse consumer error", zap.Error(err))
 				}
 			}()
-			logger.Info("✅ ClickHouse consumer started")
-		} else {
-			logger.Error("failed to create ClickHouse Kafka consumer", zap.Error(err))
+			logger.Info("ClickHouse multi-topic consumer started for time-series events",
+				zap.Int("topic_count", len(chConsumers)),
+				zap.Strings("topics", chTopics))
 		}
 	}
 
-	// ✅ ClickHouse Consumer
-	// if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
-	// 	kafkaConsumerCH, err := client.NewKafkaConsumer(
-	// 		f.config,
-	// 		"device-events",  // ✅ CHANGED THIS LINE
-	// 		"ch-consumer-group",
-	// 		logger,
-	// 	)
-	// 	if err == nil {
-	// 		chConsumer := consumer.NewClickHouseConsumer(
-	// 			kafkaConsumerCH,
-	// 			f.clickhouseClient.Conn(), // ✅ return underlying clickhouse.Conn
-	// 			1000,
-	// 			5*time.Second,
-	// 		)
-	// 		mgr.chConsumer = chConsumer
-
-	// 		mgr.wg.Add(1)
-	// 		go func() {
-	// 			defer mgr.wg.Done()
-	// 			if err := chConsumer.Start(consumerCtx); err != nil {
-	// 				logger.Error("ClickHouse consumer error", zap.Error(err))
-	// 			}
-	// 		}()
-	// 		logger.Info("ClickHouse consumer started")
-	// 	} else {
-	// 		logger.Error("failed to create ClickHouse Kafka consumer", zap.Error(err))
-	// 	}
-	// }
-
-	logger.Info("Kafka logging system initialized",
+	logger.Info("Kafka logging system initialized with optimized event distribution",
 		zap.Bool("es_enabled", mgr.esConsumer != nil),
 		zap.Bool("ch_enabled", mgr.chConsumer != nil),
 	)
 
 	return mgr, nil
 }
-
 // ============================================================================
 // CLIENT INITIALIZATION
 // ============================================================================
@@ -627,17 +628,22 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 // ========================================================================
 
 // GetAdminService returns the admin service
-// ✅ REFACTORED - Removed audit repository dependency
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
 			f.UserRepository(),
-			f.GetSessionService(), // ✅ ADD THIS LINE - SessionService dependency
-			f.Hasher(),            // ✅ ADDED: Missing argument
-			f.EncryptionManager(), // ✅ ADDED: Missing argument
+			f.GetSessionService(),
+			f.Hasher(),
+			f.EncryptionManager(),
 			f.logger,
 		)
+		
+		// ✅ SET LOG PRODUCER FOR ADMIN SERVICE
+		logProducer := f.GetLogProducerService()
+		if logProducer != nil {
+			f.adminService.SetLogProducerService(logProducer)
+		}
 	}
 	return f.adminService
 }
@@ -761,7 +767,7 @@ func (f *Factory) Close() error {
 		close(f.closed)
 		util.Info("Shutting down factory...")
 
-		// ✅ ADD THIS - Shutdown Kafka logging first
+		// ✅ Shutdown Kafka logging first
 		if f.kafkaLoggingMgr != nil {
 			if err := f.kafkaLoggingMgr.Shutdown(); err != nil {
 				util.Error("Failed to shutdown Kafka logging", util.ErrorField(err))

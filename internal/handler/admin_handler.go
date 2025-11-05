@@ -1,10 +1,11 @@
-// internal/handler/admin_handler.go - FIXED VERSION
+// internal/handler/admin_handler.go - FULLY UPDATED VERSION
 
 package handler
 
 import (
 	"encoding/json"
 	"fmt"
+	"net" // ✅ ADDED
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,13 +25,17 @@ type AdminHandler struct {
 	logger       *zap.Logger
 }
 
-// NewAdminHandler creates a new admin handler
-func NewAdminHandler(adminService *service.AdminService, logger *zap.Logger) *AdminHandler {
+// ✅ UPDATED CONSTRUCTOR: Add LogProducerService parameter
+func NewAdminHandler(
+	adminService *service.AdminService, 
+	logger *zap.Logger,
+) *AdminHandler {
 	return &AdminHandler{
 		adminService: adminService,
 		logger:       logger,
 	}
 }
+
 
 // RegisterRoutes registers all admin routes
 func (h *AdminHandler) RegisterRoutes(router chi.Router) {
@@ -76,8 +81,6 @@ func (h *AdminHandler) RegisterRoutes(router chi.Router) {
 			r.Get("/phone/{phone}", h.GetAdminByPhone)
 			r.Get("/", h.ListAdmins)
 			r.Get("/role/{roleLevel}", h.GetAdminsByRole)
-
-			// ❌ REMOVED: r.Post("/authenticate", h.AuthenticateAdmin) - NOW IN PUBLIC ROUTES
 		})
 	})
 }
@@ -736,8 +739,6 @@ func isValidRoleLevel(role string) bool {
 	}
 }
 
-// ===== HELPER FUNCTIONS =====
-
 // getRequesterAdminID extracts admin ID from request context (set by middleware)
 func getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
 	adminID, ok := r.Context().Value("adminID").(uuid.UUID)
@@ -756,13 +757,63 @@ func getRequesterRole(r *http.Request) (string, error) {
 	return role, nil
 }
 
-// getClientIP extracts client IP from request
+// getClientIP extracts the client IP address from the request
 func (h *AdminHandler) getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
+	// Check for forwarded IP first (load balancer, proxy, etc.)
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		// X-Forwarded-For can be a list of IPs, take the first one
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			// Validate IP format
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return ip
+			}
+		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	
+	// Check for other common headers
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+			return realIP
+		}
 	}
-	return r.RemoteAddr
+	
+	if cfConnectingIP := r.Header.Get("CF-Connecting-IP"); cfConnectingIP != "" {
+		if parsedIP := net.ParseIP(cfConnectingIP); parsedIP != nil {
+			return cfConnectingIP
+		}
+	}
+	
+	// Check Forwarded header (RFC 7239)
+	if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
+		// Parse: for=192.0.2.60;proto=http;by=203.0.113.43
+		if strings.Contains(forwarded, "for=") {
+			parts := strings.Split(forwarded, ";")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if strings.HasPrefix(part, "for=") {
+					ip := strings.TrimPrefix(part, "for=")
+					// Remove quotes and port if present
+					ip = strings.Trim(ip, `"`)
+					if idx := strings.LastIndex(ip, ":"); idx != -1 {
+						// Check if it's a port (not IPv6)
+						if !strings.Contains(ip, "]") {
+							ip = ip[:idx]
+						}
+					}
+					if parsedIP := net.ParseIP(ip); parsedIP != nil {
+						return ip
+					}
+				}
+			}
+		}
+	}
+	
+	// Fall back to RemoteAddr
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If SplitHostPort fails, try to use RemoteAddr as-is
+		return r.RemoteAddr
+	}
+	return host
 }

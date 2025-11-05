@@ -1,6 +1,6 @@
-// File: internal/consumer/es_consumer.go (FIXED)
-// Consumes Kafka events and indexes them to Elasticsearch
-// ✅ FIXED: Bulk indexing + retry logic + proper error handling
+// File: internal/consumer/es_consumer.go (UPDATED FOR OPTIMIZED DISTRIBUTION)
+// Consumes Kafka events and indexes them to Elasticsearch for SEARCH & ANALYTICS only
+// ✅ UPDATED: Only handles search events (Admin, User, Session, Security)
 
 package consumer
 
@@ -20,7 +20,7 @@ import (
 	"auth-service/internal/util"
 )
 
-// ESConsumer consumes Kafka events and indexes them into Elasticsearch
+// ESConsumer consumes Kafka SEARCH events and indexes them into Elasticsearch
 type ESConsumer struct {
 	kafkaConsumer  *client.KafkaConsumer
 	esClient       *elasticsearch.Client
@@ -30,7 +30,7 @@ type ESConsumer struct {
 	retryBackoff   time.Duration
 }
 
-// NewESConsumer creates a new Elasticsearch consumer
+// NewESConsumer creates a new Elasticsearch consumer for search events
 func NewESConsumer(
 	kafkaConsumer *client.KafkaConsumer,
 	esClient *elasticsearch.Client,
@@ -56,9 +56,9 @@ func NewESConsumer(
 	}, nil
 }
 
-// Start begins consuming from Kafka and indexing to Elasticsearch
+// Start begins consuming from Kafka and indexing SEARCH events to Elasticsearch
 func (ec *ESConsumer) Start(ctx context.Context) error {
-	ec.logger.Info("ES consumer started")
+	ec.logger.Info("ES consumer started for search events")
 
 	for {
 		select {
@@ -87,28 +87,8 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 				}
 			}
 
-			// Route to appropriate indexing function
+			// ✅ UPDATED: Only route SEARCH & ANALYTICS events to Elasticsearch
 			switch eventType {
-			case "otp":
-				var event models.OTPLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal OTP event", zap.Error(err))
-					continue
-				}
-				if err := ec.indexOTPEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index OTP event", zap.Error(err))
-				}
-
-			case "mpin":
-				var event models.MPINLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal MPIN event", zap.Error(err))
-					continue
-				}
-				if err := ec.indexMPINEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index MPIN event", zap.Error(err))
-				}
-
 			case "security":
 				var event models.SecurityLogEvent
 				if err := json.Unmarshal(msg.Value, &event); err != nil {
@@ -149,18 +129,15 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 					ec.logger.Error("failed to index User event", zap.Error(err))
 				}
 
-			case "device":
-				var event models.DeviceLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal Device event", zap.Error(err))
-					continue
-				}
-				if err := ec.indexDeviceEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index Device event", zap.Error(err))
-				}
-
+			// ✅ REMOVED: Device, MPIN, OTP events (now handled by ClickHouse only)
 			default:
-				ec.logger.Warn("unknown event type received", zap.String("event_type", eventType))
+				ec.logger.Debug("ignoring time-series event for Elasticsearch", 
+					zap.String("event_type", eventType),
+					zap.String("reason", "handled_by_clickhouse"))
+				// Still commit the message since it's processed by ClickHouse consumer
+				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+					ec.logger.Error("failed to commit ignored message", zap.Error(err))
+				}
 			}
 		}
 	}
@@ -171,17 +148,7 @@ func (ec *ESConsumer) Stop(ctx context.Context) error {
 	return ec.bulkIndexer.Close(ctx)
 }
 
-// ================== Indexing Methods ==================
-
-func (ec *ESConsumer) indexOTPEvent(ctx context.Context, event *models.OTPLogEvent) error {
-	index := fmt.Sprintf("otp-events-%s", event.Timestamp.Format("2006.01.02"))
-	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
-}
-
-func (ec *ESConsumer) indexMPINEvent(ctx context.Context, event *models.MPINLogEvent) error {
-	index := fmt.Sprintf("mpin-events-%s", event.Timestamp.Format("2006.01.02"))
-	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
-}
+// ================== SEARCH EVENT Indexing Methods ==================
 
 func (ec *ESConsumer) indexSecurityEvent(ctx context.Context, event *models.SecurityLogEvent) error {
 	index := fmt.Sprintf("security-events-%s", event.Timestamp.Format("2006.01.02"))
@@ -203,10 +170,7 @@ func (ec *ESConsumer) indexUserEvent(ctx context.Context, event *models.UserLogE
 	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
 }
 
-func (ec *ESConsumer) indexDeviceEvent(ctx context.Context, event *models.DeviceLogEvent) error {
-	index := fmt.Sprintf("device-events-%s", event.Timestamp.Format("2006.01.02"))
-	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
-}
+// ✅ REMOVED: indexOTPEvent, indexMPINEvent, indexDeviceEvent
 
 // ✅ FIXED: Use bulk indexer instead of single document indexing
 func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID string, doc interface{}) error {
@@ -236,7 +200,7 @@ func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID s
 			}
 		},
 		OnSuccess: func(_ context.Context, _ esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem) {
-			ec.logger.Debug("document indexed",
+			ec.logger.Debug("document indexed in Elasticsearch",
 				zap.String("index", index),
 				zap.String("doc_id", docID))
 		},

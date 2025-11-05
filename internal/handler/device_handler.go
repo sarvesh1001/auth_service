@@ -23,18 +23,11 @@ type DeviceHandler struct {
     logger        *zap.Logger
 }
 
-// ✅ UPDATE CONSTRUCTOR: Add LogProducerService parameter
+// ✅ FIXED: Remove LogProducerService parameter - service already has it
 func NewDeviceHandler(
     deviceService *service.DeviceService, 
-    logProducer *service.LogProducerService, // ✅ ADD THIS
     logger *zap.Logger,
 ) *DeviceHandler {
-    
-    // ✅ SET LOG PRODUCER ON SERVICE
-    if logProducer != nil {
-        deviceService.SetLogProducerService(logProducer)
-    }
-    
     return &DeviceHandler{
         deviceService: deviceService,
         logger:        logger,
