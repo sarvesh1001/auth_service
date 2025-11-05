@@ -1,6 +1,6 @@
-// File: internal/consumer/es_consumer.go (UPDATED FOR OPTIMIZED DISTRIBUTION)
+// File: internal/consumer/es_consumer.go - COMPLETE UPDATED VERSION
 // Consumes Kafka events and indexes them to Elasticsearch for SEARCH & ANALYTICS only
-// ✅ UPDATED: Only handles search events (Admin, User, Session, Security)
+// ✅ UPDATED: Handles Admin, User, Session, Security events with proper AdminLogEvent indexing
 
 package consumer
 
@@ -35,7 +35,7 @@ func NewESConsumer(
 	kafkaConsumer *client.KafkaConsumer,
 	esClient *elasticsearch.Client,
 ) (*ESConsumer, error) {
-	// ✅ FIXED: Initialize bulk indexer for better performance
+	// ✅ Initialize bulk indexer for better performance
 	bulkIndexer, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 		Client:     esClient,
 		NumWorkers: 4,
@@ -93,45 +93,70 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 				var event models.SecurityLogEvent
 				if err := json.Unmarshal(msg.Value, &event); err != nil {
 					ec.logger.Error("failed to unmarshal Security event", zap.Error(err))
+					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+					}
 					continue
 				}
 				if err := ec.indexSecurityEvent(ctx, &event); err != nil {
 					ec.logger.Error("failed to index Security event", zap.Error(err))
 				}
+				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+					ec.logger.Error("failed to commit security event message", zap.Error(err))
+				}
 
 			case "admin":
+				// ✅ NEW: Handle AdminLogEvent with proper LogEnvelope structure
 				var event models.AdminLogEvent
 				if err := json.Unmarshal(msg.Value, &event); err != nil {
 					ec.logger.Error("failed to unmarshal Admin event", zap.Error(err))
+					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+					}
 					continue
 				}
 				if err := ec.indexAdminEvent(ctx, &event); err != nil {
 					ec.logger.Error("failed to index Admin event", zap.Error(err))
+				}
+				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+					ec.logger.Error("failed to commit admin event message", zap.Error(err))
 				}
 
 			case "session":
 				var event models.SessionLogEvent
 				if err := json.Unmarshal(msg.Value, &event); err != nil {
 					ec.logger.Error("failed to unmarshal Session event", zap.Error(err))
+					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+					}
 					continue
 				}
 				if err := ec.indexSessionEvent(ctx, &event); err != nil {
 					ec.logger.Error("failed to index Session event", zap.Error(err))
+				}
+				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+					ec.logger.Error("failed to commit session event message", zap.Error(err))
 				}
 
 			case "user":
 				var event models.UserLogEvent
 				if err := json.Unmarshal(msg.Value, &event); err != nil {
 					ec.logger.Error("failed to unmarshal User event", zap.Error(err))
+					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+					}
 					continue
 				}
 				if err := ec.indexUserEvent(ctx, &event); err != nil {
 					ec.logger.Error("failed to index User event", zap.Error(err))
 				}
+				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+					ec.logger.Error("failed to commit user event message", zap.Error(err))
+				}
 
 			// ✅ REMOVED: Device, MPIN, OTP events (now handled by ClickHouse only)
 			default:
-				ec.logger.Debug("ignoring time-series event for Elasticsearch", 
+				ec.logger.Debug("ignoring time-series event for Elasticsearch",
 					zap.String("event_type", eventType),
 					zap.String("reason", "handled_by_clickhouse"))
 				// Still commit the message since it's processed by ClickHouse consumer
@@ -155,9 +180,65 @@ func (ec *ESConsumer) indexSecurityEvent(ctx context.Context, event *models.Secu
 	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
 }
 
+// ✅ UPDATED: Handle AdminLogEvent with proper LogEnvelope structure
 func (ec *ESConsumer) indexAdminEvent(ctx context.Context, event *models.AdminLogEvent) error {
-	index := fmt.Sprintf("admin-events-%s", event.Timestamp.Format("2006.01.02"))
-	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
+	// Use LogEnvelope.Timestamp for index date
+	timestamp := event.LogEnvelope.Timestamp
+	index := ec.getAdminEventIndex(event)
+
+	ec.logger.Debug("indexing admin event",
+		zap.String("index", index),
+		zap.String("event_id", event.LogEnvelope.EventID),
+		zap.String("action", event.Action),
+		zap.String("admin_id", event.AdminID),
+		zap.String("status", event.Status),
+	)
+
+	// Use event_id as document ID for uniqueness
+	docID := event.LogEnvelope.EventID
+
+	// Create enriched document with all fields for searching
+	enrichedEvent := map[string]interface{}{
+		"event_id":       event.LogEnvelope.EventID,
+		"event_type":     event.LogEnvelope.EventType,
+		"service_name":   event.LogEnvelope.ServiceName,
+		"timestamp":      timestamp,
+		"environment":    event.LogEnvelope.Environment,
+		"version":        event.LogEnvelope.Version,
+		"admin_id":       event.AdminID,
+		"admin_role":     event.AdminRole,
+		"target_user_id": event.TargetUserID,
+		"action":         event.Action,
+		"resource_type":  event.ResourceType,
+		"resource_id":    event.ResourceID,
+		"status":         event.Status,
+		"error_code":     event.ErrorCode,
+		"error_message":  event.ErrorMessage,
+		"changes":        event.Changes,
+		"duration_ms":    event.Duration,
+	}
+
+	return ec.indexDocumentWithRetry(ctx, index, docID, enrichedEvent)
+}
+
+// ✅ NEW: Get appropriate index based on admin action type
+func (ec *ESConsumer) getAdminEventIndex(event *models.AdminLogEvent) string {
+	switch event.Action {
+	case "authenticate_admin", "authenticate_admin_with_session", "failed_login_attempt", "record_admin_login", "admin_lockout":
+		return fmt.Sprintf("admin-auth-%s", event.LogEnvelope.Timestamp.Format("2006.01.02"))
+
+	case "invite_admin", "promote_admin", "remove_admin", "deactivate_admin", "activate_admin":
+		return fmt.Sprintf("admin-management-%s", event.LogEnvelope.Timestamp.Format("2006.01.02"))
+
+	case "initialize_owner", "change_owner_phone":
+		return fmt.Sprintf("admin-owner-%s", event.LogEnvelope.Timestamp.Format("2006.01.02"))
+
+	case "update_admin_permissions":
+		return fmt.Sprintf("admin-permissions-%s", event.LogEnvelope.Timestamp.Format("2006.01.02"))
+
+	default:
+		return fmt.Sprintf("admin-events-%s", event.LogEnvelope.Timestamp.Format("2006.01.02"))
+	}
 }
 
 func (ec *ESConsumer) indexSessionEvent(ctx context.Context, event *models.SessionLogEvent) error {
@@ -170,7 +251,7 @@ func (ec *ESConsumer) indexUserEvent(ctx context.Context, event *models.UserLogE
 	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
 }
 
-// ✅ REMOVED: indexOTPEvent, indexMPINEvent, indexDeviceEvent
+// ✅ REMOVED: indexOTPEvent, indexMPINEvent, indexDeviceEvent (handled by ClickHouse)
 
 // ✅ FIXED: Use bulk indexer instead of single document indexing
 func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID string, doc interface{}) error {
@@ -205,6 +286,188 @@ func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID s
 				zap.String("doc_id", docID))
 		},
 	})
+}
+
+// ✅ NEW: Query helpers for admin audit trails
+
+// GetAdminEventsByAdminID returns all events for a specific admin
+// Useful for audit trails and compliance investigations
+func (ec *ESConsumer) GetAdminEventsByAdminID(ctx context.Context, adminID string, limit int) ([]models.AdminLogEvent, error) {
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"match": map[string]interface{}{
+				"admin_id": adminID,
+			},
+		},
+		"size": limit,
+		"sort": []map[string]interface{}{
+			{
+				"timestamp": map[string]string{
+					"order": "desc",
+				},
+			},
+		},
+	}
+
+	queryBody, _ := json.Marshal(query)
+	res, err := ec.esClient.Search(
+		ec.esClient.Search.WithContext(ctx),
+		ec.esClient.Search.WithIndex("admin-*"),
+		ec.esClient.Search.WithBody(bytes.NewReader(queryBody)),
+	)
+	if err != nil {
+		ec.logger.Error("failed to search admin events", zap.Error(err))
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var searchResult struct {
+		Hits struct {
+			Hits []struct {
+				Source models.AdminLogEvent `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&searchResult); err != nil {
+		ec.logger.Error("failed to decode search results", zap.Error(err))
+		return nil, err
+	}
+
+	var events []models.AdminLogEvent
+	for _, hit := range searchResult.Hits.Hits {
+		events = append(events, hit.Source)
+	}
+
+	return events, nil
+}
+
+// GetFailedAdminActions returns all failed admin actions for compliance review
+func (ec *ESConsumer) GetFailedAdminActions(ctx context.Context, hoursBack int, limit int) ([]models.AdminLogEvent, error) {
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{
+						"match": map[string]interface{}{
+							"status": "failed",
+						},
+					},
+					{
+						"range": map[string]interface{}{
+							"timestamp": map[string]interface{}{
+								"gte": fmt.Sprintf("now-%dh", hoursBack),
+							},
+						},
+					},
+				},
+			},
+		},
+		"size": limit,
+		"sort": []map[string]interface{}{
+			{
+				"timestamp": map[string]string{
+					"order": "desc",
+				},
+			},
+		},
+	}
+
+	queryBody, _ := json.Marshal(query)
+	res, err := ec.esClient.Search(
+		ec.esClient.Search.WithContext(ctx),
+		ec.esClient.Search.WithIndex("admin-*"),
+		ec.esClient.Search.WithBody(bytes.NewReader(queryBody)),
+	)
+	if err != nil {
+		ec.logger.Error("failed to search failed admin actions", zap.Error(err))
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var searchResult struct {
+		Hits struct {
+			Hits []struct {
+				Source models.AdminLogEvent `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&searchResult); err != nil {
+		ec.logger.Error("failed to decode search results", zap.Error(err))
+		return nil, err
+	}
+
+	var events []models.AdminLogEvent
+	for _, hit := range searchResult.Hits.Hits {
+		events = append(events, hit.Source)
+	}
+
+	return events, nil
+}
+
+// GetAdminActionsByType returns all admin actions of a specific type
+func (ec *ESConsumer) GetAdminActionsByType(ctx context.Context, action string, hoursBack int, limit int) ([]models.AdminLogEvent, error) {
+	query := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{
+						"match": map[string]interface{}{
+							"action": action,
+						},
+					},
+					{
+						"range": map[string]interface{}{
+							"timestamp": map[string]interface{}{
+								"gte": fmt.Sprintf("now-%dh", hoursBack),
+							},
+						},
+					},
+				},
+			},
+		},
+		"size": limit,
+		"sort": []map[string]interface{}{
+			{
+				"timestamp": map[string]string{
+					"order": "desc",
+				},
+			},
+		},
+	}
+
+	queryBody, _ := json.Marshal(query)
+	res, err := ec.esClient.Search(
+		ec.esClient.Search.WithContext(ctx),
+		ec.esClient.Search.WithIndex("admin-*"),
+		ec.esClient.Search.WithBody(bytes.NewReader(queryBody)),
+	)
+	if err != nil {
+		ec.logger.Error("failed to search admin actions by type", zap.Error(err))
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	var searchResult struct {
+		Hits struct {
+			Hits []struct {
+				Source models.AdminLogEvent `json:"_source"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&searchResult); err != nil {
+		ec.logger.Error("failed to decode search results", zap.Error(err))
+		return nil, err
+	}
+
+	var events []models.AdminLogEvent
+	for _, hit := range searchResult.Hits.Hits {
+		events = append(events, hit.Source)
+	}
+
+	return events, nil
 }
 
 // Health check for Elasticsearch

@@ -174,6 +174,8 @@ func (s *DeviceService) GetActiveDevice(
 	ctx context.Context,
 	userID uuid.UUID,
 ) (*models.UserActiveDevice, error) {
+	startTime := time.Now()
+
 	// Try cache first
 	if s.distCache != nil {
 		cacheKey := fmt.Sprintf("device:%s", userID.String())
@@ -187,13 +189,37 @@ func (s *DeviceService) GetActiveDevice(
 	// Cache miss - fetch from database
 	device, err := s.deviceRepo.GetActiveDevice(ctx, userID)
 	if err != nil {
-		return nil, err
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       userID.String(),
+				Action:       "get_active_device",
+				Status:       "failed",
+				ErrorCode:    "GET_DEVICE_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+		return nil, fmt.Errorf("failed to get active device: %w", err)
 	}
 
 	// Cache the result
 	if device != nil && s.distCache != nil {
 		cacheKey := fmt.Sprintf("device:%s", userID.String())
 		s.distCache.SetWithExpiry(ctx, cacheKey, device, 5*time.Minute)
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil && device != nil {
+		event := &models.DeviceLogEvent{
+			UserID:    userID.String(),
+			DeviceID:  device.DeviceID,
+			Action:    "get_active_device",
+			Status:    "success",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	return device, nil
@@ -397,19 +423,72 @@ func (s *DeviceService) GetDeviceBindingHistory(
 	userID uuid.UUID,
 	limit int,
 ) ([]*models.UserActiveDevice, error) {
+	startTime := time.Now()
+
 	// Use history table if available
 	if s.historyRepo != nil {
-		return s.historyRepo.GetBindingHistory(ctx, userID, limit)
+		history, err := s.historyRepo.GetBindingHistory(ctx, userID, limit)
+		if err != nil {
+			// ✅ Log failure event
+			if s.logProducer != nil {
+				event := &models.DeviceLogEvent{
+					UserID:       userID.String(),
+					Action:       "get_binding_history",
+					Status:       "failed",
+					ErrorCode:    "GET_HISTORY_FAILED",
+					ErrorMessage: err.Error(),
+					Duration:     int64(time.Since(startTime).Milliseconds()),
+				}
+				_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+			}
+			return nil, fmt.Errorf("failed to get binding history: %w", err)
+		}
+
+		// ✅ Log success event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:   userID.String(),
+				Action:   "get_binding_history",
+				Status:   "success",
+				Duration: int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+
+		return history, nil
 	}
 
 	// Fallback to current device
 	device, err := s.deviceRepo.GetActiveDevice(ctx, userID)
 	if err != nil {
-		return nil, err
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				UserID:       userID.String(),
+				Action:       "get_binding_history",
+				Status:       "failed",
+				ErrorCode:    "GET_DEVICE_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+		return nil, fmt.Errorf("failed to get active device: %w", err)
 	}
 
 	if device == nil {
 		return []*models.UserActiveDevice{}, nil
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil {
+		event := &models.DeviceLogEvent{
+			UserID:   userID.String(),
+			Action:   "get_binding_history",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	return []*models.UserActiveDevice{device}, nil
@@ -420,13 +499,71 @@ func (s *DeviceService) GetUsersByDevice(
 	ctx context.Context,
 	deviceID string,
 ) ([]*models.UserActiveDevice, error) {
+	startTime := time.Now()
+
 	// Use history table if available (faster with materialized view)
 	if s.historyRepo != nil {
-		return s.historyRepo.GetUsersByDeviceFromHistory(ctx, deviceID)
+		users, err := s.historyRepo.GetUsersByDeviceFromHistory(ctx, deviceID)
+		if err != nil {
+			// ✅ Log failure event
+			if s.logProducer != nil {
+				event := &models.DeviceLogEvent{
+					DeviceID:     deviceID,
+					Action:       "get_users_by_device",
+					Status:       "failed",
+					ErrorCode:    "GET_USERS_FAILED",
+					ErrorMessage: err.Error(),
+					Duration:     int64(time.Since(startTime).Milliseconds()),
+				}
+				_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+			}
+			return nil, fmt.Errorf("failed to get users by device from history: %w", err)
+		}
+
+		// ✅ Log success event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				DeviceID: deviceID,
+				Action:   "get_users_by_device",
+				Status:   "success",
+				Duration: int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+
+		return users, nil
 	}
 
 	// Fallback to main repository
-	return s.deviceRepo.GetUsersByDevice(ctx, deviceID)
+	users, err := s.deviceRepo.GetUsersByDevice(ctx, deviceID)
+	if err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				DeviceID:     deviceID,
+				Action:       "get_users_by_device",
+				Status:       "failed",
+				ErrorCode:    "GET_USERS_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+		return nil, fmt.Errorf("failed to get users by device: %w", err)
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil {
+		event := &models.DeviceLogEvent{
+			DeviceID: deviceID,
+			Action:   "get_users_by_device",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+	}
+
+	return users, nil
 }
 
 // CleanupOrphanedDevices removes old device bindings
@@ -454,7 +591,7 @@ func (s *DeviceService) CleanupOrphanedDevices(
 	}
 
 	// ✅ Log success event
-	if s.logProducer != nil && count > 0 {
+	if s.logProducer != nil {
 		event := &models.DeviceLogEvent{
 			Action:   "cleanup_orphaned",
 			Status:   "success",
@@ -472,14 +609,48 @@ func (s *DeviceService) CleanupOrphanedDevices(
 
 // HealthCheck checks service health
 func (s *DeviceService) HealthCheck(ctx context.Context) error {
+	startTime := time.Now()
+
 	if err := s.deviceRepo.HealthCheck(ctx); err != nil {
-		return err
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				Action:       "health_check",
+				Status:       "failed",
+				ErrorCode:    "DEVICE_REPO_HEALTH_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+		return fmt.Errorf("device repository health check failed: %w", err)
 	}
 
 	if s.historyRepo != nil {
 		if err := s.historyRepo.HealthCheck(ctx); err != nil {
-			return err
+			// ✅ Log failure event
+			if s.logProducer != nil {
+				event := &models.DeviceLogEvent{
+					Action:       "health_check",
+					Status:       "failed",
+					ErrorCode:    "HISTORY_REPO_HEALTH_FAILED",
+					ErrorMessage: err.Error(),
+					Duration:     int64(time.Since(startTime).Milliseconds()),
+				}
+				_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+			}
+			return fmt.Errorf("history repository health check failed: %w", err)
 		}
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil {
+		event := &models.DeviceLogEvent{
+			Action:   "health_check",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
 
 	return nil
@@ -487,7 +658,35 @@ func (s *DeviceService) HealthCheck(ctx context.Context) error {
 
 // GetServiceStats returns service statistics
 func (s *DeviceService) GetServiceStats(ctx context.Context) (map[string]interface{}, error) {
-	return s.deviceRepo.GetRepositoryStats(ctx)
+	startTime := time.Now()
+
+	stats, err := s.deviceRepo.GetRepositoryStats(ctx)
+	if err != nil {
+		// ✅ Log failure event
+		if s.logProducer != nil {
+			event := &models.DeviceLogEvent{
+				Action:       "get_service_stats",
+				Status:       "failed",
+				ErrorCode:    "GET_STATS_FAILED",
+				ErrorMessage: err.Error(),
+				Duration:     int64(time.Since(startTime).Milliseconds()),
+			}
+			_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+		}
+		return nil, fmt.Errorf("failed to get service stats: %w", err)
+	}
+
+	// ✅ Log success event
+	if s.logProducer != nil {
+		event := &models.DeviceLogEvent{
+			Action:   "get_service_stats",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
+		}
+		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
+	}
+
+	return stats, nil
 }
 
 // generateBindToken generates a cryptographically secure bind token
