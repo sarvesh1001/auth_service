@@ -1,4 +1,5 @@
 package service
+
 import (
     "context"
     "crypto/sha256"
@@ -50,6 +51,7 @@ type UserService struct {
     distCache       *DistributedCache
     rateLimiter     *RateLimiter
     validationMutex sync.RWMutex
+    logProducer     *LogProducerService // ✅ ADDED: Kafka log producer
 }
 
 // RateLimiter handles rate limiting for user operations
@@ -142,6 +144,18 @@ func NewUserServiceWithCache(
     return service
 }
 
+// ✅ ADDED: SetLogProducerService sets Kafka log producer service
+func (s *UserService) SetLogProducerService(logProducer *LogProducerService) {
+    s.logProducer = logProducer
+}
+
+// ✅ ADDED: logUserEvent logs a user event to Kafka
+func (s *UserService) logUserEvent(ctx context.Context, event *models.UserLogEvent) {
+    if s.logProducer != nil {
+        _ = s.logProducer.ProduceUserEvent(ctx, event)
+    }
+}
+
 // SetDistributedCache sets the distributed cache
 func (s *UserService) SetDistributedCache(distCache *DistributedCache) {
     s.distCache = distCache
@@ -177,8 +191,28 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
 
     encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, req.PhoneNumber, "phone")
     if err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to encrypt phone during user creation",
+            },
+            UserID:      userID.String(),
+            Action:      "create_user",
+            PhoneNumber: req.PhoneNumber,
+            Status:      "failed",
+            ErrorCode:   "PHONE_ENCRYPTION_FAILED",
+            Duration:    int64(time.Since(startTime).Milliseconds()),
+        })
         return nil, fmt.Errorf("failed to encrypt phone: %w", err)
     }
+    
     s.logger.Info("Encrypted phone debug",
     util.String("EncryptedValue", encryptedPhone.EncryptedValue),
     util.String("EncryptedDEK", encryptedPhone.EncryptedDEK),
@@ -222,11 +256,55 @@ func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*
     }
 
     if err := s.userRepo.CreateUser(ctx, user); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to create user in database",
+            },
+            UserID:      userID.String(),
+            Action:      "create_user",
+            PhoneNumber: req.PhoneNumber,
+            Status:      "failed",
+            ErrorCode:   "CREATE_USER_FAILED",
+            Duration:    int64(time.Since(startTime).Milliseconds()),
+        })
         return nil, fmt.Errorf("failed to create user: %w", err)
     }
 
     s.cacheUser(ctx, user)
     s.cachePhoneMapping(ctx, phoneHash, userID)
+
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User created successfully",
+        },
+        UserID:      userID.String(),
+        Action:      "create_user",
+        PhoneNumber: req.PhoneNumber,
+        Status:      "success",
+        DeviceID:    req.DeviceID,
+        Changes: map[string]interface{}{
+            "data_region":     req.DataRegion,
+            "consent_agreed":  req.ConsentAgreed,
+            "consent_version": req.ConsentVersion,
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
 
     s.logger.Info("User created successfully",
         util.String("user_id", userID.String()),
@@ -297,15 +375,27 @@ func (s *UserService) GetUserByPhone(ctx context.Context, phoneNumber string) (*
 
 // UpdateUser updates user information with validation
 func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *UserUpdateRequest) (*models.User, error) {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, userID)
     if err != nil {
         return nil, err
     }
 
-    if req.DeviceID != nil {
+    changes := make(map[string]interface{})
+    
+    if req.DeviceID != nil && *req.DeviceID != user.DeviceID {
+        changes["device_id"] = map[string]interface{}{
+            "old": user.DeviceID,
+            "new": *req.DeviceID,
+        }
         user.DeviceID = *req.DeviceID
     }
-    if req.DeviceFingerprint != nil {
+    if req.DeviceFingerprint != nil && *req.DeviceFingerprint != user.DeviceFingerprint {
+        changes["device_fingerprint"] = map[string]interface{}{
+            "old": user.DeviceFingerprint,
+            "new": *req.DeviceFingerprint,
+        }
         user.DeviceFingerprint = *req.DeviceFingerprint
     }
     if req.ProfileServiceID != nil {
@@ -313,9 +403,17 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
         if err != nil {
             return nil, fmt.Errorf("invalid profile service ID format: %w", err)
         }
+        changes["profile_service_id"] = map[string]interface{}{
+            "old": user.ProfileServiceID,
+            "new": profileID,
+        }
         user.ProfileServiceID = profileID
     }
-    if req.DataRegion != nil {
+    if req.DataRegion != nil && *req.DataRegion != user.DataRegion {
+        changes["data_region"] = map[string]interface{}{
+            "old": user.DataRegion,
+            "new": *req.DataRegion,
+        }
         user.DataRegion = *req.DataRegion
     }
 
@@ -323,11 +421,49 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
     user.UpdatedAt = &now
 
     if err := s.userRepo.UpdateUser(ctx, user); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to update user in database",
+            },
+            UserID:   userID.String(),
+            Action:   "update_user",
+            Status:   "failed",
+            ErrorCode: "UPDATE_USER_FAILED",
+            Changes:  changes,
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        })
         return nil, fmt.Errorf("failed to update user: %w", err)
     }
 
     s.invalidateUserCache(ctx, userID)
     s.cacheUser(ctx, user)
+
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User updated successfully",
+        },
+        UserID:   userID.String(),
+        Action:   "update_user",
+        Status:   "success",
+        Changes:  changes,
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
 
     s.logger.Info("User updated successfully",
         util.String("user_id", userID.String()),
@@ -339,12 +475,32 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 
 // UpdateUserProfile updates user profile service ID
 func (s *UserService) UpdateUserProfile(ctx context.Context, userID uuid.UUID, profileServiceID uuid.UUID) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, userID)
     if err != nil {
         return err
     }
 
     if err := s.userRepo.UpdateUserProfile(ctx, userID, profileServiceID); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to update user profile in database",
+            },
+            UserID:   userID.String(),
+            Action:   "update_user_profile",
+            Status:   "failed",
+            ErrorCode: "UPDATE_PROFILE_FAILED",
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        })
         return fmt.Errorf("failed to update user profile: %w", err)
     }
 
@@ -355,11 +511,34 @@ func (s *UserService) UpdateUserProfile(ctx context.Context, userID uuid.UUID, p
     s.invalidateUserCache(ctx, userID)
     s.cacheUser(ctx, user)
 
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User profile updated successfully",
+        },
+        UserID:   userID.String(),
+        Action:   "update_user_profile",
+        Status:   "success",
+        Changes: map[string]interface{}{
+            "profile_service_id": profileServiceID.String(),
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
     return nil
 }
 
 // UpdateUserStatus updates user status with validation
 func (s *UserService) UpdateUserStatus(ctx context.Context, userID uuid.UUID, isVerified, isBlocked, isBanned bool) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, userID)
     if err != nil {
         return err
@@ -370,8 +549,30 @@ func (s *UserService) UpdateUserStatus(ctx context.Context, userID uuid.UUID, is
     }
 
     if err := s.userRepo.UpdateUserStatus(ctx, userID, isVerified, isBlocked, isBanned); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to update user status in database",
+            },
+            UserID:   userID.String(),
+            Action:   "update_user_status",
+            Status:   "failed",
+            ErrorCode: "UPDATE_STATUS_FAILED",
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        })
         return fmt.Errorf("failed to update user status: %w", err)
     }
+
+    oldVerified := user.IsVerified
+    oldBlocked := user.IsBlocked
+    oldBanned := user.IsBanned
 
     user.IsVerified = isVerified
     user.IsBlocked = isBlocked
@@ -381,6 +582,29 @@ func (s *UserService) UpdateUserStatus(ctx context.Context, userID uuid.UUID, is
     
     s.invalidateUserCache(ctx, userID)
     s.cacheUser(ctx, user)
+
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User status updated successfully",
+        },
+        UserID:   userID.String(),
+        Action:   "update_user_status",
+        Status:   "success",
+        Changes: map[string]interface{}{
+            "is_verified": map[string]interface{}{"old": oldVerified, "new": isVerified},
+            "is_blocked":  map[string]interface{}{"old": oldBlocked, "new": isBlocked},
+            "is_banned":   map[string]interface{}{"old": oldBanned, "new": isBanned},
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
 
     s.logger.Info("User status updated",
         util.String("user_id", userID.String()),
@@ -394,6 +618,8 @@ func (s *UserService) UpdateUserStatus(ctx context.Context, userID uuid.UUID, is
 
 // UpdateLastLogin updates user's last login timestamp
 func (s *UserService) UpdateLastLogin(ctx context.Context, userID uuid.UUID) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, userID)
     if err != nil {
         return err
@@ -406,6 +632,24 @@ func (s *UserService) UpdateLastLogin(ctx context.Context, userID uuid.UUID) err
 
     user.LastLogin = &now
     s.cacheUser(ctx, user)
+
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User last login updated",
+        },
+        UserID:   userID.String(),
+        Action:   "update_last_login",
+        Status:   "success",
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
 
     return nil
 }
@@ -566,6 +810,8 @@ func (s *UserService) UpdateUsersBatch(ctx context.Context, updates map[uuid.UUI
 
 // UpdateKYCStatus updates user's KYC status with validation
 func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, req.UserID)
     if err != nil {
         return err
@@ -577,8 +823,29 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 
     now := time.Now().UTC()
     if err := s.userRepo.UpdateKYCStatus(ctx, req.UserID, req.Status, req.Level, req.VerifiedBy); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to update KYC status in database",
+            },
+            UserID:      req.UserID.String(),
+            Action:      "update_kyc_status",
+            Status:      "failed",
+            ErrorCode:   "UPDATE_KYC_FAILED",
+            Duration:    int64(time.Since(startTime).Milliseconds()),
+        })
         return fmt.Errorf("failed to update KYC status: %w", err)
     }
+
+    oldStatus := user.KYCStatus
+    oldLevel := user.KYCLevel
 
     user.KYCStatus = req.Status
     user.KYCLevel = req.Level
@@ -592,6 +859,31 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 
     s.invalidateUserCache(ctx, req.UserID)
     s.cacheUser(ctx, user)
+
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "KYC status updated successfully",
+        },
+        UserID:   req.UserID.String(),
+        Action:   "update_kyc_status",
+        Status:   "success",
+        Changes: map[string]interface{}{
+            "old_status": oldStatus,
+            "new_status": req.Status,
+            "old_level":  oldLevel,
+            "new_level":  req.Level,
+            "verified_by": req.VerifiedBy.String(),
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
 
     s.logger.Info("KYC status updated",
         util.String("user_id", req.UserID.String()),
@@ -633,12 +925,35 @@ func (s *UserService) GetUsersByKYCStatus(ctx context.Context, status string, li
 
 // UpdateUserConsent updates user consent information
 func (s *UserService) UpdateUserConsent(ctx context.Context, userID uuid.UUID, agreed bool, version string) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, userID)
     if err != nil {
         return err
     }
 
+    oldAgreed := user.ConsentAgreed
+    oldVersion := user.ConsentVersion
+
     if err := s.userRepo.UpdateUserConsent(ctx, userID, agreed, version); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to update user consent in database",
+            },
+            UserID:   userID.String(),
+            Action:   "update_user_consent",
+            Status:   "failed",
+            ErrorCode: "UPDATE_CONSENT_FAILED",
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        })
         return fmt.Errorf("failed to update user consent: %w", err)
     }
 
@@ -650,6 +965,28 @@ func (s *UserService) UpdateUserConsent(ctx context.Context, userID uuid.UUID, a
     s.invalidateUserCache(ctx, userID)
     s.cacheUser(ctx, user)
 
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User consent updated successfully",
+        },
+        UserID:   userID.String(),
+        Action:   "update_user_consent",
+        Status:   "success",
+        Changes: map[string]interface{}{
+            "consent_agreed":   map[string]interface{}{"old": oldAgreed, "new": agreed},
+            "consent_version": map[string]interface{}{"old": oldVersion, "new": version},
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
     return nil
 }
 
@@ -657,6 +994,8 @@ func (s *UserService) UpdateUserConsent(ctx context.Context, userID uuid.UUID, a
 
 // BanUser bans a user with comprehensive validation
 func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, req.UserID)
     if err != nil {
         return err
@@ -667,6 +1006,24 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
     }
 
     if err := s.userRepo.BanUser(ctx, req.UserID, req.BannedBy, req.Reason); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to ban user in database",
+            },
+            UserID:      req.UserID.String(),
+            Action:      "ban_user",
+            Status:      "failed",
+            ErrorCode:   "BAN_USER_FAILED",
+            Duration:    int64(time.Since(startTime).Milliseconds()),
+        })
         return fmt.Errorf("failed to ban user: %w", err)
     }
 
@@ -680,6 +1037,29 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
     s.invalidateUserCache(ctx, req.UserID)
     s.cacheUser(ctx, user)
 
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "warning",
+            Message:     "User banned successfully",
+        },
+        UserID:   req.UserID.String(),
+        Action:   "ban_user",
+        Status:   "success",
+        Changes: map[string]interface{}{
+            "banned_by":   req.BannedBy.String(),
+            "banned_reason": req.Reason,
+            "banned_at":   now,
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
     s.logger.Warn("User banned",
         util.String("user_id", req.UserID.String()),
         util.String("banned_by", req.BannedBy.String()),
@@ -691,6 +1071,8 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
 
 // UnbanUser unbans a user
 func (s *UserService) UnbanUser(ctx context.Context, userID uuid.UUID) error {
+    startTime := time.Now()
+
     user, err := s.GetUserByID(ctx, userID)
     if err != nil {
         return err
@@ -701,6 +1083,24 @@ func (s *UserService) UnbanUser(ctx context.Context, userID uuid.UUID) error {
     }
 
     if err := s.userRepo.UnbanUser(ctx, userID); err != nil {
+        // ✅ ADDED: Log failure event
+        s.logUserEvent(ctx, &models.UserLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "user",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to unban user in database",
+            },
+            UserID:   userID.String(),
+            Action:   "unban_user",
+            Status:   "failed",
+            ErrorCode: "UNBAN_USER_FAILED",
+            Duration: int64(time.Since(startTime).Milliseconds()),
+        })
         return fmt.Errorf("failed to unban user: %w", err)
     }
 
@@ -713,6 +1113,24 @@ func (s *UserService) UnbanUser(ctx context.Context, userID uuid.UUID) error {
     
     s.invalidateUserCache(ctx, userID)
     s.cacheUser(ctx, user)
+
+    // ✅ ADDED: Log success event
+    s.logUserEvent(ctx, &models.UserLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "user",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "User unbanned successfully",
+        },
+        UserID:   userID.String(),
+        Action:   "unban_user",
+        Status:   "success",
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
 
     s.logger.Info("User unbanned",
         util.String("user_id", userID.String()),

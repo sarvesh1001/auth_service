@@ -1,6 +1,6 @@
-// File: internal/consumer/es_consumer.go - COMPLETE UPDATED VERSION
-// Consumes Kafka events and indexes them to Elasticsearch for SEARCH & ANALYTICS only
-// ✅ UPDATED: Handles Admin, User, Session, Security events with proper AdminLogEvent indexing
+// File: internal/consumer/es_consumer.go - UPDATED FOR MULTI-TOPIC CONSUMPTION
+// Consumes Kafka events from multiple topics and indexes them to Elasticsearch for SEARCH & ANALYTICS
+// ✅ UPDATED: Handles multiple topics with separate consumers
 
 package consumer
 
@@ -9,10 +9,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esutil"
+	"github.com/segmentio/kafka-go" // ✅ ADD MISSING IMPORT
 	"go.uber.org/zap"
 
 	"auth-service/internal/client"
@@ -20,9 +22,9 @@ import (
 	"auth-service/internal/util"
 )
 
-// ESConsumer consumes Kafka SEARCH events and indexes them into Elasticsearch
+// ESConsumer consumes Kafka SEARCH events from multiple topics and indexes them into Elasticsearch
 type ESConsumer struct {
-	kafkaConsumer  *client.KafkaConsumer
+	kafkaConsumers map[string]*client.KafkaConsumer // ✅ CHANGED: Multiple consumers by topic
 	esClient       *elasticsearch.Client
 	bulkIndexer    esutil.BulkIndexer
 	logger         *zap.Logger
@@ -32,7 +34,7 @@ type ESConsumer struct {
 
 // NewESConsumer creates a new Elasticsearch consumer for search events
 func NewESConsumer(
-	kafkaConsumer *client.KafkaConsumer,
+	kafkaConsumers map[string]*client.KafkaConsumer, // ✅ CHANGED: Accept map of consumers
 	esClient *elasticsearch.Client,
 ) (*ESConsumer, error) {
 	// ✅ Initialize bulk indexer for better performance
@@ -47,33 +49,60 @@ func NewESConsumer(
 	}
 
 	return &ESConsumer{
-		kafkaConsumer: kafkaConsumer,
-		esClient:      esClient,
-		bulkIndexer:   bulkIndexer,
-		logger:        util.Get(),
-		maxRetries:    3,
-		retryBackoff:  100 * time.Millisecond,
+		kafkaConsumers: kafkaConsumers, // ✅ FIXED: Use correct field name (plural)
+		esClient:       esClient,
+		bulkIndexer:    bulkIndexer,
+		logger:         util.Get(),
+		maxRetries:     3,
+		retryBackoff:   100 * time.Millisecond,
 	}, nil
 }
 
-// Start begins consuming from Kafka and indexing SEARCH events to Elasticsearch
+// Start begins consuming from Kafka topics and indexing SEARCH events to Elasticsearch
 func (ec *ESConsumer) Start(ctx context.Context) error {
-	ec.logger.Info("ES consumer started for search events")
+	ec.logger.Info("ES consumer started for multiple topics",
+		zap.Int("topic_count", len(ec.kafkaConsumers)),
+		zap.Strings("topics", ec.getTopicNames()))
 
+	var wg sync.WaitGroup
+	
+	// Start a goroutine for each topic consumer
+	for topic, kafkaConsumer := range ec.kafkaConsumers {
+		wg.Add(1)
+		go func(topic string, consumer *client.KafkaConsumer) {
+			defer wg.Done()
+			ec.consumeTopic(ctx, topic, consumer)
+		}(topic, kafkaConsumer)
+	}
+	
+	// Wait for all consumers to finish when context is cancelled
+	wg.Wait()
+	
+	// ✅ Close bulk indexer gracefully
+	if err := ec.bulkIndexer.Close(ctx); err != nil {
+		ec.logger.Error("failed to close bulk indexer", zap.Error(err))
+	}
+	
+	ec.logger.Info("ES consumer stopped")
+	return ctx.Err()
+}
+
+// consumeTopic handles consumption for a single topic
+func (ec *ESConsumer) consumeTopic(ctx context.Context, topic string, kafkaConsumer *client.KafkaConsumer) {
+	ec.logger.Info("Starting consumption for topic", zap.String("topic", topic))
+	
 	for {
 		select {
 		case <-ctx.Done():
-			// ✅ Close bulk indexer gracefully
-			if err := ec.bulkIndexer.Close(ctx); err != nil {
-				ec.logger.Error("failed to close bulk indexer", zap.Error(err))
-			}
-			ec.logger.Info("ES consumer stopped")
-			return ctx.Err()
-
+			ec.logger.Info("Stopping consumption for topic", zap.String("topic", topic))
+			return
+			
 		default:
-			msg, err := ec.kafkaConsumer.ConsumeMessage(ctx)
+			msg, err := kafkaConsumer.ConsumeMessage(ctx)
 			if err != nil {
-				ec.logger.Error("failed to consume message", zap.Error(err))
+				ec.logger.Error("failed to consume message", 
+					zap.String("topic", topic),
+					zap.Error(err))
 				time.Sleep(time.Second)
 				continue
 			}
@@ -87,85 +116,98 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 				}
 			}
 
-			// ✅ UPDATED: Only route SEARCH & ANALYTICS events to Elasticsearch
-			switch eventType {
-			case "security":
-				var event models.SecurityLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal Security event", zap.Error(err))
-					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-					}
-					continue
-				}
-				if err := ec.indexSecurityEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index Security event", zap.Error(err))
-				}
-				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-					ec.logger.Error("failed to commit security event message", zap.Error(err))
-				}
-
-			case "admin":
-				// ✅ NEW: Handle AdminLogEvent with proper LogEnvelope structure
-				var event models.AdminLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal Admin event", zap.Error(err))
-					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-					}
-					continue
-				}
-				if err := ec.indexAdminEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index Admin event", zap.Error(err))
-				}
-				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-					ec.logger.Error("failed to commit admin event message", zap.Error(err))
-				}
-
-			case "session":
-				var event models.SessionLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal Session event", zap.Error(err))
-					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-					}
-					continue
-				}
-				if err := ec.indexSessionEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index Session event", zap.Error(err))
-				}
-				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-					ec.logger.Error("failed to commit session event message", zap.Error(err))
-				}
-
-			case "user":
-				var event models.UserLogEvent
-				if err := json.Unmarshal(msg.Value, &event); err != nil {
-					ec.logger.Error("failed to unmarshal User event", zap.Error(err))
-					if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-						ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-					}
-					continue
-				}
-				if err := ec.indexUserEvent(ctx, &event); err != nil {
-					ec.logger.Error("failed to index User event", zap.Error(err))
-				}
-				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-					ec.logger.Error("failed to commit user event message", zap.Error(err))
-				}
-
-			// ✅ REMOVED: Device, MPIN, OTP events (now handled by ClickHouse only)
-			default:
-				ec.logger.Debug("ignoring time-series event for Elasticsearch",
-					zap.String("event_type", eventType),
-					zap.String("reason", "handled_by_clickhouse"))
-				// Still commit the message since it's processed by ClickHouse consumer
-				if err := ec.kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-					ec.logger.Error("failed to commit ignored message", zap.Error(err))
-				}
-			}
+			// Process the event based on type
+			ec.processEvent(ctx, eventType, msg, kafkaConsumer)
 		}
 	}
+}
+
+// processEvent processes a single event - ✅ FIXED: Use kafka.Message type
+func (ec *ESConsumer) processEvent(ctx context.Context, eventType string, msg *kafka.Message, kafkaConsumer *client.KafkaConsumer) {
+	switch eventType {
+	case "security":
+		var event models.SecurityLogEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			ec.logger.Error("failed to unmarshal Security event", zap.Error(err))
+			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+			}
+			return
+		}
+		if err := ec.indexSecurityEvent(ctx, &event); err != nil {
+			ec.logger.Error("failed to index Security event", zap.Error(err))
+		}
+		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+			ec.logger.Error("failed to commit security event message", zap.Error(err))
+		}
+
+	case "admin":
+		var event models.AdminLogEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			ec.logger.Error("failed to unmarshal Admin event", zap.Error(err))
+			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+			}
+			return
+		}
+		if err := ec.indexAdminEvent(ctx, &event); err != nil {
+			ec.logger.Error("failed to index Admin event", zap.Error(err))
+		}
+		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+			ec.logger.Error("failed to commit admin event message", zap.Error(err))
+		}
+
+	case "session":
+		var event models.SessionLogEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			ec.logger.Error("failed to unmarshal Session event", zap.Error(err))
+			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+			}
+			return
+		}
+		if err := ec.indexSessionEvent(ctx, &event); err != nil {
+			ec.logger.Error("failed to index Session event", zap.Error(err))
+		}
+		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+			ec.logger.Error("failed to commit session event message", zap.Error(err))
+		}
+
+	case "user":
+		var event models.UserLogEvent
+		if err := json.Unmarshal(msg.Value, &event); err != nil {
+			ec.logger.Error("failed to unmarshal User event", zap.Error(err))
+			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
+			}
+			return
+		}
+		if err := ec.indexUserEvent(ctx, &event); err != nil {
+			ec.logger.Error("failed to index User event", zap.Error(err))
+		}
+		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+			ec.logger.Error("failed to commit user event message", zap.Error(err))
+		}
+
+	// ✅ REMOVED: Device, MPIN, OTP events (now handled by ClickHouse only)
+	default:
+		ec.logger.Debug("ignoring time-series event for Elasticsearch",
+			zap.String("event_type", eventType),
+			zap.String("reason", "handled_by_clickhouse"))
+		// Still commit the message since it's processed by ClickHouse consumer
+		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+			ec.logger.Error("failed to commit ignored message", zap.Error(err))
+		}
+	}
+}
+
+// getTopicNames returns the list of topics being consumed
+func (ec *ESConsumer) getTopicNames() []string {
+	topics := make([]string, 0, len(ec.kafkaConsumers))
+	for topic := range ec.kafkaConsumers {
+		topics = append(topics, topic)
+	}
+	return topics
 }
 
 // Stop stops the consumer gracefully
@@ -250,8 +292,6 @@ func (ec *ESConsumer) indexUserEvent(ctx context.Context, event *models.UserLogE
 	index := fmt.Sprintf("user-events-%s", event.Timestamp.Format("2006.01.02"))
 	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
 }
-
-// ✅ REMOVED: indexOTPEvent, indexMPINEvent, indexDeviceEvent (handled by ClickHouse)
 
 // ✅ FIXED: Use bulk indexer instead of single document indexing
 func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID string, doc interface{}) error {

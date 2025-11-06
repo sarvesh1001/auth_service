@@ -168,126 +168,140 @@ func NewFactory() (*Factory, error) {
 
 // InitializeKafkaLogging sets up Kafka producer and consumers with optimized event distribution
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
-	logger := util.Get()
+    logger := util.Get()
 
-	if len(f.config.Kafka.Brokers) == 0 {
-		logger.Warn("Kafka brokers not configured, logging to stdout only")
-		return nil, nil
-	}
+    if len(f.config.Kafka.Brokers) == 0 {
+        logger.Warn("Kafka brokers not configured, logging to stdout only")
+        return nil, nil
+    }
 
-	kafkaProducer, err := client.NewKafkaProducer(f.config, logger)
-	if err != nil {
-		logger.Error("failed to initialize Kafka producer", zap.Error(err))
-		return nil, err
-	}
+    kafkaProducer, err := client.NewKafkaProducer(f.config, logger)
+    if err != nil {
+        logger.Error("failed to initialize Kafka producer", zap.Error(err))
+        return nil, err
+    }
 
-	logProducer := service.NewLogProducerService(
-		kafkaProducer,
-		f.config.Environment,
-		"v1.0.0",
-	)
+    logProducer := service.NewLogProducerService(
+        kafkaProducer,
+        f.config.Environment,
+        "v1.0.0",
+    )
 
-	consumerCtx, cancel := context.WithCancel(context.Background())
+    consumerCtx, cancel := context.WithCancel(context.Background())
 
-	mgr := &KafkaLoggingManager{
-		producer:  logProducer,
-		cancelCtx: cancel,
-		logger:    logger,
-	}
+    mgr := &KafkaLoggingManager{
+        producer:  logProducer,
+        cancelCtx: cancel,
+        logger:    logger,
+    }
 
-	// ✅ ELASTICSEARCH CONSUMER - Search & Analytics Events
-	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
-		esTopics := []string{
-			"admin-events",    // Audit trails, role searches
-			"user-events",     // User behavior analysis  
-			"security-events", // Fraud investigation (dual-purpose)
-			"session-events",  // Session analytics
-		}
-		
-		// Create Kafka consumer for ES topics
-		kafkaConsumerES, err := client.NewKafkaConsumer(
-			f.config,
-			"admin-events",      // Primary topic
-			"es-consumer-group", 
-			logger,
-		)
-		if err == nil {
-			esConsumer, err := consumer.NewESConsumer(kafkaConsumerES, f.esClient.Client)
-			if err != nil {
-				logger.Error("failed to create Elasticsearch consumer", zap.Error(err))
-			} else {
-				mgr.esConsumer = esConsumer
-				mgr.wg.Add(1)
-				go func() {
-					defer mgr.wg.Done()
-					if err := esConsumer.Start(consumerCtx); err != nil {
-						logger.Error("ES consumer error", zap.Error(err))
-					}
-				}()
-				logger.Info("Elasticsearch consumer started for search events",
-					zap.Strings("topics", esTopics))
-			}
-		} else {
-			logger.Error("failed to create Elasticsearch Kafka consumer", zap.Error(err))
-		}
-	}
+    // ✅ ELASTICSEARCH CONSUMER - Search & Analytics Events (MULTI-TOPIC)
+    if f.config.Elasticsearch.URL != "" && f.esClient != nil {
+        esTopics := []string{
+            "admin-events",    // Audit trails, role searches
+            "user-events",     // User behavior analysis  
+            "security-events", // Fraud investigation (dual-purpose)
+            "session-events",  // Session analytics
+        }
+        
+        // Create multiple Kafka consumers for ES (one per topic)
+        esConsumers := make(map[string]*client.KafkaConsumer)
+        
+        for _, topic := range esTopics {
+            kafkaConsumer, err := client.NewKafkaConsumer(
+                f.config,
+                topic,
+                "es-consumer-group", 
+                logger,
+            )
+            if err != nil {
+                logger.Error("failed to create Elasticsearch Kafka consumer", 
+                    zap.String("topic", topic), 
+                    zap.Error(err))
+                continue
+            }
+            esConsumers[topic] = kafkaConsumer
+        }
 
-	// ✅ CLICKHOUSE CONSUMER - Time-Series & Metrics Events (MULTI-TOPIC)
-	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
-		chTopics := []string{
-			"device-events",     // Device metrics, binding trends
-			"mpin-events",       // Authentication patterns
-			"otp-events",        // Delivery metrics
-			"security-events",   // Real-time fraud detection (dual-purpose)
-		}
-		
-		// Create multiple Kafka consumers for ClickHouse (one per topic)
-		chConsumers := make(map[string]*client.KafkaConsumer)
-		
-		for _, topic := range chTopics {
-			kafkaConsumer, err := client.NewKafkaConsumer(
-				f.config,
-				topic,
-				"clickhouse-consumer-group",  
-				logger,
-			)
-			if err != nil {
-				logger.Error("failed to create ClickHouse Kafka consumer", 
-					zap.String("topic", topic), 
-					zap.Error(err))
-				continue
-			}
-			chConsumers[topic] = kafkaConsumer
-		}
+        if len(esConsumers) > 0 {
+            // ✅ FIXED: Create ESConsumer with multiple topic consumers
+            esConsumer, err := consumer.NewESConsumer(
+                esConsumers, // ✅ Pass the map of consumers
+                f.esClient.Client,
+            )
+            if err != nil {
+                logger.Error("failed to create Elasticsearch consumer", zap.Error(err))
+            } else {
+                mgr.esConsumer = esConsumer
+                mgr.wg.Add(1)
+                go func() {
+                    defer mgr.wg.Done()
+                    if err := esConsumer.Start(consumerCtx); err != nil {
+                        logger.Error("ES consumer error", zap.Error(err))
+                    }
+                }()
+                logger.Info("Elasticsearch multi-topic consumer started for search events",
+                    zap.Int("topic_count", len(esConsumers)),
+                    zap.Strings("topics", esTopics))
+            }
+        }
+    }
 
-		if len(chConsumers) > 0 {
-			// ✅ FIXED: Use the new multi-topic ClickHouse consumer - pass the MAP, not individual consumer
-			chConsumer := consumer.NewClickHouseConsumer(
-				chConsumers, // ✅ This is the map, not a single consumer
-				f.clickhouseClient.Conn(),
-				1000,          // batch size
-				5*time.Second, // flush interval
-			)
-			mgr.chConsumer = chConsumer
-			mgr.wg.Add(1)
-			go func() {
-				defer mgr.wg.Done()
-				if err := chConsumer.Start(consumerCtx); err != nil {
-					logger.Error("ClickHouse consumer error", zap.Error(err))
-				}
-			}()
-			logger.Info("ClickHouse multi-topic consumer started for time-series events",
-				zap.Int("topic_count", len(chConsumers)),
-				zap.Strings("topics", chTopics))
-		}
-	}
+    // ✅ CLICKHOUSE CONSUMER - Time-Series & Metrics Events (MULTI-TOPIC)
+    if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
+        chTopics := []string{
+            "device-events",     // Device metrics, binding trends
+            "mpin-events",       // Authentication patterns
+            "otp-events",        // Delivery metrics
+            "security-events",   // Real-time fraud detection (dual-purpose)
+        }
+        
+        // Create multiple Kafka consumers for ClickHouse (one per topic)
+        chConsumers := make(map[string]*client.KafkaConsumer)
+        
+        for _, topic := range chTopics {
+            kafkaConsumer, err := client.NewKafkaConsumer(
+                f.config,
+                topic,
+                "clickhouse-consumer-group",  
+                logger,
+            )
+            if err != nil {
+                logger.Error("failed to create ClickHouse Kafka consumer", 
+                    zap.String("topic", topic), 
+                    zap.Error(err))
+                continue
+            }
+            chConsumers[topic] = kafkaConsumer
+        }
 
-	logger.Info("Kafka logging system initialized with optimized event distribution",
-		zap.Bool("es_enabled", mgr.esConsumer != nil),
-		zap.Bool("ch_enabled", mgr.chConsumer != nil),
-	)
+        if len(chConsumers) > 0 {
+            chConsumer := consumer.NewClickHouseConsumer(
+                chConsumers,
+                f.clickhouseClient.Conn(),
+                1000,          // batch size
+                5*time.Second, // flush interval
+            )
+            mgr.chConsumer = chConsumer
+            mgr.wg.Add(1)
+            go func() {
+                defer mgr.wg.Done()
+                if err := chConsumer.Start(consumerCtx); err != nil {
+                    logger.Error("ClickHouse consumer error", zap.Error(err))
+                }
+            }()
+            logger.Info("ClickHouse multi-topic consumer started for time-series events",
+                zap.Int("topic_count", len(chConsumers)),
+                zap.Strings("topics", chTopics))
+        }
+    }
 
-	return mgr, nil
+    logger.Info("Kafka logging system initialized with optimized event distribution",
+        zap.Bool("es_enabled", mgr.esConsumer != nil),
+        zap.Bool("ch_enabled", mgr.chConsumer != nil),
+    )
+
+    return mgr, nil
 }
 // ============================================================================
 // CLIENT INITIALIZATION
@@ -504,27 +518,31 @@ func (f *Factory) ServiceFactory() *service.ServiceFactory {
 	}
 	return f.serviceFactory
 }
-
 func (f *Factory) GetUserService() *service.UserService {
-	f.once.Do(func() {
-		repo := f.UserRepository()
-		hasher := f.Hasher()
-		encMgr := f.EncryptionManager()
-		bucketMgr := f.BucketingManager()
-		logger := f.logger
+    f.once.Do(func() {
+        repo := f.UserRepository()
+        hasher := f.Hasher()
+        encMgr := f.EncryptionManager()
+        bucketMgr := f.BucketingManager()
+        logger := f.logger
 
-		var distCache *service.DistributedCache
-		if f.redisClient != nil {
-			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
-		}
+        var distCache *service.DistributedCache
+        if f.redisClient != nil {
+            distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+        }
 
-		f.userService = service.NewUserServiceWithCache(
-			repo, hasher, encMgr, bucketMgr, distCache, logger,
-		)
-	})
-	return f.userService
+        f.userService = service.NewUserServiceWithCache(
+            repo, hasher, encMgr, bucketMgr, distCache, logger,
+        )
+        
+        // ✅ SET LOG PRODUCER FOR USER SERVICE
+        logProducer := f.GetLogProducerService()
+        if logProducer != nil {
+            f.userService.SetLogProducerService(logProducer)
+        }
+    })
+    return f.userService
 }
-
 func (f *Factory) GetOTPService() *service.OTPService {
 	if f.otpService == nil {
 		repo := f.OTPRepository()
