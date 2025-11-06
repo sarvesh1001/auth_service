@@ -1,6 +1,7 @@
 // File: internal/consumer/es_consumer.go - UPDATED FOR MULTI-TOPIC CONSUMPTION
 // Consumes Kafka events from multiple topics and indexes them to Elasticsearch for SEARCH & ANALYTICS
 // ✅ UPDATED: Handles multiple topics with separate consumers
+// ✅ FIXED: Message committing logic to prevent data loss
 
 package consumer
 
@@ -14,7 +15,7 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esutil"
-	"github.com/segmentio/kafka-go" // ✅ ADD MISSING IMPORT
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"auth-service/internal/client"
@@ -24,7 +25,7 @@ import (
 
 // ESConsumer consumes Kafka SEARCH events from multiple topics and indexes them into Elasticsearch
 type ESConsumer struct {
-	kafkaConsumers map[string]*client.KafkaConsumer // ✅ CHANGED: Multiple consumers by topic
+	kafkaConsumers map[string]*client.KafkaConsumer
 	esClient       *elasticsearch.Client
 	bulkIndexer    esutil.BulkIndexer
 	logger         *zap.Logger
@@ -34,10 +35,10 @@ type ESConsumer struct {
 
 // NewESConsumer creates a new Elasticsearch consumer for search events
 func NewESConsumer(
-	kafkaConsumers map[string]*client.KafkaConsumer, // ✅ CHANGED: Accept map of consumers
+	kafkaConsumers map[string]*client.KafkaConsumer,
 	esClient *elasticsearch.Client,
 ) (*ESConsumer, error) {
-	// ✅ Initialize bulk indexer for better performance
+	// Initialize bulk indexer for better performance
 	bulkIndexer, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 		Client:     esClient,
 		NumWorkers: 4,
@@ -49,7 +50,7 @@ func NewESConsumer(
 	}
 
 	return &ESConsumer{
-		kafkaConsumers: kafkaConsumers, // ✅ FIXED: Use correct field name (plural)
+		kafkaConsumers: kafkaConsumers,
 		esClient:       esClient,
 		bulkIndexer:    bulkIndexer,
 		logger:         util.Get(),
@@ -78,7 +79,7 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 	// Wait for all consumers to finish when context is cancelled
 	wg.Wait()
 	
-	// ✅ Close bulk indexer gracefully
+	// Close bulk indexer gracefully
 	if err := ec.bulkIndexer.Close(ctx); err != nil {
 		ec.logger.Error("failed to close bulk indexer", zap.Error(err))
 	}
@@ -122,82 +123,90 @@ func (ec *ESConsumer) consumeTopic(ctx context.Context, topic string, kafkaConsu
 	}
 }
 
-// processEvent processes a single event - ✅ FIXED: Use kafka.Message type
+// processEvent processes a single event - ✅ FIXED: Proper message committing logic
 func (ec *ESConsumer) processEvent(ctx context.Context, eventType string, msg *kafka.Message, kafkaConsumer *client.KafkaConsumer) {
+	var processErr error
+	var shouldCommit bool
+	
+	defer func() {
+		// Only commit if processing was successful or event is intentionally ignored
+		if shouldCommit {
+			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
+				ec.logger.Error("failed to commit message", 
+					zap.String("event_type", eventType),
+					zap.Error(err))
+			}
+		} else if processErr != nil {
+			ec.logger.Error("skipping message commit due to processing error", 
+				zap.String("event_type", eventType),
+				zap.Error(processErr))
+		}
+	}()
+
 	switch eventType {
 	case "security":
 		var event models.SecurityLogEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			ec.logger.Error("failed to unmarshal Security event", zap.Error(err))
-			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-			}
-			return
+			processErr = fmt.Errorf("failed to unmarshal Security event: %w", err)
+			ec.logger.Error("failed to unmarshal Security event", zap.Error(processErr))
+			return // Don't commit - let Kafka redeliver
 		}
 		if err := ec.indexSecurityEvent(ctx, &event); err != nil {
-			ec.logger.Error("failed to index Security event", zap.Error(err))
+			processErr = fmt.Errorf("failed to index Security event: %w", err)
+			ec.logger.Error("failed to index Security event", zap.Error(processErr))
+			return // Don't commit - let Kafka redeliver
 		}
-		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-			ec.logger.Error("failed to commit security event message", zap.Error(err))
-		}
+		shouldCommit = true // ✅ Only commit after successful processing
 
 	case "admin":
 		var event models.AdminLogEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			ec.logger.Error("failed to unmarshal Admin event", zap.Error(err))
-			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-			}
+			processErr = fmt.Errorf("failed to unmarshal Admin event: %w", err)
+			ec.logger.Error("failed to unmarshal Admin event", zap.Error(processErr))
 			return
 		}
 		if err := ec.indexAdminEvent(ctx, &event); err != nil {
-			ec.logger.Error("failed to index Admin event", zap.Error(err))
+			processErr = fmt.Errorf("failed to index Admin event: %w", err)
+			ec.logger.Error("failed to index Admin event", zap.Error(processErr))
+			return
 		}
-		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-			ec.logger.Error("failed to commit admin event message", zap.Error(err))
-		}
+		shouldCommit = true
 
 	case "session":
 		var event models.SessionLogEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			ec.logger.Error("failed to unmarshal Session event", zap.Error(err))
-			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-			}
+			processErr = fmt.Errorf("failed to unmarshal Session event: %w", err)
+			ec.logger.Error("failed to unmarshal Session event", zap.Error(processErr))
 			return
 		}
 		if err := ec.indexSessionEvent(ctx, &event); err != nil {
-			ec.logger.Error("failed to index Session event", zap.Error(err))
+			processErr = fmt.Errorf("failed to index Session event: %w", err)
+			ec.logger.Error("failed to index Session event", zap.Error(processErr))
+			return
 		}
-		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-			ec.logger.Error("failed to commit session event message", zap.Error(err))
-		}
+		shouldCommit = true
 
 	case "user":
 		var event models.UserLogEvent
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			ec.logger.Error("failed to unmarshal User event", zap.Error(err))
-			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-				ec.logger.Error("failed to commit message after unmarshal error", zap.Error(err))
-			}
+			processErr = fmt.Errorf("failed to unmarshal User event: %w", err)
+			ec.logger.Error("failed to unmarshal User event", zap.Error(processErr))
 			return
 		}
 		if err := ec.indexUserEvent(ctx, &event); err != nil {
-			ec.logger.Error("failed to index User event", zap.Error(err))
+			processErr = fmt.Errorf("failed to index User event: %w", err)
+			ec.logger.Error("failed to index User event", zap.Error(processErr))
+			return
 		}
-		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-			ec.logger.Error("failed to commit user event message", zap.Error(err))
-		}
+		shouldCommit = true
 
-	// ✅ REMOVED: Device, MPIN, OTP events (now handled by ClickHouse only)
+	// REMOVED: Device, MPIN, OTP events (now handled by ClickHouse only)
 	default:
 		ec.logger.Debug("ignoring time-series event for Elasticsearch",
 			zap.String("event_type", eventType),
 			zap.String("reason", "handled_by_clickhouse"))
 		// Still commit the message since it's processed by ClickHouse consumer
-		if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-			ec.logger.Error("failed to commit ignored message", zap.Error(err))
-		}
+		shouldCommit = true // ✅ Commit ignored messages (they go to ClickHouse)
 	}
 }
 
@@ -222,7 +231,7 @@ func (ec *ESConsumer) indexSecurityEvent(ctx context.Context, event *models.Secu
 	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
 }
 
-// ✅ UPDATED: Handle AdminLogEvent with proper LogEnvelope structure
+// UPDATED: Handle AdminLogEvent with proper LogEnvelope structure
 func (ec *ESConsumer) indexAdminEvent(ctx context.Context, event *models.AdminLogEvent) error {
 	// Use LogEnvelope.Timestamp for index date
 	timestamp := event.LogEnvelope.Timestamp
@@ -263,7 +272,7 @@ func (ec *ESConsumer) indexAdminEvent(ctx context.Context, event *models.AdminLo
 	return ec.indexDocumentWithRetry(ctx, index, docID, enrichedEvent)
 }
 
-// ✅ NEW: Get appropriate index based on admin action type
+// NEW: Get appropriate index based on admin action type
 func (ec *ESConsumer) getAdminEventIndex(event *models.AdminLogEvent) string {
 	switch event.Action {
 	case "authenticate_admin", "authenticate_admin_with_session", "failed_login_attempt", "record_admin_login", "admin_lockout":
@@ -293,14 +302,14 @@ func (ec *ESConsumer) indexUserEvent(ctx context.Context, event *models.UserLogE
 	return ec.indexDocumentWithRetry(ctx, index, event.EventID, event)
 }
 
-// ✅ FIXED: Use bulk indexer instead of single document indexing
+// FIXED: Use bulk indexer instead of single document indexing
 func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID string, doc interface{}) error {
 	data, err := json.Marshal(doc)
 	if err != nil {
 		return fmt.Errorf("failed to marshal document: %w", err)
 	}
 
-	// ✅ Use bulk indexer
+	// Use bulk indexer
 	return ec.bulkIndexer.Add(ctx, esutil.BulkIndexerItem{
 		Action:     "index",
 		Index:      index,
@@ -328,7 +337,7 @@ func (ec *ESConsumer) indexDocumentWithRetry(ctx context.Context, index, docID s
 	})
 }
 
-// ✅ NEW: Query helpers for admin audit trails
+// NEW: Query helpers for admin audit trails
 
 // GetAdminEventsByAdminID returns all events for a specific admin
 // Useful for audit trails and compliance investigations

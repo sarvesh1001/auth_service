@@ -1,6 +1,5 @@
-// internal/service/otp_service.go - UPDATED WITH ADMIN_LOGIN PURPOSE SUPPORT
-// Key changes: Add "admin_login" to purpose validation
-// Context: Admins use OTP before MPIN for login
+// internal/service/otp_service.go - UPDATED WITH KAFKA LOGGING
+// Key changes: Added Kafka logging for all OTP operations with proper error handling
 
 package service
 
@@ -22,6 +21,7 @@ import (
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/util"
 
+	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
 )
@@ -65,6 +65,7 @@ type OTPService struct {
 	config          *config.Config
 	logger          *zap.Logger
 	distCache       *DistributedCache
+	logProducer     *LogProducerService // ✅ NEW: Kafka log producer
 	sendRateCache   *lru.Cache[string, *TokenBucket]
 	verifyRateCache *lru.Cache[string, *TokenBucket]
 	lockoutCache    *lru.Cache[string, time.Time]
@@ -121,6 +122,7 @@ func NewOTPService(
 	cfg *config.Config,
 	distCache *DistributedCache,
 	logger *zap.Logger,
+	logProducer *LogProducerService, // ✅ NEW: Accept log producer
 ) *OTPService {
 	sendCache, _ := lru.New[string, *TokenBucket](100_000)
 	verifyCache, _ := lru.New[string, *TokenBucket](100_000)
@@ -132,9 +134,17 @@ func NewOTPService(
 		logger:          logger,
 		distCache:       distCache,
 		config:          cfg,
+		logProducer:     logProducer, // ✅ NEW: Store log producer
 		sendRateCache:   sendCache,
 		verifyRateCache: verifyCache,
 		lockoutCache:    lockoutCache,
+	}
+}
+
+// ✅ NEW: logOTPEvent helper method
+func (s *OTPService) logOTPEvent(ctx context.Context, event *models.OTPLogEvent) {
+	if s.logProducer != nil {
+		_ = s.logProducer.ProduceOTPEvent(ctx, event)
 	}
 }
 
@@ -193,8 +203,46 @@ func (tb *TokenBucket) TimeUntilToken() int {
 func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResponse, error) {
 	startTime := time.Now()
 
+	// ✅ NEW: Log OTP send attempt
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP send initiated",
+		},
+		PhoneNumber: req.PhoneNumber,
+		Status:      "send_initiated",
+		Purpose:     req.Purpose,
+		IPAddress:   req.IPAddress,
+	})
+
 	// Validate and sanitize input
 	if err := s.validateSendRequest(req); err != nil {
+		// ✅ NEW: Log validation failure
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP send validation failed",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "send_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "VALIDATION_FAILED",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
 
@@ -208,6 +256,28 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	// Check account lockout
 	if locked, until := s.isAccountLocked(phoneHash); locked {
 		retryAfter := int(time.Until(until).Seconds())
+		
+		// ✅ NEW: Log account lockout
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Account locked for OTP send",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "send_blocked",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "ACCOUNT_LOCKED",
+			AttemptNumber: 0,
+			AttemptsLeft:  retryAfter,
+		})
+
 		return &OTPResponse{
 			Success:    false,
 			Message:    "Account temporarily locked due to excessive attempts",
@@ -219,6 +289,27 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	if !s.checkSendRateLimit(rateKey, req.Purpose) {
 		bucket := s.getSendTokenBucket(rateKey, req.Purpose)
 		retryAfter := bucket.TimeUntilToken()
+
+		// ✅ NEW: Log rate limit exceeded
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP send rate limit exceeded",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "rate_limited",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "RATE_LIMIT_EXCEEDED",
+			AttemptNumber: 0,
+			AttemptsLeft:  retryAfter,
+		})
 
 		s.logger.Warn("OTP send rate limit exceeded",
 			util.String("phone_hash", phoneHash),
@@ -236,12 +327,52 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	// Generate OTP
 	otp, err := scylla.GenerateOTP(6)
 	if err != nil {
+		// ✅ NEW: Log OTP generation failure
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP generation failed",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "send_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "GENERATION_FAILED",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("failed to generate OTP: %w", err)
 	}
 
 	// Generate salt and hash OTP
 	salt, err := scylla.GenerateSalt()
 	if err != nil {
+		// ✅ NEW: Log salt generation failure
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Salt generation failed",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "send_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "SALT_GENERATION_FAILED",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("failed to generate salt: %w", err)
 	}
 
@@ -264,7 +395,7 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 		OTPSalt:       salt,
 		HashAlgorithm: "sha256",
 		PepperVersion: s.hasher.GetCurrentPepperVersion(),
-		Purpose:       req.Purpose, // ✅ NEW: Purpose stored in OTP record
+		Purpose:       req.Purpose,
 		Attempts:      0,
 		ExpiresAt:     expiresAt,
 		IPAddress:     ipAddr,
@@ -273,6 +404,26 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 
 	// Save to database (PRIMARY)
 	if err := s.otpRepo.CreateOTP(ctx, otpVerification); err != nil {
+		// ✅ NEW: Log database save failure
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to save OTP to database",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "send_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "DATABASE_SAVE_FAILED",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("failed to create OTP: %w", err)
 	}
 
@@ -287,7 +438,7 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 				s.logger.Warn("Failed to cache OTP in Redis (non-critical)",
 					util.ErrorField(err),
 					util.String("phone_hash", phoneHash),
-					util.String("purpose", req.Purpose), // ✅ NEW: Log purpose
+					util.String("purpose", req.Purpose),
 				)
 			}
 		}()
@@ -296,9 +447,31 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	// Send OTP via SMS/Email provider
 	s.sendOTPViaSMS(ctx, req.PhoneNumber, otp, req.Provider)
 
+	// ✅ NEW: Log successful OTP send
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP sent successfully",
+		},
+		PhoneNumber:   req.PhoneNumber,
+		Status:        "sent",
+		Purpose:       req.Purpose,
+		IPAddress:     req.IPAddress,
+		OTPProvider:   req.Provider,
+		AttemptNumber: 0,
+		AttemptsLeft:  scylla.OTPMaxAttempts,
+		Duration:      int64(time.Since(startTime).Milliseconds()),
+	})
+
 	s.logger.Info("OTP sent successfully",
 		util.String("phone_hash", phoneHash),
-		util.String("purpose", req.Purpose), // ✅ NEW: Log purpose
+		util.String("purpose", req.Purpose),
 		util.Duration("duration", time.Since(startTime)),
 	)
 
@@ -313,10 +486,32 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	// Include OTP value in development mode
 	if s.config.IsDevelopment() && s.config.OTP.LogOTPInDev {
 		resp.OTPValue = otp
+		
+		// ✅ NEW: Log development OTP (with warning level)
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "DEVELOPMENT: OTP logged (DO NOT USE IN PRODUCTION)",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "development_otp_logged",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			OTPProvider:   req.Provider,
+			AttemptNumber: 0,
+			AttemptsLeft:  scylla.OTPMaxAttempts,
+		})
+		
 		s.logger.Info("🔐 DEVELOPMENT: OTP Generated (DO NOT USE IN PRODUCTION)",
 			util.String("phone", req.PhoneNumber),
 			util.String("otp", otp),
-			util.String("purpose", req.Purpose), // ✅ NEW: Log purpose
+			util.String("purpose", req.Purpose),
 			util.Time("expires_at", expiresAt),
 		)
 	}
@@ -328,8 +523,46 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTPResponse, error) {
 	startTime := time.Now()
 
+	// ✅ NEW: Log OTP verification attempt
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP verification initiated",
+		},
+		PhoneNumber: req.PhoneNumber,
+		Status:      "verification_initiated",
+		Purpose:     req.Purpose,
+		IPAddress:   req.IPAddress,
+	})
+
 	// Validate input
 	if err := s.validateVerifyRequest(req); err != nil {
+		// ✅ NEW: Log validation failure
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP verification validation failed",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "VALIDATION_FAILED",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
 
@@ -341,6 +574,28 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Check account lockout
 	if locked, until := s.isAccountLocked(phoneHash); locked {
 		retryAfter := int(time.Until(until).Seconds())
+		
+		// ✅ NEW: Log account lockout for verification
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Account locked for OTP verification",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_blocked",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "ACCOUNT_LOCKED",
+			AttemptNumber: 0,
+			AttemptsLeft:  retryAfter,
+		})
+		
 		return &OTPResponse{
 			Success:    false,
 			Message:    "Account temporarily locked",
@@ -353,9 +608,30 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 		bucket := s.getVerifyTokenBucket(rateKey, req.Purpose)
 		retryAfter := bucket.TimeUntilToken()
 
+		// ✅ NEW: Log verification rate limit exceeded
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP verification rate limit exceeded",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_rate_limited",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "RATE_LIMIT_EXCEEDED",
+			AttemptNumber: 0,
+			AttemptsLeft:  retryAfter,
+		})
+
 		s.logger.Warn("OTP verification rate limit exceeded",
 			util.String("phone_hash", phoneHash),
-			util.String("purpose", req.Purpose), // ✅ NEW: Log purpose
+			util.String("purpose", req.Purpose),
 			util.Int("retry_after", retryAfter),
 		)
 
@@ -383,6 +659,28 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 
 	if err != nil {
 		s.incrementFailedAttempts(phoneHash)
+		
+		// ✅ NEW: Log OTP not found
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP not found for verification",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "OTP_NOT_FOUND",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
+		
 		return &OTPResponse{
 			Success: false,
 			Message: "OTP not found",
@@ -392,6 +690,28 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Check expiry
 	if time.Now().After(otpRecord.ExpiresAt) {
 		s.incrementFailedAttempts(phoneHash)
+		
+		// ✅ NEW: Log OTP expired
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP expired for verification",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "OTP_EXPIRED",
+			AttemptNumber: otpRecord.Attempts,
+			AttemptsLeft:  scylla.OTPMaxAttempts - otpRecord.Attempts,
+		})
+		
 		return &OTPResponse{
 			Success:   false,
 			Message:   "OTP has expired",
@@ -402,6 +722,28 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Check attempts BEFORE validation
 	if otpRecord.Attempts >= scylla.OTPMaxAttempts {
 		s.lockAccount(phoneHash)
+		
+		// ✅ NEW: Log OTP attempts exceeded
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP verification attempts exceeded",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_blocked",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "ATTEMPTS_EXCEEDED",
+			AttemptNumber: otpRecord.Attempts,
+			AttemptsLeft:  0,
+		})
+		
 		return &OTPResponse{
 			Success:      false,
 			Message:      "Max OTP verification attempts exceeded",
@@ -428,6 +770,28 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 			s.lockAccount(phoneHash)
 		}
 
+		// ✅ NEW: Log invalid OTP attempt
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Invalid OTP provided",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "verification_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "INVALID_OTP",
+			AttemptNumber: validatedOTP.Attempts,
+			AttemptsLeft:  attemptsLeft,
+			Duration:      int64(time.Since(startTime).Milliseconds()),
+		})
+
 		return &OTPResponse{
 			Success:      false,
 			Message:      "Invalid OTP",
@@ -441,7 +805,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 		s.logger.Warn("Failed to invalidate OTP after successful verification",
 			util.ErrorField(err),
 			util.String("phone_hash", phoneHash),
-			util.String("purpose", req.Purpose), // ✅ NEW: Log purpose
+			util.String("purpose", req.Purpose),
 		)
 	}
 
@@ -454,9 +818,30 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Clear failed attempts
 	s.clearFailedAttempts(phoneHash)
 
+	// ✅ NEW: Log successful OTP verification
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP verified successfully",
+		},
+		PhoneNumber:   req.PhoneNumber,
+		Status:        "verified",
+		Purpose:       req.Purpose,
+		IPAddress:     req.IPAddress,
+		AttemptNumber: validatedOTP.Attempts,
+		AttemptsLeft:  scylla.OTPMaxAttempts - validatedOTP.Attempts,
+		Duration:      int64(time.Since(startTime).Milliseconds()),
+	})
+
 	s.logger.Info("OTP verified successfully",
 		util.String("phone_hash", phoneHash),
-		util.String("purpose", req.Purpose), // ✅ NEW: Log purpose
+		util.String("purpose", req.Purpose),
 		util.Duration("duration", time.Since(startTime)),
 	)
 
@@ -468,8 +853,48 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 
 // ResendOTP resends an OTP with stricter rate limiting
 func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTPResponse, error) {
+	startTime := time.Now()
+
+	// ✅ NEW: Log OTP resend attempt
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP resend initiated",
+		},
+		PhoneNumber: req.PhoneNumber,
+		Status:      "resend_initiated",
+		Purpose:     req.Purpose,
+		IPAddress:   req.IPAddress,
+	})
+
 	// Validate input
 	if err := s.validateResendRequest(req); err != nil {
+		// ✅ NEW: Log resend validation failure
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP resend validation failed",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "resend_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "VALIDATION_FAILED",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
 
@@ -478,12 +903,54 @@ func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTP
 	// Retrieve active OTP using prepared statement
 	otpRecord, err := s.otpRepo.GetActiveOTP(ctx, phoneHash, req.Purpose)
 	if err != nil {
+		// ✅ NEW: Log no active OTP for resend
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "No active OTP found for resend",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "resend_failed",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "NO_ACTIVE_OTP",
+			ErrorMessage:  err.Error(),
+			AttemptNumber: 0,
+		})
 		return nil, fmt.Errorf("no active OTP to resend: %w", err)
 	}
 
 	// Enforce resend cooldown
 	if time.Since(otpRecord.CreatedAt) < OTPResendCooldown {
 		retry := int((OTPResendCooldown - time.Since(otpRecord.CreatedAt)).Seconds())
+		
+		// ✅ NEW: Log resend cooldown
+		s.logOTPEvent(ctx, &models.OTPLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeOTP),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP resend cooldown active",
+			},
+			PhoneNumber:   req.PhoneNumber,
+			Status:        "resend_cooldown",
+			Purpose:       req.Purpose,
+			IPAddress:     req.IPAddress,
+			ErrorCode:     "COOLDOWN_ACTIVE",
+			AttemptNumber: 0,
+			AttemptsLeft:  retry,
+		})
+		
 		return &OTPResponse{
 			Success:    false,
 			Message:    "Please wait before requesting a new OTP",
@@ -493,6 +960,26 @@ func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTP
 
 	// Invalidate the old OTP
 	_ = s.otpRepo.InvalidateOTP(ctx, phoneHash, req.Purpose)
+
+	// ✅ NEW: Log successful OTP resend
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP resend completed successfully",
+		},
+		PhoneNumber:   req.PhoneNumber,
+		Status:        "resend_completed",
+		Purpose:       req.Purpose,
+		IPAddress:     req.IPAddress,
+		AttemptNumber: 0,
+		Duration:      int64(time.Since(startTime).Milliseconds()),
+	})
 
 	// Issue a new OTP via SendOTP
 	sendReq := &OTPSendRequest{
@@ -614,6 +1101,7 @@ func (s *OTPService) lockAccount(phoneHash string) {
 		_ = s.distCache.SetWithExpiry(context.Background(), key, lockUntil.Unix(), AccountLockoutDuration)
 	}
 
+	// ✅ NEW: Log account lockout
 	s.logger.Warn("Account locked due to excessive failed attempts",
 		util.String("phone_hash", phoneHash),
 		util.String("lock_until", lockUntil.Format(time.RFC3339)),
@@ -716,6 +1204,23 @@ func (s *OTPService) generatePhoneHash(phoneNumber string) string {
 
 // sendOTPViaSMS sends OTP via SMS provider (stub for integration)
 func (s *OTPService) sendOTPViaSMS(ctx context.Context, phoneNumber, otp, provider string) error {
+	// ✅ NEW: Log SMS sending attempt
+	s.logOTPEvent(ctx, &models.OTPLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeOTP),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Sending OTP via SMS provider",
+		},
+		PhoneNumber: phoneNumber,
+		Status:      "sms_sending",
+		OTPProvider: provider,
+	})
+
 	s.logger.Info("Sending OTP via SMS",
 		util.String("phone", phoneNumber),
 		util.String("provider", provider),
@@ -780,4 +1285,9 @@ func (s *OTPService) CleanupExpiredOTPs(ctx context.Context, batchSize int) (int
 	// ScyllaDB TTL handles expiry automatically
 	s.logger.Info("Cleanup skipped - TTL handles expiry automatically")
 	return 0, nil
+}
+
+// ✅ NEW: SetLogProducerService sets Kafka log producer service
+func (s *OTPService) SetLogProducerService(logProducer *LogProducerService) {
+	s.logProducer = logProducer
 }
