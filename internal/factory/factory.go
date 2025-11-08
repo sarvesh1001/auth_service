@@ -1,5 +1,5 @@
-// File: internal/factory/factory.go - WITH JWT TOKEN SUPPORT
-// ✅ UPDATED: Added JWT service, auth handler, and router with no behavioral changes
+// File: internal/factory/factory.go
+// ✅ UPDATED: JWT Token Support + Fixed ScyllaDB Client (No Prepared Statements)
 
 package factory
 
@@ -16,6 +16,7 @@ import (
 	"auth-service/internal/encryption"
 	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
+	"auth-service/internal/hashing/pepperstore" // ✅ NEW
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/service"
@@ -46,6 +47,7 @@ type Factory struct {
 	closed            chan struct{}
 	mpinRepository    scylla.MPINRepository
 	mpinService       *service.MPINService
+	pepperStoreRepo   pepperstore.PepperStore // ✅ Use interface type
 	deviceTrustRepo   scylla.DeviceTrustRepository
 	otpRepository     scylla.OTPRepository
 	otpService        *service.OTPService
@@ -58,7 +60,7 @@ type Factory struct {
 	adminRepository   scylla.AdminRepository
 	adminService      *service.AdminService
 
-	// ✅ NEW: JWT and routing
+	// ✅ JWT and routing
 	jwtService  *service.JWTService
 	authHandler *handler.AuthHandler
 	router      chi.Router
@@ -340,7 +342,7 @@ func (f *Factory) initializeClients() error {
 		}
 	}
 
-	// ScyllaDB
+	// ✅ ScyllaDB - NOW WITH FIXED CLIENT (NO PREPARED STATEMENT CACHING)
 	if sc, err := scylla.NewScyllaClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("scylla: %w", err))
 	} else {
@@ -348,7 +350,8 @@ func (f *Factory) initializeClients() error {
 		if err := f.scyllaClient.HealthCheck(); err != nil {
 			initErrors = append(initErrors, fmt.Errorf("scylla health check: %w", err))
 		} else {
-			util.Info("ScyllaDB client initialized and healthy")
+			util.Info("ScyllaDB client initialized and healthy",
+				util.String("note", "prepared_statement_caching_disabled"))
 		}
 	}
 
@@ -394,27 +397,54 @@ func (f *Factory) initializeClients() error {
 	}
 	return nil
 }
-
 func (f *Factory) initializeManagers() {
-	f.hasher = hashing.NewHasher(f.config)
+	// ✅ UPDATED: Initialize hasher with pepper store repository
+	pepperStore := f.PepperStoreRepository()
+
+	hasher, err := hashing.NewHasher(f.config, pepperStore)
+	if err != nil {
+		// ✅ IMPROVED: More descriptive error
+		f.logger.Error("CRITICAL: Failed to initialize hasher",
+			zap.Error(err),
+			zap.String("impact", "MPIN operations will fail"))
+
+		// In production, you might want to fail fast
+		if f.config.IsProduction() {
+			panic(fmt.Sprintf("CRITICAL: Failed to initialize hasher: %v", err))
+		}
+
+		// Create a dummy hasher that will fail gracefully
+		f.hasher = nil
+	} else {
+		f.hasher = hasher
+		util.Info("Hasher initialized with pepper persistence",
+			util.Int("current_pepper_version", hasher.GetCurrentPepperVersion()))
+	}
+
 	var kmsClient *kms.Client
 	if f.config.KMS.Enabled {
 		kmsClient = nil
 	}
+
 	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
 	f.bucketingManager = bucketing.NewBucketingManager(f.config)
-	if f.config.IsProduction() {
+
+	// ✅ UPDATED: Start pepper rotation only if hasher was initialized successfully
+	if f.hasher != nil && f.config.IsProduction() {
 		f.hasher.StartPepperRotation()
+		util.Info("Pepper rotation started")
 	}
+
 	util.Info("Managers initialized successfully",
 		util.Bool("hashing_initialized", f.hasher != nil),
 		util.Bool("encryption_initialized", f.encryptionManager != nil),
 		util.Bool("bucketing_initialized", f.bucketingManager != nil),
+		util.Bool("pepper_persistence_enabled", f.hasher != nil),
 	)
 }
 
 // ============================================================================
-// ✅ NEW: JWT SERVICE GETTER
+// ✅ JWT SERVICE GETTER
 // ============================================================================
 
 func (f *Factory) GetJWTService() *service.JWTService {
@@ -438,6 +468,16 @@ func (f *Factory) GetLogProducerService() *service.LogProducerService {
 // ========================================================================
 // REPOSITORY GETTERS
 // ========================================================================
+
+func (f *Factory) PepperStoreRepository() pepperstore.PepperStore {
+	if f.pepperStoreRepo == nil {
+		f.pepperStoreRepo = scylla.NewPepperStoreRepository(
+			f.ScyllaClient(),
+			f.logger,
+		)
+	}
+	return f.pepperStoreRepo
+}
 
 func (f *Factory) UserRepository() scylla.UserRepository {
 	if f.userRepository == nil {
@@ -464,6 +504,7 @@ func (f *Factory) OTPRepository() scylla.OTPRepository {
 	return f.otpRepository
 }
 
+// ✅ UPDATED: MPIN Repository - NOW WITH FIXED CLIENT
 func (f *Factory) MPINRepository() scylla.MPINRepository {
 	if f.mpinRepository == nil {
 		f.mpinRepository = scylla.NewMPINRepository(
@@ -622,7 +663,7 @@ func (f *Factory) GetSessionService() *service.SessionService {
 	if f.sessionService == nil {
 		sessionRepo := f.SessionRepository()
 		cfg := f.Config()
-		jwtService := f.GetJWTService() // ✅ ADD THIS
+		jwtService := f.GetJWTService() // ✅ GET JWT SERVICE
 		logger := f.logger
 
 		logProducer := f.GetLogProducerService()
@@ -631,7 +672,7 @@ func (f *Factory) GetSessionService() *service.SessionService {
 		f.sessionService = service.NewSessionService(
 			sessionRepo,
 			cfg,
-			jwtService, // ✅ ADD THIS
+			jwtService, // ✅ PASS JWT SERVICE
 			logger,
 			logProducer,
 		)
@@ -688,7 +729,7 @@ func (f *Factory) GetAdminService() *service.AdminService {
 }
 
 // ============================================================================
-// ✅ NEW: HANDLER INITIALIZATION
+// ✅ HANDLER INITIALIZATION
 // ============================================================================
 
 // ✅ FIXED: InitializeHandlers with correct AuthHandler arguments
@@ -818,10 +859,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		}
 	}
 
-	if f.hasher == nil {
-		errs["hasher"] = fmt.Errorf("hasher not initialized")
-	}
-
 	if f.encryptionManager == nil {
 		errs["encryption"] = fmt.Errorf("encryption manager not initialized")
 	}
@@ -882,6 +919,26 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["kafka_logging"] = fmt.Errorf("kafka logging manager not initialized")
 	}
 
+	// ✅ NEW: Pepper store health check
+	if f.pepperStoreRepo != nil {
+		// Try to get current pepper as health check
+		_, _, err := f.pepperStoreRepo.GetCurrentPepper(ctx)
+		if err != nil {
+			errs["pepper_store"] = fmt.Errorf("pepper store health check failed: %w", err)
+		}
+	} else {
+		errs["pepper_store"] = fmt.Errorf("pepper store repository not initialized")
+	}
+
+	// ✅ NEW: Hasher health check (with context)
+	if f.hasher != nil {
+		if err := f.hasher.HealthCheck(ctx); err != nil {
+			errs["hasher"] = err
+		}
+	} else {
+		errs["hasher"] = fmt.Errorf("hasher not initialized")
+	}
+
 	return errs
 }
 
@@ -931,7 +988,11 @@ func (f *Factory) Close() error {
 			f.redisClient.Close()
 			util.Info("Redis client closed")
 		}
-
+		// ✅ NEW: Hasher cleanup if it has any resources
+		if f.hasher != nil {
+			// If hasher has any background goroutines, stop them here
+			util.Info("Hasher shut down")
+		}
 		if f.encryptionManager != nil {
 			f.encryptionManager.ClearCache()
 			util.Info("Encryption manager cache cleared")

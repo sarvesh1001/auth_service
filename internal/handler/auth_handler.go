@@ -1,14 +1,19 @@
-// internal/handler/auth_handler.go - UPDATED VERSION
 package handler
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"regexp"
+
+	"github.com/go-playground/validator/v10"
+
+	"auth-service/internal/models"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
 
@@ -17,6 +22,16 @@ import (
 	"go.uber.org/zap"
 )
 
+var validate = validator.New()
+
+func init() {
+	// Custom validation for alphanumeric + dash + underscore
+	validate.RegisterValidation("alphanumdash", func(fl validator.FieldLevel) bool {
+		return regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(fl.Field().String())
+	})
+}
+
+// AuthHandler handles HTTP requests for authentication and user operations
 type AuthHandler struct {
 	otpService     *service.OTPService
 	mpinService    *service.MPINService
@@ -47,6 +62,10 @@ func NewAuthHandler(
 	}
 }
 
+// ============================================
+// ROUTE REGISTRATION
+// ============================================
+
 // RegisterPublicRoutes registers only public authentication routes
 func (h *AuthHandler) RegisterPublicRoutes(router chi.Router) {
 	router.Route("/auth", func(r chi.Router) {
@@ -57,6 +76,12 @@ func (h *AuthHandler) RegisterPublicRoutes(router chi.Router) {
 		r.Post("/register", h.RegisterUser)
 		r.Post("/mpin/setup", h.SetupMPIN)
 
+		// ✅ ADDED: MPIN Forgot Flow APIs
+		r.Post("/mpin/forgot/send-otp", h.SendForgotMPINOTP)
+		r.Post("/mpin/forgot/verify-otp", h.VerifyForgotMPINOTP)
+		r.Post("/mpin/forgot", h.ForgotMPIN)
+		r.Post("/mpin/change", h.ChangeMPIN)
+
 		// Token refresh (public - uses refresh token)
 		r.Post("/refresh", h.RefreshTokens)
 
@@ -65,7 +90,7 @@ func (h *AuthHandler) RegisterPublicRoutes(router chi.Router) {
 	})
 }
 
-// RegisterProtectedRoutes registers JWT-protected authentication routes
+// RegisterProtectedRoutes registers JWT-protected authentication and user routes
 func (h *AuthHandler) RegisterProtectedRoutes(router chi.Router) {
 	router.Route("/auth", func(r chi.Router) {
 		// Session validation (protected - requires JWT)
@@ -74,12 +99,36 @@ func (h *AuthHandler) RegisterProtectedRoutes(router chi.Router) {
 		r.Post("/logout", h.Logout)
 		r.Post("/logout/all", h.LogoutAllDevices)
 	})
+
+	// User management routes (protected - requires JWT)
+	router.Route("/users", func(r chi.Router) {
+		// User profile operations
+		r.Get("/{userID}", h.GetUserByID)
+		r.Put("/{userID}", h.UpdateUser)
+		r.Patch("/{userID}/last-login", h.UpdateLastLogin)
+
+		// Health check
+		r.Get("/health", h.UserHealthCheck)
+	})
+}
+
+// RegisterUserPublicRoutes registers user routes that should be publicly accessible
+func (h *AuthHandler) RegisterUserPublicRoutes(router chi.Router) {
+	router.Route("/users", func(r chi.Router) {
+		// Public user routes - for checking user existence without authentication
+		r.Get("/phone/{phoneNumber}", h.GetUserByPhonePublic)
+		r.Get("/health", h.UserHealthCheck)
+	})
 }
 
 // For backward compatibility
 func (h *AuthHandler) RegisterRoutes(router chi.Router) {
 	h.RegisterPublicRoutes(router)
 }
+
+// ============================================
+// AUTHENTICATION FLOW METHODS (Google-style: OTP first, then MPIN)
+// ============================================
 
 // LoginFlowRequest for starting login process
 type LoginFlowRequest struct {
@@ -491,6 +540,120 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
+// ============================================
+// ✅ ADDED: MPIN FORGOT FLOW METHODS
+// ============================================
+
+// SendForgotMPINOTP handles sending OTP for MPIN reset
+func (h *AuthHandler) SendForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "invalid request")
+		return
+	}
+
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "invalid user ID")
+		return
+	}
+
+	requestID, err := h.mpinService.SendForgotMPINOTP(ctx, userID)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "failed to send OTP")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]string{
+		"request_id": requestID,
+		"message":    "OTP sent to registered phone number",
+	}, "OTP sent successfully"))
+}
+
+// VerifyForgotMPINOTP handles OTP verification and MPIN reset
+func (h *AuthHandler) VerifyForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req service.MPINForgotWithOTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "invalid request")
+		return
+	}
+
+	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &req); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "failed to verify OTP and reset MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
+}
+
+// ForgotMPIN handles MPIN reset on trusted devices
+func (h *AuthHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req service.MPINForgotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+
+	if err := h.mpinService.ForgotMPIN(ctx, &req); err != nil {
+		statusCode := h.getForgotMPINStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully on trusted device"))
+
+	h.logger.Info("MPIN reset via forgot flow",
+		util.String("user_id", req.UserID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ChangeMPIN handles MPIN change with current MPIN verification
+func (h *AuthHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req service.MPINChangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+
+	if err := h.mpinService.ChangeMPIN(ctx, &req); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to change MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN changed successfully"))
+
+	h.logger.Info("MPIN changed via HTTP",
+		util.String("user_id", req.UserID.String()),
+		util.String("device_id", req.DeviceID),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ============================================
+// SESSION MANAGEMENT METHODS
+// ============================================
+
 // RefreshTokens handles token refresh
 func (h *AuthHandler) RefreshTokens(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -638,6 +801,167 @@ func (h *AuthHandler) DebugToken(w http.ResponseWriter, r *http.Request) {
 	}, "Token validation successful"))
 }
 
+// ============================================
+// USER MANAGEMENT METHODS
+// ============================================
+
+// GetUserByID handles user retrieval by ID - PROTECTED
+func (h *AuthHandler) GetUserByID(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID format")
+		return
+	}
+
+	user, err := h.userService.GetUserByID(ctx, userID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get user")
+		return
+	}
+
+	// Remove sensitive data before responding
+	h.sanitizeUser(user)
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(user, "User retrieved successfully"))
+	h.logger.Debug("User retrieved via HTTP",
+		util.String("user_id", userID.String()),
+		util.Duration("duration", time.Since(startTime)),
+		util.String("method", "GetUserByID"),
+	)
+}
+
+// GetUserByPhonePublic handles user retrieval by phone number - PUBLIC (No JWT required)
+func (h *AuthHandler) GetUserByPhonePublic(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	phoneNumber := chi.URLParam(r, "phoneNumber")
+	if phoneNumber == "" {
+		h.respondWithError(w, http.StatusBadRequest, errors.New("phone number is required"), "Phone number is required")
+		return
+	}
+
+	// Sanitize input
+	phoneNumber = util.SanitizeInput(phoneNumber)
+
+	user, err := h.userService.GetUserByPhone(ctx, phoneNumber)
+	if err != nil {
+		// Return 404 for not found, but don't expose internal errors
+		if errors.Is(err, service.ErrUserNotFound) {
+			h.respondWithError(w, http.StatusNotFound, err, "User not found")
+			return
+		}
+		// For other errors, return generic error message
+		h.respondWithError(w, http.StatusInternalServerError,
+			errors.New("internal server error"), "Failed to get user by phone")
+		return
+	}
+
+	// Remove sensitive data before responding
+	h.sanitizeUser(user)
+
+	// Return minimal user info for existence check
+	response := map[string]interface{}{
+		"user_exists": true,
+		"user_id":     user.UserID.String(),
+		"is_verified": user.IsVerified,
+		"is_blocked":  user.IsBlocked,
+		"is_banned":   user.IsBanned,
+		"data_region": user.DataRegion,
+		"created_at":  user.CreatedAt,
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "User found"))
+	h.logger.Debug("User retrieved by phone via public API",
+		util.String("phone", phoneNumber),
+		util.Duration("duration", time.Since(startTime)),
+		util.String("method", "GetUserByPhonePublic"),
+	)
+}
+
+// UpdateUser handles user updates - PROTECTED
+func (h *AuthHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID format")
+		return
+	}
+
+	var req service.UserUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	user, err := h.userService.UpdateUser(ctx, userID, &req)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update user")
+		return
+	}
+
+	// Remove sensitive data before responding
+	h.sanitizeUser(user)
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(user, "User updated successfully"))
+	h.logger.Info("User updated via HTTP",
+		util.String("user_id", userID.String()),
+		util.Duration("duration", time.Since(startTime)),
+		util.String("method", "UpdateUser"),
+	)
+}
+
+// UpdateLastLogin handles last login updates - PROTECTED
+func (h *AuthHandler) UpdateLastLogin(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID format")
+		return
+	}
+
+	if err := h.userService.UpdateLastLogin(ctx, userID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update last login")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Last login updated successfully"))
+	h.logger.Debug("Last login updated via HTTP",
+		util.String("user_id", userID.String()),
+		util.Duration("duration", time.Since(startTime)),
+		util.String("method", "UpdateLastLogin"),
+	)
+}
+
+// UserHealthCheck handles user service health check
+func (h *AuthHandler) UserHealthCheck(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if err := h.userService.HealthCheck(ctx); err != nil {
+		h.respondWithError(w, http.StatusServiceUnavailable, err, "Service unhealthy")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Service is healthy"))
+}
+
+// ============================================
+// HELPER METHODS
+// ============================================
+
 // Helper methods
 func (h *AuthHandler) hasMPIN(ctx context.Context, userID uuid.UUID) bool {
 	status, err := h.mpinService.GetMPINStatus(ctx, userID)
@@ -664,4 +988,44 @@ func (h *AuthHandler) respondWithError(w http.ResponseWriter, statusCode int, er
 		util.String("message", message),
 	)
 	h.respondWithJSON(w, statusCode, errorResponse(err, message))
+}
+
+// getStatusCode determines the appropriate HTTP status code for an error
+func (h *AuthHandler) getStatusCode(err error) int {
+	switch {
+	case errors.Is(err, service.ErrUserNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, service.ErrInvalidInput):
+		return http.StatusBadRequest
+	case errors.Is(err, service.ErrUserAlreadyExists):
+		return http.StatusConflict
+	case errors.Is(err, service.ErrPermissionDenied):
+		return http.StatusForbidden
+	case errors.Is(err, service.ErrUserBanned), errors.Is(err, service.ErrUserBlocked):
+		return http.StatusForbidden
+	case errors.Is(err, service.ErrKYCRequired):
+		return http.StatusPreconditionFailed
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// getForgotMPINStatusCode determines status code for MPIN forgot errors
+func (h *AuthHandler) getForgotMPINStatusCode(err error) int {
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "untrusted device") || strings.Contains(errMsg, "blocked") {
+		return http.StatusForbidden
+	}
+	if strings.Contains(errMsg, "not found") {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
+}
+
+// sanitizeUser removes sensitive data from user before sending in response
+func (h *AuthHandler) sanitizeUser(user *models.User) {
+	// Clear encrypted phone data
+	user.PhoneEncrypted = ""
+	user.PhoneKeyID = uuid.Nil
+	// Note: We keep phone hash for identification but not the encrypted version
 }

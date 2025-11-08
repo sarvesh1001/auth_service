@@ -81,6 +81,9 @@ func NewRouter(
 		// ✅ AUTH FLOW: Login, logout, token management (public operations)
 		authHandler.RegisterPublicRoutes(r)
 
+		// ✅ PUBLIC USER ROUTES: For checking user existence without auth
+		authHandler.RegisterUserPublicRoutes(r)
+
 		// OTP routes (public - for authentication)
 		otpHandler.RegisterRoutes(r)
 
@@ -111,7 +114,7 @@ func NewRouter(
 			// Protected user operations
 			r.Route("/user", func(r chi.Router) {
 				r.Get("/{userID}", userHandler.GetUserByID)
-				r.Get("/phone/{phoneNumber}", userHandler.GetUserByPhone)
+				// NOTE: GetUserByPhone removed from protected routes - now public
 				r.Put("/{userID}", userHandler.UpdateUser)
 				r.Patch("/{userID}/profile", userHandler.UpdateUserProfile)
 				r.Patch("/{userID}/status", userHandler.UpdateUserStatus)

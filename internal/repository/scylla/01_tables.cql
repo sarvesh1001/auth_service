@@ -303,3 +303,16 @@ AND compaction = {
 }
 AND compression = {'sstable_compression': 'LZ4Compressor'}
 AND comment = 'Immutable admin audit log with 45-day retention';
+
+
+-- ===============================
+-- PEPPER STORE TABLE
+-- ===============================
+CREATE TABLE IF NOT EXISTS pepper_store (
+    version INT PRIMARY KEY,
+    pepper TEXT,
+    created_at TIMESTAMP,
+    is_active BOOLEAN
+) WITH compaction = {'class': 'LeveledCompactionStrategy'}
+AND compression = {'sstable_compression': 'LZ4Compressor'}
+AND comment = 'Stores pepper values for MPIN/OTP hashing to survive container restarts';
