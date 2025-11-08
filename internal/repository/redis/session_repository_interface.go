@@ -7,9 +7,9 @@ import (
     "time"
 
     "auth-service/internal/models"
-
     "github.com/google/uuid"
 )
+
 type SessionRepository interface {
     // Core Operations
     CreateSession(ctx context.Context, session *models.ActiveSession) error
@@ -30,14 +30,21 @@ type SessionRepository interface {
     InvalidateDeviceSessions(ctx context.Context, deviceID string) error
     GetActiveSessionsCount(ctx context.Context, userID uuid.UUID) (int, error)
 
-    // ✅ NEW: Admin Session Support
+    // Admin Session Support
     GetSessionType(ctx context.Context, sessionToken string) (string, error)
     IsAdminSession(ctx context.Context, sessionToken string) (bool, error)
     GetAdminSessions(ctx context.Context, userID uuid.UUID) ([]*models.ActiveSession, error)
     InvalidateAdminSessions(ctx context.Context, userID uuid.UUID) error
     GetActiveAdminSessionsCount(ctx context.Context, userID uuid.UUID) (int, error)
 
-    // Health & Monitoring
+    // ✅ NEW: JWT Refresh Token Operations
+    StoreRefreshToken(ctx context.Context, data *models.RefreshTokenData) error
+    GetRefreshToken(ctx context.Context, refreshID string) (*models.RefreshTokenData, error)
+    DeleteRefreshToken(ctx context.Context, refreshID string) error
+    GetUserRefreshTokens(ctx context.Context, userID string) ([]string, error)
+    RevokeAllUserRefreshTokens(ctx context.Context, userID string) error
+
+    // Health Monitoring
     HealthCheck(ctx context.Context) error
     GetRepositoryStats(ctx context.Context) (map[string]interface{}, error)
 }

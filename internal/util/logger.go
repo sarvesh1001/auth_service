@@ -1,6 +1,8 @@
 package util
 
 import (
+	"encoding/json" // ✅ add this
+	"net/http"
 	"sync"
 	"time"
 
@@ -148,11 +150,42 @@ func Duration(key string, value time.Duration) zap.Field {
 func Int64(key string, value int64) zap.Field {
 	return zap.Int64(key, value)
 }
+
 // Time creates a time.Time field
 func Time(key string, value time.Time) zap.Field {
-    return zap.Time(key, value)
+	return zap.Time(key, value)
 }
+
 // Strings creates a string slice field
 func Strings(key string, value []string) zap.Field {
-    return zap.Strings(key, value)
+	return zap.Strings(key, value)
+}
+
+// JSONError writes a structured JSON error response to the client and logs it.
+func JSONError(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	response := map[string]interface{}{
+		"status":  statusCode,
+		"error":   http.StatusText(statusCode),
+		"message": message,
+		"time":    time.Now().Format(time.RFC3339),
+	}
+
+	// Write JSON response to client
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		Get().Error("failed to write JSON error response",
+			zap.Int("status", statusCode),
+			zap.String("message", message),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Log error (optional)
+	Get().Warn("API error response",
+		zap.Int("status", statusCode),
+		zap.String("message", message),
+	)
 }

@@ -1,6 +1,5 @@
-// File: internal/factory/factory.go - OPTIMIZED EVENT DISTRIBUTION
-// ✅ UPDATED: Optimized event distribution between ES and ClickHouse
-// ✅ FIXED: Added missing log producers and health checks
+// File: internal/factory/factory.go - WITH JWT TOKEN SUPPORT
+// ✅ UPDATED: Added JWT service, auth handler, and router with no behavioral changes
 
 package factory
 
@@ -15,6 +14,7 @@ import (
 	"auth-service/internal/config"
 	"auth-service/internal/consumer"
 	"auth-service/internal/encryption"
+	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
@@ -23,6 +23,7 @@ import (
 	"auth-service/internal/util"
 
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 )
 
@@ -54,10 +55,13 @@ type Factory struct {
 	deviceService     *service.DeviceService
 	deviceHistoryRepo *scylla.DeviceHistoryRepositoryImpl
 	kafkaLoggingMgr   *KafkaLoggingManager
+	adminRepository   scylla.AdminRepository
+	adminService      *service.AdminService
 
-	// ✅ Admin repositories and services
-	adminRepository scylla.AdminRepository
-	adminService    *service.AdminService
+	// ✅ NEW: JWT and routing
+	jwtService  *service.JWTService
+	authHandler *handler.AuthHandler
+	router      chi.Router
 
 	logger *zap.Logger
 }
@@ -82,15 +86,12 @@ func (m *KafkaLoggingManager) Shutdown() error {
 
 	m.logger.Info("Shutting down Kafka logging manager...")
 
-	// Cancel the context to stop consumers
 	if m.cancelCtx != nil {
 		m.cancelCtx()
 	}
 
-	// Wait for consumers to finish
 	m.wg.Wait()
 
-	// Close the producer
 	if m.producer != nil {
 		if err := m.producer.Close(); err != nil {
 			m.logger.Error("Failed to close log producer", zap.Error(err))
@@ -105,7 +106,6 @@ func (m *KafkaLoggingManager) GetLogProducerService() *service.LogProducerServic
 	return m.producer
 }
 
-// ✅ NEW: Health check for Kafka logging components
 func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error {
 	errs := make(map[string]error)
 
@@ -114,22 +114,15 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 		return errs
 	}
 
-	// Check producer health
-	if m.producer != nil {
-		// Note: You might want to add a HealthCheck method to LogProducerService
-		// For now, we'll assume it's healthy if initialized
-	} else {
+	if m.producer == nil {
 		errs["kafka_producer"] = fmt.Errorf("kafka producer not initialized")
 	}
 
-	// Check ES consumer health
 	if m.esConsumer != nil {
 		if err := m.esConsumer.Health(ctx); err != nil {
 			errs["es_consumer"] = err
 		}
 	}
-
-	// Note: Add similar health check for ClickHouse consumer if available
 
 	return errs
 }
@@ -168,11 +161,9 @@ func NewFactory() (*Factory, error) {
 	}
 	f.initializeManagers()
 
-	// ✅ Initialize Kafka logging with optimized event distribution
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
-		// Don't fail - logging should not break service startup
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
 
@@ -187,10 +178,9 @@ func NewFactory() (*Factory, error) {
 }
 
 // ============================================================================
-// KAFKA LOGGING INITIALIZATION - OPTIMIZED EVENT DISTRIBUTION (FIXED)
+// KAFKA LOGGING INITIALIZATION - OPTIMIZED EVENT DISTRIBUTION
 // ============================================================================
 
-// InitializeKafkaLogging sets up Kafka producer and consumers with optimized event distribution
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	logger := util.Get()
 
@@ -223,24 +213,24 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
 		esTopics := []string{
 			"admin-events",    // Audit trails, role searches
-			"user-events",     // User behavior analysis  
+			"user-events",     // User behavior analysis
 			"security-events", // Fraud investigation (dual-purpose)
 			"session-events",  // Session analytics
 		}
-		
+
 		// Create multiple Kafka consumers for ES (one per topic)
 		esConsumers := make(map[string]*client.KafkaConsumer)
-		
+
 		for _, topic := range esTopics {
 			kafkaConsumer, err := client.NewKafkaConsumer(
 				f.config,
 				topic,
-				"es-consumer-group", 
+				"es-consumer-group",
 				logger,
 			)
 			if err != nil {
-				logger.Error("failed to create Elasticsearch Kafka consumer", 
-					zap.String("topic", topic), 
+				logger.Error("failed to create Elasticsearch Kafka consumer",
+					zap.String("topic", topic),
 					zap.Error(err))
 				continue
 			}
@@ -274,25 +264,25 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	// ✅ CLICKHOUSE CONSUMER - Time-Series & Metrics Events (MULTI-TOPIC)
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
 		chTopics := []string{
-			"device-events",     // Device metrics, binding trends
-			"mpin-events",       // Authentication patterns
-			"otp-events",        // Delivery metrics
-			"security-events",   // Real-time fraud detection (dual-purpose)
+			"device-events",   // Device metrics, binding trends
+			"mpin-events",     // Authentication patterns
+			"otp-events",      // Delivery metrics
+			"security-events", // Real-time fraud detection (dual-purpose)
 		}
-		
+
 		// Create multiple Kafka consumers for ClickHouse (one per topic)
 		chConsumers := make(map[string]*client.KafkaConsumer)
-		
+
 		for _, topic := range chTopics {
 			kafkaConsumer, err := client.NewKafkaConsumer(
 				f.config,
 				topic,
-				"clickhouse-consumer-group",  
+				"clickhouse-consumer-group",
 				logger,
 			)
 			if err != nil {
-				logger.Error("failed to create ClickHouse Kafka consumer", 
-					zap.String("topic", topic), 
+				logger.Error("failed to create ClickHouse Kafka consumer",
+					zap.String("topic", topic),
 					zap.Error(err))
 				continue
 			}
@@ -424,10 +414,20 @@ func (f *Factory) initializeManagers() {
 }
 
 // ============================================================================
+// ✅ NEW: JWT SERVICE GETTER
+// ============================================================================
+
+func (f *Factory) GetJWTService() *service.JWTService {
+	if f.jwtService == nil {
+		f.jwtService = service.NewJWTService(f.Config(), f.logger)
+	}
+	return f.jwtService
+}
+
+// ============================================================================
 // LOG PRODUCER SERVICE GETTER
 // ============================================================================
 
-// GetLogProducerService returns the log producer service for use in handlers/services
 func (f *Factory) GetLogProducerService() *service.LogProducerService {
 	if f.kafkaLoggingMgr == nil {
 		return nil
@@ -501,7 +501,6 @@ func (f *Factory) DeviceRepository() scylla.DeviceRepository {
 	return f.deviceRepository
 }
 
-// ✅ DEVICE HISTORY REPOSITORY
 func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryImpl {
 	if f.deviceHistoryRepo == nil {
 		f.deviceHistoryRepo = scylla.NewDeviceHistoryRepository(
@@ -512,11 +511,6 @@ func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryIm
 	return f.deviceHistoryRepo
 }
 
-// ========================================================================
-// ✅ REFACTORED: ADMIN REPOSITORY GETTERS
-// ========================================================================
-
-// AdminRepository returns the admin repository
 func (f *Factory) AdminRepository() scylla.AdminRepository {
 	if f.adminRepository == nil {
 		f.adminRepository = scylla.NewAdminRepository(
@@ -528,7 +522,7 @@ func (f *Factory) AdminRepository() scylla.AdminRepository {
 }
 
 // ========================================================================
-// SERVICE GETTERS - FIXED WITH LOG PRODUCERS
+// SERVICE GETTERS - UPDATED WITH JWT
 // ========================================================================
 
 func (f *Factory) ServiceFactory() *service.ServiceFactory {
@@ -545,30 +539,30 @@ func (f *Factory) ServiceFactory() *service.ServiceFactory {
 }
 
 func (f *Factory) GetUserService() *service.UserService {
-    f.once.Do(func() {
-        repo := f.UserRepository()
-        hasher := f.Hasher()
-        encMgr := f.EncryptionManager()
-        bucketMgr := f.BucketingManager()
-        logger := f.logger
+	f.once.Do(func() {
+		repo := f.UserRepository()
+		hasher := f.Hasher()
+		encMgr := f.EncryptionManager()
+		bucketMgr := f.BucketingManager()
+		logger := f.logger
 
-        var distCache *service.DistributedCache
-        if f.redisClient != nil {
-            distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
-        }
+		var distCache *service.DistributedCache
+		if f.redisClient != nil {
+			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+		}
 
-        f.userService = service.NewUserServiceWithCache(
-            repo, hasher, encMgr, bucketMgr, distCache, logger,
-        )
-        
-        // ✅ SET LOG PRODUCER FOR USER SERVICE
-        logProducer := f.GetLogProducerService()
-        if logProducer != nil {
-            f.userService.SetLogProducerService(logProducer)
-        }
-    })
-    return f.userService
+		f.userService = service.NewUserServiceWithCache(
+			repo, hasher, encMgr, bucketMgr, distCache, logger,
+		)
+
+		logProducer := f.GetLogProducerService()
+		if logProducer != nil {
+			f.userService.SetLogProducerService(logProducer)
+		}
+	})
+	return f.userService
 }
+
 func (f *Factory) GetOTPService() *service.OTPService {
 	if f.otpService == nil {
 		repo := f.OTPRepository()
@@ -581,12 +575,12 @@ func (f *Factory) GetOTPService() *service.OTPService {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
 
-		// ✅ UPDATED: Pass log producer to constructor
 		logProducer := f.GetLogProducerService()
 		f.otpService = service.NewOTPService(repo, hasher, cfg, distCache, logger, logProducer)
 	}
 	return f.otpService
 }
+
 func (f *Factory) GetMPINService() *service.MPINService {
 	if f.mpinService == nil {
 		mpinRepo := f.MPINRepository()
@@ -603,7 +597,6 @@ func (f *Factory) GetMPINService() *service.MPINService {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
 
-		// ✅ UPDATED: Pass log producer to constructor
 		logProducer := f.GetLogProducerService()
 		f.mpinService = service.NewMPINService(
 			mpinRepo,
@@ -614,7 +607,7 @@ func (f *Factory) GetMPINService() *service.MPINService {
 			hasher,
 			cfg,
 			logger,
-			logProducer, // ✅ ADD THIS
+			logProducer,
 		)
 
 		if distCache != nil {
@@ -623,25 +616,29 @@ func (f *Factory) GetMPINService() *service.MPINService {
 	}
 	return f.mpinService
 }
-// ✅ FIXED: Session Service with Log Producer in constructor
+
+// ✅ UPDATED: Session Service with JWT
 func (f *Factory) GetSessionService() *service.SessionService {
 	if f.sessionService == nil {
 		sessionRepo := f.SessionRepository()
 		cfg := f.Config()
+		jwtService := f.GetJWTService() // ✅ ADD THIS
 		logger := f.logger
 
-		// ✅ UPDATED: Pass log producer to constructor
 		logProducer := f.GetLogProducerService()
+
+		// ✅ UPDATED: Pass JWT service to constructor
 		f.sessionService = service.NewSessionService(
 			sessionRepo,
 			cfg,
+			jwtService, // ✅ ADD THIS
 			logger,
-			logProducer, // ✅ ADD THIS
+			logProducer,
 		)
 	}
 	return f.sessionService
 }
-// ✅ DEVICE SERVICE WITH HISTORY AND LOG PRODUCER
+
 func (f *Factory) GetDeviceService() *service.DeviceService {
 	if f.deviceService == nil {
 		deviceRepo := f.DeviceRepository()
@@ -660,11 +657,9 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 			logger,
 		)
 
-		// ✅ SET HISTORY REPOSITORY
 		historyRepo := f.GetDeviceHistoryRepository()
 		f.deviceService.SetHistoryRepository(historyRepo)
 
-		// ✅ SET LOG PRODUCER
 		logProducer := f.GetLogProducerService()
 		if logProducer != nil {
 			f.deviceService.SetLogProducerService(logProducer)
@@ -673,11 +668,6 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 	return f.deviceService
 }
 
-// ========================================================================
-// ✅ REFACTORED: ADMIN SERVICE GETTERS
-// ========================================================================
-
-// GetAdminService returns the admin service
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
@@ -688,8 +678,7 @@ func (f *Factory) GetAdminService() *service.AdminService {
 			f.EncryptionManager(),
 			f.logger,
 		)
-		
-		// ✅ SET LOG PRODUCER FOR ADMIN SERVICE
+
 		logProducer := f.GetLogProducerService()
 		if logProducer != nil {
 			f.adminService.SetLogProducerService(logProducer)
@@ -698,8 +687,86 @@ func (f *Factory) GetAdminService() *service.AdminService {
 	return f.adminService
 }
 
+// ============================================================================
+// ✅ NEW: HANDLER INITIALIZATION
+// ============================================================================
+
+// ✅ FIXED: InitializeHandlers with correct AuthHandler arguments
+func (f *Factory) InitializeHandlers() error {
+	logger := f.logger
+
+	// Get all services
+	userService := f.GetUserService()
+	otpService := f.GetOTPService()
+	mpinService := f.GetMPINService()
+	sessionService := f.GetSessionService()
+	deviceService := f.GetDeviceService()
+	adminService := f.GetAdminService()
+	jwtService := f.GetJWTService()
+
+	// ✅ Initialize handlers with updated constructors
+	userHandler := handler.NewUserHandler(userService, logger)
+
+	// ✅ OTP handler with session service
+	otpHandler := handler.NewOTPHandler(
+		otpService,
+		sessionService, // ✅ For JWT token issuance
+		logger,
+	)
+
+	// ✅ MPIN handler with session service
+	mpinHandler := handler.NewMPINHandler(
+		mpinService,
+		sessionService, // ✅ For JWT token issuance
+		logger,
+	)
+
+	sessionHandler := handler.NewSessionHandler(sessionService, logger)
+	deviceHandler := handler.NewDeviceHandler(deviceService, logger)
+	adminHandler := handler.NewAdminHandler(adminService, sessionService, logger)
+
+	// ✅ FIXED: Auth handler with all required services (now 7 arguments)
+	authHandler := handler.NewAuthHandler(
+		otpService,
+		mpinService,
+		sessionService,
+		userService,
+		deviceService, // ✅ ADDED
+		jwtService,    // ✅ ADDED
+		logger,
+	)
+	f.authHandler = authHandler
+
+	// ✅ UPDATED: Router with auth handler and JWT service
+	f.router = handler.NewRouter(
+		userHandler,
+		otpHandler,
+		mpinHandler,
+		sessionHandler,
+		deviceHandler,
+		adminHandler,
+		authHandler, // ✅ ADD THIS
+		sessionService,
+		jwtService, // ✅ ADD THIS
+		logger,
+	)
+
+	logger.Info("Handlers and router initialized with JWT support")
+	return nil
+}
+
+// ✅ NEW: Router getter
+func (f *Factory) GetRouter() chi.Router {
+	if f.router == nil {
+		if err := f.InitializeHandlers(); err != nil {
+			f.logger.Fatal("Failed to initialize handlers", util.ErrorField(err))
+		}
+	}
+	return f.router
+}
+
 // ========================================================================
-// HEALTH CHECK - UPDATED WITH KAFKA LOGGING
+// HEALTH CHECK
 // ========================================================================
 
 func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
@@ -819,7 +886,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 }
 
 // ========================================================================
-// CLEANUP - UPDATED WITH KAFKA LOGGING SHUTDOWN
+// CLEANUP
 // ========================================================================
 
 func (f *Factory) Close() error {

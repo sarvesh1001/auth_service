@@ -697,3 +697,35 @@ func (s *DeviceService) generateBindToken() (string, error) {
 	}
 	return base64.URLEncoding.EncodeToString(b), nil
 }
+
+
+// Add these methods to your existing device_service.go
+
+// IsDeviceTrusted checks if a device is trusted for a user
+func (s *DeviceService) IsDeviceTrusted(ctx context.Context, userID uuid.UUID, deviceID string) (bool, error) {
+    startTime := time.Now()
+
+    // Get active device for user
+    activeDevice, err := s.deviceRepo.GetActiveDevice(ctx, userID)
+    if err != nil {
+        s.logger.Warn("Failed to get active device for trust check",
+            util.String("user_id", userID.String()),
+            util.String("device_id", deviceID),
+            util.ErrorField(err))
+        return false, err
+    }
+
+    if activeDevice == nil {
+        return false, nil
+    }
+
+    isTrusted := activeDevice.DeviceID == deviceID
+
+    s.logger.Debug("Device trust check completed",
+        util.String("user_id", userID.String()),
+        util.String("device_id", deviceID),
+        util.Bool("is_trusted", isTrusted),
+        util.Duration("duration", time.Since(startTime)))
+
+    return isTrusted, nil
+}

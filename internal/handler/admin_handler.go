@@ -22,16 +22,19 @@ import (
 // AdminHandler handles HTTP requests for admin operations
 type AdminHandler struct {
 	adminService *service.AdminService
+	sessionService *service.SessionService // ✅ ADD THIS
 	logger       *zap.Logger
 }
 
 // ✅ UPDATED CONSTRUCTOR: Add LogProducerService parameter
 func NewAdminHandler(
 	adminService *service.AdminService, 
+	sessionService *service.SessionService, // ✅ ADD THIS
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
 		adminService: adminService,
+		sessionService: sessionService, // ✅ ADD THIS
 		logger:       logger,
 	}
 }

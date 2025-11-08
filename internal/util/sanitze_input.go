@@ -1,6 +1,7 @@
 package util
 
 import( "html"
+"net/http"
 "strings")
 
 
@@ -21,4 +22,27 @@ func ContainsSuspicious(s string) bool {
 		}
 	}
 	return false
+}
+
+// GetClientIP extracts client IP from request
+func GetClientIP(r *http.Request) string {
+    // Check X-Forwarded-For header first
+    if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+        ips := strings.Split(xff, ",")
+        if len(ips) > 0 {
+            return strings.TrimSpace(ips[0])
+        }
+    }
+
+    // Check X-Real-IP header
+    if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+        return xrip
+    }
+
+    // Fall back to RemoteAddr
+    ip := r.RemoteAddr
+    if colon := strings.LastIndex(ip, ":"); colon != -1 {
+        ip = ip[:colon]
+    }
+    return ip
 }

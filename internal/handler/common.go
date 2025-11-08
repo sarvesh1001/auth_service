@@ -1,3 +1,4 @@
+// internal/handler/common.go
 package handler
 
 import "time"
@@ -9,7 +10,7 @@ type Response struct {
     Error     string      `json:"error,omitempty"`
     Message   string      `json:"message"`
     Meta      interface{} `json:"meta,omitempty"`
-    Timestamp time.Time   `json:"timestamp"` // ✅ FIXED: Proper field name
+    Timestamp time.Time   `json:"timestamp"`
 }
 
 // Meta represents pagination metadata
@@ -22,7 +23,7 @@ type Meta struct {
 // successResponse creates a successful response
 func successResponse(data interface{}, message string) Response {
     return Response{
-        Success:   true, // ✅ FIXED: Proper field assignment
+        Success:   true,
         Data:      data,
         Message:   message,
         Timestamp: time.Now().UTC(),
@@ -31,10 +32,14 @@ func successResponse(data interface{}, message string) Response {
 
 // errorResponse creates an error response
 func errorResponse(err error, message string) Response {
+    errorMsg := ""
+    if err != nil {
+        errorMsg = err.Error()
+    }
     return Response{
-        Success:   false, // ✅ FIXED: Proper field assignment
-        Error:     err.Error(),
+        Success:   false,
+        Error:     errorMsg,
         Message:   message,
         Timestamp: time.Now().UTC(),
     }
-}
+} 
