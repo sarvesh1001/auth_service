@@ -23,12 +23,12 @@ type AdminRepositoryImpl struct {
 	logger   *zap.Logger
 
 	// Prepared statements
-	stmtGetAdminByID          *gocql.Query
-	stmtGetAdminByPhoneHash   *gocql.Query
-	stmtGetActiveAdmins       *gocql.Query
-	stmtUpdateLastLogin       *gocql.Query
+	stmtGetAdminByID            *gocql.Query
+	stmtGetAdminByPhoneHash     *gocql.Query
+	stmtGetActiveAdmins         *gocql.Query
+	stmtUpdateLastLogin         *gocql.Query
 	stmtIncrementFailedAttempts *gocql.Query
-	stmtMutex                 sync.RWMutex
+	stmtMutex                   sync.RWMutex
 }
 
 // NewAdminRepository creates a new admin repository
@@ -43,140 +43,142 @@ func NewAdminRepository(
 	repo.prepareStatements()
 	return repo
 }
+
 // GetActiveAdmins retrieves only active admins
 func (r *AdminRepositoryImpl) GetActiveAdmins(ctx context.Context, limit int) ([]*models.AdminUser, error) {
-    if limit <= 0 {
-        limit = 100
-    }
-    if limit > 1000 {
-        limit = 1000
-    }
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
 
-    // ✅ FIX: Use base table with filter instead of materialized view
-    query := r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
+	// ✅ FIX: Use base table with filter instead of materialized view
+	query := r.client.Session.Query(
+		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE is_active = true LIMIT ?`,
-        limit,
-    )
+		limit,
+	)
 
-    iter := query.WithContext(ctx).Iter()
-    defer iter.Close()
+	iter := query.WithContext(ctx).Iter()
+	defer iter.Close()
 
-    var admins []*models.AdminUser
+	var admins []*models.AdminUser
 
-    for {
-        var admin models.AdminUser
-        var scannedID gocql.UUID
-        var scannedCreatedBy gocql.UUID
-        var scannedPhoneKeyID gocql.UUID
+	for {
+		var admin models.AdminUser
+		var scannedID gocql.UUID
+		var scannedCreatedBy gocql.UUID
+		var scannedPhoneKeyID gocql.UUID
 
-        if !iter.Scan(&scannedID, &admin.PhoneHash, &admin.PhoneEncrypted,
-            &scannedPhoneKeyID, &admin.PhoneEncryptedDEK, &admin.AdminRoleLevel, 
-            &admin.AdminPermissions, &admin.AdminCreatedAt, &scannedCreatedBy, 
-            &admin.AdminUpdatedAt, &admin.IsActive, &admin.DataAccessScope, 
-            &admin.IPWhitelist, &admin.FailedLoginAttempts, &admin.LastLogin) {
-            break
-        }
+		if !iter.Scan(&scannedID, &admin.PhoneHash, &admin.PhoneEncrypted,
+			&scannedPhoneKeyID, &admin.PhoneEncryptedDEK, &admin.AdminRoleLevel,
+			&admin.AdminPermissions, &admin.AdminCreatedAt, &scannedCreatedBy,
+			&admin.AdminUpdatedAt, &admin.IsActive, &admin.DataAccessScope,
+			&admin.IPWhitelist, &admin.FailedLoginAttempts, &admin.LastLogin) {
+			break
+		}
 
-        admin.AdminID = uuid.UUID(scannedID)
-        admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
-        admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
-        admins = append(admins, &admin)
-    }
+		admin.AdminID = uuid.UUID(scannedID)
+		admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
+		admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
+		admins = append(admins, &admin)
+	}
 
-    if err := iter.Close(); err != nil {
-        return nil, fmt.Errorf("failed to query active admins: %w", err)
-    }
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to query active admins: %w", err)
+	}
 
-    return admins, nil
+	return admins, nil
 }
 
 // prepareStatements prepares frequently used queries for better performance
 func (r *AdminRepositoryImpl) prepareStatements() {
-    r.stmtMutex.Lock()
-    defer r.stmtMutex.Unlock()
+	r.stmtMutex.Lock()
+	defer r.stmtMutex.Unlock()
 
-    // Prepare GetAdminByID query
-    r.stmtGetAdminByID = r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek, 
+	// Prepare GetAdminByID query
+	r.stmtGetAdminByID = r.client.Session.Query(
+		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek, 
                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE admin_id = ?`,
-    )
+	)
 
-    // Prepare GetAdminByPhoneHash query
-    r.stmtGetAdminByPhoneHash = r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek, 
+	// Prepare GetAdminByPhoneHash query
+	r.stmtGetAdminByPhoneHash = r.client.Session.Query(
+		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek, 
                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE phone_hash = ?`,
-    )
+	)
 
-    // ✅ FIX: Update GetActiveAdmins to use base table with filter
-    r.stmtGetActiveAdmins = r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek, 
+	// ✅ FIX: Update GetActiveAdmins to use base table with filter
+	r.stmtGetActiveAdmins = r.client.Session.Query(
+		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek, 
                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE is_active = true LIMIT ?`,
-    )
+	)
 
-    // Prepare UpdateLastLogin query
-    r.stmtUpdateLastLogin = r.client.Session.Query(
-        `UPDATE admin_users SET last_login = ? WHERE admin_id = ?`,
-    )
+	// Prepare UpdateLastLogin query
+	r.stmtUpdateLastLogin = r.client.Session.Query(
+		`UPDATE admin_users SET last_login = ? WHERE admin_id = ?`,
+	)
 
-    r.logger.Info("Prepared statements initialized for admin repository")
+	r.logger.Info("Prepared statements initialized for admin repository")
 }
 
 // GetAdminsByRole retrieves all admins with specific role level
 func (r *AdminRepositoryImpl) GetAdminsByRole(ctx context.Context, roleLevel string) ([]*models.AdminUser, error) {
-    // ✅ FIX: Use base table with ALLOW FILTERING instead of materialized view
-    query := r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
+	// ✅ FIX: Use base table with ALLOW FILTERING instead of materialized view
+	query := r.client.Session.Query(
+		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE admin_role_level = ? ALLOW FILTERING`,
-        roleLevel,
-    )
+		roleLevel,
+	)
 
-    iter := query.WithContext(ctx).Iter()
-    defer iter.Close()
+	iter := query.WithContext(ctx).Iter()
+	defer iter.Close()
 
-    var admins []*models.AdminUser
+	var admins []*models.AdminUser
 
-    for {
-        var admin models.AdminUser
-        var scannedID gocql.UUID
-        var scannedCreatedBy gocql.UUID
-        var scannedPhoneKeyID gocql.UUID
+	for {
+		var admin models.AdminUser
+		var scannedID gocql.UUID
+		var scannedCreatedBy gocql.UUID
+		var scannedPhoneKeyID gocql.UUID
 
-        if !iter.Scan(&scannedID, &admin.PhoneHash, &admin.PhoneEncrypted,
-            &scannedPhoneKeyID, &admin.PhoneEncryptedDEK, &admin.AdminRoleLevel, 
-            &admin.AdminPermissions, &admin.AdminCreatedAt, &scannedCreatedBy, 
-            &admin.AdminUpdatedAt, &admin.IsActive, &admin.DataAccessScope, 
-            &admin.IPWhitelist, &admin.FailedLoginAttempts, &admin.LastLogin) {
-            break
-        }
+		if !iter.Scan(&scannedID, &admin.PhoneHash, &admin.PhoneEncrypted,
+			&scannedPhoneKeyID, &admin.PhoneEncryptedDEK, &admin.AdminRoleLevel,
+			&admin.AdminPermissions, &admin.AdminCreatedAt, &scannedCreatedBy,
+			&admin.AdminUpdatedAt, &admin.IsActive, &admin.DataAccessScope,
+			&admin.IPWhitelist, &admin.FailedLoginAttempts, &admin.LastLogin) {
+			break
+		}
 
-        admin.AdminID = uuid.UUID(scannedID)
-        admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
-        admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
-        admins = append(admins, &admin)
-    }
+		admin.AdminID = uuid.UUID(scannedID)
+		admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
+		admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
+		admins = append(admins, &admin)
+	}
 
-    if err := iter.Close(); err != nil {
-        return nil, fmt.Errorf("failed to query admins by role: %w", err)
-    }
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to query admins by role: %w", err)
+	}
 
-    return admins, nil
+	return admins, nil
 }
+
 // ===== CORE OPERATIONS =====
 
 // CreateAdmin creates a new admin user
@@ -280,52 +282,53 @@ func (r *AdminRepositoryImpl) GetAdminByID(ctx context.Context, adminID uuid.UUI
 // EXPECTS: phoneHash to be pre-hashed by service layer
 // GetAdminByPhoneHash retrieves an admin by their phone hash
 func (r *AdminRepositoryImpl) GetAdminByPhoneHash(ctx context.Context, phoneHash string) (*models.AdminUser, error) {
-    // ✅ FIX: Add ALLOW FILTERING
-    query := r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
+	// ✅ FIX: Add ALLOW FILTERING
+	query := r.client.Session.Query(
+		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE phone_hash = ? LIMIT 1 ALLOW FILTERING`,
-        phoneHash,
-    )
+		phoneHash,
+	)
 
-    var admin models.AdminUser
-    var scannedID gocql.UUID
-    var scannedCreatedBy gocql.UUID
-    var scannedPhoneKeyID gocql.UUID
+	var admin models.AdminUser
+	var scannedID gocql.UUID
+	var scannedCreatedBy gocql.UUID
+	var scannedPhoneKeyID gocql.UUID
 
-    err := r.client.ScanWithRetry(query.WithContext(ctx),
-        &scannedID,
-        &admin.PhoneHash,
-        &admin.PhoneEncrypted,
-        &scannedPhoneKeyID,
-        &admin.PhoneEncryptedDEK,
-        &admin.AdminRoleLevel,
-        &admin.AdminPermissions,
-        &admin.AdminCreatedAt,
-        &scannedCreatedBy,
-        &admin.AdminUpdatedAt,
-        &admin.IsActive,
-        &admin.DataAccessScope,
-        &admin.IPWhitelist,
-        &admin.FailedLoginAttempts,
-        &admin.LastLogin,
-    )
+	err := r.client.ScanWithRetry(query.WithContext(ctx),
+		&scannedID,
+		&admin.PhoneHash,
+		&admin.PhoneEncrypted,
+		&scannedPhoneKeyID,
+		&admin.PhoneEncryptedDEK,
+		&admin.AdminRoleLevel,
+		&admin.AdminPermissions,
+		&admin.AdminCreatedAt,
+		&scannedCreatedBy,
+		&admin.AdminUpdatedAt,
+		&admin.IsActive,
+		&admin.DataAccessScope,
+		&admin.IPWhitelist,
+		&admin.FailedLoginAttempts,
+		&admin.LastLogin,
+	)
 
-    if err != nil {
-        if err == gocql.ErrNotFound {
-            return nil, fmt.Errorf("admin not found for phone hash")
-        }
-        return nil, fmt.Errorf("failed to get admin by phone hash: %w", err)
-    }
+	if err != nil {
+		if err == gocql.ErrNotFound {
+			return nil, fmt.Errorf("admin not found for phone hash")
+		}
+		return nil, fmt.Errorf("failed to get admin by phone hash: %w", err)
+	}
 
-    admin.AdminID = uuid.UUID(scannedID)
-    admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
-    admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
+	admin.AdminID = uuid.UUID(scannedID)
+	admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
+	admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
 
-    return &admin, nil
+	return &admin, nil
 }
+
 // ===== ADMIN MANAGEMENT =====
 
 // UpdateAdminPermissions updates admin permissions
@@ -444,60 +447,60 @@ func (r *AdminRepositoryImpl) RemoveAdmin(ctx context.Context, adminID uuid.UUID
 
 // ===== OWNER MANAGEMENT =====
 
-// GetOwner retrieves the current system owner (only one allowed)
-// GetOwner retrieves the current system owner (only one allowed)
-func (r *AdminRepositoryImpl) GetOwner(ctx context.Context) (*models.AdminUser, error) {
-    // ✅ FIX: Add ALLOW FILTERING to the query
-    query := r.client.Session.Query(
-        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
-                admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
-                admin_updated_at, is_active, data_access_scope, ip_whitelist, 
-                failed_login_attempts, last_login 
-         FROM admin_users WHERE admin_role_level = ? AND is_active = true LIMIT 1 ALLOW FILTERING`,
-        models.RoleLevelOwner,
-    )
+// // GetAdminOwner retrieves the current system owner (only one allowed)
+// func (r *AdminRepositoryImpl) GetAdminOwner(ctx context.Context) (*models.AdminUser, error) {
+// 	// ✅ FIX: Add ALLOW FILTERING to the query
+// 	query := r.client.Session.Query(
+// 		`SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
+//                 admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
+//                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
+//                 failed_login_attempts, last_login 
+//          FROM admin_users WHERE admin_role_level = ? AND is_active = true LIMIT 1 ALLOW FILTERING`,
+// 		models.RoleLevelOwner,
+// 	)
 
-    var admin models.AdminUser
-    var scannedID gocql.UUID
-    var scannedCreatedBy gocql.UUID
-    var scannedPhoneKeyID gocql.UUID
+// 	var admin models.AdminUser
+// 	var scannedID gocql.UUID
+// 	var scannedCreatedBy gocql.UUID
+// 	var scannedPhoneKeyID gocql.UUID
 
-    err := r.client.ScanWithRetry(query.WithContext(ctx),
-        &scannedID,
-        &admin.PhoneHash,
-        &admin.PhoneEncrypted,
-        &scannedPhoneKeyID,
-        &admin.PhoneEncryptedDEK,
-        &admin.AdminRoleLevel,
-        &admin.AdminPermissions,
-        &admin.AdminCreatedAt,
-        &scannedCreatedBy,
-        &admin.AdminUpdatedAt,
-        &admin.IsActive,
-        &admin.DataAccessScope,
-        &admin.IPWhitelist,
-        &admin.FailedLoginAttempts,
-        &admin.LastLogin,
-    )
+// 	err := r.client.ScanWithRetry(query.WithContext(ctx),
+// 		&scannedID,
+// 		&admin.PhoneHash,
+// 		&admin.PhoneEncrypted,
+// 		&scannedPhoneKeyID,
+// 		&admin.PhoneEncryptedDEK,
+// 		&admin.AdminRoleLevel,
+// 		&admin.AdminPermissions,
+// 		&admin.AdminCreatedAt,
+// 		&scannedCreatedBy,
+// 		&admin.AdminUpdatedAt,
+// 		&admin.IsActive,
+// 		&admin.DataAccessScope,
+// 		&admin.IPWhitelist,
+// 		&admin.FailedLoginAttempts,
+// 		&admin.LastLogin,
+// 	)
 
-    if err != nil {
-        if err == gocql.ErrNotFound {
-            return nil, nil // ✅ Return nil, nil when no owner exists (not an error)
-        }
-        return nil, fmt.Errorf("failed to get owner: %w", err)
-    }
+// 	if err != nil {
+// 		if err == gocql.ErrNotFound {
+// 			return nil, nil // ✅ Return nil, nil when no owner exists (not an error)
+// 		}
+// 		return nil, fmt.Errorf("failed to get owner: %w", err)
+// 	}
 
-    admin.AdminID = uuid.UUID(scannedID)
-    admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
-    admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
+// 	admin.AdminID = uuid.UUID(scannedID)
+// 	admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
+// 	admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
 
-    return &admin, nil
-}
-// SetOwner sets/changes the owner 
+// 	return &admin, nil
+// }
+
+// SetAdminOwner sets/changes the owner
 // EXPECTS: phoneHash to be pre-hashed by service layer
-func (r *AdminRepositoryImpl) SetOwner(ctx context.Context, adminID uuid.UUID, phoneHash string) error {
+func (r *AdminRepositoryImpl) SetAdminOwner(ctx context.Context, adminID uuid.UUID, phoneHash string) error {
 	// Check if owner already exists
-	owner, err := r.GetOwner(ctx)
+	owner, err := r.GetAdminOwner(ctx)
 	if err == nil && owner != nil && owner.AdminID != adminID {
 		return fmt.Errorf("system already has an owner - cannot add another owner")
 	}
@@ -539,14 +542,16 @@ func (r *AdminRepositoryImpl) SetOwner(ctx context.Context, adminID uuid.UUID, p
 
 	return fmt.Errorf("unauthorized: only owner can change owner details")
 }
-// IsOwnerExists checks if system has an owner
-func (r *AdminRepositoryImpl) IsOwnerExists(ctx context.Context) (bool, error) {
-    owner, err := r.GetOwner(ctx)
-    if err != nil {
-        return false, fmt.Errorf("failed to check owner existence: %w", err)
-    }
-    return owner != nil, nil // ✅ Fixed: Return true if owner exists, false if nil
+
+// IsAdminOwnerExists checks if system has an owner
+func (r *AdminRepositoryImpl) IsAdminOwnerExists(ctx context.Context) (bool, error) {
+	owner, err := r.GetAdminOwner(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to check owner existence: %w", err)
+	}
+	return owner != nil, nil // ✅ Fixed: Return true if owner exists, false if nil
 }
+
 // ===== ADMIN STATUS OPERATIONS =====
 
 // DeactivateAdmin sets is_active = false
@@ -581,8 +586,8 @@ func (r *AdminRepositoryImpl) ActivateAdmin(ctx context.Context, adminID uuid.UU
 	return nil
 }
 
-// UpdateLastLogin updates admin last login timestamp
-func (r *AdminRepositoryImpl) UpdateLastLogin(ctx context.Context, adminID uuid.UUID) error {
+// UpdateAdminLastLogin updates admin last login timestamp
+func (r *AdminRepositoryImpl) UpdateAdminLastLogin(ctx context.Context, adminID uuid.UUID) error {
 	r.stmtMutex.RLock()
 	query := r.stmtUpdateLastLogin.Bind(time.Now().UTC(), gocql.UUID(adminID))
 	r.stmtMutex.RUnlock()
@@ -596,8 +601,8 @@ func (r *AdminRepositoryImpl) UpdateLastLogin(ctx context.Context, adminID uuid.
 
 // ===== FAILED ATTEMPTS TRACKING =====
 
-// IncrementFailedLoginAttempts increments failed attempts counter
-func (r *AdminRepositoryImpl) IncrementFailedLoginAttempts(ctx context.Context, adminID uuid.UUID) (int, error) {
+// IncrementAdminFailedLoginAttempts increments failed attempts counter
+func (r *AdminRepositoryImpl) IncrementAdminFailedLoginAttempts(ctx context.Context, adminID uuid.UUID) (int, error) {
 	admin, err := r.GetAdminByID(ctx, adminID)
 	if err != nil {
 		return 0, err
@@ -619,8 +624,8 @@ func (r *AdminRepositoryImpl) IncrementFailedLoginAttempts(ctx context.Context, 
 	return newAttempts, nil
 }
 
-// ResetFailedLoginAttempts resets failed attempts to 0
-func (r *AdminRepositoryImpl) ResetFailedLoginAttempts(ctx context.Context, adminID uuid.UUID) error {
+// ResetAdminFailedLoginAttempts resets failed attempts to 0
+func (r *AdminRepositoryImpl) ResetAdminFailedLoginAttempts(ctx context.Context, adminID uuid.UUID) error {
 	query := r.client.Session.Query(
 		`UPDATE admin_users SET failed_login_attempts = 0, admin_updated_at = ? WHERE admin_id = ?`,
 		time.Now().UTC(),
@@ -666,9 +671,9 @@ func (r *AdminRepositoryImpl) GetAllAdmins(ctx context.Context, limit int) ([]*m
 		var scannedPhoneKeyID gocql.UUID
 
 		if !iter.Scan(&scannedID, &admin.PhoneHash, &admin.PhoneEncrypted,
-			&scannedPhoneKeyID, &admin.PhoneEncryptedDEK, &admin.AdminRoleLevel, 
-			&admin.AdminPermissions, &admin.AdminCreatedAt, &scannedCreatedBy, 
-			&admin.AdminUpdatedAt, &admin.IsActive, &admin.DataAccessScope, 
+			&scannedPhoneKeyID, &admin.PhoneEncryptedDEK, &admin.AdminRoleLevel,
+			&admin.AdminPermissions, &admin.AdminCreatedAt, &scannedCreatedBy,
+			&admin.AdminUpdatedAt, &admin.IsActive, &admin.DataAccessScope,
 			&admin.IPWhitelist, &admin.FailedLoginAttempts, &admin.LastLogin) {
 			break
 		}
@@ -688,8 +693,8 @@ func (r *AdminRepositoryImpl) GetAllAdmins(ctx context.Context, limit int) ([]*m
 
 // ===== HEALTH & STATISTICS =====
 
-// HealthCheck verifies repository connectivity
-func (r *AdminRepositoryImpl) HealthCheck(ctx context.Context) error {
+// AdminHealthCheck verifies repository connectivity
+func (r *AdminRepositoryImpl) AdminHealthCheck(ctx context.Context) error {
 	var count int
 	if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users`).WithContext(ctx).Scan(&count); err != nil {
 		return fmt.Errorf("admin repository health check failed: %w", err)
@@ -697,39 +702,196 @@ func (r *AdminRepositoryImpl) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// GetRepositoryStats returns repository statistics
-func (r *AdminRepositoryImpl) GetRepositoryStats(ctx context.Context) (map[string]interface{}, error) {
-    stats := make(map[string]interface{})
+// GetAdminRepositoryStats returns repository statistics
+func (r *AdminRepositoryImpl) GetAdminRepositoryStats(ctx context.Context) (map[string]interface{}, error) {
+	stats := make(map[string]interface{})
 
-    // Count total admins
-    var totalAdmins int
-    if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users`).WithContext(ctx).Scan(&totalAdmins); err != nil {
-        return nil, fmt.Errorf("failed to count admins: %w", err)
-    }
-    stats["total_admins"] = totalAdmins
+	// Count total admins
+	var totalAdmins int
+	if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users`).WithContext(ctx).Scan(&totalAdmins); err != nil {
+		return nil, fmt.Errorf("failed to count admins: %w", err)
+	}
+	stats["total_admins"] = totalAdmins
 
-    // Count active admins
-    var activeAdmins int
-    if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users WHERE is_active = true`).WithContext(ctx).Scan(&activeAdmins); err != nil {
-        return nil, fmt.Errorf("failed to count active admins: %w", err)
-    }
-    stats["active_admins"] = activeAdmins
+	// Count active admins
+	var activeAdmins int
+	if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users WHERE is_active = true`).WithContext(ctx).Scan(&activeAdmins); err != nil {
+		return nil, fmt.Errorf("failed to count active admins: %w", err)
+	}
+	stats["active_admins"] = activeAdmins
 
-    // ✅ FIX: Count by role using base table with ALLOW FILTERING
-    roles := []string{models.RoleLevelOwner, models.RoleLevelSuperEmployee, models.RoleLevelEmployee}
-    for _, role := range roles {
-        var count int
-        if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users WHERE admin_role_level = ? ALLOW FILTERING`, role).WithContext(ctx).Scan(&count); err != nil {
-            continue
-        }
-        stats[fmt.Sprintf("admins_%s", role)] = count
-    }
+	// ✅ FIX: Count by role using base table with ALLOW FILTERING
+	roles := []string{models.RoleLevelOwner, models.RoleLevelSuperEmployee, models.RoleLevelEmployee}
+	for _, role := range roles {
+		var count int
+		if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users WHERE admin_role_level = ? ALLOW FILTERING`, role).WithContext(ctx).Scan(&count); err != nil {
+			continue
+		}
+		stats[fmt.Sprintf("admins_%s", role)] = count
+	}
 
-    return stats, nil
+	return stats, nil
 }
-// UpdateOwnerPhone updates owner's phone information - FIXED VERSION
-func (r *AdminRepositoryImpl) UpdateOwnerPhone(ctx context.Context, adminID uuid.UUID, phoneHash, phoneEncrypted string, phoneKeyID uuid.UUID, phoneEncryptedDEK string) error {
-    // ✅ ADD: Input validation
+
+// Add this method to ensure AdminMPINRepositoryImpl implements MPINRepository
+func (r *AdminMPINRepositoryImpl) GetMPINByUserID(ctx context.Context, userID uuid.UUID) (*models.MPINCredential, error) {
+	// For admin repository, treat userID as adminID
+	return r.GetMPINByAdminID(ctx, userID)
+}
+
+// Add these missing methods to AdminDeviceRepositoryImpl
+
+// GetUsersByDevice implements DeviceRepository interface
+func (r *AdminDeviceRepositoryImpl) GetUsersByDevice(
+	ctx context.Context,
+	deviceID string,
+) ([]*models.UserActiveDevice, error) {
+	startTime := time.Now()
+
+	if deviceID == "" {
+		return nil, fmt.Errorf("device ID cannot be empty")
+	}
+
+	query := r.client.Session.Query(`
+        SELECT admin_id, device_id, session_id, bound_at, bind_token
+        FROM admin_active_device
+        WHERE device_id = ?
+        ALLOW FILTERING
+    `, deviceID)
+
+	iter := query.WithContext(ctx).Iter()
+	defer iter.Close()
+
+	var devices []*models.UserActiveDevice
+	var scannedAdminID gocql.UUID
+	var scannedSessionID *gocql.UUID
+	var device models.UserActiveDevice
+
+	for iter.Scan(&scannedAdminID, &device.DeviceID, &scannedSessionID, &device.BoundAt, &device.BindToken) {
+		device.UserID = uuid.UUID(scannedAdminID).String()
+		if scannedSessionID != nil {
+			sessionID := uuid.UUID(*scannedSessionID)
+			device.SessionID = sessionID.String()
+		}
+		devices = append(devices, &device)
+		device = models.UserActiveDevice{}
+	}
+
+	if err := iter.Close(); err != nil {
+		r.metrics.RecordQuery(time.Since(startTime), false)
+		return nil, fmt.Errorf("failed to get admins by device: %w", err)
+	}
+
+	r.metrics.RecordQuery(time.Since(startTime), true)
+	return devices, nil
+}
+// GetOwner retrieves the current system owner (only one allowed)
+// This method is required by the AdminRepository interface
+func (r *AdminRepositoryImpl) GetOwner(ctx context.Context) (*models.AdminUser, error) {
+    return r.GetAdminOwner(ctx)
+}
+
+// GetRepositoryStats returns repository statistics
+// This method is required by the AdminRepository interface
+func (r *AdminRepositoryImpl) GetRepositoryStats(ctx context.Context) (map[string]interface{}, error) {
+    return r.GetAdminRepositoryStats(ctx)
+}
+
+func (r *AdminRepositoryImpl) HealthCheck(ctx context.Context) error {
+    return r.AdminHealthCheck(ctx)
+}
+
+
+// // UpdateAdminOwnerPhone updates owner's phone information
+// func (r *AdminRepositoryImpl) UpdateAdminOwnerPhone(ctx context.Context, adminID uuid.UUID, phoneHash, phoneEncrypted string, phoneKeyID uuid.UUID, phoneEncryptedDEK string) error {
+//     if adminID == uuid.Nil {
+//         return fmt.Errorf("invalid admin ID")
+//     }
+//     if phoneHash == "" {
+//         return fmt.Errorf("phone hash cannot be empty")
+//     }
+
+//     query := r.client.Session.Query(
+//         `UPDATE admin_users SET 
+//             phone_hash = ?, 
+//             phone_encrypted = ?, 
+//             phone_key_id = ?, 
+//             phone_encrypted_dek = ?, 
+//             admin_updated_at = ? 
+//          WHERE admin_id = ?`,
+//         phoneHash,
+//         phoneEncrypted,
+//         gocql.UUID(phoneKeyID),
+//         phoneEncryptedDEK,
+//         time.Now().UTC(),
+//         gocql.UUID(adminID),
+//     )
+
+//     if err := r.client.ExecuteWithRetry(query.WithContext(ctx), 3); err != nil {
+//         r.logger.Error("Failed to execute UpdateOwnerPhone query",
+//             util.String("admin_id", adminID.String()),
+//             util.ErrorField(err),
+//         )
+//         return fmt.Errorf("failed to update owner phone: %w", err)
+//     }
+
+//     r.logger.Info("Owner phone updated successfully",
+//         util.String("admin_id", adminID.String()),
+//     )
+//     return nil
+// }
+// internal/repository/scylla/admin_repository_impl.go
+
+// GetOwner retrieves the current system owner (only one allowed)
+func (r *AdminRepositoryImpl) GetAdminOwner(ctx context.Context) (*models.AdminUser, error) {
+    query := r.client.Session.Query(
+        `SELECT admin_id, phone_hash, phone_encrypted, phone_key_id, phone_encrypted_dek,
+                admin_role_level, admin_permissions, admin_created_at, admin_created_by, 
+                admin_updated_at, is_active, data_access_scope, ip_whitelist, 
+                failed_login_attempts, last_login 
+         FROM admin_users WHERE admin_role_level = ? ALLOW FILTERING`,
+        models.RoleLevelOwner,
+    )
+
+    var admin models.AdminUser
+    var scannedID gocql.UUID
+    var scannedCreatedBy gocql.UUID
+    var scannedPhoneKeyID gocql.UUID
+
+    err := r.client.ScanWithRetry(query.WithContext(ctx),
+        &scannedID,
+        &admin.PhoneHash,
+        &admin.PhoneEncrypted,
+        &scannedPhoneKeyID,
+        &admin.PhoneEncryptedDEK,
+        &admin.AdminRoleLevel,
+        &admin.AdminPermissions,
+        &admin.AdminCreatedAt,
+        &scannedCreatedBy,
+        &admin.AdminUpdatedAt,
+        &admin.IsActive,
+        &admin.DataAccessScope,
+        &admin.IPWhitelist,
+        &admin.FailedLoginAttempts,
+        &admin.LastLogin,
+    )
+
+    if err != nil {
+        if err == gocql.ErrNotFound {
+            return nil, nil // No owner exists yet
+        }
+        return nil, fmt.Errorf("failed to get owner: %w", err)
+    }
+
+    admin.AdminID = uuid.UUID(scannedID)
+    admin.AdminCreatedBy = uuid.UUID(scannedCreatedBy)
+    admin.PhoneKeyID = uuid.UUID(scannedPhoneKeyID)
+
+    return &admin, nil
+}
+
+// UpdateAdminOwnerPhone updates owner's phone information
+func (r *AdminRepositoryImpl) UpdateAdminOwnerPhone(ctx context.Context, adminID uuid.UUID, phoneHash, phoneEncrypted string, phoneKeyID uuid.UUID, phoneEncryptedDEK string) error {
     if adminID == uuid.Nil {
         return fmt.Errorf("invalid admin ID")
     }
@@ -738,7 +900,13 @@ func (r *AdminRepositoryImpl) UpdateOwnerPhone(ctx context.Context, adminID uuid
     }
 
     query := r.client.Session.Query(
-        `UPDATE admin_users SET phone_hash = ?, phone_encrypted = ?, phone_key_id = ?, phone_encrypted_dek = ?, admin_updated_at = ? WHERE admin_id = ?`,
+        `UPDATE admin_users SET 
+            phone_hash = ?, 
+            phone_encrypted = ?, 
+            phone_key_id = ?, 
+            phone_encrypted_dek = ?, 
+            admin_updated_at = ? 
+         WHERE admin_id = ?`,
         phoneHash,
         phoneEncrypted,
         gocql.UUID(phoneKeyID),
@@ -748,15 +916,16 @@ func (r *AdminRepositoryImpl) UpdateOwnerPhone(ctx context.Context, adminID uuid
     )
 
     if err := r.client.ExecuteWithRetry(query.WithContext(ctx), 3); err != nil {
-        r.logger.Error("Failed to execute UpdateOwnerPhone query",
+        r.logger.Error("Failed to update owner phone",
             util.String("admin_id", adminID.String()),
             util.ErrorField(err),
         )
         return fmt.Errorf("failed to update owner phone: %w", err)
     }
 
-    r.logger.Info("Owner phone updated with encrypted fields",
+    r.logger.Info("Owner phone updated successfully",
         util.String("admin_id", adminID.String()),
     )
     return nil
 }
+

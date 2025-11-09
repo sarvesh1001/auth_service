@@ -316,3 +316,80 @@ CREATE TABLE IF NOT EXISTS pepper_store (
 ) WITH compaction = {'class': 'LeveledCompactionStrategy'}
 AND compression = {'sstable_compression': 'LZ4Compressor'}
 AND comment = 'Stores pepper values for MPIN/OTP hashing to survive container restarts';
+-- ===============================
+-- ADMIN MPIN CREDENTIALS TABLE
+-- ===============================
+CREATE TABLE IF NOT EXISTS admin_mpin_credentials (
+    admin_id uuid PRIMARY KEY,
+    mpin_hash text,
+    mpin_salt text,
+    pepper_version int,
+    hash_algorithm text,
+    device_id text,
+    last_changed timestamp,
+    failed_attempts int,
+    is_locked boolean,
+    locked_until timestamp
+) WITH compression = {'sstable_compression': 'LZ4Compressor'}
+AND compaction = {'class': 'LeveledCompactionStrategy'}
+AND gc_grace_seconds = 86400
+AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'}
+AND comment = 'Stores admin MPIN credentials with device binding';
+
+
+
+-- Add to your ScyllaDB schema
+CREATE TABLE IF NOT EXISTS admin_device_trust_levels (
+    admin_id uuid,
+    device_id text,
+    trust_status text,
+    first_successful_login timestamp,
+    last_login timestamp,
+    ip_address inet,
+    user_agent text,
+    is_blocked boolean,
+    PRIMARY KEY (admin_id, device_id)
+) WITH compaction = {'class': 'LeveledCompactionStrategy'};
+
+
+
+
+-- Admin device binding history table
+CREATE TABLE IF NOT EXISTS admin_device_binding_history (
+    admin_id UUID,
+    device_id TEXT,
+    session_id UUID,
+    bound_at TIMESTAMP,
+    bind_token TEXT,
+    action TEXT,
+    PRIMARY KEY (admin_id, bound_at)
+) WITH CLUSTERING ORDER BY (bound_at DESC);
+
+
+-- ===============================
+-- ADMIN DATA DELETIONS TABLE
+-- ===============================
+CREATE TABLE IF NOT EXISTS admin_data_deletions (
+    deletion_id uuid,
+    admin_id uuid,
+    device_id text,
+    reason text,
+    deleted_at timestamp,
+    data_wiped_categories set<text>,
+    deleted_by uuid,
+    PRIMARY KEY (deletion_id, admin_id)
+) WITH default_time_to_live = 3888000
+AND compression = {'sstable_compression': 'LZ4Compressor'};
+
+
+
+-- ===============================
+-- ADMIN ACTIVE DEVICE TABLE
+-- ===============================
+CREATE TABLE IF NOT EXISTS admin_active_device (
+    admin_id uuid PRIMARY KEY,
+    device_id text,
+    session_id uuid,
+    bound_at timestamp,
+    bind_token text
+) WITH compaction = {'class': 'LeveledCompactionStrategy'};

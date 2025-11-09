@@ -62,6 +62,7 @@ type OTPLogEvent struct {
 type MPINLogEvent struct {
 	LogEnvelope
 	UserID        string `json:"user_id"`
+	EntityType   string    `json:"entity_type"` // "user" or "admin
 	Status        string `json:"status"`
 	Attempts      int    `json:"attempts"`
 	AttemptsLeft  int    `json:"attempts_left"`
@@ -134,6 +135,7 @@ type UserLogEvent struct {
 type DeviceLogEvent struct {
 	LogEnvelope
 	UserID       string `json:"user_id"`
+	EntityType   string  `json:"entity_type"` // "user" or "admin"
 	DeviceID     string `json:"device_id"`
 	Action       string `json:"action"`
 	Status       string `json:"status"`

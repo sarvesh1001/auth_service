@@ -1,5 +1,5 @@
 // File: internal/factory/factory.go
-// ✅ UPDATED: JWT Token Support + Fixed ScyllaDB Client (No Prepared Statements)
+// ✅ FIXED: All compilation errors resolved
 
 package factory
 
@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
+	
 	"auth-service/internal/bucketing"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
@@ -16,7 +16,7 @@ import (
 	"auth-service/internal/encryption"
 	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
-	"auth-service/internal/hashing/pepperstore" // ✅ NEW
+	"auth-service/internal/hashing/pepperstore"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/service"
@@ -41,13 +41,22 @@ type Factory struct {
 	bucketingManager  *bucketing.BucketingManager
 	userRepository    scylla.UserRepository
 	serviceFactory    *service.ServiceFactory
+	
+	// ✅ FIXED: Use concrete types for repositories that need type assertions
+	adminDeviceRepo       *scylla.AdminDeviceRepositoryImpl
+	adminDeviceTrustRepo  scylla.AdminDeviceTrustRepository
+	adminMPINRepo         *scylla.AdminMPINRepositoryImpl
+	adminDeviceHistoryRepo *scylla.AdminDeviceHistoryRepositoryImpl
+	
+	adminDeviceService   *service.AdminDeviceService
+	adminMPINService     *service.AdminMPINService
 	userService       *service.UserService
 	once              sync.Once
 	closeOnce         sync.Once
 	closed            chan struct{}
 	mpinRepository    scylla.MPINRepository
 	mpinService       *service.MPINService
-	pepperStoreRepo   pepperstore.PepperStore // ✅ Use interface type
+	pepperStoreRepo   pepperstore.PepperStore
 	deviceTrustRepo   scylla.DeviceTrustRepository
 	otpRepository     scylla.OTPRepository
 	otpService        *service.OTPService
@@ -60,7 +69,7 @@ type Factory struct {
 	adminRepository   scylla.AdminRepository
 	adminService      *service.AdminService
 
-	// ✅ JWT and routing
+	// JWT and routing
 	jwtService  *service.JWTService
 	authHandler *handler.AuthHandler
 	router      chi.Router
@@ -69,7 +78,7 @@ type Factory struct {
 }
 
 // ============================================================================
-// KAFKA LOGGING MANAGER STRUCT
+// KAFKA LOGGING MANAGER - FIXED
 // ============================================================================
 
 type KafkaLoggingManager struct {
@@ -123,6 +132,12 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 	if m.esConsumer != nil {
 		if err := m.esConsumer.Health(ctx); err != nil {
 			errs["es_consumer"] = err
+		}
+	}
+
+	if m.chConsumer != nil {
+		if err := m.chConsumer.Health(ctx); err != nil {
+			errs["clickhouse_consumer"] = err
 		}
 	}
 
@@ -320,6 +335,125 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	return mgr, nil
 }
 
+// ========================================================================
+// ADMIN REPOSITORY GETTERS - FIXED (Use concrete types)
+// ========================================================================
+
+func (f *Factory) AdminDeviceRepository() *scylla.AdminDeviceRepositoryImpl {
+	if f.adminDeviceRepo == nil {
+		f.adminDeviceRepo = scylla.NewAdminDeviceRepository(
+			f.ScyllaClient(),
+			f.logger,
+		)
+	}
+	return f.adminDeviceRepo
+}
+
+func (f *Factory) AdminDeviceTrustRepository() scylla.AdminDeviceTrustRepository {
+	if f.adminDeviceTrustRepo == nil {
+		f.adminDeviceTrustRepo = scylla.NewAdminDeviceTrustRepository(
+			f.ScyllaClient(),
+			f.logger,
+		)
+	}
+	return f.adminDeviceTrustRepo
+}
+
+// ✅ FIXED: Return concrete type
+func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
+	if f.adminMPINRepo == nil {
+		f.adminMPINRepo = scylla.NewAdminMPINRepository(
+			f.ScyllaClient(),
+			f.logger,
+		)
+	}
+	return f.adminMPINRepo
+}
+
+// ✅ FIXED: Return concrete type
+func (f *Factory) AdminDeviceHistoryRepository() *scylla.AdminDeviceHistoryRepositoryImpl {
+	if f.adminDeviceHistoryRepo == nil {
+		f.adminDeviceHistoryRepo = scylla.NewAdminDeviceHistoryRepository(
+			f.ScyllaClient(),
+			f.logger,
+		)
+	}
+	return f.adminDeviceHistoryRepo
+}
+
+// ========================================================================
+// ADMIN SERVICE GETTERS - FIXED (Use concrete types)
+// ========================================================================
+
+func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
+	if f.adminDeviceService == nil {
+		deviceRepo := f.AdminDeviceRepository() // ✅ Now returns concrete type
+		trustRepo := f.AdminDeviceTrustRepository()
+		mpinRepo := f.AdminMPINRepository() // ✅ Now returns concrete type
+		cfg := f.Config()
+		logger := f.logger
+
+		var distCache *service.DistributedCache
+		if f.redisClient != nil {
+			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+		}
+
+		f.adminDeviceService = service.NewAdminDeviceService(
+			deviceRepo,
+			trustRepo,
+			mpinRepo,
+			distCache,
+			*cfg,
+			logger,
+		)
+
+		// Set history repository
+		historyRepo := f.AdminDeviceHistoryRepository() // ✅ Now returns concrete type
+		f.adminDeviceService.SetHistoryRepository(historyRepo)
+
+		// Set log producer
+		logProducer := f.GetLogProducerService()
+		if logProducer != nil {
+			f.adminDeviceService.SetLogProducerService(logProducer)
+		}
+	}
+	return f.adminDeviceService
+}
+
+func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
+	if f.adminMPINService == nil {
+		mpinRepo := f.AdminMPINRepository() // ✅ Now returns concrete type
+		adminRepo := f.AdminRepository()
+		deviceTrustRepo := f.AdminDeviceTrustRepository()
+		otpService := f.GetOTPService()
+		encryptionMgr := f.EncryptionManager()
+		hasher := f.Hasher()
+		cfg := f.Config()
+		logger := f.logger
+
+		logProducer := f.GetLogProducerService()
+
+		f.adminMPINService = service.NewAdminMPINService(
+			mpinRepo,
+			adminRepo,
+			deviceTrustRepo,
+			otpService,
+			encryptionMgr,
+			hasher,
+			cfg,
+			logger,
+			logProducer,
+		)
+
+		var distCache *service.DistributedCache
+		if f.redisClient != nil {
+			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+			f.adminMPINService.SetDistributedCache(distCache)
+		}
+	}
+	return f.adminMPINService
+}
+
 // ============================================================================
 // CLIENT INITIALIZATION
 // ============================================================================
@@ -397,6 +531,7 @@ func (f *Factory) initializeClients() error {
 	}
 	return nil
 }
+
 func (f *Factory) initializeManagers() {
 	// ✅ UPDATED: Initialize hasher with pepper store repository
 	pepperStore := f.PepperStoreRepository()
@@ -709,12 +844,20 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 	return f.deviceService
 }
 
+// ============================================================================
+// ADMIN SERVICE GETTER - FIXED (Missing arguments)
+// ============================================================================
+
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
+		// ✅ FIXED: Add missing required services
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
 			f.UserRepository(),
 			f.GetSessionService(),
+			f.GetOTPService(),    // ✅ ADDED: Missing argument
+			f.GetMPINService(),   // ✅ ADDED: Missing argument  
+			f.GetDeviceService(), // ✅ ADDED: Missing argument
 			f.Hasher(),
 			f.EncryptionManager(),
 			f.logger,
@@ -729,10 +872,9 @@ func (f *Factory) GetAdminService() *service.AdminService {
 }
 
 // ============================================================================
-// ✅ HANDLER INITIALIZATION
+// ✅ HANDLER INITIALIZATION - FIXED Router arguments
 // ============================================================================
 
-// ✅ FIXED: InitializeHandlers with correct AuthHandler arguments
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
 
@@ -740,6 +882,8 @@ func (f *Factory) InitializeHandlers() error {
 	userService := f.GetUserService()
 	otpService := f.GetOTPService()
 	mpinService := f.GetMPINService()
+	adminMPINService := f.GetAdminMPINService()
+	adminDeviceService := f.GetAdminDeviceService()
 	sessionService := f.GetSessionService()
 	deviceService := f.GetDeviceService()
 	adminService := f.GetAdminService()
@@ -755,40 +899,41 @@ func (f *Factory) InitializeHandlers() error {
 		logger,
 	)
 
-	// ✅ MPIN handler with session service
-	mpinHandler := handler.NewMPINHandler(
-		mpinService,
-		sessionService, // ✅ For JWT token issuance
+
+	sessionHandler := handler.NewSessionHandler(sessionService, logger)
+	// deviceHandler := handler.NewDeviceHandler(deviceService, logger)
+	adminHandler := handler.NewAdminHandler(
+		adminService,
+		otpService,
+		adminMPINService,
+		adminDeviceService,
+		sessionService,
+		userService,
+		jwtService,
 		logger,
 	)
 
-	sessionHandler := handler.NewSessionHandler(sessionService, logger)
-	deviceHandler := handler.NewDeviceHandler(deviceService, logger)
-	adminHandler := handler.NewAdminHandler(adminService, sessionService, logger)
-
-	// ✅ FIXED: Auth handler with all required services (now 7 arguments)
+	// ✅ FIXED: Auth handler with all required services
 	authHandler := handler.NewAuthHandler(
 		otpService,
 		mpinService,
 		sessionService,
 		userService,
-		deviceService, // ✅ ADDED
-		jwtService,    // ✅ ADDED
+		deviceService,
+		jwtService,
 		logger,
 	)
 	f.authHandler = authHandler
 
-	// ✅ UPDATED: Router with auth handler and JWT service
+	// ✅ FIXED: Router with correct number of arguments (8 instead of 10)
 	f.router = handler.NewRouter(
 		userHandler,
 		otpHandler,
-		mpinHandler,
 		sessionHandler,
-		deviceHandler,
 		adminHandler,
-		authHandler, // ✅ ADD THIS
+		authHandler,
 		sessionService,
-		jwtService, // ✅ ADD THIS
+		jwtService,
 		logger,
 	)
 
@@ -807,7 +952,7 @@ func (f *Factory) GetRouter() chi.Router {
 }
 
 // ========================================================================
-// HEALTH CHECK
+// HEALTH CHECK - FIXED
 // ========================================================================
 
 func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
@@ -937,6 +1082,40 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		}
 	} else {
 		errs["hasher"] = fmt.Errorf("hasher not initialized")
+	}
+
+	// ✅ ADDED: Admin repositories health checks
+	if f.adminDeviceRepo != nil {
+		if err := f.adminDeviceRepo.HealthCheck(ctx); err != nil {
+			errs["admin_device_repository"] = err
+		}
+	} else {
+		errs["admin_device_repository"] = fmt.Errorf("admin device repository not initialized")
+	}
+
+	if f.adminMPINRepo != nil {
+		if err := f.adminMPINRepo.HealthCheck(ctx); err != nil {
+			errs["admin_mpin_repository"] = err
+		}
+	} else {
+		errs["admin_mpin_repository"] = fmt.Errorf("admin MPIN repository not initialized")
+	}
+
+	// ✅ ADDED: Admin services health checks
+	if f.adminDeviceService != nil {
+		if err := f.adminDeviceService.HealthCheck(ctx); err != nil {
+			errs["admin_device_service"] = err
+		}
+	} else {
+		errs["admin_device_service"] = fmt.Errorf("admin device service not initialized")
+	}
+
+	if f.adminMPINService != nil {
+		if err := f.adminMPINService.HealthCheck(ctx); err != nil {
+			errs["admin_mpin_service"] = err
+		}
+	} else {
+		errs["admin_mpin_service"] = fmt.Errorf("admin MPIN service not initialized")
 	}
 
 	return errs

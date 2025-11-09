@@ -1,5 +1,3 @@
-// internal/service/admin_service.go
-
 package service
 
 import (
@@ -24,9 +22,12 @@ type AdminService struct {
 	adminRepo      scylla.AdminRepository
 	userRepo       scylla.UserRepository
 	sessionService *SessionService
+	otpService     *OTPService
+	mpinService    *MPINService
+	deviceService  *DeviceService
 	hasher         *hashing.Hasher
 	encryptionMgr  *encryption.EncryptionManager
-	logProducer    *LogProducerService // Kafka log producer
+	logProducer    *LogProducerService
 	logger         *zap.Logger
 }
 
@@ -35,6 +36,9 @@ func NewAdminService(
 	adminRepo scylla.AdminRepository,
 	userRepo scylla.UserRepository,
 	sessionService *SessionService,
+	otpService *OTPService,
+	mpinService *MPINService,
+	deviceService *DeviceService,
 	hasher *hashing.Hasher,
 	encryptionMgr *encryption.EncryptionManager,
 	logger *zap.Logger,
@@ -43,6 +47,9 @@ func NewAdminService(
 		adminRepo:      adminRepo,
 		userRepo:       userRepo,
 		sessionService: sessionService,
+		otpService:     otpService,
+		mpinService:    mpinService,
+		deviceService:  deviceService,
 		hasher:         hasher,
 		encryptionMgr:  encryptionMgr,
 		logger:         logger,
@@ -72,11 +79,11 @@ func (s *AdminService) GeneratePhoneHash(phoneNumber string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// InitializeOwner creates the first owner; logs success and failure events
+// InitializeOwner creates the first system owner
 func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*models.AdminUser, error) {
 	startTime := time.Now()
 
-	exists, err := s.adminRepo.IsOwnerExists(ctx)
+	exists, err := s.adminRepo.IsAdminOwnerExists(ctx)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -220,17 +227,8 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 		return fmt.Errorf("new phone cannot be empty")
 	}
 
-	s.logger.Info("ChangeOwnerPhone called",
-		util.String("owner_id", ownerID.String()),
-		util.String("new_phone", newPhone),
-	)
-
 	owner, err := s.adminRepo.GetOwner(ctx)
 	if err != nil {
-		s.logger.Error("Failed to get owner from repository",
-			util.String("owner_id", ownerID.String()),
-			util.ErrorField(err),
-		)
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -253,9 +251,6 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 	}
 
 	if owner == nil {
-		s.logger.Error("Owner not found in database",
-			util.String("owner_id", ownerID.String()),
-		)
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -276,16 +271,7 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 		return fmt.Errorf("owner not found in system")
 	}
 
-	s.logger.Info("Owner found",
-		util.String("owner_id", owner.AdminID.String()),
-		util.String("owner_role", owner.AdminRoleLevel),
-	)
-
 	if owner.AdminID != ownerID {
-		s.logger.Warn("Unauthorized phone change attempt",
-			util.String("requester_id", ownerID.String()),
-			util.String("actual_owner_id", owner.AdminID.String()),
-		)
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -336,10 +322,6 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 
 	encryptedResult, err := s.encryptionMgr.EncryptField(ctx, newPhone, "phone")
 	if err != nil {
-		s.logger.Error("Failed to encrypt new phone",
-			util.String("owner_id", ownerID.String()),
-			util.ErrorField(err),
-		)
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -366,16 +348,8 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 		return fmt.Errorf("failed to parse key ID: %w", err)
 	}
 
-	s.logger.Info("Phone encryption completed",
-		util.String("key_id", keyID.String()),
-		util.Int("encrypted_length", len(encryptedResult.EncryptedValue)),
-	)
-
-	if err := s.adminRepo.UpdateOwnerPhone(ctx, ownerID, newPhoneHash, encryptedResult.EncryptedValue, keyID, encryptedResult.EncryptedDEK); err != nil {
-		s.logger.Error("Failed to update owner phone in repository",
-			util.String("owner_id", ownerID.String()),
-			util.ErrorField(err),
-		)
+	// ✅ FIXED: Use correct method name
+	if err := s.adminRepo.UpdateAdminOwnerPhone(ctx, ownerID, newPhoneHash, encryptedResult.EncryptedValue, keyID, encryptedResult.EncryptedDEK); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -415,15 +389,10 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 		Duration:   int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("Owner phone updated successfully",
-		util.String("admin_id", ownerID.String()),
-		util.String("new_phone_hash", newPhoneHash),
-	)
-
 	return nil
 }
 
-// InviteAdmin invites a user as admin - NO USER REGISTRATION CHECK
+// InviteAdmin invites a user as admin
 func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel string, requesterID uuid.UUID, requesterRole string) (*models.AdminUser, error) {
 	startTime := time.Now()
 
@@ -630,23 +599,16 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("User invited as admin",
-		util.String("admin_id", admin.AdminID.String()),
-		util.String("phone", phone),
-		util.String("role_level", roleLevel),
-		util.String("invited_by", requesterID.String()),
-	)
-
 	return admin, nil
 }
 
-// GetAdminByPhone retrieves admin by phone, hashing phone before lookup
+// GetAdminByPhone retrieves admin by phone
 func (s *AdminService) GetAdminByPhone(ctx context.Context, phone string) (*models.AdminUser, error) {
 	phoneHash := s.GeneratePhoneHash(phone)
 	return s.adminRepo.GetAdminByPhoneHash(ctx, phoneHash)
 }
 
-// AuthenticateAdmin authenticates an admin by phone - ONLY CHECKS ADMIN TABLE
+// AuthenticateAdmin authenticates an admin by phone
 func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*models.AdminUser, error) {
 	startTime := time.Now()
 
@@ -694,7 +656,8 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
 		return nil, fmt.Errorf("admin account is deactivated")
 	}
 
-	if err := s.adminRepo.UpdateLastLogin(ctx, admin.AdminID); err != nil {
+	// ✅ FIXED: Use correct method name
+	if err := s.adminRepo.UpdateAdminLastLogin(ctx, admin.AdminID); err != nil {
 		s.logger.Warn("Failed to update last login",
 			util.String("admin_id", admin.AdminID.String()),
 			util.ErrorField(err),
@@ -761,6 +724,14 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
 			Duration:     int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, "", fmt.Errorf("failed to create admin session: %w", err)
+	}
+
+	// ✅ FIXED: Use correct method name
+	if err := s.adminRepo.UpdateAdminLastLogin(ctx, admin.AdminID); err != nil {
+		s.logger.Warn("Failed to update last login",
+			util.String("admin_id", admin.AdminID.String()),
+			util.ErrorField(err),
+		)
 	}
 
 	s.logAdminEvent(ctx, &models.AdminLogEvent{
@@ -927,17 +898,10 @@ func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newR
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("Admin promoted",
-		util.String("admin_id", adminID.String()),
-		util.String("old_role", oldRole),
-		util.String("new_role", newRole),
-		util.String("promoted_by", promotedBy.String()),
-	)
-
 	return nil
 }
 
-// RemoveAdmin removes an admin (soft delete - sets is_active = false)
+// RemoveAdmin removes an admin (soft delete)
 func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, removedBy uuid.UUID) error {
 	startTime := time.Now()
 
@@ -1072,15 +1036,10 @@ func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, remov
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("Admin removed",
-		util.String("admin_id", adminID.String()),
-		util.String("removed_by", removedBy.String()),
-	)
-
 	return nil
 }
 
-// DeactivateAdmin deactivates an admin (temporary suspend)
+// DeactivateAdmin deactivates an admin temporarily
 func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, deactivatedBy uuid.UUID) error {
 	startTime := time.Now()
 
@@ -1192,10 +1151,6 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("Admin deactivated",
-		util.String("admin_id", adminID.String()),
-	)
-
 	return nil
 }
 
@@ -1289,10 +1244,6 @@ func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, act
 		Status:       "success",
 		Duration:     int64(time.Since(startTime).Milliseconds()),
 	})
-
-	s.logger.Info("Admin activated",
-		util.String("admin_id", adminID.String()),
-	)
 
 	return nil
 }
@@ -1432,11 +1383,6 @@ func (s *AdminService) UpdateAdminPermissions(ctx context.Context, adminID uuid.
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
-	s.logger.Info("Admin permissions updated",
-		util.String("admin_id", adminID.String()),
-		util.Strings("new_permissions", permissions),
-	)
-
 	return nil
 }
 
@@ -1444,7 +1390,8 @@ func (s *AdminService) UpdateAdminPermissions(ctx context.Context, adminID uuid.
 func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) error {
 	startTime := time.Now()
 
-	if err := s.adminRepo.UpdateLastLogin(ctx, adminID); err != nil {
+	// ✅ FIXED: Use correct method name
+	if err := s.adminRepo.UpdateAdminLastLogin(ctx, adminID); err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -1483,7 +1430,8 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
 		Duration:   int64(time.Since(startTime).Milliseconds()),
 	})
 
-	if err := s.adminRepo.ResetFailedLoginAttempts(ctx, adminID); err != nil {
+	// ✅ FIXED: Use correct method name
+	if err := s.adminRepo.ResetAdminFailedLoginAttempts(ctx, adminID); err != nil {
 		s.logger.Warn("Failed to reset login attempts",
 			util.String("admin_id", adminID.String()),
 			util.ErrorField(err),
@@ -1497,7 +1445,8 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
 func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID) (bool, int, error) {
 	startTime := time.Now()
 
-	attempts, err := s.adminRepo.IncrementFailedLoginAttempts(ctx, adminID)
+	// ✅ FIXED: Use correct method name
+	attempts, err := s.adminRepo.IncrementAdminFailedLoginAttempts(ctx, adminID)
 	if err != nil {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -1647,7 +1596,7 @@ func (s *AdminService) getPermissionsForRole(roleLevel string) []string {
 	}
 }
 
-// HealthCheck verifies admin service health
+// HealthChecka verifies admin service health
 func (s *AdminService) HealthCheck(ctx context.Context) error {
 	return s.adminRepo.HealthCheck(ctx)
 }
@@ -1656,3 +1605,5 @@ func (s *AdminService) HealthCheck(ctx context.Context) error {
 func (s *AdminService) GetStats(ctx context.Context) (map[string]interface{}, error) {
 	return s.adminRepo.GetRepositoryStats(ctx)
 }
+
+
