@@ -34,6 +34,8 @@ type RefreshTokenData struct {
     // Admin-specific fields
     AdminRoleLevel   string   `json:"admin_role_level,omitempty"`
     AdminPermissions []string `json:"admin_permissions,omitempty"`
+    // CompanyContext *CompanyContext `json:"company_context,omitempty"`
+
 }
 
 // TokenPairResponse returned to client
@@ -43,3 +45,13 @@ type TokenPairResponse struct {
     ExpiresIn    int    `json:"expires_in"` // seconds until access token expires
     TokenType    string `json:"token_type"` // "Bearer"
 }
+
+// type CompanyContext struct {
+//     CompanyID    string   `json:"company_id"`
+//     EmployeeID   string   `json:"employee_id,omitempty"`
+//     RoleID       string   `json:"role_id,omitempty"`
+//     RoleLevel    string   `json:"role_level,omitempty"`
+//     DepartmentID string   `json:"department_id,omitempty"`
+//     Permissions  []string `json:"permissions"`
+//     SubscriptionTier string `json:"subscription_tier,omitempty"`
+// }

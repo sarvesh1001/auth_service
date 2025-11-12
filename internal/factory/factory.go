@@ -7,8 +7,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
-	
+	"time"	
+	"strconv"
 	"auth-service/internal/bucketing"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
@@ -22,7 +22,6 @@ import (
 	"auth-service/internal/service"
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
-
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -41,13 +40,13 @@ type Factory struct {
 	bucketingManager  *bucketing.BucketingManager
 	userRepository    scylla.UserRepository
 	serviceFactory    *service.ServiceFactory
-	
 	// ✅ FIXED: Use concrete types for repositories that need type assertions
 	adminDeviceRepo       *scylla.AdminDeviceRepositoryImpl
 	adminDeviceTrustRepo  scylla.AdminDeviceTrustRepository
 	adminMPINRepo         *scylla.AdminMPINRepositoryImpl
 	adminDeviceHistoryRepo *scylla.AdminDeviceHistoryRepositoryImpl
-	
+	companyRepository scylla.CompanyRepository
+    companyService    *service.CompanyService
 	adminDeviceService   *service.AdminDeviceService
 	adminMPINService     *service.AdminMPINService
 	userService       *service.UserService
@@ -338,7 +337,6 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 // ========================================================================
 // ADMIN REPOSITORY GETTERS - FIXED (Use concrete types)
 // ========================================================================
-
 func (f *Factory) AdminDeviceRepository() *scylla.AdminDeviceRepositoryImpl {
 	if f.adminDeviceRepo == nil {
 		f.adminDeviceRepo = scylla.NewAdminDeviceRepository(
@@ -368,6 +366,29 @@ func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 		)
 	}
 	return f.adminMPINRepo
+}
+
+func (f *Factory) CompanyRepository() scylla.CompanyRepository {
+    if f.companyRepository == nil {
+        f.companyRepository = scylla.NewCompanyRepository(
+            f.ScyllaClient(),
+            f.logger,
+        )
+    }
+    return f.companyRepository
+}
+
+// Add company service getter
+func (f *Factory) GetCompanyService() *service.CompanyService {
+    if f.companyService == nil {
+        f.companyService = service.NewCompanyService(
+            f.CompanyRepository(),
+            f.GetUserService(),
+            f.AdminRepository(),
+            f.logger,
+        )
+    }
+    return f.companyService
 }
 
 // ✅ FIXED: Return concrete type
@@ -887,10 +908,12 @@ func (f *Factory) InitializeHandlers() error {
 	sessionService := f.GetSessionService()
 	deviceService := f.GetDeviceService()
 	adminService := f.GetAdminService()
+	companyService := f.GetCompanyService()  // Add this
 	jwtService := f.GetJWTService()
 
+
 	// ✅ Initialize handlers with updated constructors
-	userHandler := handler.NewUserHandler(userService, logger)
+	// userHandler := handler.NewUserHandler(userService, logger)
 
 	// ✅ OTP handler with session service
 	otpHandler := handler.NewOTPHandler(
@@ -900,10 +923,11 @@ func (f *Factory) InitializeHandlers() error {
 	)
 
 
-	sessionHandler := handler.NewSessionHandler(sessionService, logger)
+	// sessionHandler := handler.NewSessionHandler(sessionService, logger)
 	// deviceHandler := handler.NewDeviceHandler(deviceService, logger)
 	adminHandler := handler.NewAdminHandler(
 		adminService,
+		companyService,  // Add this
 		otpService,
 		adminMPINService,
 		adminDeviceService,
@@ -919,6 +943,7 @@ func (f *Factory) InitializeHandlers() error {
 		mpinService,
 		sessionService,
 		userService,
+		companyService,  // ✅ ADDED: Company service
 		deviceService,
 		jwtService,
 		logger,
@@ -927,15 +952,14 @@ func (f *Factory) InitializeHandlers() error {
 
 	// ✅ FIXED: Router with correct number of arguments (8 instead of 10)
 	f.router = handler.NewRouter(
-		userHandler,
-		otpHandler,
-		sessionHandler,
-		adminHandler,
-		authHandler,
-		sessionService,
-		jwtService,
-		logger,
+		otpHandler,      // ✅ First argument: OTPHandler
+		adminHandler,    // ✅ Second argument: AdminHandler  
+		authHandler,     // ✅ Third argument: AuthHandler
+		sessionService,  // ✅ Fourth argument: SessionService
+		jwtService,      // ✅ Fifth argument: JWTService
+		logger,          // ✅ Sixth argument: Logger
 	)
+	
 
 	logger.Info("Handlers and router initialized with JWT support")
 	return nil
@@ -1181,6 +1205,16 @@ func (f *Factory) Close() error {
 		util.Info("Factory shutdown completed")
 	})
 	return nil
+}
+func parseIntDefault(s string, def int) int {
+    if s == "" {
+        return def
+    }
+    i, err := strconv.Atoi(s)
+    if err != nil {
+        return def
+    }
+    return i
 }
 
 // ========================================================================

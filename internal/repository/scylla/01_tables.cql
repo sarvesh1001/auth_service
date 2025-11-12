@@ -16,36 +16,37 @@ USE core_auth;
 -- USERS TABLE
 -- ===============================
 CREATE TABLE IF NOT EXISTS users (
-user_bucket int,
-user_id uuid,
-phone_hash text,
-phone_encrypted blob,
-phone_key_id uuid,
-phone_encrypted_dek text,
-device_id text,
-device_fingerprint text,
-kyc_status text,
-kyc_level text,
-kyc_verified_at timestamp,
-kyc_verified_by uuid,
-profile_service_id uuid,
-is_verified boolean,
-is_blocked boolean,
-is_banned boolean,
-banned_by uuid,
-banned_reason text,
-banned_at timestamp,
-created_at timestamp,
-last_login timestamp,
-updated_at timestamp,
-consent_agreed boolean,
-consent_version text,
-data_region text,
-PRIMARY KEY ((user_bucket), user_id)
+    user_bucket int,
+    user_id uuid,
+    phone_hash text,
+    phone_encrypted blob,
+    phone_key_id uuid,
+    phone_encrypted_dek text,
+    device_id text,
+    device_fingerprint text,
+    kyc_status text,
+    kyc_level text,
+    kyc_verified_at timestamp,
+    kyc_verified_by uuid,
+    profile_service_id uuid,
+    is_verified boolean,
+    is_blocked boolean,
+    is_banned boolean,
+    banned_by uuid,
+    banned_reason text,
+    banned_at timestamp,
+    created_at timestamp,
+    last_login timestamp,
+    updated_at timestamp,
+    consent_agreed boolean,
+    consent_version text,
+    data_region text,
+    company_id uuid,  -- ✅ moved here instead of ALTER TABLE
+    PRIMARY KEY ((user_bucket), user_id)
 ) WITH compaction = {
-'class': 'TimeWindowCompactionStrategy',
-'compaction_window_size': 1,
-'compaction_window_unit': 'DAYS'
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_size': 1,
+    'compaction_window_unit': 'DAYS'
 } AND compression = {'sstable_compression': 'LZ4Compressor'};
 
 -- ===============================
@@ -393,3 +394,85 @@ CREATE TABLE IF NOT EXISTS admin_active_device (
     bound_at timestamp,
     bind_token text
 ) WITH compaction = {'class': 'LeveledCompactionStrategy'};
+
+
+
+
+-- =========================================================
+-- COMPANY & ENTERPRISE TABLES
+-- =========================================================
+
+-- Companies table for SME customers
+CREATE TABLE IF NOT EXISTS companies (
+    company_id uuid,
+    company_name text,
+    owner_phone text,  -- encrypted
+    owner_user_id uuid, -- reference to users table
+    subscription_tier text, -- 'basic', 'premium', 'enterprise'
+    subscription_start_date timestamp,
+    subscription_end_date timestamp,
+    monthly_premium double,  -- ✅ Change from decimal to double
+    max_employees int,
+    is_active boolean,
+    is_blocked boolean,
+    blocked_reason text,
+    blocked_by uuid,
+    blocked_at timestamp,
+    created_at timestamp,
+    updated_at timestamp,
+    data_region text,
+    PRIMARY KEY (company_id)
+);
+
+-- Company departments
+CREATE TABLE IF NOT EXISTS company_departments (
+    company_id uuid,
+    department_id uuid,
+    department_name text,
+    department_head uuid, -- user_id
+    permissions list<text>, -- department-level permissions
+    is_active boolean,
+    created_at timestamp,
+    updated_at timestamp,
+    PRIMARY KEY (company_id, department_id)
+);
+
+-- Employee roles and permissions
+CREATE TABLE IF NOT EXISTS employee_roles (
+    company_id uuid,
+    role_id uuid,
+    role_name text, -- 'accountant', 'hr_manager', 'sales_agent'
+    role_level text, -- 'owner', 'manager', 'employee', 'viewer'
+    permissions list<text>,
+    department_id uuid, -- optional department restriction
+    is_system_role boolean, -- predefined roles
+    created_at timestamp,
+    updated_at timestamp,
+    PRIMARY KEY (company_id, role_id)
+);
+
+-- Company employees (links users to companies with roles)
+CREATE TABLE IF NOT EXISTS company_employees (
+    company_id uuid,
+    user_id uuid,
+    employee_id text, -- company-specific employee ID
+    role_id uuid,
+    department_id uuid,
+    hire_date timestamp,
+    is_active boolean,
+    reports_to uuid, -- manager user_id
+    created_at timestamp,
+    updated_at timestamp,
+    PRIMARY KEY (company_id, user_id)
+);
+
+-- Employee permissions (overrides role permissions)
+CREATE TABLE IF NOT EXISTS employee_permissions (
+    company_id uuid,
+    user_id uuid,
+    permission text,
+    granted_by uuid,
+    granted_at timestamp,
+    expires_at timestamp,
+    PRIMARY KEY ((company_id, user_id), permission)
+);

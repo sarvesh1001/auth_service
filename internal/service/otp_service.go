@@ -36,24 +36,24 @@ var (
 )
 
 const (
-	OTPSendLimit1Min         = 2
-	OTPSendLimit5Min         = 3
-	OTPSendLimitHour         = 10
-	OTPVerifyLimit30Sec      = 3
-	OTPVerifyLimitMin        = 5
-	OTPResendCooldown        = 60 * time.Second
+	OTPSendLimit1Min    = 2
+	OTPSendLimit5Min    = 3
+	OTPSendLimitHour    = 10
+	OTPVerifyLimit30Sec = 3
+	OTPVerifyLimitMin   = 5
+	OTPResendCooldown   = 60 * time.Second
 
-	OTPExpiryDuration        = 5 * time.Minute
-	OTPCacheDuration         = 6 * time.Minute
+	OTPExpiryDuration         = 5 * time.Minute
+	OTPCacheDuration          = 6 * time.Minute
 	OTPRateLimitCacheDuration = 1 * time.Hour
 
-	AccountLockoutDuration   = 30 * time.Minute
-	AccountLockoutThreshold  = 5
+	AccountLockoutDuration  = 30 * time.Minute
+	AccountLockoutThreshold = 5
 
 	// ✅ NEW: Admin login rate limits (stricter than user)
-	AdminOTPSendLimit1Min   = 1
-	AdminOTPSendLimit5Min   = 2
-	AdminOTPSendLimitHour   = 5
+	AdminOTPSendLimit1Min    = 1
+	AdminOTPSendLimit5Min    = 2
+	AdminOTPSendLimitHour    = 5
 	AdminOTPVerifyLimit30Sec = 2
 	AdminOTPVerifyLimitMin   = 3
 )
@@ -85,25 +85,25 @@ type TokenBucket struct {
 type OTPSendRequest struct {
 	PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
 	// ✅ UPDATED: Added "admin_login" as valid purpose
-	Purpose     string `json:"purpose" validate:"required,oneof=login registration verification password_reset admin_login"`
-	IPAddress   string `json:"ip_address"`
-	DeviceID    string `json:"device_id"`
-	Provider    string `json:"provider,omitempty"`
+	Purpose   string `json:"purpose" validate:"required,oneof=login registration verification password_reset admin_login"`
+	IPAddress string `json:"ip_address"`
+	DeviceID  string `json:"device_id"`
+	Provider  string `json:"provider,omitempty"`
 }
 
 type OTPVerifyRequest struct {
 	PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
 	OTP         string `json:"otp" validate:"required,len=6,numeric"`
 	// ✅ UPDATED: Added "admin_login" as valid purpose
-	Purpose     string `json:"purpose" validate:"required,oneof=login registration verification password_reset admin_login"`
-	IPAddress   string `json:"ip_address"`
+	Purpose   string `json:"purpose" validate:"required,oneof=login registration verification password_reset admin_login"`
+	IPAddress string `json:"ip_address"`
 }
 
 type OTPResendRequest struct {
 	PhoneNumber string `json:"phone_number" validate:"required,min=10,max=15"`
 	// ✅ UPDATED: Added "admin_login" as valid purpose
-	Purpose     string `json:"purpose" validate:"required,oneof=login registration verification password_reset admin_login"`
-	IPAddress   string `json:"ip_address"`
+	Purpose   string `json:"purpose" validate:"required,oneof=login registration verification password_reset admin_login"`
+	IPAddress string `json:"ip_address"`
 }
 
 type OTPResponse struct {
@@ -256,7 +256,7 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	// Check account lockout
 	if locked, until := s.isAccountLocked(phoneHash); locked {
 		retryAfter := int(time.Until(until).Seconds())
-		
+
 		// ✅ NEW: Log account lockout
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -486,7 +486,7 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 	// Include OTP value in development mode
 	if s.config.IsDevelopment() && s.config.OTP.LogOTPInDev {
 		resp.OTPValue = otp
-		
+
 		// ✅ NEW: Log development OTP (with warning level)
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -507,7 +507,7 @@ func (s *OTPService) SendOTP(ctx context.Context, req *OTPSendRequest) (*OTPResp
 			AttemptNumber: 0,
 			AttemptsLeft:  scylla.OTPMaxAttempts,
 		})
-		
+
 		s.logger.Info("🔐 DEVELOPMENT: OTP Generated (DO NOT USE IN PRODUCTION)",
 			util.String("phone", req.PhoneNumber),
 			util.String("otp", otp),
@@ -574,7 +574,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Check account lockout
 	if locked, until := s.isAccountLocked(phoneHash); locked {
 		retryAfter := int(time.Until(until).Seconds())
-		
+
 		// ✅ NEW: Log account lockout for verification
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -595,7 +595,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 			AttemptNumber: 0,
 			AttemptsLeft:  retryAfter,
 		})
-		
+
 		return &OTPResponse{
 			Success:    false,
 			Message:    "Account temporarily locked",
@@ -659,7 +659,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 
 	if err != nil {
 		s.incrementFailedAttempts(phoneHash)
-		
+
 		// ✅ NEW: Log OTP not found
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -680,7 +680,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 			ErrorMessage:  err.Error(),
 			AttemptNumber: 0,
 		})
-		
+
 		return &OTPResponse{
 			Success: false,
 			Message: "OTP not found",
@@ -690,7 +690,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Check expiry
 	if time.Now().After(otpRecord.ExpiresAt) {
 		s.incrementFailedAttempts(phoneHash)
-		
+
 		// ✅ NEW: Log OTP expired
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -711,7 +711,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 			AttemptNumber: otpRecord.Attempts,
 			AttemptsLeft:  scylla.OTPMaxAttempts - otpRecord.Attempts,
 		})
-		
+
 		return &OTPResponse{
 			Success:   false,
 			Message:   "OTP has expired",
@@ -722,7 +722,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 	// Check attempts BEFORE validation
 	if otpRecord.Attempts >= scylla.OTPMaxAttempts {
 		s.lockAccount(phoneHash)
-		
+
 		// ✅ NEW: Log OTP attempts exceeded
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -743,7 +743,7 @@ func (s *OTPService) VerifyOTP(ctx context.Context, req *OTPVerifyRequest) (*OTP
 			AttemptNumber: otpRecord.Attempts,
 			AttemptsLeft:  0,
 		})
-		
+
 		return &OTPResponse{
 			Success:      false,
 			Message:      "Max OTP verification attempts exceeded",
@@ -929,7 +929,7 @@ func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTP
 	// Enforce resend cooldown
 	if time.Since(otpRecord.CreatedAt) < OTPResendCooldown {
 		retry := int((OTPResendCooldown - time.Since(otpRecord.CreatedAt)).Seconds())
-		
+
 		// ✅ NEW: Log resend cooldown
 		s.logOTPEvent(ctx, &models.OTPLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -950,7 +950,7 @@ func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTP
 			AttemptNumber: 0,
 			AttemptsLeft:  retry,
 		})
-		
+
 		return &OTPResponse{
 			Success:    false,
 			Message:    "Please wait before requesting a new OTP",
@@ -1151,11 +1151,13 @@ func (s *OTPService) validateSendRequest(req *OTPSendRequest) error {
 	}
 	// ✅ NEW: Added "admin_login" to valid purposes
 	validPurposes := map[string]bool{
-		"login":             true,
-		"registration":      true,
-		"verification":      true,
-		"password_reset":    true,
-		"admin_login":       true, // ✅ NEW: Admin login OTP
+		"login":          true,
+		"registration":   true,
+		"verification":   true,
+		"password_reset": true,
+		"admin_login":    true,
+		"forgot_mpin":    true, // ✅ ADD THIS
+		// ✅ NEW: Admin login OTP
 	}
 	if !validPurposes[req.Purpose] {
 		return fmt.Errorf("invalid purpose: must be one of login, registration, verification, password_reset, admin_login")
@@ -1179,11 +1181,13 @@ func (s *OTPService) validateVerifyRequest(req *OTPVerifyRequest) error {
 	}
 	// ✅ NEW: Added "admin_login" to valid purposes
 	validPurposes := map[string]bool{
-		"login":             true,
-		"registration":      true,
-		"verification":      true,
-		"password_reset":    true,
-		"admin_login":       true, // ✅ NEW: Admin login OTP
+		"login":          true,
+		"registration":   true,
+		"verification":   true,
+		"password_reset": true,
+		"admin_login":    true, // ✅ NEW: Admin login OTP
+		"forgot_mpin":    true, // ✅ ADD THIS
+
 	}
 	if !validPurposes[req.Purpose] {
 		return fmt.Errorf("invalid purpose")
@@ -1264,8 +1268,8 @@ func (s *OTPService) GetOTPStats(ctx context.Context) (map[string]interface{}, e
 			},
 		},
 		"lockout": map[string]interface{}{
-			"threshold_attempts":  AccountLockoutThreshold,
-			"duration_minutes":    int(AccountLockoutDuration.Minutes()),
+			"threshold_attempts": AccountLockoutThreshold,
+			"duration_minutes":   int(AccountLockoutDuration.Minutes()),
 		},
 		"timestamp": time.Now().UTC(),
 	}

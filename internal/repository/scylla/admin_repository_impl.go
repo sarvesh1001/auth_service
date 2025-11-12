@@ -456,7 +456,7 @@ func (r *AdminRepositoryImpl) RemoveAdmin(ctx context.Context, adminID uuid.UUID
 //                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
 //                 failed_login_attempts, last_login 
 //          FROM admin_users WHERE admin_role_level = ? AND is_active = true LIMIT 1 ALLOW FILTERING`,
-// 		models.RoleLevelOwner,
+// 		models.AdminRoleLevelOwner,
 // 	)
 
 // 	var admin models.AdminUser
@@ -510,7 +510,7 @@ func (r *AdminRepositoryImpl) SetAdminOwner(ctx context.Context, adminID uuid.UU
 		admin := &models.AdminUser{
 			AdminID:             adminID,
 			PhoneHash:           phoneHash, // ✅ Store pre-hashed phone
-			AdminRoleLevel:      models.RoleLevelOwner,
+			AdminRoleLevel:      models.AdminRoleLevelOwner,
 			AdminPermissions:    []string{}, // Will be set based on role
 			AdminCreatedAt:      time.Now().UTC(),
 			AdminCreatedBy:      adminID, // Self-created for first owner
@@ -721,7 +721,7 @@ func (r *AdminRepositoryImpl) GetAdminRepositoryStats(ctx context.Context) (map[
 	stats["active_admins"] = activeAdmins
 
 	// ✅ FIX: Count by role using base table with ALLOW FILTERING
-	roles := []string{models.RoleLevelOwner, models.RoleLevelSuperEmployee, models.RoleLevelEmployee}
+	roles := []string{models.AdminRoleLevelOwner, models.AdminRoleLevelSuperEmployee, models.AdminRoleLevelEmployee}
 	for _, role := range roles {
 		var count int
 		if err := r.client.Session.Query(`SELECT COUNT(*) FROM admin_users WHERE admin_role_level = ? ALLOW FILTERING`, role).WithContext(ctx).Scan(&count); err != nil {
@@ -850,7 +850,7 @@ func (r *AdminRepositoryImpl) GetAdminOwner(ctx context.Context) (*models.AdminU
                 admin_updated_at, is_active, data_access_scope, ip_whitelist, 
                 failed_login_attempts, last_login 
          FROM admin_users WHERE admin_role_level = ? ALLOW FILTERING`,
-        models.RoleLevelOwner,
+        models.AdminRoleLevelOwner,
     )
 
     var admin models.AdminUser

@@ -33,13 +33,14 @@ func init() {
 
 // AuthHandler handles HTTP requests for authentication and user operations
 type AuthHandler struct {
-	otpService     *service.OTPService
-	mpinService    *service.MPINService
-	sessionService *service.SessionService
-	userService    *service.UserService
-	deviceService  *service.DeviceService
-	jwtService     *service.JWTService
-	logger         *zap.Logger
+	otpService      *service.OTPService
+	mpinService     *service.MPINService
+	sessionService  *service.SessionService
+	userService     *service.UserService
+	companyService  *service.CompanyService // ✅ NEW: Company service for subscription checks
+	deviceService   *service.DeviceService
+	jwtService      *service.JWTService
+	logger          *zap.Logger
 }
 
 func NewAuthHandler(
@@ -47,6 +48,7 @@ func NewAuthHandler(
 	mpinService *service.MPINService,
 	sessionService *service.SessionService,
 	userService *service.UserService,
+	companyService *service.CompanyService, // ✅ NEW: Company service
 	deviceService *service.DeviceService,
 	jwtService *service.JWTService,
 	logger *zap.Logger,
@@ -56,6 +58,7 @@ func NewAuthHandler(
 		mpinService:    mpinService,
 		sessionService: sessionService,
 		userService:    userService,
+		companyService: companyService, // ✅ NEW: Company service
 		deviceService:  deviceService,
 		jwtService:     jwtService,
 		logger:         logger,
@@ -89,26 +92,28 @@ func (h *AuthHandler) RegisterPublicRoutes(router chi.Router) {
 		r.Get("/debug-token", h.DebugToken)
 	})
 }
+func (h *AuthHandler) RegisterProtectedRoutes(r chi.Router) {
+	// ✅ Direct routes (no nested /auth)
+	r.Get("/auth/validate", h.ValidateSession)
+	r.Get("/auth/status", h.GetAuthStatus)
+	r.Post("/auth/logout", h.Logout)
+	r.Post("/auth/logout/all", h.LogoutAllDevices)
 
-// RegisterProtectedRoutes registers JWT-protected authentication and user routes
-func (h *AuthHandler) RegisterProtectedRoutes(router chi.Router) {
-	router.Route("/auth", func(r chi.Router) {
-		// Session validation (protected - requires JWT)
-		r.Get("/validate", h.ValidateSession)
-		r.Get("/status", h.GetAuthStatus)
-		r.Post("/logout", h.Logout)
-		r.Post("/logout/all", h.LogoutAllDevices)
-	})
+	// ✅ User management routes (protected)
+		// ✅ Protected user routes (no nested /users)
+	r.Get("/users/{userID}", h.GetUserByID)
+	r.Put("/users/{userID}", h.UpdateUser)
+	r.Patch("/users/{userID}/last-login", h.UpdateLastLogin)
+	r.Get("/users/health", h.UserHealthCheck)
 
-	// User management routes (protected - requires JWT)
-	router.Route("/users", func(r chi.Router) {
-		// User profile operations
-		r.Get("/{userID}", h.GetUserByID)
-		r.Put("/{userID}", h.UpdateUser)
-		r.Patch("/{userID}/last-login", h.UpdateLastLogin)
 
-		// Health check
-		r.Get("/health", h.UserHealthCheck)
+	// ✅ Company management routes (protected)
+	r.Route("/companies", func(r chi.Router) {
+		r.Get("/{companyID}", h.GetCompany)
+		r.Get("/{companyID}/employees", h.ListEmployees)
+		r.Post("/{companyID}/employees", h.AddEmployee)
+		r.Delete("/{companyID}/employees/{userID}", h.RemoveEmployee)
+		r.Get("/context", h.GetCompanyContext)
 	})
 }
 
@@ -138,8 +143,8 @@ type LoginFlowRequest struct {
 	DataRegion        string `json:"data_region" validate:"required"`
 }
 
-// LoginFlowResponse returns available auth methods and flow state
-type LoginFlowResponse struct {
+// UserLoginFlowResponse returns available auth methods and flow state (CHANGED NAME)
+type UserLoginFlowResponse struct {
 	FlowState     string `json:"flow_state"` // "new_user", "existing_user_mpin", "existing_user_otp", "mpin_locked"
 	UserExists    bool   `json:"user_exists"`
 	HasMPIN       bool   `json:"has_mpin"`
@@ -166,20 +171,33 @@ func (h *AuthHandler) InitiateLogin(w http.ResponseWriter, r *http.Request) {
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 	req.DataRegion = util.SanitizeInput(req.DataRegion)
 
-	// Check if user exists
+	// ✅ STRICT: Check if user exists - no auto-creation
 	user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
-	userExists := err == nil && user != nil
-
-	response := &LoginFlowResponse{
-		UserExists: userExists,
+	if err != nil {
+		// User doesn't exist - cannot proceed with login
+		h.respondWithError(w, http.StatusNotFound, 
+			fmt.Errorf("USER_NOT_FOUND: Phone number not registered"), 
+			"User not found. Please register first.")
+		return
 	}
 
-	if !userExists {
-		// New user flow - always requires OTP
-		response.FlowState = "new_user"
-		response.Message = "New user - OTP verification required for registration"
-		h.respondWithJSON(w, http.StatusOK, successResponse(response, "Login flow determined"))
+	// ✅ CHECK: User status
+	if user.IsBanned {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("USER_BANNED: Account is banned"),
+			"Account is banned. Please contact support.")
 		return
+	}
+
+	if user.IsBlocked {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("USER_BLOCKED: Account is temporarily blocked"),
+			"Account is temporarily blocked.")
+		return
+	}
+
+	response := &UserLoginFlowResponse{
+		UserExists: true,
 	}
 
 	// Existing user - check MPIN status
@@ -218,7 +236,7 @@ func (h *AuthHandler) InitiateLogin(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("Login initiation completed",
 		util.String("phone", req.PhoneNumber),
-		util.Bool("user_exists", userExists),
+		util.Bool("user_exists", true),
 		util.Bool("has_mpin", response.HasMPIN),
 		util.Bool("mpin_locked", response.MPINLocked),
 		util.Bool("device_trusted", deviceTrusted),
@@ -253,6 +271,15 @@ func (h *AuthHandler) RegisterUser(w http.ResponseWriter, r *http.Request) {
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 	req.DataRegion = util.SanitizeInput(req.DataRegion)
 	req.OTP = util.SanitizeInput(req.OTP)
+
+	// ✅ STRICT: Check if user already exists
+	existingUser, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+	if err == nil && existingUser != nil {
+		h.respondWithError(w, http.StatusConflict,
+			fmt.Errorf("USER_ALREADY_EXISTS: Phone number already registered"),
+			"User already exists. Please login instead.")
+		return
+	}
 
 	// Verify OTP first
 	otpVerifyReq := service.OTPVerifyRequest{
@@ -341,6 +368,13 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 
+	// ✅ STRICT: Get user - must exist
+	user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+		return
+	}
+
 	// Verify OTP
 	otpVerifyReq := service.OTPVerifyRequest{
 		PhoneNumber: req.PhoneNumber,
@@ -359,13 +393,6 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized,
 			fmt.Errorf("OTP_VERIFICATION_FAILED: OTP verification failed"),
 			"OTP verification failed")
-		return
-	}
-
-	// Get user
-	user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
-	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "User not found")
 		return
 	}
 
@@ -433,6 +460,47 @@ func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ✅ STRICT: Get user - must exist
+	user, err := h.userService.GetUserByID(ctx, userID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+		return
+	}
+
+	// ✅ CHECK: User status
+	if user.IsBanned {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("USER_BANNED: Account is banned"),
+			"Account is banned. Please contact support.")
+		return
+	}
+
+	if user.IsBlocked {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("USER_BLOCKED: Account is temporarily blocked"),
+			"Account is temporarily blocked.")
+		return
+	}
+
+	// ✅ CHECK: Company subscription status (if user has company)
+	if user.CompanyID != uuid.Nil {
+		companyContext, err := h.companyService.GetCompanyContext(ctx, userID)
+		if err != nil {
+			// Extract subscription status from error
+			if strings.Contains(err.Error(), "subscription status:") {
+				h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
+				return
+			}
+			h.respondWithError(w, http.StatusForbidden, err, "Company access denied")
+			return
+		}
+		// Company context is valid - user can proceed
+		h.logger.Debug("Company subscription check passed",
+			util.String("user_id", userID.String()),
+			util.String("company_id", companyContext.CompanyID),
+			util.String("subscription_tier", companyContext.SubscriptionTier))
+	}
+
 	// Verify device trust
 	deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, userID, req.DeviceID)
 	if err != nil || !deviceTrusted {
@@ -477,14 +545,27 @@ func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+	// Get company context for response if available
+	var companyContext *models.CompanyContext
+	if user.CompanyID != uuid.Nil {
+		companyContext, _ = h.companyService.GetCompanyContext(ctx, userID)
+	}
+
+	responseData := map[string]interface{}{
 		"tokens":  tokens, // ✅ JWT access_token + refresh_token for API access
 		"user_id": userID.String(),
 		"message": "MPIN login successful",
-	}, "Login successful"))
+	}
+
+	if companyContext != nil {
+		responseData["company_context"] = companyContext
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Login successful"))
 
 	h.logger.Info("MPIN login completed with JWT tokens",
 		util.String("user_id", userID.String()),
+		util.Bool("has_company", user.CompanyID != uuid.Nil),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
@@ -517,6 +598,13 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ✅ STRICT: Verify user exists
+	_, err = h.userService.GetUserByID(ctx, userID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+		return
+	}
+
 	// Setup MPIN
 	mpinReq := service.MPINSetupRequest{
 		UserID:   userID,
@@ -536,6 +624,238 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("MPIN setup completed (no tokens issued)",
 		util.String("user_id", userID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ============================================
+// ✅ NEW: COMPANY MANAGEMENT HANDLERS
+// ============================================
+
+// GetCompany retrieves company details
+func (h *AuthHandler) GetCompany(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	company, err := h.companyService.GetCompany(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err, "Company not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(company, "Company retrieved successfully"))
+
+	h.logger.Debug("Company retrieved",
+		util.String("company_id", companyID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ListEmployees retrieves employees for a company
+func (h *AuthHandler) ListEmployees(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Get page and limit from query params
+	page := h.getIntQueryParam(r, "page", 1)
+	limit := h.getIntQueryParam(r, "limit", 50)
+
+	employees, total, err := h.companyService.ListEmployees(ctx, companyID, page, limit)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to list employees")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"employees": employees,
+		"total":     total,
+		"page":      page,
+		"limit":     limit,
+	}, "Employees retrieved successfully"))
+
+	h.logger.Debug("Employees listed",
+		util.String("company_id", companyID.String()),
+		util.Int("count", len(employees)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// AddEmployeeRequest for adding employee to company
+type AddEmployeeRequest struct {
+	PhoneNumber   string    `json:"phone_number" validate:"required"`
+	EmployeeID    string    `json:"employee_id" validate:"required"`
+	RoleID        uuid.UUID `json:"role_id" validate:"required"`
+	DepartmentID  uuid.UUID `json:"department_id" validate:"required"`
+	ReportsTo     uuid.UUID `json:"reports_to,omitempty"`
+}
+
+// AddEmployee adds an employee to a company
+func (h *AuthHandler) AddEmployee(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Get user ID from JWT context (the user adding the employee)
+	addedBy := r.Context().Value("user_id")
+	if addedBy == nil {
+		h.respondWithError(w, http.StatusUnauthorized, 
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	addedByID, err := uuid.Parse(addedBy.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req AddEmployeeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Sanitize inputs
+	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+	req.EmployeeID = util.SanitizeInput(req.EmployeeID)
+
+	// Create service request
+	serviceReq := service.AddEmployeeRequest{
+		CompanyID:    companyID,
+		PhoneNumber:  req.PhoneNumber,
+		EmployeeID:   req.EmployeeID,
+		RoleID:       req.RoleID,
+		DepartmentID: req.DepartmentID,
+		ReportsTo:    req.ReportsTo,
+		AddedBy:      addedByID,
+	}
+
+	if err := h.companyService.AddEmployee(ctx, &serviceReq); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to add employee")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Employee added successfully"))
+
+	h.logger.Info("Employee added to company",
+		util.String("company_id", companyID.String()),
+		util.String("added_by", addedByID.String()),
+		util.String("phone", req.PhoneNumber),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// RemoveEmployee removes an employee from a company
+func (h *AuthHandler) RemoveEmployee(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	// Get user ID from JWT context (the user removing the employee)
+	removedBy := r.Context().Value("user_id")
+	if removedBy == nil {
+		h.respondWithError(w, http.StatusUnauthorized, 
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	removedByID, err := uuid.Parse(removedBy.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	if err := h.companyService.RemoveEmployee(ctx, companyID, userID, removedByID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to remove employee")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee removed successfully"))
+
+	h.logger.Info("Employee removed from company",
+		util.String("company_id", companyID.String()),
+		util.String("user_id", userID.String()),
+		util.String("removed_by", removedByID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetCompanyContext returns the company context for the authenticated user
+func (h *AuthHandler) GetCompanyContext(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	// Get user ID from JWT context
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized, 
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
+	if err != nil {
+		if strings.Contains(err.Error(), "subscription status:") {
+			h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
+			return
+		}
+		if strings.Contains(err.Error(), "user is not an active employee") {
+			h.respondWithError(w, http.StatusForbidden, err, "Not an active employee")
+			return
+		}
+		h.respondWithError(w, http.StatusNotFound, err, "Company context not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(companyContext, "Company context retrieved"))
+
+	h.logger.Debug("Company context retrieved",
+		util.String("user_id", userIDParsed.String()),
+		util.String("company_id", companyContext.CompanyID),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
@@ -973,6 +1293,19 @@ func (h *AuthHandler) getClientIP(r *http.Request) string {
 		return xff
 	}
 	return r.RemoteAddr
+}
+
+func (h *AuthHandler) getIntQueryParam(r *http.Request, key string, defaultValue int) int {
+	value := r.URL.Query().Get(key)
+	if value == "" {
+		return defaultValue
+	}
+	var result int
+	_, err := fmt.Sscanf(value, "%d", &result)
+	if err != nil {
+		return defaultValue
+	}
+	return result
 }
 
 func (h *AuthHandler) respondWithJSON(w http.ResponseWriter, statusCode int, data interface{}) {

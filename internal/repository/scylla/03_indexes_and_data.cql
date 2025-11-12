@@ -31,3 +31,8 @@ CREATE INDEX IF NOT EXISTS admin_users_phone_hash_idx ON admin_users (phone_hash
 CREATE INDEX IF NOT EXISTS admin_users_is_active_idx ON admin_users (is_active);
 CREATE INDEX IF NOT EXISTS idx_pepper_store_is_active 
 ON pepper_store(is_active);
+
+-- Create individual indexes instead (Scylla only allows one column per index)
+CREATE INDEX IF NOT EXISTS companies_is_active_idx ON companies (is_active);
+CREATE INDEX IF NOT EXISTS companies_is_blocked_idx ON companies (is_blocked);
+CREATE INDEX IF NOT EXISTS companies_subscription_end_date_idx ON companies (subscription_end_date);

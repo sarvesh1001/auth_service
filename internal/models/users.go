@@ -8,6 +8,7 @@ type User struct {
     PhoneHash         string     `db:"phone_hash"`
     PhoneEncrypted    string     `db:"phone_encrypted"`      // ✅ CHANGED: []byte -> string
     PhoneKeyID        uuid.UUID  `db:"phone_key_id"`
+    CompanyID uuid.UUID `db:"company_id" json:"company_id"`
     DeviceID          string     `db:"device_id"`
     DeviceFingerprint string     `db:"device_fingerprint"`
     KYCStatus         string     `db:"kyc_status"`
@@ -30,3 +31,4 @@ type User struct {
     PhoneEncryptedDEK string    `db:"phone_encrypted_dek"`
 
 }
+

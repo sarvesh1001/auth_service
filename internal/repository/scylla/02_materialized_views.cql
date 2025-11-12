@@ -1,5 +1,9 @@
 USE core_auth;
 
+-- =========================================================
+-- USERS MATERIALIZED VIEWS
+-- =========================================================
+
 -- USERS BY PHONE HASH
 CREATE MATERIALIZED VIEW IF NOT EXISTS users_by_phone_hash AS
     SELECT user_bucket, user_id, phone_hash, is_blocked, kyc_status
@@ -41,10 +45,79 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS banned_users AS
         'compaction_window_unit': 'DAYS'
     };
 
--- DEVICE BINDINGS BY DEVICE ID (FIXED)
+-- DEVICE BINDINGS BY DEVICE ID
 CREATE MATERIALIZED VIEW IF NOT EXISTS device_bindings_by_device_id AS
     SELECT user_id, device_id, bound_at, bind_token, action_timestamp
     FROM user_device_binding_history
     WHERE device_id IS NOT NULL AND user_id IS NOT NULL AND action_timestamp IS NOT NULL AND bound_at IS NOT NULL
     PRIMARY KEY ((device_id), action_timestamp, bound_at, user_id)
     WITH CLUSTERING ORDER BY (action_timestamp DESC, bound_at DESC);
+
+
+-- =========================================================
+-- COMPANY MATERIALIZED VIEWS (FIXED)
+-- =========================================================
+-- =========================================================
+-- COMPANY MATERIALIZED VIEWS (FIXED - ScyllaDB Compatible)
+-- =========================================================
+
+-- Companies by owner (user_id)
+CREATE MATERIALIZED VIEW IF NOT EXISTS companies_by_owner AS
+    SELECT company_id, company_name, owner_phone, owner_user_id,
+           subscription_tier, is_active, created_at
+    FROM companies 
+    WHERE owner_user_id IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (owner_user_id, company_id);
+
+-- Employees by user
+CREATE MATERIALIZED VIEW IF NOT EXISTS employees_by_user AS
+    SELECT company_id, user_id, employee_id, role_id, department_id, is_active
+    FROM company_employees 
+    WHERE user_id IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (user_id, company_id);
+
+-- Companies by tier (main view)
+CREATE MATERIALIZED VIEW IF NOT EXISTS companies_by_tier AS
+    SELECT company_id, company_name, subscription_tier, is_active, is_blocked,
+           subscription_start_date, subscription_end_date, created_at
+    FROM companies 
+    WHERE subscription_tier IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (subscription_tier, company_id)
+    WITH CLUSTERING ORDER BY (company_id ASC);
+
+-- Companies by active/inactive status
+CREATE MATERIALIZED VIEW IF NOT EXISTS companies_by_active_status AS
+    SELECT company_id, company_name, subscription_tier, is_active, is_blocked,
+           subscription_start_date, subscription_end_date, created_at
+    FROM companies
+    WHERE is_active IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (is_active, company_id)
+    WITH CLUSTERING ORDER BY (company_id ASC);
+
+-- Companies by blocked status
+CREATE MATERIALIZED VIEW IF NOT EXISTS companies_by_blocked_status AS
+    SELECT company_id, company_name, subscription_tier, is_active, is_blocked,
+           subscription_start_date, subscription_end_date, created_at
+    FROM companies
+    WHERE is_blocked IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (is_blocked, company_id)
+    WITH CLUSTERING ORDER BY (company_id ASC);
+
+-- Companies by subscription end date
+CREATE MATERIALIZED VIEW IF NOT EXISTS companies_by_subscription_date AS
+    SELECT company_id, company_name, subscription_tier, is_active, is_blocked,
+           subscription_start_date, subscription_end_date, created_at
+    FROM companies 
+    WHERE subscription_end_date IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (subscription_end_date, company_id)
+    WITH CLUSTERING ORDER BY (company_id ASC);
+
+-- Companies by creation date (for recent companies)
+CREATE MATERIALIZED VIEW IF NOT EXISTS companies_by_created_date AS
+    SELECT company_id, company_name, subscription_tier, is_active, created_at
+    FROM companies
+    WHERE created_at IS NOT NULL AND company_id IS NOT NULL
+    PRIMARY KEY (created_at, company_id)
+    WITH CLUSTERING ORDER BY (company_id ASC);
+
+    

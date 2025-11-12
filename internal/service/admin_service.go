@@ -160,7 +160,7 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
 		PhoneEncrypted:    encryptedResult.EncryptedValue,
 		PhoneKeyID:        keyID,
 		PhoneEncryptedDEK: encryptedResult.EncryptedDEK,
-		AdminRoleLevel:    models.RoleLevelOwner,
+		AdminRoleLevel:    models.AdminRoleLevelOwner,
 		AdminPermissions:  s.getOwnerPermissions(),
 		AdminCreatedAt:    time.Now().UTC(),
 		AdminCreatedBy:    ownerID,
@@ -205,7 +205,7 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
 			Message:     "Owner initialized successfully",
 		},
 		AdminID:   ownerID.String(),
-		AdminRole: models.RoleLevelOwner,
+		AdminRole: models.AdminRoleLevelOwner,
 		Action:    "initialize_owner",
 		Status:    "success",
 		Duration:  int64(time.Since(startTime).Milliseconds()),
@@ -383,7 +383,7 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 			Message:     "Owner phone updated successfully",
 		},
 		AdminID:    ownerID.String(),
-		AdminRole:  models.RoleLevelOwner,
+		AdminRole:  models.AdminRoleLevelOwner,
 		Action:     "change_owner_phone",
 		Status:     "success",
 		Duration:   int64(time.Since(startTime).Milliseconds()),
@@ -461,7 +461,7 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
 		return nil, fmt.Errorf("employees cannot invite admins")
 	}
 
-	if requester.IsSuperEmployee() && roleLevel != models.RoleLevelEmployee {
+	if requester.IsSuperEmployee() && roleLevel != models.AdminRoleLevelEmployee {
 		s.logAdminEvent(ctx, &models.AdminLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -1541,9 +1541,9 @@ func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID)
 // getDefaultDataAccessScope returns default data access scope for role
 func (s *AdminService) getDefaultDataAccessScope(roleLevel string) []string {
 	switch roleLevel {
-	case models.RoleLevelOwner, models.RoleLevelSuperEmployee:
+	case models.AdminRoleLevelOwner, models.AdminRoleLevelSuperEmployee:
 		return []string{models.DataAccessGlobal}
-	case models.RoleLevelEmployee:
+	case models.AdminRoleLevelEmployee:
 		return []string{models.DataAccessGlobal}
 	default:
 		return []string{models.DataAccessGlobal}
@@ -1569,10 +1569,10 @@ func (s *AdminService) getOwnerPermissions() []string {
 // getPermissionsForRole returns permissions based on role
 func (s *AdminService) getPermissionsForRole(roleLevel string) []string {
 	switch roleLevel {
-	case models.RoleLevelOwner:
+	case models.AdminRoleLevelOwner:
 		return s.getOwnerPermissions()
 
-	case models.RoleLevelSuperEmployee:
+	case models.AdminRoleLevelSuperEmployee:
 		return []string{
 			models.PermissionReadUsers,
 			models.PermissionWriteUsers,
@@ -1583,7 +1583,7 @@ func (s *AdminService) getPermissionsForRole(roleLevel string) []string {
 			models.PermissionViewAuditLog,
 		}
 
-	case models.RoleLevelEmployee:
+	case models.AdminRoleLevelEmployee:
 		return []string{
 			models.PermissionReadUsers,
 			models.PermissionWriteUsers,
@@ -1605,5 +1605,20 @@ func (s *AdminService) HealthCheck(ctx context.Context) error {
 func (s *AdminService) GetStats(ctx context.Context) (map[string]interface{}, error) {
 	return s.adminRepo.GetRepositoryStats(ctx)
 }
-
-
+// Add this method to AdminService
+func (s *AdminService) GetInactiveAdmins(ctx context.Context, limit int) ([]*models.AdminUser, error) {
+    // Get all admins and filter inactive ones
+    allAdmins, err := s.adminRepo.GetAllAdmins(ctx, limit)
+    if err != nil {
+        return nil, err
+    }
+    
+    var inactiveAdmins []*models.AdminUser
+    for _, admin := range allAdmins {
+        if !admin.IsActive {
+            inactiveAdmins = append(inactiveAdmins, admin)
+        }
+    }
+    
+    return inactiveAdmins, nil
+}
