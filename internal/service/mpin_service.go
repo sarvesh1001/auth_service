@@ -7,6 +7,9 @@ import (
 	"auth-service/internal/encryption"
 	"auth-service/internal/hashing"
 	"auth-service/internal/models"
+
+	"auth-service/internal/repository/postgres" // ✅ ADD THIS
+
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/util"
 	"context"
@@ -40,7 +43,7 @@ const (
 // MPINService handles all MPIN-related business logic
 type MPINService struct {
 	mpinRepo        scylla.MPINRepository
-	userRepo        scylla.UserRepository
+	userRepo        postgres.UserRepository
 	deviceTrustRepo scylla.DeviceTrustRepository
 	otpService      *OTPService
 	encryptionMgr   *encryption.EncryptionManager
@@ -120,7 +123,7 @@ type MPINForgotRequest struct {
 
 func NewMPINService(
 	mpinRepo scylla.MPINRepository,
-	userRepo scylla.UserRepository,
+	userRepo postgres.UserRepository,
 	deviceTrustRepo scylla.DeviceTrustRepository,
 	otpService *OTPService,
 	encryptionMgr *encryption.EncryptionManager,
@@ -274,7 +277,7 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 		return fmt.Errorf("%w: user not found", ErrInvalidInput)
 	}
 
-	if user.IsBanned {
+	if !user.IsActive {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -296,7 +299,7 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 		return ErrUserBanned
 	}
 
-	if user.IsBlocked {
+	if !user.IsActive {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -442,6 +445,201 @@ func (s *MPINService) SetupMPIN(ctx context.Context, req *MPINSetupRequest) erro
 	return nil
 }
 
+// // ✅ CORRECTED: SendForgotMPINOTP - Sends OTP for forgot MPIN flow
+// func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (string, error) {
+// 	startTime := time.Now()
+
+// 	// ✅ NEW: Log OTP send initiation
+// 	s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 		LogEnvelope: models.LogEnvelope{
+// 			EventID:     uuid.New().String(),
+// 			EventType:   string(models.LogEventTypeMPIN),
+// 			ServiceName: "auth-service",
+// 			Timestamp:   time.Now(),
+// 			Environment: s.config.Environment,
+// 			Version:     ServiceVersion,
+
+// 			Level:   string(models.LogLevelInfo),
+// 			Message: "Forgot MPIN OTP send initiated",
+// 		},
+// 		UserID: userID.String(),
+// 		Status: "forgot_otp_initiated",
+// 	})
+
+// 	// Fetch user from database
+// 	user, err := s.userRepo.GetUserByID(ctx, userID)
+// 	if err != nil {
+// 		s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 			LogEnvelope: models.LogEnvelope{
+// 				EventID:     uuid.New().String(),
+// 				EventType:   string(models.LogEventTypeMPIN),
+// 				ServiceName: "auth-service",
+// 				Timestamp:   time.Now(),
+// 				Environment: s.config.Environment,
+// 				Version:     ServiceVersion,
+
+// 				Level:   string(models.LogLevelError),
+// 				Message: "User not found for forgot MPIN OTP",
+// 			},
+// 			UserID:        userID.String(),
+// 			Status:        "forgot_otp_failed",
+// 			ErrorCode:     "USER_NOT_FOUND",
+// 			FailureReason: "user_not_found",
+// 		})
+// 		return "", fmt.Errorf("user not found: %w", err)
+// 	}
+
+// 	// ✅ FIXED: Use IsActive instead of IsBanned
+// 	if !user.IsActive {
+// 		s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 			LogEnvelope: models.LogEnvelope{
+// 				EventID:     uuid.New().String(),
+// 				EventType:   string(models.LogEventTypeMPIN),
+// 				ServiceName: "auth-service",
+// 				Timestamp:   time.Now(),
+// 				Environment: s.config.Environment,
+// 				Version:     ServiceVersion,
+
+// 				Level:   string(models.LogLevelWarning),
+// 				Message: "Inactive user attempted forgot MPIN OTP",
+// 			},
+// 			UserID:        userID.String(),
+// 			Status:        "forgot_otp_failed",
+// 			ErrorCode:     "USER_INACTIVE",
+// 			FailureReason: "user_inactive",
+// 		})
+// 		return "", fmt.Errorf("user account is inactive")
+// 	}
+
+// 	// ✅ FIXED: Create pointer to EncryptedData struct with proper type conversion
+// 	encryptedData := &encryption.EncryptedData{
+// 		EncryptedValue: string(user.PhoneEncrypted), // ✅ FIXED: Convert []byte to string
+// 		EncryptedDEK:   "",                          // ✅ FIXED: Empty string since field doesn't exist in model
+// 		KeyID:          user.PhoneKeyID.String(),
+// 		Version:        "v1",
+// 		CreatedAt:      user.CreatedAt,
+// 	}
+
+// 	// ✅ FIXED: Remove problematic logging or fix type conversion
+// 	s.logger.Info("DecryptField debug",
+// 		util.String("EncryptedValue", string(user.PhoneEncrypted)), // ✅ FIXED: Convert []byte to string
+// 		// Removed EncryptedDEK since field doesn't exist in model
+// 		util.String("KeyID", user.PhoneKeyID.String()),
+// 		util.String("UserID", userID.String()),
+// 		util.Int("EncryptedValueLength", len(user.PhoneEncrypted)), // ✅ ADDED: Log length instead
+// 	)
+
+// 	// ✅ FIXED: Pass pointer directly (already a pointer from &)
+// 	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
+// 	if err != nil {
+// 		s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 			LogEnvelope: models.LogEnvelope{
+// 				EventID:     uuid.New().String(),
+// 				EventType:   string(models.LogEventTypeMPIN),
+// 				ServiceName: "auth-service",
+// 				Timestamp:   time.Now(),
+// 				Environment: s.config.Environment,
+// 				Version:     ServiceVersion,
+
+// 				Level:   string(models.LogLevelError),
+// 				Message: "Failed to decrypt phone number for forgot MPIN OTP",
+// 			},
+// 			UserID:        userID.String(),
+// 			Status:        "forgot_otp_failed",
+// 			ErrorCode:     "PHONE_DECRYPTION_FAILED",
+// 			ErrorMessage:  err.Error(),
+// 			FailureReason: "phone_decryption_failed",
+// 		})
+// 		s.logger.Error("Failed to decrypt phone number",
+// 			util.ErrorField(err),
+// 			util.String("user_id", userID.String()),
+// 		)
+// 		return "", fmt.Errorf("failed to decrypt phone number: %w", err)
+// 	}
+
+// 	// Prepare OTP send request
+// 	otpReq := &OTPSendRequest{
+// 		PhoneNumber: phoneNumber,
+// 		Purpose:     "forgot_mpin",
+// 		DeviceID:    "",
+// 	}
+
+// 	// Send OTP via OTP service
+// 	otpResp, err := s.otpService.SendOTP(ctx, otpReq)
+// 	if err != nil {
+// 		s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 			LogEnvelope: models.LogEnvelope{
+// 				EventID:     uuid.New().String(),
+// 				EventType:   string(models.LogEventTypeMPIN),
+// 				ServiceName: "auth-service",
+// 				Timestamp:   time.Now(),
+// 				Environment: s.config.Environment,
+// 				Version:     ServiceVersion,
+
+// 				Level:   string(models.LogLevelError),
+// 				Message: "OTP service error for forgot MPIN",
+// 			},
+// 			UserID:        userID.String(),
+// 			Status:        "forgot_otp_failed",
+// 			ErrorCode:     "OTP_SEND_FAILED",
+// 			ErrorMessage:  err.Error(),
+// 			FailureReason: "otp_send_failed",
+// 		})
+// 		s.logger.Error("OTP service error",
+// 			util.ErrorField(err),
+// 			util.String("user_id", userID.String()),
+// 		)
+// 		return "", err
+// 	}
+
+// 	if !otpResp.Success {
+// 		s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 			LogEnvelope: models.LogEnvelope{
+// 				EventID:     uuid.New().String(),
+// 				EventType:   string(models.LogEventTypeMPIN),
+// 				ServiceName: "auth-service",
+// 				Timestamp:   time.Now(),
+// 				Environment: s.config.Environment,
+// 				Version:     ServiceVersion,
+
+// 				Level:   string(models.LogLevelError),
+// 				Message: "OTP send failed for forgot MPIN",
+// 			},
+// 			UserID:        userID.String(),
+// 			Status:        "forgot_otp_failed",
+// 			ErrorCode:     "OTP_SEND_FAILED",
+// 			ErrorMessage:  otpResp.Message,
+// 			FailureReason: "otp_send_failed",
+// 		})
+// 		return "", fmt.Errorf("failed to send OTP: %s", otpResp.Message)
+// 	}
+
+// 	// ✅ NEW: Log successful OTP send
+// 	s.logMPINEvent(ctx, &models.MPINLogEvent{
+// 		LogEnvelope: models.LogEnvelope{
+// 			EventID:     uuid.New().String(),
+// 			EventType:   string(models.LogEventTypeMPIN),
+// 			ServiceName: "auth-service",
+// 			Timestamp:   time.Now(),
+// 			Environment: s.config.Environment,
+// 			Version:     ServiceVersion,
+
+// 			Level:   string(models.LogLevelInfo),
+// 			Message: "Forgot MPIN OTP sent successfully",
+// 		},
+// 		UserID:   userID.String(),
+// 		Status:   "forgot_otp_sent",
+// 		Duration: int64(time.Since(startTime).Milliseconds()),
+// 	})
+
+// 	s.logger.Info("Forgot MPIN OTP sent successfully",
+// 		util.String("user_id", userID.String()),
+// 		util.String("phone", phoneNumber[len(phoneNumber)-4:]+"****"),
+// 	)
+
+// 	return "", nil
+// }
+
 // ✅ CORRECTED: SendForgotMPINOTP - Sends OTP for forgot MPIN flow
 func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (string, error) {
 	startTime := time.Now()
@@ -454,10 +652,9 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 			ServiceName: "auth-service",
 			Timestamp:   time.Now(),
 			Environment: s.config.Environment,
-			Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-			Level:   string(models.LogLevelInfo),
-			Message: "Forgot MPIN OTP send initiated",
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Forgot MPIN OTP send initiated",
 		},
 		UserID: userID.String(),
 		Status: "forgot_otp_initiated",
@@ -473,10 +670,9 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 				ServiceName: "auth-service",
 				Timestamp:   time.Now(),
 				Environment: s.config.Environment,
-				Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-				Level:   string(models.LogLevelError),
-				Message: "User not found for forgot MPIN OTP",
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "User not found for forgot MPIN OTP",
 			},
 			UserID:        userID.String(),
 			Status:        "forgot_otp_failed",
@@ -486,8 +682,8 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 		return "", fmt.Errorf("user not found: %w", err)
 	}
 
-	// Check if user is banned
-	if user.IsBanned {
+	// ✅ FIXED: Use IsActive instead of IsBanned
+	if !user.IsActive {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),
@@ -495,33 +691,61 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 				ServiceName: "auth-service",
 				Timestamp:   time.Now(),
 				Environment: s.config.Environment,
-				Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-				Level:   string(models.LogLevelWarning),
-				Message: "Banned user attempted forgot MPIN OTP",
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Inactive user attempted forgot MPIN OTP",
 			},
 			UserID:        userID.String(),
 			Status:        "forgot_otp_failed",
-			ErrorCode:     "USER_BANNED",
-			FailureReason: "user_banned",
+			ErrorCode:     "USER_INACTIVE",
+			FailureReason: "user_inactive",
 		})
-		return "", ErrUserBanned
+		return "", fmt.Errorf("user account is inactive")
 	}
 
-	// ✅ FIXED: Create pointer to EncryptedData struct
+	// ✅ FIXED: Check if user has required encryption fields
+	if len(user.PhoneEncrypted) == 0 || user.PhoneKeyID == uuid.Nil || user.PhoneEncryptedDEK == "" {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "User missing required encryption fields for forgot MPIN OTP",
+			},
+			UserID:        userID.String(),
+			Status:        "forgot_otp_failed",
+			ErrorCode:     "MISSING_ENCRYPTION_FIELDS",
+			FailureReason: "missing_encryption_fields",
+		})
+		s.logger.Error("User missing required encryption fields",
+			util.String("user_id", userID.String()),
+			util.Int("phone_encrypted_length", len(user.PhoneEncrypted)),
+			util.Bool("has_phone_key_id", user.PhoneKeyID != uuid.Nil),
+			util.Bool("has_phone_encrypted_dek", user.PhoneEncryptedDEK != ""),
+		)
+		return "", fmt.Errorf("user missing required encryption fields")
+	}
+
+	// ✅ FIXED: Create proper EncryptedData struct with all required fields
 	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: user.PhoneEncrypted,
-		EncryptedDEK:   user.PhoneEncryptedDEK,
+		EncryptedValue: string(user.PhoneEncrypted), // ✅ FIXED: Convert []byte to string
+		EncryptedDEK:   user.PhoneEncryptedDEK,      // ✅ FIXED: Use actual DEK from user model
 		KeyID:          user.PhoneKeyID.String(),
 		Version:        "v1",
 		CreatedAt:      user.CreatedAt,
 	}
 
-	s.logger.Info("DecryptField debug",
-		util.String("EncryptedValue", user.PhoneEncrypted),
-		util.String("EncryptedDEK", user.PhoneEncryptedDEK),
-		util.String("KeyID", user.PhoneKeyID.String()),
-		util.String("UserID", userID.String()),
+	// ✅ FIXED: Improved debug logging
+	s.logger.Debug("Decrypting phone number for forgot MPIN OTP",
+		util.String("user_id", userID.String()),
+		util.Int("encrypted_value_length", len(user.PhoneEncrypted)),
+		util.String("key_id", user.PhoneKeyID.String()),
+		util.Bool("has_encrypted_dek", user.PhoneEncryptedDEK != ""),
+		util.Int("encrypted_dek_length", len(user.PhoneEncryptedDEK)),
 	)
 
 	// ✅ FIXED: Pass pointer directly (already a pointer from &)
@@ -534,10 +758,9 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 				ServiceName: "auth-service",
 				Timestamp:   time.Now(),
 				Environment: s.config.Environment,
-				Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-				Level:   string(models.LogLevelError),
-				Message: "Failed to decrypt phone number for forgot MPIN OTP",
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to decrypt phone number for forgot MPIN OTP",
 			},
 			UserID:        userID.String(),
 			Status:        "forgot_otp_failed",
@@ -548,15 +771,40 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 		s.logger.Error("Failed to decrypt phone number",
 			util.ErrorField(err),
 			util.String("user_id", userID.String()),
+			util.String("key_id", user.PhoneKeyID.String()),
+			util.Int("encrypted_value_length", len(user.PhoneEncrypted)),
+			util.Int("encrypted_dek_length", len(user.PhoneEncryptedDEK)),
 		)
 		return "", fmt.Errorf("failed to decrypt phone number: %w", err)
+	}
+
+	// Validate phone number after decryption
+	if phoneNumber == "" {
+		s.logMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Decrypted phone number is empty",
+			},
+			UserID:        userID.String(),
+			Status:        "forgot_otp_failed",
+			ErrorCode:     "EMPTY_PHONE_NUMBER",
+			FailureReason: "empty_phone_number",
+		})
+		return "", fmt.Errorf("decrypted phone number is empty")
 	}
 
 	// Prepare OTP send request
 	otpReq := &OTPSendRequest{
 		PhoneNumber: phoneNumber,
 		Purpose:     "forgot_mpin",
-		DeviceID:    "",
+		IPAddress:   "", // You might want to capture this from context
+		DeviceID:    "", // You might want to capture this from context
 	}
 
 	// Send OTP via OTP service
@@ -569,10 +817,9 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 				ServiceName: "auth-service",
 				Timestamp:   time.Now(),
 				Environment: s.config.Environment,
-				Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-				Level:   string(models.LogLevelError),
-				Message: "OTP service error for forgot MPIN",
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP service error for forgot MPIN",
 			},
 			UserID:        userID.String(),
 			Status:        "forgot_otp_failed",
@@ -580,9 +827,10 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 			ErrorMessage:  err.Error(),
 			FailureReason: "otp_send_failed",
 		})
-		s.logger.Error("OTP service error",
+		s.logger.Error("OTP service error for forgot MPIN",
 			util.ErrorField(err),
 			util.String("user_id", userID.String()),
+			util.String("phone", phoneNumber[len(phoneNumber)-4:]+"****"), // Mask phone for logs
 		)
 		return "", err
 	}
@@ -595,10 +843,9 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 				ServiceName: "auth-service",
 				Timestamp:   time.Now(),
 				Environment: s.config.Environment,
-				Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-				Level:   string(models.LogLevelError),
-				Message: "OTP send failed for forgot MPIN",
+				Version:     ServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP send failed for forgot MPIN",
 			},
 			UserID:        userID.String(),
 			Status:        "forgot_otp_failed",
@@ -617,10 +864,9 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 			ServiceName: "auth-service",
 			Timestamp:   time.Now(),
 			Environment: s.config.Environment,
-			Version:     ServiceVersion, // ✅ FIXED: Use constant
-
-			Level:   string(models.LogLevelInfo),
-			Message: "Forgot MPIN OTP sent successfully",
+			Version:     ServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Forgot MPIN OTP sent successfully",
 		},
 		UserID:   userID.String(),
 		Status:   "forgot_otp_sent",
@@ -629,7 +875,8 @@ func (s *MPINService) SendForgotMPINOTP(ctx context.Context, userID uuid.UUID) (
 
 	s.logger.Info("Forgot MPIN OTP sent successfully",
 		util.String("user_id", userID.String()),
-		util.String("phone", phoneNumber[len(phoneNumber)-4:]+"****"),
+		util.String("phone", phoneNumber[len(phoneNumber)-4:]+"****"), // Mask phone for security
+		util.Duration("duration", time.Since(startTime)),
 	)
 
 	return "", nil
@@ -707,7 +954,7 @@ func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWi
 
 	// ✅ FIXED: Create pointer to EncryptedData struct
 	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: user.PhoneEncrypted,
+		EncryptedValue: string(user.PhoneEncrypted),
 		EncryptedDEK:   user.PhoneEncryptedDEK,
 		KeyID:          user.PhoneKeyID.String(),
 		Version:        "v1",
@@ -1863,7 +2110,7 @@ func (s *MPINService) ChangeMPINAdmin(ctx context.Context, req *MPINAdminChangeR
 		return fmt.Errorf("user not found: %w", err)
 	}
 
-	if user.IsBanned {
+	if !user.IsActive {
 		s.logMPINEvent(ctx, &models.MPINLogEvent{
 			LogEnvelope: models.LogEnvelope{
 				EventID:     uuid.New().String(),

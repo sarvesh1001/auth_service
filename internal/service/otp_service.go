@@ -990,11 +990,21 @@ func (s *OTPService) ResendOTP(ctx context.Context, req *OTPResendRequest) (*OTP
 	}
 	return s.SendOTP(ctx, sendReq)
 }
-
-// validateResendRequest checks required fields for resend
 func (s *OTPService) validateResendRequest(req *OTPResendRequest) error {
 	if req.PhoneNumber == "" || req.Purpose == "" {
 		return fmt.Errorf("phone_number and purpose are required")
+	}
+	// ✅ NEW: Added "forgot_mpin" to valid purposes
+	validPurposes := map[string]bool{
+		"login":          true,
+		"registration":   true,
+		"verification":   true,
+		"password_reset": true,
+		"admin_login":    true,
+		"forgot_mpin":    true, // ✅ ADD THIS
+	}
+	if !validPurposes[req.Purpose] {
+		return fmt.Errorf("invalid purpose")
 	}
 	return nil
 }

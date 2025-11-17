@@ -181,6 +181,31 @@ services:
       - dev-net
 
   # ===============================
+  # PostgreSQL Database
+  # ===============================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-dev
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DATABASE:-auth_service}
+      - POSTGRES_USER=${POSTGRES_USER:-auth_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-auth_user} -d ${POSTGRES_DATABASE:-auth_service}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - dev-net
+
+  # ===============================
   # Schema Initialization Service
   # ===============================
   schema-init:
@@ -193,6 +218,8 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_started
+      postgres:
+        condition: service_healthy
     volumes:
       - .:/app:ro
     restart: "no"
@@ -231,6 +258,12 @@ services:
       - CLICKHOUSE_URL=clickhouse:9000
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE:-auth_service}
+      - POSTGRES_USER=${POSTGRES_USER:-auth_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres_password}
+      - POSTGRES_SSLMODE=disable
       - ENCRYPTION_MASTER_KEY=${ENCRYPTION_MASTER_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - API_KEY=${API_KEY}
@@ -253,6 +286,8 @@ services:
       elasticsearch:
         condition: service_healthy
       clickhouse:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f -X GET https://localhost:8443/health || exit 1"]
@@ -302,6 +337,7 @@ volumes:
   scylla_data:
   elasticsearch_data:
   clickhouse_data:
+  postgres_data:
 
 networks:
   dev-net:

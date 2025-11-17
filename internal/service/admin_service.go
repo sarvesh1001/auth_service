@@ -1,6 +1,7 @@
 package service
 
 import (
+	"auth-service/internal/repository/postgres"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"auth-service/internal/models"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/util"
+
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -20,7 +22,7 @@ import (
 // AdminService handles admin related business logic
 type AdminService struct {
 	adminRepo      scylla.AdminRepository
-	userRepo       scylla.UserRepository
+	userRepo       postgres.UserRepository
 	sessionService *SessionService
 	otpService     *OTPService
 	mpinService    *MPINService
@@ -34,7 +36,7 @@ type AdminService struct {
 // NewAdminService creates admin service with injected dependencies
 func NewAdminService(
 	adminRepo scylla.AdminRepository,
-	userRepo scylla.UserRepository,
+	userRepo postgres.UserRepository,
 	sessionService *SessionService,
 	otpService *OTPService,
 	mpinService *MPINService,
@@ -155,21 +157,21 @@ func (s *AdminService) InitializeOwner(ctx context.Context, phone string) (*mode
 
 	ownerID := uuid.New()
 	owner := &models.AdminUser{
-		AdminID:           ownerID,
-		PhoneHash:         phoneHash,
-		PhoneEncrypted:    encryptedResult.EncryptedValue,
-		PhoneKeyID:        keyID,
-		PhoneEncryptedDEK: encryptedResult.EncryptedDEK,
-		AdminRoleLevel:    models.AdminRoleLevelOwner,
-		AdminPermissions:  s.getOwnerPermissions(),
-		AdminCreatedAt:    time.Now().UTC(),
-		AdminCreatedBy:    ownerID,
-		AdminUpdatedAt:    time.Now().UTC(),
-		IsActive:          true,
-		DataAccessScope:   []string{models.DataAccessGlobal},
-		IPWhitelist:       []string{},
+		AdminID:             ownerID,
+		PhoneHash:           phoneHash,
+		PhoneEncrypted:      encryptedResult.EncryptedValue,
+		PhoneKeyID:          keyID,
+		PhoneEncryptedDEK:   encryptedResult.EncryptedDEK,
+		AdminRoleLevel:      models.AdminRoleLevelOwner,
+		AdminPermissions:    s.getOwnerPermissions(),
+		AdminCreatedAt:      time.Now().UTC(),
+		AdminCreatedBy:      ownerID,
+		AdminUpdatedAt:      time.Now().UTC(),
+		IsActive:            true,
+		DataAccessScope:     []string{models.DataAccessGlobal},
+		IPWhitelist:         []string{},
 		FailedLoginAttempts: 0,
-		LastLogin:         time.Time{},
+		LastLogin:           time.Time{},
 	}
 
 	if err := s.adminRepo.CreateAdmin(ctx, owner); err != nil {
@@ -262,11 +264,11 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 				Level:       "error",
 				Message:     "Owner not found",
 			},
-			AdminID:      ownerID.String(),
-			Action:       "change_owner_phone",
-			Status:       "failed",
-			ErrorCode:    "OWNER_NOT_FOUND",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   ownerID.String(),
+			Action:    "change_owner_phone",
+			Status:    "failed",
+			ErrorCode: "OWNER_NOT_FOUND",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("owner not found in system")
 	}
@@ -283,11 +285,11 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 				Level:       "warning",
 				Message:     "Unauthorized phone change attempt",
 			},
-			AdminID:      ownerID.String(),
-			Action:       "change_owner_phone",
-			Status:       "failed",
-			ErrorCode:    "UNAUTHORIZED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   ownerID.String(),
+			Action:    "change_owner_phone",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("unauthorized: only owner can change phone")
 	}
@@ -311,11 +313,11 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 				Level:       "warning",
 				Message:     "Phone already used by another admin",
 			},
-			AdminID:      ownerID.String(),
-			Action:       "change_owner_phone",
-			Status:       "failed",
-			ErrorCode:    "PHONE_ALREADY_USED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   ownerID.String(),
+			Action:    "change_owner_phone",
+			Status:    "failed",
+			ErrorCode: "PHONE_ALREADY_USED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("phone number is already used by another admin")
 	}
@@ -382,11 +384,11 @@ func (s *AdminService) ChangeOwnerPhone(ctx context.Context, ownerID uuid.UUID, 
 			Level:       "info",
 			Message:     "Owner phone updated successfully",
 		},
-		AdminID:    ownerID.String(),
-		AdminRole:  models.AdminRoleLevelOwner,
-		Action:     "change_owner_phone",
-		Status:     "success",
-		Duration:   int64(time.Since(startTime).Milliseconds()),
+		AdminID:   ownerID.String(),
+		AdminRole: models.AdminRoleLevelOwner,
+		Action:    "change_owner_phone",
+		Status:    "success",
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	return nil
@@ -431,11 +433,11 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
 				Level:       "warning",
 				Message:     "Requester is not active",
 			},
-			AdminID:      requesterID.String(),
-			Action:       "invite_admin",
-			Status:       "failed",
-			ErrorCode:    "REQUESTER_INACTIVE",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   requesterID.String(),
+			Action:    "invite_admin",
+			Status:    "failed",
+			ErrorCode: "REQUESTER_INACTIVE",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("requester is not active")
 	}
@@ -452,11 +454,11 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
 				Level:       "warning",
 				Message:     "Employee cannot invite admins",
 			},
-			AdminID:      requesterID.String(),
-			Action:       "invite_admin",
-			Status:       "failed",
-			ErrorCode:    "UNAUTHORIZED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   requesterID.String(),
+			Action:    "invite_admin",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("employees cannot invite admins")
 	}
@@ -473,11 +475,11 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
 				Level:       "warning",
 				Message:     "Super employee can only invite as employee",
 			},
-			AdminID:      requesterID.String(),
-			Action:       "invite_admin",
-			Status:       "failed",
-			ErrorCode:    "UNAUTHORIZED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   requesterID.String(),
+			Action:    "invite_admin",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("super employees can only invite as employee")
 	}
@@ -497,11 +499,11 @@ func (s *AdminService) InviteAdmin(ctx context.Context, phone string, roleLevel 
 				Level:       "warning",
 				Message:     "Phone already an admin",
 			},
-			AdminID:      requesterID.String(),
-			Action:       "invite_admin",
-			Status:       "failed",
-			ErrorCode:    "PHONE_ALREADY_ADMIN",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   requesterID.String(),
+			Action:    "invite_admin",
+			Status:    "failed",
+			ErrorCode: "PHONE_ALREADY_ADMIN",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("phone number is already an admin")
 	}
@@ -647,11 +649,11 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
 				Level:       "warning",
 				Message:     "Admin account deactivated",
 			},
-			AdminID:      admin.AdminID.String(),
-			Action:       "authenticate_admin",
-			Status:       "failed",
-			ErrorCode:    "ACCOUNT_DEACTIVATED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   admin.AdminID.String(),
+			Action:    "authenticate_admin",
+			Status:    "failed",
+			ErrorCode: "ACCOUNT_DEACTIVATED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("admin account is deactivated")
 	}
@@ -675,11 +677,11 @@ func (s *AdminService) AuthenticateAdmin(ctx context.Context, phone string) (*mo
 			Level:       "info",
 			Message:     "Admin authenticated successfully",
 		},
-		AdminID:    admin.AdminID.String(),
-		AdminRole:  admin.AdminRoleLevel,
-		Action:     "authenticate_admin",
-		Status:     "success",
-		Duration:   int64(time.Since(startTime).Milliseconds()),
+		AdminID:   admin.AdminID.String(),
+		AdminRole: admin.AdminRoleLevel,
+		Action:    "authenticate_admin",
+		Status:    "success",
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	return admin, nil
@@ -745,11 +747,11 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
 			Level:       "info",
 			Message:     "Admin authenticated with session successfully",
 		},
-		AdminID:    admin.AdminID.String(),
-		AdminRole:  admin.AdminRoleLevel,
-		Action:     "authenticate_admin_with_session",
-		Status:     "success",
-		Duration:   int64(time.Since(startTime).Milliseconds()),
+		AdminID:   admin.AdminID.String(),
+		AdminRole: admin.AdminRoleLevel,
+		Action:    "authenticate_admin_with_session",
+		Status:    "success",
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	return admin, session.SessionToken, nil
@@ -817,11 +819,11 @@ func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newR
 				Level:       "warning",
 				Message:     "Unauthorized promotion attempt",
 			},
-			AdminID:      promotedBy.String(),
-			Action:       "promote_admin",
-			Status:       "failed",
-			ErrorCode:    "UNAUTHORIZED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   promotedBy.String(),
+			Action:    "promote_admin",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("unauthorized: cannot promote to %s role", newRole)
 	}
@@ -963,11 +965,11 @@ func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, remov
 				Level:       "warning",
 				Message:     "Unauthorized removal attempt",
 			},
-			AdminID:      removedBy.String(),
-			Action:       "remove_admin",
-			Status:       "failed",
-			ErrorCode:    "UNAUTHORIZED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   removedBy.String(),
+			Action:    "remove_admin",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("unauthorized: cannot remove admin with role %s", admin.AdminRoleLevel)
 	}
@@ -984,11 +986,11 @@ func (s *AdminService) RemoveAdmin(ctx context.Context, adminID uuid.UUID, remov
 				Level:       "warning",
 				Message:     "Cannot remove owner admin",
 			},
-			AdminID:      removedBy.String(),
-			Action:       "remove_admin",
-			Status:       "failed",
-			ErrorCode:    "CANNOT_REMOVE_OWNER",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   removedBy.String(),
+			Action:    "remove_admin",
+			Status:    "failed",
+			ErrorCode: "CANNOT_REMOVE_OWNER",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("cannot remove owner admin")
 	}
@@ -1078,11 +1080,11 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
 				Level:       "warning",
 				Message:     "Admin already inactive",
 			},
-			AdminID:      deactivatedBy.String(),
-			Action:       "deactivate_admin",
-			Status:       "failed",
-			ErrorCode:    "ALREADY_INACTIVE",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   deactivatedBy.String(),
+			Action:    "deactivate_admin",
+			Status:    "failed",
+			ErrorCode: "ALREADY_INACTIVE",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("admin is already inactive")
 	}
@@ -1099,11 +1101,11 @@ func (s *AdminService) DeactivateAdmin(ctx context.Context, adminID uuid.UUID, d
 				Level:       "warning",
 				Message:     "Cannot deactivate owner admin",
 			},
-			AdminID:      deactivatedBy.String(),
-			Action:       "deactivate_admin",
-			Status:       "failed",
-			ErrorCode:    "CANNOT_DEACTIVATE_OWNER",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   deactivatedBy.String(),
+			Action:    "deactivate_admin",
+			Status:    "failed",
+			ErrorCode: "CANNOT_DEACTIVATE_OWNER",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("cannot deactivate owner admin")
 	}
@@ -1193,11 +1195,11 @@ func (s *AdminService) ActivateAdmin(ctx context.Context, adminID uuid.UUID, act
 				Level:       "warning",
 				Message:     "Admin already active",
 			},
-			AdminID:      activatedBy.String(),
-			Action:       "activate_admin",
-			Status:       "failed",
-			ErrorCode:    "ALREADY_ACTIVE",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   activatedBy.String(),
+			Action:    "activate_admin",
+			Status:    "failed",
+			ErrorCode: "ALREADY_ACTIVE",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("admin is already active")
 	}
@@ -1325,11 +1327,11 @@ func (s *AdminService) UpdateAdminPermissions(ctx context.Context, adminID uuid.
 				Level:       "warning",
 				Message:     "Unauthorized permission update attempt",
 			},
-			AdminID:      updatedBy.String(),
-			Action:       "update_admin_permissions",
-			Status:       "failed",
-			ErrorCode:    "UNAUTHORIZED",
-			Duration:     int64(time.Since(startTime).Milliseconds()),
+			AdminID:   updatedBy.String(),
+			Action:    "update_admin_permissions",
+			Status:    "failed",
+			ErrorCode: "UNAUTHORIZED",
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return fmt.Errorf("unauthorized: cannot update permissions for %s role", admin.AdminRoleLevel)
 	}
@@ -1424,10 +1426,10 @@ func (s *AdminService) RecordAdminLogin(ctx context.Context, adminID uuid.UUID) 
 			Level:       "info",
 			Message:     "Admin login recorded successfully",
 		},
-		AdminID:    adminID.String(),
-		Action:     "record_admin_login",
-		Status:     "success",
-		Duration:   int64(time.Since(startTime).Milliseconds()),
+		AdminID:  adminID.String(),
+		Action:   "record_admin_login",
+		Status:   "success",
+		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
 	// ✅ FIXED: Use correct method name
@@ -1508,10 +1510,10 @@ func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID)
 					Level:       "warning",
 					Message:     "Admin locked out due to failed attempts",
 				},
-				AdminID:    adminID.String(),
-				Action:     "admin_lockout",
-				Status:     "success",
-				Duration:   int64(time.Since(startTime).Milliseconds()),
+				AdminID:  adminID.String(),
+				Action:   "admin_lockout",
+				Status:   "success",
+				Duration: int64(time.Since(startTime).Milliseconds()),
 			})
 		}
 	}
@@ -1527,10 +1529,10 @@ func (s *AdminService) RecordFailedLogin(ctx context.Context, adminID uuid.UUID)
 			Level:       "warning",
 			Message:     "Admin failed login attempt",
 		},
-		AdminID:    adminID.String(),
-		Action:     "failed_login_attempt",
-		Status:     "success",
-		Duration:   int64(time.Since(startTime).Milliseconds()),
+		AdminID:  adminID.String(),
+		Action:   "failed_login_attempt",
+		Status:   "success",
+		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
 
 	return shouldLockout, attempts, nil
@@ -1605,20 +1607,21 @@ func (s *AdminService) HealthCheck(ctx context.Context) error {
 func (s *AdminService) GetStats(ctx context.Context) (map[string]interface{}, error) {
 	return s.adminRepo.GetRepositoryStats(ctx)
 }
+
 // Add this method to AdminService
 func (s *AdminService) GetInactiveAdmins(ctx context.Context, limit int) ([]*models.AdminUser, error) {
-    // Get all admins and filter inactive ones
-    allAdmins, err := s.adminRepo.GetAllAdmins(ctx, limit)
-    if err != nil {
-        return nil, err
-    }
-    
-    var inactiveAdmins []*models.AdminUser
-    for _, admin := range allAdmins {
-        if !admin.IsActive {
-            inactiveAdmins = append(inactiveAdmins, admin)
-        }
-    }
-    
-    return inactiveAdmins, nil
+	// Get all admins and filter inactive ones
+	allAdmins, err := s.adminRepo.GetAllAdmins(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var inactiveAdmins []*models.AdminUser
+	for _, admin := range allAdmins {
+		if !admin.IsActive {
+			inactiveAdmins = append(inactiveAdmins, admin)
+		}
+	}
+
+	return inactiveAdmins, nil
 }

@@ -1,38 +1,48 @@
 USE core_auth;
 
+-- =========================================================
+-- INDEXES AND ADMIN ROLES
+-- =========================================================
+
+-- ===============================
 -- MPIN INDEXES
+-- ===============================
 CREATE INDEX IF NOT EXISTS idx_mpin_locked ON mpin_credentials (is_locked);
 CREATE INDEX IF NOT EXISTS idx_mpin_device ON mpin_credentials (device_id);
 
+-- ===============================
 -- ADMIN ROLES TABLE
+-- ===============================
 CREATE TABLE IF NOT EXISTS admin_roles (
     role_level text PRIMARY KEY,
     role_name text,
     permissions set<text>,
     mfa_required boolean
-);
+) WITH comment = 'Static admin role definitions for Scylla-based RBAC control.';
 
--- INSERT INITIAL ROLES
+-- ===============================
+-- INITIAL ROLE SEED DATA
+-- ===============================
 INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
-('owner', 'System Owner', {'manage_employees','manage_super_employees','ban_employees','ban_users','system_config'}, true);
-
-INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
-('super_employee', 'Supervisor', {'manage_employees','ban_users','verify_kyc'}, true);
-
-INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
-('employee', 'Support Agent', {'verify_kyc','ban_users'}, true);
+('owner', 'System Owner', {'manage_admins','system_config','manage_security','view_audit_logs'}, true);
 
 INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
-('support', 'Read Only Support', {'view_user_data'}, false);
+('super_admin', 'Super Administrator', {'manage_admins','view_audit_logs','manage_trust','ban_users'}, true);
 
--- Create secondary indexes for admin queries
+INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
+('moderator', 'Moderator', {'verify_kyc','ban_users','manage_sessions'}, true);
+
+INSERT INTO admin_roles (role_level, role_name, permissions, mfa_required) VALUES 
+('support', 'Support Staff', {'view_user_data','view_sessions'}, false);
+
+-- ===============================
+-- SECONDARY INDEXES FOR ADMIN QUERIES
+-- ===============================
 CREATE INDEX IF NOT EXISTS admin_users_role_level_idx ON admin_users (admin_role_level);
 CREATE INDEX IF NOT EXISTS admin_users_phone_hash_idx ON admin_users (phone_hash);
 CREATE INDEX IF NOT EXISTS admin_users_is_active_idx ON admin_users (is_active);
-CREATE INDEX IF NOT EXISTS idx_pepper_store_is_active 
-ON pepper_store(is_active);
 
--- Create individual indexes instead (Scylla only allows one column per index)
-CREATE INDEX IF NOT EXISTS companies_is_active_idx ON companies (is_active);
-CREATE INDEX IF NOT EXISTS companies_is_blocked_idx ON companies (is_blocked);
-CREATE INDEX IF NOT EXISTS companies_subscription_end_date_idx ON companies (subscription_end_date);
+-- ===============================
+-- PEPPER STORE INDEX
+-- ===============================
+CREATE INDEX IF NOT EXISTS idx_pepper_store_is_active ON pepper_store (is_active);
