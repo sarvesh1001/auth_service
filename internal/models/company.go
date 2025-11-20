@@ -106,16 +106,6 @@ type Company struct {
 // PERMISSIONS
 // =========================================================
 
-type Permission struct {
-	PermissionID   uuid.UUID `db:"permission_id" json:"permission_id"`
-	PermissionName string    `db:"permission_name" json:"permission_name"`
-	Description    string    `db:"description" json:"description"`
-	Category       string    `db:"category" json:"category"`
-	Module         string    `db:"module" json:"module"`
-	RequiresTier   string    `db:"requires_tier" json:"requires_tier"`
-	CreatedAt      time.Time `db:"created_at" json:"created_at"`
-}
-
 // =========================================================
 // ROLES
 // =========================================================
@@ -265,3 +255,43 @@ const (
 	DataRegionEU = "eu"
 	DataRegionAS = "as"
 )
+
+type Permission struct {
+	PermissionID   uuid.UUID `json:"permission_id" db:"permission_id"`
+	PermissionName string    `json:"permission_name" db:"permission_name"`
+	Description    string    `json:"description" db:"description"`
+	Category       string    `json:"category" db:"category"`
+	Module         string    `json:"module" db:"module"`
+	RequiresTier   string    `json:"requires_tier" db:"requires_tier"`
+	BitIndex       int       `json:"bit_index" db:"bit_index"` // 🔵 NEW
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+}
+
+type PermissionWithBitIndex struct {
+	ID       string `json:"id" db:"permission_id"`
+	Name     string `json:"name" db:"permission_name"`
+	BitIndex int    `json:"bit_index" db:"bit_index"`
+	Module   string `json:"module" db:"module"`
+	Category string `json:"category" db:"category"`
+}
+
+// Role bitmask information
+type RoleBitmaskInfo struct {
+	RoleID          uuid.UUID `json:"role_id"`
+	PermissionMask  []uint64  `json:"permission_mask"`
+	Permissions     []string  `json:"permissions"`
+	PermissionCount int       `json:"permission_count"`
+	BitmaskSize     int       `json:"bitmask_size"`
+}
+
+// User permission summary
+type UserPermissionSummary struct {
+	UserID           uuid.UUID `json:"user_id"`
+	CompanyID        uuid.UUID `json:"company_id"`
+	PermissionMask   []uint64  `json:"permission_mask"`
+	Permissions      []string  `json:"permissions"`
+	TotalPermissions int       `json:"total_permissions"`
+	IsOwner          bool      `json:"is_owner"`
+	RoleName         string    `json:"role_name"`
+	RoleLevel        int       `json:"role_level"`
+}

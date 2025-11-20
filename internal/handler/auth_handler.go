@@ -110,7 +110,7 @@ func (h *AuthHandler) RegisterProtectedRoutes(r chi.Router) {
 	r.Route("/companies", func(r chi.Router) {
 		r.Get("/{companyID}", h.GetCompany)
 		r.Get("/{companyID}/employees", h.ListEmployees)
-		r.Post("/{companyID}/employees", h.AddEmployee)
+		// r.Post("/{companyID}/employees", h.AddEmployee)
 		r.Delete("/{companyID}/employees/{userID}", h.RemoveEmployee)
 		r.Get("/context", h.GetCompanyContext)
 		r.Post("/{companyID}/employees/{userID}/role", h.UpdateEmployeeRole)
@@ -149,68 +149,6 @@ func (h *AuthHandler) RegisterRoutes(router chi.Router) {
 // ============================================
 // PHASE 2 - OWNER OPERATIONS
 // ============================================
-
-// RenameDepartment renames a department (Owner only)
-func (h *AuthHandler) RenameDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	departmentIDStr := chi.URLParam(r, "departmentID")
-	departmentID, err := uuid.Parse(departmentIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
-		return
-	}
-
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
-
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
-
-	var req struct {
-		DepartmentName string `json:"department_name" validate:"required"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Sanitize input
-	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
-
-	if err := h.companyService.RenameDepartment(ctx, companyID, departmentID, req.DepartmentName, userIDParsed); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to rename department")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department renamed successfully"))
-
-	h.logger.Info("Department renamed",
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("new_name", req.DepartmentName),
-		util.String("updated_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
 
 // AddDepartment adds a new department (Owner only)
 func (h *AuthHandler) AddDepartment(w http.ResponseWriter, r *http.Request) {
@@ -252,7 +190,20 @@ func (h *AuthHandler) AddDepartment(w http.ResponseWriter, r *http.Request) {
 	// Sanitize input
 	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
 
-	department, err := h.companyService.AddDepartment(ctx, companyID, req.DepartmentName, req.SystemDepartmentID, userIDParsed)
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add departments"),
+			"Insufficient permissions")
+		return
+	}
+
+	department, err := h.companyService.AddDepartment(ctx, companyID, req.DepartmentName, req.SystemDepartmentID)
 	if err != nil {
 		statusCode := h.getStatusCode(err)
 		h.respondWithError(w, statusCode, err, "Failed to add department")
@@ -309,7 +260,26 @@ func (h *AuthHandler) AddManager(w http.ResponseWriter, r *http.Request) {
 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
 	req.RoleName = util.SanitizeInput(req.RoleName)
 
-	if err := h.companyService.AddManager(ctx, &req, userIDParsed); err != nil {
+	// Check permissions using bitmask
+	hasCreatePermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.create")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	hasAdminAccess, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+
+	if !hasCreatePermission || !hasAdminAccess {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add managers"),
+			"Insufficient permissions")
+		return
+	}
+
+	if err := h.companyService.AddManager(ctx, &req); err != nil {
 		statusCode := h.getStatusCode(err)
 		h.respondWithError(w, statusCode, err, "Failed to add manager")
 		return
@@ -367,6 +337,19 @@ func (h *AuthHandler) AssignManagerPermissions(w http.ResponseWriter, r *http.Re
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.permission.assign")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to assign permissions"),
+			"Insufficient permissions")
 		return
 	}
 
@@ -429,6 +412,19 @@ func (h *AuthHandler) RevokeManagerPermissions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.permission.revoke")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to revoke permissions"),
+			"Insufficient permissions")
+		return
+	}
+
 	if err := h.companyService.RevokeManagerPermissions(ctx, companyID, managerID, req.Permissions, userIDParsed); err != nil {
 		statusCode := h.getStatusCode(err)
 		h.respondWithError(w, statusCode, err, "Failed to revoke manager permissions")
@@ -448,86 +444,86 @@ func (h *AuthHandler) RevokeManagerPermissions(w http.ResponseWriter, r *http.Re
 // ============================================
 // UPDATED EMPLOYEE MANAGEMENT FOR PHASE 2 & 3
 // ============================================
-// AddEmployee handles employee addition by both Owner and Manager
-func (h *AuthHandler) AddEmployee(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
+// // AddEmployee handles employee addition by both Owner and Manager
+// func (h *AuthHandler) AddEmployee(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	// Get user ID from JWT context (the user adding the employee)
-	addedBy := r.Context().Value("user_id")
-	if addedBy == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
+// 	companyIDStr := chi.URLParam(r, "companyID")
+// 	companyID, err := uuid.Parse(companyIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+// 		return
+// 	}
 
-	addedByID, err := uuid.Parse(addedBy.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
+// 	// Get user ID from JWT context (the user adding the employee)
+// 	addedBy := r.Context().Value("user_id")
+// 	if addedBy == nil {
+// 		h.respondWithError(w, http.StatusUnauthorized,
+// 			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+// 			"Authentication required")
+// 		return
+// 	}
 
-	var req service.AddEmployeeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	addedByID, err := uuid.Parse(addedBy.(string))
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+// 		return
+// 	}
 
-	req.CompanyID = companyID
+// 	var req service.AddEmployeeRequest
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	// Sanitize inputs
-	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
-	req.EmployeeID = util.SanitizeInput(req.EmployeeID)
+// 	req.CompanyID = companyID
 
-	// Check if the user adding the employee is a manager
-	employee, err := h.companyService.GetEmployee(ctx, companyID, addedByID)
-	if err != nil {
-		h.respondWithError(w, http.StatusForbidden, err, "User is not an employee of the company")
-		return
-	}
+// 	// Sanitize inputs
+// 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+// 	req.EmployeeID = util.SanitizeInput(req.EmployeeID)
 
-	role, err := h.companyService.GetRole(ctx, employee.RoleID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user role")
-		return
-	}
+// 	// Check if the user adding the employee is a manager
+// 	employee, err := h.companyService.GetEmployee(ctx, companyID, addedByID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusForbidden, err, "User is not an employee of the company")
+// 		return
+// 	}
 
-	var addErr error
+// 	role, err := h.companyService.GetRole(ctx, employee.RoleID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user role")
+// 		return
+// 	}
 
-	// If user is manager (role level <= 200), use ManagerAddEmployee
-	if role.RoleLevel <= 200 && role.RoleLevel > 0 {
-		addErr = h.companyService.ManagerAddEmployee(ctx, &req, addedByID)
-	} else {
-		// Owner or higher role - use regular AddEmployee
-		req.AddedBy = addedByID
-		addErr = h.companyService.AddEmployee(ctx, &req, addedByID)
-	}
+// 	var addErr error
 
-	if addErr != nil {
-		statusCode := h.getStatusCode(addErr)
-		h.respondWithError(w, statusCode, addErr, "Failed to add employee")
-		return
-	}
+// 	// If user is manager (role level <= 200), use ManagerAddEmployee
+// 	if role.RoleLevel <= 200 && role.RoleLevel > 0 {
+// 		addErr = h.companyService.ManagerAddEmployee(ctx, &req, addedByID)
+// 	} else {
+// 		// Owner or higher role - use regular AddEmployee
+// 		addErr = h.companyService.AddEmployee(ctx, &req)
+// 	}
 
-	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Employee added successfully"))
+// 	if addErr != nil {
+// 		statusCode := h.getStatusCode(addErr)
+// 		h.respondWithError(w, statusCode, addErr, "Failed to add employee")
+// 		return
+// 	}
 
-	h.logger.Info("Employee added to company",
-		util.String("company_id", companyID.String()),
-		util.String("added_by", addedByID.String()),
-		util.String("phone", req.PhoneNumber),
-		util.String("employee_id", req.EmployeeID),
-		util.String("role_id", req.RoleID.String()),
-		util.String("department_id", req.DepartmentID.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
+// 	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Employee added successfully"))
+
+// 	h.logger.Info("Employee added to company",
+// 		util.String("company_id", companyID.String()),
+// 		util.String("added_by", addedByID.String()),
+// 		util.String("phone", req.PhoneNumber),
+// 		util.String("employee_id", req.EmployeeID),
+// 		util.String("role_id", req.RoleID.String()),
+// 		util.String("department_id", req.DepartmentID.String()),
+// 		util.Duration("duration", time.Since(startTime)))
+// }
 
 // ============================================
 // AUTHENTICATION FLOW METHODS
@@ -1012,6 +1008,19 @@ func (h *AuthHandler) RemoveEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.terminate")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to remove employees"),
+			"Insufficient permissions")
+		return
+	}
+
 	if err := h.companyService.RemoveEmployee(ctx, companyID, userID, removedByID); err != nil {
 		statusCode := h.getStatusCode(err)
 		h.respondWithError(w, statusCode, err, "Failed to remove employee")
@@ -1068,6 +1077,19 @@ func (h *AuthHandler) UpdateEmployeeRole(w http.ResponseWriter, r *http.Request)
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.update")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to update employee roles"),
+			"Insufficient permissions")
 		return
 	}
 
@@ -1128,6 +1150,19 @@ func (h *AuthHandler) UpdateEmployeeDepartment(w http.ResponseWriter, r *http.Re
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.update")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to update employee departments"),
+			"Insufficient permissions")
 		return
 	}
 
@@ -1701,4 +1736,80 @@ func (h *AuthHandler) sanitizeUser(user *models.User) {
 	user.PhoneEncrypted = nil
 	user.PhoneKeyID = uuid.Nil
 	user.PhoneEncryptedDEK = ""
+}
+
+// RenameDepartment renames a department (Owner only)
+func (h *AuthHandler) RenameDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	// Get user ID from JWT context
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req struct {
+		DepartmentName string `json:"department_name" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Sanitize input
+	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
+
+	// Check permission using bitmask - MAKE SURE THIS PERMISSION MATCHES
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "administrative.department.update")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to rename departments"),
+			"Insufficient permissions")
+		return
+	}
+
+	// 🔥 CRITICAL: Make sure this calls RenameDepartment, NOT UpdateDepartment
+	if err := h.companyService.RenameDepartment(ctx, companyID, departmentID, req.DepartmentName); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to rename department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department renamed successfully"))
+
+	h.logger.Info("Department renamed",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.String("new_name", req.DepartmentName),
+		util.String("updated_by", userIDParsed.String()),
+		util.Duration("duration", time.Since(startTime)))
 }

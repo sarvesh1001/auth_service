@@ -19,29 +19,31 @@ func parseBearerToken(r *http.Request, logger *zap.Logger) (string, bool) {
 		return "", false
 	}
 
-	// Split on whitespace to tolerate multiple spaces or extra data
+	// Split on whitespace
 	fields := strings.Fields(authHeader)
 	if len(fields) < 2 || !strings.EqualFold(fields[0], "Bearer") {
 		logger.Warn("Invalid Authorization header format", zap.String("header", authHeader))
 		return "", false
 	}
 
-	// Join all remaining fields (handles accidental spaces inside token)
 	tokenStr := strings.Join(fields[1:], " ")
-
-	// Trim quotes and spaces
 	tokenStr = strings.TrimSpace(strings.Trim(tokenStr, `"`))
 
-	// Structural validation: JWT should contain exactly 2 dots
+	// Structural validation: JWT must have exactly 2 dots
 	if strings.Count(tokenStr, ".") != 2 {
-		logger.Warn("Malformed JWT token", zap.Int("dot_count", strings.Count(tokenStr, ".")), zap.Int("len", len(tokenStr)))
+		logger.Warn("Malformed JWT token", zap.Int("dot_count", strings.Count(tokenStr, ".")))
 		return "", false
 	}
 
 	return tokenStr, true
 }
 
-// JWTAuthMiddleware validates JWT access tokens (stateless, no Redis lookup)
+// ============================================================================
+//                            MAIN JWT MIDDLEWARE
+// ============================================================================
+// internal/middleware/jwt_auth.go
+// internal/middleware/jwt_auth.go
+
 func JWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +53,7 @@ func JWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(
 				return
 			}
 
-			// Validate JWT (stateless)
+			// Validate JWT
 			claims, err := jwtService.ValidateAccessToken(r.Context(), tokenStr)
 			if err != nil {
 				logger.Warn("JWT validation failed", util.ErrorField(err))
@@ -59,16 +61,27 @@ func JWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(
 				return
 			}
 
-			// Add claims to context
-			ctx := context.WithValue(r.Context(), "user_id", claims.UserID)
+			// Prepare context with all claims including permission mask
+			ctx := r.Context()
+
+			// Store as strings (already strings from JWT claims)
+			ctx = context.WithValue(ctx, "user_id", claims.UserID)
 			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
 			ctx = context.WithValue(ctx, "role", claims.Role)
 			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
+			ctx = context.WithValue(ctx, "company_id", claims.CompanyID) // This should be string
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
+			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
 
+			// Handle admin-specific claims
 			if claims.SessionType == "admin" {
 				ctx = context.WithValue(ctx, "admin_role_level", claims.AdminRoleLevel)
 				ctx = context.WithValue(ctx, "admin_permissions", claims.AdminPermissions)
+
+				// Ensure admin has full permission mask
+				if claims.PermissionMask == nil || len(claims.PermissionMask) == 0 {
+					ctx = context.WithValue(ctx, "permission_mask", buildFullAccessMask())
+				}
 			}
 
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -76,7 +89,19 @@ func JWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(
 	}
 }
 
-// UserAuthMiddleware validates JWT tokens and ensures user session type
+// Helper function for full access mask
+func buildFullAccessMask() []uint64 {
+	mask := make([]uint64, 4)
+	for i := range mask {
+		mask[i] = ^uint64(0)
+	}
+	return mask
+}
+
+// ============================================================================
+//                     USER-ONLY SESSION MIDDLEWARE
+// ============================================================================
+
 func UserAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +111,6 @@ func UserAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func
 				return
 			}
 
-			// Validate JWT
 			claims, err := jwtService.ValidateAccessToken(r.Context(), tokenStr)
 			if err != nil {
 				logger.Warn("JWT validation failed", util.ErrorField(err))
@@ -94,43 +118,34 @@ func UserAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func
 				return
 			}
 
-			// Ensure it's a user session (not admin)
+			// Only allow "user" session type
 			if claims.SessionType != "user" {
-				logger.Warn("Access denied: not a user session",
-					util.String("session_type", claims.SessionType),
-					util.String("user_id", claims.UserID),
-				)
 				util.JSONError(w, http.StatusForbidden, "access denied: user session required")
 				return
 			}
 
-			// Add claims to context
+			// Add to context
 			ctx := context.WithValue(r.Context(), "user_id", claims.UserID)
 			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
 			ctx = context.WithValue(ctx, "role", claims.Role)
 			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
 			ctx = context.WithValue(ctx, "jti", claims.JTI)
 
+			// Add permission mask
+			ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-// // internal/middleware/admin_jwt_middleware.go
-// package middleware
+// ============================================================================
+//
+//	ADMIN-ONLY SESSION MIDDLEWARE
+//
+// ============================================================================
+// internal/middleware/jwt_auth.go
 
-// import (
-//     "context"
-//     "net/http"
-//     "strings"
-
-//     "auth-service/internal/service"
-//     "auth-service/internal/util"
-
-//     "go.uber.org/zap"
-// )
-
-// AdminJWTAuthMiddleware validates JWT tokens and ensures admin session type
 func AdminJWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +155,6 @@ func AdminJWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) 
 				return
 			}
 
-			// Validate JWT
 			claims, err := jwtService.ValidateAccessToken(r.Context(), tokenStr)
 			if err != nil {
 				logger.Warn("JWT validation failed", util.ErrorField(err))
@@ -148,22 +162,23 @@ func AdminJWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) 
 				return
 			}
 
-			// Ensure it's an admin session
+			// Only admin allowed
 			if claims.SessionType != "admin" {
-				logger.Warn("Access denied: not an admin session",
-					util.String("session_type", claims.SessionType),
-					util.String("user_id", claims.UserID),
-				)
 				util.JSONError(w, http.StatusForbidden, "access denied: admin session required")
 				return
 			}
 
-			// Add claims to context
-			ctx := context.WithValue(r.Context(), "admin_id", claims.UserID)
-			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
-			ctx = context.WithValue(ctx, "role", claims.Role)
-			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
-			ctx = context.WithValue(ctx, "jti", claims.JTI)
+			ctx := context.WithValue(r.Context(), "admin_id", claims.UserID) // String
+			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)       // String
+			ctx = context.WithValue(ctx, "role", claims.Role)                // String
+			ctx = context.WithValue(ctx, "session_type", claims.SessionType) // String
+			ctx = context.WithValue(ctx, "jti", claims.JTI)                  // String
+			ctx = context.WithValue(ctx, "company_id", claims.CompanyID)     // String
+
+			// Full permission mask for admin
+			ctx = context.WithValue(ctx, "permission_mask", buildFullAccessMask())
+
+			// Admin-specific fields
 			ctx = context.WithValue(ctx, "admin_role_level", claims.AdminRoleLevel)
 			ctx = context.WithValue(ctx, "admin_permissions", claims.AdminPermissions)
 
@@ -172,19 +187,22 @@ func AdminJWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) 
 	}
 }
 
-// AdminRoleMiddleware validates specific admin role levels
+// ============================================================================
+//                      ADMIN ROLE-HIERARCHY CHECK
+// ============================================================================
+
 func AdminRoleMiddleware(requiredRole string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			adminRoleLevel, ok := r.Context().Value("admin_role_level").(string)
+
+			adminRole, ok := r.Context().Value("admin_role").(string)
 			if !ok {
-				util.JSONError(w, http.StatusForbidden, "admin role level not found")
+				util.JSONError(w, http.StatusForbidden, "admin role not found")
 				return
 			}
 
-			// Check role hierarchy
-			if !isRoleAuthorized(adminRoleLevel, requiredRole) {
-				util.JSONError(w, http.StatusForbidden, "insufficient privileges")
+			if !isRoleAuthorized(adminRole, requiredRole) {
+				util.JSONError(w, http.StatusForbidden, "insufficient admin privileges")
 				return
 			}
 
@@ -193,7 +211,6 @@ func AdminRoleMiddleware(requiredRole string) func(http.Handler) http.Handler {
 	}
 }
 
-// isRoleAuthorized checks if the user's role has sufficient privileges
 func isRoleAuthorized(userRole, requiredRole string) bool {
 	roleHierarchy := map[string]int{
 		"owner":          3,
@@ -201,10 +218,10 @@ func isRoleAuthorized(userRole, requiredRole string) bool {
 		"employee":       1,
 	}
 
-	userLevel, userOk := roleHierarchy[userRole]
-	requiredLevel, requiredOk := roleHierarchy[requiredRole]
+	userLevel, uok := roleHierarchy[userRole]
+	requiredLevel, rok := roleHierarchy[requiredRole]
 
-	if !userOk || !requiredOk {
+	if !uok || !rok {
 		return false
 	}
 

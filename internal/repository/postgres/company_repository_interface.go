@@ -1,9 +1,9 @@
+// internal/repository/postgres/company_repository.go
 package postgres
 
 import (
-	"context"
-
 	"auth-service/internal/models"
+	"context"
 
 	"github.com/google/uuid"
 )
@@ -13,8 +13,6 @@ type CompanyRepository interface {
 	// Company Operations
 	// ============================================================
 	CreateCompany(ctx context.Context, company *models.Company, additionalDepartments []string) error
-
-	// CreateCompany(ctx context.Context, company *models.Company) error
 	GetCompany(ctx context.Context, companyID uuid.UUID) (*models.Company, error)
 	GetCompaniesByOwner(ctx context.Context, ownerUserID uuid.UUID) ([]*models.Company, error)
 	UpdateCompany(ctx context.Context, company *models.Company) error
@@ -28,7 +26,7 @@ type CompanyRepository interface {
 	ListCompanies(ctx context.Context, limit, offset int) ([]*models.Company, int, error)
 	CheckCompanyExists(ctx context.Context, companyName string, ownerUserID uuid.UUID) (bool, error)
 	GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error)
-	// Add these methods to the CompanyRepository interface:
+
 	// Department operations
 	UpdateDepartmentName(ctx context.Context, departmentID uuid.UUID, newName string) error
 	GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error)
@@ -39,8 +37,10 @@ type CompanyRepository interface {
 
 	// Role operations
 	CreateRoleWithDetails(ctx context.Context, role *models.Role, departmentID uuid.UUID, permissionIDs []uuid.UUID, createdBy uuid.UUID) error
+
 	// Employee hierarchy
 	GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error)
+
 	// ============================================================
 	// System Department Operations
 	// ============================================================
@@ -126,12 +126,20 @@ type CompanyRepository interface {
 	UpdatePermission(ctx context.Context, permission *models.Permission) error
 	DeletePermission(ctx context.Context, permissionID uuid.UUID) error
 
+	// 🔵 BITMASK METHODS
+	GetUserPermissionBitmask(ctx context.Context, companyID, userID uuid.UUID) ([]uint64, error)
+	GetRolePermissionBitmask(ctx context.Context, roleID uuid.UUID) ([]uint64, error)
+	GetPermissionsWithBitIndex(ctx context.Context) ([]*models.PermissionWithBitIndex, error)
+	GetPermissionsByBitPositions(ctx context.Context, bitPositions []uint64) ([]*models.Permission, error)
+	GetPermissionBitIndexes(ctx context.Context, permissionNames []string) (map[string]uint64, error)
+
 	// ============================================================
 	// Analytics & Reporting
 	// ============================================================
 	GetCompanyStats(ctx context.Context, companyID uuid.UUID) (map[string]interface{}, error)
 	GetEmployeeRoleHierarchy(ctx context.Context, companyID uuid.UUID) ([]*EmployeeRoleHierarchy, error)
 	GetRoleDistribution(ctx context.Context, companyID uuid.UUID) (map[string]int, error)
+	GetPermissionsBySystemDepartments(ctx context.Context, systemDeptIDs []uuid.UUID, module, category, tier string) ([]*models.Permission, error)
 
 	// ============================================================
 	// Utility Methods
@@ -142,13 +150,3 @@ type CompanyRepository interface {
 }
 
 // EmployeeRoleHierarchy represents employee with role information
-type EmployeeRoleHierarchy struct {
-	EmployeeID   string    `json:"employee_id"`
-	UserID       uuid.UUID `json:"user_id"`
-	RoleName     string    `json:"role_name"`
-	RoleLevel    int       `json:"role_level"`
-	DepartmentID uuid.UUID `json:"department_id"`
-	Department   string    `json:"department"`
-	ReportsTo    uuid.UUID `json:"reports_to"`
-	IsActive     bool      `json:"is_active"`
-}

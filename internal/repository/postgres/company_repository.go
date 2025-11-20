@@ -1,9 +1,12 @@
+// internal/repository/postgres/company_repository_impl.go
 package postgres
 
 import (
 	"auth-service/internal/client"
 	"auth-service/internal/models"
+	"auth-service/internal/rbac"
 	"auth-service/internal/util"
+
 	"context"
 	"database/sql"
 	"fmt"
@@ -11,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgtype"
-
 	"github.com/google/uuid"
+	"github.com/jackc/pgtype"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 )
 
@@ -24,6 +27,18 @@ const (
 	DefaultCompanyPageSize = 100
 	CompanyStmtCacheSize   = 30
 )
+
+// EmployeeRoleHierarchy represents employee role hierarchy for reporting
+type EmployeeRoleHierarchy struct {
+	EmployeeID   string    `json:"employee_id"`
+	UserID       uuid.UUID `json:"user_id"`
+	RoleName     string    `json:"role_name"`
+	RoleLevel    int       `json:"role_level"`
+	DepartmentID uuid.UUID `json:"department_id"`
+	Department   string    `json:"department"`
+	ReportsTo    uuid.UUID `json:"reports_to"`
+	IsActive     bool      `json:"is_active"`
+}
 
 // CompanyRepositoryImpl handles PostgreSQL company and RBAC operations
 type CompanyRepositoryImpl struct {
@@ -53,95 +68,6 @@ func NewCompanyRepository(postgresClient *client.PostgresClient, logger *zap.Log
 
 	return repo
 }
-
-// ============================================================================
-// COMPANY OPERATIONS - UPDATED FOR NEW FLOW
-// ============================================================================
-
-// // CreateCompany creates a new company and automatically creates owner role
-// func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *models.Company) error {
-// 	tx, err := r.client.BeginTx(ctx, nil)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to begin transaction: %w", err)
-// 	}
-// 	defer tx.Rollback()
-
-// 	// 1. Insert company
-// 	companyQuery := `
-// 		INSERT INTO companies (
-// 			company_id, company_name, owner_user_id, subscription_tier,
-// 			subscription_status, max_employees, data_region, is_active,
-// 			created_at, updated_at, subscription_start_date, subscription_end_date
-// 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
-
-// 	_, err = tx.ExecContext(ctx, companyQuery,
-// 		company.CompanyID, company.CompanyName, company.OwnerUserID, company.SubscriptionTier,
-// 		company.SubscriptionStatus, company.MaxEmployees, company.DataRegion, company.IsActive,
-// 		company.CreatedAt, company.UpdatedAt, company.SubscriptionStartDate, company.SubscriptionEndDate,
-// 	)
-
-// 	if err != nil {
-// 		r.recordError()
-// 		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") ||
-// 			strings.Contains(err.Error(), "unique constraint") {
-// 			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
-// 		}
-// 		return fmt.Errorf("failed to create company: %w", err)
-// 	}
-
-// 	// 2. Create OWNER role for this company
-// 	ownerRoleID := uuid.New()
-// 	ownerRoleQuery := `
-// 		INSERT INTO roles (
-// 			role_id, role_name, role_level, company_id, is_system_role,
-// 			description, created_at, updated_at
-// 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-
-// 	_, err = tx.ExecContext(ctx, ownerRoleQuery,
-// 		ownerRoleID, "Owner", 1000, company.CompanyID, true,
-// 		"Company owner with full permissions", company.CreatedAt, company.UpdatedAt,
-// 	)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create owner role: %w", err)
-// 	}
-
-// 	// 3. Grant all permissions to owner role
-// 	grantPermissionsQuery := `
-// 		INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
-// 		SELECT $1, permission_id, $2, $3 FROM permissions
-// 		WHERE requires_tier <= $4` // Assuming requires_tier indicates permission level
-
-// 	_, err = tx.ExecContext(ctx, grantPermissionsQuery,
-// 		ownerRoleID, company.OwnerUserID, company.CreatedAt, 1000)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to grant permissions to owner role: %w", err)
-// 	}
-
-// 	// 4. Add owner as employee in company_employees
-// 	employeeQuery := `
-// 		INSERT INTO company_employees (
-// 			company_id, user_id, employee_id, role_id,
-// 			hire_date, is_active, created_at, updated_at
-// 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-
-// 	_, err = tx.ExecContext(ctx, employeeQuery,
-// 		company.CompanyID, company.OwnerUserID, uuid.New().String(), ownerRoleID,
-// 		company.CreatedAt, true, company.CreatedAt, company.UpdatedAt,
-// 	)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to add owner as employee: %w", err)
-// 	}
-
-// 	if err := tx.Commit(); err != nil {
-// 		return fmt.Errorf("failed to commit transaction: %w", err)
-// 	}
-
-// 	r.recordQuery()
-// 	r.logger.Debug("Company created successfully with owner setup",
-// 		util.String("company_id", company.CompanyID.String()),
-// 		util.String("company_name", company.CompanyName))
-// 	return nil
-// }
 
 // GetCompany retrieves a company by ID
 func (r *CompanyRepositoryImpl) GetCompany(ctx context.Context, companyID uuid.UUID) (*models.Company, error) {
@@ -573,7 +499,7 @@ func (r *CompanyRepositoryImpl) CheckCompanyExists(ctx context.Context, companyN
 }
 
 // ============================================================================
-// SYSTEM DEPARTMENT OPERATIONS - NEW
+// SYSTEM DEPARTMENT OPERATIONS
 // ============================================================================
 
 // GetSystemDepartments retrieves all global system departments
@@ -636,8 +562,32 @@ func (r *CompanyRepositoryImpl) GetSystemDepartmentByModule(ctx context.Context,
 	return &dept, nil
 }
 
+// GetSystemDepartment retrieves a specific system department by ID
+func (r *CompanyRepositoryImpl) GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error) {
+	query := `
+        SELECT system_department_id, name, module_code, description
+        FROM system_departments 
+        WHERE system_department_id = $1`
+
+	var dept models.SystemDepartment
+	err := r.client.QueryRow(ctx, query, systemDeptID).Scan(
+		&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("system department not found: %s", systemDeptID)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to get system department: %w", err)
+	}
+
+	r.recordQuery()
+	return &dept, nil
+}
+
 // ============================================================================
-// DEPARTMENT OPERATIONS - UPDATED FOR NEW FLOW
+// DEPARTMENT OPERATIONS
 // ============================================================================
 
 // CreateDepartment creates a new department linked to a system department
@@ -819,6 +769,25 @@ func (r *CompanyRepositoryImpl) UpdateDepartment(ctx context.Context, department
 	return nil
 }
 
+// UpdateDepartmentName updates a department's name
+func (r *CompanyRepositoryImpl) UpdateDepartmentName(ctx context.Context, departmentID uuid.UUID, newName string) error {
+	query := `UPDATE departments SET department_name = $1, updated_at = $2 WHERE department_id = $3`
+
+	result, err := r.client.Exec(ctx, query, newName, time.Now().UTC(), departmentID)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to update department name: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("department not found: %s", departmentID)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
 // DeactivateDepartment deactivates a department
 func (r *CompanyRepositoryImpl) DeactivateDepartment(ctx context.Context, departmentID uuid.UUID) error {
 	query := `UPDATE departments SET is_active = false, updated_at = $1 WHERE department_id = $2`
@@ -943,8 +912,41 @@ func (r *CompanyRepositoryImpl) GetDepartmentLoad(ctx context.Context, companyID
 	return departmentLoad, nil
 }
 
+// GetDepartmentBySystemID retrieves a department by company and system department ID
+func (r *CompanyRepositoryImpl) GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error) {
+	query := `
+        SELECT department_id, company_id, department_name, system_department_id,
+               is_active, created_at, updated_at
+        FROM departments 
+        WHERE company_id = $1 AND system_department_id = $2 AND is_active = true`
+
+	var department models.Department
+	var systemDeptID sql.NullString
+
+	err := r.client.QueryRow(ctx, query, companyID, systemDepartmentID).Scan(
+		&department.DepartmentID, &department.CompanyID, &department.DepartmentName,
+		&systemDeptID, &department.IsActive, &department.CreatedAt, &department.UpdatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("department not found for system department: %s", systemDepartmentID)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to get department by system ID: %w", err)
+	}
+
+	if systemDeptID.Valid {
+		systemID, _ := uuid.Parse(systemDeptID.String)
+		department.SystemDepartmentID = &systemID
+	}
+
+	r.recordQuery()
+	return &department, nil
+}
+
 // ============================================================================
-// ROLE-DEPARTMENT MAPPING OPERATIONS - NEW
+// ROLE-DEPARTMENT MAPPING OPERATIONS
 // ============================================================================
 
 // CreateRoleDepartment maps a role to a department
@@ -1038,7 +1040,7 @@ func (r *CompanyRepositoryImpl) GetRoleDepartments(ctx context.Context, roleID u
 }
 
 // ============================================================================
-// ROLE & PERMISSION OPERATIONS - UPDATED
+// ROLE & PERMISSION OPERATIONS
 // ============================================================================
 
 // CreateRole creates a new role and optionally maps to departments
@@ -1076,6 +1078,71 @@ func (r *CompanyRepositoryImpl) CreateRole(ctx context.Context, role *models.Rol
 			if err != nil {
 				return fmt.Errorf("failed to map role to department %s: %w", deptID, err)
 			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// CreateRoleWithDetails creates a role with department and permissions in one transaction
+func (r *CompanyRepositoryImpl) CreateRoleWithDetails(ctx context.Context, role *models.Role, departmentID uuid.UUID, permissionIDs []uuid.UUID, createdBy uuid.UUID) error {
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Create role
+	roleQuery := `
+        INSERT INTO roles (
+            role_id, role_name, role_level, company_id, is_system_role,
+            description, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
+	_, err = tx.ExecContext(ctx, roleQuery,
+		role.RoleID, role.RoleName, role.RoleLevel, role.CompanyID,
+		role.IsSystemRole, role.Description, role.CreatedAt, role.UpdatedAt,
+	)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to create role: %w", err)
+	}
+
+	// 2. Map role to department
+	roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
+	_, err = tx.ExecContext(ctx, roleDeptQuery, role.RoleID, departmentID)
+	if err != nil {
+		return fmt.Errorf("failed to map role to department: %w", err)
+	}
+
+	// 3. Grant permissions if provided
+	if len(permissionIDs) > 0 {
+		grantQuery := `
+            INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
+            VALUES `
+
+		values := []interface{}{}
+		valuePlaceholders := []string{}
+		grantedAt := time.Now().UTC()
+
+		for i, permID := range permissionIDs {
+			baseIndex := i * 4
+			valuePlaceholders = append(valuePlaceholders,
+				fmt.Sprintf("($%d, $%d, $%d, $%d)",
+					baseIndex+1, baseIndex+2, baseIndex+3, baseIndex+4))
+
+			values = append(values, role.RoleID, permID, createdBy, grantedAt)
+		}
+
+		grantQuery += strings.Join(valuePlaceholders, ", ")
+		_, err = tx.ExecContext(ctx, grantQuery, values...)
+		if err != nil {
+			return fmt.Errorf("failed to grant permissions to role: %w", err)
 		}
 	}
 
@@ -1524,7 +1591,7 @@ func (r *CompanyRepositoryImpl) InitializeDefaultPermissions(ctx context.Context
 }
 
 // ============================================================================
-// EMPLOYEE OPERATIONS - UPDATED
+// EMPLOYEE OPERATIONS
 // ============================================================================
 
 // CreateEmployee creates a new company employee with role and department validation
@@ -1614,59 +1681,75 @@ func (r *CompanyRepositoryImpl) GetEmployee(ctx context.Context, companyID, user
 	return &employee, nil
 }
 
-// // GetEmployeesByUser retrieves all company employees for a user
-// func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error) {
-// 	query := `
-// 		SELECT company_id, employee_id, role_id, department_id,
-// 			   hire_date, is_active, reports_to, created_at, updated_at
-// 		FROM company_employees
-// 		WHERE user_id = $1 AND is_active = true
-// 		ORDER BY hire_date DESC`
+// GetEmployeesByUser retrieves all company employees for a user
+func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error) {
+	query := `
+        SELECT company_id, employee_id, role_id, department_id,
+               hire_date, is_active, reports_to, created_at, updated_at
+        FROM company_employees 
+        WHERE user_id = $1 AND is_active = true
+        ORDER BY hire_date DESC`
 
-// 	rows, err := r.client.Query(ctx, query, userID)
-// 	if err != nil {
-// 		r.recordError()
-// 		return nil, fmt.Errorf("failed to query employees by user: %w", err)
-// 	}
-// 	defer rows.Close()
+	rows, err := r.client.Query(ctx, query, userID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query employees by user: %w", err)
+	}
+	defer rows.Close()
 
-// 	var employees []*models.CompanyEmployee
-// 	for rows.Next() {
-// 		var employee models.CompanyEmployee
-// 		var deptID, reportsTo sql.NullString
+	var employees []*models.CompanyEmployee
 
-// 		err := rows.Scan(
-// 			&employee.CompanyID, &employee.EmployeeID, &employee.RoleID,
-// 			&deptID, &employee.HireDate, &employee.IsActive, &reportsTo,
-// 			&employee.CreatedAt, &employee.UpdatedAt,
-// 		)
-// 		if err != nil {
-// 			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-// 			continue
-// 		}
+	for rows.Next() {
+		var employee models.CompanyEmployee
 
-// 		employee.UserID = userID
+		// pgx v4 UUID type
+		var deptID pgtype.UUID
+		var reportsTo pgtype.UUID
 
-// 		// Handle nullable UUIDs
-// 		if deptID.Valid {
-// 			departmentID, _ := uuid.Parse(deptID.String)
-// 			employee.DepartmentID = &departmentID
-// 		}
-// 		if reportsTo.Valid {
-// 			reportsToID, _ := uuid.Parse(reportsTo.String)
-// 			employee.ReportsTo = &reportsToID
-// 		}
+		err := rows.Scan(
+			&employee.CompanyID,
+			&employee.EmployeeID,
+			&employee.RoleID,
+			&deptID,
+			&employee.HireDate,
+			&employee.IsActive,
+			&reportsTo,
+			&employee.CreatedAt,
+			&employee.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
+			continue
+		}
 
-// 		employees = append(employees, &employee)
-// 	}
+		employee.UserID = userID
 
-// 	if err := rows.Err(); err != nil {
-// 		return nil, fmt.Errorf("error iterating employee rows: %w", err)
-// 	}
+		// Convert department_id if present
+		if deptID.Status == pgtype.Present {
+			u, _ := uuid.FromBytes(deptID.Bytes[:])
+			employee.DepartmentID = &u
+		}
 
-// 	r.recordQuery()
-// 	return employees, nil
-// }
+		// Convert reports_to if present
+		if reportsTo.Status == pgtype.Present {
+			u, _ := uuid.FromBytes(reportsTo.Bytes[:])
+			employee.ReportsTo = &u
+		}
+
+		employees = append(employees, &employee)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating employee rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("Employees by user retrieved",
+		util.String("user_id", userID.String()),
+		util.Int("employee_count", len(employees)))
+
+	return employees, nil
+}
 
 // UpdateEmployee updates employee information
 func (r *CompanyRepositoryImpl) UpdateEmployee(ctx context.Context, employee *models.CompanyEmployee) error {
@@ -2162,8 +2245,66 @@ func (r *CompanyRepositoryImpl) GetUsersByRoleLevel(ctx context.Context, company
 	return employees, nil
 }
 
+// GetEmployeeHierarchy retrieves employee hierarchy for a company
+func (r *CompanyRepositoryImpl) GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
+	query := `
+        SELECT ce.user_id, ce.employee_id, r.role_name, r.role_level,
+               d.department_id, d.department_name, ce.reports_to, ce.is_active
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        LEFT JOIN departments d ON ce.department_id = d.department_id
+        WHERE ce.company_id = $1 AND ce.is_active = true
+        ORDER BY r.role_level ASC, d.department_name, ce.employee_id`
+
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query employee hierarchy: %w", err)
+	}
+	defer rows.Close()
+
+	var hierarchy []*models.EmployeeHierarchy
+	for rows.Next() {
+		var item models.EmployeeHierarchy
+		var deptID, deptName, reportsTo sql.NullString
+
+		err := rows.Scan(
+			&item.UserID, &item.EmployeeID, &item.RoleName, &item.RoleLevel,
+			&deptID, &deptName, &reportsTo, &item.IsActive,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan hierarchy row", util.ErrorField(err))
+			continue
+		}
+
+		item.CompanyID = companyID
+
+		// Handle nullable fields
+		if deptID.Valid {
+			departmentID, _ := uuid.Parse(deptID.String)
+			item.DepartmentID = &departmentID
+		}
+		if deptName.Valid {
+			item.Department = deptName.String
+		}
+		if reportsTo.Valid {
+			reportsToID, _ := uuid.Parse(reportsTo.String)
+			item.ReportsTo = &reportsToID
+		}
+
+		hierarchy = append(hierarchy, &item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating hierarchy rows: %w", err)
+	}
+
+	r.recordQuery()
+	return hierarchy, nil
+}
+
 // ============================================================================
-// PERMISSION & RBAC QUERIES - UPDATED
+// PERMISSION & RBAC QUERIES
 // ============================================================================
 
 // GetAllPermissions retrieves all permissions
@@ -2279,6 +2420,93 @@ func (r *CompanyRepositoryImpl) GetPermissionsByModule(ctx context.Context, modu
 
 	r.recordQuery()
 	return permissions, nil
+}
+
+// GetPermissionsByNames retrieves permissions by their names
+func (r *CompanyRepositoryImpl) GetPermissionsByNames(ctx context.Context, permissionNames []string) ([]*models.Permission, error) {
+	if len(permissionNames) == 0 {
+		return []*models.Permission{}, nil
+	}
+
+	// Create placeholders for the IN clause
+	placeholders := make([]string, len(permissionNames))
+	values := []interface{}{}
+
+	for i, name := range permissionNames {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		values = append(values, name)
+	}
+
+	query := fmt.Sprintf(`
+        SELECT permission_id, permission_name, description, category, module, requires_tier, created_at
+        FROM permissions 
+        WHERE permission_name IN (%s)`,
+		strings.Join(placeholders, ", "))
+
+	rows, err := r.client.Query(ctx, query, values...)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query permissions by names: %w", err)
+	}
+	defer rows.Close()
+
+	var permissions []*models.Permission
+	for rows.Next() {
+		var perm models.Permission
+		err := rows.Scan(
+			&perm.PermissionID, &perm.PermissionName, &perm.Description,
+			&perm.Category, &perm.Module, &perm.RequiresTier, &perm.CreatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
+			continue
+		}
+		permissions = append(permissions, &perm)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	r.recordQuery()
+	return permissions, nil
+}
+
+// GetUserPermissionNames retrieves permission names for a user
+func (r *CompanyRepositoryImpl) GetUserPermissionNames(ctx context.Context, userID uuid.UUID) ([]string, error) {
+	query := `
+        SELECT DISTINCT p.permission_name
+        FROM permissions p
+        INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+        INNER JOIN roles r ON rp.role_id = r.role_id
+        INNER JOIN company_employees ce ON r.role_id = ce.role_id
+        WHERE ce.user_id = $1 AND ce.is_active = true
+        ORDER BY p.permission_name`
+
+	rows, err := r.client.Query(ctx, query, userID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query user permission names: %w", err)
+	}
+	defer rows.Close()
+
+	var permissionNames []string
+	for rows.Next() {
+		var name string
+		err := rows.Scan(&name)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission name", util.ErrorField(err))
+			continue
+		}
+		permissionNames = append(permissionNames, name)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission name rows: %w", err)
+	}
+
+	r.recordQuery()
+	return permissionNames, nil
 }
 
 // CheckUserPermission checks if a user has a specific permission with module validation
@@ -2419,66 +2647,6 @@ func (r *CompanyRepositoryImpl) CheckUserPermissionDetailed(ctx context.Context,
 
 	result.HasPermission = permissionExists && roleDeptExists && moduleMatch
 	return result, nil
-}
-
-// GetUserPermissions retrieves all permissions for a user with module validation
-func (r *CompanyRepositoryImpl) GetUserPermissions(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Permission, error) {
-	// First check if user is company owner
-	var ownerUserID uuid.UUID
-	ownerQuery := `SELECT owner_user_id FROM companies WHERE company_id = $1`
-	err := r.client.QueryRow(ctx, ownerQuery, companyID).Scan(&ownerUserID)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to get company owner: %w", err)
-	}
-
-	// Owner gets all permissions
-	if ownerUserID == userID {
-		return r.GetAllPermissions(ctx)
-	}
-
-	// For non-owner, check permissions with module validation
-	query := `
-		SELECT DISTINCT p.permission_id, p.permission_name, p.description, 
-			   p.category, p.module, p.requires_tier, p.created_at
-		FROM permissions p
-		INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
-		INNER JOIN roles r ON rp.role_id = r.role_id
-		INNER JOIN company_employees ce ON r.role_id = ce.role_id
-		INNER JOIN role_departments rd ON r.role_id = rd.role_id AND ce.department_id = rd.department_id
-		INNER JOIN departments d ON ce.department_id = d.department_id
-		INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
-		WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
-		  AND p.module = sd.module_code  -- Module must match
-		ORDER BY p.category, p.permission_name`
-
-	rows, err := r.client.Query(ctx, query, companyID, userID)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query user permissions: %w", err)
-	}
-	defer rows.Close()
-
-	var permissions []*models.Permission
-	for rows.Next() {
-		var perm models.Permission
-		err := rows.Scan(
-			&perm.PermissionID, &perm.PermissionName, &perm.Description,
-			&perm.Category, &perm.Module, &perm.RequiresTier, &perm.CreatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
-			continue
-		}
-		permissions = append(permissions, &perm)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating permission rows: %w", err)
-	}
-
-	r.recordQuery()
-	return permissions, nil
 }
 
 // GetUsersWithPermission retrieves users with a specific permission
@@ -2689,6 +2857,196 @@ func (r *CompanyRepositoryImpl) DeletePermission(ctx context.Context, permission
 
 	r.recordQuery()
 	return nil
+}
+
+// GetRolePermissionBitmask retrieves permission bitmask for a role
+func (r *CompanyRepositoryImpl) GetRolePermissionBitmask(ctx context.Context, roleID uuid.UUID) ([]uint64, error) {
+	query := `
+        SELECT p.bit_index
+        FROM permissions p
+        INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+        WHERE rp.role_id = $1 AND p.bit_index IS NOT NULL`
+
+	rows, err := r.client.Query(ctx, query, roleID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query role permission bitmask: %w", err)
+	}
+	defer rows.Close()
+
+	var bitPositions []uint64
+	for rows.Next() {
+		var bitIndex int
+		err := rows.Scan(&bitIndex)
+		if err != nil {
+			r.logger.Warn("Failed to scan bit index", util.ErrorField(err))
+			continue
+		}
+		bitPositions = append(bitPositions, uint64(bitIndex))
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating role bitmask rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("Role permission bitmask retrieved",
+		util.String("role_id", roleID.String()),
+		util.Int("bit_count", len(bitPositions)))
+
+	return rbac.BuildMaskFromBitPositions(bitPositions), nil
+}
+
+// GetPermissionsWithBitIndex retrieves all permissions with their bit indexes
+func (r *CompanyRepositoryImpl) GetPermissionsWithBitIndex(ctx context.Context) ([]*models.PermissionWithBitIndex, error) {
+	query := `
+        SELECT permission_id, permission_name, bit_index, module, category
+        FROM permissions 
+        WHERE bit_index IS NOT NULL
+        ORDER BY bit_index`
+
+	rows, err := r.client.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query permissions with bit index: %w", err)
+	}
+	defer rows.Close()
+
+	var permissions []*models.PermissionWithBitIndex
+	for rows.Next() {
+		var perm models.PermissionWithBitIndex
+		err := rows.Scan(
+			&perm.ID, &perm.Name, &perm.BitIndex, &perm.Module, &perm.Category,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission with bit index", util.ErrorField(err))
+			continue
+		}
+		permissions = append(permissions, &perm)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("Permissions with bit index retrieved",
+		util.Int("permission_count", len(permissions)))
+
+	return permissions, nil
+}
+
+// GetPermissionsByBitPositions gets permissions by their bit positions
+func (r *CompanyRepositoryImpl) GetPermissionsByBitPositions(ctx context.Context, bitPositions []uint64) ([]*models.Permission, error) {
+	if len(bitPositions) == 0 {
+		return []*models.Permission{}, nil
+	}
+
+	// Convert bit positions to interface slice for query
+	args := make([]interface{}, len(bitPositions))
+	placeholders := make([]string, len(bitPositions))
+
+	for i, pos := range bitPositions {
+		args[i] = int(pos)
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	query := fmt.Sprintf(`
+        SELECT permission_id, permission_name, description, category, module, requires_tier, bit_index
+        FROM permissions 
+        WHERE bit_index IN (%s)
+        ORDER BY bit_index`, strings.Join(placeholders, ", "))
+
+	rows, err := r.client.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query permissions by bit positions: %w", err)
+	}
+	defer rows.Close()
+
+	var permissions []*models.Permission
+	for rows.Next() {
+		var perm models.Permission
+		var bitIndex sql.NullInt32
+
+		err := rows.Scan(
+			&perm.PermissionID, &perm.PermissionName, &perm.Description,
+			&perm.Category, &perm.Module, &perm.RequiresTier, &bitIndex,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission by bit position", util.ErrorField(err))
+			continue
+		}
+
+		if bitIndex.Valid {
+			perm.BitIndex = int(bitIndex.Int32)
+		}
+
+		permissions = append(permissions, &perm)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	r.recordQuery()
+	return permissions, nil
+}
+
+// GetPermissionBitIndexes returns a map of permission names to bit indexes
+func (r *CompanyRepositoryImpl) GetPermissionBitIndexes(ctx context.Context, permissionNames []string) (map[string]uint64, error) {
+	if len(permissionNames) == 0 {
+		return map[string]uint64{}, nil
+	}
+
+	args := make([]interface{}, len(permissionNames))
+	placeholders := make([]string, len(permissionNames))
+
+	for i, name := range permissionNames {
+		args[i] = name
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	query := fmt.Sprintf(`
+        SELECT permission_name, bit_index
+        FROM permissions 
+        WHERE permission_name IN (%s) AND bit_index IS NOT NULL`,
+		strings.Join(placeholders, ", "))
+
+	rows, err := r.client.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query permission bit indexes: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]uint64)
+	for rows.Next() {
+		var name string
+		var bitIndex int
+		err := rows.Scan(&name, &bitIndex)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission bit index", util.ErrorField(err))
+			continue
+		}
+		result[name] = uint64(bitIndex)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission bit index rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("Permission bit indexes retrieved",
+		util.Int("permission_count", len(result)))
+
+	return result, nil
+}
+
+// Helper method to build full access mask (all bits = 1)
+func (r *CompanyRepositoryImpl) buildFullAccessMask() []uint64 {
+	// We have 229 permissions, so we need 4 uint64s (229/64 = 3.57 -> 4)
+	mask := make([]uint64, 4)
+	for i := range mask {
+		mask[i] = ^uint64(0) // Set all bits to 1
+	}
+	return mask
 }
 
 // ============================================================================
@@ -2930,7 +3288,7 @@ func (r *CompanyRepositoryImpl) Close() error {
 // initializePreparedStatements initializes frequently used prepared statements
 func (r *CompanyRepositoryImpl) initializePreparedStatements(ctx context.Context) {
 	statements := map[string]string{
-		// Existing statements
+		// Company statements
 		"get_company": `
 			SELECT company_id, company_name, owner_user_id, subscription_tier,
 				   subscription_status, max_employees, data_region, is_active,
@@ -2942,7 +3300,33 @@ func (r *CompanyRepositoryImpl) initializePreparedStatements(ctx context.Context
 				   hire_date, is_active, reports_to, created_at, updated_at
 			FROM company_employees WHERE company_id = $1 AND user_id = $2`,
 
-		// New statements for the flow
+		// Bitmask-specific statements
+		"get_user_permission_bitmask": `
+			SELECT DISTINCT p.bit_index
+			FROM permissions p
+			INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+			INNER JOIN roles r ON rp.role_id = r.role_id
+			INNER JOIN company_employees ce ON r.role_id = ce.role_id
+			INNER JOIN role_departments rd ON r.role_id = rd.role_id AND ce.department_id = rd.department_id
+			INNER JOIN departments d ON ce.department_id = d.department_id
+			INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+			WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+			  AND p.module = sd.module_code
+			  AND p.bit_index IS NOT NULL`,
+
+		"get_role_permission_bitmask": `
+			SELECT p.bit_index
+			FROM permissions p
+			INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+			WHERE rp.role_id = $1 AND p.bit_index IS NOT NULL`,
+
+		"get_permissions_with_bit_index": `
+			SELECT permission_id, permission_name, bit_index, module, category
+			FROM permissions 
+			WHERE bit_index IS NOT NULL
+			ORDER BY bit_index`,
+
+		// Permission and RBAC statements
 		"check_user_permission_full": `
 			SELECT COUNT(*) > 0
 			FROM company_employees ce
@@ -2989,15 +3373,6 @@ func (r *CompanyRepositoryImpl) initializePreparedStatements(ctx context.Context
 		util.Int("statements", len(r.stmtCache)))
 }
 
-// // getStmt retrieves a prepared statement from cache
-// func (r *CompanyRepositoryImpl) getStmt(name string) (*sql.Stmt, bool) {
-// 	r.stmtMutex.RLock()
-// 	defer r.stmtMutex.RUnlock()
-
-// 	stmt, exists := r.stmtCache[name]
-// 	return stmt, exists
-// }
-
 func (r *CompanyRepositoryImpl) recordQuery() {
 	r.metrics.Lock()
 	defer r.metrics.Unlock()
@@ -3016,89 +3391,406 @@ func (r *CompanyRepositoryImpl) recordError() {
 	r.metrics.errorCount++
 }
 
-// Add to CompanyRepository interface
+// CreateCompany creates a new company with full RBAC setup
+// func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *models.Company, additionalDepartments []string) error {
+// 	tx, err := r.client.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to begin transaction: %w", err)
+// 	}
+// 	defer tx.Rollback()
 
-// Implementation in postgres/company_repository.go
-func (r *CompanyRepositoryImpl) GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error) {
-	query := `
-        SELECT system_department_id, name, module_code, description
-        FROM system_departments 
-        WHERE system_department_id = $1`
+// 	// 1. Insert company
+// 	companyQuery := `
+//         INSERT INTO companies (
+//             company_id, company_name, owner_user_id, subscription_tier,
+//             subscription_status, max_employees, data_region, is_active,
+//             created_at, updated_at, subscription_start_date, subscription_end_date
+//         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
 
-	var dept models.SystemDepartment
-	err := r.client.QueryRow(ctx, query, systemDeptID).Scan(
-		&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
-	)
+// 	_, err = tx.ExecContext(ctx, companyQuery,
+// 		company.CompanyID, company.CompanyName, company.OwnerUserID, company.SubscriptionTier,
+// 		company.SubscriptionStatus, company.MaxEmployees, company.DataRegion, company.IsActive,
+// 		company.CreatedAt, company.UpdatedAt, company.SubscriptionStartDate, company.SubscriptionEndDate,
+// 	)
+// 	if err != nil {
+// 		r.recordError()
+// 		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
+// 			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
+// 		}
+// 		return fmt.Errorf("failed to create company: %w", err)
+// 	}
 
+// 	// 2. Create OWNER role for this company
+// 	ownerRoleID := uuid.New()
+// 	ownerRoleQuery := `
+//         INSERT INTO roles (
+//             role_id, role_name, role_level, company_id, is_system_role,
+//             description, created_at, updated_at
+//         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
+// 	_, err = tx.ExecContext(ctx, ownerRoleQuery,
+// 		ownerRoleID, "Owner", 1000, company.CompanyID, true,
+// 		"Company owner with full permissions", company.CreatedAt, company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create owner role: %w", err)
+// 	}
+
+// 	// 3. Create Default Department: ADMINISTRATION
+// 	adminDeptID := uuid.New()
+// 	adminDeptQuery := `
+//         INSERT INTO departments (
+//             department_id, company_id, department_name, system_department_id,
+//             is_active, created_at, updated_at
+//         ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+// 	_, err = tx.ExecContext(ctx, adminDeptQuery,
+// 		adminDeptID, company.CompanyID, "Administration", nil,
+// 		true, company.CreatedAt, company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create administration department: %w", err)
+// 	}
+
+// 	// 4. Create Additional Department Rows from user input
+// 	systemDepts, err := r.GetSystemDepartments(ctx)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to get system departments: %w", err)
+// 	}
+
+// 	// Map department names to system departments
+// 	systemDeptMap := make(map[string]uuid.UUID)
+// 	for _, dept := range systemDepts {
+// 		systemDeptMap[strings.ToLower(dept.ModuleCode)] = dept.SystemDepartmentID
+// 	}
+
+// 	// Store created department IDs - ONLY the ones the owner should have access to
+// 	ownerAccessDeptIDs := []uuid.UUID{adminDeptID} // Owner always has access to Administration
+
+// 	for _, deptName := range additionalDepartments {
+// 		deptID := uuid.New()
+// 		var systemDeptID uuid.UUID
+
+// 		// Map department name to system module
+// 		switch strings.ToLower(deptName) {
+// 		case "hr", "human resources":
+// 			systemDeptID = systemDeptMap["hr"]
+// 		case "inventory", "warehouse":
+// 			systemDeptID = systemDeptMap["inventory"]
+// 		case "sales":
+// 			systemDeptID = systemDeptMap["sales"]
+// 		case "production", "manufacturing":
+// 			systemDeptID = systemDeptMap["production"]
+// 		case "finance", "accounting":
+// 			systemDeptID = systemDeptMap["finance"]
+// 		case "logistics", "shipping":
+// 			systemDeptID = systemDeptMap["logistics"]
+// 		case "it", "technology":
+// 			systemDeptID = systemDeptMap["it"]
+// 		case "customer support", "support":
+// 			systemDeptID = systemDeptMap["support"]
+// 		case "quality control", "qc":
+// 			systemDeptID = systemDeptMap["qc"]
+// 		case "quality assurance", "qa":
+// 			systemDeptID = systemDeptMap["qa"]
+// 		case "research", "r&d":
+// 			systemDeptID = systemDeptMap["rnd"]
+// 		case "operations":
+// 			systemDeptID = systemDeptMap["operations"]
+// 		case "marketing":
+// 			systemDeptID = systemDeptMap["marketing"]
+// 		case "procurement", "purchasing":
+// 			systemDeptID = systemDeptMap["procurement"]
+// 		default:
+// 			// Use operations as default for unknown departments
+// 			systemDeptID = systemDeptMap["operations"]
+// 		}
+
+// 		deptQuery := `
+//             INSERT INTO departments (
+//                 department_id, company_id, department_name, system_department_id,
+//                 is_active, created_at, updated_at
+//             ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+// 		_, err = tx.ExecContext(ctx, deptQuery,
+// 			deptID, company.CompanyID, deptName, systemDeptID,
+// 			true, company.CreatedAt, company.UpdatedAt,
+// 		)
+// 		if err != nil {
+// 			r.logger.Warn("Failed to create department",
+// 				util.String("department", deptName),
+// 				util.ErrorField(err))
+// 			continue // Continue with other departments even if one fails
+// 		}
+
+// 		// Add this department to owner's accessible departments
+// 		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
+// 	}
+
+// 	// 5. Assign ONLY the specified departments to the Owner role (not all departments)
+// 	roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
+// 	for _, deptID := range ownerAccessDeptIDs {
+// 		_, err = tx.ExecContext(ctx, roleDeptQuery, ownerRoleID, deptID)
+// 		if err != nil {
+// 			r.logger.Warn("Failed to assign department to owner role",
+// 				util.String("department_id", deptID.String()),
+// 				util.ErrorField(err))
+// 			// Continue even if some assignments fail
+// 		}
+// 	}
+
+// 	// 6. Grant permissions ONLY for the modules that the owner has access to
+// 	// This is the key change: instead of granting ALL permissions, we grant only permissions
+// 	// for the modules that the owner's departments belong to
+// 	grantPermissionsQuery := `
+//         INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
+//         SELECT $1, p.permission_id, $2, $3
+//         FROM permissions p
+//         WHERE p.module IN (
+//             SELECT DISTINCT sd.module_code
+//             FROM system_departments sd
+//             INNER JOIN departments d ON sd.system_department_id = d.system_department_id
+//             WHERE d.department_id = ANY($4)
+//         )`
+
+// 	// Convert ownerAccessDeptIDs to PostgreSQL UUID array
+// 	deptIDStrings := make([]string, len(ownerAccessDeptIDs))
+// 	for i, id := range ownerAccessDeptIDs {
+// 		deptIDStrings[i] = id.String()
+// 	}
+
+// 	_, err = tx.ExecContext(ctx, grantPermissionsQuery,
+// 		ownerRoleID, company.OwnerUserID, company.CreatedAt, pq.Array(deptIDStrings))
+// 	if err != nil {
+// 		return fmt.Errorf("failed to grant permissions to owner role: %w", err)
+// 	}
+
+// 	// 7. Insert the Owner as Employee with Administration department
+// 	employeeQuery := `
+//         INSERT INTO company_employees (
+//             company_id, user_id, employee_id, role_id, department_id,
+//             hire_date, is_active, created_at, updated_at
+//         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+
+// 	_, err = tx.ExecContext(ctx, employeeQuery,
+// 		company.CompanyID, company.OwnerUserID, "OWNER-"+company.CompanyID.String()[:8], ownerRoleID, adminDeptID,
+// 		company.CreatedAt, true, company.CreatedAt, company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to add owner as employee: %w", err)
+// 	}
+
+// 	if err := tx.Commit(); err != nil {
+// 		return fmt.Errorf("failed to commit transaction: %w", err)
+// 	}
+
+// 	r.recordQuery()
+// 	r.logger.Info("Company created successfully with restricted RBAC setup",
+// 		util.String("company_id", company.CompanyID.String()),
+// 		util.String("company_name", company.CompanyName),
+// 		util.Int("owner_department_count", len(ownerAccessDeptIDs)),
+// 		util.Int("additional_departments", len(additionalDepartments)))
+
+// 	return nil
+// }
+
+// GetUserPermissions retrieves all permissions for a user with module validation
+func (r *CompanyRepositoryImpl) GetUserPermissions(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Permission, error) {
+	// First check if user is company owner
+	var ownerUserID uuid.UUID
+	ownerQuery := `SELECT owner_user_id FROM companies WHERE company_id = $1`
+	err := r.client.QueryRow(ctx, ownerQuery, companyID).Scan(&ownerUserID)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("system department not found: %s", systemDeptID)
-		}
 		r.recordError()
-		return nil, fmt.Errorf("failed to get system department: %w", err)
+		return nil, fmt.Errorf("failed to get company owner: %w", err)
 	}
 
-	r.recordQuery()
-	return &dept, nil
-}
+	// For owners, use a simpler query that doesn't rely on department modules
+	if ownerUserID == userID {
+		query := `
+			SELECT DISTINCT p.permission_id, p.permission_name, p.description, 
+				   p.category, p.module, p.requires_tier, p.created_at
+			FROM permissions p
+			INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+			INNER JOIN roles r ON rp.role_id = r.role_id
+			INNER JOIN company_employees ce ON r.role_id = ce.role_id
+			WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+			ORDER BY p.category, p.permission_name`
 
-// GetEmployeeHierarchy retrieves employee hierarchy for a company
-func (r *CompanyRepositoryImpl) GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
+		rows, err := r.client.Query(ctx, query, companyID, userID)
+		if err != nil {
+			r.recordError()
+			return nil, fmt.Errorf("failed to query owner permissions: %w", err)
+		}
+		defer rows.Close()
+
+		var permissions []*models.Permission
+		for rows.Next() {
+			var perm models.Permission
+			err := rows.Scan(
+				&perm.PermissionID, &perm.PermissionName, &perm.Description,
+				&perm.Category, &perm.Module, &perm.RequiresTier, &perm.CreatedAt,
+			)
+			if err != nil {
+				r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
+				continue
+			}
+			permissions = append(permissions, &perm)
+		}
+
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("error iterating permission rows: %w", err)
+		}
+
+		r.recordQuery()
+		r.logger.Debug("Owner permissions retrieved",
+			util.String("user_id", userID.String()),
+			util.String("company_id", companyID.String()),
+			util.Int("permission_count", len(permissions)))
+		return permissions, nil
+	}
+
+	// For non-owner, check permissions with module validation
 	query := `
-        SELECT ce.user_id, ce.employee_id, r.role_name, r.role_level,
-               d.department_id, d.department_name, ce.reports_to, ce.is_active
-        FROM company_employees ce
-        INNER JOIN roles r ON ce.role_id = r.role_id
-        LEFT JOIN departments d ON ce.department_id = d.department_id
-        WHERE ce.company_id = $1 AND ce.is_active = true
-        ORDER BY r.role_level ASC, d.department_name, ce.employee_id`
+		SELECT DISTINCT p.permission_id, p.permission_name, p.description, 
+			   p.category, p.module, p.requires_tier, p.created_at
+		FROM permissions p
+		INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+		INNER JOIN roles r ON rp.role_id = r.role_id
+		INNER JOIN company_employees ce ON r.role_id = ce.role_id
+		INNER JOIN role_departments rd ON r.role_id = rd.role_id AND ce.department_id = rd.department_id
+		INNER JOIN departments d ON ce.department_id = d.department_id
+		LEFT JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+		WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+		  AND (sd.system_department_id IS NULL OR p.module = sd.module_code)
+		ORDER BY p.category, p.permission_name`
 
-	rows, err := r.client.Query(ctx, query, companyID)
+	rows, err := r.client.Query(ctx, query, companyID, userID)
 	if err != nil {
 		r.recordError()
-		return nil, fmt.Errorf("failed to query employee hierarchy: %w", err)
+		return nil, fmt.Errorf("failed to query user permissions: %w", err)
 	}
 	defer rows.Close()
 
-	var hierarchy []*models.EmployeeHierarchy
+	var permissions []*models.Permission
 	for rows.Next() {
-		var item models.EmployeeHierarchy
-		var deptID, deptName, reportsTo sql.NullString
-
+		var perm models.Permission
 		err := rows.Scan(
-			&item.UserID, &item.EmployeeID, &item.RoleName, &item.RoleLevel,
-			&deptID, &deptName, &reportsTo, &item.IsActive,
+			&perm.PermissionID, &perm.PermissionName, &perm.Description,
+			&perm.Category, &perm.Module, &perm.RequiresTier, &perm.CreatedAt,
 		)
 		if err != nil {
-			r.logger.Warn("Failed to scan hierarchy row", util.ErrorField(err))
+			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
 			continue
 		}
-
-		item.CompanyID = companyID
-
-		// Handle nullable fields
-		if deptID.Valid {
-			departmentID, _ := uuid.Parse(deptID.String)
-			item.DepartmentID = &departmentID
-		}
-		if deptName.Valid {
-			item.Department = deptName.String
-		}
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			item.ReportsTo = &reportsToID
-		}
-
-		hierarchy = append(hierarchy, &item)
+		permissions = append(permissions, &perm)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating hierarchy rows: %w", err)
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
 	}
 
 	r.recordQuery()
-	return hierarchy, nil
+	return permissions, nil
 }
+
+// // GetUserPermissionBitmask retrieves the complete permission bitmask for a user
+// func (r *CompanyRepositoryImpl) GetUserPermissionBitmask(ctx context.Context, companyID, userID uuid.UUID) ([]uint64, error) {
+// 	// Check if user is company owner
+// 	var ownerUserID uuid.UUID
+// 	ownerQuery := `SELECT owner_user_id FROM companies WHERE company_id = $1`
+// 	err := r.client.QueryRow(ctx, ownerQuery, companyID).Scan(&ownerUserID)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to get company owner: %w", err)
+// 	}
+
+// 	// For owners, use a simpler query
+// 	if ownerUserID == userID {
+// 		query := `
+// 			SELECT DISTINCT p.bit_index
+// 			FROM permissions p
+// 			INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+// 			INNER JOIN roles r ON rp.role_id = r.role_id
+// 			INNER JOIN company_employees ce ON r.role_id = ce.role_id
+// 			WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+// 			  AND p.bit_index IS NOT NULL`
+
+// 		rows, err := r.client.Query(ctx, query, companyID, userID)
+// 		if err != nil {
+// 			return nil, fmt.Errorf("failed to query owner permission bitmask: %w", err)
+// 		}
+// 		defer rows.Close()
+
+// 		var bitPositions []uint64
+// 		for rows.Next() {
+// 			var bitIndex int
+// 			err := rows.Scan(&bitIndex)
+// 			if err != nil {
+// 				r.logger.Warn("Failed to scan bit index", util.ErrorField(err))
+// 				continue
+// 			}
+// 			bitPositions = append(bitPositions, uint64(bitIndex))
+// 		}
+
+// 		if err := rows.Err(); err != nil {
+// 			return nil, fmt.Errorf("error iterating bitmask rows: %w", err)
+// 		}
+
+// 		r.recordQuery()
+// 		r.logger.Debug("Owner permission bitmask retrieved",
+// 			util.String("user_id", userID.String()),
+// 			util.String("company_id", companyID.String()),
+// 			util.Int("bit_count", len(bitPositions)))
+
+// 		return rbac.BuildMaskFromBitPositions(bitPositions), nil
+// 	}
+
+// 	// For non-owner, get permissions via RBAC flow with module validation
+// 	query := `
+//         SELECT DISTINCT p.bit_index
+//         FROM permissions p
+//         INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+//         INNER JOIN roles r ON rp.role_id = r.role_id
+//         INNER JOIN company_employees ce ON r.role_id = ce.role_id
+//         INNER JOIN role_departments rd ON r.role_id = rd.role_id AND ce.department_id = rd.department_id
+//         INNER JOIN departments d ON ce.department_id = d.department_id
+//         LEFT JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+//         WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+//           AND (sd.system_department_id IS NULL OR p.module = sd.module_code)
+//           AND p.bit_index IS NOT NULL`
+
+// 	rows, err := r.client.Query(ctx, query, companyID, userID)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to query user permission bitmask: %w", err)
+// 	}
+// 	defer rows.Close()
+
+// 	var bitPositions []uint64
+// 	for rows.Next() {
+// 		var bitIndex int
+// 		err := rows.Scan(&bitIndex)
+// 		if err != nil {
+// 			r.logger.Warn("Failed to scan bit index", util.ErrorField(err))
+// 			continue
+// 		}
+// 		bitPositions = append(bitPositions, uint64(bitIndex))
+// 	}
+
+// 	if err := rows.Err(); err != nil {
+// 		return nil, fmt.Errorf("error iterating bitmask rows: %w", err)
+// 	}
+
+// 	r.recordQuery()
+// 	r.logger.Debug("User permission bitmask retrieved",
+// 		util.String("user_id", userID.String()),
+// 		util.String("company_id", companyID.String()),
+// 		util.Bool("is_owner", false),
+// 		util.Int("bit_count", len(bitPositions)))
+
+// 	return rbac.BuildMaskFromBitPositions(bitPositions), nil
+// }
+
+// CreateCompany creates a new company with full RBAC setup
 func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *models.Company, additionalDepartments []string) error {
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
@@ -3143,23 +3835,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *mode
 		return fmt.Errorf("failed to create owner role: %w", err)
 	}
 
-	// 🔵 STEP 3 — Create Default Department: ADMINISTRATION
-	adminDeptID := uuid.New()
-	adminDeptQuery := `
-        INSERT INTO departments (
-            department_id, company_id, department_name, system_department_id,
-            is_active, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
-
-	_, err = tx.ExecContext(ctx, adminDeptQuery,
-		adminDeptID, company.CompanyID, "Administration", nil,
-		true, company.CreatedAt, company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create administration department: %w", err)
-	}
-
-	// 🔵 STEP 4 — Create Additional Department Rows from user input
+	// 3. Get system departments first
 	systemDepts, err := r.GetSystemDepartments(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get system departments: %w", err)
@@ -3171,45 +3847,86 @@ func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *mode
 		systemDeptMap[strings.ToLower(dept.ModuleCode)] = dept.SystemDepartmentID
 	}
 
-	createdDeptIDs := []uuid.UUID{adminDeptID} // Start with admin department
+	// 4. Create Default Department: ADMINISTRATION with system department
+	adminDeptID := uuid.New()
+	adminDeptQuery := `
+        INSERT INTO departments (
+            department_id, company_id, department_name, system_department_id,
+            is_active, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+	// Get the Administration system department
+	adminSystemDeptID, ok := systemDeptMap["administration"]
+	if !ok {
+		return fmt.Errorf("administration system department not found")
+	}
+
+	_, err = tx.ExecContext(ctx, adminDeptQuery,
+		adminDeptID, company.CompanyID, "Administration", adminSystemDeptID,
+		true, company.CreatedAt, company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create administration department: %w", err)
+	}
+
+	// 5. Create Additional Department Rows from user input
+	// Store created department IDs and their modules
+	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}   // Owner always has access to Administration
+	ownerAccessModules := []string{"administration"} // Owner always has administration module
 
 	for _, deptName := range additionalDepartments {
 		deptID := uuid.New()
 		var systemDeptID uuid.UUID
+		var moduleCode string
 
 		// Map department name to system module
 		switch strings.ToLower(deptName) {
 		case "hr", "human resources":
 			systemDeptID = systemDeptMap["hr"]
+			moduleCode = "hr"
 		case "inventory", "warehouse":
 			systemDeptID = systemDeptMap["inventory"]
+			moduleCode = "inventory"
 		case "sales":
 			systemDeptID = systemDeptMap["sales"]
+			moduleCode = "sales"
 		case "production", "manufacturing":
 			systemDeptID = systemDeptMap["production"]
+			moduleCode = "production"
 		case "finance", "accounting":
 			systemDeptID = systemDeptMap["finance"]
+			moduleCode = "finance"
 		case "logistics", "shipping":
 			systemDeptID = systemDeptMap["logistics"]
+			moduleCode = "logistics"
 		case "it", "technology":
 			systemDeptID = systemDeptMap["it"]
+			moduleCode = "it"
 		case "customer support", "support":
 			systemDeptID = systemDeptMap["support"]
+			moduleCode = "support"
 		case "quality control", "qc":
 			systemDeptID = systemDeptMap["qc"]
+			moduleCode = "qc"
 		case "quality assurance", "qa":
 			systemDeptID = systemDeptMap["qa"]
+			moduleCode = "qa"
 		case "research", "r&d":
 			systemDeptID = systemDeptMap["rnd"]
+			moduleCode = "rnd"
 		case "operations":
 			systemDeptID = systemDeptMap["operations"]
+			moduleCode = "operations"
 		case "marketing":
 			systemDeptID = systemDeptMap["marketing"]
+			moduleCode = "marketing"
 		case "procurement", "purchasing":
 			systemDeptID = systemDeptMap["procurement"]
+			moduleCode = "procurement"
 		default:
 			// Use operations as default for unknown departments
 			systemDeptID = systemDeptMap["operations"]
+			moduleCode = "operations"
 		}
 
 		deptQuery := `
@@ -3229,12 +3946,14 @@ func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *mode
 			continue // Continue with other departments even if one fails
 		}
 
-		createdDeptIDs = append(createdDeptIDs, deptID)
+		// Add this department to owner's accessible departments and modules
+		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
+		ownerAccessModules = append(ownerAccessModules, moduleCode)
 	}
 
-	// 🔵 STEP 6 — Assign EVERY department to the Owner role
+	// 6. Assign ONLY the specified departments to the Owner role
 	roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
-	for _, deptID := range createdDeptIDs {
+	for _, deptID := range ownerAccessDeptIDs {
 		_, err = tx.ExecContext(ctx, roleDeptQuery, ownerRoleID, deptID)
 		if err != nil {
 			r.logger.Warn("Failed to assign department to owner role",
@@ -3244,18 +3963,21 @@ func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *mode
 		}
 	}
 
-	// 🔵 STEP 7 — Assign ALL permissions to Owner Role
+	// 7. Grant permissions ONLY for the modules that the owner has access to
+	// This ensures owner only gets permissions for their assigned departments' modules
 	grantPermissionsQuery := `
         INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
-        SELECT $1, permission_id, $2, $3 FROM permissions`
+        SELECT $1, p.permission_id, $2, $3 
+        FROM permissions p
+        WHERE p.module = ANY($4)`
 
 	_, err = tx.ExecContext(ctx, grantPermissionsQuery,
-		ownerRoleID, company.OwnerUserID, company.CreatedAt)
+		ownerRoleID, company.OwnerUserID, company.CreatedAt, pq.Array(ownerAccessModules))
 	if err != nil {
 		return fmt.Errorf("failed to grant permissions to owner role: %w", err)
 	}
 
-	// 🔵 STEP 8 — Insert the Owner as Employee with Administration department
+	// 8. Insert the Owner as Employee with Administration department
 	employeeQuery := `
         INSERT INTO company_employees (
             company_id, user_id, employee_id, role_id, department_id,
@@ -3275,105 +3997,381 @@ func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *mode
 	}
 
 	r.recordQuery()
-	r.logger.Info("Company created successfully with full RBAC setup",
+	r.logger.Info("Company created successfully with restricted RBAC setup",
 		util.String("company_id", company.CompanyID.String()),
 		util.String("company_name", company.CompanyName),
-		util.Int("department_count", len(createdDeptIDs)),
-		util.Int("additional_departments", len(additionalDepartments)))
+		util.Int("owner_department_count", len(ownerAccessDeptIDs)),
+		util.Int("owner_module_count", len(ownerAccessModules)),
+		util.Strings("owner_modules", ownerAccessModules))
 
 	return nil
 }
 
-// Department operations
-func (r *CompanyRepositoryImpl) UpdateDepartmentName(ctx context.Context, departmentID uuid.UUID, newName string) error {
-	query := `UPDATE departments SET department_name = $1, updated_at = $2 WHERE department_id = $3`
-
-	result, err := r.client.Exec(ctx, query, newName, time.Now().UTC(), departmentID)
+// GetUserPermissionBitmask retrieves the complete permission bitmask for a user
+func (r *CompanyRepositoryImpl) GetUserPermissionBitmask(ctx context.Context, companyID, userID uuid.UUID) ([]uint64, error) {
+	// Check if user is company owner
+	var ownerUserID uuid.UUID
+	ownerQuery := `SELECT owner_user_id FROM companies WHERE company_id = $1`
+	err := r.client.QueryRow(ctx, ownerQuery, companyID).Scan(&ownerUserID)
 	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to update department name: %w", err)
+		return nil, fmt.Errorf("failed to get company owner: %w", err)
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("department not found: %s", departmentID)
-	}
+	// For owners, get permissions ONLY for their selected modules
+	if ownerUserID == userID {
+		r.logger.Debug("🔑 User is company owner - fetching permissions for selected modules",
+			util.String("user_id", userID.String()),
+			util.String("company_id", companyID.String()))
 
-	r.recordQuery()
-	return nil
-}
+		// FIXED: Get permissions ONLY for the modules that the owner has departments for
+		query := `
+            SELECT DISTINCT p.bit_index
+            FROM permissions p
+            WHERE p.bit_index IS NOT NULL
+            AND p.module IN (
+                -- Get modules from the owner's departments
+                SELECT DISTINCT sd.module_code
+                FROM departments d
+                INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+                INNER JOIN role_departments rd ON d.department_id = rd.department_id
+                INNER JOIN roles r ON rd.role_id = r.role_id
+                INNER JOIN company_employees ce ON r.role_id = ce.role_id
+                WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+            )
+            ORDER BY p.bit_index`
 
-func (r *CompanyRepositoryImpl) GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error) {
-	query := `
-        SELECT department_id, company_id, department_name, system_department_id,
-               is_active, created_at, updated_at
-        FROM departments 
-        WHERE company_id = $1 AND system_department_id = $2 AND is_active = true`
-
-	var department models.Department
-	var systemDeptID sql.NullString
-
-	err := r.client.QueryRow(ctx, query, companyID, systemDepartmentID).Scan(
-		&department.DepartmentID, &department.CompanyID, &department.DepartmentName,
-		&systemDeptID, &department.IsActive, &department.CreatedAt, &department.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("department not found for system department: %s", systemDepartmentID)
+		rows, err := r.client.Query(ctx, query, companyID, userID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query owner permission bitmask: %w", err)
 		}
-		r.recordError()
-		return nil, fmt.Errorf("failed to get department by system ID: %w", err)
+		defer rows.Close()
+
+		var bitPositions []uint64
+		for rows.Next() {
+			var bitIndex int
+			err := rows.Scan(&bitIndex)
+			if err != nil {
+				r.logger.Warn("Failed to scan bit index", util.ErrorField(err))
+				continue
+			}
+			bitPositions = append(bitPositions, uint64(bitIndex))
+		}
+
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("error iterating bitmask rows: %w", err)
+		}
+
+		r.recordQuery()
+		r.logger.Debug("✅ Owner permission bitmask retrieved for selected modules",
+			util.String("user_id", userID.String()),
+			util.Int("total_bit_positions", len(bitPositions)),
+			util.Any("bit_positions", bitPositions))
+
+		mask := rbac.BuildMaskFromBitPositions(bitPositions)
+
+		// Debug: Check what modules the owner has access to
+		modulesQuery := `
+            SELECT DISTINCT sd.module_code, sd.name
+            FROM departments d
+            INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+            INNER JOIN role_departments rd ON d.department_id = rd.department_id
+            INNER JOIN roles r ON rd.role_id = r.role_id
+            INNER JOIN company_employees ce ON r.role_id = ce.role_id
+            WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true`
+
+		moduleRows, err := r.client.Query(ctx, modulesQuery, companyID, userID)
+		if err == nil {
+			defer moduleRows.Close()
+			var ownerModules []string
+			for moduleRows.Next() {
+				var moduleCode, moduleName string
+				if err := moduleRows.Scan(&moduleCode, &moduleName); err == nil {
+					ownerModules = append(ownerModules, moduleCode+" ("+moduleName+")")
+				}
+			}
+			r.logger.Debug("📦 Owner has access to modules",
+				util.String("user_id", userID.String()),
+				util.Strings("modules", ownerModules))
+		}
+
+		return mask, nil
 	}
 
-	if systemDeptID.Valid {
-		systemID, _ := uuid.Parse(systemDeptID.String)
-		department.SystemDepartmentID = &systemID
+	// For non-owner employees, use the existing RBAC flow
+	r.logger.Debug("👤 User is employee - using RBAC permission flow",
+		util.String("user_id", userID.String()),
+		util.String("company_id", companyID.String()))
+
+	query := `
+        SELECT DISTINCT p.bit_index
+        FROM permissions p
+        INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
+        INNER JOIN roles r ON rp.role_id = r.role_id
+        INNER JOIN company_employees ce ON r.role_id = ce.role_id
+        INNER JOIN role_departments rd ON r.role_id = rd.role_id AND ce.department_id = rd.department_id
+        INNER JOIN departments d ON ce.department_id = d.department_id
+        LEFT JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+        WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+          AND (sd.system_department_id IS NULL OR p.module = sd.module_code)
+          AND p.bit_index IS NOT NULL`
+
+	rows, err := r.client.Query(ctx, query, companyID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query user permission bitmask: %w", err)
+	}
+	defer rows.Close()
+
+	var bitPositions []uint64
+	for rows.Next() {
+		var bitIndex int
+		err := rows.Scan(&bitIndex)
+		if err != nil {
+			r.logger.Warn("Failed to scan bit index", util.ErrorField(err))
+			continue
+		}
+		bitPositions = append(bitPositions, uint64(bitIndex))
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating bitmask rows: %w", err)
 	}
 
 	r.recordQuery()
-	return &department, nil
+	r.logger.Debug("✅ Employee permission bitmask retrieved",
+		util.String("user_id", userID.String()),
+		util.String("company_id", companyID.String()),
+		util.Int("bit_count", len(bitPositions)),
+		util.Any("bit_positions", bitPositions))
+
+	return rbac.BuildMaskFromBitPositions(bitPositions), nil
 }
 
-// Permission operations
-func (r *CompanyRepositoryImpl) GetPermissionsByNames(ctx context.Context, permissionNames []string) ([]*models.Permission, error) {
-	if len(permissionNames) == 0 {
+// ============================================================================
+// PERMISSION QUERY OPERATIONS
+// ============================================================================
+
+// GetPermissionsBySystemDepartments retrieves permissions filtered by system departments and optional filters
+func (r *CompanyRepositoryImpl) GetPermissionsBySystemDepartments(
+	ctx context.Context,
+	systemDeptIDs []uuid.UUID,
+	module, category, tier string,
+) ([]*models.Permission, error) {
+
+	if len(systemDeptIDs) == 0 {
 		return []*models.Permission{}, nil
 	}
 
-	// Create placeholders for the IN clause
-	placeholders := make([]string, len(permissionNames))
-	values := []interface{}{}
-
-	for i, name := range permissionNames {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		values = append(values, name)
+	// Convert UUIDs to string array for PostgreSQL
+	deptIDStrings := make([]string, len(systemDeptIDs))
+	for i, id := range systemDeptIDs {
+		deptIDStrings[i] = id.String()
 	}
 
-	query := fmt.Sprintf(`
-        SELECT permission_id, permission_name, description, category, module, requires_tier, created_at
-        FROM permissions 
-        WHERE permission_name IN (%s)`,
-		strings.Join(placeholders, ", "))
+	// Build the base query with JOIN on system_departments
+	query := `
+        SELECT DISTINCT 
+            p.permission_id, 
+            p.permission_name, 
+            p.description, 
+            p.category, 
+            p.module, 
+            p.requires_tier, 
+            p.bit_index,
+            p.created_at
+        FROM permissions p
+        INNER JOIN system_departments sd ON p.module = sd.module_code
+        WHERE sd.system_department_id = ANY($1)`
 
-	rows, err := r.client.Query(ctx, query, values...)
+	args := []interface{}{pq.Array(deptIDStrings)}
+	argCount := 1
+
+	// Add optional filters
+	if module != "" {
+		argCount++
+		query += fmt.Sprintf(" AND p.module = $%d", argCount)
+		args = append(args, module)
+	}
+
+	if category != "" {
+		argCount++
+		query += fmt.Sprintf(" AND p.category = $%d", argCount)
+		args = append(args, category)
+	}
+
+	if tier != "" {
+		argCount++
+		query += fmt.Sprintf(" AND p.requires_tier = $%d", argCount)
+		args = append(args, tier)
+	}
+
+	// Add ordering
+	query += " ORDER BY p.module, p.category, p.permission_name"
+
+	// Execute query
+	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
 		r.recordError()
-		return nil, fmt.Errorf("failed to query permissions by names: %w", err)
+		return nil, fmt.Errorf("failed to query permissions by system departments: %w", err)
 	}
 	defer rows.Close()
 
 	var permissions []*models.Permission
 	for rows.Next() {
 		var perm models.Permission
+		var bitIndex sql.NullInt32
+
 		err := rows.Scan(
-			&perm.PermissionID, &perm.PermissionName, &perm.Description,
-			&perm.Category, &perm.Module, &perm.RequiresTier, &perm.CreatedAt,
+			&perm.PermissionID,
+			&perm.PermissionName,
+			&perm.Description,
+			&perm.Category,
+			&perm.Module,
+			&perm.RequiresTier,
+			&bitIndex,
+			&perm.CreatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission row",
+				util.ErrorField(err),
+				util.String("method", "GetPermissionsBySystemDepartments"))
+			continue
+		}
+
+		// Handle nullable bit_index
+		if bitIndex.Valid {
+			perm.BitIndex = int(bitIndex.Int32)
+		}
+
+		permissions = append(permissions, &perm)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("Permissions retrieved by system departments",
+		util.Int("system_dept_count", len(systemDeptIDs)),
+		util.Int("permission_count", len(permissions)),
+		util.String("module_filter", module),
+		util.String("category_filter", category),
+		util.String("tier_filter", tier))
+
+	return permissions, nil
+}
+
+// GetPermissionsByCompanyModules retrieves permissions for a company's active modules
+func (r *CompanyRepositoryImpl) GetPermissionsByCompanyModules(
+	ctx context.Context,
+	companyID uuid.UUID,
+	module, category, tier string,
+) ([]*models.Permission, error) {
+
+	// Get company's active system departments through their departments
+	query := `
+        SELECT DISTINCT sd.system_department_id
+        FROM departments d
+        INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+        WHERE d.company_id = $1 AND d.is_active = true`
+
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query company system departments: %w", err)
+	}
+	defer rows.Close()
+
+	var systemDeptIDs []uuid.UUID
+	for rows.Next() {
+		var deptID uuid.UUID
+		err := rows.Scan(&deptID)
+		if err != nil {
+			r.logger.Warn("Failed to scan system department ID", util.ErrorField(err))
+			continue
+		}
+		systemDeptIDs = append(systemDeptIDs, deptID)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating system department rows: %w", err)
+	}
+
+	// Use the main method to get permissions
+	return r.GetPermissionsBySystemDepartments(ctx, systemDeptIDs, module, category, tier)
+}
+
+// GetModulePermissions retrieves all permissions for specific modules
+func (r *CompanyRepositoryImpl) GetModulePermissions(
+	ctx context.Context,
+	modules []string,
+	category, tier string,
+) ([]*models.Permission, error) {
+
+	if len(modules) == 0 {
+		return []*models.Permission{}, nil
+	}
+
+	query := `
+        SELECT 
+            permission_id, 
+            permission_name, 
+            description, 
+            category, 
+            module, 
+            requires_tier, 
+            bit_index,
+            created_at
+        FROM permissions 
+        WHERE module = ANY($1)`
+
+	args := []interface{}{pq.Array(modules)}
+	argCount := 1
+
+	if category != "" {
+		argCount++
+		query += fmt.Sprintf(" AND category = $%d", argCount)
+		args = append(args, category)
+	}
+
+	if tier != "" {
+		argCount++
+		query += fmt.Sprintf(" AND requires_tier = $%d", argCount)
+		args = append(args, tier)
+	}
+
+	query += " ORDER BY module, category, permission_name"
+
+	rows, err := r.client.Query(ctx, query, args...)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query module permissions: %w", err)
+	}
+	defer rows.Close()
+
+	var permissions []*models.Permission
+	for rows.Next() {
+		var perm models.Permission
+		var bitIndex sql.NullInt32
+
+		err := rows.Scan(
+			&perm.PermissionID,
+			&perm.PermissionName,
+			&perm.Description,
+			&perm.Category,
+			&perm.Module,
+			&perm.RequiresTier,
+			&bitIndex,
+			&perm.CreatedAt,
 		)
 		if err != nil {
 			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
 			continue
 		}
+
+		if bitIndex.Valid {
+			perm.BitIndex = int(bitIndex.Int32)
+		}
+
 		permissions = append(permissions, &perm)
 	}
 
@@ -3383,169 +4381,4 @@ func (r *CompanyRepositoryImpl) GetPermissionsByNames(ctx context.Context, permi
 
 	r.recordQuery()
 	return permissions, nil
-}
-
-func (r *CompanyRepositoryImpl) GetUserPermissionNames(ctx context.Context, userID uuid.UUID) ([]string, error) {
-	query := `
-        SELECT DISTINCT p.permission_name
-        FROM permissions p
-        INNER JOIN role_permissions rp ON p.permission_id = rp.permission_id
-        INNER JOIN roles r ON rp.role_id = r.role_id
-        INNER JOIN company_employees ce ON r.role_id = ce.role_id
-        WHERE ce.user_id = $1 AND ce.is_active = true
-        ORDER BY p.permission_name`
-
-	rows, err := r.client.Query(ctx, query, userID)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query user permission names: %w", err)
-	}
-	defer rows.Close()
-
-	var permissionNames []string
-	for rows.Next() {
-		var name string
-		err := rows.Scan(&name)
-		if err != nil {
-			r.logger.Warn("Failed to scan permission name", util.ErrorField(err))
-			continue
-		}
-		permissionNames = append(permissionNames, name)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating permission name rows: %w", err)
-	}
-
-	r.recordQuery()
-	return permissionNames, nil
-}
-
-// Role operations
-func (r *CompanyRepositoryImpl) CreateRoleWithDetails(ctx context.Context, role *models.Role, departmentID uuid.UUID, permissionIDs []uuid.UUID, createdBy uuid.UUID) error {
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// 1. Create role
-	roleQuery := `
-        INSERT INTO roles (
-            role_id, role_name, role_level, company_id, is_system_role,
-            description, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-
-	_, err = tx.ExecContext(ctx, roleQuery,
-		role.RoleID, role.RoleName, role.RoleLevel, role.CompanyID,
-		role.IsSystemRole, role.Description, role.CreatedAt, role.UpdatedAt,
-	)
-	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to create role: %w", err)
-	}
-
-	// 2. Map role to department
-	roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
-	_, err = tx.ExecContext(ctx, roleDeptQuery, role.RoleID, departmentID)
-	if err != nil {
-		return fmt.Errorf("failed to map role to department: %w", err)
-	}
-
-	// 3. Grant permissions if provided
-	if len(permissionIDs) > 0 {
-		grantQuery := `
-            INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
-            VALUES `
-
-		values := []interface{}{}
-		valuePlaceholders := []string{}
-		grantedAt := time.Now().UTC()
-
-		for i, permID := range permissionIDs {
-			baseIndex := i * 4
-			valuePlaceholders = append(valuePlaceholders,
-				fmt.Sprintf("($%d, $%d, $%d, $%d)",
-					baseIndex+1, baseIndex+2, baseIndex+3, baseIndex+4))
-
-			values = append(values, role.RoleID, permID, createdBy, grantedAt)
-		}
-
-		grantQuery += strings.Join(valuePlaceholders, ", ")
-		_, err = tx.ExecContext(ctx, grantQuery, values...)
-		if err != nil {
-			return fmt.Errorf("failed to grant permissions to role: %w", err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	r.recordQuery()
-	return nil
-}
-func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error) {
-	query := `
-        SELECT company_id, employee_id, role_id, department_id,
-               hire_date, is_active, reports_to, created_at, updated_at
-        FROM company_employees 
-        WHERE user_id = $1 AND is_active = true
-        ORDER BY hire_date DESC`
-
-	rows, err := r.client.Query(ctx, query, userID)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query employees by user: %w", err)
-	}
-	defer rows.Close()
-
-	var employees []*models.CompanyEmployee
-
-	for rows.Next() {
-		var employee models.CompanyEmployee
-
-		// pgx v4 UUID type
-		var deptID pgtype.UUID
-		var reportsTo pgtype.UUID
-
-		err := rows.Scan(
-			&employee.CompanyID,
-			&employee.EmployeeID,
-			&employee.RoleID,
-			&deptID,
-			&employee.HireDate,
-			&employee.IsActive,
-			&reportsTo,
-			&employee.CreatedAt,
-			&employee.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
-
-		employee.UserID = userID
-
-		// Convert department_id if present
-		if deptID.Status == pgtype.Present {
-			u, _ := uuid.FromBytes(deptID.Bytes[:])
-			employee.DepartmentID = &u
-		}
-
-		// Convert reports_to if present
-		if reportsTo.Status == pgtype.Present {
-			u, _ := uuid.FromBytes(reportsTo.Bytes[:])
-			employee.ReportsTo = &u
-		}
-
-		employees = append(employees, &employee)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating employee rows: %w", err)
-	}
-
-	r.recordQuery()
-	return employees, nil
 }

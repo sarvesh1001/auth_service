@@ -1,5 +1,5 @@
 // File: internal/factory/factory.go
-// ✅ UPDATED: Migrated User and Company repositories from Scylla to PostgreSQL
+// ✅ UPDATED: Complete implementation with bitmask permissions and JWT hybrid tokens
 
 package factory
 
@@ -14,7 +14,6 @@ import (
 	"auth-service/internal/hashing/pepperstore"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
-
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/service"
 	"auth-service/internal/tls"
@@ -45,7 +44,7 @@ type Factory struct {
 	// ✅ UPDATED: PostgreSQL repositories for User and Company
 	postgresClient            *client.PostgresClient
 	postgresUserRepository    postgres.UserRepository
-	postgresCompanyRepository postgres.CompanyRepository // ✅ ADDED
+	postgresCompanyRepository postgres.CompanyRepository
 
 	serviceFactory *service.ServiceFactory
 	// ✅ FIXED: Use concrete types for repositories that need type assertions
@@ -53,10 +52,6 @@ type Factory struct {
 	adminDeviceTrustRepo   scylla.AdminDeviceTrustRepository
 	adminMPINRepo          *scylla.AdminMPINRepositoryImpl
 	adminDeviceHistoryRepo *scylla.AdminDeviceHistoryRepositoryImpl
-
-	// ✅ REMOVED: Scylla UserRepository and CompanyRepository
-	// userRepository         scylla.UserRepository
-	// companyRepository      scylla.CompanyRepository
 
 	companyService     *service.CompanyService
 	adminDeviceService *service.AdminDeviceService
@@ -80,16 +75,17 @@ type Factory struct {
 	adminRepository    scylla.AdminRepository
 	adminService       *service.AdminService
 
-	// JWT and routing
-	jwtService  *service.JWTService
-	authHandler *handler.AuthHandler
-	router      chi.Router
+	// ✅ NEW: JWT and RBAC services
+	jwtService      *service.JWTService
+	rbacInitService *service.RBACInitService
+	authHandler     *handler.AuthHandler
+	router          chi.Router
 
 	logger *zap.Logger
 }
 
 // ============================================================================
-// KAFKA LOGGING MANAGER - FIXED
+// KAFKA LOGGING MANAGER
 // ============================================================================
 
 type KafkaLoggingManager struct {
@@ -158,7 +154,6 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 // ============================================================================
 // FACTORY INITIALIZATION
 // ============================================================================
-
 func NewFactory() (*Factory, error) {
 	cfg := config.LoadConfig()
 	util.Init(cfg.Environment, cfg.Logging.Level, cfg.Logging.Format)
@@ -195,11 +190,18 @@ func NewFactory() (*Factory, error) {
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
 
+	// ✅ ADD THIS: Initialize RBAC permission registry
+	ctx := context.Background()
+	if err := f.InitializeRBAC(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
+	}
+
 	util.Info("Factory initialized successfully",
 		util.String("environment", cfg.Environment),
 		util.Bool("tls_enabled", cfg.Server.EnableTLS),
 		util.Bool("kms_enabled", cfg.KMS.Enabled),
 		util.Bool("kafka_logging_enabled", f.kafkaLoggingMgr != nil),
+		util.Bool("rbac_initialized", true), // ✅ ADD THIS
 	)
 
 	return f, nil
@@ -266,9 +268,8 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		}
 
 		if len(esConsumers) > 0 {
-			// ✅ FIXED: Create ESConsumer with multiple topic consumers
 			esConsumer, err := consumer.NewESConsumer(
-				esConsumers, // ✅ Pass the map of consumers
+				esConsumers,
 				f.esClient.Client,
 			)
 			if err != nil {
@@ -346,9 +347,10 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	return mgr, nil
 }
 
-// ========================================================================
-// ADMIN REPOSITORY GETTERS - FIXED (Use concrete types)
-// ========================================================================
+// ============================================================================
+// ADMIN REPOSITORY GETTERS - FIXED
+// ============================================================================
+
 func (f *Factory) AdminDeviceRepository() *scylla.AdminDeviceRepositoryImpl {
 	if f.adminDeviceRepo == nil {
 		f.adminDeviceRepo = scylla.NewAdminDeviceRepository(
@@ -369,7 +371,6 @@ func (f *Factory) AdminDeviceTrustRepository() scylla.AdminDeviceTrustRepository
 	return f.adminDeviceTrustRepo
 }
 
-// ✅ FIXED: Return concrete type
 func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 	if f.adminMPINRepo == nil {
 		f.adminMPINRepo = scylla.NewAdminMPINRepository(
@@ -380,30 +381,6 @@ func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 	return f.adminMPINRepo
 }
 
-// ✅ UPDATED: Company repository now uses PostgreSQL
-func (f *Factory) CompanyRepository() postgres.CompanyRepository {
-	if f.postgresCompanyRepository == nil {
-		f.postgresCompanyRepository = postgres.NewCompanyRepository(
-			f.PostgresClient(),
-			f.logger,
-		)
-	}
-	return f.postgresCompanyRepository
-}
-
-// ✅ UPDATED: Company service uses PostgreSQL repository
-func (f *Factory) GetCompanyService() *service.CompanyService {
-	if f.companyService == nil {
-		f.companyService = service.NewCompanyService(
-			f.CompanyRepository(), // ✅ Now uses PostgreSQL
-			f.GetUserService(),
-			f.logger,
-		)
-	}
-	return f.companyService
-}
-
-// ✅ FIXED: Return concrete type
 func (f *Factory) AdminDeviceHistoryRepository() *scylla.AdminDeviceHistoryRepositoryImpl {
 	if f.adminDeviceHistoryRepo == nil {
 		f.adminDeviceHistoryRepo = scylla.NewAdminDeviceHistoryRepository(
@@ -414,240 +391,19 @@ func (f *Factory) AdminDeviceHistoryRepository() *scylla.AdminDeviceHistoryRepos
 	return f.adminDeviceHistoryRepo
 }
 
-// ========================================================================
-// ADMIN SERVICE GETTERS - FIXED (Use concrete types)
-// ========================================================================
+// ============================================================================
+// ✅ UPDATED REPOSITORY GETTERS - POSTGRESQL MIGRATION
+// ============================================================================
 
-func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
-	if f.adminDeviceService == nil {
-		deviceRepo := f.AdminDeviceRepository() // ✅ Now returns concrete type
-		trustRepo := f.AdminDeviceTrustRepository()
-		mpinRepo := f.AdminMPINRepository() // ✅ Now returns concrete type
-		cfg := f.Config()
-		logger := f.logger
-
-		var distCache *service.DistributedCache
-		if f.redisClient != nil {
-			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
-		}
-
-		f.adminDeviceService = service.NewAdminDeviceService(
-			deviceRepo,
-			trustRepo,
-			mpinRepo,
-			distCache,
-			*cfg,
-			logger,
+func (f *Factory) CompanyRepository() postgres.CompanyRepository {
+	if f.postgresCompanyRepository == nil {
+		f.postgresCompanyRepository = postgres.NewCompanyRepository(
+			f.PostgresClient(),
+			f.logger,
 		)
-
-		// Set history repository
-		historyRepo := f.AdminDeviceHistoryRepository() // ✅ Now returns concrete type
-		f.adminDeviceService.SetHistoryRepository(historyRepo)
-
-		// Set log producer
-		logProducer := f.GetLogProducerService()
-		if logProducer != nil {
-			f.adminDeviceService.SetLogProducerService(logProducer)
-		}
 	}
-	return f.adminDeviceService
+	return f.postgresCompanyRepository
 }
-
-func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
-	if f.adminMPINService == nil {
-		mpinRepo := f.AdminMPINRepository() // ✅ Now returns concrete type
-		adminRepo := f.AdminRepository()
-		deviceTrustRepo := f.AdminDeviceTrustRepository()
-		otpService := f.GetOTPService()
-		encryptionMgr := f.EncryptionManager()
-		hasher := f.Hasher()
-		cfg := f.Config()
-		logger := f.logger
-
-		logProducer := f.GetLogProducerService()
-
-		f.adminMPINService = service.NewAdminMPINService(
-			mpinRepo,
-			adminRepo,
-			deviceTrustRepo,
-			otpService,
-			encryptionMgr,
-			hasher,
-			cfg,
-			logger,
-			logProducer,
-		)
-
-		var distCache *service.DistributedCache
-		if f.redisClient != nil {
-			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
-			f.adminMPINService.SetDistributedCache(distCache)
-		}
-	}
-	return f.adminMPINService
-}
-
-// ============================================================================
-// CLIENT INITIALIZATION
-// ============================================================================
-
-func (f *Factory) initializeClients() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var initErrors []error
-
-	// Redis
-	if rc, err := client.NewRedisClient(f.config, f.logger); err != nil {
-		initErrors = append(initErrors, fmt.Errorf("redis: %w", err))
-	} else {
-		f.redisClient = rc
-		if err := f.redisClient.HealthCheck(ctx); err != nil {
-			initErrors = append(initErrors, fmt.Errorf("redis health check: %w", err))
-		} else {
-			util.Info("Redis client initialized and healthy")
-		}
-	}
-
-	// ✅ PostgreSQL - CRITICAL for User and Company data
-	if pgc, err := client.NewPostgresClient(f.config, f.logger); err != nil {
-		initErrors = append(initErrors, fmt.Errorf("postgres: %w", err))
-	} else {
-		f.postgresClient = pgc
-		if err := f.postgresClient.HealthCheck(ctx); err != nil {
-			initErrors = append(initErrors, fmt.Errorf("postgres health check: %w", err))
-		} else {
-			util.Info("PostgreSQL client initialized and healthy")
-		}
-	}
-
-	// ✅ ScyllaDB - NOW WITH FIXED CLIENT (NO PREPARED STATEMENT CACHING)
-	if sc, err := scylla.NewScyllaClient(f.config, f.logger); err != nil {
-		initErrors = append(initErrors, fmt.Errorf("scylla: %w", err))
-	} else {
-		f.scyllaClient = sc
-		if err := f.scyllaClient.HealthCheck(); err != nil {
-			initErrors = append(initErrors, fmt.Errorf("scylla health check: %w", err))
-		} else {
-			util.Info("ScyllaDB client initialized and healthy",
-				util.String("note", "prepared_statement_caching_disabled"))
-		}
-	}
-
-	// Kafka
-	if kp, err := client.NewKafkaProducer(f.config, f.logger); err != nil {
-		util.Warn("Kafka producer initialization failed - proceeding without Kafka", util.ErrorField(err))
-	} else {
-		f.kafkaProducer = kp
-		util.Info("Kafka producer initialized")
-	}
-
-	// Elasticsearch
-	if ec, err := client.NewElasticsearchClient(f.config, f.logger); err != nil {
-		initErrors = append(initErrors, fmt.Errorf("elasticsearch: %w", err))
-	} else {
-		f.esClient = ec
-		if err := f.esClient.HealthCheck(); err != nil {
-			initErrors = append(initErrors, fmt.Errorf("elasticsearch health check: %w", err))
-		} else {
-			util.Info("Elasticsearch client initialized and healthy")
-		}
-	}
-
-	// ClickHouse
-	if chc, err := client.NewClickHouseClient(f.config, f.logger); err != nil {
-		initErrors = append(initErrors, fmt.Errorf("clickhouse: %w", err))
-	} else {
-		f.clickhouseClient = chc
-		if err := f.clickhouseClient.HealthCheck(ctx); err != nil {
-			initErrors = append(initErrors, fmt.Errorf("clickhouse health check: %w", err))
-		} else {
-			util.Info("ClickHouse client initialized and healthy")
-		}
-	}
-
-	if len(initErrors) > 0 {
-		if f.config.IsProduction() {
-			return fmt.Errorf("critical service initialization failed: %v", initErrors)
-		}
-		for _, e := range initErrors {
-			util.Warn("Service initialization warning", util.ErrorField(e))
-		}
-	}
-	return nil
-}
-
-func (f *Factory) initializeManagers() {
-	// ✅ UPDATED: Initialize hasher with pepper store repository
-	pepperStore := f.PepperStoreRepository()
-
-	hasher, err := hashing.NewHasher(f.config, pepperStore)
-	if err != nil {
-		// ✅ IMPROVED: More descriptive error
-		f.logger.Error("CRITICAL: Failed to initialize hasher",
-			zap.Error(err),
-			zap.String("impact", "MPIN operations will fail"))
-
-		// In production, you might want to fail fast
-		if f.config.IsProduction() {
-			panic(fmt.Sprintf("CRITICAL: Failed to initialize hasher: %v", err))
-		}
-
-		// Create a dummy hasher that will fail gracefully
-		f.hasher = nil
-	} else {
-		f.hasher = hasher
-		util.Info("Hasher initialized with pepper persistence",
-			util.Int("current_pepper_version", hasher.GetCurrentPepperVersion()))
-	}
-
-	var kmsClient *kms.Client
-	if f.config.KMS.Enabled {
-		kmsClient = nil
-	}
-
-	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
-	f.bucketingManager = bucketing.NewBucketingManager(f.config)
-
-	// ✅ UPDATED: Start pepper rotation only if hasher was initialized successfully
-	if f.hasher != nil && f.config.IsProduction() {
-		f.hasher.StartPepperRotation()
-		util.Info("Pepper rotation started")
-	}
-
-	util.Info("Managers initialized successfully",
-		util.Bool("hashing_initialized", f.hasher != nil),
-		util.Bool("encryption_initialized", f.encryptionManager != nil),
-		util.Bool("bucketing_initialized", f.bucketingManager != nil),
-		util.Bool("pepper_persistence_enabled", f.hasher != nil),
-	)
-}
-
-// ============================================================================
-// ✅ JWT SERVICE GETTER
-// ============================================================================
-
-func (f *Factory) GetJWTService() *service.JWTService {
-	if f.jwtService == nil {
-		f.jwtService = service.NewJWTService(f.Config(), f.logger)
-	}
-	return f.jwtService
-}
-
-// ============================================================================
-// LOG PRODUCER SERVICE GETTER
-// ============================================================================
-
-func (f *Factory) GetLogProducerService() *service.LogProducerService {
-	if f.kafkaLoggingMgr == nil {
-		return nil
-	}
-	return f.kafkaLoggingMgr.GetLogProducerService()
-}
-
-// ========================================================================
-// REPOSITORY GETTERS - UPDATED FOR POSTGRESQL MIGRATION
-// ========================================================================
 
 func (f *Factory) PepperStoreRepository() pepperstore.PepperStore {
 	if f.pepperStoreRepo == nil {
@@ -659,7 +415,6 @@ func (f *Factory) PepperStoreRepository() pepperstore.PepperStore {
 	return f.pepperStoreRepo
 }
 
-// ✅ UPDATED: User repository now uses PostgreSQL
 func (f *Factory) UserRepository() postgres.UserRepository {
 	if f.postgresUserRepository == nil {
 		f.postgresUserRepository = postgres.NewUserRepository(
@@ -682,7 +437,6 @@ func (f *Factory) OTPRepository() scylla.OTPRepository {
 	return f.otpRepository
 }
 
-// ✅ UPDATED: MPIN Repository - NOW WITH FIXED CLIENT
 func (f *Factory) MPINRepository() scylla.MPINRepository {
 	if f.mpinRepository == nil {
 		f.mpinRepository = scylla.NewMPINRepository(
@@ -740,14 +494,39 @@ func (f *Factory) AdminRepository() scylla.AdminRepository {
 	return f.adminRepository
 }
 
-// ========================================================================
-// SERVICE GETTERS - UPDATED WITH JWT AND POSTGRESQL
-// ========================================================================
+// ============================================================================
+// ✅ JWT AND RBAC SERVICES
+// ============================================================================
+
+func (f *Factory) GetJWTService() *service.JWTService {
+	if f.jwtService == nil {
+		f.jwtService = service.NewJWTService(
+			f.Config(),
+			f.CompanyRepository(),
+			f.logger,
+		)
+	}
+	return f.jwtService
+}
+
+func (f *Factory) GetRBACInitService() *service.RBACInitService {
+	if f.rbacInitService == nil {
+		f.rbacInitService = service.NewRBACInitService(
+			f.CompanyRepository(),
+			f.logger,
+		)
+	}
+	return f.rbacInitService
+}
+
+// ============================================================================
+// ✅ SERVICE GETTERS - UPDATED WITH JWT AND BITMASK SUPPORT
+// ============================================================================
 
 func (f *Factory) ServiceFactory() *service.ServiceFactory {
 	if f.serviceFactory == nil {
 		f.serviceFactory = service.NewServiceFactory(
-			f.UserRepository(), // ✅ Now uses PostgreSQL
+			f.UserRepository(),
 			f.Hasher(),
 			f.EncryptionManager(),
 			f.logger,
@@ -756,10 +535,9 @@ func (f *Factory) ServiceFactory() *service.ServiceFactory {
 	return f.serviceFactory
 }
 
-// ✅ UPDATED: User service now uses PostgreSQL repository
 func (f *Factory) GetUserService() *service.UserService {
 	f.once.Do(func() {
-		repo := f.UserRepository() // ✅ Now returns PostgreSQL repository
+		repo := f.UserRepository()
 		hasher := f.Hasher()
 		encMgr := f.EncryptionManager()
 		logger := f.logger
@@ -770,7 +548,7 @@ func (f *Factory) GetUserService() *service.UserService {
 		}
 
 		f.userService = service.NewUserServiceWithCache(
-			repo, hasher, encMgr, distCache, logger, // ✅ 5 args
+			repo, hasher, encMgr, distCache, logger,
 		)
 
 		logProducer := f.GetLogProducerService()
@@ -802,7 +580,7 @@ func (f *Factory) GetOTPService() *service.OTPService {
 func (f *Factory) GetMPINService() *service.MPINService {
 	if f.mpinService == nil {
 		mpinRepo := f.MPINRepository()
-		userRepo := f.UserRepository() // ✅ Now uses PostgreSQL
+		userRepo := f.UserRepository()
 		deviceTrustRepo := f.GetDeviceTrustRepository()
 		otpService := f.GetOTPService()
 		encryptionMgr := f.EncryptionManager()
@@ -835,23 +613,22 @@ func (f *Factory) GetMPINService() *service.MPINService {
 	return f.mpinService
 }
 
-// ✅ UPDATED: Session Service with JWT
 func (f *Factory) GetSessionService() *service.SessionService {
 	if f.sessionService == nil {
 		sessionRepo := f.SessionRepository()
 		cfg := f.Config()
-		jwtService := f.GetJWTService() // ✅ GET JWT SERVICE
+		jwtService := f.GetJWTService()
 		logger := f.logger
-
 		logProducer := f.GetLogProducerService()
+		companyRepo := f.CompanyRepository()
 
-		// ✅ UPDATED: Pass JWT service to constructor
 		f.sessionService = service.NewSessionService(
 			sessionRepo,
 			cfg,
-			jwtService, // ✅ PASS JWT SERVICE
+			jwtService,
 			logger,
 			logProducer,
+			companyRepo,
 		)
 	}
 	return f.sessionService
@@ -886,20 +663,97 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 	return f.deviceService
 }
 
+func (f *Factory) GetCompanyService() *service.CompanyService {
+	if f.companyService == nil {
+		f.companyService = service.NewCompanyService(
+			f.CompanyRepository(),
+			f.GetUserService(),
+			f.logger,
+		)
+	}
+	return f.companyService
+}
+
 // ============================================================================
-// ADMIN SERVICE GETTER - FIXED (Missing arguments)
+// ✅ ADMIN SERVICE GETTERS
 // ============================================================================
+
+func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
+	if f.adminDeviceService == nil {
+		deviceRepo := f.AdminDeviceRepository()
+		trustRepo := f.AdminDeviceTrustRepository()
+		mpinRepo := f.AdminMPINRepository()
+		cfg := f.Config()
+		logger := f.logger
+
+		var distCache *service.DistributedCache
+		if f.redisClient != nil {
+			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+		}
+
+		f.adminDeviceService = service.NewAdminDeviceService(
+			deviceRepo,
+			trustRepo,
+			mpinRepo,
+			distCache,
+			*cfg,
+			logger,
+		)
+
+		historyRepo := f.AdminDeviceHistoryRepository()
+		f.adminDeviceService.SetHistoryRepository(historyRepo)
+
+		logProducer := f.GetLogProducerService()
+		if logProducer != nil {
+			f.adminDeviceService.SetLogProducerService(logProducer)
+		}
+	}
+	return f.adminDeviceService
+}
+
+func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
+	if f.adminMPINService == nil {
+		mpinRepo := f.AdminMPINRepository()
+		adminRepo := f.AdminRepository()
+		deviceTrustRepo := f.AdminDeviceTrustRepository()
+		otpService := f.GetOTPService()
+		encryptionMgr := f.EncryptionManager()
+		hasher := f.Hasher()
+		cfg := f.Config()
+		logger := f.logger
+
+		logProducer := f.GetLogProducerService()
+
+		f.adminMPINService = service.NewAdminMPINService(
+			mpinRepo,
+			adminRepo,
+			deviceTrustRepo,
+			otpService,
+			encryptionMgr,
+			hasher,
+			cfg,
+			logger,
+			logProducer,
+		)
+
+		var distCache *service.DistributedCache
+		if f.redisClient != nil {
+			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+			f.adminMPINService.SetDistributedCache(distCache)
+		}
+	}
+	return f.adminMPINService
+}
 
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
-		// ✅ FIXED: Add missing required services
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
-			f.UserRepository(), // ✅ Now uses PostgreSQL
+			f.UserRepository(),
 			f.GetSessionService(),
-			f.GetOTPService(),    // ✅ ADDED: Missing argument
-			f.GetMPINService(),   // ✅ ADDED: Missing argument
-			f.GetDeviceService(), // ✅ ADDED: Missing argument
+			f.GetOTPService(),
+			f.GetMPINService(),
+			f.GetDeviceService(),
 			f.Hasher(),
 			f.EncryptionManager(),
 			f.logger,
@@ -914,7 +768,137 @@ func (f *Factory) GetAdminService() *service.AdminService {
 }
 
 // ============================================================================
-// ✅ HANDLER INITIALIZATION - FIXED Router arguments
+// ✅ CLIENT INITIALIZATION
+// ============================================================================
+
+func (f *Factory) initializeClients() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var initErrors []error
+
+	// Redis
+	if rc, err := client.NewRedisClient(f.config, f.logger); err != nil {
+		initErrors = append(initErrors, fmt.Errorf("redis: %w", err))
+	} else {
+		f.redisClient = rc
+		if err := f.redisClient.HealthCheck(ctx); err != nil {
+			initErrors = append(initErrors, fmt.Errorf("redis health check: %w", err))
+		} else {
+			util.Info("Redis client initialized and healthy")
+		}
+	}
+
+	// PostgreSQL
+	if pgc, err := client.NewPostgresClient(f.config, f.logger); err != nil {
+		initErrors = append(initErrors, fmt.Errorf("postgres: %w", err))
+	} else {
+		f.postgresClient = pgc
+		if err := f.postgresClient.HealthCheck(ctx); err != nil {
+			initErrors = append(initErrors, fmt.Errorf("postgres health check: %w", err))
+		} else {
+			util.Info("PostgreSQL client initialized and healthy")
+		}
+	}
+
+	// ScyllaDB
+	if sc, err := scylla.NewScyllaClient(f.config, f.logger); err != nil {
+		initErrors = append(initErrors, fmt.Errorf("scylla: %w", err))
+	} else {
+		f.scyllaClient = sc
+		if err := f.scyllaClient.HealthCheck(); err != nil {
+			initErrors = append(initErrors, fmt.Errorf("scylla health check: %w", err))
+		} else {
+			util.Info("ScyllaDB client initialized and healthy")
+		}
+	}
+
+	// Kafka
+	if kp, err := client.NewKafkaProducer(f.config, f.logger); err != nil {
+		util.Warn("Kafka producer initialization failed - proceeding without Kafka", util.ErrorField(err))
+	} else {
+		f.kafkaProducer = kp
+		util.Info("Kafka producer initialized")
+	}
+
+	// Elasticsearch
+	if ec, err := client.NewElasticsearchClient(f.config, f.logger); err != nil {
+		initErrors = append(initErrors, fmt.Errorf("elasticsearch: %w", err))
+	} else {
+		f.esClient = ec
+		if err := f.esClient.HealthCheck(); err != nil {
+			initErrors = append(initErrors, fmt.Errorf("elasticsearch health check: %w", err))
+		} else {
+			util.Info("Elasticsearch client initialized and healthy")
+		}
+	}
+
+	// ClickHouse
+	if chc, err := client.NewClickHouseClient(f.config, f.logger); err != nil {
+		initErrors = append(initErrors, fmt.Errorf("clickhouse: %w", err))
+	} else {
+		f.clickhouseClient = chc
+		if err := f.clickhouseClient.HealthCheck(ctx); err != nil {
+			initErrors = append(initErrors, fmt.Errorf("clickhouse health check: %w", err))
+		} else {
+			util.Info("ClickHouse client initialized and healthy")
+		}
+	}
+
+	if len(initErrors) > 0 {
+		if f.config.IsProduction() {
+			return fmt.Errorf("critical service initialization failed: %v", initErrors)
+		}
+		for _, e := range initErrors {
+			util.Warn("Service initialization warning", util.ErrorField(e))
+		}
+	}
+	return nil
+}
+
+func (f *Factory) initializeManagers() {
+	pepperStore := f.PepperStoreRepository()
+
+	hasher, err := hashing.NewHasher(f.config, pepperStore)
+	if err != nil {
+		f.logger.Error("CRITICAL: Failed to initialize hasher",
+			zap.Error(err),
+			zap.String("impact", "MPIN operations will fail"))
+
+		if f.config.IsProduction() {
+			panic(fmt.Sprintf("CRITICAL: Failed to initialize hasher: %v", err))
+		}
+
+		f.hasher = nil
+	} else {
+		f.hasher = hasher
+		util.Info("Hasher initialized with pepper persistence",
+			util.Int("current_pepper_version", hasher.GetCurrentPepperVersion()))
+	}
+
+	var kmsClient *kms.Client
+	if f.config.KMS.Enabled {
+		kmsClient = nil
+	}
+
+	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
+	f.bucketingManager = bucketing.NewBucketingManager(f.config)
+
+	if f.hasher != nil && f.config.IsProduction() {
+		f.hasher.StartPepperRotation()
+		util.Info("Pepper rotation started")
+	}
+
+	util.Info("Managers initialized successfully",
+		util.Bool("hashing_initialized", f.hasher != nil),
+		util.Bool("encryption_initialized", f.encryptionManager != nil),
+		util.Bool("bucketing_initialized", f.bucketingManager != nil),
+		util.Bool("pepper_persistence_enabled", f.hasher != nil),
+	)
+}
+
+// ============================================================================
+// ✅ HANDLER INITIALIZATION - UPDATED WITH JWT AND RBAC
 // ============================================================================
 
 func (f *Factory) InitializeHandlers() error {
@@ -929,62 +913,58 @@ func (f *Factory) InitializeHandlers() error {
 	sessionService := f.GetSessionService()
 	deviceService := f.GetDeviceService()
 	adminService := f.GetAdminService()
-	companyService := f.GetCompanyService() // ✅ Now uses PostgreSQL
+	companyService := f.GetCompanyService()
 	jwtService := f.GetJWTService()
 
-	// ✅ Initialize handlers with updated constructors
-	// userHandler := handler.NewUserHandler(userService, logger)
-
-	// ✅ OTP handler with session service
+	// Initialize handlers
 	otpHandler := handler.NewOTPHandler(
 		otpService,
-		sessionService, // ✅ For JWT token issuance
+		sessionService,
 		logger,
 	)
 
-	// sessionHandler := handler.NewSessionHandler(sessionService, logger)
-	// deviceHandler := handler.NewDeviceHandler(deviceService, logger)
 	adminHandler := handler.NewAdminHandler(
-		adminService,       // ✅ First: *service.AdminService
-		companyService,     // ✅ Second: *service.CompanyService
-		userService,        // ✅ Third: *service.UserService
-		otpService,         // ✅ Fourth: *service.OTPService
-		adminMPINService,   // ✅ Fifth: *service.AdminMPINService
-		adminDeviceService, // ✅ Sixth: *service.AdminDeviceService
-		sessionService,     // ✅ Seventh: *service.SessionService
-		jwtService,         // ✅ Eighth: *service.JWTService
-		logger,             // ✅ Ninth: *zap.Logger
+		adminService,
+		companyService,
+		userService,
+		otpService,
+		adminMPINService,
+		adminDeviceService,
+		sessionService,
+		jwtService,
+		logger,
 	)
+
 	rbacHandler := handler.NewRBACHandler(companyService, logger)
+
 	// ✅ FIXED: Auth handler with all required services
 	authHandler := handler.NewAuthHandler(
 		otpService,
 		mpinService,
 		sessionService,
 		userService,
-		companyService, // ✅ Now uses PostgreSQL
+		companyService,
 		deviceService,
 		jwtService,
 		logger,
 	)
 	f.authHandler = authHandler
 
-	// ✅ FIXED: Router with correct number of arguments (8 instead of 10)
+	// ✅ FIXED: Router with correct number of arguments
 	f.router = handler.NewRouter(
-		otpHandler,     // ✅ First argument: OTPHandler
-		adminHandler,   // ✅ Second argument: AdminHandler
-		authHandler,    // ✅ Third argument: AuthHandler
-		rbacHandler,    // Add this
-		sessionService, // ✅ Fourth argument: SessionService
-		jwtService,     // ✅ Fifth argument: JWTService
-		logger,         // ✅ Sixth argument: Logger
+		otpHandler,
+		adminHandler,
+		authHandler,
+		rbacHandler,
+		sessionService,
+		jwtService,
+		logger,
 	)
 
-	logger.Info("Handlers and router initialized with PostgreSQL support")
+	logger.Info("Handlers and router initialized with JWT and bitmask support")
 	return nil
 }
 
-// ✅ NEW: Router getter
 func (f *Factory) GetRouter() chi.Router {
 	if f.router == nil {
 		if err := f.InitializeHandlers(); err != nil {
@@ -994,14 +974,27 @@ func (f *Factory) GetRouter() chi.Router {
 	return f.router
 }
 
-// ========================================================================
-// HEALTH CHECK - UPDATED FOR POSTGRESQL MIGRATION
-// ========================================================================
+// ============================================================================
+// ✅ RBAC INITIALIZATION
+// ============================================================================
+
+func (f *Factory) InitializeRBAC(ctx context.Context) error {
+	rbacInitService := f.GetRBACInitService()
+	if err := rbacInitService.InitializePermissionRegistry(ctx); err != nil {
+		return fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
+	}
+	f.logger.Info("RBAC permission registry initialized successfully")
+	return nil
+}
+
+// ============================================================================
+// ✅ HEALTH CHECK - UPDATED FOR JWT AND RBAC
+// ============================================================================
 
 func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	errs := make(map[string]error)
 
-	// ✅ PostgreSQL health checks (CRITICAL for User and Company data)
+	// PostgreSQL health checks
 	if f.postgresClient != nil {
 		if err := f.postgresClient.HealthCheck(ctx); err != nil {
 			errs["postgres"] = err
@@ -1010,7 +1003,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["postgres"] = fmt.Errorf("postgres client not initialized")
 	}
 
-	// ✅ PostgreSQL User Repository health check
 	if f.postgresUserRepository != nil {
 		if err := f.postgresUserRepository.HealthCheck(ctx); err != nil {
 			errs["postgres_user_repository"] = err
@@ -1019,7 +1011,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["postgres_user_repository"] = fmt.Errorf("postgres user repository not initialized")
 	}
 
-	// ✅ PostgreSQL Company Repository health check
 	if f.postgresCompanyRepository != nil {
 		if err := f.postgresCompanyRepository.HealthCheck(ctx); err != nil {
 			errs["postgres_company_repository"] = err
@@ -1028,6 +1019,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["postgres_company_repository"] = fmt.Errorf("postgres company repository not initialized")
 	}
 
+	// Other clients and repositories...
 	if f.redisClient != nil {
 		if err := f.redisClient.HealthCheck(ctx); err != nil {
 			errs["redis"] = err
@@ -1098,7 +1090,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["device_repository"] = fmt.Errorf("device repository not initialized")
 	}
 
-	// ✅ DEVICE HISTORY REPOSITORY HEALTH CHECK
 	if f.deviceHistoryRepo != nil {
 		if err := f.deviceHistoryRepo.HealthCheck(ctx); err != nil {
 			errs["device_history_repository"] = err
@@ -1107,7 +1098,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["device_history_repository"] = fmt.Errorf("device history repository not initialized")
 	}
 
-	// ✅ ADMIN REPOSITORY HEALTH CHECK
 	if f.adminRepository != nil {
 		if err := f.adminRepository.HealthCheck(ctx); err != nil {
 			errs["admin_repository"] = err
@@ -1116,7 +1106,29 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_repository"] = fmt.Errorf("admin repository not initialized")
 	}
 
-	// ✅ KAFKA LOGGING HEALTH CHECK
+	// ✅ NEW: JWT and RBAC service health checks
+	if f.jwtService != nil {
+		// JWT service doesn't have a health check method, but we can verify it's initialized
+	} else {
+		errs["jwt_service"] = fmt.Errorf("JWT service not initialized")
+	}
+
+	if f.rbacInitService != nil {
+		// RBAC init service doesn't have a health check method
+	} else {
+		errs["rbac_init_service"] = fmt.Errorf("RBAC init service not initialized")
+	}
+
+	// ✅ NEW: Company service health check
+	if f.companyService != nil {
+		if err := f.companyService.HealthCheck(ctx); err != nil {
+			errs["company_service"] = err
+		}
+	} else {
+		errs["company_service"] = fmt.Errorf("company service not initialized")
+	}
+
+	// Kafka logging health check
 	if f.kafkaLoggingMgr != nil {
 		kafkaErrs := f.kafkaLoggingMgr.HealthCheck(ctx)
 		for k, v := range kafkaErrs {
@@ -1126,9 +1138,8 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["kafka_logging"] = fmt.Errorf("kafka logging manager not initialized")
 	}
 
-	// ✅ NEW: Pepper store health check
+	// Pepper store health check
 	if f.pepperStoreRepo != nil {
-		// Try to get current pepper as health check
 		_, _, err := f.pepperStoreRepo.GetCurrentPepper(ctx)
 		if err != nil {
 			errs["pepper_store"] = fmt.Errorf("pepper store health check failed: %w", err)
@@ -1137,7 +1148,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["pepper_store"] = fmt.Errorf("pepper store repository not initialized")
 	}
 
-	// ✅ NEW: Hasher health check (with context)
+	// Hasher health check
 	if f.hasher != nil {
 		if err := f.hasher.HealthCheck(ctx); err != nil {
 			errs["hasher"] = err
@@ -1146,7 +1157,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["hasher"] = fmt.Errorf("hasher not initialized")
 	}
 
-	// ✅ ADDED: Admin repositories health checks
+	// Admin repositories health checks
 	if f.adminDeviceRepo != nil {
 		if err := f.adminDeviceRepo.HealthCheck(ctx); err != nil {
 			errs["admin_device_repository"] = err
@@ -1163,7 +1174,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_mpin_repository"] = fmt.Errorf("admin MPIN repository not initialized")
 	}
 
-	// ✅ ADDED: Admin services health checks
+	// Admin services health checks
 	if f.adminDeviceService != nil {
 		if err := f.adminDeviceService.HealthCheck(ctx); err != nil {
 			errs["admin_device_service"] = err
@@ -1183,27 +1194,29 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	return errs
 }
 
-// ========================================================================
-// CLEANUP
-// ========================================================================
+// ============================================================================
+// ✅ CLEANUP
+// ============================================================================
 
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)
 		util.Info("Shutting down factory...")
 
-		// ✅ Shutdown Kafka logging first
+		// Shutdown Kafka logging first
 		if f.kafkaLoggingMgr != nil {
 			if err := f.kafkaLoggingMgr.Shutdown(); err != nil {
 				util.Error("Failed to shutdown Kafka logging", util.ErrorField(err))
 			}
 			util.Info("Kafka logging system shut down")
 		}
-		// ✅ PostgreSQL cleanup (CRITICAL - User and Company data)
+
+		// PostgreSQL cleanup
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
 			util.Info("PostgreSQL client closed")
 		}
+
 		if f.clickhouseClient != nil {
 			f.clickhouseClient.Close()
 			util.Info("ClickHouse client closed")
@@ -1233,11 +1246,12 @@ func (f *Factory) Close() error {
 			f.redisClient.Close()
 			util.Info("Redis client closed")
 		}
-		// ✅ NEW: Hasher cleanup if it has any resources
+
+		// Hasher cleanup
 		if f.hasher != nil {
-			// If hasher has any background goroutines, stop them here
 			util.Info("Hasher shut down")
 		}
+
 		if f.encryptionManager != nil {
 			f.encryptionManager.ClearCache()
 			util.Info("Encryption manager cache cleared")
@@ -1248,6 +1262,7 @@ func (f *Factory) Close() error {
 	})
 	return nil
 }
+
 func parseIntDefault(s string, def int) int {
 	if s == "" {
 		return def
@@ -1259,9 +1274,9 @@ func parseIntDefault(s string, def int) int {
 	return i
 }
 
-// ========================================================================
-// SIMPLE GETTERS
-// ========================================================================
+// ============================================================================
+// ✅ SIMPLE GETTERS
+// ============================================================================
 
 func (f *Factory) Config() *config.Config                           { return f.config }
 func (f *Factory) TLSManager() *tls.TLSManager                      { return f.tlsManager }
@@ -1269,12 +1284,15 @@ func (f *Factory) ScyllaClient() *scylla.ScyllaClient               { return f.s
 func (f *Factory) Hasher() *hashing.Hasher                          { return f.hasher }
 func (f *Factory) EncryptionManager() *encryption.EncryptionManager { return f.encryptionManager }
 func (f *Factory) BucketingManager() *bucketing.BucketingManager    { return f.bucketingManager }
-
-// ✅ UPDATED: PostgreSQL getters
-func (f *Factory) PostgresClient() *client.PostgresClient {
-	return f.postgresClient
+func (f *Factory) PostgresClient() *client.PostgresClient           { return f.postgresClient }
+func (f *Factory) GetLogProducerService() *service.LogProducerService {
+	if f.kafkaLoggingMgr == nil {
+		return nil
+	}
+	return f.kafkaLoggingMgr.GetLogProducerService()
 }
 
+// ✅ UPDATED: PostgreSQL repository getters
 func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	if f.postgresUserRepository == nil {
 		f.postgresUserRepository = postgres.NewUserRepository(
@@ -1285,7 +1303,6 @@ func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	return f.postgresUserRepository
 }
 
-// ✅ ADDED: PostgreSQL Company repository getter
 func (f *Factory) PostgresCompanyRepository() postgres.CompanyRepository {
 	if f.postgresCompanyRepository == nil {
 		f.postgresCompanyRepository = postgres.NewCompanyRepository(

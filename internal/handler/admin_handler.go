@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-
 	"strings"
 	"time"
 
@@ -59,7 +58,6 @@ func NewAdminHandler(
 
 func (h *AdminHandler) RegisterRoutes(router chi.Router) {
 	// Admin Authentication Routes (public - no auth middleware)
-	// ONLY register public auth routes - protected management routes are registered manually in router
 	router.Route("/admin-auth", func(r chi.Router) {
 		r.Post("/login/initiate", h.InitiateAdminLogin)
 		r.Post("/login/verify-otp", h.VerifyAdminOTPLogin)
@@ -69,16 +67,9 @@ func (h *AdminHandler) RegisterRoutes(router chi.Router) {
 		r.Post("/logout", h.LogoutAdmin)
 		r.Get("/health", h.HealthCheck)
 	})
-
-	// REMOVED: Admin Management Routes (protected - now registered manually in router)
-	// These routes are registered in router.go under /admin protected route group
-	// to prevent duplicate route registration conflict
-
-	// REMOVED: Company Management Routes (protected - now registered manually in router)
-
-	// REMOVED: User Management Routes (protected - now registered manually in router)
 }
 
+// ===== HELPER RESPONSE
 // ===== ADMIN AUTHENTICATION FLOW =====
 
 // LoginFlowResponse defines the response for admin login flow
@@ -434,77 +425,6 @@ type CreateCompanyRequest struct {
 	Departments        []string `json:"departments"` // Departments to create for this company
 }
 
-// CreateCompany creates a new company and sets up RBAC structure
-// func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	adminID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-// 		return
-// 	}
-
-// 	var req CreateCompanyRequest
-
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Validate required fields
-// 	if req.CompanyName == "" || req.OwnerPhone == "" || req.SubscriptionTier == "" ||
-// 		(req.SubscriptionMonths == 0 && req.SubscriptionDays == 0) {
-// 		h.respondWithError(w, http.StatusBadRequest,
-// 			fmt.Errorf("missing required fields"),
-// 			"Company name, owner phone, subscription tier, and at least subscription months or days are required")
-// 		return
-// 	}
-
-// 	// Create company using enhanced service
-// 	companyReq := service.CreateCompanyRequest{
-// 		CompanyName:        req.CompanyName,
-// 		OwnerPhone:         req.OwnerPhone,
-// 		SubscriptionTier:   req.SubscriptionTier,
-// 		MaxEmployees:       req.MaxEmployees,
-// 		DataRegion:         req.DataRegion,
-// 		SubscriptionMonths: req.SubscriptionMonths,
-// 		SubscriptionDays:   req.SubscriptionDays,
-// 	}
-
-// 	company, err := h.companyService.CreateCompany(ctx, &companyReq)
-// 	if err != nil {
-// 		if strings.Contains(err.Error(), "already exists") {
-// 			h.respondWithError(w, http.StatusConflict, err, "Company with this name already exists for the owner")
-// 			return
-// 		}
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to create company")
-// 		return
-// 	}
-
-// 	// Create default departments if specified
-// 	if len(req.Departments) > 0 {
-// 		if err := h.setupCompanyDepartments(ctx, company.CompanyID, req.Departments, adminID); err != nil {
-// 			h.logger.Warn("Failed to setup some departments for company",
-// 				util.String("company_id", company.CompanyID.String()),
-// 				util.ErrorField(err))
-// 			// Continue even if department setup fails
-// 		}
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(company, "Company created successfully with RBAC setup"))
-
-//		h.logger.Info("Company created by admin with RBAC setup",
-//			util.String("company_id", company.CompanyID.String()),
-//			util.String("company_name", company.CompanyName),
-//			util.String("owner_phone", req.OwnerPhone),
-//			util.String("subscription_tier", req.SubscriptionTier),
-//			util.Int("department_count", len(req.Departments)),
-//			util.String("created_by", adminID.String()),
-//			util.Duration("duration", time.Since(startTime)),
-//		)
-//	}
 func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -533,7 +453,7 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		Departments:        req.Departments, // Pass departments to service
 	}
 
-	company, err := h.companyService.CreateCompany(ctx, &companyReq)
+	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			h.respondWithError(w, http.StatusConflict, err, "Company with this name already exists for the owner")
@@ -556,78 +476,6 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
-
-// // setupCompanyDepartments creates departments for a new company
-// func (h *AdminHandler) setupCompanyDepartments(ctx context.Context, companyID uuid.UUID, departments []string, adminID uuid.UUID) error {
-// 	// Get available system departments
-// 	systemDepts, err := h.companyService.GetSystemDepartments(ctx)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to get system departments: %w", err)
-// 	}
-
-// 	systemDeptMap := make(map[string]uuid.UUID)
-// 	for _, dept := range systemDepts {
-// 		systemDeptMap[dept.ModuleCode] = dept.SystemDepartmentID
-// 	}
-
-// 	// Create requested departments
-// 	for _, deptName := range departments {
-// 		// Map department name to system module
-// 		var systemDeptID uuid.UUID
-// 		switch strings.ToLower(deptName) {
-// 		case "hr", "human resources":
-// 			systemDeptID = systemDeptMap["hr"]
-// 		case "finance", "accounting":
-// 			systemDeptID = systemDeptMap["finance"]
-// 		case "inventory", "warehouse":
-// 			systemDeptID = systemDeptMap["inventory"]
-// 		case "sales":
-// 			systemDeptID = systemDeptMap["sales"]
-// 		case "production", "manufacturing":
-// 			systemDeptID = systemDeptMap["production"]
-// 		case "logistics", "shipping":
-// 			systemDeptID = systemDeptMap["logistics"]
-// 		case "it", "technology":
-// 			systemDeptID = systemDeptMap["it"]
-// 		case "customer support", "support":
-// 			systemDeptID = systemDeptMap["support"]
-// 		case "quality control", "qc":
-// 			systemDeptID = systemDeptMap["qc"]
-// 		case "quality assurance", "qa":
-// 			systemDeptID = systemDeptMap["qa"]
-// 		case "research", "r&d":
-// 			systemDeptID = systemDeptMap["rnd"]
-// 		case "operations":
-// 			systemDeptID = systemDeptMap["operations"]
-// 		case "marketing":
-// 			systemDeptID = systemDeptMap["marketing"]
-// 		case "procurement", "purchasing":
-// 			systemDeptID = systemDeptMap["procurement"]
-// 		default:
-// 			// Use operations as default
-// 			systemDeptID = systemDeptMap["operations"]
-// 		}
-
-// 		deptReq := service.CreateDepartmentRequest{
-// 			CompanyID:          companyID,
-// 			DepartmentName:     deptName,
-// 			SystemDepartmentID: systemDeptID,
-// 			DepartmentHead:     nil, // Can be set later
-// 			ParentDepartmentID: nil,
-// 			CreatedBy:          adminID,
-// 		}
-
-// 		if _, err := h.companyService.CreateDepartment(ctx, &deptReq); err != nil {
-// 			h.logger.Warn("Failed to create department",
-// 				util.String("company_id", companyID.String()),
-// 				util.String("department_name", deptName),
-// 				util.ErrorField(err))
-// 			continue
-// 		}
-// 	}
-
-// 	return nil
-// }
 
 // ===== DEPARTMENT MANAGEMENT =====
 
@@ -664,7 +512,6 @@ func (h *AdminHandler) CreateDepartment(w http.ResponseWriter, r *http.Request) 
 		SystemDepartmentID: req.SystemDepartmentID,
 		DepartmentHead:     req.DepartmentHead,
 		ParentDepartmentID: req.ParentDepartmentID,
-		CreatedBy:          adminID,
 	}
 
 	department, err := h.companyService.CreateDepartment(ctx, &deptReq)
@@ -685,46 +532,46 @@ func (h *AdminHandler) CreateDepartment(w http.ResponseWriter, r *http.Request) 
 	)
 }
 
-// GetCompanyDepartments retrieves all departments for a company
-func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // GetCompanyDepartments retrieves all departments for a company
+// func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
+// 	companyIDStr := chi.URLParam(r, "companyID")
+// 	companyID, err := uuid.Parse(companyIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+// 		return
+// 	}
 
-	limit := h.getIntQueryParam(r, "limit", 50)
-	offset := h.getIntQueryParam(r, "offset", 0)
+// 	limit := h.getIntQueryParam(r, "limit", 50)
+// 	offset := h.getIntQueryParam(r, "offset", 0)
 
-	departments, total, err := h.companyService.ListDepartments(ctx, companyID, limit, offset, false)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company departments")
-		return
-	}
+// 	departments, total, err := h.companyService.GetDepartmentsByCompany(ctx, companyID, limit, offset)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company departments")
+// 		return
+// 	}
 
-	response := map[string]interface{}{
-		"departments": departments,
-		"meta": map[string]interface{}{
-			"company_id": companyID.String(),
-			"count":      len(departments),
-			"total":      total,
-			"limit":      limit,
-			"offset":     offset,
-		},
-	}
+// 	response := map[string]interface{}{
+// 		"departments": departments,
+// 		"meta": map[string]interface{}{
+// 			"company_id": companyID.String(),
+// 			"count":      len(departments),
+// 			"total":      total,
+// 			"limit":      limit,
+// 			"offset":     offset,
+// 		},
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company departments retrieved successfully"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company departments retrieved successfully"))
 
-	h.logger.Debug("Company departments retrieved",
-		util.String("company_id", companyID.String()),
-		util.Int("count", len(departments)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Debug("Company departments retrieved",
+// 		util.String("company_id", companyID.String()),
+// 		util.Int("count", len(departments)),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 // ===== ROLE MANAGEMENT =====
 
@@ -801,9 +648,9 @@ func (h *AdminHandler) GetCompanyRoles(w http.ResponseWriter, r *http.Request) {
 
 	limit := h.getIntQueryParam(r, "limit", 50)
 	offset := h.getIntQueryParam(r, "offset", 0)
-	includePermissions := h.getBoolQueryParam(r, "include_permissions", false)
+	_ = h.getBoolQueryParam(r, "include_permissions", false)
 
-	roles, total, err := h.companyService.ListRoles(ctx, companyID, limit, offset, includePermissions)
+	roles, total, err := h.companyService.GetRolesByCompany(ctx, companyID, limit, offset)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company roles")
 		return
@@ -861,7 +708,7 @@ func (h *AdminHandler) GetPermissionsByModule(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	permissions, err := h.companyService.ListPermissionsByModule(ctx, module)
+	permissions, err := h.companyService.GetPermissionsByModule(ctx, module)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get permissions by module")
 		return
@@ -947,7 +794,6 @@ func (h *AdminHandler) GrantRolePermissions(w http.ResponseWriter, r *http.Reque
 	grantReq := service.GrantRolePermissionsRequest{
 		RoleID:        roleID,
 		PermissionIDs: req.PermissionIDs,
-		GrantedBy:     adminID,
 	}
 
 	if err := h.companyService.GrantRolePermissions(ctx, &grantReq); err != nil {
@@ -965,64 +811,6 @@ func (h *AdminHandler) GrantRolePermissions(w http.ResponseWriter, r *http.Reque
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
-
-// ===== EMPLOYEE MANAGEMENT WITH RBAC =====
-
-// // AddEmployeeRequest defines the request for adding an employee with RBAC
-// type AddEmployeeRequest struct {
-// 	CompanyID    uuid.UUID  `json:"company_id" validate:"required"`
-// 	PhoneNumber  string     `json:"phone_number" validate:"required"`
-// 	EmployeeID   string     `json:"employee_id" validate:"required"`
-// 	RoleID       uuid.UUID  `json:"role_id" validate:"required"`
-// 	DepartmentID uuid.UUID  `json:"department_id" validate:"required"`
-// 	ReportsTo    *uuid.UUID `json:"reports_to,omitempty"`
-// }
-
-// func (h *AdminHandler) AddEmployee(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	adminID, err := h.getRequesterAdminID(r)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-// 		return
-// 	}
-
-// 	var req AddEmployeeRequest
-
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Convert to service request
-// 	empReq := service.AddEmployeeRequest{
-// 		CompanyID:    req.CompanyID,
-// 		PhoneNumber:  req.PhoneNumber,
-// 		EmployeeID:   req.EmployeeID,
-// 		RoleID:       req.RoleID,
-// 		DepartmentID: req.DepartmentID,
-// 		ReportsTo:    req.ReportsTo,
-// 		AddedBy:      adminID,
-// 	}
-
-// 	if err := h.companyService.AddEmployee(ctx, &empReq); err != nil {
-// 		statusCode := h.getStatusCode(err)
-// 		h.respondWithError(w, statusCode, err, "Failed to add employee")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Employee added successfully with RBAC setup"))
-
-// 	h.logger.Info("Employee added with RBAC setup",
-// 		util.String("company_id", req.CompanyID.String()),
-// 		util.String("employee_id", req.EmployeeID),
-// 		util.String("role_id", req.RoleID.String()),
-// 		util.String("department_id", req.DepartmentID.String()),
-// 		util.String("added_by", adminID.String()),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
 
 // UpdateEmployeeRole updates employee role and department
 func (h *AdminHandler) UpdateEmployeeRole(w http.ResponseWriter, r *http.Request) {
@@ -2816,4 +2604,176 @@ func (h *AdminHandler) sanitizeUserForAdmin(u *models.User) {
 	u.PhoneKeyID = uuid.Nil
 	u.PhoneEncryptedDEK = ""
 	// Keep phone_hash and other non-sensitive fields for admin listing
+}
+
+// GetCompanyDepartments retrieves all departments for a company
+func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Get user ID from context
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	// Check session type first - admin has full access
+	sessionType, _ := ctx.Value("session_type").(string)
+	accessMethod := "none"
+
+	if sessionType == "admin" {
+		accessMethod = "admin"
+		// Admin can access any company's departments
+	} else {
+		// For non-admin users, check if they belong to the company
+		isEmployee, err := h.companyService.IsUserActiveEmployee(ctx, companyID, userID)
+		if err != nil || !isEmployee {
+			h.respondWithError(w, http.StatusForbidden,
+				fmt.Errorf("ACCESS_DENIED: User is not an employee of this company"),
+				"You don't have permission to view departments for this company")
+			return
+		}
+
+		// Check if user has permission to view departments
+		hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "administrative.department.view")
+		if err != nil {
+			h.logger.Warn("Permission check failed",
+				util.String("user_id", userID.String()),
+				util.String("company_id", companyID.String()),
+				util.ErrorField(err))
+		}
+
+		if hasPermission {
+			accessMethod = "permission"
+		} else {
+			// Check if user is company owner
+			isOwner, err := h.isCompanyOwner(r, companyID)
+			if err != nil {
+				h.logger.Warn("Owner check failed",
+					util.String("user_id", userID.String()),
+					util.String("company_id", companyID.String()),
+					util.ErrorField(err))
+			} else if isOwner {
+				accessMethod = "owner"
+			} else {
+				h.respondWithError(w, http.StatusForbidden,
+					fmt.Errorf("ACCESS_DENIED: No permission to view company departments"),
+					"You don't have permission to view departments for this company")
+				return
+			}
+		}
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	departments, total, err := h.companyService.GetDepartmentsByCompany(ctx, companyID, limit, offset)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company departments")
+		return
+	}
+
+	response := map[string]interface{}{
+		"departments": departments,
+		"meta": map[string]interface{}{
+			"company_id":    companyID.String(),
+			"count":         len(departments),
+			"total":         total,
+			"limit":         limit,
+			"offset":        offset,
+			"access_method": accessMethod,
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company departments retrieved successfully"))
+
+	h.logger.Info("Company departments retrieved",
+		util.String("company_id", companyID.String()),
+		util.String("user_id", userID.String()),
+		util.String("access_method", accessMethod),
+		util.Int("count", len(departments)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// Fix the helper method to check if user is company owner
+func (h *AdminHandler) isCompanyOwner(r *http.Request, companyID uuid.UUID) (bool, error) {
+	ctx := r.Context()
+
+	// Get user ID from context
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok {
+		return false, fmt.Errorf("user ID not found in context")
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return false, fmt.Errorf("invalid user ID in context")
+	}
+
+	// Get company directly from repository to avoid permission issues
+	company, err := h.companyService.GetCompany(ctx, companyID)
+	if err != nil {
+		return false, fmt.Errorf("company not found: %w", err)
+	}
+
+	return company.OwnerUserID == userID, nil
+}
+
+// Temporary debug endpoint - remove in production
+func (h *AdminHandler) DebugCompanyDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Get all departments without pagination for debugging
+	departments, total, err := h.companyService.GetDepartmentsByCompany(ctx, companyID, 1000, 0)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get departments")
+		return
+	}
+
+	// Get company info
+	company, err := h.companyService.GetCompany(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company")
+		return
+	}
+
+	response := map[string]interface{}{
+		"company": map[string]interface{}{
+			"id":            company.CompanyID,
+			"name":          company.CompanyName,
+			"owner_user_id": company.OwnerUserID,
+		},
+		"departments": departments,
+		"total_count": total,
+		"debug_info": map[string]interface{}{
+			"company_id":       companyID.String(),
+			"department_count": len(departments),
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Debug department info"))
 }
