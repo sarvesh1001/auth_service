@@ -164,17 +164,11 @@ func NewFactory() (*Factory, error) {
 		closed: make(chan struct{}),
 		logger: logger,
 	}
-
 	if cfg.Server.EnableTLS {
 		tlsConfig := &tls.TLSConfig{
-			EnableTLS:   cfg.Server.EnableTLS,
-			AutoCert:    cfg.Server.AutoCert,
-			Domain:      cfg.Server.Domain,
-			CertFile:    cfg.Server.CertFile,
-			KeyFile:     cfg.Server.KeyFile,
-			AutoCertDir: cfg.Server.AutoCertDir,
-			Email:       cfg.Server.Email,
-			Environment: cfg.Environment,
+			EnableTLS: cfg.Server.EnableTLS,
+			CertFile:  cfg.Server.CertFile,
+			KeyFile:   cfg.Server.KeyFile,
 		}
 		f.tlsManager = tls.NewTLSManager(tlsConfig)
 	}

@@ -30,7 +30,7 @@ func NewRouter(
 	// ============================================================
 	// GLOBAL MIDDLEWARES
 	// ============================================================
-	router.Use(requireHTTPS)
+	// router.Use(requireHTTPS)
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
 	router.Use(LoggerMiddleware(logger))
@@ -416,17 +416,17 @@ func CompanyAccessMiddleware() func(http.Handler) http.Handler {
 	}
 }
 
-func requireHTTPS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil && !strings.Contains(r.Host, "localhost") && !strings.Contains(r.Host, "127.0.0.1") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUpgradeRequired)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "https required"})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
+// func requireHTTPS(next http.Handler) http.Handler {
+// 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// 		if r.TLS == nil && !strings.Contains(r.Host, "localhost") && !strings.Contains(r.Host, "127.0.0.1") {
+// 			w.Header().Set("Content-Type", "application/json")
+// 			w.WriteHeader(http.StatusUpgradeRequired)
+// 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "https required"})
+// 			return
+// 		}
+// 		next.ServeHTTP(w, r)
+// 	})
+// }
 
 func JWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -490,6 +490,34 @@ func LoggerMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+func requireHTTPS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		host := r.Host
+
+		// Allow HTTP on local dev networks:
+		if r.TLS == nil &&
+			(strings.HasPrefix(host, "localhost") ||
+				strings.HasPrefix(host, "127.0.0.1") ||
+				strings.HasPrefix(host, "192.168.") ||
+				strings.HasPrefix(host, "10.") ||
+				strings.HasPrefix(host, "172.16.")) {
+
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// All other cases require HTTPS
+		if r.TLS == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUpgradeRequired)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "https required"})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func respondWithJWTError(w http.ResponseWriter, logger *zap.Logger, statusCode int, message string) {

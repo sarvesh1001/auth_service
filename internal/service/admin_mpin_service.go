@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sync"
 	"time"
+
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -56,10 +57,10 @@ type AdminMPINVerifyResult struct {
 }
 
 type AdminMPINChangeRequest struct {
-	AdminID    uuid.UUID `json:"admin_id" validate:"required"`
-	CurrentMPIN string   `json:"current_mpin" validate:"required"`
-	NewMPIN    string    `json:"new_mpin" validate:"required,min=6,max=8"`
-	DeviceID   string    `json:"device_id" validate:"required"`
+	AdminID     uuid.UUID `json:"admin_id" validate:"required"`
+	CurrentMPIN string    `json:"current_mpin" validate:"required"`
+	NewMPIN     string    `json:"new_mpin" validate:"required,min=6,max=8"`
+	DeviceID    string    `json:"device_id" validate:"required"`
 }
 
 type AdminMPINResetRequest struct {
@@ -171,7 +172,7 @@ func (s *AdminMPINService) isAdminMPINWeak(mpin string) bool {
 		return true
 	}
 	weakAdminMPINs := []string{
-		"123456", "000000", "111111", "222222", "333333", "444444", 
+		"123456", "000000", "111111", "222222", "333333", "444444",
 		"555555", "666666", "777777", "888888", "999999", "112233",
 		"123123", "654321", "121212", "131313", "123321",
 	}
@@ -1144,28 +1145,28 @@ func (s *AdminMPINService) UnlockAdminMPIN(ctx context.Context, adminID uuid.UUI
 }
 
 // GetAdminMPINStatus gets admin MPIN status
-func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.UUID) (*AdminMPINStatus, error) {
-	mpinCred, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, adminID)
-	if err != nil {
-		if err.Error() == "MPIN not found for admin: "+adminID.String() {
-			return &AdminMPINStatus{
-				AdminID: adminID,
-				Exists:  false,
-			}, nil
-		}
-		return nil, err
-	}
+// func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.UUID) (*AdminMPINStatus, error) {
+// 	mpinCred, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, adminID)
+// 	if err != nil {
+// 		if err.Error() == "MPIN not found for admin: "+adminID.String() {
+// 			return &AdminMPINStatus{
+// 				AdminID: adminID,
+// 				Exists:  false,
+// 			}, nil
+// 		}
+// 		return nil, err
+// 	}
 
-	return &AdminMPINStatus{
-		AdminID:        adminID,
-		Exists:         true,
-		IsLocked:       mpinCred.IsLocked,
-		FailedAttempts: mpinCred.FailedAttempts,
-		LockedUntil:    mpinCred.LockedUntil,
-		LastChanged:    mpinCred.LastChanged,
-		DeviceID:       mpinCred.DeviceID,
-	}, nil
-}
+// 	return &AdminMPINStatus{
+// 		AdminID:        adminID,
+// 		Exists:         true,
+// 		IsLocked:       mpinCred.IsLocked,
+// 		FailedAttempts: mpinCred.FailedAttempts,
+// 		LockedUntil:    mpinCred.LockedUntil,
+// 		LastChanged:    mpinCred.LastChanged,
+// 		DeviceID:       mpinCred.DeviceID,
+// 	}, nil
+// }
 
 // UpdateAdminMPINDeviceBinding updates device binding for admin MPIN
 func (s *AdminMPINService) UpdateAdminMPINDeviceBinding(ctx context.Context, adminID uuid.UUID, deviceID string) error {
@@ -1884,13 +1885,11 @@ func (s *AdminMPINService) ForgotAdminMPIN(ctx context.Context, req *AdminMPINFo
 }
 
 func (s *AdminMPINService) invalidateAdminMPINCache(ctx context.Context, adminID uuid.UUID) {
-    if s.distCache != nil {
-        cacheKey := fmt.Sprintf("admin_mpin:%s", adminID.String())
-        _ = s.distCache.Delete(ctx, cacheKey)
-    }
+	if s.distCache != nil {
+		cacheKey := fmt.Sprintf("admin_mpin:%s", adminID.String())
+		_ = s.distCache.Delete(ctx, cacheKey)
+	}
 }
-
-
 
 // SetLogProducerService sets Kafka log producer service
 func (s *AdminMPINService) SetLogProducerService(logProducer *LogProducerService) {
@@ -1910,4 +1909,46 @@ func (s *AdminMPINService) DebugHasherStatus(ctx context.Context) map[string]int
 	}
 
 	return status
+}
+
+// GetAdminMPINStatus gets admin MPIN status - WITH DEBUG LOGGING
+func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.UUID) (*AdminMPINStatus, error) {
+	s.logger.Debug("🔍 GetAdminMPINStatus called",
+		util.String("admin_id", adminID.String()))
+
+	mpinCred, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, adminID)
+	if err != nil {
+		s.logger.Error("❌ Error getting admin MPIN",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()))
+		return nil, err
+	}
+
+	if mpinCred == nil {
+		s.logger.Debug("❌ No MPIN found - returning Exists: false",
+			util.String("admin_id", adminID.String()))
+		return &AdminMPINStatus{
+			AdminID:        adminID,
+			Exists:         false, // ✅ This is crucial
+			IsLocked:       false,
+			FailedAttempts: 0,
+			LockedUntil:    nil,
+			LastChanged:    nil,
+			DeviceID:       "",
+		}, nil
+	}
+
+	s.logger.Debug("✅ MPIN exists - returning Exists: true",
+		util.String("admin_id", adminID.String()),
+		util.Bool("is_locked", mpinCred.IsLocked))
+
+	return &AdminMPINStatus{
+		AdminID:        adminID,
+		Exists:         true, // ✅ Only when MPIN actually exists
+		IsLocked:       mpinCred.IsLocked,
+		FailedAttempts: mpinCred.FailedAttempts,
+		LockedUntil:    mpinCred.LockedUntil,
+		LastChanged:    mpinCred.LastChanged,
+		DeviceID:       mpinCred.DeviceID,
+	}, nil
 }

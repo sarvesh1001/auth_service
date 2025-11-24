@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
 type AdminMPINRepository interface {
 	// Core MPIN operations
 	CreateAdminMPIN(ctx context.Context, mpin *models.MPINCredential) error
@@ -42,13 +43,13 @@ type AdminMPINRepository interface {
 	// Compatibility method
 	GetMPINByUserID(ctx context.Context, userID uuid.UUID) (*models.MPINCredential, error)
 }
+
 // Constants for admin MPIN
 const (
 	AdminMPINMaxFailedAttempts = 5
 	AdminMPINLockoutDuration   = 30 * time.Minute // Longer lockout for admins
 	AdminMPINBatchSize         = 100
 )
-
 
 // AdminMPINRepositoryImpl implements AdminMPINRepository interface
 type AdminMPINRepositoryImpl struct {
@@ -102,58 +103,58 @@ func (r *AdminMPINRepositoryImpl) CreateAdminMPIN(ctx context.Context, mpin *mod
 	return nil
 }
 
-// GetAdminMPINByAdminID retrieves admin MPIN credential by admin ID
-func (r *AdminMPINRepositoryImpl) GetAdminMPINByAdminID(ctx context.Context, adminID uuid.UUID) (*models.MPINCredential, error) {
-	r.mu.RLock()
-	client := r.client
-	r.mu.RUnlock()
+// // GetAdminMPINByAdminID retrieves admin MPIN credential by admin ID
+// func (r *AdminMPINRepositoryImpl) GetAdminMPINByAdminID(ctx context.Context, adminID uuid.UUID) (*models.MPINCredential, error) {
+// 	r.mu.RLock()
+// 	client := r.client
+// 	r.mu.RUnlock()
 
-	query := client.Query(`
-        SELECT admin_id, mpin_hash, mpin_salt, pepper_version, hash_algorithm,
-               device_id, last_changed, failed_attempts, is_locked, locked_until
-        FROM admin_mpin_credentials WHERE admin_id = ?`,
-		gocql.UUID(adminID))
+// 	query := client.Query(`
+//         SELECT admin_id, mpin_hash, mpin_salt, pepper_version, hash_algorithm,
+//                device_id, last_changed, failed_attempts, is_locked, locked_until
+//         FROM admin_mpin_credentials WHERE admin_id = ?`,
+// 		gocql.UUID(adminID))
 
-	var mpin models.MPINCredential
-	var scannedID gocql.UUID
+// 	var mpin models.MPINCredential
+// 	var scannedID gocql.UUID
 
-	err := client.ScanWithRetry(query.WithContext(ctx),
-		&scannedID,
-		&mpin.MPINHash,
-		&mpin.MPINSalt,
-		&mpin.PepperVersion,
-		&mpin.HashAlgorithm,
-		&mpin.DeviceID,
-		&mpin.LastChanged,
-		&mpin.FailedAttempts,
-		&mpin.IsLocked,
-		&mpin.LockedUntil,
-	)
-	if err != nil {
-		if err == gocql.ErrNotFound {
-			return nil, fmt.Errorf("MPIN not found for admin: %s", adminID)
-		}
-		return nil, fmt.Errorf("failed to get admin MPIN: %w", err)
-	}
+// 	err := client.ScanWithRetry(query.WithContext(ctx),
+// 		&scannedID,
+// 		&mpin.MPINHash,
+// 		&mpin.MPINSalt,
+// 		&mpin.PepperVersion,
+// 		&mpin.HashAlgorithm,
+// 		&mpin.DeviceID,
+// 		&mpin.LastChanged,
+// 		&mpin.FailedAttempts,
+// 		&mpin.IsLocked,
+// 		&mpin.LockedUntil,
+// 	)
+// 	if err != nil {
+// 		if err == gocql.ErrNotFound {
+// 			return nil, fmt.Errorf("MPIN not found for admin: %s", adminID)
+// 		}
+// 		return nil, fmt.Errorf("failed to get admin MPIN: %w", err)
+// 	}
 
-	mpin.UserID = uuid.UUID(scannedID).String()
+// 	mpin.UserID = uuid.UUID(scannedID).String()
 
-	// Auto-unlock expired locks
-	if mpin.IsLocked && mpin.LockedUntil != nil && time.Now().After(*mpin.LockedUntil) {
-		if err := r.UnlockAdminMPIN(ctx, adminID); err != nil {
-			r.logger.Warn("Failed to auto-unlock expired admin MPIN",
-				util.ErrorField(err),
-				util.String("admin_id", adminID.String()),
-			)
-		} else {
-			mpin.IsLocked = false
-			mpin.LockedUntil = nil
-			mpin.FailedAttempts = 0
-		}
-	}
+// 	// Auto-unlock expired locks
+// 	if mpin.IsLocked && mpin.LockedUntil != nil && time.Now().After(*mpin.LockedUntil) {
+// 		if err := r.UnlockAdminMPIN(ctx, adminID); err != nil {
+// 			r.logger.Warn("Failed to auto-unlock expired admin MPIN",
+// 				util.ErrorField(err),
+// 				util.String("admin_id", adminID.String()),
+// 			)
+// 		} else {
+// 			mpin.IsLocked = false
+// 			mpin.LockedUntil = nil
+// 			mpin.FailedAttempts = 0
+// 		}
+// 	}
 
-	return &mpin, nil
-}
+// 	return &mpin, nil
+// }
 
 // UpdateAdminMPIN updates admin MPIN hash and related fields
 func (r *AdminMPINRepositoryImpl) UpdateAdminMPIN(ctx context.Context, adminID uuid.UUID, mpinHash, salt string, pepperVersion int) error {
@@ -471,39 +472,108 @@ func (r *AdminMPINRepositoryImpl) GetAdminMPINByUserID(ctx context.Context, user
 func (r *AdminDeviceRepositoryImpl) BindUserDevice(ctx context.Context, userID uuid.UUID, deviceID, bindToken string) error {
 	return r.BindAdminDevice(ctx, userID, deviceID, bindToken)
 }
+
 // GetMPINByAdminID retrieves MPIN credentials for an admin
 // This method is required by the interface - FIXED VERSION
 func (r *AdminMPINRepositoryImpl) GetMPINByAdminID(ctx context.Context, adminID uuid.UUID) (*models.MPINCredential, error) {
-    // Use the same query structure as GetAdminMPINByAdminID
-    query := r.client.Query(`
+	// Use the same query structure as GetAdminMPINByAdminID
+	query := r.client.Query(`
         SELECT admin_id, mpin_hash, mpin_salt, pepper_version, hash_algorithm,
                device_id, last_changed, failed_attempts, is_locked, locked_until
         FROM admin_mpin_credentials WHERE admin_id = ?`,
-        gocql.UUID(adminID))
+		gocql.UUID(adminID))
 
-    var mpin models.MPINCredential
-    var scannedID gocql.UUID
+	var mpin models.MPINCredential
+	var scannedID gocql.UUID
 
-    err := r.client.ScanWithRetry(query.WithContext(ctx),
-        &scannedID,
-        &mpin.MPINHash,
-        &mpin.MPINSalt,        // ✅ Fixed: Use MPINSalt, not Salt
-        &mpin.PepperVersion,
-        &mpin.HashAlgorithm,
-        &mpin.DeviceID,
-        &mpin.LastChanged,      // ✅ Fixed: Use LastChanged, not CreatedAt
-        &mpin.FailedAttempts,
-        &mpin.IsLocked,
-        &mpin.LockedUntil,
-    )
+	err := r.client.ScanWithRetry(query.WithContext(ctx),
+		&scannedID,
+		&mpin.MPINHash,
+		&mpin.MPINSalt, // ✅ Fixed: Use MPINSalt, not Salt
+		&mpin.PepperVersion,
+		&mpin.HashAlgorithm,
+		&mpin.DeviceID,
+		&mpin.LastChanged, // ✅ Fixed: Use LastChanged, not CreatedAt
+		&mpin.FailedAttempts,
+		&mpin.IsLocked,
+		&mpin.LockedUntil,
+	)
 
-    if err != nil {
-        if err == gocql.ErrNotFound {
-            return nil, nil
-        }
-        return nil, fmt.Errorf("failed to get MPIN by admin ID: %w", err)
-    }
+	if err != nil {
+		if err == gocql.ErrNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get MPIN by admin ID: %w", err)
+	}
 
-    mpin.UserID = uuid.UUID(scannedID).String()  // ✅ Fixed: Convert to string
-    return &mpin, nil
+	mpin.UserID = uuid.UUID(scannedID).String() // ✅ Fixed: Convert to string
+	return &mpin, nil
+} // GetAdminMPINByAdminID retrieves admin MPIN credential by admin ID - FIXED VERSION
+// GetAdminMPINByAdminID retrieves admin MPIN credential by admin ID - WITH DEBUG LOGGING
+func (r *AdminMPINRepositoryImpl) GetAdminMPINByAdminID(ctx context.Context, adminID uuid.UUID) (*models.MPINCredential, error) {
+	r.mu.RLock()
+	client := r.client
+	r.mu.RUnlock()
+
+	r.logger.Debug("🔍 GetAdminMPINByAdminID called",
+		util.String("admin_id", adminID.String()))
+
+	query := client.Query(`
+        SELECT admin_id, mpin_hash, mpin_salt, pepper_version, hash_algorithm,
+               device_id, last_changed, failed_attempts, is_locked, locked_until
+        FROM admin_mpin_credentials WHERE admin_id = ?`,
+		gocql.UUID(adminID))
+
+	var mpin models.MPINCredential
+	var scannedID gocql.UUID
+
+	err := client.ScanWithRetry(query.WithContext(ctx),
+		&scannedID,
+		&mpin.MPINHash,
+		&mpin.MPINSalt,
+		&mpin.PepperVersion,
+		&mpin.HashAlgorithm,
+		&mpin.DeviceID,
+		&mpin.LastChanged,
+		&mpin.FailedAttempts,
+		&mpin.IsLocked,
+		&mpin.LockedUntil,
+	)
+
+	if err != nil {
+		if err == gocql.ErrNotFound {
+			r.logger.Debug("❌ MPIN not found for admin",
+				util.String("admin_id", adminID.String()))
+			return nil, nil // Return nil for "not found"
+		}
+		r.logger.Error("❌ Database error getting admin MPIN",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()))
+		return nil, fmt.Errorf("failed to get admin MPIN: %w", err)
+	}
+
+	mpin.UserID = uuid.UUID(scannedID).String()
+
+	r.logger.Debug("✅ MPIN found for admin",
+		util.String("admin_id", adminID.String()),
+		util.Bool("is_locked", mpin.IsLocked),
+		util.Int("failed_attempts", mpin.FailedAttempts))
+
+	// Auto-unlock expired locks
+	if mpin.IsLocked && mpin.LockedUntil != nil && time.Now().After(*mpin.LockedUntil) {
+		r.logger.Debug("🔄 Auto-unlocking expired MPIN lock",
+			util.String("admin_id", adminID.String()))
+		if err := r.UnlockAdminMPIN(ctx, adminID); err != nil {
+			r.logger.Warn("Failed to auto-unlock expired admin MPIN",
+				util.ErrorField(err),
+				util.String("admin_id", adminID.String()),
+			)
+		} else {
+			mpin.IsLocked = false
+			mpin.LockedUntil = nil
+			mpin.FailedAttempts = 0
+		}
+	}
+
+	return &mpin, nil
 }

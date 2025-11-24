@@ -102,6 +102,10 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 
+	h.logger.Debug("🔍 InitiateAdminLogin called",
+		util.String("phone", req.PhoneNumber),
+		util.String("device_id", req.DeviceID))
+
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	adminExists := err == nil && admin != nil
 
@@ -116,22 +120,44 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	h.logger.Debug("🔍 Checking MPIN status for admin",
+		util.String("admin_id", admin.AdminID.String()))
+
 	// Use AdminMPINService method
 	mpinStatus, err := h.mpinService.GetAdminMPINStatus(ctx, admin.AdminID)
 	if err != nil {
+		h.logger.Error("❌ Error getting MPIN status",
+			util.ErrorField(err),
+			util.String("admin_id", admin.AdminID.String()))
 		response.FlowState = "existing_user_otp"
 		response.Message = "Existing admin - OTP verification required (no MPIN setup)"
 		h.respondWithJSON(w, http.StatusOK, successResponse(response, "Login flow determined"))
 		return
 	}
 
-	response.HasMPIN = true
+	h.logger.Debug("📊 MPIN Status Result",
+		util.String("admin_id", admin.AdminID.String()),
+		util.Bool("exists", mpinStatus.Exists),
+		util.Bool("is_locked", mpinStatus.IsLocked))
+
+	// ✅ CRITICAL: Only set HasMPIN to true if MPIN actually exists
+	response.HasMPIN = mpinStatus.Exists
 	response.MPINLocked = mpinStatus.IsLocked
 
 	// Use AdminDeviceService method
 	deviceTrusted, _ := h.deviceService.IsDeviceTrusted(ctx, admin.AdminID, req.DeviceID)
 
-	if response.MPINLocked {
+	h.logger.Debug("📊 Final Login Flow Decision",
+		util.String("admin_id", admin.AdminID.String()),
+		util.Bool("has_mpin", response.HasMPIN),
+		util.Bool("mpin_locked", response.MPINLocked),
+		util.Bool("device_trusted", deviceTrusted))
+
+	// Update flow logic based on MPIN existence
+	if !mpinStatus.Exists {
+		response.FlowState = "existing_user_otp"
+		response.Message = "Existing admin - OTP verification required (no MPIN setup)"
+	} else if response.MPINLocked {
 		response.FlowState = "mpin_locked"
 		response.Message = "MPIN locked - OTP verification required"
 	} else if deviceTrusted {
@@ -146,17 +172,16 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin login flow determined"))
 
-	h.logger.Info("Admin login initiation completed",
+	h.logger.Info("✅ Admin login initiation completed",
 		util.String("phone", req.PhoneNumber),
 		util.Bool("admin_exists", adminExists),
-		util.Bool("has_mpin", response.HasMPIN),
+		util.Bool("has_mpin", response.HasMPIN), // This should now be accurate
 		util.Bool("mpin_locked", response.MPINLocked),
 		util.Bool("device_trusted", deviceTrusted),
 		util.String("flow_state", response.FlowState),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
-
 func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -2409,12 +2434,11 @@ func (h *AdminHandler) GetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // ===== HELPER METHODS =====
-
-func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
-	status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
-	return err == nil && status != nil && status.Exists
-}
-
+//
+//	func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
+//		status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
+//		return err == nil && status != nil && status.Exists // ✅ Check the Exists field
+//	}
 func (h *AdminHandler) getIntQueryParam(r *http.Request, key string, defaultValue int) int {
 	value := r.URL.Query().Get(key)
 	if value == "" {
@@ -2776,4 +2800,22 @@ func (h *AdminHandler) DebugCompanyDepartments(w http.ResponseWriter, r *http.Re
 	}
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Debug department info"))
+}
+func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
+	h.logger.Debug("🔍 hasMPIN helper called", util.String("admin_id", adminID.String()))
+
+	status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
+	if err != nil {
+		h.logger.Warn("❌ Error in hasMPIN helper",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()))
+		return false
+	}
+
+	result := status != nil && status.Exists
+	h.logger.Debug("📊 hasMPIN result",
+		util.String("admin_id", adminID.String()),
+		util.Bool("result", result))
+
+	return result
 }
