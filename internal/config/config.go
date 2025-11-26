@@ -39,6 +39,8 @@ type Config struct {
 	MPIN          MPINConfig
 	JWT           JWTConfig
 	Encryption    EncryptionConfig
+	QR            QRConfig
+	WebSocket     WebSocketConfig
 }
 
 // ----------------------------
@@ -213,6 +215,34 @@ type OTPConfig struct {
 	BypassRateLimitDev bool          `json:"bypass_rate_limit_dev"`
 }
 
+// ✅ NEW: QR Web Login configuration
+type QRConfig struct {
+	HMACSecret       string        `mapstructure:"hmac_secret"`
+	Expiry           time.Duration `mapstructure:"expiry"`
+	CleanupInterval  time.Duration `mapstructure:"cleanup_interval"`
+	PollingInterval  time.Duration `mapstructure:"polling_interval"`
+	MaxQRPerUser     int           `mapstructure:"max_qr_per_user"`
+	CacheTTL         time.Duration `mapstructure:"cache_ttl"`
+	TokenLength      int           `mapstructure:"token_length"`
+	RequireUserAgent bool          `mapstructure:"require_user_agent"`
+	AllowSameDevice  bool          `mapstructure:"allow_same_device"`
+	LogScansInDev    bool          `mapstructure:"log_scans_in_dev"`
+}
+
+// ✅ NEW: WebSocket configuration
+type WebSocketConfig struct {
+	ReadBufferSize    int           `mapstructure:"read_buffer_size"`
+	WriteBufferSize   int           `mapstructure:"write_buffer_size"`
+	MaxMessageSize    int64         `mapstructure:"max_message_size"`
+	HandshakeTimeout  time.Duration `mapstructure:"handshake_timeout"`
+	WriteWait         time.Duration `mapstructure:"write_wait"`
+	PongWait          time.Duration `mapstructure:"pong_wait"`
+	PingPeriod        time.Duration `mapstructure:"ping_period"`
+	MaxConnections    int           `mapstructure:"max_connections"`
+	AllowedOrigins    []string      `mapstructure:"allowed_origins"`
+	EnableCompression bool          `mapstructure:"enable_compression"`
+}
+
 var (
 	cfg       *Config
 	once      sync.Once
@@ -349,9 +379,11 @@ func LoadConfig() *Config {
 				Enabled:  !isDev,
 			},
 
-			OTP:  loadOTPConfig(environment),
-			MPIN: loadMPINConfig(environment),
-			JWT:  loadJWTConfig(environment),
+			OTP:       loadOTPConfig(environment),
+			MPIN:      loadMPINConfig(environment),
+			JWT:       loadJWTConfig(environment),
+			QR:        loadQRConfig(environment),
+			WebSocket: loadWebSocketConfig(),
 
 			Encryption: EncryptionConfig{
 				MasterKey:  getEnv("ENCRYPTION_MASTER_KEY", ""),
@@ -380,6 +412,8 @@ func LoadConfig() *Config {
 			zap.Duration("jwt_access_ttl", cfg.JWT.AccessTTL),
 			zap.Duration("jwt_refresh_ttl", cfg.JWT.RefreshTTL),
 			zap.Bool("jwt_rotate_refresh", cfg.JWT.RotateRefreshTokens),
+			zap.Duration("qr_expiry", cfg.QR.Expiry),
+			zap.Int("websocket_max_connections", cfg.WebSocket.MaxConnections),
 		)
 	})
 
@@ -461,6 +495,46 @@ func loadOTPConfig(env string) OTPConfig {
 		SMSTemplateID:      getEnv("SMS_TEMPLATE_ID", ""),
 		LogOTPInDev:        isDev,
 		BypassRateLimitDev: getEnvAsBool("OTP_BYPASS_RATE_LIMIT_DEV", isDev),
+	}
+}
+
+// ----------------------------
+// ✅ NEW: loadQRConfig
+// ----------------------------
+
+func loadQRConfig(env string) QRConfig {
+	isDev := env == "development"
+
+	return QRConfig{
+		HMACSecret:       getSecureEnv("QR_HMAC_SECRET", "default-qr-hmac-secret-change-in-production"),
+		Expiry:           getEnvAsDuration("QR_EXPIRY", 10*time.Minute),
+		CleanupInterval:  getEnvAsDuration("QR_CLEANUP_INTERVAL", 1*time.Hour),
+		PollingInterval:  getEnvAsDuration("QR_POLLING_INTERVAL", 2*time.Second),
+		MaxQRPerUser:     getEnvAsInt("QR_MAX_PER_USER", 5),
+		CacheTTL:         getEnvAsDuration("QR_CACHE_TTL", 15*time.Minute),
+		TokenLength:      getEnvAsInt("QR_TOKEN_LENGTH", 32),
+		RequireUserAgent: getEnvAsBool("QR_REQUIRE_USER_AGENT", true),
+		AllowSameDevice:  getEnvAsBool("QR_ALLOW_SAME_DEVICE", false),
+		LogScansInDev:    getEnvAsBool("QR_LOG_SCANS_IN_DEV", isDev),
+	}
+}
+
+// ----------------------------
+// ✅ NEW: loadWebSocketConfig
+// ----------------------------
+
+func loadWebSocketConfig() WebSocketConfig {
+	return WebSocketConfig{
+		ReadBufferSize:    getEnvAsInt("WS_READ_BUFFER_SIZE", 1024),
+		WriteBufferSize:   getEnvAsInt("WS_WRITE_BUFFER_SIZE", 1024),
+		MaxMessageSize:    getEnvAsInt64("WS_MAX_MESSAGE_SIZE", 512),
+		HandshakeTimeout:  getEnvAsDuration("WS_HANDSHAKE_TIMEOUT", 10*time.Second),
+		WriteWait:         getEnvAsDuration("WS_WRITE_WAIT", 10*time.Second),
+		PongWait:          getEnvAsDuration("WS_PONG_WAIT", 60*time.Second),
+		PingPeriod:        getEnvAsDuration("WS_PING_PERIOD", 54*time.Second),
+		MaxConnections:    getEnvAsInt("WS_MAX_CONNECTIONS", 10000),
+		AllowedOrigins:    getEnvAsSlice("WS_ALLOWED_ORIGINS", []string{"*"}, ","),
+		EnableCompression: getEnvAsBool("WS_ENABLE_COMPRESSION", true),
 	}
 }
 
@@ -624,6 +698,25 @@ func validateConfig(cfg *Config) {
 		if cfg.OTP.LogOTPInDev {
 			util.Warn("OTP logging enabled in production")
 		}
+
+		// ✅ NEW: QR validation
+		if cfg.QR.HMACSecret == "default-qr-hmac-secret-change-in-production" {
+			util.Warn("QR_HMAC_SECRET is using default value - change in production")
+		}
+		if cfg.QR.Expiry < 5*time.Minute {
+			util.Warn("QR_EXPIRY is very short - consider increasing for better UX")
+		}
+		if cfg.QR.AllowSameDevice {
+			util.Warn("QR_ALLOW_SAME_DEVICE is enabled - this may reduce security")
+		}
+
+		// ✅ NEW: WebSocket validation
+		if cfg.WebSocket.MaxConnections < 1000 {
+			util.Warn("WS_MAX_CONNECTIONS is low - consider increasing for production")
+		}
+		if cfg.WebSocket.AllowedOrigins[0] == "*" {
+			util.Warn("WS_ALLOWED_ORIGINS is set to '*' - consider restricting in production")
+		}
 	}
 
 	if cfg.Hashing.Argon2MemoryCost < 65536 {
@@ -645,6 +738,14 @@ func getEnv(key, defaultValue string) string {
 func getEnvAsInt(key string, defaultValue int) int {
 	strValue := getEnv(key, "")
 	if value, err := strconv.Atoi(strValue); err == nil {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvAsInt64(key string, defaultValue int64) int64 {
+	strValue := getEnv(key, "")
+	if value, err := strconv.ParseInt(strValue, 10, 64); err == nil {
 		return value
 	}
 	return defaultValue

@@ -12,6 +12,7 @@ import (
 	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
+	"auth-service/internal/models"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
@@ -40,7 +41,13 @@ type Factory struct {
 	hasher            *hashing.Hasher
 	encryptionManager *encryption.EncryptionManager
 	bucketingManager  *bucketing.BucketingManager
-
+	pairingRepo       redis.PairingRepository
+	pairingService    *service.PairingService
+	wsService         *service.WebSocketService
+	pairingHandler    *handler.PairingHandler
+	wsHandler         *handler.WebSocketHandler
+	qrUtil            *util.QRUtil
+	hmacUtil          *util.HMACUtil
 	// ✅ UPDATED: PostgreSQL repositories for User and Company
 	postgresClient            *client.PostgresClient
 	postgresUserRepository    postgres.UserRepository
@@ -894,6 +901,9 @@ func (f *Factory) initializeManagers() {
 // ============================================================================
 // ✅ HANDLER INITIALIZATION - UPDATED WITH JWT AND RBAC
 // ============================================================================
+// ============================================================================
+// ✅ HANDLER INITIALIZATION - UPDATED WITH QR WEB LOGIN
+// ============================================================================
 
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
@@ -909,6 +919,10 @@ func (f *Factory) InitializeHandlers() error {
 	adminService := f.GetAdminService()
 	companyService := f.GetCompanyService()
 	jwtService := f.GetJWTService()
+
+	// ✅ NEW: QR Web Login services
+	_ = f.GetPairingService()
+	_ = f.GetWebSocketService()
 
 	// Initialize handlers
 	otpHandler := handler.NewOTPHandler(
@@ -944,21 +958,26 @@ func (f *Factory) InitializeHandlers() error {
 	)
 	f.authHandler = authHandler
 
-	// ✅ FIXED: Router with correct number of arguments
+	// ✅ NEW: QR Web Login handlers
+	pairingHandler := f.GetPairingHandler()
+	wsHandler := f.GetWebSocketHandler()
+
+	// ✅ UPDATED: Router with QR Web Login handlers
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
 		authHandler,
 		rbacHandler,
+		pairingHandler, // ✅ NEW
+		wsHandler,      // ✅ NEW
 		sessionService,
 		jwtService,
 		logger,
 	)
 
-	logger.Info("Handlers and router initialized with JWT and bitmask support")
+	logger.Info("Handlers and router initialized with JWT, bitmask, and QR web login support")
 	return nil
 }
-
 func (f *Factory) GetRouter() chi.Router {
 	if f.router == nil {
 		if err := f.InitializeHandlers(); err != nil {
@@ -984,7 +1003,6 @@ func (f *Factory) InitializeRBAC(ctx context.Context) error {
 // ============================================================================
 // ✅ HEALTH CHECK - UPDATED FOR JWT AND RBAC
 // ============================================================================
-
 func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	errs := make(map[string]error)
 
@@ -1100,20 +1118,15 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_repository"] = fmt.Errorf("admin repository not initialized")
 	}
 
-	// ✅ NEW: JWT and RBAC service health checks
-	if f.jwtService != nil {
-		// JWT service doesn't have a health check method, but we can verify it's initialized
-	} else {
+	// JWT + RBAC
+	if f.jwtService == nil {
 		errs["jwt_service"] = fmt.Errorf("JWT service not initialized")
 	}
-
-	if f.rbacInitService != nil {
-		// RBAC init service doesn't have a health check method
-	} else {
+	if f.rbacInitService == nil {
 		errs["rbac_init_service"] = fmt.Errorf("RBAC init service not initialized")
 	}
 
-	// ✅ NEW: Company service health check
+	// Company service
 	if f.companyService != nil {
 		if err := f.companyService.HealthCheck(ctx); err != nil {
 			errs["company_service"] = err
@@ -1132,7 +1145,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["kafka_logging"] = fmt.Errorf("kafka logging manager not initialized")
 	}
 
-	// Pepper store health check
+	// Pepper store
 	if f.pepperStoreRepo != nil {
 		_, _, err := f.pepperStoreRepo.GetCurrentPepper(ctx)
 		if err != nil {
@@ -1142,7 +1155,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["pepper_store"] = fmt.Errorf("pepper store repository not initialized")
 	}
 
-	// Hasher health check
+	// Hasher
 	if f.hasher != nil {
 		if err := f.hasher.HealthCheck(ctx); err != nil {
 			errs["hasher"] = err
@@ -1151,7 +1164,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["hasher"] = fmt.Errorf("hasher not initialized")
 	}
 
-	// Admin repositories health checks
+	// Admin repositories
 	if f.adminDeviceRepo != nil {
 		if err := f.adminDeviceRepo.HealthCheck(ctx); err != nil {
 			errs["admin_device_repository"] = err
@@ -1168,7 +1181,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_mpin_repository"] = fmt.Errorf("admin MPIN repository not initialized")
 	}
 
-	// Admin services health checks
+	// Admin services
 	if f.adminDeviceService != nil {
 		if err := f.adminDeviceService.HealthCheck(ctx); err != nil {
 			errs["admin_device_service"] = err
@@ -1185,13 +1198,46 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_mpin_service"] = fmt.Errorf("admin MPIN service not initialized")
 	}
 
+	// ======================================================================
+	// ✅ NEW — QR WEB LOGIN HEALTH CHECKS
+	// ======================================================================
+	if f.pairingRepo != nil {
+		testSession := &models.PairingSession{
+			SessionID: "health-check",
+			Status:    "pending",
+			Nonce:     "test-nonce",
+			CreatedAt: time.Now(),
+			ExpiresAt: time.Now().Add(1 * time.Minute),
+		}
+
+		if err := f.pairingRepo.CreatePairingSession(ctx, testSession); err != nil {
+			errs["pairing_repository"] = fmt.Errorf("pairing repository health check failed: %w", err)
+		} else {
+			// cleanup
+			_ = f.pairingRepo.DeletePairingSession(ctx, "health-check")
+		}
+	} else {
+		errs["pairing_repository"] = fmt.Errorf("pairing repository not initialized")
+	}
+
+	if f.pairingService == nil {
+		errs["pairing_service"] = fmt.Errorf("pairing service not initialized")
+	}
+
+	if f.wsService == nil {
+		errs["websocket_service"] = fmt.Errorf("WebSocket service not initialized")
+	}
+
+	if f.qrUtil == nil {
+		errs["qr_util"] = fmt.Errorf("QR utility not initialized")
+	}
+
 	return errs
 }
 
 // ============================================================================
 // ✅ CLEANUP
 // ============================================================================
-
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)
@@ -1211,31 +1257,37 @@ func (f *Factory) Close() error {
 			util.Info("PostgreSQL client closed")
 		}
 
+		// ClickHouse cleanup
 		if f.clickhouseClient != nil {
 			f.clickhouseClient.Close()
 			util.Info("ClickHouse client closed")
 		}
 
+		// Elasticsearch cleanup
 		if f.esClient != nil {
 			f.esClient.Close()
 			util.Info("Elasticsearch client closed")
 		}
 
+		// Kafka producer cleanup
 		if f.kafkaProducer != nil {
 			f.kafkaProducer.Close()
 			util.Info("Kafka producer closed")
 		}
 
+		// Service factory cleanup
 		if f.serviceFactory != nil {
 			f.serviceFactory.Cleanup()
 			util.Info("Service factory cleaned up")
 		}
 
+		// Scylla cleanup
 		if f.scyllaClient != nil {
 			f.scyllaClient.Close()
 			util.Info("ScyllaDB client closed")
 		}
 
+		// Redis cleanup
 		if f.redisClient != nil {
 			f.redisClient.Close()
 			util.Info("Redis client closed")
@@ -1246,14 +1298,27 @@ func (f *Factory) Close() error {
 			util.Info("Hasher shut down")
 		}
 
+		// Encryption manager cleanup
 		if f.encryptionManager != nil {
 			f.encryptionManager.ClearCache()
 			util.Info("Encryption manager cache cleared")
 		}
 
+		// ============================================================================
+		// ✅ NEW — CLEANUP FOR QR WEB LOGIN
+		// ============================================================================
+
+		// WebSocket service cleanup
+		if f.wsService != nil {
+			// If wsService has a Close() or Shutdown() method, call it here:
+			// _ = f.wsService.Close()
+			util.Info("WebSocket service shut down")
+		}
+
 		util.Sync()
 		util.Info("Factory shutdown completed")
 	})
+
 	return nil
 }
 
@@ -1305,4 +1370,85 @@ func (f *Factory) PostgresCompanyRepository() postgres.CompanyRepository {
 		)
 	}
 	return f.postgresCompanyRepository
+}
+
+// GetPairingRepository returns the pairing repository
+func (f *Factory) GetPairingRepository() redis.PairingRepository {
+	if f.pairingRepo == nil {
+		f.pairingRepo = redis.NewPairingRepository(
+			f.redisClient.Client(),
+			f.logger,
+		)
+	}
+	return f.pairingRepo
+}
+
+// GetHMACUtil returns HMAC utility
+func (f *Factory) GetHMACUtil() *util.HMACUtil {
+	if f.hmacUtil == nil {
+		secret := f.config.Security.JWTSecret // Use JWT secret or separate config
+		if secret == "" {
+			secret = "default-qr-hmac-secret-change-in-production"
+		}
+		f.hmacUtil = util.NewHMACUtil(secret)
+	}
+	return f.hmacUtil
+}
+
+// GetQRUtil returns QR utility
+func (f *Factory) GetQRUtil() *util.QRUtil {
+	if f.qrUtil == nil {
+		f.qrUtil = util.NewQRUtil(f.config.Security.JWTSecret)
+	}
+	return f.qrUtil
+}
+
+// GetPairingService returns the pairing service
+func (f *Factory) GetPairingService() *service.PairingService {
+	if f.pairingService == nil {
+		f.pairingService = service.NewPairingService(
+			f.GetPairingRepository(),
+			f.GetSessionService(),
+			f.GetQRUtil(),
+			f.config,
+			f.logger,
+		)
+	}
+	return f.pairingService
+}
+
+// GetWebSocketService returns the WebSocket service
+func (f *Factory) GetWebSocketService() *service.WebSocketService {
+	if f.wsService == nil {
+		f.wsService = service.NewWebSocketService(f.logger)
+
+		// Start the WebSocket service in background
+		go f.wsService.Run()
+
+		f.logger.Info("WebSocket service started")
+	}
+	return f.wsService
+}
+
+// GetPairingHandler returns the pairing handler
+func (f *Factory) GetPairingHandler() *handler.PairingHandler {
+	if f.pairingHandler == nil {
+		f.pairingHandler = handler.NewPairingHandler(
+			f.GetPairingService(),
+			f.GetWebSocketService(),
+			f.logger,
+		)
+	}
+	return f.pairingHandler
+}
+
+// GetWebSocketHandler returns the WebSocket handler
+func (f *Factory) GetWebSocketHandler() *handler.WebSocketHandler {
+	if f.wsHandler == nil {
+		f.wsHandler = handler.NewWebSocketHandler(
+			f.GetWebSocketService(),
+			f.logger,
+		)
+	}
+	return f.wsHandler
 }

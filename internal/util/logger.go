@@ -189,3 +189,23 @@ func JSONError(w http.ResponseWriter, statusCode int, message string) {
 		zap.String("message", message),
 	)
 }
+
+// JSONResponse writes a successful JSON response
+func JSONResponse(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	response := map[string]interface{}{
+		"status": statusCode,
+		"data":   data,
+		"time":   time.Now().Format(time.RFC3339),
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		Get().Error("failed to write JSON response",
+			zap.Int("status", statusCode),
+			zap.Any("data", data),
+			zap.Error(err),
+		)
+	}
+}
