@@ -191,7 +191,7 @@ func (e *RiskEngine) AssessRisk(req RiskAssessmentRequest) RiskAssessment {
 		}
 
 		assessment.RiskLevel = e.calculateRiskLevel(assessment.RiskScore)
-		assessment.BlockAction = assessment.RiskScore >= 120
+		assessment.BlockAction = assessment.RiskScore >= 150
 		assessment.Confidence = e.calculateConfidence(assessment.RiskScore)
 
 		util.Info("Forgot MPIN Risk Complete",

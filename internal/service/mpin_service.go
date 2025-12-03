@@ -51,21 +51,67 @@ const (
 
 // MPIN request/response structures
 type MPINSetupRequest struct {
-	UserID            uuid.UUID `json:"user_id" validate:"required"`
-	MPIN              string    `json:"mpin" validate:"required,min=4,max=8"`
-	DeviceID          string    `json:"device_id" validate:"required"`
-	IPAddress         string    `json:"ip_address"`
-	DeviceFingerprint string    `json:"device_fingerprint"`
-	UserAgent         string    `json:"user_agent"`
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+
+    MPIN              string `json:"mpin" validate:"required,min=4,max=8"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    IPAddress         string `json:"ip_address"`
+    DeviceFingerprint string `json:"device_fingerprint"`
+    UserAgent         string `json:"user_agent"`
 }
 
 type MPINVerifyRequest struct {
-	UserID            uuid.UUID `json:"user_id" validate:"required"`
-	MPIN              string    `json:"mpin" validate:"required"`
-	DeviceID          string    `json:"device_id" validate:"required"`
-	IPAddress         string    `json:"ip_address"`
-	DeviceFingerprint string    `json:"device_fingerprint"`
-	UserAgent         string    `json:"user_agent"`
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+    MPIN              string `json:"mpin" validate:"required"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    IPAddress         string `json:"ip_address"`
+    DeviceFingerprint string `json:"device_fingerprint"`
+    UserAgent         string `json:"user_agent"`
+}
+
+type MPINChangeRequest struct {
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+    CurrentMPIN       string `json:"current_mpin" validate:"required"`
+    NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    IPAddress         string `json:"ip_address"`
+    DeviceFingerprint string `json:"device_fingerprint"`
+    UserAgent         string `json:"user_agent"`
+}
+
+type MPINResetRequest struct {
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+    ResetBy     uuid.UUID `json:"reset_by" validate:"required"`
+    Reason      string    `json:"reason" validate:"required"`
+    IPAddress   string    `json:"ip_address"`
+    UserAgent   string    `json:"user_agent"`
+}
+
+type MPINAdminChangeRequest struct {
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+    NewMPIN     string    `json:"new_mpin" validate:"required,min=4,max=8"`
+    AdminID     uuid.UUID `json:"admin_id" validate:"required"`
+    Reason      string    `json:"reason,omitempty"`
+    IPAddress   string    `json:"ip_address"`
+    UserAgent   string    `json:"user_agent"`
+}
+
+type MPINForgotRequest struct {
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    IPAddress         string `json:"ip_address"`
+    DeviceFingerprint string `json:"device_fingerprint"`
+    UserAgent         string `json:"user_agent"`
+}
+
+type MPINForgotWithOTPRequest struct {
+    UserID            uuid.UUID `json:"user_id" validate:"required"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
+    OTPCode           string `json:"otp_code" validate:"required,len=6"`
+    IPAddress         string `json:"ip_address"`
+    DeviceFingerprint string `json:"device_fingerprint"`
+    UserAgent         string `json:"user_agent"`
 }
 
 type MPINVerifyResult struct {
@@ -76,23 +122,7 @@ type MPINVerifyResult struct {
 	Message        string     `json:"message"`
 }
 
-type MPINChangeRequest struct {
-	UserID            uuid.UUID `json:"user_id" validate:"required"`
-	CurrentMPIN       string    `json:"current_mpin" validate:"required"`
-	NewMPIN           string    `json:"new_mpin" validate:"required,min=4,max=8"`
-	DeviceID          string    `json:"device_id" validate:"required"`
-	IPAddress         string    `json:"ip_address"`
-	DeviceFingerprint string    `json:"device_fingerprint"`
-	UserAgent         string    `json:"user_agent"`
-}
 
-type MPINResetRequest struct {
-	UserID    uuid.UUID `json:"user_id" validate:"required"`
-	ResetBy   uuid.UUID `json:"reset_by" validate:"required"`
-	Reason    string    `json:"reason" validate:"required"`
-	IPAddress string    `json:"ip_address"`
-	UserAgent string    `json:"user_agent"`
-}
 
 type MPINStatus struct {
 	UserID         uuid.UUID  `json:"user_id"`
@@ -104,32 +134,8 @@ type MPINStatus struct {
 	DeviceID       string     `json:"device_id"`
 }
 
-type MPINAdminChangeRequest struct {
-	UserID    uuid.UUID `json:"user_id" validate:"required"`
-	NewMPIN   string    `json:"new_mpin" validate:"required,min=4,max=8"`
-	AdminID   uuid.UUID `json:"admin_id" validate:"required"`
-	Reason    string    `json:"reason,omitempty"`
-	IPAddress string    `json:"ip_address"`
-	UserAgent string    `json:"user_agent"`
-}
 
-type MPINForgotRequest struct {
-	UserID            uuid.UUID `json:"user_id" validate:"required"`
-	DeviceID          string    `json:"device_id" validate:"required"`
-	IPAddress         string    `json:"ip_address"`
-	DeviceFingerprint string    `json:"device_fingerprint"`
-	UserAgent         string    `json:"user_agent"`
-}
 
-type MPINForgotWithOTPRequest struct {
-	UserID            uuid.UUID `json:"user_id" validate:"required"`
-	DeviceID          string    `json:"device_id" validate:"required"`
-	NewMPIN           string    `json:"new_mpin" validate:"required,min=4,max=8"`
-	OTPCode           string    `json:"otp_code" validate:"required,len=6"`
-	IPAddress         string    `json:"ip_address"`
-	DeviceFingerprint string    `json:"device_fingerprint"`
-	UserAgent         string    `json:"user_agent"`
-}
 
 // MPINService handles all MPIN-related business logic with enhanced security
 type MPINService struct {
@@ -1017,252 +1023,167 @@ func (s *MPINService) VerifyMPIN(ctx context.Context, req *MPINVerifyRequest) (*
 	return result, nil
 }
 
-// ✅ UPDATED: ForgotMPIN with device trust checks handled by MPIN service and UserAgent
+// ✅ UPDATED: ForgotMPIN with phone number parameter and device trust checks handled by MPIN service and UserAgent
 func (s *MPINService) ForgotMPIN(ctx context.Context, req *MPINForgotRequest) error {
-	startTime := time.Now()
+    startTime := time.Now()
 
-	s.logMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     ServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Forgot MPIN flow initiated",
-		},
-		UserID:    req.UserID.String(),
-		Status:    "forgot_initiated",
-		DeviceID:  req.DeviceID,
-		UserAgent: req.UserAgent,
-	})
+    s.logMPINEvent(ctx, &models.MPINLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   string(models.LogEventTypeMPIN),
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: s.config.Environment,
+            Version:     ServiceVersion,
+            Level:       string(models.LogLevelInfo),
+            Message:     "Forgot MPIN flow initiated",
+        },
+        UserID:    req.UserID.String(),
+        Status:    "forgot_initiated",
+        DeviceID:  req.DeviceID,
+        UserAgent: req.UserAgent,
+    })
 
-	// ✅ NEW: Rate limiting for forgot MPIN
-	forgotRateKey := fmt.Sprintf("mpin_forgot:%s:%s", req.UserID.String(), req.DeviceID)
-	if allowed, retryAfter := s.checkRateLimit(ctx, forgotRateKey, MPINForgotRateLimit, MPINForgotRateWindow); !allowed {
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "MPIN forgot rate limit exceeded",
-			},
-			UserID:       req.UserID.String(),
-			Status:       "forgot_rate_limited",
-			DeviceID:     req.DeviceID,
-			UserAgent:    req.UserAgent,
-			ErrorCode:    "RATE_LIMIT_EXCEEDED",
-			AttemptsLeft: retryAfter,
-		})
-		return ErrMPINRateLimitExceeded
-	}
+    // ✅ FIXED: Use the UserID from request (passed by handler)
+    user, err := s.userRepo.GetUserByID(ctx, req.UserID)
+    if err != nil {
+        s.logMPINEvent(ctx, &models.MPINLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   string(models.LogEventTypeMPIN),
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: s.config.Environment,
+                Version:     ServiceVersion,
+                Level:       string(models.LogLevelError),
+                Message:     "User not found for forgot MPIN",
+            },
+            UserID:        req.UserID.String(),
+            Status:        "forgot_failed",
+            DeviceID:      req.DeviceID,
+            UserAgent:     req.UserAgent,
+            ErrorCode:     "USER_NOT_FOUND",
+            FailureReason: "user_not_found",
+        })
+        return fmt.Errorf("user not found: %w", err)
+    }
 
-	// ✅ UPDATED: Device trust handled by MPIN service
-	isTrusted, trustLevel, err := s.isDeviceTrusted(ctx, req.UserID, req.DeviceID, req.IPAddress, req.DeviceFingerprint)
-	if err != nil {
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Device trust check failed for forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "DEVICE_TRUST_CHECK_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "device_trust_check_failed",
-		})
-		return fmt.Errorf("device trust check failed: %w", err)
-	}
+    // Decrypt phone number
+    encryptedData := &encryption.EncryptedData{
+        EncryptedValue: string(user.PhoneEncrypted),
+        EncryptedDEK:   user.PhoneEncryptedDEK,
+        KeyID:          user.PhoneKeyID.String(),
+        Version:        "v1",
+        CreatedAt:      user.CreatedAt,
+    }
 
-	if !isTrusted {
-		// Update risk score for untrusted device attempting forgot MPIN
-		if trustLevel != nil {
-			trustLevel.RiskScore += 10
-			if updateErr := s.deviceTrustRepo.UpdateRisk(ctx, trustLevel); updateErr != nil {
-				s.logger.Warn("Failed to update risk score for untrusted device",
-					util.ErrorField(updateErr),
-					util.String("user_id", req.UserID.String()),
-				)
-			}
-		}
+    phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
+    if err != nil {
+        s.logMPINEvent(ctx, &models.MPINLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   string(models.LogEventTypeMPIN),
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: s.config.Environment,
+                Version:     ServiceVersion,
+                Level:       string(models.LogLevelError),
+                Message:     "Failed to decrypt phone number for forgot MPIN",
+            },
+            UserID:        req.UserID.String(),
+            Status:        "forgot_failed",
+            DeviceID:      req.DeviceID,
+            UserAgent:     req.UserAgent,
+            ErrorCode:     "PHONE_DECRYPTION_FAILED",
+            ErrorMessage:  err.Error(),
+            FailureReason: "phone_decryption_failed",
+        })
+        return fmt.Errorf("failed to decrypt phone number: %w", err)
+    }
 
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Untrusted device attempted forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "DEVICE_NOT_TRUSTED",
-			FailureReason: "device_not_trusted",
-		})
-		return ErrDeviceNotTrusted
-	}
+    // ✅ UPDATED: Use UserOTPService instead of OTPService
+    otpReq := &UserOTPSendRequest{
+        PhoneNumber:       phoneNumber,
+        Purpose:           "forgot_mpin",
+        IPAddress:         req.IPAddress,
+        DeviceID:          req.DeviceID,
+        UserAgent:         req.UserAgent,
+        DeviceFingerprint: req.DeviceFingerprint,
+    }
 
-	// Send OTP for verification on trusted device using UserOTPService
-	user, err := s.userRepo.GetUserByID(ctx, req.UserID)
-	if err != nil {
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "User not found for forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "USER_NOT_FOUND",
-			FailureReason: "user_not_found",
-		})
-		return fmt.Errorf("user not found: %w", err)
-	}
+    otpResp, err := s.userOTPService.UserSendOTP(ctx, otpReq)
+    if err != nil {
+        s.logMPINEvent(ctx, &models.MPINLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   string(models.LogEventTypeMPIN),
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: s.config.Environment,
+                Version:     ServiceVersion,
+                Level:       string(models.LogLevelError),
+                Message:     "Failed to send OTP for forgot MPIN",
+            },
+            UserID:        req.UserID.String(),
+            Status:        "forgot_failed",
+            DeviceID:      req.DeviceID,
+            UserAgent:     req.UserAgent,
+            ErrorCode:     "OTP_SEND_FAILED",
+            ErrorMessage:  err.Error(),
+            FailureReason: "otp_send_failed",
+        })
+        return fmt.Errorf("failed to send OTP: %w", err)
+    }
 
-	// ✅ FIXED: Create proper EncryptedData struct
-	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: string(user.PhoneEncrypted),
-		EncryptedDEK:   user.PhoneEncryptedDEK,
-		KeyID:          user.PhoneKeyID.String(),
-		Version:        "v1",
-		CreatedAt:      user.CreatedAt,
-	}
+    if !otpResp.Success {
+        s.logMPINEvent(ctx, &models.MPINLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   string(models.LogEventTypeMPIN),
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: s.config.Environment,
+                Version:     ServiceVersion,
+                Level:       string(models.LogLevelError),
+                Message:     "OTP send failed for forgot MPIN",
+            },
+            UserID:        req.UserID.String(),
+            Status:        "forgot_failed",
+            DeviceID:      req.DeviceID,
+            UserAgent:     req.UserAgent,
+            ErrorCode:     "OTP_SEND_FAILED",
+            ErrorMessage:  otpResp.Message,
+            FailureReason: "otp_send_failed",
+        })
+        return fmt.Errorf("OTP send failed: %s", otpResp.Message)
+    }
 
-	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
-	if err != nil {
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to decrypt phone number for forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "PHONE_DECRYPTION_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "phone_decryption_failed",
-		})
-		return fmt.Errorf("failed to decrypt phone number: %w", err)
-	}
+    s.logMPINEvent(ctx, &models.MPINLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   string(models.LogEventTypeMPIN),
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: s.config.Environment,
+            Version:     ServiceVersion,
+            Level:       string(models.LogLevelInfo),
+            Message:     "OTP sent for forgot MPIN",
+        },
+        UserID:    req.UserID.String(),
+        Status:    "forgot_otp_sent",
+        DeviceID:  req.DeviceID,
+        UserAgent: req.UserAgent,
+        Duration:  int64(time.Since(startTime).Milliseconds()),
+    })
 
-	// ✅ UPDATED: Use UserOTPService instead of OTPService
-	otpReq := &UserOTPSendRequest{
-		PhoneNumber:       phoneNumber,
-		Purpose:           "forgot_mpin",
-		IPAddress:         req.IPAddress,
-		DeviceID:          req.DeviceID,
-		UserAgent:         req.UserAgent,
-		DeviceFingerprint: req.DeviceFingerprint,
-	}
+    s.logger.Info("OTP sent for forgot MPIN",
+        util.String("user_id", req.UserID.String()),
+        util.String("device_id", req.DeviceID),
+        util.String("user_agent", req.UserAgent),
+    )
 
-	otpResp, err := s.userOTPService.UserSendOTP(ctx, otpReq)
-	if err != nil {
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to send OTP for forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "OTP_SEND_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "otp_send_failed",
-		})
-		return fmt.Errorf("failed to send OTP: %w", err)
-	}
-
-	if !otpResp.Success {
-		s.logMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     ServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "OTP send failed for forgot MPIN",
-			},
-			UserID:        req.UserID.String(),
-			Status:        "forgot_failed",
-			DeviceID:      req.DeviceID,
-			UserAgent:     req.UserAgent,
-			ErrorCode:     "OTP_SEND_FAILED",
-			ErrorMessage:  otpResp.Message,
-			FailureReason: "otp_send_failed",
-		})
-		return fmt.Errorf("OTP send failed: %s", otpResp.Message)
-	}
-
-	s.logMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     ServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "OTP sent for forgot MPIN on trusted device",
-		},
-		UserID:      req.UserID.String(),
-		Status:      "forgot_otp_sent",
-		DeviceID:    req.DeviceID,
-		UserAgent:   req.UserAgent,
-		DeviceTrust: string(trustLevel.TrustStatus),
-		Duration:    int64(time.Since(startTime).Milliseconds()),
-	})
-
-	s.logger.Info("OTP sent for forgot MPIN on trusted device",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("user_agent", req.UserAgent),
-		util.String("trust_status", string(trustLevel.TrustStatus)),
-	)
-
-	return nil
+    return nil
 }
-
 // ✅ UPDATED: VerifyForgotMPINOTP with device trust checks handled by MPIN service and UserAgent
 func (s *MPINService) VerifyForgotMPINOTP(ctx context.Context, req *MPINForgotWithOTPRequest) error {
 	startTime := time.Now()

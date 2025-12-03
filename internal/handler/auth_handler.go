@@ -64,7 +64,47 @@ func NewAuthHandler(
 		logger:         logger,
 	}
 }
+// Handler request structures for phone-based APIs
+type MPINSetupPhoneRequest struct {
+    PhoneNumber       string `json:"phone_number" validate:"required"`
+    MPIN              string `json:"mpin" validate:"required,min=4,max=8"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+    UserAgent         string `json:"user_agent,omitempty"`
+}
 
+type MPINVerifyPhoneRequest struct {
+    PhoneNumber       string `json:"phone_number" validate:"required"`
+    MPIN              string `json:"mpin" validate:"required"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+    UserAgent         string `json:"user_agent,omitempty"`
+}
+
+type MPINChangePhoneRequest struct {
+    PhoneNumber       string `json:"phone_number" validate:"required"`
+    CurrentMPIN       string `json:"current_mpin" validate:"required"`
+    NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    DeviceFingerprint string `json:"device_fingerprint"`
+    UserAgent         string `json:"user_agent,omitempty"`
+}
+
+type MPINForgotPhoneRequest struct {
+    PhoneNumber       string `json:"phone_number" validate:"required"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+    UserAgent         string `json:"user_agent,omitempty"`
+}
+
+type MPINForgotWithOTPPhoneRequest struct {
+    PhoneNumber       string `json:"phone_number" validate:"required"`
+    DeviceID          string `json:"device_id" validate:"required"`
+    NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
+    OTPCode           string `json:"otp_code" validate:"required,len=6"`
+    DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+    UserAgent         string `json:"user_agent,omitempty"`
+}
 // ============================================
 // ROUTE REGISTRATION
 // ============================================
@@ -361,193 +401,171 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 
 // VerifyMPINLogin handles MPIN verification for daily login
 func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	var req struct {
-		UserID            string `json:"user_id" validate:"required"`
-		MPIN              string `json:"mpin" validate:"required"`
-		DeviceID          string `json:"device_id" validate:"required"`
-		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
-	}
+    var req MPINVerifyPhoneRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+    // Sanitize inputs
+    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+    req.MPIN = util.SanitizeInput(req.MPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.UserAgent = util.SanitizeInput(req.UserAgent)
 
-	// Sanitize inputs
-	req.MPIN = util.SanitizeInput(req.MPIN)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    // Get user by phone number
+    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "User not found")
+        return
+    }
 
-	userID, err := uuid.Parse(req.UserID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+    // Check user status
+    if !user.IsActive {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("USER_INACTIVE: Account is inactive"),
+            "Account is inactive. Please contact support.")
+        return
+    }
 
-	// Get user - must exist
-	user, err := h.userService.GetUserByID(ctx, userID)
-	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "User not found")
-		return
-	}
+    // Check company subscription status if user has company
+    companyContext, err := h.companyService.GetCompanyContext(ctx, user.UserID)
+    if err != nil && !strings.Contains(err.Error(), "user is not an active employee") {
+        if strings.Contains(err.Error(), "subscription status:") {
+            h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
+            return
+        }
+        h.logger.Warn("Company context check failed", util.ErrorField(err))
+    }
 
-	// Check user status
-	if !user.IsActive {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("USER_INACTIVE: Account is inactive"),
-			"Account is inactive. Please contact support.")
-		return
-	}
+    // Verify device trust
+    deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, user.UserID, req.DeviceID)
+    if err != nil || !deviceTrusted {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
+            "MPIN login not allowed on this device")
+        return
+    }
 
-	// Check company subscription status if user has company
-	companyContext, err := h.companyService.GetCompanyContext(ctx, userID)
-	if err != nil && !strings.Contains(err.Error(), "user is not an active employee") {
-		if strings.Contains(err.Error(), "subscription status:") {
-			h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
-			return
-		}
-		h.logger.Warn("Company context check failed", util.ErrorField(err))
-	}
+    // ✅ UPDATED: Enhanced MPIN verification with device fingerprint
+    mpinVerifyReq := service.MPINVerifyRequest{
+        UserID:            user.UserID,
+        MPIN:              req.MPIN,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        IPAddress:         h.getClientIP(r),
+        UserAgent:         r.UserAgent(),
+    }
 
-	// Verify device trust
-	deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, userID, req.DeviceID)
-	if err != nil || !deviceTrusted {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
-			"MPIN login not allowed on this device")
-		return
-	}
+    mpinResult, err := h.mpinService.VerifyMPIN(ctx, &mpinVerifyReq)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
+        return
+    }
 
-	// ✅ UPDATED: Enhanced MPIN verification with device fingerprint
-	mpinVerifyReq := service.MPINVerifyRequest{
-		UserID:            userID,
-		MPIN:              req.MPIN,
-		DeviceID:          req.DeviceID,
-		DeviceFingerprint: req.DeviceFingerprint,
-		IPAddress:         h.getClientIP(r),
-		UserAgent:         r.UserAgent(),
-	}
+    if !mpinResult.Verified {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
+            "MPIN verification failed")
+        return
+    }
 
-	mpinResult, err := h.mpinService.VerifyMPIN(ctx, &mpinVerifyReq)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
-		return
-	}
+    userRole := "user"
+    if companyContext != nil {
+        userRole = companyContext.RoleName
+    }
 
-	if !mpinResult.Verified {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
-			"MPIN verification failed")
-		return
-	}
+    // Issue JWT token pair
+    tokenReq := &service.IssueTokenPairRequest{
+        UserID:      user.UserID.String(),
+        Role:        userRole,
+        DeviceID:    req.DeviceID,
+        SessionType: "user",
+        IPAddress:   h.getClientIP(r),
+    }
 
-	userRole := "user"
-	if companyContext != nil {
-		userRole = companyContext.RoleName
-	}
+    tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue tokens")
+        return
+    }
 
-	// Issue JWT token pair
-	tokenReq := &service.IssueTokenPairRequest{
-		UserID:      userID.String(),
-		Role:        userRole,
-		DeviceID:    req.DeviceID,
-		SessionType: "user",
-		IPAddress:   h.getClientIP(r),
-	}
+    responseData := map[string]interface{}{
+        "tokens":  tokens,
+        "user_id": user.UserID.String(),
+        "phone":   req.PhoneNumber,
+        "message": "MPIN login successful",
+    }
 
-	tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue tokens")
-		return
-	}
+    if companyContext != nil {
+        responseData["company_context"] = companyContext
+    }
 
-	responseData := map[string]interface{}{
-		"tokens":  tokens,
-		"user_id": userID.String(),
-		"message": "MPIN login successful",
-	}
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Login successful"))
 
-	if companyContext != nil {
-		responseData["company_context"] = companyContext
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Login successful"))
-
-	h.logger.Info("MPIN login completed with JWT tokens",
-		util.String("user_id", userID.String()),
-		util.String("role", userRole),
-		util.Bool("has_company", companyContext != nil),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-// SetupMPINRequest for MPIN setup
-type SetupMPINRequest struct {
-	UserID            string `json:"user_id" validate:"required"`
-	MPIN              string `json:"mpin" validate:"required,min=4,max=8"`
-	DeviceID          string `json:"device_id" validate:"required"`
-	DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
-	UserAgent         string `json:"user_agent,omitempty"`
+    h.logger.Info("MPIN login completed with JWT tokens",
+        util.String("user_id", user.UserID.String()),
+        util.String("phone", req.PhoneNumber),
+        util.String("role", userRole),
+        util.Bool("has_company", companyContext != nil),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
 
 // SetupMPIN handles MPIN setup after registration
 func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	var req SetupMPINRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+    var req MPINSetupPhoneRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
 
-	// Sanitize inputs
-	req.MPIN = util.SanitizeInput(req.MPIN)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
-	req.UserAgent = util.SanitizeInput(req.UserAgent)
+    // Sanitize inputs
+    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+    req.MPIN = util.SanitizeInput(req.MPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.UserAgent = util.SanitizeInput(req.UserAgent)
 
-	userID, err := uuid.Parse(req.UserID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+    // Get user by phone number
+    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "User not found")
+        return
+    }
 
-	// Verify user exists
-	_, err = h.userService.GetUserByID(ctx, userID)
-	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "User not found")
-		return
-	}
+    // ✅ UPDATED: Create service request with UserID (from phone lookup)
+    mpinReq := service.MPINSetupRequest{
+        UserID:            user.UserID,
+        MPIN:              req.MPIN,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        IPAddress:         h.getClientIP(r),
+        UserAgent:         r.UserAgent(),
+    }
 
-	// ✅ UPDATED: Enhanced MPIN setup with all required fields
-	mpinReq := service.MPINSetupRequest{
-		UserID:            userID,
-		MPIN:              req.MPIN,
-		DeviceID:          req.DeviceID,
-		DeviceFingerprint: req.DeviceFingerprint,
-		IPAddress:         h.getClientIP(r),
-		UserAgent:         r.UserAgent(),
-	}
+    if err := h.mpinService.SetupMPIN(ctx, &mpinReq); err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to setup MPIN")
+        return
+    }
 
-	if err := h.mpinService.SetupMPIN(ctx, &mpinReq); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to setup MPIN")
-		return
-	}
+    h.respondWithJSON(w, http.StatusCreated, successResponse(map[string]interface{}{
+        "message": "MPIN setup successfully. You can now use MPIN for daily authentication.",
+    }, "MPIN setup successful"))
 
-	h.respondWithJSON(w, http.StatusCreated, successResponse(map[string]interface{}{
-		"message": "MPIN setup successfully. You can now use MPIN for daily authentication.",
-	}, "MPIN setup successful"))
-
-	h.logger.Info("MPIN setup completed",
-		util.String("user_id", userID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    h.logger.Info("MPIN setup completed",
+        util.String("user_id", user.UserID.String()),
+        util.String("phone", req.PhoneNumber),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
-
 // ============================================
 // MPIN FORGOT FLOW METHODS
 // ============================================
@@ -776,40 +794,62 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 // 		util.Duration("duration", time.Since(startTime)),
 // 	)
 // }
-
+// ChangeMPIN handles MPIN change for users
+// ChangeMPIN handles MPIN change for users
 func (h *AuthHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	var req service.MPINChangeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+    var req MPINChangePhoneRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
 
-	req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
-	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
-	req.IPAddress = h.getClientIP(r)
-	req.UserAgent = r.UserAgent()
+    // Sanitize inputs
+    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+    req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
+    req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.UserAgent = util.SanitizeInput(req.UserAgent)
 
-	if err := h.mpinService.ChangeMPIN(ctx, &req); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to change MPIN")
-		return
-	}
+    // Get user by phone number
+    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "User not found")
+        return
+    }
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN changed successfully"))
+    // Create MPIN change request
+    mpinChangeReq := service.MPINChangeRequest{
+        UserID:            user.UserID,
+        CurrentMPIN:       req.CurrentMPIN,
+        NewMPIN:           req.NewMPIN,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        IPAddress:         h.getClientIP(r),
+        UserAgent:         r.UserAgent(),
+    }
 
-	h.logger.Info("MPIN changed via HTTP",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("user_agent", req.UserAgent),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    if err := h.mpinService.ChangeMPIN(ctx, &mpinChangeReq); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to change MPIN")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "message": "MPIN changed successfully",
+    }, "MPIN change successful"))
+
+    h.logger.Info("MPIN changed successfully",
+        util.String("user_id", user.UserID.String()),
+        util.String("phone", req.PhoneNumber),
+        util.String("device_id", req.DeviceID),
+        util.String("user_agent", req.UserAgent),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
-
 // ============================================
 // OTP MANAGEMENT METHODS
 // ============================================
@@ -2093,95 +2133,109 @@ func (h *AuthHandler) getClientIP(r *http.Request) string {
 
 // SendForgotMPINOTP sends OTP for forgot MPIN flow
 func (h *AuthHandler) SendForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	var req struct {
-		UserID            string `json:"user_id" validate:"required"`
-		DeviceID          string `json:"device_id" validate:"required"`
-		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
-	}
+    var req MPINForgotPhoneRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
+        return
+    }
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
-		return
-	}
+    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.UserAgent = util.SanitizeInput(req.UserAgent)
 
-	userID, err := uuid.Parse(req.UserID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+    // Get user by phone number
+    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "User not found")
+        return
+    }
 
-	// ✅ FIXED: Create proper MPIN forgot request that MPIN service expects
-	forgotReq := service.MPINForgotRequest{
-		UserID:            userID,
-		DeviceID:          req.DeviceID,
-		DeviceFingerprint: req.DeviceFingerprint,
-		IPAddress:         h.getClientIP(r),
-		UserAgent:         r.UserAgent(),
-	}
+    // Create MPIN forgot request
+    forgotReq := service.MPINForgotRequest{
+        UserID:            user.UserID,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        IPAddress:         h.getClientIP(r),
+        UserAgent:         r.UserAgent(),
+    }
 
-	// ✅ FIXED: Call MPIN service directly - it will handle phone decryption and OTP sending
-	if err := h.mpinService.ForgotMPIN(ctx, &forgotReq); err != nil {
-		statusCode := h.getForgotMPINStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to initiate forgot MPIN flow")
-		return
-	}
+    if err := h.mpinService.ForgotMPIN(ctx, &forgotReq); err != nil {
+        statusCode := h.getForgotMPINStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to initiate forgot MPIN flow")
+        return
+    }
 
-	// Generate request ID for the forgot MPIN flow
-	requestID := uuid.New().String()
+    responseData := map[string]interface{}{
+        "message": "OTP sent to registered phone number for MPIN reset",
+    }
 
-	responseData := map[string]interface{}{
-		"request_id": requestID,
-		"message":    "OTP sent to registered phone number for MPIN reset",
-	}
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "OTP sent successfully"))
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "OTP sent successfully"))
-
-	h.logger.Info("Forgot MPIN OTP sent",
-		util.String("user_id", userID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("request_id", requestID),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    h.logger.Info("Forgot MPIN OTP sent",
+        util.String("user_id", user.UserID.String()),
+        util.String("phone", req.PhoneNumber),
+        util.String("device_id", req.DeviceID),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
-
 // VerifyForgotMPINOTP handles OTP verification and MPIN reset
 func (h *AuthHandler) VerifyForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	var req service.MPINForgotWithOTPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+    var req MPINForgotWithOTPPhoneRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
 
-	// Sanitize inputs
-	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
-	req.OTPCode = util.SanitizeInput(req.OTPCode)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
-	req.IPAddress = h.getClientIP(r)
-	req.UserAgent = r.UserAgent()
+    // Sanitize inputs
+    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+    req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.OTPCode = util.SanitizeInput(req.OTPCode)
+    req.UserAgent = util.SanitizeInput(req.UserAgent)
 
-	// ✅ FIXED: Call MPIN service directly - it will handle phone decryption and OTP verification
-	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &req); err != nil {
-		statusCode := h.getForgotMPINStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to verify OTP and reset MPIN")
-		return
-	}
+    // Get user by phone number
+    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "User not found")
+        return
+    }
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
+    // Create MPIN forgot with OTP request
+    forgotOTPReq := service.MPINForgotWithOTPRequest{
+        UserID:            user.UserID,
+        NewMPIN:           req.NewMPIN,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        OTPCode:           req.OTPCode,
+        IPAddress:         h.getClientIP(r),
+        UserAgent:         r.UserAgent(),
+    }
 
-	h.logger.Info("MPIN reset via forgot OTP flow",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    if err := h.mpinService.VerifyForgotMPINOTP(ctx, &forgotOTPReq); err != nil {
+        statusCode := h.getForgotMPINStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to verify OTP and reset MPIN")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "message": "MPIN reset successfully",
+    }, "MPIN reset successful"))
+
+    h.logger.Info("MPIN reset via forgot OTP flow",
+        util.String("user_id", user.UserID.String()),
+        util.String("phone", req.PhoneNumber),
+        util.String("device_id", req.DeviceID),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
-
 // ForgotMPIN handles MPIN reset on trusted devices (legacy endpoint - uses new flow internally)
 func (h *AuthHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
