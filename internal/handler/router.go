@@ -21,8 +21,8 @@ func NewRouter(
 	adminHandler *AdminHandler,
 	authHandler *AuthHandler,
 	rbacHandler *RBACHandler,
-	pairingHandler *PairingHandler, // ✅ NEW
-	wsHandler *WebSocketHandler, // ✅ NEW
+	pairingHandler *PairingHandler,
+	wsHandler *WebSocketHandler,
 	sessionService *service.SessionService,
 	jwtService *service.JWTService,
 	logger *zap.Logger,
@@ -80,7 +80,7 @@ func NewRouter(
 			r.Get("/qr", pairingHandler.GenerateQR)
 			r.Get("/status", pairingHandler.Status)
 			r.Post("/confirm", pairingHandler.Confirm)
-			r.Get("/ws", pairingHandler.WebSocket) // WebSocket endpoint
+			r.Get("/ws", pairingHandler.WebSocket)
 
 			// Mobile pairing (requires JWT)
 			r.With(c.JWTAuthMiddleware(jwtService, logger)).
@@ -88,22 +88,9 @@ func NewRouter(
 		})
 
 		//-----------------------------------------------------------
-		// ADMIN AUTH (PUBLIC)
+		// ADMIN AUTH (PUBLIC) - Use RegisterRoutes for all admin auth endpoints
 		//-----------------------------------------------------------
-		r.Route("/admin-auth", func(r chi.Router) {
-			r.Post("/init-owner", adminHandler.InitializeOwner)
-			r.Get("/health", adminHandler.HealthCheck)
-			r.Post("/login/initiate", adminHandler.InitiateAdminLogin)
-			r.Post("/login/verify-otp", adminHandler.VerifyAdminOTPLogin)
-			r.Post("/login/verify-mpin", adminHandler.VerifyAdminMPINLogin)
-			r.Post("/mpin/setup", adminHandler.SetupAdminMPIN)
-			r.Post("/refresh", adminHandler.RefreshAdminTokens)
-			r.Post("/logout", adminHandler.LogoutAdmin)
-
-			// ✅ NEW: Admin cleanup endpoint for QR sessions
-			r.With(c.AdminJWTAuthMiddleware(jwtService, logger)).
-				Post("/cleanup-pairing", pairingHandler.Cleanup)
-		})
+		adminHandler.RegisterRoutes(r)
 
 		//-----------------------------------------------------------
 		// PROTECTED ROUTES (JWT REQUIRED)
@@ -124,7 +111,7 @@ func NewRouter(
 			r.Route("/companies/{companyID}", func(r chi.Router) {
 				r.Get("/", adminHandler.GetCompany)
 				r.Get("/employees", adminHandler.GetCompanyEmployees)
-				r.Get("/departments", adminHandler.GetCompanyDepartments) // Allow company owners
+				r.Get("/departments", adminHandler.GetCompanyDepartments)
 				r.Get("/roles", adminHandler.GetCompanyRoles)
 				r.Get("/hierarchy", adminHandler.GetCompanyHierarchy)
 				r.Get("/stats", adminHandler.GetCompanyStats)
@@ -132,9 +119,6 @@ func NewRouter(
 				// Owner-only operations (protected by bitmask)
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.create", logger)).
 					Post("/departments", adminHandler.CreateDepartment)
-
-				// r.With(c.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
-				// 	Post("/employees", adminHandler.AddEmployee)
 
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
 					Put("/employees/{userID}/role", adminHandler.UpdateEmployeeRole)
@@ -150,26 +134,20 @@ func NewRouter(
 				// ===============================
 				// ROLE MANAGEMENT
 				// ===============================
-				// Create role with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.create", logger)).
 					Post("/roles", rbacHandler.CreateRole)
 
-				// List roles with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/roles", rbacHandler.ListRoles)
 
-				// Get role with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/roles/{roleID}", rbacHandler.GetRole)
 
-				// Update role with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.update", logger)).
 					Put("/roles/{roleID}", rbacHandler.UpdateRole)
 
-				// Delete role with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.delete", logger)).
 					Delete("/roles/{roleID}", rbacHandler.DeleteRole)
-				// In your router setup, add these routes under the RBAC section:
 
 				// Employee Management
 				r.With(c.BitmaskPermissionMiddleware("hr.employee.create", logger)).
@@ -182,85 +160,70 @@ func NewRouter(
 				// Available Permissions for current user
 				r.With(c.BitmaskPermissionMiddleware("hr.employee.create", logger)).
 					Get("/available-permissions", rbacHandler.GetAvailablePermissions)
+
 				// ===============================
 				// PERMISSION MANAGEMENT
 				// ===============================
-				// Assign permissions with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
 					Post("/roles/{roleID}/permissions", rbacHandler.AssignPermissionsToRole)
 
-				// Remove permissions with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
 					Delete("/roles/{roleID}/permissions", rbacHandler.RemovePermissionsFromRole)
 
-				// Get role permissions with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/roles/{roleID}/permissions", rbacHandler.GetRolePermissions)
 
-				// Replace role permissions with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
 					Put("/roles/{roleID}/permissions", rbacHandler.ReplaceRolePermissions)
 
 				// ===============================
 				// GLOBAL PERMISSION QUERIES
 				// ===============================
-				// List all permissions with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/permissions", rbacHandler.ListAllPermissions)
 
-				// List permissions by module with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/permissions/module/{module}", rbacHandler.ListPermissionsByModule)
 
-				// Get permission by name with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/permissions/name/{permissionName}", rbacHandler.GetPermissionByName)
 
 				// ===============================
 				// DEPARTMENT MANAGEMENT
 				// ===============================
-				// Create department with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.create", logger)).
 					Post("/departments", rbacHandler.CreateDepartment)
 
-				// List departments with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.view", logger)).
 					Get("/departments", rbacHandler.ListDepartments)
 
-				// Update department with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.update", logger)).
 					Put("/departments/{departmentID}", rbacHandler.UpdateDepartment)
-				// Rename department (only name) - NEW
+
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.update", logger)).
 					Put("/departments/{departmentID}/rename", rbacHandler.RenameDepartment)
 
-				// Deactivate department with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.department.delete", logger)).
 					Delete("/departments/{departmentID}", rbacHandler.DeactivateDepartment)
 
 				// ===============================
 				// USER PERMISSIONS & HIERARCHY
 				// ===============================
-				// Get user permissions with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
 					Get("/users/{userID}/permissions", rbacHandler.GetUserPermissions)
 
-				// Get user permission bitmask with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
 					Get("/users/{userID}/permissions/bitmask", rbacHandler.GetUserPermissionBitmask)
 
-				// Check user permission with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
 					Get("/users/{userID}/permissions/check", rbacHandler.CheckUserPermission)
 
-				// Get user hierarchy with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
 					Get("/users/{userID}/hierarchy", rbacHandler.GetUserHierarchy)
 
 				// ===============================
 				// BULK ROLE ASSIGNMENT
 				// ===============================
-				// Bulk assign roles with permission middleware
 				r.With(c.BitmaskPermissionMiddleware("administrative.role.assign", logger)).
 					Post("/bulk-assign", rbacHandler.BulkAssignRoles)
 			})
@@ -272,11 +235,12 @@ func NewRouter(
 
 				// NEW: Admin JWT middleware (admins automatically get full access)
 				r.Use(c.AdminJWTAuthMiddleware(jwtService, logger))
+				r.Post("/mpin/change-by-admin", adminHandler.ChangeAdminMPINByAdmin)
 
 				// All admin routes remain as they are
 				// --------------------------------------------------------
 				// SYSTEM / PERMISSIONS / COMPANY / EMPLOYEE / RBAC
-				// ---------------	-----------------------------------------
+				// --------------------------------------------------------
 				r.Get("/debug/companies/{companyID}/departments", adminHandler.DebugCompanyDepartments)
 				r.Route("/permissions", func(r chi.Router) {
 					r.Get("/system-departments", adminHandler.GetSystemDepartments)
@@ -312,7 +276,7 @@ func NewRouter(
 					})
 				})
 
-				// Employee
+				// Employee Management
 				r.Route("/employees", func(r chi.Router) {
 					r.Route("/{userID}", func(r chi.Router) {
 						r.Put("/role", adminHandler.UpdateEmployeeRole)
@@ -322,7 +286,7 @@ func NewRouter(
 					r.Post("/check-permission", adminHandler.CheckEmployeePermission)
 				})
 
-				// Role Permission
+				// Role Permission Management
 				r.Route("/roles", func(r chi.Router) {
 					r.Route("/{roleID}", func(r chi.Router) {
 						r.Post("/permissions", adminHandler.GrantRolePermissions)
@@ -436,18 +400,6 @@ func CompanyAccessMiddleware() func(http.Handler) http.Handler {
 	}
 }
 
-// func requireHTTPS(next http.Handler) http.Handler {
-// 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-// 		if r.TLS == nil && !strings.Contains(r.Host, "localhost") && !strings.Contains(r.Host, "127.0.0.1") {
-// 			w.Header().Set("Content-Type", "application/json")
-// 			w.WriteHeader(http.StatusUpgradeRequired)
-// 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "https required"})
-// 			return
-// 		}
-// 		next.ServeHTTP(w, r)
-// 	})
-// }
-
 func JWTAuthMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -511,6 +463,7 @@ func LoggerMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
 		})
 	}
 }
+
 func requireHTTPS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 

@@ -17,11 +17,11 @@ import (
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/service"
+	"auth-service/internal/sms" // ADD THIS: SMS package import
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
 	"context"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -52,35 +52,35 @@ type Factory struct {
 	postgresClient            *client.PostgresClient
 	postgresUserRepository    postgres.UserRepository
 	postgresCompanyRepository postgres.CompanyRepository
-
-	serviceFactory *service.ServiceFactory
+	smsManager                *sms.SMSManager // ADD THIS: SMS Manager field
+	serviceFactory            *service.ServiceFactory
 	// ✅ FIXED: Use concrete types for repositories that need type assertions
 	adminDeviceRepo        *scylla.AdminDeviceRepositoryImpl
 	adminDeviceTrustRepo   scylla.AdminDeviceTrustRepository
 	adminMPINRepo          *scylla.AdminMPINRepositoryImpl
 	adminDeviceHistoryRepo *scylla.AdminDeviceHistoryRepositoryImpl
-
-	companyService     *service.CompanyService
-	adminDeviceService *service.AdminDeviceService
-	adminMPINService   *service.AdminMPINService
-	userService        *service.UserService
-	once               sync.Once
-	closeOnce          sync.Once
-	closed             chan struct{}
-	mpinRepository     scylla.MPINRepository
-	mpinService        *service.MPINService
-	pepperStoreRepo    pepperstore.PepperStore
-	deviceTrustRepo    scylla.DeviceTrustRepository
-	otpRepository      scylla.OTPRepository
-	otpService         *service.OTPService
-	sessionRepo        redis.SessionRepository
-	sessionService     *service.SessionService
-	deviceRepository   scylla.DeviceRepository
-	deviceService      *service.DeviceService
-	deviceHistoryRepo  *scylla.DeviceHistoryRepositoryImpl
-	kafkaLoggingMgr    *KafkaLoggingManager
-	adminRepository    scylla.AdminRepository
-	adminService       *service.AdminService
+	userOTPService         *service.UserOTPService
+	companyService         *service.CompanyService
+	adminDeviceService     *service.AdminDeviceService
+	adminMPINService       *service.AdminMPINService
+	userService            *service.UserService
+	once                   sync.Once
+	closeOnce              sync.Once
+	closed                 chan struct{}
+	mpinRepository         scylla.MPINRepository
+	mpinService            *service.MPINService
+	pepperStoreRepo        pepperstore.PepperStore
+	deviceTrustRepo        scylla.DeviceTrustRepository
+	otpRepository          scylla.OTPRepository
+	otpService             *service.OTPService
+	sessionRepo            redis.SessionRepository
+	sessionService         *service.SessionService
+	deviceRepository       scylla.DeviceRepository
+	deviceService          *service.DeviceService
+	deviceHistoryRepo      *scylla.DeviceHistoryRepositoryImpl
+	kafkaLoggingMgr        *KafkaLoggingManager
+	adminRepository        scylla.AdminRepository
+	adminService           *service.AdminService
 
 	// ✅ NEW: JWT and RBAC services
 	jwtService      *service.JWTService
@@ -225,6 +225,7 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		logger.Error("failed to initialize Kafka producer", zap.Error(err))
 		return nil, err
 	}
+	f.kafkaProducer = kafkaProducer
 
 	logProducer := service.NewLogProducerService(
 		kafkaProducer,
@@ -322,9 +323,9 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		if len(chConsumers) > 0 {
 			chConsumer := consumer.NewClickHouseConsumer(
 				chConsumers,
-				f.clickhouseClient.Conn(),
-				1000,          // batch size
-				5*time.Second, // flush interval
+				f.clickhouseClient, // ✅ PASS THE FULL CLIENT
+				1000,               // batch size
+				5*time.Second,      // flush interval
 			)
 			mgr.chConsumer = chConsumer
 			mgr.wg.Add(1)
@@ -448,6 +449,46 @@ func (f *Factory) MPINRepository() scylla.MPINRepository {
 	return f.mpinRepository
 }
 
+// ============================================================================
+// ✅ USER OTP SERVICE GETTERS
+// ============================================================================
+
+func (f *Factory) GetUserOTPService() *service.UserOTPService {
+	if f.userOTPService == nil {
+		repo := f.OTPRepository()
+		hasher := f.Hasher()
+		cfg := f.Config()
+		logger := f.logger
+
+		var distCache *service.DistributedCache
+		if f.redisClient != nil {
+			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+		}
+
+		logProducer := f.GetLogProducerService()
+		phoneValidator := f.GetPhoneValidator()
+		deviceTrustRepo := f.GetDeviceTrustRepository()
+		smsManager := f.GetSMSManager()
+
+		f.userOTPService = service.NewUserOTPService(
+			repo,
+			hasher,
+			cfg,
+			distCache,
+			logger,
+			logProducer,
+			phoneValidator,
+			deviceTrustRepo,
+			smsManager,
+		)
+
+		// Set admin service after UserOTPService is created to break circular dependency
+		if phoneValidator != nil {
+			phoneValidator.SetAdminService(f.GetAdminService())
+		}
+	}
+	return f.userOTPService
+}
 func (f *Factory) GetDeviceTrustRepository() scylla.DeviceTrustRepository {
 	if f.deviceTrustRepo == nil {
 		f.deviceTrustRepo = scylla.NewDeviceTrustRepository(f.scyllaClient, f.logger)
@@ -559,7 +600,15 @@ func (f *Factory) GetUserService() *service.UserService {
 	})
 	return f.userService
 }
-
+func (f *Factory) GetPhoneValidator() *service.PhoneValidatorImpl {
+	// Create phone validator without admin service initially to break circular dependency
+	phoneValidator := service.NewPhoneValidator(
+		f.GetUserService(),
+		nil, // Don't pass admin service yet
+		f.logger,
+	)
+	return phoneValidator
+}
 func (f *Factory) GetOTPService() *service.OTPService {
 	if f.otpService == nil {
 		repo := f.OTPRepository()
@@ -573,17 +622,92 @@ func (f *Factory) GetOTPService() *service.OTPService {
 		}
 
 		logProducer := f.GetLogProducerService()
-		f.otpService = service.NewOTPService(repo, hasher, cfg, distCache, logger, logProducer)
+
+		// Create phone validator without triggering admin service creation
+		phoneValidator := f.GetPhoneValidator()
+
+		f.otpService = service.NewOTPService(
+			repo,
+			hasher,
+			cfg,
+			distCache,
+			logger,
+			logProducer,
+			phoneValidator,
+			f.AdminDeviceTrustRepository(),
+			f.smsManager, // ADD THIS: Pass SMS Manager
+		)
+
+		// Set admin service after OTPService is created to break circular dependency
+		if phoneValidator != nil {
+			phoneValidator.SetAdminService(f.GetAdminService())
+		}
 	}
 	return f.otpService
 }
+func (f *Factory) GetAdminService() *service.AdminService {
+	if f.adminService == nil {
+		f.adminService = service.NewAdminService(
+			f.AdminRepository(),
+			f.UserRepository(),
+			f.GetSessionService(),
+			f.GetOTPService(), // This is now safe
+			f.GetMPINService(),
+			f.GetDeviceService(),
+			f.Hasher(),
+			f.EncryptionManager(),
+			f.logger,
+		)
 
+		logProducer := f.GetLogProducerService()
+		if logProducer != nil {
+			f.adminService.SetLogProducerService(logProducer)
+		}
+	}
+	return f.adminService
+}
+
+// func (f *Factory) GetPhoneValidator() *service.PhoneValidatorImpl {
+// 	return service.NewPhoneValidator(
+// 		f.GetUserService(),
+// 		nil,
+// 		f.logger,
+// 	)
+// }
+
+// func (f *Factory) GetOTPService() *service.OTPService {
+// 	if f.otpService == nil {
+// 		repo := f.OTPRepository()
+// 		hasher := f.Hasher()
+// 		cfg := f.Config()
+// 		logger := f.logger
+
+// 		var distCache *service.DistributedCache
+// 		if f.redisClient != nil {
+// 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
+// 		}
+
+// 		logProducer := f.GetLogProducerService()
+// 		phoneValidator := f.GetPhoneValidator()
+
+//			f.otpService = service.NewOTPService(
+//				repo,
+//				hasher,
+//				cfg,
+//				distCache,
+//				logger,
+//				logProducer,
+//				phoneValidator,
+//			)
+//		}
+//		return f.otpService
+//	}
 func (f *Factory) GetMPINService() *service.MPINService {
 	if f.mpinService == nil {
 		mpinRepo := f.MPINRepository()
 		userRepo := f.UserRepository()
 		deviceTrustRepo := f.GetDeviceTrustRepository()
-		otpService := f.GetOTPService()
+		userOTPService := f.GetUserOTPService() // ✅ NEW: for users
 		encryptionMgr := f.EncryptionManager()
 		hasher := f.Hasher()
 		cfg := f.Config()
@@ -599,7 +723,7 @@ func (f *Factory) GetMPINService() *service.MPINService {
 			mpinRepo,
 			userRepo,
 			deviceTrustRepo,
-			otpService,
+			userOTPService,
 			encryptionMgr,
 			hasher,
 			cfg,
@@ -634,10 +758,11 @@ func (f *Factory) GetSessionService() *service.SessionService {
 	}
 	return f.sessionService
 }
-
 func (f *Factory) GetDeviceService() *service.DeviceService {
 	if f.deviceService == nil {
 		deviceRepo := f.DeviceRepository()
+		deviceTrustRepo := f.GetDeviceTrustRepository()        // NEW
+		adminDeviceTrustRepo := f.AdminDeviceTrustRepository() // NEW
 		cfg := f.Config()
 		logger := f.logger
 
@@ -648,6 +773,8 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 
 		f.deviceService = service.NewDeviceService(
 			deviceRepo,
+			deviceTrustRepo,      // NEW ARG
+			adminDeviceTrustRepo, // NEW ARG
 			distCache,
 			*cfg,
 			logger,
@@ -746,32 +873,31 @@ func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
 	return f.adminMPINService
 }
 
-func (f *Factory) GetAdminService() *service.AdminService {
-	if f.adminService == nil {
-		f.adminService = service.NewAdminService(
-			f.AdminRepository(),
-			f.UserRepository(),
-			f.GetSessionService(),
-			f.GetOTPService(),
-			f.GetMPINService(),
-			f.GetDeviceService(),
-			f.Hasher(),
-			f.EncryptionManager(),
-			f.logger,
-		)
+// func (f *Factory) GetAdminService() *service.AdminService {
+// 	if f.adminService == nil {
+// 		f.adminService = service.NewAdminService(
+// 			f.AdminRepository(),
+// 			f.UserRepository(),
+// 			f.GetSessionService(),
+// 			f.GetOTPService(),
+// 			f.GetMPINService(),
+// 			f.GetDeviceService(),
+// 			f.Hasher(),
+// 			f.EncryptionManager(),
+// 			f.logger,
+// 		)
 
-		logProducer := f.GetLogProducerService()
-		if logProducer != nil {
-			f.adminService.SetLogProducerService(logProducer)
-		}
-	}
-	return f.adminService
-}
+// 		logProducer := f.GetLogProducerService()
+// 		if logProducer != nil {
+// 			f.adminService.SetLogProducerService(logProducer)
+// 		}
+// 	}
+// 	return f.adminService
+// }
 
 // ============================================================================
 // ✅ CLIENT INITIALIZATION
 // ============================================================================
-
 func (f *Factory) initializeClients() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -814,14 +940,6 @@ func (f *Factory) initializeClients() error {
 		}
 	}
 
-	// Kafka
-	if kp, err := client.NewKafkaProducer(f.config, f.logger); err != nil {
-		util.Warn("Kafka producer initialization failed - proceeding without Kafka", util.ErrorField(err))
-	} else {
-		f.kafkaProducer = kp
-		util.Info("Kafka producer initialized")
-	}
-
 	// Elasticsearch
 	if ec, err := client.NewElasticsearchClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("elasticsearch: %w", err))
@@ -847,16 +965,13 @@ func (f *Factory) initializeClients() error {
 	}
 
 	if len(initErrors) > 0 {
-		if f.config.IsProduction() {
-			return fmt.Errorf("critical service initialization failed: %v", initErrors)
-		}
 		for _, e := range initErrors {
 			util.Warn("Service initialization warning", util.ErrorField(e))
 		}
 	}
+
 	return nil
 }
-
 func (f *Factory) initializeManagers() {
 	pepperStore := f.PepperStoreRepository()
 
@@ -885,6 +1000,10 @@ func (f *Factory) initializeManagers() {
 	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
 	f.bucketingManager = bucketing.NewBucketingManager(f.config)
 
+	// ADD THIS: Initialize SMS Manager
+	f.smsManager = sms.NewSMSManager(f.logger)
+	util.Info("SMS manager initialized")
+
 	if f.hasher != nil && f.config.IsProduction() {
 		f.hasher.StartPepperRotation()
 		util.Info("Pepper rotation started")
@@ -894,6 +1013,7 @@ func (f *Factory) initializeManagers() {
 		util.Bool("hashing_initialized", f.hasher != nil),
 		util.Bool("encryption_initialized", f.encryptionManager != nil),
 		util.Bool("bucketing_initialized", f.bucketingManager != nil),
+		util.Bool("sms_manager_initialized", f.smsManager != nil), // ADD THIS
 		util.Bool("pepper_persistence_enabled", f.hasher != nil),
 	)
 }
@@ -919,6 +1039,7 @@ func (f *Factory) InitializeHandlers() error {
 	adminService := f.GetAdminService()
 	companyService := f.GetCompanyService()
 	jwtService := f.GetJWTService()
+	userOTPService := f.GetUserOTPService() // ✅ NEW: for users
 
 	// ✅ NEW: QR Web Login services
 	_ = f.GetPairingService()
@@ -947,7 +1068,7 @@ func (f *Factory) InitializeHandlers() error {
 
 	// ✅ FIXED: Auth handler with all required services
 	authHandler := handler.NewAuthHandler(
-		otpService,
+		userOTPService, // ✅ NEW: Add UserOTPService
 		mpinService,
 		sessionService,
 		userService,
@@ -1238,99 +1359,133 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 // ============================================================================
 // ✅ CLEANUP
 // ============================================================================
+// ============================================================================
+// ✅ CLEANUP (UPDATED — NO INVALID Close() CALLS ON KAFKA CONSUMERS)
+// ============================================================================
+// ============================================================================
+// ✅ CLEANUP (FINAL — WITH ES & CLICKHOUSE CONSUMER STOP + KAFKA PRODUCER CLOSE)
+// ============================================================================
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)
 		util.Info("Shutting down factory...")
 
-		// Shutdown Kafka logging first
+		// ============================================================================
+		// 1️⃣ SHUTDOWN KAFKA LOGGING MANAGER
+		//    - Cancels consumer contexts
+		//    - Waits for goroutines to exit
+		// ============================================================================
 		if f.kafkaLoggingMgr != nil {
-			if err := f.kafkaLoggingMgr.Shutdown(); err != nil {
-				util.Error("Failed to shutdown Kafka logging", util.ErrorField(err))
+			util.Info("Shutting down Kafka logging manager...")
+
+			// Stop all consumer goroutines
+			if f.kafkaLoggingMgr.cancelCtx != nil {
+				f.kafkaLoggingMgr.cancelCtx()
 			}
-			util.Info("Kafka logging system shut down")
+
+			// Wait for ES/ClickHouse consumers to exit
+			f.kafkaLoggingMgr.wg.Wait()
+
+			// Close log producer (this wraps KafkaProducer)
+			if f.kafkaLoggingMgr.producer != nil {
+				if err := f.kafkaLoggingMgr.producer.Close(); err != nil {
+					util.Error("Failed to close log producer", util.ErrorField(err))
+				}
+			}
+
+			// Explicit status logs
+			if f.kafkaLoggingMgr.esConsumer != nil {
+				util.Info("Elasticsearch Kafka consumer stopped")
+			}
+			if f.kafkaLoggingMgr.chConsumer != nil {
+				util.Info("ClickHouse Kafka consumer stopped")
+			}
+
+			util.Info("Kafka logging system fully shut down")
 		}
 
-		// PostgreSQL cleanup
+		// ============================================================================
+		// 2️⃣ SHUTDOWN KAFKA PRODUCER (GLOBAL)
+		//    Note: LogProducerService already closed its producer, but we still
+		//    close the factory-level one as safety.
+		// ============================================================================
+		if f.kafkaProducer != nil {
+			if err := f.kafkaProducer.Close(); err != nil {
+				util.Error("Failed to close Kafka producer", util.ErrorField(err))
+			} else {
+				util.Info("Kafka producer closed")
+			}
+		}
+
+		// ============================================================================
+		// 3️⃣ CLOSE DATABASES
+		// ============================================================================
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
 			util.Info("PostgreSQL client closed")
 		}
 
-		// ClickHouse cleanup
 		if f.clickhouseClient != nil {
 			f.clickhouseClient.Close()
 			util.Info("ClickHouse client closed")
 		}
 
-		// Elasticsearch cleanup
 		if f.esClient != nil {
 			f.esClient.Close()
 			util.Info("Elasticsearch client closed")
 		}
 
-		// Kafka producer cleanup
-		if f.kafkaProducer != nil {
-			f.kafkaProducer.Close()
-			util.Info("Kafka producer closed")
-		}
-
-		// Service factory cleanup
+		// ============================================================================
+		// 4️⃣ SERVICE FACTORY CLEANUP
+		// ============================================================================
 		if f.serviceFactory != nil {
 			f.serviceFactory.Cleanup()
 			util.Info("Service factory cleaned up")
 		}
 
-		// Scylla cleanup
+		// ============================================================================
+		// 5️⃣ CLOSE SCYLLA + REDIS
+		// ============================================================================
 		if f.scyllaClient != nil {
 			f.scyllaClient.Close()
 			util.Info("ScyllaDB client closed")
 		}
 
-		// Redis cleanup
 		if f.redisClient != nil {
 			f.redisClient.Close()
 			util.Info("Redis client closed")
 		}
 
-		// Hasher cleanup
+		// ============================================================================
+		// 6️⃣ SECURITY MANAGERS
+		// ============================================================================
 		if f.hasher != nil {
 			util.Info("Hasher shut down")
 		}
 
-		// Encryption manager cleanup
 		if f.encryptionManager != nil {
 			f.encryptionManager.ClearCache()
 			util.Info("Encryption manager cache cleared")
 		}
 
 		// ============================================================================
-		// ✅ NEW — CLEANUP FOR QR WEB LOGIN
+		// 7️⃣ WEBSOCKET SERVICE
 		// ============================================================================
-
-		// WebSocket service cleanup
 		if f.wsService != nil {
-			// If wsService has a Close() or Shutdown() method, call it here:
-			// _ = f.wsService.Close()
+			if closer, ok := interface{}(f.wsService).(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
 			util.Info("WebSocket service shut down")
 		}
 
+		// ============================================================================
+		// 8️⃣ FINAL LOGGING SYNC
+		// ============================================================================
 		util.Sync()
 		util.Info("Factory shutdown completed")
 	})
 
 	return nil
-}
-
-func parseIntDefault(s string, def int) int {
-	if s == "" {
-		return def
-	}
-	i, err := strconv.Atoi(s)
-	if err != nil {
-		return def
-	}
-	return i
 }
 
 // ============================================================================
@@ -1451,4 +1606,9 @@ func (f *Factory) GetWebSocketHandler() *handler.WebSocketHandler {
 		)
 	}
 	return f.wsHandler
+}
+
+// GetSMSManager returns the SMS manager instance
+func (f *Factory) GetSMSManager() *sms.SMSManager {
+	return f.smsManager
 }

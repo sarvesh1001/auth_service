@@ -1,51 +1,71 @@
+// internal/service/admin_mpin_service.go
 package service
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"regexp"
+	"sync"
+	"time"
+
 	"auth-service/internal/config"
 	"auth-service/internal/encryption"
 	"auth-service/internal/hashing"
 	"auth-service/internal/models"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/util"
-	"context"
-	"errors"
-	"fmt"
-	"regexp"
-	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
 var (
-	ErrAdminMPINNotFound      = errors.New("admin MPIN not found")
-	ErrAdminMPINInvalid       = errors.New("invalid admin MPIN")
-	ErrAdminMPINLocked        = errors.New("admin MPIN is locked")
-	ErrAdminMPINAlreadyExists = errors.New("admin MPIN already exists")
-	ErrAdminMPINTooWeak       = errors.New("admin MPIN is too weak")
-	ErrAdminDeviceNotBound    = errors.New("device not bound to admin MPIN")
+	ErrAdminMPINNotFound          = errors.New("admin MPIN not found")
+	ErrAdminMPINInvalid           = errors.New("invalid admin MPIN")
+	ErrAdminMPINLocked            = errors.New("admin MPIN is locked")
+	ErrAdminMPINAlreadyExists     = errors.New("admin MPIN already exists")
+	ErrAdminMPINTooWeak           = errors.New("admin MPIN is too weak")
+	ErrAdminDeviceNotBound        = errors.New("device not bound to admin MPIN")
+	ErrAdminDeviceNotTrusted      = errors.New("device is not trusted")
+	ErrAdminMPINRateLimitExceeded = errors.New("MPIN rate limit exceeded")
+	ErrAdminMPINAttemptsExceeded  = errors.New("maximum MPIN attempts exceeded")
 )
 
 const (
-	AdminMPINMinLength    = 6
-	AdminMPINMaxLength    = 8
-	AdminMPINLockDuration = 30 * time.Minute
-	AdminMPINMaxAttempts  = 5
-	AdminServiceVersion   = "v1.0.0"
+	AdminMPINMinLength        = 6
+	AdminMPINMaxLength        = 8
+	AdminMPINLockDuration     = 30 * time.Minute
+	AdminMPINMaxAttempts      = 5
+	AdminMPINVerifyRateLimit  = 5
+	AdminMPINForgotRateLimit  = 3
+	AdminMPINChangeRateLimit  = 5
+	AdminMPINRateLimitWindow  = time.Minute
+	AdminMPINForgotRateWindow = time.Hour
+	AdminServiceVersion       = "v1.0.0"
+	AdminMPINCacheDuration    = 5 * time.Minute
 )
 
 // Admin MPIN request/response structures
 type AdminMPINSetupRequest struct {
-	AdminID  uuid.UUID `json:"admin_id" validate:"required"`
-	MPIN     string    `json:"mpin" validate:"required,min=6,max=8"`
-	DeviceID string    `json:"device_id" validate:"required"`
+	AdminID           uuid.UUID `json:"admin_id" validate:"required"`
+	MPIN              string    `json:"mpin" validate:"required,min=6,max=8"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type AdminMPINVerifyRequest struct {
-	AdminID  uuid.UUID `json:"admin_id" validate:"required"`
-	MPIN     string    `json:"mpin" validate:"required"`
-	DeviceID string    `json:"device_id" validate:"required"`
+	AdminID           uuid.UUID `json:"admin_id" validate:"required"`
+	MPIN              string    `json:"mpin" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"` // ✅ ADDED USER AGENT
 }
 
 type AdminMPINVerifyResult struct {
@@ -57,16 +77,21 @@ type AdminMPINVerifyResult struct {
 }
 
 type AdminMPINChangeRequest struct {
-	AdminID     uuid.UUID `json:"admin_id" validate:"required"`
-	CurrentMPIN string    `json:"current_mpin" validate:"required"`
-	NewMPIN     string    `json:"new_mpin" validate:"required,min=6,max=8"`
-	DeviceID    string    `json:"device_id" validate:"required"`
+	AdminID           uuid.UUID `json:"admin_id" validate:"required"`
+	CurrentMPIN       string    `json:"current_mpin" validate:"required"`
+	NewMPIN           string    `json:"new_mpin" validate:"required,min=6,max=8"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"` // ✅ ADDED USER AGENT
 }
 
 type AdminMPINResetRequest struct {
-	AdminID uuid.UUID `json:"admin_id" validate:"required"`
-	ResetBy uuid.UUID `json:"reset_by" validate:"required"`
-	Reason  string    `json:"reason" validate:"required"`
+	AdminID   uuid.UUID `json:"admin_id" validate:"required"`
+	ResetBy   uuid.UUID `json:"reset_by" validate:"required"`
+	Reason    string    `json:"reason" validate:"required"`
+	IPAddress string    `json:"ip_address"`
+	UserAgent string    `json:"user_agent"` // ✅ ADDED USER AGENT
 }
 
 type AdminMPINStatus struct {
@@ -84,20 +109,29 @@ type AdminMPINAdminChangeRequest struct {
 	NewMPIN   string    `json:"new_mpin" validate:"required,min=6,max=8"`
 	ChangedBy uuid.UUID `json:"changed_by" validate:"required"`
 	Reason    string    `json:"reason,omitempty"`
+	IPAddress string    `json:"ip_address"`
+	UserAgent string    `json:"user_agent"` // ✅ ADDED USER AGENT
 }
 
 // Admin Forgot MPIN structures
 type AdminMPINForgotRequest struct {
-	AdminID  uuid.UUID `json:"admin_id" validate:"required"`
-	DeviceID string    `json:"device_id" validate:"required"`
-	NewMPIN  string    `json:"new_mpin" validate:"required,min=6,max=8"`
+	PhoneNumber       string    `json:"phone_number" validate:"required"`
+	AdminID           uuid.UUID `json:"admin_id"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent"`
 }
 
 type AdminMPINForgotWithOTPRequest struct {
-	AdminID  uuid.UUID `json:"admin_id" validate:"required"`
-	DeviceID string    `json:"device_id" validate:"required"`
-	NewMPIN  string    `json:"new_mpin" validate:"required,min=6,max=8"`
-	OTPCode  string    `json:"otp_code" validate:"required,len=6"`
+	PhoneNumber       string    `json:"phone_number" validate:"required"`
+	AdminID           uuid.UUID `json:"admin_id"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	NewMPIN           string    `json:"new_mpin" validate:"required,min=6,max=8"`
+	OTPCode           string    `json:"otp_code" validate:"required,len=6"`
+	IPAddress         string    `json:"ip_address"`
+	DeviceFingerprint string    `json:"device_fingerprint"`
+	UserAgent         string    `json:"user_agent,omitempty"`
 }
 
 // AdminMPINService handles all admin MPIN-related business logic
@@ -140,6 +174,122 @@ func NewAdminMPINService(
 	}
 }
 
+// Helper function to hash device fingerprint
+func (s *AdminMPINService) hashDeviceFingerprint(fingerprint string) string {
+	if fingerprint == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(fingerprint))
+	return hex.EncodeToString(hash[:])
+}
+
+// Helper function to get subnet from IP address
+func (s *AdminMPINService) getSubnet(ipAddress string) string {
+	if ipAddress == "" {
+		return ""
+	}
+
+	parsedIP := net.ParseIP(ipAddress)
+	if parsedIP == nil {
+		return ""
+	}
+
+	// For IPv4, use /24 subnet (first 3 octets)
+	if ipv4 := parsedIP.To4(); ipv4 != nil {
+		mask := net.CIDRMask(24, 32)
+		maskedIP := ipv4.Mask(mask)
+		return maskedIP.String()
+	}
+
+	// For IPv6, use /64 subnet (first 64 bits)
+	if ipv6 := parsedIP.To16(); ipv6 != nil {
+		mask := net.CIDRMask(64, 128)
+		maskedIP := ipv6.Mask(mask)
+		return maskedIP.String()
+	}
+
+	return ""
+}
+
+// Check if subnets match
+func (s *AdminMPINService) isSubnetMatch(ip1, ip2 string) bool {
+	if ip1 == "" || ip2 == "" {
+		return true
+	}
+
+	subnet1 := s.getSubnet(ip1)
+	subnet2 := s.getSubnet(ip2)
+
+	if subnet1 == "" || subnet2 == "" {
+		return true
+	}
+
+	return subnet1 == subnet2
+}
+
+// Enhanced device trust verification for MPIN operations
+func (s *AdminMPINService) isDeviceTrusted(ctx context.Context, adminID uuid.UUID, deviceID, ipAddress, deviceFingerprint string) (bool, *models.DeviceTrustLevel, error) {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
+	if err != nil {
+		return false, nil, err
+	}
+
+	if trustLevel == nil {
+		return false, nil, nil
+	}
+
+	// Check if device is blocked
+	if trustLevel.IsBlocked {
+		return false, trustLevel, nil
+	}
+
+	// Check trust status
+	if trustLevel.TrustStatus != models.TrustStatusPrimary && trustLevel.TrustStatus != models.TrustStatusTrusted {
+		return false, trustLevel, nil
+	}
+
+	// Check IP subnet mismatch
+	if ipAddress != "" && trustLevel.LastIPAddress != "" && !s.isSubnetMatch(trustLevel.LastIPAddress, ipAddress) {
+		s.logger.Warn("IP subnet mismatch for trusted device",
+			util.String("admin_id", adminID.String()),
+			util.String("device_id", deviceID),
+			util.String("stored_ip", trustLevel.LastIPAddress),
+			util.String("current_ip", ipAddress),
+		)
+
+		// Update risk score for subnet mismatch
+		trustLevel.RiskScore += 15
+		if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
+			s.logger.Warn("Failed to update risk score for subnet mismatch",
+				util.ErrorField(err),
+				util.String("admin_id", adminID.String()),
+			)
+		}
+		return false, trustLevel, nil
+	}
+
+	// Check hashed device fingerprint
+	hashedFingerprint := s.hashDeviceFingerprint(deviceFingerprint)
+	if deviceFingerprint != "" && trustLevel.DeviceFingerprint != "" && trustLevel.DeviceFingerprint != hashedFingerprint {
+		s.logger.Warn("Device fingerprint mismatch for trusted device",
+			util.String("admin_id", adminID.String()),
+			util.String("device_id", deviceID),
+		)
+
+		// Update risk score for fingerprint mismatch
+		trustLevel.RiskScore += 10
+		if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
+			s.logger.Warn("Failed to update risk score for fingerprint mismatch",
+				util.ErrorField(err),
+				util.String("admin_id", adminID.String()),
+			)
+		}
+		return false, trustLevel, nil
+	}
+
+	return true, trustLevel, nil
+}
+
 // logAdminMPINEvent helper method
 func (s *AdminMPINService) logAdminMPINEvent(ctx context.Context, event *models.MPINLogEvent) {
 	if s.logProducer != nil {
@@ -149,6 +299,91 @@ func (s *AdminMPINService) logAdminMPINEvent(ctx context.Context, event *models.
 
 func (s *AdminMPINService) SetDistributedCache(distCache *DistributedCache) {
 	s.distCache = distCache
+}
+
+// Rate limiting methods with risk score updates
+func (s *AdminMPINService) checkRateLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int) {
+	if s.distCache == nil {
+		return true, 0
+	}
+
+	allowed, retryAfter := s.distCache.AllowRate(ctx, key, limit, window)
+
+	// Update risk score when rate limit is exceeded
+	if !allowed {
+		// Extract admin ID from key if possible
+		if matches := regexp.MustCompile(`admin_mpin_[^:]+:([^:]+):`).FindStringSubmatch(key); len(matches) > 1 {
+			if adminID, err := uuid.Parse(matches[1]); err == nil {
+				go s.updateRiskScoreForRateLimit(ctx, adminID)
+			}
+		}
+	}
+
+	return allowed, retryAfter
+}
+
+// Update risk score for rate limit violations
+func (s *AdminMPINService) updateRiskScoreForRateLimit(ctx context.Context, adminID uuid.UUID) {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, "")
+	if err != nil || trustLevel == nil {
+		return
+	}
+
+	trustLevel.RiskScore += 10
+	if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, trustLevel.DeviceID, trustLevel); err != nil {
+		s.logger.Warn("Failed to update risk score for rate limit",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()),
+		)
+	}
+}
+
+// Update risk score for failed MPIN
+func (s *AdminMPINService) updateRiskScoreForFailedMPIN(ctx context.Context, adminID uuid.UUID, deviceID string) {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
+	if err != nil || trustLevel == nil {
+		return
+	}
+
+	trustLevel.RiskScore += 10
+	if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
+		s.logger.Warn("Failed to update risk score for failed MPIN",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()),
+		)
+	}
+}
+
+// Update risk score for device mismatch
+func (s *AdminMPINService) updateRiskScoreForDeviceMismatch(ctx context.Context, adminID uuid.UUID, deviceID string) {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
+	if err != nil || trustLevel == nil {
+		return
+	}
+
+	trustLevel.RiskScore += 10
+	if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
+		s.logger.Warn("Failed to update risk score for device mismatch",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()),
+		)
+	}
+}
+
+// Update risk score for OTP failures
+func (s *AdminMPINService) updateRiskScoreForOTPFailure(ctx context.Context, adminID uuid.UUID, deviceID string) {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
+	if err != nil || trustLevel == nil {
+		return
+	}
+
+	trustLevel.RiskScore += 10
+	if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel); err != nil {
+		s.logger.Warn("Failed to update risk score for OTP failure",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()),
+		)
+	}
 }
 
 func (s *AdminMPINService) validateAdminMPIN(mpin string) error {
@@ -198,7 +433,7 @@ func (s *AdminMPINService) isSequential(mpin string) bool {
 	return ascending || descending
 }
 
-// SetupAdminMPIN creates a new admin MPIN
+// SetupAdminMPIN with hashed device fingerprint
 func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSetupRequest) error {
 	startTime := time.Now()
 
@@ -221,9 +456,10 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN setup initiated",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_setup_initiated",
-		DeviceID: req.DeviceID,
+		UserID:    req.AdminID.String(),
+		Status:    "admin_setup_initiated",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
 	})
 
 	if err := s.validateAdminMPIN(req.MPIN); err != nil {
@@ -241,11 +477,36 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			UserID:        req.AdminID.String(),
 			Status:        "admin_setup_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "VALIDATION_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "admin_mpin_validation_failed",
 		})
 		return err
+	}
+
+	// Rate limiting for setup with risk score updates
+	setupRateKey := fmt.Sprintf("admin_mpin_setup:%s:%s", req.AdminID.String(), req.DeviceID)
+	if allowed, retryAfter := s.checkRateLimit(ctx, setupRateKey, 3, time.Hour); !allowed {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Admin MPIN setup rate limit exceeded",
+			},
+			UserID:       req.AdminID.String(),
+			Status:       "admin_setup_rate_limited",
+			DeviceID:     req.DeviceID,
+			UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:    "RATE_LIMIT_EXCEEDED",
+			AttemptsLeft: retryAfter,
+		})
+		return ErrAdminMPINRateLimitExceeded
 	}
 
 	admin, err := s.adminRepo.GetAdminByID(ctx, req.AdminID)
@@ -264,6 +525,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			UserID:        req.AdminID.String(),
 			Status:        "admin_setup_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "ADMIN_NOT_FOUND",
 			FailureReason: "admin_not_found",
 		})
@@ -285,6 +547,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			UserID:        req.AdminID.String(),
 			Status:        "admin_setup_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "ADMIN_INACTIVE",
 			FailureReason: "admin_inactive",
 		})
@@ -307,6 +570,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			UserID:        req.AdminID.String(),
 			Status:        "admin_setup_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "ADMIN_MPIN_ALREADY_EXISTS",
 			FailureReason: "admin_mpin_already_exists",
 		})
@@ -329,6 +593,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			UserID:        req.AdminID.String(),
 			Status:        "admin_setup_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "HASHING_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
@@ -365,6 +630,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			UserID:        req.AdminID.String(),
 			Status:        "admin_setup_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "REPOSITORY_CREATE_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_create_failed",
@@ -372,7 +638,19 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 		return fmt.Errorf("failed to create admin MPIN: %w", err)
 	}
 
-	if err := s.deviceTrustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, "", ""); err != nil {
+	// Enhanced device trust setup with hashed fingerprint and IP
+	trustLevel := &models.DeviceTrustLevel{
+		UserID:            req.AdminID,
+		DeviceID:          req.DeviceID,
+		TrustStatus:       models.TrustStatusTrusted,
+		DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
+		LastIPAddress:     req.IPAddress,
+		UserAgent:         req.UserAgent,
+		IsBlocked:         false,
+		RiskScore:         0,
+	}
+
+	if err := s.deviceTrustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, trustLevel); err != nil {
 		s.logger.Warn("Failed to set admin device trust level",
 			util.ErrorField(err),
 			util.String("admin_id", req.AdminID.String()),
@@ -380,7 +658,7 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 		)
 	}
 
-	s.invalidateAdminMPINCache(ctx, req.AdminID) // ✅ Added ctx parameter
+	s.invalidateAdminMPINCache(ctx, req.AdminID)
 
 	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -393,21 +671,23 @@ func (s *AdminMPINService) SetupAdminMPIN(ctx context.Context, req *AdminMPINSet
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN setup completed successfully",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_setup_completed",
-		DeviceID: req.DeviceID,
-		Duration: int64(time.Since(startTime).Milliseconds()),
+		UserID:    req.AdminID.String(),
+		Status:    "admin_setup_completed",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	s.logger.Info("Admin MPIN setup completed",
 		util.String("admin_id", req.AdminID.String()),
 		util.String("device_id", req.DeviceID),
+		util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
 		util.Duration("duration", time.Since(startTime)),
 	)
 	return nil
 }
 
-// VerifyAdminMPIN verifies an admin MPIN
+// VerifyAdminMPIN with risk score updates for failures
 func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVerifyRequest) (*AdminMPINVerifyResult, error) {
 	startTime := time.Now()
 
@@ -422,10 +702,35 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN verification initiated",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_verification_initiated",
-		DeviceID: req.DeviceID,
+		UserID:    req.AdminID.String(),
+		Status:    "admin_verification_initiated",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
 	})
+
+	// Rate limiting for MPIN verification with risk score updates
+	verifyRateKey := fmt.Sprintf("admin_mpin_verify:%s:%s", req.AdminID.String(), req.DeviceID)
+	if allowed, retryAfter := s.checkRateLimit(ctx, verifyRateKey, AdminMPINVerifyRateLimit, AdminMPINRateLimitWindow); !allowed {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Admin MPIN verification rate limit exceeded",
+			},
+			UserID:       req.AdminID.String(),
+			Status:       "admin_verification_rate_limited",
+			DeviceID:     req.DeviceID,
+			UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:    "RATE_LIMIT_EXCEEDED",
+			AttemptsLeft: retryAfter,
+		})
+		return nil, ErrAdminMPINRateLimitExceeded
+	}
 
 	if err := s.validateAdminMPIN(req.MPIN); err != nil {
 		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
@@ -442,6 +747,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			UserID:        req.AdminID.String(),
 			Status:        "admin_verification_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "VALIDATION_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "admin_mpin_validation_failed",
@@ -466,6 +772,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 				UserID:        req.AdminID.String(),
 				Status:        "admin_verification_failed",
 				DeviceID:      req.DeviceID,
+				UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 				ErrorCode:     "ADMIN_MPIN_NOT_FOUND",
 				FailureReason: "admin_mpin_not_found",
 			})
@@ -492,6 +799,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 				UserID:        req.AdminID.String(),
 				Status:        "admin_verification_failed",
 				DeviceID:      req.DeviceID,
+				UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 				Attempts:      AdminMPINMaxAttempts,
 				AttemptsLeft:  0,
 				IsLocked:      true,
@@ -515,6 +823,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			UserID:        req.AdminID.String(),
 			Status:        "admin_verification_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "REPOSITORY_ERROR",
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_error",
@@ -534,15 +843,20 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 				Level:       string(models.LogLevelWarning),
 				Message:     "Device mismatch during admin MPIN verification",
 			},
-			UserID:   req.AdminID.String(),
-			Status:   "admin_device_mismatch",
-			DeviceID: req.DeviceID,
+			UserID:    req.AdminID.String(),
+			Status:    "admin_device_mismatch",
+			DeviceID:  req.DeviceID,
+			UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
 		})
 		s.logger.Warn("Device mismatch during admin MPIN verification",
 			util.String("admin_id", req.AdminID.String()),
 			util.String("expected_device", mpinCred.DeviceID),
 			util.String("provided_device", req.DeviceID),
+			util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
 		)
+
+		// Update risk score for device mismatch
+		go s.updateRiskScoreForDeviceMismatch(ctx, req.AdminID, req.DeviceID)
 	}
 
 	hashResult := &hashing.HashResult{
@@ -568,6 +882,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			UserID:        req.AdminID.String(),
 			Status:        "admin_verification_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "HASH_VERIFICATION_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "hash_verification_failed",
@@ -592,7 +907,19 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 		result.FailedAttempts = 0
 		result.RemainingTries = AdminMPINMaxAttempts
 
-		if err := s.deviceTrustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, "", ""); err != nil {
+		// Update device trust with hashed fingerprint and current IP
+		trustLevel := &models.DeviceTrustLevel{
+			UserID:            req.AdminID,
+			DeviceID:          req.DeviceID,
+			TrustStatus:       models.TrustStatusTrusted,
+			DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
+			LastIPAddress:     req.IPAddress,
+			UserAgent:         req.UserAgent, // ✅ ADDED USER AGENT
+			IsBlocked:         false,
+			RiskScore:         0, // Reset risk score on successful verification
+		}
+
+		if err := s.deviceTrustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, trustLevel); err != nil {
 			s.logger.Warn("Failed to update admin device trust on successful login",
 				util.ErrorField(err),
 				util.String("admin_id", req.AdminID.String()),
@@ -613,6 +940,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			UserID:       req.AdminID.String(),
 			Status:       "admin_verification_successful",
 			DeviceID:     req.DeviceID,
+			UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
 			Attempts:     0,
 			AttemptsLeft: AdminMPINMaxAttempts,
 			IsLocked:     false,
@@ -629,6 +957,9 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 			result.FailedAttempts = newFailedAttempts
 			result.RemainingTries = max(0, AdminMPINMaxAttempts-newFailedAttempts)
 		}
+
+		// Update risk score for failed MPIN verification
+		go s.updateRiskScoreForFailedMPIN(ctx, req.AdminID, req.DeviceID)
 
 		if result.RemainingTries == 0 {
 			result.Message = "Admin MPIN is now locked due to too many failed attempts"
@@ -649,6 +980,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 				UserID:       req.AdminID.String(),
 				Status:       "admin_mpin_locked",
 				DeviceID:     req.DeviceID,
+				UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
 				Attempts:     newFailedAttempts,
 				AttemptsLeft: 0,
 				IsLocked:     true,
@@ -671,6 +1003,7 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 				UserID:       req.AdminID.String(),
 				Status:       "admin_verification_failed",
 				DeviceID:     req.DeviceID,
+				UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
 				Attempts:     newFailedAttempts,
 				AttemptsLeft: result.RemainingTries,
 				IsLocked:     false,
@@ -683,13 +1016,14 @@ func (s *AdminMPINService) VerifyAdminMPIN(ctx context.Context, req *AdminMPINVe
 		util.String("admin_id", req.AdminID.String()),
 		util.Bool("verified", verified),
 		util.Int("failed_attempts", result.FailedAttempts),
+		util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
 		util.Duration("duration", time.Since(startTime)),
 	)
 
 	return result, nil
 }
 
-// ChangeAdminMPIN changes an admin's MPIN
+// ChangeAdminMPIN changes an admin's MPIN (requires old MPIN)
 func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINChangeRequest) error {
 	startTime := time.Now()
 
@@ -704,10 +1038,35 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN change initiated",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_change_initiated",
-		DeviceID: req.DeviceID,
+		UserID:    req.AdminID.String(),
+		Status:    "admin_change_initiated",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
 	})
+
+	// Rate limiting for MPIN change with risk score updates
+	changeRateKey := fmt.Sprintf("admin_mpin_change:%s:%s", req.AdminID.String(), req.DeviceID)
+	if allowed, retryAfter := s.checkRateLimit(ctx, changeRateKey, AdminMPINChangeRateLimit, AdminMPINForgotRateWindow); !allowed {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Admin MPIN change rate limit exceeded",
+			},
+			UserID:       req.AdminID.String(),
+			Status:       "admin_change_rate_limited",
+			DeviceID:     req.DeviceID,
+			UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:    "RATE_LIMIT_EXCEEDED",
+			AttemptsLeft: retryAfter,
+		})
+		return ErrAdminMPINRateLimitExceeded
+	}
 
 	if err := s.validateAdminMPIN(req.NewMPIN); err != nil {
 		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
@@ -724,6 +1083,7 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "VALIDATION_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "new_admin_mpin_validation_failed",
@@ -732,9 +1092,12 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 	}
 
 	verifyReq := &AdminMPINVerifyRequest{
-		AdminID:  req.AdminID,
-		MPIN:     req.CurrentMPIN,
-		DeviceID: req.DeviceID,
+		AdminID:           req.AdminID,
+		MPIN:              req.CurrentMPIN,
+		DeviceID:          req.DeviceID,
+		IPAddress:         req.IPAddress,
+		DeviceFingerprint: req.DeviceFingerprint,
+		UserAgent:         req.UserAgent, // ✅ ADDED USER AGENT
 	}
 
 	verifyResult, err := s.VerifyAdminMPIN(ctx, verifyReq)
@@ -757,6 +1120,7 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "CURRENT_ADMIN_MPIN_INVALID",
 			FailureReason: "current_admin_mpin_invalid",
 		})
@@ -779,6 +1143,7 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "HASHING_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
@@ -801,6 +1166,7 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_failed",
 			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "REPOSITORY_UPDATE_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_update_failed",
@@ -815,7 +1181,7 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 		)
 	}
 
-	s.invalidateAdminMPINCache(ctx, req.AdminID) // ✅ Added ctx parameter
+	s.invalidateAdminMPINCache(ctx, req.AdminID)
 
 	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -828,22 +1194,588 @@ func (s *AdminMPINService) ChangeAdminMPIN(ctx context.Context, req *AdminMPINCh
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN changed successfully",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_change_completed",
-		DeviceID: req.DeviceID,
-		Duration: int64(time.Since(startTime).Milliseconds()),
+		UserID:    req.AdminID.String(),
+		Status:    "admin_change_completed",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	s.logger.Info("Admin MPIN changed successfully",
 		util.String("admin_id", req.AdminID.String()),
 		util.String("device_id", req.DeviceID),
+		util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
 		util.Duration("duration", time.Since(startTime)),
 	)
 
 	return nil
 }
 
-// ChangeAdminMPINByAdmin changes an admin's MPIN by another admin
+// ForgotAdminMPIN with device trust checks handled by MPIN service
+func (s *AdminMPINService) ForgotAdminMPIN(ctx context.Context, req *AdminMPINForgotRequest) error {
+	startTime := time.Now()
+
+	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     AdminServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Forgot admin MPIN flow initiated",
+		},
+		UserID:    req.AdminID.String(),
+		Status:    "admin_forgot_initiated",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
+	})
+
+	// Rate limiting for forgot MPIN
+	forgotRateKey := fmt.Sprintf("admin_mpin_forgot:%s:%s", req.AdminID.String(), req.DeviceID)
+	if allowed, retryAfter := s.checkRateLimit(ctx, forgotRateKey, AdminMPINForgotRateLimit, AdminMPINForgotRateWindow); !allowed {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Admin MPIN forgot rate limit exceeded",
+			},
+			UserID:       req.AdminID.String(),
+			Status:       "admin_forgot_rate_limited",
+			DeviceID:     req.DeviceID,
+			UserAgent:    req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:    "RATE_LIMIT_EXCEEDED",
+			AttemptsLeft: retryAfter,
+		})
+		return ErrAdminMPINRateLimitExceeded
+	}
+
+	// CHECK: Device trust handled by MPIN service
+	isTrusted, trustLevel, err := s.isDeviceTrusted(ctx, req.AdminID, req.DeviceID, req.IPAddress, req.DeviceFingerprint)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Device trust check failed for forgot MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:     "DEVICE_TRUST_CHECK_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "device_trust_check_failed",
+		})
+		return fmt.Errorf("device trust check failed: %w", err)
+	}
+
+	if !isTrusted {
+		// Update risk score for untrusted device attempting forgot MPIN
+		if trustLevel != nil {
+			trustLevel.RiskScore += 10
+			if updateErr := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, req.AdminID, req.DeviceID, trustLevel); updateErr != nil {
+				s.logger.Warn("Failed to update risk score for untrusted device",
+					util.ErrorField(updateErr),
+					util.String("admin_id", req.AdminID.String()),
+				)
+			}
+		}
+
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Untrusted device attempted forgot MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:     "DEVICE_NOT_TRUSTED",
+			FailureReason: "device_not_trusted",
+		})
+		return ErrAdminDeviceNotTrusted
+	}
+
+	// Send OTP for verification on trusted device
+	admin, err := s.adminRepo.GetAdminByID(ctx, req.AdminID)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Admin not found for forgot MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:     "ADMIN_NOT_FOUND",
+			FailureReason: "admin_not_found",
+		})
+		return fmt.Errorf("admin not found: %w", err)
+	}
+
+	encryptedData := &encryption.EncryptedData{
+		EncryptedValue: admin.PhoneEncrypted,
+		EncryptedDEK:   admin.PhoneEncryptedDEK,
+		KeyID:          admin.PhoneKeyID.String(),
+		Version:        "v1",
+		CreatedAt:      admin.AdminCreatedAt,
+	}
+
+	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to decrypt phone number for forgot MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:     "PHONE_DECRYPTION_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "phone_decryption_failed",
+		})
+		return fmt.Errorf("failed to decrypt admin phone number: %w", err)
+	}
+
+	// Send OTP for verification
+	otpReq := &OTPSendRequest{
+		PhoneNumber:       phoneNumber,
+		Purpose:           "forgot_mpin",
+		IPAddress:         req.IPAddress,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		UserAgent:         req.UserAgent,
+	}
+
+	otpResp, err := s.otpService.SendOTP(ctx, otpReq)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to send OTP for forgot MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:     "OTP_SEND_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "otp_send_failed",
+		})
+		return fmt.Errorf("failed to send OTP: %w", err)
+	}
+
+	if !otpResp.Success {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "OTP send failed for forgot MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
+			ErrorCode:     "OTP_SEND_FAILED",
+			ErrorMessage:  otpResp.Message,
+			FailureReason: "otp_send_failed",
+		})
+		return fmt.Errorf("OTP send failed: %s", otpResp.Message)
+	}
+
+	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     AdminServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "OTP sent for forgot MPIN on trusted device",
+		},
+		UserID:      req.AdminID.String(),
+		Status:      "admin_forgot_otp_sent",
+		DeviceID:    req.DeviceID,
+		UserAgent:   req.UserAgent, // ✅ ADDED USER AGENT
+		DeviceTrust: string(trustLevel.TrustStatus),
+		Duration:    int64(time.Since(startTime).Milliseconds()),
+	})
+
+	s.logger.Info("OTP sent for admin forgot MPIN on trusted device",
+		util.String("admin_id", req.AdminID.String()),
+		util.String("device_id", req.DeviceID),
+		util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
+		util.String("trust_status", string(trustLevel.TrustStatus)),
+	)
+
+	return nil
+}
+
+// VerifyForgotAdminMPINOTP with device trust checks handled by MPIN service
+func (s *AdminMPINService) VerifyForgotAdminMPINOTP(ctx context.Context, req *AdminMPINForgotWithOTPRequest) error {
+	startTime := time.Now()
+
+	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     AdminServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Forgot admin MPIN OTP verification initiated",
+		},
+		UserID:    req.AdminID.String(),
+		Status:    "admin_forgot_otp_verification_initiated",
+		DeviceID:  req.DeviceID,
+		UserAgent: req.UserAgent,
+	})
+
+	// CHECK: Device trust handled by MPIN service
+	isTrusted, trustLevel, err := s.isDeviceTrusted(ctx, req.AdminID, req.DeviceID, req.IPAddress, req.DeviceFingerprint)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Device trust check failed for forgot MPIN OTP",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "DEVICE_TRUST_CHECK_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "device_trust_check_failed",
+		})
+		return fmt.Errorf("device trust check failed: %w", err)
+	}
+
+	if !isTrusted {
+		// Update risk score for untrusted device attempting OTP verification
+		if trustLevel != nil {
+			trustLevel.RiskScore += 10
+			if updateErr := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, req.AdminID, req.DeviceID, trustLevel); updateErr != nil {
+				s.logger.Warn("Failed to update risk score for untrusted device in OTP verification",
+					util.ErrorField(updateErr),
+					util.String("admin_id", req.AdminID.String()),
+				)
+			}
+		}
+
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Untrusted device attempted forgot MPIN OTP verification",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "DEVICE_NOT_TRUSTED",
+			FailureReason: "device_not_trusted",
+		})
+		return ErrAdminDeviceNotTrusted
+	}
+
+	if err := s.validateAdminMPIN(req.NewMPIN); err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "MPIN validation failed for forgot admin MPIN OTP",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "VALIDATION_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "admin_mpin_validation_failed",
+		})
+		return err
+	}
+
+	admin, err := s.adminRepo.GetAdminByID(ctx, req.AdminID)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Admin not found for forgot MPIN OTP verification",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "ADMIN_NOT_FOUND",
+			FailureReason: "admin_not_found",
+		})
+		return fmt.Errorf("admin not found: %w", err)
+	}
+
+	encryptedData := &encryption.EncryptedData{
+		EncryptedValue: admin.PhoneEncrypted,
+		EncryptedDEK:   admin.PhoneEncryptedDEK,
+		KeyID:          admin.PhoneKeyID.String(),
+		Version:        "v1",
+		CreatedAt:      admin.AdminCreatedAt,
+	}
+
+	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to decrypt phone number for forgot admin MPIN OTP verification",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "PHONE_DECRYPTION_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "phone_decryption_failed",
+		})
+		return fmt.Errorf("failed to decrypt admin phone number: %w", err)
+	}
+
+	// ✅ UPDATED: Pass UserAgent to OTP verification
+	otpVerifyReq := &OTPVerifyRequest{
+		PhoneNumber:       phoneNumber,
+		OTP:               req.OTPCode,
+		Purpose:           "forgot_mpin",
+		IPAddress:         req.IPAddress,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		UserAgent:         req.UserAgent,
+	}
+
+	otpResp, err := s.otpService.VerifyOTP(ctx, otpVerifyReq)
+	if err != nil {
+		// Update risk score for OTP verification failure
+		go s.updateRiskScoreForOTPFailure(ctx, req.AdminID, req.DeviceID)
+
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "OTP verification failed for forgot admin MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "OTP_VERIFICATION_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "otp_verification_failed",
+		})
+		return fmt.Errorf("invalid OTP code")
+	}
+
+	if !otpResp.Success {
+		// Update risk score for invalid OTP
+		go s.updateRiskScoreForOTPFailure(ctx, req.AdminID, req.DeviceID)
+
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelWarning),
+				Message:     "Invalid OTP code for forgot admin MPIN",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "INVALID_OTP",
+			FailureReason: "invalid_otp",
+		})
+		return fmt.Errorf("invalid OTP code")
+	}
+
+	hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
+	if err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to hash MPIN for forgot admin MPIN OTP",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "HASHING_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "hashing_failed",
+		})
+		return fmt.Errorf("failed to hash admin MPIN: %w", err)
+	}
+
+	if err := s.mpinRepo.UpdateAdminMPIN(ctx, req.AdminID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
+		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   string(models.LogEventTypeMPIN),
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: s.config.Environment,
+				Version:     AdminServiceVersion,
+				Level:       string(models.LogLevelError),
+				Message:     "Failed to update MPIN for forgot admin MPIN OTP",
+			},
+			UserID:        req.AdminID.String(),
+			Status:        "admin_forgot_otp_verification_failed",
+			DeviceID:      req.DeviceID,
+			UserAgent:     req.UserAgent,
+			ErrorCode:     "MPIN_UPDATE_FAILED",
+			ErrorMessage:  err.Error(),
+			FailureReason: "mpin_update_failed",
+		})
+		return fmt.Errorf("failed to update admin MPIN: %w", err)
+	}
+
+	_ = s.mpinRepo.UnlockAdminMPIN(ctx, req.AdminID)
+
+	// Update device trust with hashed fingerprint and current information
+	updatedTrustLevel := &models.DeviceTrustLevel{
+		UserID:            req.AdminID,
+		DeviceID:          req.DeviceID,
+		TrustStatus:       models.TrustStatusTrusted,
+		DeviceFingerprint: s.hashDeviceFingerprint(req.DeviceFingerprint),
+		LastIPAddress:     req.IPAddress,
+		UserAgent:         req.UserAgent, // ✅ ADDED USER AGENT
+		IsBlocked:         false,
+		RiskScore:         0, // Reset risk score on successful reset
+	}
+
+	if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, req.AdminID, req.DeviceID, updatedTrustLevel); err != nil {
+		s.logger.Warn("Failed to update admin device trust level",
+			util.ErrorField(err),
+			util.String("admin_id", req.AdminID.String()),
+		)
+	}
+
+	s.invalidateAdminMPINCache(ctx, req.AdminID)
+
+	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   string(models.LogEventTypeMPIN),
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: s.config.Environment,
+			Version:     AdminServiceVersion,
+			Level:       string(models.LogLevelInfo),
+			Message:     "Admin MPIN reset via forgot with OTP verification completed",
+		},
+		UserID:      req.AdminID.String(),
+		Status:      "admin_forgot_otp_verification_completed",
+		DeviceID:    req.DeviceID,
+		UserAgent:   req.UserAgent,
+		DeviceTrust: string(trustLevel.TrustStatus),
+		Duration:    int64(time.Since(startTime).Milliseconds()),
+	})
+
+	s.logger.Info("Admin MPIN reset via forgot with OTP verification on trusted device",
+		util.String("admin_id", req.AdminID.String()),
+		util.String("device_id", req.DeviceID),
+		util.String("user_agent", req.UserAgent),
+		util.String("trust_status", string(trustLevel.TrustStatus)),
+	)
+
+	return nil
+}
+
+// ChangeAdminMPINByAdmin changes admin MPIN by another admin (admin override)
 func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *AdminMPINAdminChangeRequest) error {
 	startTime := time.Now()
 
@@ -858,8 +1790,9 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN change by admin initiated",
 		},
-		UserID: req.AdminID.String(),
-		Status: "admin_change_by_admin_initiated",
+		UserID:    req.AdminID.String(),
+		Status:    "admin_change_by_admin_initiated",
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
 	})
 
 	if err := s.validateAdminMPIN(req.NewMPIN); err != nil {
@@ -876,6 +1809,7 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_by_admin_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "VALIDATION_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "new_admin_mpin_validation_failed",
@@ -898,6 +1832,7 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_by_admin_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "ADMIN_NOT_FOUND",
 			FailureReason: "admin_not_found",
 		})
@@ -918,6 +1853,7 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_by_admin_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "ADMIN_INACTIVE",
 			FailureReason: "admin_inactive",
 		})
@@ -939,6 +1875,7 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_by_admin_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "HASHING_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "hashing_failed",
@@ -960,6 +1897,7 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_change_by_admin_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "REPOSITORY_UPDATE_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "repository_update_failed",
@@ -969,7 +1907,7 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 
 	_ = s.mpinRepo.UnlockAdminMPIN(ctx, req.AdminID)
 
-	s.invalidateAdminMPINCache(ctx, req.AdminID) // ✅ Added ctx parameter
+	s.invalidateAdminMPINCache(ctx, req.AdminID)
 
 	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -982,22 +1920,24 @@ func (s *AdminMPINService) ChangeAdminMPINByAdmin(ctx context.Context, req *Admi
 			Level:       string(models.LogLevelWarning),
 			Message:     "Admin MPIN changed by admin successfully",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_change_by_admin_completed",
-		Duration: int64(time.Since(startTime).Milliseconds()),
+		UserID:    req.AdminID.String(),
+		Status:    "admin_change_by_admin_completed",
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	s.logger.Warn("Admin MPIN changed by admin",
 		util.String("admin_id", req.AdminID.String()),
 		util.String("changed_by", req.ChangedBy.String()),
 		util.String("reason", req.Reason),
+		util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
 		util.Duration("duration", time.Since(startTime)),
 	)
 
 	return nil
 }
 
-// ResetAdminMPIN resets admin MPIN
+// ResetAdminMPIN resets admin MPIN (admin override - unlocks only)
 func (s *AdminMPINService) ResetAdminMPIN(ctx context.Context, req *AdminMPINResetRequest) error {
 	startTime := time.Now()
 
@@ -1012,8 +1952,9 @@ func (s *AdminMPINService) ResetAdminMPIN(ctx context.Context, req *AdminMPINRes
 			Level:       string(models.LogLevelInfo),
 			Message:     "Admin MPIN reset initiated",
 		},
-		UserID: req.AdminID.String(),
-		Status: "admin_reset_initiated",
+		UserID:    req.AdminID.String(),
+		Status:    "admin_reset_initiated",
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
 	})
 
 	_, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, req.AdminID)
@@ -1031,6 +1972,7 @@ func (s *AdminMPINService) ResetAdminMPIN(ctx context.Context, req *AdminMPINRes
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_reset_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "ADMIN_MPIN_NOT_FOUND",
 			FailureReason: "admin_mpin_not_found",
 		})
@@ -1051,6 +1993,7 @@ func (s *AdminMPINService) ResetAdminMPIN(ctx context.Context, req *AdminMPINRes
 			},
 			UserID:        req.AdminID.String(),
 			Status:        "admin_reset_failed",
+			UserAgent:     req.UserAgent, // ✅ ADDED USER AGENT
 			ErrorCode:     "UNLOCK_FAILED",
 			ErrorMessage:  err.Error(),
 			FailureReason: "unlock_failed",
@@ -1058,7 +2001,7 @@ func (s *AdminMPINService) ResetAdminMPIN(ctx context.Context, req *AdminMPINRes
 		return fmt.Errorf("failed to unlock admin MPIN: %w", err)
 	}
 
-	s.invalidateAdminMPINCache(ctx, req.AdminID) // ✅ Added ctx parameter
+	s.invalidateAdminMPINCache(ctx, req.AdminID)
 
 	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
 		LogEnvelope: models.LogEnvelope{
@@ -1071,15 +2014,17 @@ func (s *AdminMPINService) ResetAdminMPIN(ctx context.Context, req *AdminMPINRes
 			Level:       string(models.LogLevelWarning),
 			Message:     "Admin MPIN reset by admin completed",
 		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_reset_completed",
-		Duration: int64(time.Since(startTime).Milliseconds()),
+		UserID:    req.AdminID.String(),
+		Status:    "admin_reset_completed",
+		UserAgent: req.UserAgent, // ✅ ADDED USER AGENT
+		Duration:  int64(time.Since(startTime).Milliseconds()),
 	})
 
 	s.logger.Warn("Admin MPIN reset by admin",
 		util.String("admin_id", req.AdminID.String()),
 		util.String("reset_by", req.ResetBy.String()),
 		util.String("reason", req.Reason),
+		util.String("user_agent", req.UserAgent), // ✅ ADDED USER AGENT
 		util.Duration("duration", time.Since(startTime)),
 	)
 
@@ -1144,774 +2089,7 @@ func (s *AdminMPINService) UnlockAdminMPIN(ctx context.Context, adminID uuid.UUI
 	return nil
 }
 
-// GetAdminMPINStatus gets admin MPIN status
-// func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.UUID) (*AdminMPINStatus, error) {
-// 	mpinCred, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, adminID)
-// 	if err != nil {
-// 		if err.Error() == "MPIN not found for admin: "+adminID.String() {
-// 			return &AdminMPINStatus{
-// 				AdminID: adminID,
-// 				Exists:  false,
-// 			}, nil
-// 		}
-// 		return nil, err
-// 	}
-
-// 	return &AdminMPINStatus{
-// 		AdminID:        adminID,
-// 		Exists:         true,
-// 		IsLocked:       mpinCred.IsLocked,
-// 		FailedAttempts: mpinCred.FailedAttempts,
-// 		LockedUntil:    mpinCred.LockedUntil,
-// 		LastChanged:    mpinCred.LastChanged,
-// 		DeviceID:       mpinCred.DeviceID,
-// 	}, nil
-// }
-
-// UpdateAdminMPINDeviceBinding updates device binding for admin MPIN
-func (s *AdminMPINService) UpdateAdminMPINDeviceBinding(ctx context.Context, adminID uuid.UUID, deviceID string) error {
-	if err := s.mpinRepo.UpdateAdminMPINDeviceBinding(ctx, adminID, deviceID); err != nil {
-		return fmt.Errorf("failed to update admin device binding: %w", err)
-	}
-
-	s.invalidateAdminMPINCache(ctx, adminID)
-
-	return nil
-}
-
-// GetAdminMPINsByDevice gets all admin MPINs associated with a device
-func (s *AdminMPINService) GetAdminMPINsByDevice(ctx context.Context, deviceID string) ([]*models.MPINCredential, error) {
-	return s.mpinRepo.GetAdminMPINsByDevice(ctx, deviceID)
-}
-
-// GetAdminLockedMPINs gets locked admin MPIN credentials
-func (s *AdminMPINService) GetAdminLockedMPINs(ctx context.Context, limit int) ([]*models.MPINCredential, error) {
-	return s.mpinRepo.GetAdminLockedMPINs(ctx, limit)
-}
-
-// CleanupAdminExpiredLocks cleans up expired admin MPIN locks
-func (s *AdminMPINService) CleanupAdminExpiredLocks(ctx context.Context) (int, error) {
-	return s.mpinRepo.CleanupAdminUnlockedMPINs(ctx)
-}
-
-// GetAdminMPINStats gets admin MPIN service statistics
-func (s *AdminMPINService) GetAdminMPINStats(ctx context.Context) (map[string]interface{}, error) {
-	stats, err := s.mpinRepo.GetAdminRepositoryStats(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	stats["service_constants"] = map[string]interface{}{
-		"min_length":            AdminMPINMinLength,
-		"max_length":            AdminMPINMaxLength,
-		"max_attempts":          AdminMPINMaxAttempts,
-		"lock_duration_minutes": int(AdminMPINLockDuration.Minutes()),
-	}
-
-	return stats, nil
-}
-
-// HealthCheck performs a health check on the admin MPIN service
-func (s *AdminMPINService) HealthCheck(ctx context.Context) error {
-	return s.mpinRepo.HealthCheck(ctx)
-}
-
-// SendForgotAdminMPINOTP sends OTP for forgot admin MPIN flow
-func (s *AdminMPINService) SendForgotAdminMPINOTP(ctx context.Context, adminID uuid.UUID) (string, error) {
-	startTime := time.Now()
-
-	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     AdminServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Forgot admin MPIN OTP send initiated",
-		},
-		UserID: adminID.String(),
-		Status: "admin_forgot_otp_initiated",
-	})
-
-	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Admin not found for forgot MPIN OTP",
-			},
-			UserID:        adminID.String(),
-			Status:        "admin_forgot_otp_failed",
-			ErrorCode:     "ADMIN_NOT_FOUND",
-			FailureReason: "admin_not_found",
-		})
-		return "", fmt.Errorf("admin not found: %w", err)
-	}
-
-	if !admin.IsActive {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Inactive admin attempted forgot MPIN OTP",
-			},
-			UserID:        adminID.String(),
-			Status:        "admin_forgot_otp_failed",
-			ErrorCode:     "ADMIN_INACTIVE",
-			FailureReason: "admin_inactive",
-		})
-		return "", fmt.Errorf("admin account is inactive")
-	}
-
-	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: admin.PhoneEncrypted,
-		EncryptedDEK:   admin.PhoneEncryptedDEK,
-		KeyID:          admin.PhoneKeyID.String(),
-		Version:        "v1",
-		CreatedAt:      admin.AdminCreatedAt,
-	}
-
-	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to decrypt phone number for forgot admin MPIN OTP",
-			},
-			UserID:        adminID.String(),
-			Status:        "admin_forgot_otp_failed",
-			ErrorCode:     "PHONE_DECRYPTION_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "phone_decryption_failed",
-		})
-		s.logger.Error("Failed to decrypt admin phone number",
-			util.ErrorField(err),
-			util.String("admin_id", adminID.String()),
-		)
-		return "", fmt.Errorf("failed to decrypt admin phone number: %w", err)
-	}
-
-	otpReq := &OTPSendRequest{
-		PhoneNumber: phoneNumber,
-		Purpose:     "forgot_admin_mpin",
-		DeviceID:    "",
-	}
-
-	otpResp, err := s.otpService.SendOTP(ctx, otpReq)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "OTP service error for forgot admin MPIN",
-			},
-			UserID:        adminID.String(),
-			Status:        "admin_forgot_otp_failed",
-			ErrorCode:     "OTP_SEND_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "otp_send_failed",
-		})
-		s.logger.Error("OTP service error for admin",
-			util.ErrorField(err),
-			util.String("admin_id", adminID.String()),
-		)
-		return "", err
-	}
-
-	if !otpResp.Success {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "OTP send failed for forgot admin MPIN",
-			},
-			UserID:        adminID.String(),
-			Status:        "admin_forgot_otp_failed",
-			ErrorCode:     "OTP_SEND_FAILED",
-			ErrorMessage:  otpResp.Message,
-			FailureReason: "otp_send_failed",
-		})
-		return "", fmt.Errorf("failed to send OTP: %s", otpResp.Message)
-	}
-
-	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     AdminServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Forgot admin MPIN OTP sent successfully",
-		},
-		UserID:   adminID.String(),
-		Status:   "admin_forgot_otp_sent",
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	s.logger.Info("Forgot admin MPIN OTP sent successfully",
-		util.String("admin_id", adminID.String()),
-		util.String("phone", phoneNumber[len(phoneNumber)-4:]+"****"),
-	)
-
-	return "", nil
-}
-
-// VerifyForgotAdminMPINOTP verifies OTP and resets admin MPIN
-func (s *AdminMPINService) VerifyForgotAdminMPINOTP(ctx context.Context, req *AdminMPINForgotWithOTPRequest) error {
-	startTime := time.Now()
-
-	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     AdminServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Forgot admin MPIN OTP verification initiated",
-		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_forgot_otp_verification_initiated",
-		DeviceID: req.DeviceID,
-	})
-
-	if err := s.validateAdminMPIN(req.NewMPIN); err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "MPIN validation failed for forgot admin MPIN OTP",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "VALIDATION_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "admin_mpin_validation_failed",
-		})
-		return err
-	}
-
-	admin, err := s.adminRepo.GetAdminByID(ctx, req.AdminID)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Admin not found for forgot MPIN OTP verification",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "ADMIN_NOT_FOUND",
-			FailureReason: "admin_not_found",
-		})
-		return fmt.Errorf("admin not found: %w", err)
-	}
-
-	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: admin.PhoneEncrypted,
-		EncryptedDEK:   admin.PhoneEncryptedDEK,
-		KeyID:          admin.PhoneKeyID.String(),
-		Version:        "v1",
-		CreatedAt:      admin.AdminCreatedAt,
-	}
-
-	phoneNumber, err := s.encryptionMgr.DecryptField(ctx, encryptedData)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to decrypt phone number for forgot admin MPIN OTP verification",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "PHONE_DECRYPTION_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "phone_decryption_failed",
-		})
-		s.logger.Error("Failed to decrypt admin phone number",
-			util.ErrorField(err),
-			util.String("admin_id", req.AdminID.String()),
-		)
-		return fmt.Errorf("failed to decrypt admin phone number: %w", err)
-	}
-
-	otpVerifyReq := &OTPVerifyRequest{
-		PhoneNumber: phoneNumber,
-		OTP:         req.OTPCode,
-		Purpose:     "forgot_admin_mpin",
-	}
-
-	otpResp, err := s.otpService.VerifyOTP(ctx, otpVerifyReq)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "OTP verification failed for forgot admin MPIN",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "OTP_VERIFICATION_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "otp_verification_failed",
-		})
-		s.logger.Warn("OTP verification failed for admin",
-			util.ErrorField(err),
-			util.String("admin_id", req.AdminID.String()),
-		)
-		return fmt.Errorf("invalid OTP code")
-	}
-
-	if !otpResp.Success {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Invalid OTP code for forgot admin MPIN",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "INVALID_OTP",
-			FailureReason: "invalid_otp",
-		})
-		return fmt.Errorf("invalid OTP code")
-	}
-
-	deviceTrust, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, req.AdminID, req.DeviceID)
-	if err != nil {
-		deviceTrust = &models.DeviceTrustLevel{
-			UserID:      req.AdminID,
-			DeviceID:    req.DeviceID,
-			TrustStatus: models.TrustStatusUntrusted,
-		}
-	}
-
-	primaryDevice, _ := s.deviceTrustRepo.GetAdminPrimaryDevice(ctx, req.AdminID)
-
-	isTrustedDevice := deviceTrust.TrustStatus == models.TrustStatusPrimary ||
-		deviceTrust.TrustStatus == models.TrustStatusTrusted
-
-	shouldWipeData := !isTrustedDevice && (primaryDevice != nil && primaryDevice.DeviceID != req.DeviceID)
-
-	hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to hash MPIN for forgot admin MPIN OTP",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "HASHING_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "hashing_failed",
-		})
-		s.logger.Error("Failed to hash admin MPIN",
-			util.ErrorField(err),
-			util.String("admin_id", req.AdminID.String()),
-		)
-		return fmt.Errorf("failed to hash admin MPIN: %w", err)
-	}
-
-	if err := s.mpinRepo.UpdateAdminMPIN(ctx, req.AdminID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to update MPIN for forgot admin MPIN OTP",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_otp_verification_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "MPIN_UPDATE_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "mpin_update_failed",
-		})
-		s.logger.Error("Failed to update admin MPIN",
-			util.ErrorField(err),
-			util.String("admin_id", req.AdminID.String()),
-		)
-		return fmt.Errorf("failed to update admin MPIN: %w", err)
-	}
-
-	_ = s.mpinRepo.UnlockAdminMPIN(ctx, req.AdminID)
-
-	if shouldWipeData {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Data wipe triggered for forgot admin MPIN on untrusted device",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_data_wipe_triggered",
-			DeviceID:      req.DeviceID,
-			FailureReason: "untrusted_device_forgot_admin_mpin",
-		})
-
-		s.logger.Warn("Data wipe triggered - forgot admin MPIN on new device",
-			util.String("admin_id", req.AdminID.String()),
-			util.String("device_id", req.DeviceID),
-			util.String("trust_status", string(deviceTrust.TrustStatus)),
-		)
-
-		deletion := &models.UserDataDeletion{
-			DeletionID:          uuid.New(),
-			UserID:              req.AdminID,
-			DeviceID:            req.DeviceID,
-			Reason:              "forgot_admin_mpin_new_device",
-			DeletedAt:           time.Now(),
-			DataWipedCategories: []string{"session_tokens", "saved_data", "preferences"},
-		}
-
-		if err := s.deviceTrustRepo.RecordAdminDataDeletion(ctx, deletion); err != nil {
-			s.logger.Error("Failed to record admin data deletion",
-				util.ErrorField(err),
-				util.String("admin_id", req.AdminID.String()),
-			)
-		}
-	}
-
-	if err := s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, req.AdminID, req.DeviceID, models.TrustStatusTrusted); err != nil {
-		s.logger.Warn("Failed to set admin device trust level",
-			util.ErrorField(err),
-			util.String("admin_id", req.AdminID.String()),
-		)
-	}
-
-	s.invalidateAdminMPINCache(ctx, req.AdminID) // ✅ Added ctx parameter
-
-	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     AdminServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Admin MPIN reset via forgot with OTP verification completed",
-		},
-		UserID:      req.AdminID.String(),
-		Status:      "admin_forgot_otp_verification_completed",
-		DeviceID:    req.DeviceID,
-		DeviceTrust: string(deviceTrust.TrustStatus),
-		Duration:    int64(time.Since(startTime).Milliseconds()),
-	})
-
-	s.logger.Info("Admin MPIN reset via forgot with OTP verification",
-		util.String("admin_id", req.AdminID.String()),
-		util.String("device_id", req.DeviceID),
-		util.Bool("data_wiped", shouldWipeData),
-		util.String("trust_status", string(deviceTrust.TrustStatus)),
-	)
-
-	return nil
-}
-
-// ForgotAdminMPIN allows admin to reset MPIN on trusted device
-func (s *AdminMPINService) ForgotAdminMPIN(ctx context.Context, req *AdminMPINForgotRequest) error {
-	startTime := time.Now()
-
-	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     AdminServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Forgot admin MPIN flow initiated",
-		},
-		UserID:   req.AdminID.String(),
-		Status:   "admin_forgot_initiated",
-		DeviceID: req.DeviceID,
-	})
-
-	if err := s.validateAdminMPIN(req.NewMPIN); err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "New MPIN validation failed for forgot admin flow",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "VALIDATION_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "new_admin_mpin_validation_failed",
-		})
-		return err
-	}
-
-	_, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, req.AdminID)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Admin MPIN not found for forgot flow",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "ADMIN_MPIN_NOT_FOUND",
-			FailureReason: "admin_mpin_not_found",
-		})
-		return ErrAdminMPINNotFound
-	}
-
-	deviceTrust, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, req.AdminID, req.DeviceID)
-	if err != nil {
-		deviceTrust = &models.DeviceTrustLevel{
-			UserID:      req.AdminID,
-			DeviceID:    req.DeviceID,
-			TrustStatus: models.TrustStatusUntrusted,
-		}
-	}
-
-	if deviceTrust.IsBlocked {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "Device blocked for forgot admin MPIN",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "DEVICE_BLOCKED",
-			FailureReason: "device_blocked",
-		})
-		return fmt.Errorf("device is blocked for security reasons")
-	}
-
-	isTrustedDevice := deviceTrust.TrustStatus == models.TrustStatusPrimary ||
-		deviceTrust.TrustStatus == models.TrustStatusTrusted
-
-	if !isTrustedDevice {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelWarning),
-				Message:     "OTP verification required for untrusted device in forgot admin MPIN",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "OTP_VERIFICATION_REQUIRED",
-			FailureReason: "otp_verification_required",
-		})
-		return fmt.Errorf("OTP verification required for untrusted device - use VerifyForgotAdminMPINOTP endpoint")
-	}
-
-	hashResult, err := s.hasher.HashMPIN(req.NewMPIN)
-	if err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to hash MPIN for forgot admin flow",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "HASHING_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "hashing_failed",
-		})
-		return fmt.Errorf("failed to hash admin MPIN: %w", err)
-	}
-
-	if err := s.mpinRepo.UpdateAdminMPIN(ctx, req.AdminID, hashResult.Hash, hashResult.Salt, hashResult.PepperVersion); err != nil {
-		s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   string(models.LogEventTypeMPIN),
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: s.config.Environment,
-				Version:     AdminServiceVersion,
-				Level:       string(models.LogLevelError),
-				Message:     "Failed to update MPIN for forgot admin flow",
-			},
-			UserID:        req.AdminID.String(),
-			Status:        "admin_forgot_failed",
-			DeviceID:      req.DeviceID,
-			ErrorCode:     "REPOSITORY_UPDATE_FAILED",
-			ErrorMessage:  err.Error(),
-			FailureReason: "repository_update_failed",
-		})
-		return fmt.Errorf("failed to update admin MPIN: %w", err)
-	}
-
-	_ = s.mpinRepo.UnlockAdminMPIN(ctx, req.AdminID)
-
-	s.invalidateAdminMPINCache(ctx, req.AdminID) // ✅ Added ctx parameter
-
-	s.logAdminMPINEvent(ctx, &models.MPINLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   string(models.LogEventTypeMPIN),
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: s.config.Environment,
-			Version:     AdminServiceVersion,
-			Level:       string(models.LogLevelInfo),
-			Message:     "Admin MPIN reset via forgot flow completed",
-		},
-		UserID:      req.AdminID.String(),
-		Status:      "admin_forgot_completed",
-		DeviceID:    req.DeviceID,
-		DeviceTrust: string(deviceTrust.TrustStatus),
-		Duration:    int64(time.Since(startTime).Milliseconds()),
-	})
-
-	s.logger.Info("Admin MPIN reset via forgot flow on trusted device",
-		util.String("admin_id", req.AdminID.String()),
-		util.String("device_id", req.DeviceID),
-		util.String("device_trust_status", string(deviceTrust.TrustStatus)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
-	return nil
-}
-
-func (s *AdminMPINService) invalidateAdminMPINCache(ctx context.Context, adminID uuid.UUID) {
-	if s.distCache != nil {
-		cacheKey := fmt.Sprintf("admin_mpin:%s", adminID.String())
-		_ = s.distCache.Delete(ctx, cacheKey)
-	}
-}
-
-// SetLogProducerService sets Kafka log producer service
-func (s *AdminMPINService) SetLogProducerService(logProducer *LogProducerService) {
-	s.logProducer = logProducer
-}
-
-// DebugHasherStatus returns hasher status for debugging
-func (s *AdminMPINService) DebugHasherStatus(ctx context.Context) map[string]interface{} {
-	status := s.hasher.GetStatus()
-
-	// Get sample admin MPIN credential to check pepper version
-	adminID, _ := uuid.Parse("your-test-admin-id")
-	mpinCred, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, adminID)
-	if err == nil {
-		status["sample_admin_mpin_pepper_version"] = mpinCred.PepperVersion
-		status["sample_admin_mpin_algorithm"] = mpinCred.HashAlgorithm
-	}
-
-	return status
-}
-
-// GetAdminMPINStatus gets admin MPIN status - WITH DEBUG LOGGING
+// GetAdminMPINStatus retrieves the status of an admin's MPIN
 func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.UUID) (*AdminMPINStatus, error) {
 	s.logger.Debug("🔍 GetAdminMPINStatus called",
 		util.String("admin_id", adminID.String()))
@@ -1929,7 +2107,7 @@ func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.
 			util.String("admin_id", adminID.String()))
 		return &AdminMPINStatus{
 			AdminID:        adminID,
-			Exists:         false, // ✅ This is crucial
+			Exists:         false,
 			IsLocked:       false,
 			FailedAttempts: 0,
 			LockedUntil:    nil,
@@ -1944,11 +2122,134 @@ func (s *AdminMPINService) GetAdminMPINStatus(ctx context.Context, adminID uuid.
 
 	return &AdminMPINStatus{
 		AdminID:        adminID,
-		Exists:         true, // ✅ Only when MPIN actually exists
+		Exists:         true,
 		IsLocked:       mpinCred.IsLocked,
 		FailedAttempts: mpinCred.FailedAttempts,
 		LockedUntil:    mpinCred.LockedUntil,
 		LastChanged:    mpinCred.LastChanged,
 		DeviceID:       mpinCred.DeviceID,
 	}, nil
+}
+
+// UpdateAdminMPINDeviceBinding updates the device binding for an admin MPIN
+func (s *AdminMPINService) UpdateAdminMPINDeviceBinding(ctx context.Context, adminID uuid.UUID, deviceID string) error {
+	if err := s.mpinRepo.UpdateAdminMPINDeviceBinding(ctx, adminID, deviceID); err != nil {
+		return fmt.Errorf("failed to update admin device binding: %w", err)
+	}
+
+	s.invalidateAdminMPINCache(ctx, adminID)
+
+	return nil
+}
+
+// GetAdminMPINsByDevice retrieves all admin MPINs for a specific device
+func (s *AdminMPINService) GetAdminMPINsByDevice(ctx context.Context, deviceID string) ([]*models.MPINCredential, error) {
+	return s.mpinRepo.GetAdminMPINsByDevice(ctx, deviceID)
+}
+
+// GetAdminLockedMPINs retrieves locked admin MPINs
+func (s *AdminMPINService) GetAdminLockedMPINs(ctx context.Context, limit int) ([]*models.MPINCredential, error) {
+	return s.mpinRepo.GetAdminLockedMPINs(ctx, limit)
+}
+
+// CleanupAdminExpiredLocks cleans up expired MPIN locks
+func (s *AdminMPINService) CleanupAdminExpiredLocks(ctx context.Context) (int, error) {
+	return s.mpinRepo.CleanupAdminUnlockedMPINs(ctx)
+}
+
+// GetAdminMPINStats retrieves statistics about admin MPINs
+func (s *AdminMPINService) GetAdminMPINStats(ctx context.Context) (map[string]interface{}, error) {
+	stats, err := s.mpinRepo.GetAdminRepositoryStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	stats["service_constants"] = map[string]interface{}{
+		"min_length":            AdminMPINMinLength,
+		"max_length":            AdminMPINMaxLength,
+		"max_attempts":          AdminMPINMaxAttempts,
+		"lock_duration_minutes": int(AdminMPINLockDuration.Minutes()),
+		"rate_limits": map[string]interface{}{
+			"verify_per_minute": AdminMPINVerifyRateLimit,
+			"forgot_per_hour":   AdminMPINForgotRateLimit,
+			"change_per_hour":   AdminMPINChangeRateLimit,
+		},
+	}
+
+	return stats, nil
+}
+
+// HealthCheck performs a health check on the service
+func (s *AdminMPINService) HealthCheck(ctx context.Context) error {
+	return s.mpinRepo.HealthCheck(ctx)
+}
+
+// invalidateAdminMPINCache invalidates the cache for a specific admin MPIN
+func (s *AdminMPINService) invalidateAdminMPINCache(ctx context.Context, adminID uuid.UUID) {
+	if s.distCache != nil {
+		cacheKey := fmt.Sprintf("admin_mpin:%s", adminID.String())
+		_ = s.distCache.Delete(ctx, cacheKey)
+	}
+}
+
+// SetLogProducerService sets the log producer service
+func (s *AdminMPINService) SetLogProducerService(logProducer *LogProducerService) {
+	s.logProducer = logProducer
+}
+
+// DebugHasherStatus returns debug information about the hasher
+func (s *AdminMPINService) DebugHasherStatus(ctx context.Context) map[string]interface{} {
+	status := s.hasher.GetStatus()
+
+	// Get sample admin MPIN credential to check pepper version
+	adminID, _ := uuid.Parse("your-test-admin-id")
+	mpinCred, err := s.mpinRepo.GetAdminMPINByAdminID(ctx, adminID)
+	if err == nil {
+		status["sample_admin_mpin_pepper_version"] = mpinCred.PepperVersion
+		status["sample_admin_mpin_algorithm"] = mpinCred.HashAlgorithm
+	}
+
+	return status
+}
+
+// GetAdminDeviceRiskScore gets the current risk score for an admin device
+func (s *AdminMPINService) GetAdminDeviceRiskScore(ctx context.Context, adminID uuid.UUID, deviceID string) (int, error) {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
+	if err != nil {
+		return 0, err
+	}
+	if trustLevel == nil {
+		return 0, nil
+	}
+	return trustLevel.RiskScore, nil
+}
+
+// ResetAdminDeviceRiskScore resets the risk score for an admin device
+func (s *AdminMPINService) ResetAdminDeviceRiskScore(ctx context.Context, adminID uuid.UUID, deviceID string) error {
+	trustLevel, err := s.deviceTrustRepo.GetAdminDeviceTrustLevel(ctx, adminID, deviceID)
+	if err != nil {
+		return err
+	}
+	if trustLevel == nil {
+		return nil
+	}
+
+	trustLevel.RiskScore = 0
+	return s.deviceTrustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trustLevel)
+}
+
+// validateIPAddress validates an IP address
+func (s *AdminMPINService) validateIPAddress(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	return net.ParseIP(ip) != nil
+}
+
+// getValidatedIP returns a validated IP or empty string
+func (s *AdminMPINService) getValidatedIP(ip string) string {
+	if s.validateIPAddress(ip) {
+		return ip
+	}
+	return ""
 }

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS otp_verifications (
     expires_at timestamp,
     ip_address inet,
     provider_used text,
+    device_id text,
     PRIMARY KEY ((phone_hash, purpose, time_bucket), created_at)
 ) WITH CLUSTERING ORDER BY (created_at DESC)
 AND default_time_to_live = 300
@@ -39,6 +40,7 @@ AND compaction = {
     'compaction_window_size': 1,
     'compaction_window_unit': 'HOURS'
 };
+
 
 -- ===============================
 -- RATE LIMITS TABLES
@@ -114,6 +116,13 @@ CREATE TABLE IF NOT EXISTS device_trust_levels (
     ip_address inet,
     user_agent text,
     is_blocked boolean,
+    device_fingerprint text,
+    os_version text,
+    app_version text,
+    last_ip_subnet text,
+    last_location_hash text,
+    device_model text,
+    risk_score int,
     PRIMARY KEY (user_id, device_id)
 ) WITH compaction = {'class': 'LeveledCompactionStrategy'};
 
@@ -264,6 +273,13 @@ CREATE TABLE IF NOT EXISTS admin_device_trust_levels (
     ip_address inet,
     user_agent text,
     is_blocked boolean,
+    device_fingerprint text,
+    os_version text,
+    app_version text,
+    last_ip_subnet text,
+    last_location_hash text,
+    device_model text,
+    risk_score int,
     PRIMARY KEY (admin_id, device_id)
 );
 
@@ -295,22 +311,6 @@ CREATE TABLE IF NOT EXISTS admin_active_device (
     bound_at timestamp,
     bind_token text
 );
-
--- =========================================================
--- MATERIALIZED VIEWS (Only Session and OTP related)
--- =========================================================
-CREATE MATERIALIZED VIEW IF NOT EXISTS otp_by_phone AS
-    SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, attempts, expires_at
-    FROM otp_verifications
-    WHERE phone_hash IS NOT NULL AND purpose IS NOT NULL AND time_bucket IS NOT NULL AND created_at IS NOT NULL
-    PRIMARY KEY ((phone_hash), purpose, time_bucket, created_at)
-    WITH CLUSTERING ORDER BY (purpose ASC, time_bucket DESC, created_at DESC);
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS sessions_by_token AS
-    SELECT user_id, session_token, device_id, expires_at
-    FROM active_sessions
-    WHERE session_token IS NOT NULL AND user_id IS NOT NULL
-    PRIMARY KEY (session_token, user_id);
     
 CREATE TABLE IF NOT EXISTS user_active_device (
     user_id uuid PRIMARY KEY,

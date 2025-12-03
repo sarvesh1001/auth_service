@@ -4,6 +4,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -60,16 +61,19 @@ func (h *AdminHandler) RegisterRoutes(router chi.Router) {
 	// Admin Authentication Routes (public - no auth middleware)
 	router.Route("/admin-auth", func(r chi.Router) {
 		r.Post("/login/initiate", h.InitiateAdminLogin)
+		r.Post("/init-owner", h.InitializeOwner)
 		r.Post("/login/verify-otp", h.VerifyAdminOTPLogin)
 		r.Post("/login/verify-mpin", h.VerifyAdminMPINLogin)
 		r.Post("/mpin/setup", h.SetupAdminMPIN)
+		r.Post("/mpin/change", h.ChangeAdminMPIN)
+		r.Post("/mpin/forgot", h.ForgotAdminMPIN)
+		r.Post("/mpin/forgot/verify", h.VerifyForgotAdminMPIN)
 		r.Post("/refresh", h.RefreshAdminTokens)
 		r.Post("/logout", h.LogoutAdmin)
 		r.Get("/health", h.HealthCheck)
 	})
 }
 
-// ===== HELPER RESPONSE
 // ===== ADMIN AUTHENTICATION FLOW =====
 
 // LoginFlowResponse defines the response for admin login flow
@@ -106,6 +110,7 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 		util.String("phone", req.PhoneNumber),
 		util.String("device_id", req.DeviceID))
 
+	// ✅ CHECK: Admin exists in handler (not in OTP service)
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	adminExists := err == nil && admin != nil
 
@@ -175,13 +180,15 @@ func (h *AdminHandler) InitiateAdminLogin(w http.ResponseWriter, r *http.Request
 	h.logger.Info("✅ Admin login initiation completed",
 		util.String("phone", req.PhoneNumber),
 		util.Bool("admin_exists", adminExists),
-		util.Bool("has_mpin", response.HasMPIN), // This should now be accurate
+		util.Bool("has_mpin", response.HasMPIN),
 		util.Bool("mpin_locked", response.MPINLocked),
 		util.Bool("device_trusted", deviceTrusted),
 		util.String("flow_state", response.FlowState),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
+
+// ✅ UPDATED: VerifyAdminOTPLogin - removed device trust check (handled by OTP service)
 func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -194,7 +201,7 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
 		return
 	}
 
@@ -204,36 +211,42 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 
 	otpVerifyReq := service.OTPVerifyRequest{
-		PhoneNumber: req.PhoneNumber,
-		OTP:         req.OTP,
-		Purpose:     "admin_login",
-		IPAddress:   h.getClientIP(r),
+		PhoneNumber:       req.PhoneNumber,
+		OTP:               req.OTP,
+		Purpose:           "admin_login",
+		IPAddress:         h.getClientIP(r),
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		UserAgent:         r.UserAgent(), // ✅ CRITICAL: ADDED THIS LINE
 	}
 
 	otpResponse, err := h.otpService.VerifyOTP(ctx, &otpVerifyReq)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Invalid OTP")
+		h.handleOTPError(w, err)
 		return
 	}
 
 	if !otpResponse.Success {
 		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("OTP_VERIFICATION_FAILED: OTP verification failed"),
-			"OTP verification failed")
+			fmt.Errorf("AUTHENTICATION_FAILED"),
+			"Authentication failed")
 		return
 	}
 
+	// ✅ CHECK: Admin exists in handler
 	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "Admin not found")
+		h.respondWithError(w, http.StatusNotFound, err, "Authentication failed")
 		return
 	}
 
+	// Device binding handled by OTP service internally
 	deviceReq := service.AdminBindDeviceRequest{
-		AdminID:   admin.AdminID,
-		DeviceID:  req.DeviceID,
-		IPAddress: h.getClientIP(r),
-		UserAgent: r.UserAgent(),
+		AdminID:           admin.AdminID,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         r.UserAgent(),
 	}
 
 	if _, err := h.deviceService.BindDevice(ctx, deviceReq); err != nil {
@@ -246,22 +259,32 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// ✅ ENHANCE: Include quota information in response
+	dailyUsed := otpResponse.QuotaUsed
+	dailyLimit := otpResponse.DailyQuota
+
 	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
 		"admin_id":       admin.AdminID.String(),
 		"device_trusted": true,
 		"has_mpin":       h.hasMPIN(ctx, admin.AdminID),
 		"mpin_locked":    false,
-		"message":        "OTP verification successful. Device is now trusted.",
+		"daily_quota": map[string]interface{}{
+			"used":      dailyUsed,
+			"limit":     dailyLimit,
+			"remaining": dailyLimit - dailyUsed,
+		},
+		"message": "OTP verification successful. Device is now trusted.",
 	}, "Admin device setup successful"))
 
-	h.logger.Info("Admin OTP verification completed - device trusted (no tokens issued)",
+	h.logger.Info("Admin OTP verification completed - device trusted",
 		util.String("admin_id", admin.AdminID.String()),
 		util.String("phone", req.PhoneNumber),
 		util.String("device_id", req.DeviceID),
+		util.Int("daily_quota_used", dailyUsed),
+		util.Int("daily_quota_limit", dailyLimit),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
-
 func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -271,6 +294,7 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		MPIN              string `json:"mpin" validate:"required"`
 		DeviceID          string `json:"device_id" validate:"required"`
 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+		UserAgent         string `json:"user_agent"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -288,6 +312,7 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// ✅ CHECK: Device trust handled by MPIN service
 	deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, adminID, req.DeviceID)
 	if err != nil || !deviceTrusted {
 		h.respondWithError(w, http.StatusForbidden,
@@ -296,13 +321,26 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	mpinVerifyReq := service.AdminMPINVerifyRequest{
-		AdminID:  adminID,
-		MPIN:     req.MPIN,
-		DeviceID: req.DeviceID,
+	// ✅ FIXED: Enhanced IP handling with validation
+	ipAddress := h.getClientIP(r)
+	if ipAddress == "" {
+		h.logger.Warn("Invalid IP address detected, using safe default",
+			util.String("admin_id", adminID.String()),
+			util.String("device_id", req.DeviceID))
+		ipAddress = "0.0.0.0"
 	}
 
-	mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, &mpinVerifyReq)
+	mpinVerifyReq := &service.AdminMPINVerifyRequest{
+		AdminID:           adminID,
+		MPIN:              req.MPIN,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         ipAddress,
+		UserAgent:         r.UserAgent(), // ✅ ADD THIS LINE
+
+	}
+
+	mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, mpinVerifyReq)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
 		return
@@ -326,7 +364,7 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		Role:             "admin",
 		DeviceID:         req.DeviceID,
 		SessionType:      "admin",
-		IPAddress:        h.getClientIP(r),
+		IPAddress:        ipAddress,
 		AdminRoleLevel:   admin.AdminRoleLevel,
 		AdminPermissions: admin.AdminPermissions,
 	}
@@ -346,6 +384,7 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 	h.logger.Info("Admin MPIN login completed with JWT tokens",
 		util.String("admin_id", adminID.String()),
 		util.String("role_level", admin.AdminRoleLevel),
+		util.String("ip_address", ipAddress),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
@@ -355,9 +394,11 @@ func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 
 	var req struct {
-		AdminID  string `json:"admin_id" validate:"required"`
-		MPIN     string `json:"mpin" validate:"required,min=4,max=6"`
-		DeviceID string `json:"device_id" validate:"required"`
+		AdminID           string `json:"admin_id" validate:"required"`
+		MPIN              string `json:"mpin" validate:"required,min=6,max=8"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		DeviceFingerprint string `json:"device_fingerprint"`
+		UserAgent         string `json:"user_agent"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -367,6 +408,8 @@ func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 
 	req.MPIN = util.SanitizeInput(req.MPIN)
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.UserAgent = util.SanitizeInput(req.UserAgent)
 
 	adminID, err := uuid.Parse(req.AdminID)
 	if err != nil {
@@ -374,13 +417,16 @@ func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mpinReq := service.AdminMPINSetupRequest{
-		AdminID:  adminID,
-		MPIN:     req.MPIN,
-		DeviceID: req.DeviceID,
+	mpinReq := &service.AdminMPINSetupRequest{
+		AdminID:           adminID,
+		MPIN:              req.MPIN,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         req.UserAgent,
 	}
 
-	if err := h.mpinService.SetupAdminMPIN(ctx, &mpinReq); err != nil {
+	if err := h.mpinService.SetupAdminMPIN(ctx, mpinReq); err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to setup MPIN")
 		return
 	}
@@ -391,6 +437,276 @@ func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("Admin MPIN setup completed (no tokens issued)",
 		util.String("admin_id", adminID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ✅ NEW: ChangeAdminMPIN handler
+func (h *AdminHandler) ChangeAdminMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req struct {
+		AdminID           string `json:"admin_id" validate:"required"`
+		CurrentMPIN       string `json:"current_mpin" validate:"required"`
+		NewMPIN           string `json:"new_mpin" validate:"required,min=6,max=8"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		DeviceFingerprint string `json:"device_fingerprint"`
+		UserAgent         string `json:"user_agent"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+
+	adminID, err := uuid.Parse(req.AdminID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
+
+	mpinReq := &service.AdminMPINChangeRequest{
+		AdminID:           adminID,
+		CurrentMPIN:       req.CurrentMPIN,
+		NewMPIN:           req.NewMPIN,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         r.UserAgent(), // ✅ ADD THIS LINE
+	}
+
+	if err := h.mpinService.ChangeAdminMPIN(ctx, mpinReq); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to change MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"message": "MPIN changed successfully",
+	}, "Admin MPIN change successful"))
+
+	h.logger.Info("Admin MPIN changed successfully",
+		util.String("admin_id", adminID.String()),
+		util.String("device_id", req.DeviceID),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ✅ UPDATED: ForgotAdminMPIN - removed device trust check (handled by OTP service)
+func (h *AdminHandler) ForgotAdminMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req struct {
+		PhoneNumber       string `json:"phone_number" validate:"required"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		DeviceFingerprint string `json:"device_fingerprint"`
+		UserAgent         string `json:"user_agent"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Warn("Invalid JSON request for ForgotAdminMPIN", util.ErrorField(err))
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.UserAgent = util.SanitizeInput(req.UserAgent)
+
+	h.logger.Info("📩 ForgotAdminMPIN Request Received",
+		util.String("phone", req.PhoneNumber),
+		util.String("device_id", req.DeviceID),
+		util.String("device_fingerprint", req.DeviceFingerprint),
+		util.String("user_agent", req.UserAgent),
+		util.String("endpoint", "/admin/forgot-mpin"),
+	)
+
+	// ✅ CHECK: Admin exists in handler
+	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
+	if err != nil || admin == nil {
+		h.logger.Warn("Admin not found for ForgotAdminMPIN",
+			util.String("phone", req.PhoneNumber),
+			util.ErrorField(err),
+		)
+		h.respondWithError(w, http.StatusNotFound, fmt.Errorf("phone not registered"), "Phone not registered")
+		return
+	}
+
+	clientIP := h.getClientIP(r)
+
+	// Build forgot request - device trust handled by OTP service internally
+	forgotReq := &service.AdminMPINForgotRequest{
+		AdminID:           admin.AdminID,
+		PhoneNumber:       req.PhoneNumber,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         clientIP,
+		UserAgent:         req.UserAgent,
+	}
+
+	// STEP 4: Trigger MPIN Forgot service
+	if err := h.mpinService.ForgotAdminMPIN(ctx, forgotReq); err != nil {
+		h.logger.Error("Failed to initiate ForgotAdminMPIN",
+			util.String("admin_id", admin.AdminID.String()),
+			util.ErrorField(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to initiate forgot MPIN process")
+		return
+	}
+
+	// SUCCESS
+	h.logger.Info("🎉 ForgotAdminMPIN initiated successfully",
+		util.String("admin_id", admin.AdminID.String()),
+		util.String("phone", req.PhoneNumber),
+		util.String("device_id", req.DeviceID),
+		util.Duration("duration", time.Since(startTime)),
+	)
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"message": "OTP sent to your registered phone number for MPIN reset",
+	}, "Forgot MPIN initiated"))
+}
+
+// ✅ UPDATED: VerifyForgotAdminMPIN - removed device trust check (handled by OTP service)
+func (h *AdminHandler) VerifyForgotAdminMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req struct {
+		PhoneNumber       string `json:"phone_number" validate:"required"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		NewMPIN           string `json:"new_mpin" validate:"required,min=6,max=8"`
+		OTPCode           string `json:"otp_code" validate:"required,len=6"`
+		DeviceFingerprint string `json:"device_fingerprint"`
+		UserAgent         string `json:"user_agent"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.OTPCode = util.SanitizeInput(req.OTPCode)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+
+	// ✅ CHECK: Admin exists in handler
+	admin, err := h.adminService.GetAdminByPhone(ctx, req.PhoneNumber)
+	if err != nil || admin == nil {
+		h.respondWithError(w, http.StatusNotFound, fmt.Errorf("phone not registered"), "Phone not registered")
+		return
+	}
+
+	// Device trust handled by OTP service internally during OTP verification
+	clientIP := h.getClientIP(r)
+
+	// 🔥 Verify OTP + Reset MPIN
+	forgotReq := &service.AdminMPINForgotWithOTPRequest{
+		AdminID:           admin.AdminID,
+		PhoneNumber:       req.PhoneNumber,
+		DeviceID:          req.DeviceID,
+		NewMPIN:           req.NewMPIN,
+		OTPCode:           req.OTPCode,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         clientIP,
+		UserAgent:         r.UserAgent(), // ✅ CRITICAL: ADDED THIS LINE
+	}
+
+	if err := h.mpinService.VerifyForgotAdminMPINOTP(ctx, forgotReq); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to reset MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"message": "MPIN reset successfully. You can now login with your new MPIN.",
+	}, "Admin MPIN reset successful"))
+
+	h.logger.Info("Admin MPIN reset via forgot flow completed",
+		util.String("admin_id", admin.AdminID.String()),
+		util.String("phone", req.PhoneNumber),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ✅ NEW: ChangeAdminMPINByAdmin handler (admin changes another admin's MPIN)
+func (h *AdminHandler) ChangeAdminMPINByAdmin(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	// 🔥 NEW OVERRIDE: Allow if session_type = "admin"
+	if !h.hasAdminOrPermission(r, "read_users") {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED"),
+			"You don't have permission to change admin MPIN")
+		return
+	}
+
+	// Parse request body
+	var req struct {
+		AdminID string `json:"admin_id" validate:"required"`
+		NewMPIN string `json:"new_mpin" validate:"required,min=6,max=8"`
+		Reason  string `json:"reason,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Sanitize inputs
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.Reason = util.SanitizeInput(req.Reason)
+
+	// Validate AdminID
+	adminID, err := uuid.Parse(req.AdminID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
+
+	// Get requester admin ID
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Prepare request for service layer
+	changeReq := &service.AdminMPINAdminChangeRequest{
+		AdminID:   adminID,
+		NewMPIN:   req.NewMPIN,
+		ChangedBy: requesterID,
+		Reason:    req.Reason,
+		IPAddress: h.getClientIP(r),
+		UserAgent: r.UserAgent(), // ✅ ADD THIS LINE
+
+	}
+
+	// Call service
+	if err := h.mpinService.ChangeAdminMPINByAdmin(ctx, changeReq); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to change admin MPIN")
+		return
+	}
+
+	// Response
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"message": "Admin MPIN changed successfully by administrator",
+	}, "Admin MPIN change by admin successful"))
+
+	// Log
+	h.logger.Warn("Admin MPIN changed by another admin",
+		util.String("admin_id", adminID.String()),
+		util.String("changed_by", requesterID.String()),
+		util.String("reason", req.Reason),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
@@ -556,47 +872,6 @@ func (h *AdminHandler) CreateDepartment(w http.ResponseWriter, r *http.Request) 
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
-
-// // GetCompanyDepartments retrieves all departments for a company
-// func (h *AdminHandler) GetCompanyDepartments(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	companyIDStr := chi.URLParam(r, "companyID")
-// 	companyID, err := uuid.Parse(companyIDStr)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-// 		return
-// 	}
-
-// 	limit := h.getIntQueryParam(r, "limit", 50)
-// 	offset := h.getIntQueryParam(r, "offset", 0)
-
-// 	departments, total, err := h.companyService.GetDepartmentsByCompany(ctx, companyID, limit, offset)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company departments")
-// 		return
-// 	}
-
-// 	response := map[string]interface{}{
-// 		"departments": departments,
-// 		"meta": map[string]interface{}{
-// 			"company_id": companyID.String(),
-// 			"count":      len(departments),
-// 			"total":      total,
-// 			"limit":      limit,
-// 			"offset":     offset,
-// 		},
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Company departments retrieved successfully"))
-
-// 	h.logger.Debug("Company departments retrieved",
-// 		util.String("company_id", companyID.String()),
-// 		util.Int("count", len(departments)),
-// 		util.Duration("duration", time.Since(startTime)),
-// 	)
-// }
 
 // ===== ROLE MANAGEMENT =====
 
@@ -2434,11 +2709,65 @@ func (h *AdminHandler) GetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // ===== HELPER METHODS =====
-//
-//	func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
-//		status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
-//		return err == nil && status != nil && status.Exists // ✅ Check the Exists field
-//	}
+
+func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
+	h.logger.Debug("🔍 hasMPIN helper called", util.String("admin_id", adminID.String()))
+
+	status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
+	if err != nil {
+		h.logger.Warn("❌ Error in hasMPIN helper",
+			util.ErrorField(err),
+			util.String("admin_id", adminID.String()))
+		return false
+	}
+
+	result := status != nil && status.Exists
+	h.logger.Debug("📊 hasMPIN result",
+		util.String("admin_id", adminID.String()),
+		util.Bool("result", result))
+
+	return result
+}
+
+// ✅ NEW: Helper method to check admin permissions
+func (h *AdminHandler) hasPermission(r *http.Request, permission string) bool {
+	permissions, ok := r.Context().Value("admin_permissions").([]string)
+	if !ok {
+		return false
+	}
+	for _, p := range permissions {
+		if p == permission {
+			return true
+		}
+	}
+	return false
+}
+
+// ✅ UPDATED: Enhanced error handling for OTP operations
+func (h *AdminHandler) handleOTPError(w http.ResponseWriter, err error) {
+	var otpErr *service.OTPError
+	if errors.As(err, &otpErr) {
+		switch otpErr.Code {
+		case "RATE_LIMIT_EXCEEDED":
+			h.respondWithError(w, http.StatusTooManyRequests, err, "Too many attempts. Please try again later.")
+		case "DAILY_QUOTA_EXCEEDED":
+			h.respondWithError(w, http.StatusTooManyRequests, err, "Daily OTP limit exceeded")
+		case "ACCOUNT_LOCKED":
+			h.respondWithError(w, http.StatusLocked, err, "Account temporarily locked")
+		case "RESEND_COOLDOWN":
+			h.respondWithError(w, http.StatusTooManyRequests, err, "Please wait before requesting a new OTP")
+		case "REPLAY_ATTEMPT":
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid OTP")
+		case "PHONE_NOT_REGISTERED":
+			h.respondWithError(w, http.StatusNotFound, err, "Phone number not registered")
+		default:
+			h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
+		}
+	} else {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
+	}
+}
+
 func (h *AdminHandler) getIntQueryParam(r *http.Request, key string, defaultValue int) int {
 	value := r.URL.Query().Get(key)
 	if value == "" {
@@ -2538,13 +2867,13 @@ func (h *AdminHandler) getRequesterRole(r *http.Request) (string, error) {
 	return role, nil
 }
 
-// client IP extraction robust helper
+// ✅ FIXED: Enhanced client IP extraction with robust validation
 func (h *AdminHandler) getClientIP(r *http.Request) string {
 	// Try X-Forwarded-For first
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
 		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
 			ip := strings.TrimSpace(ips[0])
-			// Validate IP format
+			// ✅ ENHANCED: Validate IP format with proper parsing
 			if parsedIP := net.ParseIP(ip); parsedIP != nil {
 				return ip
 			}
@@ -2598,24 +2927,24 @@ func (h *AdminHandler) getClientIP(r *http.Request) string {
 		}
 	}
 
-	// Fallback to RemoteAddr with proper parsing
+	// ✅ ENHANCED: Fallback to RemoteAddr with proper parsing and validation
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		// If SplitHostPort fails, try to parse as IP directly
 		if parsedIP := net.ParseIP(r.RemoteAddr); parsedIP != nil {
 			return r.RemoteAddr
 		}
-		// Return a safe default if all parsing fails
-		return "127.0.0.1"
+		// ✅ FIX: Return empty string instead of invalid IP to prevent marshaling issues
+		return ""
 	}
 
-	// Final validation
+	// ✅ ENHANCED: Final validation with safe fallback
 	if parsedIP := net.ParseIP(host); parsedIP != nil {
 		return host
 	}
 
-	// Safe fallback
-	return "127.0.0.1"
+	// ✅ FIX: Return empty string for invalid IPs to prevent marshaling issues
+	return ""
 }
 
 // sanitizeUserForAdmin removes sensitive fields before returning users to admin endpoints
@@ -2801,21 +3130,12 @@ func (h *AdminHandler) DebugCompanyDepartments(w http.ResponseWriter, r *http.Re
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Debug department info"))
 }
-func (h *AdminHandler) hasMPIN(ctx context.Context, adminID uuid.UUID) bool {
-	h.logger.Debug("🔍 hasMPIN helper called", util.String("admin_id", adminID.String()))
 
-	status, err := h.mpinService.GetAdminMPINStatus(ctx, adminID)
-	if err != nil {
-		h.logger.Warn("❌ Error in hasMPIN helper",
-			util.ErrorField(err),
-			util.String("admin_id", adminID.String()))
-		return false
+// NEW: Admin override — admins always allowed
+func (h *AdminHandler) hasAdminOrPermission(r *http.Request, permission string) bool {
+	sessionType, _ := r.Context().Value("session_type").(string)
+	if sessionType == "admin" {
+		return true
 	}
-
-	result := status != nil && status.Exists
-	h.logger.Debug("📊 hasMPIN result",
-		util.String("admin_id", adminID.String()),
-		util.Bool("result", result))
-
-	return result
+	return h.hasPermission(r, permission)
 }

@@ -174,6 +174,29 @@ ORDER BY (timestamp, severity, user_id)
 TTL timestamp + INTERVAL 90 DAY
 SETTINGS index_granularity = 8192;
 
+-- 🛡️ NEW: Security Risk Events - Bot Protection, IP Reputation, Risk Scoring
+CREATE TABLE IF NOT EXISTS auth_analytics.security_risk_events (
+    event_id String,
+    event_type String,
+    timestamp DateTime,
+    phone_number String,
+    ip_address String,
+    device_id String,
+    user_agent String,
+    risk_score Int32,
+    event_type_detail String, -- bot_detected, ip_reputation, risk_assessment
+    reasons Array(String), -- Array of risk reasons
+    action_taken String, -- allowed, blocked, monitored
+    environment String,
+    version String,
+    message String,
+    service_name String
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (timestamp, event_type_detail, risk_score)
+TTL timestamp + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
 EOL
 
 echo "✅ Time-series tables created successfully!"
@@ -259,6 +282,25 @@ SELECT
 FROM auth_analytics.security_events
 GROUP BY event_date, severity, event_category;
 
+-- 🛡️ NEW: Security Risk Analytics - Daily aggregation
+CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.security_risk_events_daily
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, event_type_detail, action_taken)
+SETTINGS allow_nullable_key = 1 AS
+SELECT
+    toDate(timestamp) AS event_date,
+    'security_risk' AS event_type,
+    event_type_detail,
+    action_taken,
+    count() AS total_events,
+    avg(risk_score) AS avg_risk_score,
+    uniq(phone_number) AS unique_phones,
+    uniq(ip_address) AS unique_ips,
+    uniq(device_id) AS unique_devices
+FROM auth_analytics.security_risk_events
+GROUP BY event_date, event_type_detail, action_taken;
+
 -- ========================================================================
 -- UTILITY VIEWS FOR CROSS-EVENT QUERIES (NOT MATERIALIZED)
 -- ✅ Use regular views for UNION queries
@@ -314,6 +356,17 @@ FROM (
         0 AS unique_devices
     FROM auth_analytics.security_events_daily
     GROUP BY event_date, event_type
+    
+    UNION ALL
+    
+    SELECT
+        event_date,
+        event_type,
+        sum(total_events) AS total_events,
+        0 AS unique_users, -- No user_id in security risk events
+        sum(unique_devices) AS unique_devices
+    FROM auth_analytics.security_risk_events_daily
+    GROUP BY event_date, event_type
 );
 
 -- 📊 Hourly Aggregation View (Regular View)
@@ -332,8 +385,26 @@ FROM (
     SELECT timestamp, 'otp' AS event_type, user_id, duration_ms FROM auth_analytics.otp_events
     UNION ALL
     SELECT timestamp, 'security' AS event_type, user_id, 0 AS duration_ms FROM auth_analytics.security_events
+    UNION ALL
+    SELECT timestamp, 'security_risk' AS event_type, '' AS user_id, 0 AS duration_ms FROM auth_analytics.security_risk_events
 )
 GROUP BY hour, event_type;
+
+-- 🛡️ NEW: Risk Analysis View
+CREATE VIEW IF NOT EXISTS auth_analytics.risk_analysis_hourly AS
+SELECT
+    toStartOfHour(timestamp) AS hour,
+    event_type_detail,
+    action_taken,
+    count() AS total_events,
+    avg(risk_score) AS avg_risk_score,
+    countIf(risk_score >= 70) AS high_risk_events,
+    countIf(risk_score >= 40 AND risk_score < 70) AS medium_risk_events,
+    countIf(risk_score < 40) AS low_risk_events,
+    uniq(ip_address) AS unique_ips,
+    uniq(device_id) AS unique_devices
+FROM auth_analytics.security_risk_events
+GROUP BY hour, event_type_detail, action_taken;
 
 EOL
 
@@ -354,18 +425,21 @@ echo "🎉 ClickHouse time-series analytics initialization completed successfull
 echo ""
 echo "✅ Summary:"
 echo "   • Device, MPIN, OTP, Security event tables created"
+echo "   • NEW: security_risk_events table for bot protection, IP reputation, risk scoring"
 echo "   • Materialized views created for daily aggregations:"
 echo "     - device_events_daily"
 echo "     - mpin_events_daily"
 echo "     - otp_events_daily"
 echo "     - security_events_daily"
+echo "     - security_risk_events_daily (NEW)"
 echo "   • Regular views for cross-event analytics:"
 echo "     - all_events_daily"
 echo "     - events_hourly"
+echo "     - risk_analysis_hourly (NEW)"
 echo "   • 30-day TTL for most events, 90-day for security events"
 echo ""
 echo "📝 Sample Queries:"
 echo "   clickhouse-client -u auth_svc_user -p <password> << 'SQL'"
-echo "   SELECT * FROM auth_analytics.device_events_daily LIMIT 10;"
-echo "   SELECT event_date, event_type, total_events FROM auth_analytics.all_events_daily WHERE event_date = today();"
+echo "   SELECT * FROM auth_analytics.security_risk_events_daily LIMIT 10;"
+echo "   SELECT event_type_detail, count() FROM auth_analytics.security_risk_events WHERE action_taken = 'blocked' GROUP BY event_type_detail;"
 echo "   SQL"

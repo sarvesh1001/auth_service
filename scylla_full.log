@@ -1,0 +1,30 @@
+running: (['/opt/scylladb/scripts/scylla_dev_mode_setup', '--developer-mode', '1'],)
+running: (['/opt/scylladb/scripts/scylla_io_setup'],)
+2025-11-28 05:49:40,718 CRIT Supervisor is running as root.  Privileges were not dropped because no user is specified in the config file.  If you intend to run as root, you can set user=root in the config file to avoid this message.
+2025-11-28 05:49:40,718 INFO Included extra file "/etc/supervisord.conf.d/rsyslog.conf" during parsing
+2025-11-28 05:49:40,718 INFO Included extra file "/etc/supervisord.conf.d/scylla-housekeeping.conf" during parsing
+2025-11-28 05:49:40,718 INFO Included extra file "/etc/supervisord.conf.d/scylla-jmx.conf" during parsing
+2025-11-28 05:49:40,718 INFO Included extra file "/etc/supervisord.conf.d/scylla-node-exporter.conf" during parsing
+2025-11-28 05:49:40,718 INFO Included extra file "/etc/supervisord.conf.d/scylla-server.conf" during parsing
+2025-11-28 05:49:40,718 INFO Included extra file "/etc/supervisord.conf.d/sshd-server.conf" during parsing
+2025-11-28 05:49:40,784 INFO RPC interface 'supervisor' initialized
+2025-11-28 05:49:40,784 CRIT Server 'inet_http_server' running without any HTTP authentication checking
+2025-11-28 05:49:40,791 INFO supervisord started with pid 26
+2025-11-28 05:49:41,915 INFO spawned: 'rsyslog' with pid 27
+2025-11-28 05:49:42,016 INFO spawned: 'scylla' with pid 28
+2025-11-28 05:49:42,163 INFO spawned: 'scylla-housekeeping' with pid 29
+2025-11-28 05:49:42,208 INFO spawned: 'scylla-jmx' with pid 36
+2025-11-28 05:49:42,247 INFO spawned: 'scylla-node-exporter' with pid 40
+2025-11-28 05:49:42,323 INFO spawned: 'sshd' with pid 56
+2025-11-28 05:49:43,771 INFO success: rsyslog entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+2025-11-28 05:49:43,776 INFO success: scylla entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+2025-11-28 05:49:43,777 INFO success: scylla-housekeeping entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+2025-11-28 05:49:43,777 INFO success: scylla-jmx entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+2025-11-28 05:49:43,777 INFO success: scylla-node-exporter entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+2025-11-28 05:49:43,777 INFO success: sshd entered RUNNING state, process has stayed up for > than 1 seconds (startsecs)
+Scylla version 5.2.0-0.20230427.429b696bbc1b with build-id 975027027d07350577d47281c5ba5fa4a81ce9d9 starting ...
+command used: "/usr/bin/scylla --log-to-syslog 0 --log-to-stdout 1 --default-log-level info --network-stack posix --developer-mode=1 --memory 2G --smp 2 --overprovisioned --listen-address 172.18.0.5 --rpc-address 172.18.0.5 --seed-provider-parameters seeds=172.18.0.5 --alternator-address 172.18.0.5 --blocked-reactor-notify-ms 999999999"
+parsed command line options: [log-to-syslog, (positional) 0, log-to-stdout, (positional) 1, default-log-level, (positional) info, network-stack, (positional) posix, developer-mode: 1, memory, (positional) 2G, smp, (positional) 2, overprovisioned, listen-address: 172.18.0.5, rpc-address: 172.18.0.5, seed-provider-parameters: seeds=172.18.0.5, alternator-address: 172.18.0.5, blocked-reactor-notify-ms, (positional) 999999999]
+Connecting to http://localhost:10000
+Starting the JMX server
+JMX is enabled to receive remote connections on port: 7199

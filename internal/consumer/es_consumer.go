@@ -66,7 +66,7 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 		zap.Strings("topics", ec.getTopicNames()))
 
 	var wg sync.WaitGroup
-	
+
 	// Start a goroutine for each topic consumer
 	for topic, kafkaConsumer := range ec.kafkaConsumers {
 		wg.Add(1)
@@ -75,15 +75,15 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 			ec.consumeTopic(ctx, topic, consumer)
 		}(topic, kafkaConsumer)
 	}
-	
+
 	// Wait for all consumers to finish when context is cancelled
 	wg.Wait()
-	
+
 	// Close bulk indexer gracefully
 	if err := ec.bulkIndexer.Close(ctx); err != nil {
 		ec.logger.Error("failed to close bulk indexer", zap.Error(err))
 	}
-	
+
 	ec.logger.Info("ES consumer stopped")
 	return ctx.Err()
 }
@@ -91,17 +91,17 @@ func (ec *ESConsumer) Start(ctx context.Context) error {
 // consumeTopic handles consumption for a single topic
 func (ec *ESConsumer) consumeTopic(ctx context.Context, topic string, kafkaConsumer *client.KafkaConsumer) {
 	ec.logger.Info("Starting consumption for topic", zap.String("topic", topic))
-	
+
 	for {
 		select {
 		case <-ctx.Done():
 			ec.logger.Info("Stopping consumption for topic", zap.String("topic", topic))
 			return
-			
+
 		default:
 			msg, err := kafkaConsumer.ConsumeMessage(ctx)
 			if err != nil {
-				ec.logger.Error("failed to consume message", 
+				ec.logger.Error("failed to consume message",
 					zap.String("topic", topic),
 					zap.Error(err))
 				time.Sleep(time.Second)
@@ -127,17 +127,17 @@ func (ec *ESConsumer) consumeTopic(ctx context.Context, topic string, kafkaConsu
 func (ec *ESConsumer) processEvent(ctx context.Context, eventType string, msg *kafka.Message, kafkaConsumer *client.KafkaConsumer) {
 	var processErr error
 	var shouldCommit bool
-	
+
 	defer func() {
 		// Only commit if processing was successful or event is intentionally ignored
 		if shouldCommit {
 			if err := kafkaConsumer.CommitMessage(ctx, msg); err != nil {
-				ec.logger.Error("failed to commit message", 
+				ec.logger.Error("failed to commit message",
 					zap.String("event_type", eventType),
 					zap.Error(err))
 			}
 		} else if processErr != nil {
-			ec.logger.Error("skipping message commit due to processing error", 
+			ec.logger.Error("skipping message commit due to processing error",
 				zap.String("event_type", eventType),
 				zap.Error(processErr))
 		}
@@ -531,5 +531,24 @@ func (ec *ESConsumer) Health(ctx context.Context) error {
 		return fmt.Errorf("elasticsearch error: %s", res.Status())
 	}
 
+	return nil
+}
+func (ec *ESConsumer) Close(ctx context.Context) error {
+	ec.logger.Info("closing ES consumer...")
+
+	// close ES bulk indexer
+	if err := ec.bulkIndexer.Close(ctx); err != nil {
+		ec.logger.Error("failed to close bulk indexer", zap.Error(err))
+	}
+
+	// close kafka consumers
+	for topic, kc := range ec.kafkaConsumers {
+		ec.logger.Info("closing kafka consumer", zap.String("topic", topic))
+		if err := kc.Close(); err != nil {
+			ec.logger.Error("failed to close kafka consumer", zap.Error(err))
+		}
+	}
+
+	ec.logger.Info("ES consumer closed")
 	return nil
 }

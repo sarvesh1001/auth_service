@@ -1,4 +1,4 @@
-// internal/handler/auth_handler.go
+// File: internal/handler/auth_handler.go
 package handler
 
 import (
@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
-
-	"regexp"
 
 	"github.com/go-playground/validator/v10"
 
@@ -33,7 +33,7 @@ func init() {
 
 // AuthHandler handles HTTP requests for authentication and user operations
 type AuthHandler struct {
-	otpService     *service.OTPService
+	userOTPService *service.UserOTPService // UPDATED: UserOTPService for users
 	mpinService    *service.MPINService
 	sessionService *service.SessionService
 	userService    *service.UserService
@@ -44,7 +44,7 @@ type AuthHandler struct {
 }
 
 func NewAuthHandler(
-	otpService *service.OTPService,
+	userOTPService *service.UserOTPService, // UPDATED: UserOTPService parameter
 	mpinService *service.MPINService,
 	sessionService *service.SessionService,
 	userService *service.UserService,
@@ -54,7 +54,7 @@ func NewAuthHandler(
 	logger *zap.Logger,
 ) *AuthHandler {
 	return &AuthHandler{
-		otpService:     otpService,
+		userOTPService: userOTPService, // UPDATED: Set UserOTPService
 		mpinService:    mpinService,
 		sessionService: sessionService,
 		userService:    userService,
@@ -77,6 +77,7 @@ func (h *AuthHandler) RegisterPublicRoutes(router chi.Router) {
 		r.Post("/login/verify-otp", h.VerifyOTPLogin)
 		r.Post("/login/verify-mpin", h.VerifyMPINLogin)
 		r.Post("/mpin/setup", h.SetupMPIN)
+		r.Post("/otp/send", h.SendOTP)
 
 		// MPIN Forgot Flow APIs
 		r.Post("/mpin/forgot/send-otp", h.SendForgotMPINOTP)
@@ -110,14 +111,13 @@ func (h *AuthHandler) RegisterProtectedRoutes(r chi.Router) {
 	r.Route("/companies", func(r chi.Router) {
 		r.Get("/{companyID}", h.GetCompany)
 		r.Get("/{companyID}/employees", h.ListEmployees)
-		// r.Post("/{companyID}/employees", h.AddEmployee)
 		r.Delete("/{companyID}/employees/{userID}", h.RemoveEmployee)
 		r.Get("/context", h.GetCompanyContext)
 		r.Post("/{companyID}/employees/{userID}/role", h.UpdateEmployeeRole)
 		r.Post("/{companyID}/employees/{userID}/department", h.UpdateEmployeeDepartment)
 		r.Get("/{companyID}/hierarchy", h.GetCompanyHierarchy)
 
-		// 🔥 PHASE 2 - OWNER OPERATIONS
+		// Owner operations
 		r.Route("/{companyID}/departments", func(r chi.Router) {
 			r.Put("/{departmentID}", h.RenameDepartment)
 			r.Post("/", h.AddDepartment)
@@ -145,385 +145,6 @@ func (h *AuthHandler) RegisterUserPublicRoutes(router chi.Router) {
 func (h *AuthHandler) RegisterRoutes(router chi.Router) {
 	h.RegisterPublicRoutes(router)
 }
-
-// ============================================
-// PHASE 2 - OWNER OPERATIONS
-// ============================================
-
-// AddDepartment adds a new department (Owner only)
-func (h *AuthHandler) AddDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
-
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
-
-	var req struct {
-		DepartmentName     string    `json:"department_name" validate:"required"`
-		SystemDepartmentID uuid.UUID `json:"system_department_id" validate:"required"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Sanitize input
-	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
-
-	// Check permission using bitmask
-	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	if !hasPermission {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add departments"),
-			"Insufficient permissions")
-		return
-	}
-
-	department, err := h.companyService.AddDepartment(ctx, companyID, req.DepartmentName, req.SystemDepartmentID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to add department")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, successResponse(department, "Department added successfully"))
-
-	h.logger.Info("Department added",
-		util.String("company_id", companyID.String()),
-		util.String("department_id", department.DepartmentID.String()),
-		util.String("department_name", req.DepartmentName),
-		util.String("system_department_id", req.SystemDepartmentID.String()),
-		util.String("created_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
-
-// AddManager adds a new manager (Owner only)
-func (h *AuthHandler) AddManager(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
-
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
-
-	var req service.AddManagerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	req.CompanyID = companyID
-
-	// Sanitize inputs
-	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
-	req.RoleName = util.SanitizeInput(req.RoleName)
-
-	// Check permissions using bitmask
-	hasCreatePermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.create")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	hasAdminAccess, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-
-	if !hasCreatePermission || !hasAdminAccess {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add managers"),
-			"Insufficient permissions")
-		return
-	}
-
-	if err := h.companyService.AddManager(ctx, &req); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to add manager")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Manager added successfully"))
-
-	h.logger.Info("Manager added",
-		util.String("company_id", companyID.String()),
-		util.String("phone", req.PhoneNumber),
-		util.String("role_name", req.RoleName),
-		util.String("department_id", req.DepartmentID.String()),
-		util.Int("permissions_count", len(req.Permissions)),
-		util.String("added_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
-
-// AssignManagerPermissions assigns permissions to a manager (Owner only)
-func (h *AuthHandler) AssignManagerPermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	managerIDStr := chi.URLParam(r, "managerID")
-	managerID, err := uuid.Parse(managerIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid manager ID")
-		return
-	}
-
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
-
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
-
-	var req struct {
-		Permissions []string `json:"permissions" validate:"required,min=1"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Check permission using bitmask
-	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.permission.assign")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	if !hasPermission {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to assign permissions"),
-			"Insufficient permissions")
-		return
-	}
-
-	if err := h.companyService.AssignManagerPermissions(ctx, companyID, managerID, req.Permissions, userIDParsed); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to assign manager permissions")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Manager permissions assigned successfully"))
-
-	h.logger.Info("Manager permissions assigned",
-		util.String("company_id", companyID.String()),
-		util.String("manager_id", managerID.String()),
-		util.Int("permissions_count", len(req.Permissions)),
-		util.String("assigned_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
-
-// RevokeManagerPermissions revokes permissions from a manager (Owner only)
-func (h *AuthHandler) RevokeManagerPermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	managerIDStr := chi.URLParam(r, "managerID")
-	managerID, err := uuid.Parse(managerIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid manager ID")
-		return
-	}
-
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
-
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
-
-	var req struct {
-		Permissions []string `json:"permissions" validate:"required,min=1"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Check permission using bitmask
-	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.permission.revoke")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	if !hasPermission {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to revoke permissions"),
-			"Insufficient permissions")
-		return
-	}
-
-	if err := h.companyService.RevokeManagerPermissions(ctx, companyID, managerID, req.Permissions, userIDParsed); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to revoke manager permissions")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Manager permissions revoked successfully"))
-
-	h.logger.Info("Manager permissions revoked",
-		util.String("company_id", companyID.String()),
-		util.String("manager_id", managerID.String()),
-		util.Int("permissions_count", len(req.Permissions)),
-		util.String("revoked_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
-
-// ============================================
-// UPDATED EMPLOYEE MANAGEMENT FOR PHASE 2 & 3
-// ============================================
-
-// // AddEmployee handles employee addition by both Owner and Manager
-// func (h *AuthHandler) AddEmployee(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	startTime := time.Now()
-
-// 	companyIDStr := chi.URLParam(r, "companyID")
-// 	companyID, err := uuid.Parse(companyIDStr)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-// 		return
-// 	}
-
-// 	// Get user ID from JWT context (the user adding the employee)
-// 	addedBy := r.Context().Value("user_id")
-// 	if addedBy == nil {
-// 		h.respondWithError(w, http.StatusUnauthorized,
-// 			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-// 			"Authentication required")
-// 		return
-// 	}
-
-// 	addedByID, err := uuid.Parse(addedBy.(string))
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-// 		return
-// 	}
-
-// 	var req service.AddEmployeeRequest
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-// 		return
-// 	}
-
-// 	req.CompanyID = companyID
-
-// 	// Sanitize inputs
-// 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
-// 	req.EmployeeID = util.SanitizeInput(req.EmployeeID)
-
-// 	// Check if the user adding the employee is a manager
-// 	employee, err := h.companyService.GetEmployee(ctx, companyID, addedByID)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusForbidden, err, "User is not an employee of the company")
-// 		return
-// 	}
-
-// 	role, err := h.companyService.GetRole(ctx, employee.RoleID)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user role")
-// 		return
-// 	}
-
-// 	var addErr error
-
-// 	// If user is manager (role level <= 200), use ManagerAddEmployee
-// 	if role.RoleLevel <= 200 && role.RoleLevel > 0 {
-// 		addErr = h.companyService.ManagerAddEmployee(ctx, &req, addedByID)
-// 	} else {
-// 		// Owner or higher role - use regular AddEmployee
-// 		addErr = h.companyService.AddEmployee(ctx, &req)
-// 	}
-
-// 	if addErr != nil {
-// 		statusCode := h.getStatusCode(addErr)
-// 		h.respondWithError(w, statusCode, addErr, "Failed to add employee")
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Employee added successfully"))
-
-// 	h.logger.Info("Employee added to company",
-// 		util.String("company_id", companyID.String()),
-// 		util.String("added_by", addedByID.String()),
-// 		util.String("phone", req.PhoneNumber),
-// 		util.String("employee_id", req.EmployeeID),
-// 		util.String("role_id", req.RoleID.String()),
-// 		util.String("department_id", req.DepartmentID.String()),
-// 		util.Duration("duration", time.Since(startTime)))
-// }
 
 // ============================================
 // AUTHENTICATION FLOW METHODS
@@ -628,7 +249,7 @@ func (h *AuthHandler) InitiateLogin(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// VerifyOTPLogin handles OTP verification for device setup/recovery
+// VerifyOTPLogin handles OTP verification for login
 func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -641,11 +262,10 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
 		return
 	}
 
-	// Sanitize inputs
 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
 	req.OTP = util.SanitizeInput(req.OTP)
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
@@ -654,28 +274,32 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 	// Get user - must exist
 	user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+		h.respondWithError(w, http.StatusNotFound, err, "Authentication failed")
 		return
 	}
 
-	// Verify OTP
-	otpVerifyReq := service.OTPVerifyRequest{
-		PhoneNumber: req.PhoneNumber,
-		OTP:         req.OTP,
-		Purpose:     "login",
-		IPAddress:   h.getClientIP(r),
+	// ✅ UPDATED: Use UserOTPService with UserOTPVerifyRequest
+	otpVerifyReq := &service.UserOTPVerifyRequest{
+		PhoneNumber:       req.PhoneNumber,
+		OTP:               req.OTP,
+		Purpose:           "login",
+		IPAddress:         h.getClientIP(r),
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		UserAgent:         r.UserAgent(),
 	}
 
-	otpResponse, err := h.otpService.VerifyOTP(ctx, &otpVerifyReq)
+	// ✅ UPDATED: Call UserVerifyOTP method
+	otpResponse, err := h.userOTPService.UserVerifyOTP(ctx, otpVerifyReq)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "OTP verification failed")
+		h.handleUserOTPError(w, err) // UPDATED: Use user OTP error handler
 		return
 	}
 
 	if !otpResponse.Success {
 		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("OTP_VERIFICATION_FAILED: OTP verification failed"),
-			"OTP verification failed")
+			fmt.Errorf("AUTHENTICATION_FAILED"),
+			"Authentication failed")
 		return
 	}
 
@@ -700,12 +324,17 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 
 	hasMPIN := h.hasMPIN(ctx, user.UserID)
 
+	// Include quota information
 	responseData := map[string]interface{}{
 		"user_id":        user.UserID.String(),
 		"device_trusted": true,
 		"has_mpin":       hasMPIN,
 		"mpin_locked":    false,
-		"message":        "OTP verification successful. Device is now trusted.",
+		"daily_quota": map[string]interface{}{
+			"used":      otpResponse.QuotaUsed,
+			"limit":     otpResponse.DailyQuota,
+			"remaining": otpResponse.DailyQuota - otpResponse.QuotaUsed,
+		},
 	}
 
 	// If user has MPIN, they should proceed to MPIN login
@@ -719,11 +348,13 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Device setup successful"))
 
-	h.logger.Info("OTP verification completed - device trusted (no tokens issued)",
+	h.logger.Info("OTP verification completed - device trusted",
 		util.String("user_id", user.UserID.String()),
 		util.String("phone", req.PhoneNumber),
 		util.String("device_id", req.DeviceID),
 		util.Bool("has_mpin", hasMPIN),
+		util.Int("daily_quota_used", otpResponse.QuotaUsed),
+		util.Int("daily_quota_limit", otpResponse.DailyQuota),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
@@ -790,11 +421,14 @@ func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify MPIN
+	// ✅ UPDATED: Enhanced MPIN verification with device fingerprint
 	mpinVerifyReq := service.MPINVerifyRequest{
-		UserID:   userID,
-		MPIN:     req.MPIN,
-		DeviceID: req.DeviceID,
+		UserID:            userID,
+		MPIN:              req.MPIN,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         r.UserAgent(),
 	}
 
 	mpinResult, err := h.mpinService.VerifyMPIN(ctx, &mpinVerifyReq)
@@ -812,9 +446,9 @@ func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
 
 	userRole := "user"
 	if companyContext != nil {
-		// Use the role from company context - no need for type assertion
 		userRole = companyContext.RoleName
 	}
+
 	// Issue JWT token pair
 	tokenReq := &service.IssueTokenPairRequest{
 		UserID:      userID.String(),
@@ -852,9 +486,11 @@ func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
 
 // SetupMPINRequest for MPIN setup
 type SetupMPINRequest struct {
-	UserID   string `json:"user_id" validate:"required"`
-	MPIN     string `json:"mpin" validate:"required,min=4,max=6"`
-	DeviceID string `json:"device_id" validate:"required"`
+	UserID            string `json:"user_id" validate:"required"`
+	MPIN              string `json:"mpin" validate:"required,min=4,max=8"`
+	DeviceID          string `json:"device_id" validate:"required"`
+	DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+	UserAgent         string `json:"user_agent,omitempty"`
 }
 
 // SetupMPIN handles MPIN setup after registration
@@ -871,6 +507,8 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 	// Sanitize inputs
 	req.MPIN = util.SanitizeInput(req.MPIN)
 	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.UserAgent = util.SanitizeInput(req.UserAgent)
 
 	userID, err := uuid.Parse(req.UserID)
 	if err != nil {
@@ -885,11 +523,14 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Setup MPIN
+	// ✅ UPDATED: Enhanced MPIN setup with all required fields
 	mpinReq := service.MPINSetupRequest{
-		UserID:   userID,
-		MPIN:     req.MPIN,
-		DeviceID: req.DeviceID,
+		UserID:            userID,
+		MPIN:              req.MPIN,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         r.UserAgent(),
 	}
 
 	if err := h.mpinService.SetupMPIN(ctx, &mpinReq); err != nil {
@@ -905,6 +546,518 @@ func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
 		util.String("user_id", userID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)
+}
+
+// ============================================
+// MPIN FORGOT FLOW METHODS
+// ============================================
+
+// // SendForgotMPINOTP sends OTP for forgot MPIN flow
+// func (h *AuthHandler) SendForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
+
+// 	var req struct {
+// 		UserID            string `json:"user_id" validate:"required"`
+// 		DeviceID          string `json:"device_id" validate:"required"`
+// 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+// 	}
+
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
+// 		return
+// 	}
+
+// 	userID, err := uuid.Parse(req.UserID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+// 		return
+// 	}
+
+// 	// Get user to get phone number
+// 	user, err := h.userService.GetUserByID(ctx, userID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+// 		return
+// 	}
+
+// 	// ✅ UPDATED: Use UserOTPService for sending forgot MPIN OTP
+// 	otpSendReq := &service.UserOTPSendRequest{
+// 		PhoneNumber:       user.PhoneNumber, // Get phone from user object
+// 		Purpose:           "forgot_mpin",
+// 		IPAddress:         h.getClientIP(r),
+// 		DeviceID:          req.DeviceID,
+// 		DeviceFingerprint: req.DeviceFingerprint,
+// 		UserAgent:         r.UserAgent(),
+// 	}
+
+// 	// ✅ UPDATED: Call UserSendOTP method
+// 	otpResponse, err := h.userOTPService.UserSendOTP(ctx, otpSendReq)
+// 	if err != nil {
+// 		h.handleUserOTPError(w, err) // UPDATED: Use user OTP error handler
+// 		return
+// 	}
+
+// 	if !otpResponse.Success {
+// 		h.respondWithError(w, http.StatusTooManyRequests,
+// 			fmt.Errorf("OTP_SEND_FAILED"),
+// 			otpResponse.Message)
+// 		return
+// 	}
+
+// 	// Generate request ID for the forgot MPIN flow
+// 	requestID := uuid.New().String()
+
+// 	responseData := map[string]interface{}{
+// 		"request_id": requestID,
+// 		"message":    "OTP sent to registered phone number for MPIN reset",
+// 		"expires_at": otpResponse.ExpiresAt,
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "OTP sent successfully"))
+
+// 	h.logger.Info("Forgot MPIN OTP sent",
+// 		util.String("user_id", userID.String()),
+// 		util.String("phone", "***"),
+// 		util.String("device_id", req.DeviceID),
+// 		util.String("request_id", requestID),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
+
+// // VerifyForgotMPINOTP handles OTP verification and MPIN reset
+// func (h *AuthHandler) VerifyForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
+
+// 	var req service.MPINForgotWithOTPRequest
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
+
+// 	// Sanitize inputs
+// 	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+// 	req.OTPCode = util.SanitizeInput(req.OTPCode)
+// 	req.DeviceID = util.SanitizeInput(req.DeviceID)
+// 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+// 	req.IPAddress = h.getClientIP(r)
+// 	req.UserAgent = r.UserAgent()
+
+// 	// Get user to get phone number for OTP verification
+// 	user, err := h.userService.GetUserByID(ctx, req.UserID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+// 		return
+// 	}
+
+// 	// ✅ UPDATED: First verify OTP using UserOTPService
+// 	otpVerifyReq := &service.UserOTPVerifyRequest{
+// 		PhoneNumber:       req.PhoneNumber, // Use from request, not user.PhoneNumber
+// 		OTP:               req.OTPCode,
+// 		Purpose:           "forgot_mpin",
+// 		IPAddress:         req.IPAddress,
+// 		DeviceID:          req.DeviceID,
+// 		DeviceFingerprint: req.DeviceFingerprint,
+// 		UserAgent:         req.UserAgent,
+// 	}
+
+// 	otpResponse, err := h.userOTPService.UserVerifyOTP(ctx, otpVerifyReq)
+// 	if err != nil {
+// 		h.handleUserOTPError(w, err)
+// 		return
+// 	}
+
+// 	if !otpResponse.Success {
+// 		h.respondWithError(w, http.StatusUnauthorized,
+// 			fmt.Errorf("OTP_VERIFICATION_FAILED"),
+// 			"OTP verification failed")
+// 		return
+// 	}
+
+// 	// ✅ UPDATED: Now reset MPIN using the service
+// 	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &req); err != nil {
+// 		statusCode := h.getForgotMPINStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
+// 		return
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
+
+// 	h.logger.Info("MPIN reset via forgot OTP flow",
+// 		util.String("user_id", req.UserID.String()),
+// 		util.String("device_id", req.DeviceID),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
+
+// // ForgotMPIN handles MPIN reset on trusted devices (legacy endpoint - uses new flow internally)
+// func (h *AuthHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
+
+// 	var req struct {
+// 		UserID            string `json:"user_id" validate:"required"`
+// 		NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
+// 		DeviceID          string `json:"device_id" validate:"required"`
+// 		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+// 		OTPCode           string `json:"otp_code" validate:"required,len=6"`
+// 	}
+
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
+
+// 	// Sanitize inputs
+// 	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+// 	req.DeviceID = util.SanitizeInput(req.DeviceID)
+// 	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+// 	req.OTPCode = util.SanitizeInput(req.OTPCode)
+
+// 	userID, err := uuid.Parse(req.UserID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+// 		return
+// 	}
+
+// 	// Get user to get phone number
+// 	user, err := h.userService.GetUserByID(ctx, userID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusNotFound, err, "User not found")
+// 		return
+// 	}
+
+// 	// ✅ UPDATED: First verify OTP using UserOTPService
+// 	otpVerifyReq := &service.UserOTPVerifyRequest{
+// 		PhoneNumber:       user.PhoneNumber,
+// 		OTP:               req.OTPCode,
+// 		Purpose:           "forgot_mpin",
+// 		IPAddress:         h.getClientIP(r),
+// 		DeviceID:          req.DeviceID,
+// 		DeviceFingerprint: req.DeviceFingerprint,
+// 		UserAgent:         r.UserAgent(),
+// 	}
+
+// 	otpResponse, err := h.userOTPService.UserVerifyOTP(ctx, otpVerifyReq)
+// 	if err != nil {
+// 		h.handleUserOTPError(w, err)
+// 		return
+// 	}
+
+// 	if !otpResponse.Success {
+// 		h.respondWithError(w, http.StatusUnauthorized,
+// 			fmt.Errorf("OTP_VERIFICATION_FAILED"),
+// 			"OTP verification failed")
+// 		return
+// 	}
+
+// 	// Use the new VerifyForgotMPINOTP method
+// 	forgotReq := service.MPINForgotWithOTPRequest{
+// 		UserID:            userID,
+// 		NewMPIN:           req.NewMPIN,
+// 		DeviceID:          req.DeviceID,
+// 		DeviceFingerprint: req.DeviceFingerprint,
+// 		OTPCode:           req.OTPCode,
+// 		IPAddress:         h.getClientIP(r),
+// 		UserAgent:         r.UserAgent(),
+// 	}
+
+// 	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &forgotReq); err != nil {
+// 		statusCode := h.getForgotMPINStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
+// 		return
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
+
+// 	h.logger.Info("MPIN reset via forgot flow",
+// 		util.String("user_id", userID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
+
+func (h *AuthHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req service.MPINChangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.IPAddress = h.getClientIP(r)
+	req.UserAgent = r.UserAgent()
+
+	if err := h.mpinService.ChangeMPIN(ctx, &req); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to change MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN changed successfully"))
+
+	h.logger.Info("MPIN changed via HTTP",
+		util.String("user_id", req.UserID.String()),
+		util.String("device_id", req.DeviceID),
+		util.String("user_agent", req.UserAgent),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ============================================
+// OTP MANAGEMENT METHODS
+// ============================================
+func (h *AuthHandler) SendOTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req struct {
+		PhoneNumber       string `json:"phone_number" validate:"required"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+		Purpose           string `json:"purpose" validate:"required,oneof=login verification password_reset forgot_mpin"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
+		return
+	}
+
+	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.Purpose = util.SanitizeInput(req.Purpose)
+
+	// ✅ UPDATED: Use UserOTPService with UserOTPSendRequest
+	otpSendReq := &service.UserOTPSendRequest{
+		PhoneNumber:       req.PhoneNumber,
+		Purpose:           req.Purpose,
+		IPAddress:         h.getClientIP(r),
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		UserAgent:         r.UserAgent(),
+		Provider:          "resend",
+	}
+
+	// ✅ UPDATED: Call UserSendOTP method
+	otpResponse, err := h.userOTPService.UserSendOTP(ctx, otpSendReq)
+	if err != nil {
+		// 🔥 NEW: Handle rate limit response specially to include retry_after in response
+		if errors.Is(err, service.ErrUserOTPRateLimitExceeded) || 
+		   errors.Is(err, service.ErrUserDailyQuotaExceeded) {
+			
+			// 🔥 Set proper headers for 429 response
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", otpResponse.RetryAfter))
+			w.Header().Set("Vary", "Origin")
+			w.WriteHeader(http.StatusTooManyRequests)
+			
+			// 🔥 Return the exact same JSON structure as admin service
+			response := map[string]interface{}{
+				"success":    false,
+				"message":    otpResponse.Message,
+				"expires_at": otpResponse.ExpiresAt,
+				"retry_after": otpResponse.RetryAfter,
+			}
+			
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+		
+		// For other errors, use the normal error handler
+		h.handleUserOTPError(w, err)
+		return
+	}
+
+	if !otpResponse.Success {
+		// Handle other non-success cases
+		h.respondWithError(w, http.StatusTooManyRequests,
+			fmt.Errorf("OTP_SEND_FAILED"),
+			otpResponse.Message)
+		return
+	}
+
+	// Include quota information
+	responseData := map[string]interface{}{
+		"message":       "OTP sent successfully",
+		"expires_at":    otpResponse.ExpiresAt,
+		"attempts_left": otpResponse.AttemptsLeft,
+	}
+
+	if otpResponse.DailyQuota > 0 {
+		responseData["daily_quota"] = map[string]interface{}{
+			"used":      otpResponse.QuotaUsed,
+			"limit":     otpResponse.DailyQuota,
+			"remaining": otpResponse.DailyQuota - otpResponse.QuotaUsed,
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "OTP sent successfully"))
+
+	h.logger.Info("OTP sent",
+		util.String("phone", req.PhoneNumber),
+		util.String("purpose", req.Purpose),
+		util.String("device_id", req.DeviceID),
+		util.Int("daily_quota_used", otpResponse.QuotaUsed),
+		util.Int("daily_quota_limit", otpResponse.DailyQuota),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+// ============================================
+// SESSION MANAGEMENT METHODS
+// ============================================
+
+// RefreshTokens handles token refresh
+func (h *AuthHandler) RefreshTokens(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req struct {
+		RefreshToken string `json:"refresh_token" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	ipAddress := h.getClientIP(r)
+
+	tokenPair, err := h.sessionService.RefreshTokenPair(ctx, req.RefreshToken, ipAddress)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Failed to refresh tokens")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(tokenPair, "Tokens refreshed successfully"))
+}
+
+// Logout handles user logout (single device) - PROTECTED
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req struct {
+		RefreshToken string `json:"refresh_token" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	if err := h.sessionService.RevokeRefreshToken(ctx, req.RefreshToken); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to logout")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Logged out successfully"))
+}
+
+// LogoutAllDevices handles logout from all devices - PROTECTED
+func (h *AuthHandler) LogoutAllDevices(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req struct {
+		UserID string `json:"user_id" validate:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	if err := h.sessionService.RevokeAllUserRefreshTokens(ctx, userID.String()); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to logout from all devices")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Logged out from all devices successfully"))
+}
+
+// ValidateSession checks if the current session is valid - PROTECTED
+func (h *AuthHandler) ValidateSession(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("user_id")
+	deviceID := r.Context().Value("device_id")
+	role := r.Context().Value("role")
+
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("INVALID_SESSION: No valid session"),
+			"Session validation failed")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"valid":     true,
+		"user_id":   userID,
+		"device_id": deviceID,
+		"role":      role,
+		"message":   "Session is valid",
+	}, "Session validation successful"))
+}
+
+// GetAuthStatus returns authentication status - PROTECTED
+func (h *AuthHandler) GetAuthStatus(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value("user_id")
+	role := r.Context().Value("role")
+
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("NOT_AUTHENTICATED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"authenticated": true,
+		"user_id":       userID,
+		"role":          role,
+		"message":       "User is authenticated",
+	}, "Authentication status"))
+}
+
+// DebugToken - Temporary endpoint to debug JWT tokens
+func (h *AuthHandler) DebugToken(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("NO_AUTH_HEADER"), "No Authorization header")
+		return
+	}
+
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("INVALID_AUTH_FORMAT"), "Invalid Authorization format")
+		return
+	}
+
+	tokenString := parts[1]
+
+	claims, err := h.jwtService.ValidateAccessToken(r.Context(), tokenString)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Token validation failed")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+		"valid": true,
+		"claims": map[string]interface{}{
+			"user_id":      claims.UserID,
+			"device_id":    claims.DeviceID,
+			"role":         claims.Role,
+			"session_type": claims.SessionType,
+			"jti":          claims.JTI,
+			"expires_at":   claims.ExpiresAt,
+		},
+		"message": "Token is valid",
+	}, "Token validation successful"))
 }
 
 // ============================================
@@ -1253,264 +1406,373 @@ func (h *AuthHandler) GetCompanyHierarchy(w http.ResponseWriter, r *http.Request
 }
 
 // ============================================
-// MPIN FORGOT FLOW METHODS
+// OWNER OPERATIONS
 // ============================================
 
-// SendForgotMPINOTP handles sending OTP for MPIN reset
-func (h *AuthHandler) SendForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	var req struct {
-		UserID string `json:"user_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "invalid request")
-		return
-	}
-
-	userID, err := uuid.Parse(req.UserID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "invalid user ID")
-		return
-	}
-
-	requestID, err := h.mpinService.SendForgotMPINOTP(ctx, userID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "failed to send OTP")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]string{
-		"request_id": requestID,
-		"message":    "OTP sent to registered phone number",
-	}, "OTP sent successfully"))
-}
-
-// VerifyForgotMPINOTP handles OTP verification and MPIN reset
-func (h *AuthHandler) VerifyForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	var req service.MPINForgotWithOTPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "invalid request")
-		return
-	}
-
-	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &req); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "failed to verify OTP and reset MPIN")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
-}
-
-// ForgotMPIN handles MPIN reset on trusted devices
-func (h *AuthHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
+// AddDepartment adds a new department (Owner only)
+func (h *AuthHandler) AddDepartment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
 
-	var req service.MPINForgotRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-
-	if err := h.mpinService.ForgotMPIN(ctx, &req); err != nil {
-		statusCode := h.getForgotMPINStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully on trusted device"))
-
-	h.logger.Info("MPIN reset via forgot flow",
-		util.String("user_id", req.UserID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-// ChangeMPIN handles MPIN change with current MPIN verification
-func (h *AuthHandler) ChangeMPIN(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	var req service.MPINChangeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	req.CurrentMPIN = util.SanitizeInput(req.CurrentMPIN)
-	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-
-	if err := h.mpinService.ChangeMPIN(ctx, &req); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to change MPIN")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN changed successfully"))
-
-	h.logger.Info("MPIN changed via HTTP",
-		util.String("user_id", req.UserID.String()),
-		util.String("device_id", req.DeviceID),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
-// ============================================
-// SESSION MANAGEMENT METHODS
-// ============================================
-
-// RefreshTokens handles token refresh
-func (h *AuthHandler) RefreshTokens(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	var req struct {
-		RefreshToken string `json:"refresh_token" validate:"required"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	ipAddress := h.getClientIP(r)
-
-	tokenPair, err := h.sessionService.RefreshTokenPair(ctx, req.RefreshToken, ipAddress)
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Failed to refresh tokens")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(tokenPair, "Tokens refreshed successfully"))
-}
-
-// Logout handles user logout (single device) - PROTECTED
-func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	var req struct {
-		RefreshToken string `json:"refresh_token" validate:"required"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	if err := h.sessionService.RevokeRefreshToken(ctx, req.RefreshToken); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to logout")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Logged out successfully"))
-}
-
-// LogoutAllDevices handles logout from all devices - PROTECTED
-func (h *AuthHandler) LogoutAllDevices(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	var req struct {
-		UserID string `json:"user_id" validate:"required"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	userID, err := uuid.Parse(req.UserID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
-
-	if err := h.sessionService.RevokeAllUserRefreshTokens(ctx, userID.String()); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to logout from all devices")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Logged out from all devices successfully"))
-}
-
-// ValidateSession checks if the current session is valid - PROTECTED
-func (h *AuthHandler) ValidateSession(w http.ResponseWriter, r *http.Request) {
+	// Get user ID from JWT context
 	userID := r.Context().Value("user_id")
-	deviceID := r.Context().Value("device_id")
-	role := r.Context().Value("role")
-
 	if userID == nil {
 		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("INVALID_SESSION: No valid session"),
-			"Session validation failed")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
-		"valid":     true,
-		"user_id":   userID,
-		"device_id": deviceID,
-		"role":      role,
-		"message":   "Session is valid",
-	}, "Session validation successful"))
-}
-
-// GetAuthStatus returns authentication status - PROTECTED
-func (h *AuthHandler) GetAuthStatus(w http.ResponseWriter, r *http.Request) {
-	userID := r.Context().Value("user_id")
-	role := r.Context().Value("role")
-
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("NOT_AUTHENTICATED: User not authenticated"),
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
 			"Authentication required")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
-		"authenticated": true,
-		"user_id":       userID,
-		"role":          role,
-		"message":       "User is authenticated",
-	}, "Authentication status"))
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req struct {
+		DepartmentName     string    `json:"department_name" validate:"required"`
+		SystemDepartmentID uuid.UUID `json:"system_department_id" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Sanitize input
+	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add departments"),
+			"Insufficient permissions")
+		return
+	}
+
+	department, err := h.companyService.AddDepartment(ctx, companyID, req.DepartmentName, req.SystemDepartmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to add department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, successResponse(department, "Department added successfully"))
+
+	h.logger.Info("Department added",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", department.DepartmentID.String()),
+		util.String("department_name", req.DepartmentName),
+		util.String("system_department_id", req.SystemDepartmentID.String()),
+		util.String("created_by", userIDParsed.String()),
+		util.Duration("duration", time.Since(startTime)))
 }
 
-// DebugToken - Temporary endpoint to debug JWT tokens
-func (h *AuthHandler) DebugToken(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("NO_AUTH_HEADER"), "No Authorization header")
-		return
-	}
+// AddManager adds a new manager (Owner only)
+func (h *AuthHandler) AddManager(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
 
-	parts := strings.Split(authHeader, " ")
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("INVALID_AUTH_FORMAT"), "Invalid Authorization format")
-		return
-	}
-
-	tokenString := parts[1]
-
-	claims, err := h.jwtService.ValidateAccessToken(r.Context(), tokenString)
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Token validation failed")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
-		"valid": true,
-		"claims": map[string]interface{}{
-			"user_id":      claims.UserID,
-			"device_id":    claims.DeviceID,
-			"role":         claims.Role,
-			"session_type": claims.SessionType,
-			"jti":          claims.JTI,
-			"expires_at":   claims.ExpiresAt,
-		},
-		"message": "Token is valid",
-	}, "Token validation successful"))
+	// Get user ID from JWT context
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req service.AddManagerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.CompanyID = companyID
+
+	// Sanitize inputs
+	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+	req.RoleName = util.SanitizeInput(req.RoleName)
+
+	// Check permissions using bitmask
+	hasCreatePermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.create")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	hasAdminAccess, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+
+	if !hasCreatePermission || !hasAdminAccess {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add managers"),
+			"Insufficient permissions")
+		return
+	}
+
+	if err := h.companyService.AddManager(ctx, &req); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to add manager")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Manager added successfully"))
+
+	h.logger.Info("Manager added",
+		util.String("company_id", companyID.String()),
+		util.String("phone", req.PhoneNumber),
+		util.String("role_name", req.RoleName),
+		util.String("department_id", req.DepartmentID.String()),
+		util.Int("permissions_count", len(req.Permissions)),
+		util.String("added_by", userIDParsed.String()),
+		util.Duration("duration", time.Since(startTime)))
+}
+
+// AssignManagerPermissions assigns permissions to a manager (Owner only)
+func (h *AuthHandler) AssignManagerPermissions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	managerIDStr := chi.URLParam(r, "managerID")
+	managerID, err := uuid.Parse(managerIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid manager ID")
+		return
+	}
+
+	// Get user ID from JWT context
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req struct {
+		Permissions []string `json:"permissions" validate:"required,min=1"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.permission.assign")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to assign permissions"),
+			"Insufficient permissions")
+		return
+	}
+
+	if err := h.companyService.AssignManagerPermissions(ctx, companyID, managerID, req.Permissions, userIDParsed); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to assign manager permissions")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Manager permissions assigned successfully"))
+
+	h.logger.Info("Manager permissions assigned",
+		util.String("company_id", companyID.String()),
+		util.String("manager_id", managerID.String()),
+		util.Int("permissions_count", len(req.Permissions)),
+		util.String("assigned_by", userIDParsed.String()),
+		util.Duration("duration", time.Since(startTime)))
+}
+
+// RevokeManagerPermissions revokes permissions from a manager (Owner only)
+func (h *AuthHandler) RevokeManagerPermissions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	managerIDStr := chi.URLParam(r, "managerID")
+	managerID, err := uuid.Parse(managerIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid manager ID")
+		return
+	}
+
+	// Get user ID from JWT context
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req struct {
+		Permissions []string `json:"permissions" validate:"required,min=1"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "admin.permission.revoke")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to revoke permissions"),
+			"Insufficient permissions")
+		return
+	}
+
+	if err := h.companyService.RevokeManagerPermissions(ctx, companyID, managerID, req.Permissions, userIDParsed); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to revoke manager permissions")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Manager permissions revoked successfully"))
+
+	h.logger.Info("Manager permissions revoked",
+		util.String("company_id", companyID.String()),
+		util.String("manager_id", managerID.String()),
+		util.Int("permissions_count", len(req.Permissions)),
+		util.String("revoked_by", userIDParsed.String()),
+		util.Duration("duration", time.Since(startTime)))
+}
+
+// RenameDepartment renames a department (Owner only)
+func (h *AuthHandler) RenameDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	// Get user ID from JWT context
+	userID := r.Context().Value("user_id")
+	if userID == nil {
+		h.respondWithError(w, http.StatusUnauthorized,
+			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+			"Authentication required")
+		return
+	}
+
+	userIDParsed, err := uuid.Parse(userID.(string))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+		return
+	}
+
+	var req struct {
+		DepartmentName string `json:"department_name" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Sanitize input
+	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
+
+	// Check permission using bitmask
+	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "administrative.department.update")
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+		return
+	}
+	if !hasPermission {
+		h.respondWithError(w, http.StatusForbidden,
+			fmt.Errorf("PERMISSION_DENIED: User lacks permission to rename departments"),
+			"Insufficient permissions")
+		return
+	}
+
+	if err := h.companyService.RenameDepartment(ctx, companyID, departmentID, req.DepartmentName); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to rename department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department renamed successfully"))
+
+	h.logger.Info("Department renamed",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.String("new_name", req.DepartmentName),
+		util.String("updated_by", userIDParsed.String()),
+		util.Duration("duration", time.Since(startTime)))
 }
 
 // ============================================
@@ -1671,13 +1933,6 @@ func (h *AuthHandler) hasMPIN(ctx context.Context, userID uuid.UUID) bool {
 	return err == nil && status != nil
 }
 
-func (h *AuthHandler) getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
-	}
-	return r.RemoteAddr
-}
-
 func (h *AuthHandler) getIntQueryParam(r *http.Request, key string, defaultValue int) int {
 	value := r.URL.Query().Get(key)
 	if value == "" {
@@ -1706,6 +1961,7 @@ func (h *AuthHandler) respondWithError(w http.ResponseWriter, statusCode int, er
 	h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }
 
+// ✅ UPDATED: Enhanced error handling for new error types
 func (h *AuthHandler) getStatusCode(err error) int {
 	switch {
 	case errors.Is(err, service.ErrUserNotFound):
@@ -1716,6 +1972,30 @@ func (h *AuthHandler) getStatusCode(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, service.ErrPermissionDenied):
 		return http.StatusForbidden
+	case errors.Is(err, service.ErrOTPRateLimitExceeded):
+		return http.StatusTooManyRequests
+	case errors.Is(err, service.ErrDailyQuotaExceeded):
+		return http.StatusTooManyRequests
+	case errors.Is(err, service.ErrOTPReplayAttempt):
+		return http.StatusBadRequest
+	case errors.Is(err, service.ErrMPINNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, service.ErrMPINInvalid):
+		return http.StatusUnauthorized
+	case errors.Is(err, service.ErrMPINLocked):
+		return http.StatusLocked
+	case errors.Is(err, service.ErrMPINAlreadyExists):
+		return http.StatusConflict
+	case errors.Is(err, service.ErrMPINTooWeak):
+		return http.StatusBadRequest
+	case errors.Is(err, service.ErrDeviceNotBound):
+		return http.StatusForbidden
+	case errors.Is(err, service.ErrDeviceNotTrusted):
+		return http.StatusForbidden
+	case errors.Is(err, service.ErrMPINRateLimitExceeded):
+		return http.StatusTooManyRequests
+	case errors.Is(err, service.ErrMPINAttemptsExceeded):
+		return http.StatusTooManyRequests
 	default:
 		return http.StatusInternalServerError
 	}
@@ -1729,7 +2009,38 @@ func (h *AuthHandler) getForgotMPINStatusCode(err error) int {
 	if strings.Contains(errMsg, "not found") {
 		return http.StatusNotFound
 	}
+	if strings.Contains(errMsg, "rate limit") {
+		return http.StatusTooManyRequests
+	}
 	return http.StatusInternalServerError
+}
+
+// ✅ NEW: User OTP error handler for UserOTPService specific errors
+func (h *AuthHandler) handleUserOTPError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, service.ErrUserOTPRateLimitExceeded):
+		h.respondWithError(w, http.StatusTooManyRequests, err, "Too many attempts. Please try again later.")
+	case errors.Is(err, service.ErrUserDailyQuotaExceeded):
+		h.respondWithError(w, http.StatusTooManyRequests, err, "Daily OTP limit exceeded")
+	case errors.Is(err, service.ErrUserOTPReplayAttempt):
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid OTP")
+	case errors.Is(err, service.ErrUserPhoneNotRegistered):
+		h.respondWithError(w, http.StatusNotFound, err, "Phone number not registered")
+	case errors.Is(err, service.ErrUserSecurityCheckFailed):
+		h.respondWithError(w, http.StatusForbidden, err, "Security check failed")
+	case errors.Is(err, service.ErrUserOTPNotFound):
+		h.respondWithError(w, http.StatusNotFound, err, "OTP not found or expired")
+	case errors.Is(err, service.ErrUserOTPExpired):
+		h.respondWithError(w, http.StatusBadRequest, err, "OTP has expired")
+	case errors.Is(err, service.ErrUserOTPInvalid):
+		h.respondWithError(w, http.StatusUnauthorized, err, "Invalid OTP")
+	case errors.Is(err, service.ErrUserOTPAttemptsExceeded):
+		h.respondWithError(w, http.StatusTooManyRequests, err, "Maximum OTP attempts exceeded")
+	case errors.Is(err, service.ErrUserOTPAlreadyUsed):
+		h.respondWithError(w, http.StatusBadRequest, err, "OTP has already been used")
+	default:
+		h.respondWithError(w, http.StatusUnauthorized, err, "Authentication failed")
+	}
 }
 
 func (h *AuthHandler) sanitizeUser(user *models.User) {
@@ -1738,42 +2049,150 @@ func (h *AuthHandler) sanitizeUser(user *models.User) {
 	user.PhoneEncryptedDEK = ""
 }
 
-// RenameDepartment renames a department (Owner only)
-func (h *AuthHandler) RenameDepartment(w http.ResponseWriter, r *http.Request) {
+// ✅ UPDATED: Enhanced client IP extraction
+func (h *AuthHandler) getClientIP(r *http.Request) string {
+	// Try X-Forwarded-For first
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return ip
+			}
+		}
+	}
+
+	// Try X-Real-IP
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+			return realIP
+		}
+	}
+
+	// Try CF-Connecting-IP
+	if cfConnectingIP := r.Header.Get("CF-Connecting-IP"); cfConnectingIP != "" {
+		if parsedIP := net.ParseIP(cfConnectingIP); parsedIP != nil {
+			return cfConnectingIP
+		}
+	}
+
+	// Fallback to RemoteAddr with validation
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		if parsedIP := net.ParseIP(r.RemoteAddr); parsedIP != nil {
+			return r.RemoteAddr
+		}
+		return ""
+	}
+
+	if parsedIP := net.ParseIP(host); parsedIP != nil {
+		return host
+	}
+
+	return ""
+}
+
+// SendForgotMPINOTP sends OTP for forgot MPIN flow
+func (h *AuthHandler) SendForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+	var req struct {
+		UserID            string `json:"user_id" validate:"required"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request")
 		return
 	}
 
-	departmentIDStr := chi.URLParam(r, "departmentID")
-	departmentID, err := uuid.Parse(departmentIDStr)
+	userID, err := uuid.Parse(req.UserID)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
 		return
 	}
 
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
+	// ✅ FIXED: Create proper MPIN forgot request that MPIN service expects
+	forgotReq := service.MPINForgotRequest{
+		UserID:            userID,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         r.UserAgent(),
+	}
+
+	// ✅ FIXED: Call MPIN service directly - it will handle phone decryption and OTP sending
+	if err := h.mpinService.ForgotMPIN(ctx, &forgotReq); err != nil {
+		statusCode := h.getForgotMPINStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to initiate forgot MPIN flow")
 		return
 	}
 
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+	// Generate request ID for the forgot MPIN flow
+	requestID := uuid.New().String()
+
+	responseData := map[string]interface{}{
+		"request_id": requestID,
+		"message":    "OTP sent to registered phone number for MPIN reset",
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "OTP sent successfully"))
+
+	h.logger.Info("Forgot MPIN OTP sent",
+		util.String("user_id", userID.String()),
+		util.String("device_id", req.DeviceID),
+		util.String("request_id", requestID),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// VerifyForgotMPINOTP handles OTP verification and MPIN reset
+func (h *AuthHandler) VerifyForgotMPINOTP(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	var req service.MPINForgotWithOTPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
 		return
 	}
+
+	// Sanitize inputs
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.OTPCode = util.SanitizeInput(req.OTPCode)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.IPAddress = h.getClientIP(r)
+	req.UserAgent = r.UserAgent()
+
+	// ✅ FIXED: Call MPIN service directly - it will handle phone decryption and OTP verification
+	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &req); err != nil {
+		statusCode := h.getForgotMPINStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to verify OTP and reset MPIN")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
+
+	h.logger.Info("MPIN reset via forgot OTP flow",
+		util.String("user_id", req.UserID.String()),
+		util.String("device_id", req.DeviceID),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ForgotMPIN handles MPIN reset on trusted devices (legacy endpoint - uses new flow internally)
+func (h *AuthHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
 
 	var req struct {
-		DepartmentName string `json:"department_name" validate:"required"`
+		UserID            string `json:"user_id" validate:"required"`
+		NewMPIN           string `json:"new_mpin" validate:"required,min=4,max=8"`
+		DeviceID          string `json:"device_id" validate:"required"`
+		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+		OTPCode           string `json:"otp_code" validate:"required,len=6"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1781,35 +2200,39 @@ func (h *AuthHandler) RenameDepartment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Sanitize input
-	req.DepartmentName = util.SanitizeInput(req.DepartmentName)
+	// Sanitize inputs
+	req.NewMPIN = util.SanitizeInput(req.NewMPIN)
+	req.DeviceID = util.SanitizeInput(req.DeviceID)
+	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+	req.OTPCode = util.SanitizeInput(req.OTPCode)
 
-	// Check permission using bitmask - MAKE SURE THIS PERMISSION MATCHES
-	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "administrative.department.update")
+	userID, err := uuid.Parse(req.UserID)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	if !hasPermission {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to rename departments"),
-			"Insufficient permissions")
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
 		return
 	}
 
-	// 🔥 CRITICAL: Make sure this calls RenameDepartment, NOT UpdateDepartment
-	if err := h.companyService.RenameDepartment(ctx, companyID, departmentID, req.DepartmentName); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to rename department")
+	// ✅ FIXED: Use the MPIN service's VerifyForgotMPINOTP method directly
+	forgotReq := service.MPINForgotWithOTPRequest{
+		UserID:            userID,
+		NewMPIN:           req.NewMPIN,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		OTPCode:           req.OTPCode,
+		IPAddress:         h.getClientIP(r),
+		UserAgent:         r.UserAgent(),
+	}
+
+	if err := h.mpinService.VerifyForgotMPINOTP(ctx, &forgotReq); err != nil {
+		statusCode := h.getForgotMPINStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to reset MPIN")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department renamed successfully"))
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "MPIN reset successfully"))
 
-	h.logger.Info("Department renamed",
-		util.String("company_id", companyID.String()),
-		util.String("department_id", departmentID.String()),
-		util.String("new_name", req.DepartmentName),
-		util.String("updated_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
+	h.logger.Info("MPIN reset via forgot flow",
+		util.String("user_id", userID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
 }

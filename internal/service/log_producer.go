@@ -39,6 +39,59 @@ func NewLogProducerService(
 	}
 }
 
+// ================== SECURITY RISK EVENTS ==================
+// ✅ NEW: Security Risk Events for Bot Protection, IP Reputation, Risk Scoring
+func (lps *LogProducerService) ProduceSecurityRiskEvent(ctx context.Context, event *models.SecurityEvent) error {
+	if event == nil {
+		return fmt.Errorf("event is nil")
+	}
+
+	// Set common fields if not already set
+	if event.EventID == "" {
+		event.EventID = uuid.New().String()
+	}
+	if event.EventType == "" {
+		event.EventType = "security_risk"
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+	if event.Environment == "" {
+		event.Environment = lps.environment
+	}
+	if event.Version == "" {
+		event.Version = lps.version
+	}
+	if event.ServiceName == "" {
+		event.ServiceName = "auth-service"
+	}
+
+	data, err := json.Marshal(event)
+	if err != nil {
+		lps.logger.Error("failed to marshal Security Risk event", zap.Error(err))
+		return err
+	}
+
+	headers := map[string]string{
+		"event_type":   "security_risk",
+		"phone_number": event.PhoneNumber,
+		"action_taken": event.ActionTaken,
+	}
+
+	err = lps.kafkaProducer.ProduceMessage(ctx, "security-events", []byte(event.PhoneNumber), data, headers)
+	if err != nil {
+		lps.logger.Error("failed to produce Security Risk event", zap.Error(err))
+		return err
+	}
+
+	lps.logger.Debug("✅ Security Risk event produced",
+		zap.String("phone_number", event.PhoneNumber),
+		zap.Int("risk_score", event.RiskScore),
+		zap.String("action_taken", event.ActionTaken),
+	)
+	return nil
+}
+
 // ================== OTP EVENTS ==================
 func (lps *LogProducerService) ProduceOTPEvent(ctx context.Context, event *models.OTPLogEvent) error {
 	if event == nil {

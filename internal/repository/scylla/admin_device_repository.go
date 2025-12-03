@@ -19,7 +19,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-
 type AdminDeviceRepository interface {
 	// Core device binding operations
 	BindAdminDevice(ctx context.Context, adminID uuid.UUID, deviceID, bindToken string) error
@@ -46,6 +45,7 @@ type AdminDeviceRepository interface {
 	GetUsersByDevice(ctx context.Context, deviceID string) ([]*models.UserActiveDevice, error)
 	BindUserDevice(ctx context.Context, userID uuid.UUID, deviceID, bindToken string) error
 }
+
 // AdminDeviceRepositoryImpl handles all admin device-related database operations
 type AdminDeviceRepositoryImpl struct {
 	client  *ScyllaClient
@@ -493,88 +493,89 @@ func (r *AdminDeviceRepositoryImpl) BindAdminDeviceForUser(
 	}
 	return r.BindAdminDevicesBatch(ctx, adminBindings)
 }
+
 // ========================================================================
 // MISSING BATCH OPERATIONS - ADD THESE METHODS
 // ========================================================================
 
 func (r *AdminDeviceRepositoryImpl) UnbindAdminDevicesBatch(
-    ctx context.Context,
-    adminIDs []uuid.UUID,
+	ctx context.Context,
+	adminIDs []uuid.UUID,
 ) error {
-    startTime := time.Now()
-    defer func() { r.metrics.RecordQuery(time.Since(startTime), true) }()
+	startTime := time.Now()
+	defer func() { r.metrics.RecordQuery(time.Since(startTime), true) }()
 
-    if len(adminIDs) == 0 {
-        return nil
-    }
+	if len(adminIDs) == 0 {
+		return nil
+	}
 
-    batch := r.client.Batch(gocql.UnloggedBatch)
-    for _, adminID := range adminIDs {
-        if adminID == uuid.Nil {
-            continue
-        }
-        batch.Query(`DELETE FROM admin_active_device WHERE admin_id = ?`, gocql.UUID(adminID))
-    }
+	batch := r.client.Batch(gocql.UnloggedBatch)
+	for _, adminID := range adminIDs {
+		if adminID == uuid.Nil {
+			continue
+		}
+		batch.Query(`DELETE FROM admin_active_device WHERE admin_id = ?`, gocql.UUID(adminID))
+	}
 
-    if err := r.client.ExecuteBatch(batch); err != nil {
-        r.logger.Error("Failed to unbind admin devices batch",
-            util.ErrorField(err),
-            util.Int("admin_count", len(adminIDs)))
-        return fmt.Errorf("failed to unbind admin devices batch: %w", err)
-    }
+	if err := r.client.ExecuteBatch(batch); err != nil {
+		r.logger.Error("Failed to unbind admin devices batch",
+			util.ErrorField(err),
+			util.Int("admin_count", len(adminIDs)))
+		return fmt.Errorf("failed to unbind admin devices batch: %w", err)
+	}
 
-    r.logger.Info("Admin devices batch unbound successfully",
-        util.Int("admin_count", len(adminIDs)),
-        util.Duration("duration", time.Since(startTime)))
+	r.logger.Info("Admin devices batch unbound successfully",
+		util.Int("admin_count", len(adminIDs)),
+		util.Duration("duration", time.Since(startTime)))
 
-    return nil
+	return nil
 }
 
 func (r *AdminDeviceRepositoryImpl) BindAdminDevicesBatch(
-    ctx context.Context,
-    bindings []models.UserActiveDevice,
+	ctx context.Context,
+	bindings []models.UserActiveDevice,
 ) error {
-    startTime := time.Now()
-    defer func() { r.metrics.RecordQuery(time.Since(startTime), true) }()
+	startTime := time.Now()
+	defer func() { r.metrics.RecordQuery(time.Since(startTime), true) }()
 
-    if len(bindings) == 0 {
-        return nil
-    }
+	if len(bindings) == 0 {
+		return nil
+	}
 
-    batch := r.client.Batch(gocql.UnloggedBatch)
-    now := time.Now().UTC()
+	batch := r.client.Batch(gocql.UnloggedBatch)
+	now := time.Now().UTC()
 
-    for _, binding := range bindings {
-        adminID, err := uuid.Parse(binding.UserID)
-        if err != nil {
-            r.logger.Warn("Invalid admin ID in batch binding",
-                util.String("user_id", binding.UserID))
-            continue
-        }
+	for _, binding := range bindings {
+		adminID, err := uuid.Parse(binding.UserID)
+		if err != nil {
+			r.logger.Warn("Invalid admin ID in batch binding",
+				util.String("user_id", binding.UserID))
+			continue
+		}
 
-        hashedToken := r.hashBindToken(binding.BindToken)
+		hashedToken := r.hashBindToken(binding.BindToken)
 
-        batch.Query(`
+		batch.Query(`
             INSERT INTO admin_active_device (admin_id, device_id, session_id, bound_at, bind_token)
             VALUES (?, ?, ?, ?, ?)`,
-            gocql.UUID(adminID),
-            binding.DeviceID,
-            nil, // session_id will be set later
-            now,
-            hashedToken,
-        )
-    }
+			gocql.UUID(adminID),
+			binding.DeviceID,
+			nil, // session_id will be set later
+			now,
+			hashedToken,
+		)
+	}
 
-    if err := r.client.ExecuteBatch(batch); err != nil {
-        r.logger.Error("Failed to bind admin devices batch",
-            util.ErrorField(err),
-            util.Int("binding_count", len(bindings)))
-        return fmt.Errorf("failed to bind admin devices batch: %w", err)
-    }
+	if err := r.client.ExecuteBatch(batch); err != nil {
+		r.logger.Error("Failed to bind admin devices batch",
+			util.ErrorField(err),
+			util.Int("binding_count", len(bindings)))
+		return fmt.Errorf("failed to bind admin devices batch: %w", err)
+	}
 
-    r.logger.Info("Admin devices batch bound successfully",
-        util.Int("binding_count", len(bindings)),
-        util.Duration("duration", time.Since(startTime)))
+	r.logger.Info("Admin devices batch bound successfully",
+		util.Int("binding_count", len(bindings)),
+		util.Duration("duration", time.Since(startTime)))
 
-    return nil
+	return nil
 }

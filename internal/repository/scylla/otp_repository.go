@@ -101,15 +101,15 @@ func (r *OTPRepositoryImpl) prepareStatements() {
         INSERT INTO otp_verifications (
             phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
             hash_algorithm, pepper_version, attempts, expires_at,
-            ip_address, provider_used
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ip_address,device_id, provider_used
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         USING TTL ?`)
 
 	// Prepare GetActiveOTP query
 	r.stmtGetActiveOTP = r.client.Session.Query(`
         SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
                hash_algorithm, pepper_version, attempts, expires_at,
-               ip_address, provider_used
+               ip_address, device_id, provider_used
         FROM otp_verifications
         WHERE phone_hash = ? AND purpose = ? AND time_bucket = ?
         ORDER BY created_at DESC
@@ -121,6 +121,7 @@ func (r *OTPRepositoryImpl) prepareStatements() {
         WHERE phone_hash = ? AND purpose = ? AND time_bucket = ? AND created_at = ?`)
 
 	r.logger.Info("Prepared statements initialized for OTP repository")
+
 }
 
 // Helper function to calculate time bucket from timestamp
@@ -176,7 +177,8 @@ func (r *OTPRepositoryImpl) CreateOTP(ctx context.Context, otp *models.OTPVerifi
 		otp.PepperVersion,
 		otp.Attempts,
 		otp.ExpiresAt,
-		ipToStore, // Use the validated IP
+		ipToStore,    // Use the validated IP
+		otp.DeviceID, // <-- ADD THIS LINE
 		otp.ProviderUsed,
 		ttlSeconds,
 	)
@@ -227,6 +229,7 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 		&otp.Attempts,
 		&otp.ExpiresAt,
 		&otp.IPAddress, // ✅ FIX: Scan directly into net.IP
+		&otp.DeviceID,  // <-- ADD THIS
 		&otp.ProviderUsed,
 	)
 
@@ -257,6 +260,7 @@ func (r *OTPRepositoryImpl) GetActiveOTP(ctx context.Context, phoneHash string, 
 				&otp.Attempts,
 				&otp.ExpiresAt,
 				&otp.IPAddress, // ✅ FIX: For previous bucket too
+				&otp.DeviceID,  // <-- ADD THIS
 				&otp.ProviderUsed,
 			)
 
@@ -457,7 +461,7 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 			query := r.client.Session.Query(`
 				SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
 					   hash_algorithm, pepper_version, attempts, expires_at,
-					   ip_address, provider_used
+					   ip_address, device_id , provider_used
 				FROM otp_verifications
 				WHERE phone_hash = ? AND time_bucket = ?`,
 				phoneHash, bucket,
@@ -482,6 +486,7 @@ func (r *OTPRepositoryImpl) GetOTPsByTimeRange(ctx context.Context, phoneHash st
 					&otp.Attempts,
 					&otp.ExpiresAt,
 					&otp.IPAddress, // ✅ FIX: Use net.IP directly
+					&otp.DeviceID,  // <-- ADD THIS
 					&otp.ProviderUsed,
 				) {
 					break
@@ -659,7 +664,7 @@ func (r *OTPRepositoryImpl) CreateOTPsBatch(ctx context.Context, otps []*models.
 			INSERT INTO otp_verifications (
 				phone_hash, purpose, time_bucket, created_at, otp_hash, otp_salt,
 				hash_algorithm, pepper_version, attempts, expires_at,
-				ip_address, provider_used
+				ip_address, device_id, provider_used
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			USING TTL ?`,
 			otp.PhoneHash, otp.Purpose, otp.TimeBucket, otp.CreatedAt, otp.OTPHash, otp.OTPSalt,

@@ -1,18 +1,16 @@
-
-
 package service
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"time"
-
 	"auth-service/internal/config"
 	"auth-service/internal/models"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/util"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"net"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -20,21 +18,21 @@ import (
 
 // AdminDeviceService handles admin device management business logic
 type AdminDeviceService struct {
-	deviceRepo      *scylla.AdminDeviceRepositoryImpl
-	historyRepo     *scylla.AdminDeviceHistoryRepositoryImpl // ✅ Changed from AdminDeviceTrustRepository
-	trustRepo       scylla.AdminDeviceTrustRepository
-	mpinRepo        *scylla.AdminMPINRepositoryImpl
-	distCache       *DistributedCache
-	logProducer     *LogProducerService
-	config          config.Config
-	logger          *zap.Logger
+	deviceRepo  scylla.AdminDeviceRepository
+	historyRepo scylla.AdminDeviceHistoryRepository
+	trustRepo   scylla.AdminDeviceTrustRepository
+	mpinRepo    scylla.AdminMPINRepository
+	distCache   *DistributedCache
+	logProducer *LogProducerService
+	config      config.Config
+	logger      *zap.Logger
 }
 
 // NewAdminDeviceService creates a new admin device service
 func NewAdminDeviceService(
-	deviceRepo *scylla.AdminDeviceRepositoryImpl,
+	deviceRepo scylla.AdminDeviceRepository,
 	trustRepo scylla.AdminDeviceTrustRepository,
-	mpinRepo *scylla.AdminMPINRepositoryImpl,
+	mpinRepo scylla.AdminMPINRepository,
 	distCache *DistributedCache,
 	config config.Config,
 	logger *zap.Logger,
@@ -50,7 +48,7 @@ func NewAdminDeviceService(
 }
 
 // SetHistoryRepository sets the history repository for tracking admin device binding changes
-func (s *AdminDeviceService) SetHistoryRepository(historyRepo *scylla.AdminDeviceHistoryRepositoryImpl) {
+func (s *AdminDeviceService) SetHistoryRepository(historyRepo scylla.AdminDeviceHistoryRepository) {
 	s.historyRepo = historyRepo
 }
 
@@ -59,13 +57,17 @@ func (s *AdminDeviceService) SetLogProducerService(logProducer *LogProducerServi
 	s.logProducer = logProducer
 }
 
-// Request/Response types (similar to user device service)
+// Request/Response types
 
 type AdminBindDeviceRequest struct {
-	AdminID   uuid.UUID `json:"admin_id" validate:"required"`
-	DeviceID  string    `json:"device_id" validate:"required"`
-	IPAddress string    `json:"ip_address,omitempty"`
-	UserAgent string    `json:"user_agent,omitempty"`
+	AdminID           uuid.UUID `json:"admin_id" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	DeviceFingerprint string    `json:"device_fingerprint,omitempty"`
+	OSVersion         string    `json:"os_version,omitempty"`
+	AppVersion        string    `json:"app_version,omitempty"`
+	IPAddress         string    `json:"ip_address,omitempty"`
+	UserAgent         string    `json:"user_agent,omitempty"`
+	DeviceModel       string    `json:"device_model,omitempty"`
 }
 
 type AdminBindDeviceResponse struct {
@@ -143,9 +145,23 @@ func (s *AdminDeviceService) BindDevice(
 		}
 	}
 
-	// Update device trust level
+	// Update device trust level with enhanced device information
 	if s.trustRepo != nil {
-		if err := s.trustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, req.IPAddress, req.UserAgent); err != nil {
+		trustLevel := &models.DeviceTrustLevel{
+			UserID:            req.AdminID,
+			DeviceID:          req.DeviceID,
+			TrustStatus:       models.TrustStatusTrusted,
+			DeviceFingerprint: req.DeviceFingerprint,
+			OSVersion:         req.OSVersion,
+			AppVersion:        req.AppVersion,
+			LastIPAddress:     req.IPAddress,
+			UserAgent:         req.UserAgent,
+			DeviceModel:       req.DeviceModel,
+			IsBlocked:         false,
+			RiskScore:         0,
+		}
+
+		if err := s.trustRepo.MarkAdminSuccessfulLogin(ctx, req.AdminID, req.DeviceID, trustLevel); err != nil {
 			s.logger.Warn("Failed to update admin device trust level",
 				util.ErrorField(err),
 				util.String("admin_id", req.AdminID.String()),
@@ -176,6 +192,7 @@ func (s *AdminDeviceService) BindDevice(
 	s.logger.Info("Admin device bound successfully",
 		util.String("admin_id", req.AdminID.String()),
 		util.String("device_id", req.DeviceID),
+		util.String("device_fingerprint", req.DeviceFingerprint),
 		util.String("ip_address", req.IPAddress),
 		util.Duration("duration", time.Since(startTime)))
 
@@ -230,11 +247,11 @@ func (s *AdminDeviceService) GetActiveDevice(
 	// ✅ Log success event
 	if s.logProducer != nil && device != nil {
 		event := &models.DeviceLogEvent{
-			UserID:    adminID.String(),
-			DeviceID:  device.DeviceID,
-			Action:    "admin_get_active_device",
-			Status:    "success",
-			Duration:  int64(time.Since(startTime).Milliseconds()),
+			UserID:   adminID.String(),
+			DeviceID: device.DeviceID,
+			Action:   "admin_get_active_device",
+			Status:   "success",
+			Duration: int64(time.Since(startTime).Milliseconds()),
 		}
 		_ = s.logProducer.ProduceDeviceEvent(ctx, event)
 	}
@@ -312,7 +329,7 @@ func (s *AdminDeviceService) UnbindDevice(ctx context.Context, adminID uuid.UUID
 		s.distCache.DeleteKey(ctx, cacheKey)
 	}
 
-	s.logger.Info("Admin device unbound successfully", 
+	s.logger.Info("Admin device unbound successfully",
 		util.String("admin_id", adminID.String()),
 		util.String("ip_address", ipAddress))
 	return nil
@@ -780,6 +797,47 @@ func (s *AdminDeviceService) UpdateMPINDeviceBinding(ctx context.Context, adminI
 	return s.mpinRepo.UpdateAdminMPINDeviceBinding(ctx, adminID, deviceID)
 }
 
+// GetAdminDevices retrieves all devices for an admin
+func (s *AdminDeviceService) GetAdminDevices(ctx context.Context, adminID uuid.UUID) ([]*models.DeviceTrustLevel, error) {
+	if s.trustRepo == nil {
+		return nil, fmt.Errorf("trust repository not available")
+	}
+
+	return s.trustRepo.GetAdminDevices(ctx, adminID)
+}
+
+// UpdateDeviceRiskScore updates risk score for an admin device
+func (s *AdminDeviceService) UpdateDeviceRiskScore(ctx context.Context, adminID uuid.UUID, deviceID string, riskScore int) error {
+	if s.trustRepo == nil {
+		return fmt.Errorf("trust repository not available")
+	}
+
+	return s.trustRepo.UpdateAdminDeviceRiskScore(ctx, adminID, deviceID, riskScore)
+}
+
+// RecordDataDeletion records admin data deletion event
+func (s *AdminDeviceService) RecordDataDeletion(ctx context.Context, deletion *models.UserDataDeletion) error {
+	if s.trustRepo == nil {
+		return fmt.Errorf("trust repository not available")
+	}
+
+	return s.trustRepo.RecordAdminDataDeletion(ctx, deletion)
+}
+
+// SetDeviceTrustLevel sets trust level for an admin device
+func (s *AdminDeviceService) SetDeviceTrustLevel(
+	ctx context.Context,
+	adminID uuid.UUID,
+	deviceID string,
+	trust *models.DeviceTrustLevel,
+) error {
+	if s.trustRepo == nil {
+		return fmt.Errorf("trust repository not available")
+	}
+
+	return s.trustRepo.SetAdminDeviceTrustLevel(ctx, adminID, deviceID, trust)
+}
+
 // generateBindToken generates a cryptographically secure bind token
 func (s *AdminDeviceService) generateBindToken() (string, error) {
 	b := make([]byte, 32) // 256 bits
@@ -787,4 +845,27 @@ func (s *AdminDeviceService) generateBindToken() (string, error) {
 		return "", err
 	}
 	return base64.URLEncoding.EncodeToString(b), nil
+}
+
+// ✅ FIX: Enhanced MarkAdminSuccessfulLogin with IP validation
+func (s *AdminDeviceService) MarkAdminSuccessfulLogin(
+	ctx context.Context,
+	adminID uuid.UUID,
+	deviceID string,
+	trustLevel *models.DeviceTrustLevel,
+) error {
+	// Validate IP address before storing
+	if trustLevel.LastIPAddress != "" {
+		if parsedIP := net.ParseIP(trustLevel.LastIPAddress); parsedIP == nil {
+			s.logger.Warn("Invalid IP address provided for device trust",
+				util.String("admin_id", adminID.String()),
+				util.String("device_id", deviceID),
+				util.String("ip_address", trustLevel.LastIPAddress),
+			)
+			// Clear invalid IP address
+			trustLevel.LastIPAddress = ""
+		}
+	}
+
+	return s.trustRepo.MarkAdminSuccessfulLogin(ctx, adminID, deviceID, trustLevel)
 }

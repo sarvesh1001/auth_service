@@ -46,3 +46,4 @@ CREATE INDEX IF NOT EXISTS admin_users_is_active_idx ON admin_users (is_active);
 -- PEPPER STORE INDEX
 -- ===============================
 CREATE INDEX IF NOT EXISTS idx_pepper_store_is_active ON pepper_store (is_active);
+CREATE INDEX IF NOT EXISTS ON otp_verifications (device_id);

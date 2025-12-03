@@ -19,12 +19,11 @@ if [ -z "$KAFKA_BOOTSTRAP_SERVER" ]; then
     exit 1
 fi
 
-# Wait for Kafka to be ready with better connection test
+# Wait for Kafka to become healthy
 echo "⏳ Waiting for Kafka to be ready at $KAFKA_BOOTSTRAP_SERVER..."
 MAX_ATTEMPTS=30
 ATTEMPT=1
 while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-    # Use timeout to prevent hanging
     if timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list > /dev/null 2>&1; then
         echo "✅ Kafka is ready!"
         break
@@ -41,20 +40,23 @@ while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
 done
 
 # -----------------------------------------------
-# Helper: create topic safely
+# SAFE Topic Creation With No Set -e Kill
 # -----------------------------------------------
 create_topic() {
+    set +e  # prevent set -e from killing script inside this function
+
     local topic=$1
     local partitions=${2:-3}
     local replication_factor=${3:-1}
-    local retention_ms=${4:-2592000000}  # 30 days
+    local retention_ms=${4:-2592000000}
     local compression=${5:-gzip}
 
     echo "📝 Creating topic: $topic (partitions=$partitions, retention=${retention_ms}ms)"
 
-    # Check if topic exists with timeout
+    # Check if topic exists
     if timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list 2>/dev/null | grep -q "^${topic}$"; then
         echo "   ✅ Topic already exists, skipping"
+        set -e
         return 0
     fi
 
@@ -62,7 +64,7 @@ create_topic() {
     local max_retries=3
     
     while [ $retry -lt $max_retries ]; do
-        if timeout 15s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" \
+        timeout 15s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" \
             --create \
             --topic "$topic" \
             --partitions "$partitions" \
@@ -73,9 +75,11 @@ create_topic() {
             --config "segment.ms=86400000" \
             --config "min.insync.replicas=1" \
             --config "retention.bytes=-1" \
-            --config "max.message.bytes=1048588" \
-            2>&1; then
+            --config "max.message.bytes=1048588"
+
+        if [ $? -eq 0 ]; then
             echo "   ✅ Created successfully"
+            set -e
             return 0
         fi
 
@@ -85,6 +89,7 @@ create_topic() {
     done
 
     echo "   ❌ Failed to create topic $topic after $max_retries attempts"
+    set -e
     return 1
 }
 
@@ -93,26 +98,23 @@ echo "🚀 Creating Kafka topics with optimized event distribution..."
 echo ""
 
 # -----------------------------------------------
-# Create topics with optimized configurations for each storage system
+# Topic definitions
 # -----------------------------------------------
 declare -A TOPIC_CONFIGS=(
-    # 🔍 Elasticsearch Topics (Search & Analytics)
-    # Topic: [partitions, replication, retention_ms, compression]
-    ["admin-events"]="3 1 15552000000 gzip"      # 180 days - Audit trails
-    ["user-events"]="3 1 2592000000 gzip"        # 30 days - User behavior
-    ["session-events"]="3 1 604800000 gzip"      # 7 days - Session analytics
-    
-    # 📊 ClickHouse Topics (Time-Series & Metrics)
-    ["device-events"]="3 1 2592000000 gzip"      # 30 days - Device metrics
-    ["mpin-events"]="3 1 2592000000 gzip"        # 30 days - Auth patterns  
-    ["otp-events"]="3 1 604800000 gzip"          # 7 days - Delivery metrics
-    
-    # 🔄 Dual-Purpose Topics (Both ES & ClickHouse)
-    ["security-events"]="3 1 7776000000 gzip"    # 90 days - Fraud detection + investigation
+    ["admin-events"]="3 1 15552000000 gzip"
+    ["user-events"]="3 1 2592000000 gzip"
+    ["session-events"]="3 1 604800000 gzip"
+
+    ["device-events"]="3 1 2592000000 gzip"
+    ["mpin-events"]="3 1 2592000000 gzip"
+    ["otp-events"]="3 1 604800000 gzip"
+
+    ["security-events"]="3 1 7776000000 gzip"
 )
 
 FAILED_TOPICS=()
 
+# Create topics
 for topic in "${!TOPIC_CONFIGS[@]}"; do
     config=(${TOPIC_CONFIGS[$topic]})
     if ! create_topic "$topic" "${config[0]}" "${config[1]}" "${config[2]}" "${config[3]}"; then
@@ -124,13 +126,11 @@ done
 echo "📊 Verifying topics..."
 echo ""
 
-# -----------------------------------------------
-# Verify topic creation with detailed info
-# -----------------------------------------------
 TOPICS=$(timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --list 2>/dev/null)
 
 ALL_SUCCESS=true
-echo "🔍 Elasticsearch Topics (Search & Analytics):"
+
+echo "🔍 Elasticsearch Topics:"
 for topic in "admin-events" "user-events" "session-events"; do
     if echo "$TOPICS" | grep -q "^${topic}$"; then
         echo "   ✅ $topic"
@@ -141,7 +141,7 @@ for topic in "admin-events" "user-events" "session-events"; do
 done
 
 echo ""
-echo "📊 ClickHouse Topics (Time-Series & Metrics):"
+echo "📊 ClickHouse Topics:"
 for topic in "device-events" "mpin-events" "otp-events"; do
     if echo "$TOPICS" | grep -q "^${topic}$"; then
         echo "   ✅ $topic"
@@ -152,7 +152,7 @@ for topic in "device-events" "mpin-events" "otp-events"; do
 done
 
 echo ""
-echo "🔄 Dual-Purpose Topics (Both ES & ClickHouse):"
+echo "🔄 Dual-Purpose Topics:"
 for topic in "security-events"; do
     if echo "$TOPICS" | grep -q "^${topic}$"; then
         echo "   ✅ $topic"
@@ -164,15 +164,13 @@ done
 
 echo ""
 
-if [ "$ALL_SUCCESS" = true ]; then
-    echo "✅ All Kafka topics created successfully!"
-    echo ""
-    echo "📋 Topic Configuration Summary:"
-    timeout 10s kafka-topics --bootstrap-server "$KAFKA_BOOTSTRAP_SERVER" --describe 2>/dev/null | head -30
-    echo "🎉 Kafka topic initialization completed!"
+# ---------------------------------------------------
+# Final Result
+# ---------------------------------------------------
+if [ "$ALL_SUCCESS" = "true" ]; then
+    echo "🎉 All Kafka topics created successfully!"
     exit 0
-else
-    echo "❌ Some topics failed to create: ${FAILED_TOPICS[*]}"
-    echo "⚠️  Continuing startup, but some features may not work properly"
-    exit 1
 fi
+
+echo "❌ Some topics failed to create: ${FAILED_TOPICS[*]}"
+exit 1

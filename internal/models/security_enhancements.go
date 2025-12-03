@@ -45,18 +45,6 @@ type BruteForceScore struct {
 	ExpiresAt   time.Time `db:"expires_at"`
 }
 
-type SecurityEvent struct {
-	EventID   string    `db:"event_id"`
-	EventType string    `db:"event_type"` // "otp_brute_force", "suspicious_activity"
-	PhoneHash string    `db:"phone_hash"`
-	IPAddress net.IP    `db:"ip_address"`
-	DeviceID  string    `db:"device_id"`
-	RiskScore int       `db:"risk_score"`
-	Action    string    `db:"action"` // "blocked", "allowed", "challenged"
-	Details   string    `db:"details"`
-	CreatedAt time.Time `db:"created_at"`
-}
-
 // ============================================
 // DYNAMIC COOLDOWN CONFIG
 // ============================================
@@ -113,4 +101,16 @@ type SMSDeliveryAttempt struct {
 	Error        string    `db:"error"`
 	SentAt       time.Time `db:"sent_at"`
 	ResponseTime int       `db:"response_time"` // ms
+}
+
+type SecurityEvent struct {
+	LogEnvelope
+	PhoneNumber string   `json:"phone_number"`
+	IPAddress   string   `json:"ip_address"`
+	DeviceID    string   `json:"device_id"`
+	UserAgent   string   `json:"user_agent"`
+	RiskScore   int      `json:"risk_score"`
+	EventType   string   `json:"event_type"` // bot_detected, ip_reputation, risk_assessment
+	Reasons     []string `json:"reasons"`
+	ActionTaken string   `json:"action_taken"` // allowed, blocked, monitored
 }

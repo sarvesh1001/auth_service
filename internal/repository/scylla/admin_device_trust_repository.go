@@ -1,4 +1,3 @@
-// internal/repository/scylla/admin_device_trust_repository.go
 package scylla
 
 import (
@@ -16,11 +15,13 @@ import (
 
 type AdminDeviceTrustRepository interface {
 	GetAdminDeviceTrustLevel(ctx context.Context, adminID uuid.UUID, deviceID string) (*models.DeviceTrustLevel, error)
-	SetAdminDeviceTrustLevel(ctx context.Context, adminID uuid.UUID, deviceID string, status models.DeviceTrustStatus) error
-	MarkAdminSuccessfulLogin(ctx context.Context, adminID uuid.UUID, deviceID string, ipAddress, userAgent string) error
+	SetAdminDeviceTrustLevel(ctx context.Context, adminID uuid.UUID, deviceID string, trust *models.DeviceTrustLevel) error
+	MarkAdminSuccessfulLogin(ctx context.Context, adminID uuid.UUID, deviceID string, trust *models.DeviceTrustLevel) error
 	GetAdminPrimaryDevice(ctx context.Context, adminID uuid.UUID) (*models.DeviceTrustLevel, error)
 	BlockAdminDevice(ctx context.Context, adminID uuid.UUID, deviceID string) error
 	RecordAdminDataDeletion(ctx context.Context, deletion *models.UserDataDeletion) error
+	UpdateAdminDeviceRiskScore(ctx context.Context, adminID uuid.UUID, deviceID string, riskScore int) error
+	GetAdminDevices(ctx context.Context, adminID uuid.UUID) ([]*models.DeviceTrustLevel, error)
 }
 
 type AdminDeviceTrustRepositoryImpl struct {
@@ -35,7 +36,6 @@ func NewAdminDeviceTrustRepository(client *ScyllaClient, logger *zap.Logger) Adm
 	}
 }
 
-// GetAdminDeviceTrustLevel retrieves trust details for an admin device
 func (r *AdminDeviceTrustRepositoryImpl) GetAdminDeviceTrustLevel(
 	ctx context.Context,
 	adminID uuid.UUID,
@@ -45,8 +45,9 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminDeviceTrustLevel(
 	var scannedAdminID gocql.UUID
 
 	query := r.client.Session.Query(`
-        SELECT admin_id, device_id, trust_status, first_successful_login, last_login, 
-               ip_address, user_agent, is_blocked
+        SELECT admin_id, device_id, trust_status, device_fingerprint, os_version, app_version,
+               ip_address, last_ip_subnet, last_location_hash, user_agent, device_model,
+               first_successful_login, last_login, is_blocked, risk_score
         FROM admin_device_trust_levels WHERE admin_id = ? AND device_id = ?`,
 		gocql.UUID(adminID), deviceID,
 	)
@@ -55,11 +56,18 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminDeviceTrustLevel(
 		&scannedAdminID,
 		&trust.DeviceID,
 		&trust.TrustStatus,
+		&trust.DeviceFingerprint,
+		&trust.OSVersion,
+		&trust.AppVersion,
+		&trust.LastIPAddress,
+		&trust.LastIPSubnet,
+		&trust.LastLocationHash,
+		&trust.UserAgent,
+		&trust.DeviceModel,
 		&trust.FirstSuccessfulLogin,
 		&trust.LastLogin,
-		&trust.IPAddress,
-		&trust.UserAgent,
 		&trust.IsBlocked,
+		&trust.RiskScore,
 	); err != nil {
 		if err == gocql.ErrNotFound {
 			return &models.DeviceTrustLevel{
@@ -67,6 +75,7 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminDeviceTrustLevel(
 				DeviceID:    deviceID,
 				TrustStatus: models.TrustStatusUntrusted,
 				IsBlocked:   false,
+				RiskScore:   0,
 			}, nil
 		}
 		return nil, fmt.Errorf("failed to get admin device trust level: %w", err)
@@ -76,19 +85,30 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminDeviceTrustLevel(
 	return &trust, nil
 }
 
-// SetAdminDeviceTrustLevel updates the trust level for a specific admin device
 func (r *AdminDeviceTrustRepositoryImpl) SetAdminDeviceTrustLevel(
 	ctx context.Context,
 	adminID uuid.UUID,
 	deviceID string,
-	status models.DeviceTrustStatus,
+	trust *models.DeviceTrustLevel,
 ) error {
 	query := r.client.Session.Query(`
         UPDATE admin_device_trust_levels 
-        SET trust_status = ?, last_login = ?
+        SET trust_status = ?, device_fingerprint = ?, os_version = ?, app_version = ?,
+            ip_address = ?, last_ip_subnet = ?, last_location_hash = ?, user_agent = ?,
+            device_model = ?, last_login = ?, is_blocked = ?, risk_score = ?
         WHERE admin_id = ? AND device_id = ?`,
-		string(status),
+		string(trust.TrustStatus),
+		trust.DeviceFingerprint,
+		trust.OSVersion,
+		trust.AppVersion,
+		trust.LastIPAddress,
+		trust.LastIPSubnet,
+		trust.LastLocationHash,
+		trust.UserAgent,
+		trust.DeviceModel,
 		time.Now(),
+		trust.IsBlocked,
+		trust.RiskScore,
 		gocql.UUID(adminID),
 		deviceID,
 	)
@@ -100,18 +120,18 @@ func (r *AdminDeviceTrustRepositoryImpl) SetAdminDeviceTrustLevel(
 	r.logger.Debug("Admin device trust level updated",
 		util.String("admin_id", adminID.String()),
 		util.String("device_id", deviceID),
-		util.String("trust_status", string(status)),
+		util.String("trust_status", string(trust.TrustStatus)),
+		util.Int("risk_score", trust.RiskScore),
 	)
 
 	return nil
 }
 
-// MarkAdminSuccessfulLogin records a successful login and updates trust level
 func (r *AdminDeviceTrustRepositoryImpl) MarkAdminSuccessfulLogin(
 	ctx context.Context,
 	adminID uuid.UUID,
 	deviceID string,
-	ipAddress, userAgent string,
+	trust *models.DeviceTrustLevel,
 ) error {
 	now := time.Now()
 
@@ -123,19 +143,33 @@ func (r *AdminDeviceTrustRepositoryImpl) MarkAdminSuccessfulLogin(
 	newStatus := models.TrustStatusUntrusted
 	if existing == nil || existing.FirstSuccessfulLogin == nil {
 		newStatus = models.TrustStatusTrusted
+		trust.FirstSuccessfulLogin = &now
 	}
+
+	trust.LastLogin = &now
+	trust.TrustStatus = newStatus
 
 	query := r.client.Session.Query(`
         INSERT INTO admin_device_trust_levels 
-        (admin_id, device_id, trust_status, first_successful_login, last_login, ip_address, user_agent, is_blocked)
-        VALUES (?, ?, ?, ?, ?, ?, ?, false)`,
+        (admin_id, device_id, trust_status, device_fingerprint, os_version, app_version,
+         ip_address, last_ip_subnet, last_location_hash, user_agent, device_model,
+         first_successful_login, last_login, is_blocked, risk_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		gocql.UUID(adminID),
 		deviceID,
-		string(newStatus),
-		now,
-		now,
-		ipAddress,
-		userAgent,
+		string(trust.TrustStatus),
+		trust.DeviceFingerprint,
+		trust.OSVersion,
+		trust.AppVersion,
+		trust.LastIPAddress,
+		trust.LastIPSubnet,
+		trust.LastLocationHash,
+		trust.UserAgent,
+		trust.DeviceModel,
+		trust.FirstSuccessfulLogin,
+		trust.LastLogin,
+		false,
+		trust.RiskScore,
 	)
 
 	if err := query.WithContext(ctx).Exec(); err != nil {
@@ -146,12 +180,12 @@ func (r *AdminDeviceTrustRepositoryImpl) MarkAdminSuccessfulLogin(
 		util.String("admin_id", adminID.String()),
 		util.String("device_id", deviceID),
 		util.String("trust_status", string(newStatus)),
+		util.String("device_fingerprint", trust.DeviceFingerprint),
 	)
 
 	return nil
 }
 
-// GetAdminPrimaryDevice fetches the primary trusted device for an admin
 func (r *AdminDeviceTrustRepositoryImpl) GetAdminPrimaryDevice(
 	ctx context.Context,
 	adminID uuid.UUID,
@@ -160,8 +194,9 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminPrimaryDevice(
 	var scannedAdminID gocql.UUID
 
 	query := r.client.Session.Query(`
-        SELECT admin_id, device_id, trust_status, first_successful_login, last_login, 
-               ip_address, user_agent, is_blocked
+        SELECT admin_id, device_id, trust_status, device_fingerprint, os_version, app_version,
+               ip_address, last_ip_subnet, last_location_hash, user_agent, device_model,
+               first_successful_login, last_login, is_blocked, risk_score
         FROM admin_device_trust_levels WHERE admin_id = ? AND trust_status = ?
         ALLOW FILTERING`,
 		gocql.UUID(adminID),
@@ -172,11 +207,18 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminPrimaryDevice(
 		&scannedAdminID,
 		&trust.DeviceID,
 		&trust.TrustStatus,
+		&trust.DeviceFingerprint,
+		&trust.OSVersion,
+		&trust.AppVersion,
+		&trust.LastIPAddress,
+		&trust.LastIPSubnet,
+		&trust.LastLocationHash,
+		&trust.UserAgent,
+		&trust.DeviceModel,
 		&trust.FirstSuccessfulLogin,
 		&trust.LastLogin,
-		&trust.IPAddress,
-		&trust.UserAgent,
 		&trust.IsBlocked,
+		&trust.RiskScore,
 	); err != nil {
 		if err == gocql.ErrNotFound {
 			return nil, fmt.Errorf("no admin primary device found")
@@ -188,7 +230,6 @@ func (r *AdminDeviceTrustRepositoryImpl) GetAdminPrimaryDevice(
 	return &trust, nil
 }
 
-// BlockAdminDevice marks a device as blocked for an admin
 func (r *AdminDeviceTrustRepositoryImpl) BlockAdminDevice(
 	ctx context.Context,
 	adminID uuid.UUID,
@@ -196,7 +237,7 @@ func (r *AdminDeviceTrustRepositoryImpl) BlockAdminDevice(
 ) error {
 	query := r.client.Session.Query(`
         UPDATE admin_device_trust_levels 
-        SET is_blocked = true
+        SET is_blocked = true, risk_score = 100
         WHERE admin_id = ? AND device_id = ?`,
 		gocql.UUID(adminID),
 		deviceID,
@@ -214,7 +255,82 @@ func (r *AdminDeviceTrustRepositoryImpl) BlockAdminDevice(
 	return nil
 }
 
-// RecordAdminDataDeletion logs data deletion actions for admins
+func (r *AdminDeviceTrustRepositoryImpl) UpdateAdminDeviceRiskScore(
+	ctx context.Context,
+	adminID uuid.UUID,
+	deviceID string,
+	riskScore int,
+) error {
+	query := r.client.Session.Query(`
+        UPDATE admin_device_trust_levels 
+        SET risk_score = ?
+        WHERE admin_id = ? AND device_id = ?`,
+		riskScore,
+		gocql.UUID(adminID),
+		deviceID,
+	)
+
+	if err := query.WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("failed to update admin device risk score: %w", err)
+	}
+
+	r.logger.Debug("Admin device risk score updated",
+		util.String("admin_id", adminID.String()),
+		util.String("device_id", deviceID),
+		util.Int("risk_score", riskScore),
+	)
+
+	return nil
+}
+
+func (r *AdminDeviceTrustRepositoryImpl) GetAdminDevices(
+	ctx context.Context,
+	adminID uuid.UUID,
+) ([]*models.DeviceTrustLevel, error) {
+	var devices []*models.DeviceTrustLevel
+
+	query := r.client.Session.Query(`
+        SELECT admin_id, device_id, trust_status, device_fingerprint, os_version, app_version,
+               ip_address, last_ip_subnet, last_location_hash, user_agent, device_model,
+               first_successful_login, last_login, is_blocked, risk_score
+        FROM admin_device_trust_levels WHERE admin_id = ?`,
+		gocql.UUID(adminID),
+	)
+
+	iter := query.WithContext(ctx).Iter()
+	defer iter.Close()
+
+	var trust models.DeviceTrustLevel
+	var scannedAdminID gocql.UUID
+
+	for iter.Scan(
+		&scannedAdminID,
+		&trust.DeviceID,
+		&trust.TrustStatus,
+		&trust.DeviceFingerprint,
+		&trust.OSVersion,
+		&trust.AppVersion,
+		&trust.LastIPAddress,
+		&trust.LastIPSubnet,
+		&trust.LastLocationHash,
+		&trust.UserAgent,
+		&trust.DeviceModel,
+		&trust.FirstSuccessfulLogin,
+		&trust.LastLogin,
+		&trust.IsBlocked,
+		&trust.RiskScore,
+	) {
+		trust.UserID = uuid.UUID(scannedAdminID)
+		devices = append(devices, &trust)
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to get admin devices: %w", err)
+	}
+
+	return devices, nil
+}
+
 func (r *AdminDeviceTrustRepositoryImpl) RecordAdminDataDeletion(
 	ctx context.Context,
 	deletion *models.UserDataDeletion,
@@ -244,7 +360,7 @@ func (r *AdminDeviceTrustRepositoryImpl) RecordAdminDataDeletion(
 
 	return nil
 }
-// Add this method to AdminDeviceTrustRepositoryImpl
+
 func (r *AdminDeviceTrustRepositoryImpl) HealthCheck(ctx context.Context) error {
 	var count int
 	if err := r.client.Session.Query("SELECT COUNT(*) FROM system.local").

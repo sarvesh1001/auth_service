@@ -39,3 +39,22 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS device_bindings_by_device_id AS
       AND bound_at IS NOT NULL
     PRIMARY KEY ((device_id), action_timestamp, bound_at, user_id)
     WITH CLUSTERING ORDER BY (action_timestamp DESC, bound_at DESC);
+
+
+
+
+-- =========================================================
+-- MATERIALIZED VIEWS (Only Session and OTP related)
+-- =========================================================
+CREATE MATERIALIZED VIEW IF NOT EXISTS otp_by_phone AS
+    SELECT phone_hash, purpose, time_bucket, created_at, otp_hash, attempts, expires_at
+    FROM otp_verifications
+    WHERE phone_hash IS NOT NULL AND purpose IS NOT NULL AND time_bucket IS NOT NULL AND created_at IS NOT NULL
+    PRIMARY KEY ((phone_hash), purpose, time_bucket, created_at)
+    WITH CLUSTERING ORDER BY (purpose ASC, time_bucket DESC, created_at DESC);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS sessions_by_token AS
+    SELECT user_id, session_token, device_id, expires_at
+    FROM active_sessions
+    WHERE session_token IS NOT NULL AND user_id IS NOT NULL
+    PRIMARY KEY (session_token, user_id);

@@ -18,4 +18,6 @@ type OTPVerification struct {
 	ExpiresAt     time.Time `db:"expires_at"`
 	IPAddress     net.IP    `db:"ipaddress"` // <--- PATCHED: robust to null/empty
 	ProviderUsed  string    `db:"provider_used"`
+	DeviceID      string    `db:"device_id"` // <-- NEW
+
 }
