@@ -123,19 +123,20 @@ type SessionLogEvent struct {
 	ErrorCode   string `json:"error_code,omitempty"`
 }
 
-// UserLogEvent - User operation logs
+// In models.go, update UserLogEvent struct:
 type UserLogEvent struct {
-	LogEnvelope
-	UserID      string                 `json:"user_id"`
-	Action      string                 `json:"action"`
-	PhoneNumber string                 `json:"phone_number,omitempty"`
-	Status      string                 `json:"status"`
-	DeviceID    string                 `json:"device_id,omitempty"`
-	Changes     map[string]interface{} `json:"changes,omitempty"`
-	ErrorCode   string                 `json:"error_code,omitempty"`
-	Duration    int64                  `json:"duration_ms,omitempty"`
+    LogEnvelope
+    UserID      string                 `json:"user_id"`
+    Username    string                 `json:"username,omitempty"`    // ADD THIS
+    FullName    string                 `json:"full_name,omitempty"`   // ADD THIS
+    Action      string                 `json:"action"`
+    PhoneNumber string                 `json:"phone_number,omitempty"`
+    Status      string                 `json:"status"`
+    DeviceID    string                 `json:"device_id,omitempty"`
+    Changes     map[string]interface{} `json:"changes,omitempty"`
+    ErrorCode   string                 `json:"error_code,omitempty"`
+    Duration    int64                  `json:"duration_ms,omitempty"`
 }
-
 // DeviceLogEvent - Device binding and validation logs (SIMPLIFIED - only used fields)
 type DeviceLogEvent struct {
 	LogEnvelope

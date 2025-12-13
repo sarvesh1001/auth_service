@@ -14,3 +14,4 @@ type PhoneValidator interface {
 	// NEW — User-only phone check
 	IsUserPhoneRegistered(ctx context.Context, phoneNumber string) (bool, error)
 }
+

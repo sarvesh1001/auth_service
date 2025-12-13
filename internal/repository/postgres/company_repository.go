@@ -28,17 +28,17 @@ const (
 	CompanyStmtCacheSize   = 30
 )
 
-// EmployeeRoleHierarchy represents employee role hierarchy for reporting
-type EmployeeRoleHierarchy struct {
-	EmployeeID   string    `json:"employee_id"`
-	UserID       uuid.UUID `json:"user_id"`
-	RoleName     string    `json:"role_name"`
-	RoleLevel    int       `json:"role_level"`
-	DepartmentID uuid.UUID `json:"department_id"`
-	Department   string    `json:"department"`
-	ReportsTo    uuid.UUID `json:"reports_to"`
-	IsActive     bool      `json:"is_active"`
-}
+// // EmployeeRoleHierarchy represents employee role hierarchy for reporting
+// type EmployeeRoleHierarchy struct {
+// 	EmployeeID   string    `json:"employee_id"`
+// 	UserID       uuid.UUID `json:"user_id"`
+// 	RoleName     string    `json:"role_name"`
+// 	RoleLevel    int       `json:"role_level"`
+// 	DepartmentID uuid.UUID `json:"department_id"`
+// 	Department   string    `json:"department"`
+// 	ReportsTo    uuid.UUID `json:"reports_to"`
+// 	IsActive     bool      `json:"is_active"`
+// }
 
 // CompanyRepositoryImpl handles PostgreSQL company and RBAC operations
 type CompanyRepositoryImpl struct {
@@ -1593,98 +1593,31 @@ func (r *CompanyRepositoryImpl) InitializeDefaultPermissions(ctx context.Context
 // ============================================================================
 // EMPLOYEE OPERATIONS
 // ============================================================================
-
-// CreateEmployee creates a new company employee with role and department validation
 func (r *CompanyRepositoryImpl) CreateEmployee(ctx context.Context, employee *models.CompanyEmployee) error {
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
+    query := `
+        INSERT INTO company_employees (
+            company_id, user_id, employee_id, role_id,
+            hire_date, is_active, reports_to, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
-	// 1. Check if role belongs to the department (if department is specified)
-	if employee.DepartmentID != nil {
-		var roleDeptExists bool
-		checkQuery := `SELECT COUNT(*) > 0 FROM role_departments WHERE role_id = $1 AND department_id = $2`
-		err = tx.QueryRowContext(ctx, checkQuery, employee.RoleID, *employee.DepartmentID).Scan(&roleDeptExists)
-		if err != nil {
-			return fmt.Errorf("failed to check role-department mapping: %w", err)
-		}
+    _, err := r.client.Exec(ctx, query,
+        employee.CompanyID, employee.UserID, employee.EmployeeID, employee.RoleID,
+        employee.HireDate, employee.IsActive, employee.ReportsTo,
+        employee.CreatedAt, employee.UpdatedAt,
+    )
 
-		if !roleDeptExists {
-			return fmt.Errorf("role %s is not assigned to department %s", employee.RoleID, *employee.DepartmentID)
-		}
-	}
+    if err != nil {
+        r.recordError()
+        return fmt.Errorf("failed to create employee: %w", err)
+    }
 
-	// 2. Insert employee
-	query := `
-		INSERT INTO company_employees (
-			company_id, user_id, employee_id, role_id, department_id,
-			hire_date, is_active, reports_to, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
-
-	_, err = tx.ExecContext(ctx, query,
-		employee.CompanyID, employee.UserID, employee.EmployeeID, employee.RoleID,
-		employee.DepartmentID, employee.HireDate, employee.IsActive, employee.ReportsTo,
-		employee.CreatedAt, employee.UpdatedAt,
-	)
-
-	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to create employee: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	r.recordQuery()
-	return nil
+    r.recordQuery()
+    return nil
 }
-
-// GetEmployee retrieves an employee by company and user ID
-func (r *CompanyRepositoryImpl) GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (*models.CompanyEmployee, error) {
-	query := `
-		SELECT company_id, user_id, employee_id, role_id, department_id,
-			   hire_date, is_active, reports_to, created_at, updated_at
-		FROM company_employees 
-		WHERE company_id = $1 AND user_id = $2`
-
-	var employee models.CompanyEmployee
-	var deptID, reportsTo sql.NullString
-
-	err := r.client.QueryRow(ctx, query, companyID, userID).Scan(
-		&employee.CompanyID, &employee.UserID, &employee.EmployeeID, &employee.RoleID,
-		&deptID, &employee.HireDate, &employee.IsActive, &reportsTo,
-		&employee.CreatedAt, &employee.UpdatedAt,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("employee not found")
-		}
-		r.recordError()
-		return nil, fmt.Errorf("failed to get employee: %w", err)
-	}
-
-	// Handle nullable UUIDs
-	if deptID.Valid {
-		departmentID, _ := uuid.Parse(deptID.String)
-		employee.DepartmentID = &departmentID
-	}
-	if reportsTo.Valid {
-		reportsToID, _ := uuid.Parse(reportsTo.String)
-		employee.ReportsTo = &reportsToID
-	}
-
-	r.recordQuery()
-	return &employee, nil
-}
-
 // GetEmployeesByUser retrieves all company employees for a user
 func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error) {
 	query := `
-        SELECT company_id, employee_id, role_id, department_id,
+        SELECT company_id, employee_id, role_id,
                hire_date, is_active, reports_to, created_at, updated_at
         FROM company_employees 
         WHERE user_id = $1 AND is_active = true
@@ -1703,14 +1636,12 @@ func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID u
 		var employee models.CompanyEmployee
 
 		// pgx v4 UUID type
-		var deptID pgtype.UUID
 		var reportsTo pgtype.UUID
 
 		err := rows.Scan(
 			&employee.CompanyID,
 			&employee.EmployeeID,
 			&employee.RoleID,
-			&deptID,
 			&employee.HireDate,
 			&employee.IsActive,
 			&reportsTo,
@@ -1723,12 +1654,6 @@ func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID u
 		}
 
 		employee.UserID = userID
-
-		// Convert department_id if present
-		if deptID.Status == pgtype.Present {
-			u, _ := uuid.FromBytes(deptID.Bytes[:])
-			employee.DepartmentID = &u
-		}
 
 		// Convert reports_to if present
 		if reportsTo.Status == pgtype.Present {
@@ -1751,72 +1676,50 @@ func (r *CompanyRepositoryImpl) GetEmployeesByUser(ctx context.Context, userID u
 	return employees, nil
 }
 
-// UpdateEmployee updates employee information
 func (r *CompanyRepositoryImpl) UpdateEmployee(ctx context.Context, employee *models.CompanyEmployee) error {
-	employee.UpdatedAt = time.Now().UTC()
+    employee.UpdatedAt = time.Now().UTC()
 
-	query := `
-		UPDATE company_employees SET 
-			employee_id = $1, role_id = $2, department_id = $3,
-			is_active = $4, reports_to = $5, updated_at = $6
-		WHERE company_id = $7 AND user_id = $8`
+    query := `
+        UPDATE company_employees SET
+            employee_id = $1, role_id = $2,
+            is_active = $3, reports_to = $4, updated_at = $5
+        WHERE company_id = $6 AND user_id = $7`
 
-	result, err := r.client.Exec(ctx, query,
-		employee.EmployeeID, employee.RoleID, employee.DepartmentID,
-		employee.IsActive, employee.ReportsTo, employee.UpdatedAt,
-		employee.CompanyID, employee.UserID,
-	)
+    result, err := r.client.Exec(ctx, query,
+        employee.EmployeeID, employee.RoleID,
+        employee.IsActive, employee.ReportsTo, employee.UpdatedAt,
+        employee.CompanyID, employee.UserID,
+    )
 
-	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to update employee: %w", err)
-	}
+    if err != nil {
+        r.recordError()
+        return fmt.Errorf("failed to update employee: %w", err)
+    }
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("employee not found")
-	}
+    rowsAffected, _ := result.RowsAffected()
+    if rowsAffected == 0 {
+        return fmt.Errorf("employee not found")
+    }
 
-	r.recordQuery()
-	return nil
+    r.recordQuery()
+    return nil
 }
-
-// UpdateEmployeeRole updates an employee's role
 func (r *CompanyRepositoryImpl) UpdateEmployeeRole(ctx context.Context, companyID, userID, roleID uuid.UUID) error {
-	query := `UPDATE company_employees SET role_id = $1, updated_at = $2 WHERE company_id = $3 AND user_id = $4`
+    query := `UPDATE company_employees SET role_id = $1, updated_at = $2 WHERE company_id = $3 AND user_id = $4`
 
-	result, err := r.client.Exec(ctx, query, roleID, time.Now().UTC(), companyID, userID)
-	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to update employee role: %w", err)
-	}
+    result, err := r.client.Exec(ctx, query, roleID, time.Now().UTC(), companyID, userID)
+    if err != nil {
+        r.recordError()
+        return fmt.Errorf("failed to update employee role: %w", err)
+    }
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("employee not found")
-	}
+    rowsAffected, _ := result.RowsAffected()
+    if rowsAffected == 0 {
+        return fmt.Errorf("employee not found")
+    }
 
-	r.recordQuery()
-	return nil
-}
-
-// UpdateEmployeeDepartment updates an employee's department
-func (r *CompanyRepositoryImpl) UpdateEmployeeDepartment(ctx context.Context, companyID, userID, departmentID uuid.UUID) error {
-	query := `UPDATE company_employees SET department_id = $1, updated_at = $2 WHERE company_id = $3 AND user_id = $4`
-
-	result, err := r.client.Exec(ctx, query, departmentID, time.Now().UTC(), companyID, userID)
-	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to update employee department: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("employee not found")
-	}
-
-	r.recordQuery()
-	return nil
+    r.recordQuery()
+    return nil
 }
 
 // DeactivateEmployee deactivates an employee
@@ -1887,291 +1790,72 @@ func (r *CompanyRepositoryImpl) GetActiveEmployeeCount(ctx context.Context, comp
 	return count, nil
 }
 
-// GetEmployeesByCompany retrieves employees for a company with pagination
-func (r *CompanyRepositoryImpl) GetEmployeesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
 
-	// Get total count
-	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM company_employees WHERE company_id = $1`
-	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to count employees: %w", err)
-	}
 
-	// Get paginated results
-	query := `
-		SELECT user_id, employee_id, role_id, department_id,
-			   hire_date, is_active, reports_to, created_at, updated_at
-		FROM company_employees 
-		WHERE company_id = $1
-		ORDER BY hire_date DESC 
-		LIMIT $2 OFFSET $3`
-
-	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to query employees: %w", err)
-	}
-	defer rows.Close()
-
-	employees := make([]*models.CompanyEmployee, 0, limit)
-	for rows.Next() {
-		var employee models.CompanyEmployee
-		var deptID, reportsTo sql.NullString
-
-		err := rows.Scan(
-			&employee.UserID, &employee.EmployeeID, &employee.RoleID,
-			&deptID, &employee.HireDate, &employee.IsActive, &reportsTo,
-			&employee.CreatedAt, &employee.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
-
-		employee.CompanyID = companyID
-
-		// Handle nullable UUIDs
-		if deptID.Valid {
-			departmentID, _ := uuid.Parse(deptID.String)
-			employee.DepartmentID = &departmentID
-		}
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			employee.ReportsTo = &reportsToID
-		}
-
-		employees = append(employees, &employee)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
-	}
-
-	r.recordQuery()
-	return employees, totalCount, nil
-}
-
-// GetEmployeesByDepartment retrieves employees by department
-func (r *CompanyRepositoryImpl) GetEmployeesByDepartment(ctx context.Context, departmentID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	// Get total count
-	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM company_employees WHERE department_id = $1 AND is_active = true`
-	err := r.client.QueryRow(ctx, countQuery, departmentID).Scan(&totalCount)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to count department employees: %w", err)
-	}
-
-	// Get paginated results
-	query := `
-		SELECT company_id, user_id, employee_id, role_id,
-			   hire_date, is_active, reports_to, created_at, updated_at
-		FROM company_employees 
-		WHERE department_id = $1 AND is_active = true
-		ORDER BY hire_date DESC 
-		LIMIT $2 OFFSET $3`
-
-	rows, err := r.client.Query(ctx, query, departmentID, limit, offset)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to query department employees: %w", err)
-	}
-	defer rows.Close()
-
-	employees := make([]*models.CompanyEmployee, 0, limit)
-	for rows.Next() {
-		var employee models.CompanyEmployee
-		var reportsTo sql.NullString
-
-		err := rows.Scan(
-			&employee.CompanyID, &employee.UserID, &employee.EmployeeID, &employee.RoleID,
-			&employee.HireDate, &employee.IsActive, &reportsTo,
-			&employee.CreatedAt, &employee.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
-
-		employee.DepartmentID = &departmentID
-
-		// Handle nullable UUIDs
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			employee.ReportsTo = &reportsToID
-		}
-
-		employees = append(employees, &employee)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
-	}
-
-	r.recordQuery()
-	return employees, totalCount, nil
-}
-
-// GetEmployeesByRole retrieves employees by role
-func (r *CompanyRepositoryImpl) GetEmployeesByRole(ctx context.Context, roleID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	// Get total count
-	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM company_employees WHERE role_id = $1 AND is_active = true`
-	err := r.client.QueryRow(ctx, countQuery, roleID).Scan(&totalCount)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to count role employees: %w", err)
-	}
-
-	// Get paginated results
-	query := `
-		SELECT company_id, user_id, employee_id, department_id,
-			   hire_date, is_active, reports_to, created_at, updated_at
-		FROM company_employees 
-		WHERE role_id = $1 AND is_active = true
-		ORDER BY hire_date DESC 
-		LIMIT $2 OFFSET $3`
-
-	rows, err := r.client.Query(ctx, query, roleID, limit, offset)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to query role employees: %w", err)
-	}
-	defer rows.Close()
-
-	employees := make([]*models.CompanyEmployee, 0, limit)
-	for rows.Next() {
-		var employee models.CompanyEmployee
-		var deptID, reportsTo sql.NullString
-
-		err := rows.Scan(
-			&employee.CompanyID, &employee.UserID, &employee.EmployeeID,
-			&deptID, &employee.HireDate, &employee.IsActive, &reportsTo,
-			&employee.CreatedAt, &employee.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
-
-		employee.RoleID = roleID
-
-		// Handle nullable UUIDs
-		if deptID.Valid {
-			departmentID, _ := uuid.Parse(deptID.String)
-			employee.DepartmentID = &departmentID
-		}
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			employee.ReportsTo = &reportsToID
-		}
-
-		employees = append(employees, &employee)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
-	}
-
-	r.recordQuery()
-	return employees, totalCount, nil
-}
-
-// ListActiveEmployees lists only active employees
 func (r *CompanyRepositoryImpl) ListActiveEmployees(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
+    if limit <= 0 || limit > DefaultCompanyPageSize {
+        limit = DefaultCompanyPageSize
+    }
+    if offset < 0 {
+        offset = 0
+    }
 
-	// Get total count
-	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM company_employees WHERE company_id = $1 AND is_active = true`
-	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to count active employees: %w", err)
-	}
+    var totalCount int
+    countQuery := `SELECT COUNT(*) FROM company_employees WHERE company_id = $1 AND is_active = true`
+    err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to count active employees: %w", err)
+    }
 
-	// Get paginated results
-	query := `
-        SELECT user_id, employee_id, role_id, department_id,
+    query := `
+        SELECT user_id, employee_id, role_id,
                hire_date, reports_to, created_at, updated_at
-        FROM company_employees 
+        FROM company_employees
         WHERE company_id = $1 AND is_active = true
-        ORDER BY hire_date DESC 
+        ORDER BY hire_date DESC
         LIMIT $2 OFFSET $3`
 
-	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to query active employees: %w", err)
-	}
-	defer rows.Close()
+    rows, err := r.client.Query(ctx, query, companyID, limit, offset)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to query active employees: %w", err)
+    }
+    defer rows.Close()
 
-	employees := make([]*models.CompanyEmployee, 0, limit)
-	for rows.Next() {
-		var employee models.CompanyEmployee
-		var deptID, reportsTo sql.NullString
+    employees := make([]*models.CompanyEmployee, 0, limit)
+    for rows.Next() {
+        var employee models.CompanyEmployee
+        var reportsTo sql.NullString
 
-		err := rows.Scan(
-			&employee.UserID, &employee.EmployeeID, &employee.RoleID,
-			&deptID, &employee.HireDate, &reportsTo,
-			&employee.CreatedAt, &employee.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
+        err := rows.Scan(
+            &employee.UserID, &employee.EmployeeID, &employee.RoleID,
+            &employee.HireDate, &reportsTo,
+            &employee.CreatedAt, &employee.UpdatedAt,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
+            continue
+        }
 
-		employee.CompanyID = companyID
-		employee.IsActive = true
+        employee.CompanyID = companyID
+        employee.IsActive = true
 
-		// Handle nullable UUIDs
-		if deptID.Valid {
-			departmentID, _ := uuid.Parse(deptID.String)
-			employee.DepartmentID = &departmentID
-		}
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			employee.ReportsTo = &reportsToID
-		}
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            employee.ReportsTo = &reportsToID
+        }
 
-		employees = append(employees, &employee)
-	}
+        employees = append(employees, &employee)
+    }
 
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
-	}
+    if err := rows.Err(); err != nil {
+        return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
+    }
 
-	r.recordQuery()
-	return employees, totalCount, nil
+    r.recordQuery()
+    return employees, totalCount, nil
 }
-
 // IsUserActiveEmployee checks if a user is an active employee
 func (r *CompanyRepositoryImpl) IsUserActiveEmployee(ctx context.Context, companyID, userID uuid.UUID) (bool, error) {
 	query := `SELECT COUNT(*) > 0 FROM company_employees WHERE company_id = $1 AND user_id = $2 AND is_active = true`
@@ -2187,63 +1871,6 @@ func (r *CompanyRepositoryImpl) IsUserActiveEmployee(ctx context.Context, compan
 	return isActive, nil
 }
 
-// GetUsersByRoleLevel retrieves users by role level range
-func (r *CompanyRepositoryImpl) GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error) {
-	query := `
-        SELECT ce.user_id, ce.employee_id, ce.role_id, ce.department_id,
-               ce.hire_date, ce.is_active, ce.reports_to, r.role_name, r.role_level
-        FROM company_employees ce
-        INNER JOIN roles r ON ce.role_id = r.role_id
-        WHERE ce.company_id = $1 AND ce.is_active = true 
-          AND r.role_level BETWEEN $2 AND $3
-        ORDER BY r.role_level DESC, ce.hire_date ASC`
-
-	rows, err := r.client.Query(ctx, query, companyID, minLevel, maxLevel)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query users by role level: %w", err)
-	}
-	defer rows.Close()
-
-	var employees []*models.CompanyEmployee
-	for rows.Next() {
-		var employee models.CompanyEmployee
-		var deptID, reportsTo sql.NullString
-		var roleName string
-		var roleLevel int
-
-		err := rows.Scan(
-			&employee.UserID, &employee.EmployeeID, &employee.RoleID,
-			&deptID, &employee.HireDate, &employee.IsActive, &reportsTo,
-			&roleName, &roleLevel,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
-
-		employee.CompanyID = companyID
-
-		// Handle nullable UUIDs
-		if deptID.Valid {
-			departmentID, _ := uuid.Parse(deptID.String)
-			employee.DepartmentID = &departmentID
-		}
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			employee.ReportsTo = &reportsToID
-		}
-
-		employees = append(employees, &employee)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating employee rows: %w", err)
-	}
-
-	r.recordQuery()
-	return employees, nil
-}
 
 // GetEmployeeHierarchy retrieves employee hierarchy for a company
 func (r *CompanyRepositoryImpl) GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
@@ -2508,48 +2135,42 @@ func (r *CompanyRepositoryImpl) GetUserPermissionNames(ctx context.Context, user
 	r.recordQuery()
 	return permissionNames, nil
 }
-
-// CheckUserPermission checks if a user has a specific permission with module validation
 func (r *CompanyRepositoryImpl) CheckUserPermission(ctx context.Context, companyID, userID uuid.UUID, permissionName string) (bool, error) {
-	// First check if user is company owner
-	var ownerUserID uuid.UUID
-	ownerQuery := `SELECT owner_user_id FROM companies WHERE company_id = $1`
-	err := r.client.QueryRow(ctx, ownerQuery, companyID).Scan(&ownerUserID)
-	if err != nil {
-		r.recordError()
-		return false, fmt.Errorf("failed to get company owner: %w", err)
-	}
+    var ownerUserID uuid.UUID
+    ownerQuery := `SELECT owner_user_id FROM companies WHERE company_id = $1`
+    err := r.client.QueryRow(ctx, ownerQuery, companyID).Scan(&ownerUserID)
+    if err != nil {
+        r.recordError()
+        return false, fmt.Errorf("failed to get company owner: %w", err)
+    }
 
-	// Owner has all permissions
-	if ownerUserID == userID {
-		return true, nil
-	}
+    if ownerUserID == userID {
+        return true, nil
+    }
 
-	// For non-owner, check the full permission flow
-	query := `
-		SELECT COUNT(*) > 0
-		FROM company_employees ce
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		INNER JOIN role_departments rd ON r.role_id = rd.role_id AND ce.department_id = rd.department_id
-		INNER JOIN departments d ON ce.department_id = d.department_id
-		INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
-		INNER JOIN role_permissions rp ON r.role_id = rp.role_id
-		INNER JOIN permissions p ON rp.permission_id = p.permission_id
-		WHERE ce.company_id = $1 AND ce.user_id = $2 
-		  AND ce.is_active = true AND p.permission_name = $3
-		  AND p.module = sd.module_code` // Critical: module must match
+    query := `
+        SELECT COUNT(*) > 0
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        INNER JOIN role_departments rd ON r.role_id = rd.role_id
+        INNER JOIN departments d ON rd.department_id = d.department_id
+        INNER JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+        INNER JOIN role_permissions rp ON r.role_id = rp.role_id
+        INNER JOIN permissions p ON rp.permission_id = p.permission_id
+        WHERE ce.company_id = $1 AND ce.user_id = $2
+          AND ce.is_active = true AND p.permission_name = $3
+          AND p.module = sd.module_code`
 
-	var hasPermission bool
-	err = r.client.QueryRow(ctx, query, companyID, userID, permissionName).Scan(&hasPermission)
-	if err != nil {
-		r.recordError()
-		return false, fmt.Errorf("failed to check user permission: %w", err)
-	}
+    var hasPermission bool
+    err = r.client.QueryRow(ctx, query, companyID, userID, permissionName).Scan(&hasPermission)
+    if err != nil {
+        r.recordError()
+        return false, fmt.Errorf("failed to check user permission: %w", err)
+    }
 
-	r.recordQuery()
-	return hasPermission, nil
+    r.recordQuery()
+    return hasPermission, nil
 }
-
 // CheckUserPermissionDetailed performs comprehensive permission check with all validations
 func (r *CompanyRepositoryImpl) CheckUserPermissionDetailed(ctx context.Context, companyID, userID uuid.UUID, permissionName string) (*models.PermissionCheckResult, error) {
 	result := &models.PermissionCheckResult{
@@ -2647,67 +2268,6 @@ func (r *CompanyRepositoryImpl) CheckUserPermissionDetailed(ctx context.Context,
 
 	result.HasPermission = permissionExists && roleDeptExists && moduleMatch
 	return result, nil
-}
-
-// GetUsersWithPermission retrieves users with a specific permission
-func (r *CompanyRepositoryImpl) GetUsersWithPermission(ctx context.Context, companyID uuid.UUID, permissionName string, limit int) ([]*models.CompanyEmployee, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-
-	query := `
-		SELECT ce.user_id, ce.employee_id, ce.role_id, ce.department_id,
-			   ce.hire_date, ce.is_active, ce.reports_to
-		FROM company_employees ce
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		INNER JOIN role_permissions rp ON r.role_id = rp.role_id
-		INNER JOIN permissions p ON rp.permission_id = p.permission_id
-		WHERE ce.company_id = $1 AND ce.is_active = true 
-		  AND p.permission_name = $2
-		LIMIT $3`
-
-	rows, err := r.client.Query(ctx, query, companyID, permissionName, limit)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query users with permission: %w", err)
-	}
-	defer rows.Close()
-
-	var employees []*models.CompanyEmployee
-	for rows.Next() {
-		var employee models.CompanyEmployee
-		var deptID, reportsTo sql.NullString
-
-		err := rows.Scan(
-			&employee.UserID, &employee.EmployeeID, &employee.RoleID,
-			&deptID, &employee.HireDate, &employee.IsActive, &reportsTo,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
-			continue
-		}
-
-		employee.CompanyID = companyID
-
-		// Handle nullable UUIDs
-		if deptID.Valid {
-			departmentID, _ := uuid.Parse(deptID.String)
-			employee.DepartmentID = &departmentID
-		}
-		if reportsTo.Valid {
-			reportsToID, _ := uuid.Parse(reportsTo.String)
-			employee.ReportsTo = &reportsToID
-		}
-
-		employees = append(employees, &employee)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating employee rows: %w", err)
-	}
-
-	r.recordQuery()
-	return employees, nil
 }
 
 // ============================================================================
@@ -3107,61 +2667,70 @@ func (r *CompanyRepositoryImpl) GetCompanyStats(ctx context.Context, companyID u
 	r.recordQuery()
 	return stats, nil
 }
-
 // GetEmployeeRoleHierarchy retrieves employee role hierarchy
-func (r *CompanyRepositoryImpl) GetEmployeeRoleHierarchy(ctx context.Context, companyID uuid.UUID) ([]*EmployeeRoleHierarchy, error) {
-	query := `
-		SELECT ce.employee_id, ce.user_id, r.role_name, r.role_level,
-			   d.department_id, d.department_name, ce.reports_to, ce.is_active
-		FROM company_employees ce
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		LEFT JOIN departments d ON ce.department_id = d.department_id
-		WHERE ce.company_id = $1 AND ce.is_active = true
-		ORDER BY r.role_level ASC, d.department_name, ce.employee_id`
+func (r *CompanyRepositoryImpl) GetEmployeeRoleHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
+    query := `
+        SELECT 
+            ce.company_id, ce.user_id, ce.employee_id, 
+            r.role_name, r.role_level,
+            d.department_id, d.department_name, 
+            ce.reports_to, ce.is_active
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        LEFT JOIN departments d ON ce.department_id = d.department_id
+        WHERE ce.company_id = $1 AND ce.is_active = true
+        ORDER BY r.role_level ASC, d.department_name, ce.employee_id`
 
-	rows, err := r.client.Query(ctx, query, companyID)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query employee hierarchy: %w", err)
-	}
-	defer rows.Close()
+    rows, err := r.client.Query(ctx, query, companyID)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to query employee hierarchy: %w", err)
+    }
+    defer rows.Close()
 
-	var hierarchy []*EmployeeRoleHierarchy
-	for rows.Next() {
-		var item EmployeeRoleHierarchy
-		var deptID, deptName, reportsTo sql.NullString
+    var hierarchy []*models.EmployeeHierarchy
+    for rows.Next() {
+        var item models.EmployeeHierarchy
+        var deptID, deptName, reportsTo sql.NullString
 
-		err := rows.Scan(
-			&item.EmployeeID, &item.UserID, &item.RoleName, &item.RoleLevel,
-			&deptID, &deptName, &reportsTo, &item.IsActive,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan hierarchy row", util.ErrorField(err))
-			continue
-		}
+        err := rows.Scan(
+            &item.CompanyID, &item.UserID, &item.EmployeeID,
+            &item.RoleName, &item.RoleLevel,
+            &deptID, &deptName, &reportsTo,
+            &item.IsActive,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan hierarchy row", util.ErrorField(err))
+            continue
+        }
 
-		// Handle nullable fields
-		if deptID.Valid {
-			item.DepartmentID, _ = uuid.Parse(deptID.String)
-		}
-		if deptName.Valid {
-			item.Department = deptName.String
-		}
-		if reportsTo.Valid {
-			item.ReportsTo, _ = uuid.Parse(reportsTo.String)
-		}
+        // Handle nullable fields
+        if deptID.Valid {
+            departmentID, _ := uuid.Parse(deptID.String)
+            item.DepartmentID = &departmentID
+        }
+        if deptName.Valid {
+            item.Department = deptName.String
+        }
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            item.ReportsTo = &reportsToID
+        }
 
-		hierarchy = append(hierarchy, &item)
-	}
+        hierarchy = append(hierarchy, &item)
+    }
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating hierarchy rows: %w", err)
-	}
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("error iterating hierarchy rows: %w", err)
+    }
 
-	r.recordQuery()
-	return hierarchy, nil
+    r.recordQuery()
+    r.logger.Debug("Employee role hierarchy retrieved",
+        util.String("company_id", companyID.String()),
+        util.Int("employee_count", len(hierarchy)))
+    
+    return hierarchy, nil
 }
-
 // GetRoleDistribution gets employee count per role
 func (r *CompanyRepositoryImpl) GetRoleDistribution(ctx context.Context, companyID uuid.UUID) (map[string]int, error) {
 	query := `
@@ -3789,224 +3358,222 @@ func (r *CompanyRepositoryImpl) GetUserPermissions(ctx context.Context, companyI
 
 // 	return rbac.BuildMaskFromBitPositions(bitPositions), nil
 // }
-
 // CreateCompany creates a new company with full RBAC setup
 func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *models.Company, additionalDepartments []string) error {
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
+    tx, err := r.client.BeginTx(ctx, nil)
+    if err != nil {
+        return fmt.Errorf("failed to begin transaction: %w", err)
+    }
+    defer tx.Rollback()
 
-	// 1. Insert company
-	companyQuery := `
+    // 1. Insert company
+    companyQuery := `
         INSERT INTO companies (
             company_id, company_name, owner_user_id, subscription_tier, 
             subscription_status, max_employees, data_region, is_active,
             created_at, updated_at, subscription_start_date, subscription_end_date
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
 
-	_, err = tx.ExecContext(ctx, companyQuery,
-		company.CompanyID, company.CompanyName, company.OwnerUserID, company.SubscriptionTier,
-		company.SubscriptionStatus, company.MaxEmployees, company.DataRegion, company.IsActive,
-		company.CreatedAt, company.UpdatedAt, company.SubscriptionStartDate, company.SubscriptionEndDate,
-	)
-	if err != nil {
-		r.recordError()
-		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
-			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
-		}
-		return fmt.Errorf("failed to create company: %w", err)
-	}
+    _, err = tx.ExecContext(ctx, companyQuery,
+        company.CompanyID, company.CompanyName, company.OwnerUserID, company.SubscriptionTier,
+        company.SubscriptionStatus, company.MaxEmployees, company.DataRegion, company.IsActive,
+        company.CreatedAt, company.UpdatedAt, company.SubscriptionStartDate, company.SubscriptionEndDate,
+    )
+    if err != nil {
+        r.recordError()
+        if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
+            return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
+        }
+        return fmt.Errorf("failed to create company: %w", err)
+    }
 
-	// 2. Create OWNER role for this company
-	ownerRoleID := uuid.New()
-	ownerRoleQuery := `
+    // 2. Create OWNER role for this company
+    ownerRoleID := uuid.New()
+    ownerRoleQuery := `
         INSERT INTO roles (
             role_id, role_name, role_level, company_id, is_system_role,
             description, created_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
-	_, err = tx.ExecContext(ctx, ownerRoleQuery,
-		ownerRoleID, "Owner", 1000, company.CompanyID, true,
-		"Company owner with full permissions", company.CreatedAt, company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create owner role: %w", err)
-	}
+    _, err = tx.ExecContext(ctx, ownerRoleQuery,
+        ownerRoleID, "Owner", 1000, company.CompanyID, true,
+        "Company owner with full permissions", company.CreatedAt, company.UpdatedAt,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to create owner role: %w", err)
+    }
 
-	// 3. Get system departments first
-	systemDepts, err := r.GetSystemDepartments(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get system departments: %w", err)
-	}
+    // 3. Get system departments first
+    systemDepts, err := r.GetSystemDepartments(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to get system departments: %w", err)
+    }
 
-	// Map department names to system departments
-	systemDeptMap := make(map[string]uuid.UUID)
-	for _, dept := range systemDepts {
-		systemDeptMap[strings.ToLower(dept.ModuleCode)] = dept.SystemDepartmentID
-	}
+    // Map department names to system departments
+    systemDeptMap := make(map[string]uuid.UUID)
+    for _, dept := range systemDepts {
+        systemDeptMap[strings.ToLower(dept.ModuleCode)] = dept.SystemDepartmentID
+    }
 
-	// 4. Create Default Department: ADMINISTRATION with system department
-	adminDeptID := uuid.New()
-	adminDeptQuery := `
+    // 4. Create Default Department: ADMINISTRATION with system department
+    adminDeptID := uuid.New()
+    adminDeptQuery := `
         INSERT INTO departments (
             department_id, company_id, department_name, system_department_id,
             is_active, created_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
-	// Get the Administration system department
-	adminSystemDeptID, ok := systemDeptMap["administration"]
-	if !ok {
-		return fmt.Errorf("administration system department not found")
-	}
+    // Get the Administration system department
+    adminSystemDeptID, ok := systemDeptMap["administration"]
+    if !ok {
+        return fmt.Errorf("administration system department not found")
+    }
 
-	_, err = tx.ExecContext(ctx, adminDeptQuery,
-		adminDeptID, company.CompanyID, "Administration", adminSystemDeptID,
-		true, company.CreatedAt, company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create administration department: %w", err)
-	}
+    _, err = tx.ExecContext(ctx, adminDeptQuery,
+        adminDeptID, company.CompanyID, "Administration", adminSystemDeptID,
+        true, company.CreatedAt, company.UpdatedAt,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to create administration department: %w", err)
+    }
 
-	// 5. Create Additional Department Rows from user input
-	// Store created department IDs and their modules
-	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}   // Owner always has access to Administration
-	ownerAccessModules := []string{"administration"} // Owner always has administration module
+    // 5. Create Additional Department Rows from user input
+    // Store created department IDs and their modules
+    ownerAccessDeptIDs := []uuid.UUID{adminDeptID}   // Owner always has access to Administration
+    ownerAccessModules := []string{"administration"} // Owner always has administration module
 
-	for _, deptName := range additionalDepartments {
-		deptID := uuid.New()
-		var systemDeptID uuid.UUID
-		var moduleCode string
+    for _, deptName := range additionalDepartments {
+        deptID := uuid.New()
+        var systemDeptID uuid.UUID
+        var moduleCode string
 
-		// Map department name to system module
-		switch strings.ToLower(deptName) {
-		case "hr", "human resources":
-			systemDeptID = systemDeptMap["hr"]
-			moduleCode = "hr"
-		case "inventory", "warehouse":
-			systemDeptID = systemDeptMap["inventory"]
-			moduleCode = "inventory"
-		case "sales":
-			systemDeptID = systemDeptMap["sales"]
-			moduleCode = "sales"
-		case "production", "manufacturing":
-			systemDeptID = systemDeptMap["production"]
-			moduleCode = "production"
-		case "finance", "accounting":
-			systemDeptID = systemDeptMap["finance"]
-			moduleCode = "finance"
-		case "logistics", "shipping":
-			systemDeptID = systemDeptMap["logistics"]
-			moduleCode = "logistics"
-		case "it", "technology":
-			systemDeptID = systemDeptMap["it"]
-			moduleCode = "it"
-		case "customer support", "support":
-			systemDeptID = systemDeptMap["support"]
-			moduleCode = "support"
-		case "quality control", "qc":
-			systemDeptID = systemDeptMap["qc"]
-			moduleCode = "qc"
-		case "quality assurance", "qa":
-			systemDeptID = systemDeptMap["qa"]
-			moduleCode = "qa"
-		case "research", "r&d":
-			systemDeptID = systemDeptMap["rnd"]
-			moduleCode = "rnd"
-		case "operations":
-			systemDeptID = systemDeptMap["operations"]
-			moduleCode = "operations"
-		case "marketing":
-			systemDeptID = systemDeptMap["marketing"]
-			moduleCode = "marketing"
-		case "procurement", "purchasing":
-			systemDeptID = systemDeptMap["procurement"]
-			moduleCode = "procurement"
-		default:
-			// Use operations as default for unknown departments
-			systemDeptID = systemDeptMap["operations"]
-			moduleCode = "operations"
-		}
+        // Map department name to system module
+        switch strings.ToLower(deptName) {
+        case "hr", "human resources":
+            systemDeptID = systemDeptMap["hr"]
+            moduleCode = "hr"
+        case "inventory", "warehouse":
+            systemDeptID = systemDeptMap["inventory"]
+            moduleCode = "inventory"
+        case "sales":
+            systemDeptID = systemDeptMap["sales"]
+            moduleCode = "sales"
+        case "production", "manufacturing":
+            systemDeptID = systemDeptMap["production"]
+            moduleCode = "production"
+        case "finance", "accounting":
+            systemDeptID = systemDeptMap["finance"]
+            moduleCode = "finance"
+        case "logistics", "shipping":
+            systemDeptID = systemDeptMap["logistics"]
+            moduleCode = "logistics"
+        case "it", "technology":
+            systemDeptID = systemDeptMap["it"]
+            moduleCode = "it"
+        case "customer support", "support":
+            systemDeptID = systemDeptMap["support"]
+            moduleCode = "support"
+        case "quality control", "qc":
+            systemDeptID = systemDeptMap["qc"]
+            moduleCode = "qc"
+        case "quality assurance", "qa":
+            systemDeptID = systemDeptMap["qa"]
+            moduleCode = "qa"
+        case "research", "r&d":
+            systemDeptID = systemDeptMap["rnd"]
+            moduleCode = "rnd"
+        case "operations":
+            systemDeptID = systemDeptMap["operations"]
+            moduleCode = "operations"
+        case "marketing":
+            systemDeptID = systemDeptMap["marketing"]
+            moduleCode = "marketing"
+        case "procurement", "purchasing":
+            systemDeptID = systemDeptMap["procurement"]
+            moduleCode = "procurement"
+        default:
+            // Use operations as default for unknown departments
+            systemDeptID = systemDeptMap["operations"]
+            moduleCode = "operations"
+        }
 
-		deptQuery := `
+        deptQuery := `
             INSERT INTO departments (
                 department_id, company_id, department_name, system_department_id,
                 is_active, created_at, updated_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
-		_, err = tx.ExecContext(ctx, deptQuery,
-			deptID, company.CompanyID, deptName, systemDeptID,
-			true, company.CreatedAt, company.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to create department",
-				util.String("department", deptName),
-				util.ErrorField(err))
-			continue // Continue with other departments even if one fails
-		}
+        _, err = tx.ExecContext(ctx, deptQuery,
+            deptID, company.CompanyID, deptName, systemDeptID,
+            true, company.CreatedAt, company.UpdatedAt,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to create department",
+                util.String("department", deptName),
+                util.ErrorField(err))
+            continue // Continue with other departments even if one fails
+        }
 
-		// Add this department to owner's accessible departments and modules
-		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
-		ownerAccessModules = append(ownerAccessModules, moduleCode)
-	}
+        // Add this department to owner's accessible departments and modules
+        ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
+        ownerAccessModules = append(ownerAccessModules, moduleCode)
+    }
 
-	// 6. Assign ONLY the specified departments to the Owner role
-	roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
-	for _, deptID := range ownerAccessDeptIDs {
-		_, err = tx.ExecContext(ctx, roleDeptQuery, ownerRoleID, deptID)
-		if err != nil {
-			r.logger.Warn("Failed to assign department to owner role",
-				util.String("department_id", deptID.String()),
-				util.ErrorField(err))
-			// Continue even if some assignments fail
-		}
-	}
+    // 6. Assign ONLY the specified departments to the Owner role via role_departments
+    roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
+    for _, deptID := range ownerAccessDeptIDs {
+        _, err = tx.ExecContext(ctx, roleDeptQuery, ownerRoleID, deptID)
+        if err != nil {
+            r.logger.Warn("Failed to assign department to owner role via role_departments",
+                util.String("department_id", deptID.String()),
+                util.ErrorField(err))
+            // Continue even if some assignments fail
+        }
+    }
 
-	// 7. Grant permissions ONLY for the modules that the owner has access to
-	// This ensures owner only gets permissions for their assigned departments' modules
-	grantPermissionsQuery := `
+    // 7. Grant permissions ONLY for the modules that the owner has access to
+    // This ensures owner only gets permissions for their assigned departments' modules
+    grantPermissionsQuery := `
         INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
         SELECT $1, p.permission_id, $2, $3 
         FROM permissions p
         WHERE p.module = ANY($4)`
 
-	_, err = tx.ExecContext(ctx, grantPermissionsQuery,
-		ownerRoleID, company.OwnerUserID, company.CreatedAt, pq.Array(ownerAccessModules))
-	if err != nil {
-		return fmt.Errorf("failed to grant permissions to owner role: %w", err)
-	}
+    _, err = tx.ExecContext(ctx, grantPermissionsQuery,
+        ownerRoleID, company.OwnerUserID, company.CreatedAt, pq.Array(ownerAccessModules))
+    if err != nil {
+        return fmt.Errorf("failed to grant permissions to owner role: %w", err)
+    }
 
-	// 8. Insert the Owner as Employee with Administration department
-	employeeQuery := `
+    // 8. Insert the Owner as Employee (NO department_id - department comes from role_departments)
+    employeeQuery := `
         INSERT INTO company_employees (
-            company_id, user_id, employee_id, role_id, department_id,
+            company_id, user_id, employee_id, role_id,
             hire_date, is_active, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
-	_, err = tx.ExecContext(ctx, employeeQuery,
-		company.CompanyID, company.OwnerUserID, "OWNER-"+company.CompanyID.String()[:8], ownerRoleID, adminDeptID,
-		company.CreatedAt, true, company.CreatedAt, company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to add owner as employee: %w", err)
-	}
+    _, err = tx.ExecContext(ctx, employeeQuery,
+        company.CompanyID, company.OwnerUserID, "OWNER-"+company.CompanyID.String()[:8], ownerRoleID,
+        company.CreatedAt, true, company.CreatedAt, company.UpdatedAt,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to add owner as employee: %w", err)
+    }
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf("failed to commit transaction: %w", err)
+    }
 
-	r.recordQuery()
-	r.logger.Info("Company created successfully with restricted RBAC setup",
-		util.String("company_id", company.CompanyID.String()),
-		util.String("company_name", company.CompanyName),
-		util.Int("owner_department_count", len(ownerAccessDeptIDs)),
-		util.Int("owner_module_count", len(ownerAccessModules)),
-		util.Strings("owner_modules", ownerAccessModules))
+    r.recordQuery()
+    r.logger.Info("Company created successfully with RBAC setup",
+        util.String("company_id", company.CompanyID.String()),
+        util.String("company_name", company.CompanyName),
+        util.Int("owner_department_count", len(ownerAccessDeptIDs)),
+        util.Int("owner_module_count", len(ownerAccessModules)),
+        util.Strings("owner_modules", ownerAccessModules))
 
-	return nil
+    return nil
 }
-
 // GetUserPermissionBitmask retrieves the complete permission bitmask for a user
 func (r *CompanyRepositoryImpl) GetUserPermissionBitmask(ctx context.Context, companyID, userID uuid.UUID) ([]uint64, error) {
 	// Check if user is company owner
@@ -4381,4 +3948,1108 @@ func (r *CompanyRepositoryImpl) GetModulePermissions(
 
 	r.recordQuery()
 	return permissions, nil
+}
+// ============================================================================
+// ADVANCED COMPANY SEARCH METHODS
+// ============================================================================
+
+// SearchCompaniesByName searches companies by name with advanced text search
+// SearchCompaniesByName searches companies by name with advanced text search
+func (r *CompanyRepositoryImpl) SearchCompaniesByName(
+    ctx context.Context, 
+    searchQuery string, 
+    searchType string, 
+    filters *models.CompanySearchFilters,
+    limit, offset int,
+) ([]*models.Company, int, error) {
+    
+    if limit <= 0 || limit > 100 {
+        limit = 50
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    var totalCount int
+    var companies []*models.Company
+    var err error
+
+    // Build base conditions
+    conditions := []string{}
+    args := []interface{}{}
+    argCounter := 1
+
+    // Add search condition based on type
+    if searchType == "autocomplete" || len(searchQuery) < 3 {
+        // Use trigram similarity for partial matches
+        conditions = append(conditions, 
+            fmt.Sprintf("company_name ILIKE $%d", argCounter))
+        args = append(args, "%"+searchQuery+"%")
+        argCounter++
+    } else {
+        // Use full-text search for complete words
+        conditions = append(conditions, 
+            fmt.Sprintf("company_name_tsv @@ plainto_tsquery('simple', $%d)", argCounter))
+        args = append(args, searchQuery)
+        argCounter++
+    }
+
+    // Add filters
+    if filters != nil {
+        if filters.OwnerID != uuid.Nil {
+            conditions = append(conditions, 
+                fmt.Sprintf("owner_user_id = $%d", argCounter))
+            args = append(args, filters.OwnerID)
+            argCounter++
+        }
+        if filters.IsActive != nil {
+            conditions = append(conditions, 
+                fmt.Sprintf("is_active = $%d", argCounter))
+            args = append(args, *filters.IsActive)
+            argCounter++
+        }
+        if filters.SubscriptionTier != "" {
+            conditions = append(conditions, 
+                fmt.Sprintf("subscription_tier = $%d", argCounter))
+            args = append(args, filters.SubscriptionTier)
+            argCounter++
+        }
+        if filters.DataRegion != "" {
+            conditions = append(conditions, 
+                fmt.Sprintf("data_region = $%d", argCounter))
+            args = append(args, filters.DataRegion)
+            argCounter++
+        }
+        if filters.SubscriptionStatus != "" {
+            conditions = append(conditions, 
+                fmt.Sprintf("subscription_status = $%d", argCounter))
+            args = append(args, filters.SubscriptionStatus)
+            argCounter++
+        }
+    }
+
+    // Build WHERE clause
+    whereClause := ""
+    if len(conditions) > 0 {
+        whereClause = "WHERE " + strings.Join(conditions, " AND ")
+    }
+
+    // Get total count
+    countQuery := fmt.Sprintf(`
+        SELECT COUNT(*) 
+        FROM companies 
+        %s`, whereClause)
+    
+    err = r.client.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to count search results: %w", err)
+    }
+
+    // Build search query with ordering
+    var searchQueryStr string
+    if searchType == "autocomplete" || len(searchQuery) < 3 {
+        // Use trigram similarity ordering
+        searchQueryStr = fmt.Sprintf(`
+            SELECT 
+                company_id, company_name, owner_user_id, 
+                subscription_tier, subscription_status, max_employees,
+                data_region, is_active, created_at, updated_at,
+                subscription_start_date, subscription_end_date,
+                similarity(company_name, $1) as relevance_score
+            FROM companies 
+            %s
+            ORDER BY relevance_score DESC, company_name ASC
+            LIMIT $%d OFFSET $%d`,
+            whereClause, argCounter, argCounter+1)
+        
+        args = append(args, searchQuery, limit, offset)
+    } else {
+        // Use full-text search ordering
+        searchQueryStr = fmt.Sprintf(`
+            SELECT 
+                company_id, company_name, owner_user_id, 
+                subscription_tier, subscription_status, max_employees,
+                data_region, is_active, created_at, updated_at,
+                subscription_start_date, subscription_end_date,
+                ts_rank(company_name_tsv, plainto_tsquery('simple', $1)) as relevance_score
+            FROM companies 
+            %s
+            ORDER BY relevance_score DESC, company_name ASC
+            LIMIT $%d OFFSET $%d`,
+            whereClause, argCounter, argCounter+1)
+        
+        args = append(args, limit, offset)
+    }
+
+    // Execute search
+    rows, err := r.client.Query(ctx, searchQueryStr, args...)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to search companies: %w", err)
+    }
+    defer rows.Close()
+
+    companies = make([]*models.Company, 0, limit)
+    for rows.Next() {
+        var company models.Company
+        var subStartDate, subEndDate sql.NullTime
+        var relevanceScore float64 // We'll read but not use directly
+        
+        err := rows.Scan(
+            &company.CompanyID, &company.CompanyName, &company.OwnerUserID,
+            &company.SubscriptionTier, &company.SubscriptionStatus, &company.MaxEmployees,
+            &company.DataRegion, &company.IsActive, &company.CreatedAt, &company.UpdatedAt,
+            &subStartDate, &subEndDate,
+            &relevanceScore,
+        )
+        
+        if err != nil {
+            r.logger.Warn("Failed to scan company search row", util.ErrorField(err))
+            continue
+        }
+
+        // Handle nullable dates
+        if subStartDate.Valid {
+            company.SubscriptionStartDate = &subStartDate.Time
+        }
+        if subEndDate.Valid {
+            company.SubscriptionEndDate = &subEndDate.Time
+        }
+
+        companies = append(companies, &company)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, 0, fmt.Errorf("error iterating search rows: %w", err)
+    }
+
+    r.recordQuery()
+    r.logger.Debug("Company search completed",
+        util.String("query", searchQuery),
+        util.String("type", searchType),
+        util.Int("results", len(companies)),
+        util.Int("total", totalCount))
+
+    return companies, totalCount, nil
+}
+
+// OPTION 1: DIRECT SQL APPROACH (RECOMMENDED FOR PROD)
+func (r *CompanyRepositoryImpl) SearchCompaniesByOwnerAndName(
+    ctx context.Context,
+    ownerID uuid.UUID,
+    searchQuery string,
+    isActive *bool,
+    limit, offset int,
+) ([]*models.Company, int, error) {
+    
+    if limit <= 0 || limit > 100 {
+        limit = 50
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    // =========================================================
+    // STEP 1: Build dynamic WHERE clause with bind parameters
+    // =========================================================
+    conditions := []string{"owner_user_id = $1"}
+    args := []interface{}{ownerID}
+    paramCount := 1
+
+    // Text search condition (use trigram for short, full-text for long)
+    if searchQuery != "" {
+        paramCount++
+        if len(searchQuery) < 3 {
+            // Use ILIKE with trigram optimization for autocomplete
+            conditions = append(conditions, 
+                fmt.Sprintf("company_name ILIKE $%d", paramCount))
+            args = append(args, "%"+searchQuery+"%")
+        } else {
+            // Use full-text search for complete words
+            conditions = append(conditions, 
+                fmt.Sprintf("company_name_tsv @@ plainto_tsquery('simple', $%d)", paramCount))
+            args = append(args, searchQuery)
+        }
+    }
+
+    // Active status filter
+    if isActive != nil {
+        paramCount++
+        conditions = append(conditions, 
+            fmt.Sprintf("is_active = $%d", paramCount))
+        args = append(args, *isActive)
+    }
+
+    whereClause := ""
+    if len(conditions) > 0 {
+        whereClause = "WHERE " + strings.Join(conditions, " AND ")
+    }
+
+    // =========================================================
+    // STEP 2: Get total count (fast with COUNT(*))
+    // =========================================================
+    countQuery := fmt.Sprintf("SELECT COUNT(*) FROM companies %s", whereClause)
+    
+    var totalCount int
+    err := r.client.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to count search results: %w", err)
+    }
+
+    // Early return if no results
+    if totalCount == 0 || offset >= totalCount {
+        return []*models.Company{}, totalCount, nil
+    }
+
+    // =========================================================
+    // STEP 3: Execute paginated search with optimal ordering
+    // =========================================================
+    paramCount++ // For limit
+    paramCount++ // For offset
+    
+    // Add relevance-based ordering
+    orderBy := ""
+    if searchQuery != "" && len(searchQuery) >= 3 {
+        // Full-text: order by relevance score
+        orderBy = fmt.Sprintf(`
+            ORDER BY 
+                ts_rank(company_name_tsv, plainto_tsquery('simple', $%d)) DESC,
+                company_name ASC`, 2) // $2 is the searchQuery param position
+    } else if searchQuery != "" {
+        // Trigram: order by similarity
+        orderBy = fmt.Sprintf(`
+            ORDER BY 
+                similarity(company_name, $%d) DESC,
+                company_name ASC`, 2)
+    } else {
+        // No search query: order by creation date
+        orderBy = "ORDER BY created_at DESC"
+    }
+
+    // Main search query
+    searchQueryStr := fmt.Sprintf(`
+        SELECT 
+            company_id, company_name, owner_user_id,
+            subscription_tier, subscription_status, max_employees,
+            data_region, is_active, created_at, updated_at,
+            subscription_start_date, subscription_end_date
+        FROM companies 
+        %s
+        %s
+        LIMIT $%d OFFSET $%d`,
+        whereClause, orderBy, paramCount-1, paramCount)
+
+    // Add pagination parameters
+    args = append(args, limit, offset)
+
+    rows, err := r.client.Query(ctx, searchQueryStr, args...)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to search companies: %w", err)
+    }
+    defer rows.Close()
+
+    companies := make([]*models.Company, 0, limit)
+    for rows.Next() {
+        var company models.Company
+        var subStartDate, subEndDate sql.NullTime
+        
+        err := rows.Scan(
+            &company.CompanyID, &company.CompanyName, &company.OwnerUserID,
+            &company.SubscriptionTier, &company.SubscriptionStatus, &company.MaxEmployees,
+            &company.DataRegion, &company.IsActive, &company.CreatedAt, &company.UpdatedAt,
+            &subStartDate, &subEndDate,
+        )
+        
+        if err != nil {
+            r.logger.Warn("Failed to scan company search row", 
+                util.String("owner_id", ownerID.String()),
+                util.ErrorField(err))
+            continue
+        }
+
+        // Handle nullable dates
+        if subStartDate.Valid {
+            company.SubscriptionStartDate = &subStartDate.Time
+        }
+        if subEndDate.Valid {
+            company.SubscriptionEndDate = &subEndDate.Time
+        }
+
+        companies = append(companies, &company)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, 0, fmt.Errorf("error iterating search rows: %w", err)
+    }
+
+    r.recordQuery()
+    r.logger.Debug("Company search by owner completed",
+        util.String("owner_id", ownerID.String()),
+        util.String("query", searchQuery),
+        util.Int("results", len(companies)),
+        util.Int("total", totalCount),
+        util.Int("limit", limit),
+        util.Int("offset", offset))
+
+    return companies, totalCount, nil
+}
+
+
+// GetCompanySuggestions provides autocomplete suggestions
+func (r *CompanyRepositoryImpl) GetCompanySuggestions(
+    ctx context.Context,
+    prefix string,
+    limit int,
+) ([]string, error) {
+    
+    if limit <= 0 || limit > 20 {
+        limit = 10
+    }
+
+    query := `
+        SELECT DISTINCT company_name
+        FROM companies 
+        WHERE company_name ILIKE $1
+        ORDER BY company_name ASC
+        LIMIT $2`
+
+    rows, err := r.client.Query(ctx, query, prefix+"%", limit)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to get company suggestions: %w", err)
+    }
+    defer rows.Close()
+
+    suggestions := make([]string, 0, limit)
+    for rows.Next() {
+        var name string
+        if err := rows.Scan(&name); err != nil {
+            continue
+        }
+        suggestions = append(suggestions, name)
+    }
+
+    r.recordQuery()
+    return suggestions, nil
+}
+
+// ============================================================================
+// ANALYTICS METHODS
+// ============================================================================
+
+// GetCompanySearchStats gets statistics about company search performance
+func (r *CompanyRepositoryImpl) GetCompanySearchStats(ctx context.Context) (map[string]interface{}, error) {
+    stats := make(map[string]interface{})
+
+    // Get total company count
+    var totalCompanies int
+    err := r.client.QueryRow(ctx, "SELECT COUNT(*) FROM companies").Scan(&totalCompanies)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get company count: %w", err)
+    }
+    stats["total_companies"] = totalCompanies
+
+    // Get index usage statistics
+    indexQuery := `
+        SELECT 
+            schemaname,
+            relname as tablename,
+            indexrelname as indexname,
+            idx_scan as index_scans,
+            idx_tup_read as tuples_read,
+            idx_tup_fetch as tuples_fetched
+        FROM pg_stat_user_indexes 
+        WHERE relname = 'companies'
+        ORDER BY idx_scan DESC`
+
+    rows, err := r.client.Query(ctx, indexQuery)
+    if err != nil {
+        r.logger.Warn("Failed to get index stats", util.ErrorField(err))
+        stats["index_usage_error"] = err.Error()
+    } else {
+        defer rows.Close()
+        
+        var indexStats []map[string]interface{}
+        for rows.Next() {
+            var schema, table, index string
+            var scans, read, fetched int64
+            err := rows.Scan(&schema, &table, &index, &scans, &read, &fetched)
+            if err != nil {
+                continue
+            }
+            indexStats = append(indexStats, map[string]interface{}{
+                "index_name": index,
+                "schema": schema,
+                "table": table,
+                "scans": scans,
+                "tuples_read": read,
+                "tuples_fetched": fetched,
+                "efficiency": calculateEfficiency(read, fetched),
+            })
+        }
+        stats["index_usage"] = indexStats
+        
+        // Add summary stats
+        if len(indexStats) > 0 {
+            var totalScans, totalReads int64
+            for _, idx := range indexStats {
+                if scans, ok := idx["scans"].(int64); ok {
+                    totalScans += scans
+                }
+                if reads, ok := idx["tuples_read"].(int64); ok {
+                    totalReads += reads
+                }
+            }
+            stats["index_summary"] = map[string]interface{}{
+                "total_indexes": len(indexStats),
+                "total_scans": totalScans,
+                "total_tuples_read": totalReads,
+                "avg_scans_per_index": float64(totalScans) / float64(len(indexStats)),
+            }
+        }
+    }
+
+    // Get search pattern statistics
+    patternQuery := `
+        SELECT 
+            LENGTH(company_name) as name_length,
+            COUNT(*) as count,
+            AVG(LENGTH(company_name)) as avg_length,
+            MIN(company_name) as example_name
+        FROM companies 
+        GROUP BY LENGTH(company_name)
+        ORDER BY count DESC
+        LIMIT 10`
+
+    rows2, err := r.client.Query(ctx, patternQuery)
+    if err != nil {
+        r.logger.Warn("Failed to get search patterns", util.ErrorField(err))
+        stats["patterns_error"] = err.Error()
+    } else {
+        defer rows2.Close()
+        
+        var patterns []map[string]interface{}
+        for rows2.Next() {
+            var length int
+            var count int
+            var avgLength float64
+            var exampleName string
+            err := rows2.Scan(&length, &count, &avgLength, &exampleName)
+            if err != nil {
+                continue
+            }
+            patterns = append(patterns, map[string]interface{}{
+                "name_length": length,
+                "count": count,
+                "avg_length": avgLength,
+                "example_name": exampleName,
+                "percentage": float64(count) / float64(totalCompanies) * 100,
+            })
+        }
+        stats["name_patterns"] = patterns
+    }
+
+    // Get text search statistics
+    searchStatsQuery := `
+        SELECT 
+            COUNT(*) as total_with_search,
+            SUM(CASE WHEN company_name_tsv IS NOT NULL THEN 1 ELSE 0 END) as with_tsvector,
+            AVG(LENGTH(company_name)) as avg_name_length,
+            MIN(LENGTH(company_name)) as min_name_length,
+            MAX(LENGTH(company_name)) as max_name_length
+        FROM companies`
+
+    var totalWithSearch, withTsvector int
+    var avgLength, minLength, maxLength float64
+    err = r.client.QueryRow(ctx, searchStatsQuery).Scan(
+        &totalWithSearch, &withTsvector, &avgLength, &minLength, &maxLength,
+    )
+    if err == nil {
+        stats["search_stats"] = map[string]interface{}{
+            "total_companies": totalWithSearch,
+            "with_tsvector": withTsvector,
+            "tsvector_coverage": float64(withTsvector) / float64(totalWithSearch) * 100,
+            "avg_name_length": avgLength,
+            "min_name_length": minLength,
+            "max_name_length": maxLength,
+        }
+    }
+
+    // Get common prefixes for autocomplete
+    prefixQuery := `
+        SELECT 
+            LEFT(company_name, 3) as prefix,
+            COUNT(*) as count,
+            AVG(LENGTH(company_name)) as avg_length
+        FROM companies 
+        GROUP BY LEFT(company_name, 3)
+        HAVING COUNT(*) > 1
+        ORDER BY count DESC
+        LIMIT 10`
+
+    rows3, err := r.client.Query(ctx, prefixQuery)
+    if err == nil {
+        defer rows3.Close()
+        
+        var prefixes []map[string]interface{}
+        for rows3.Next() {
+            var prefix string
+            var count int
+            var avgLength float64
+            err := rows3.Scan(&prefix, &count, &avgLength)
+            if err != nil {
+                continue
+            }
+            prefixes = append(prefixes, map[string]interface{}{
+                "prefix": prefix,
+                "count": count,
+                "avg_length": avgLength,
+                "suggestion_potential": "high",
+            })
+        }
+        if len(prefixes) > 0 {
+            stats["common_prefixes"] = prefixes
+        }
+    }
+
+    r.recordQuery()
+    return stats, nil
+}
+
+// Helper function to calculate index efficiency
+func calculateEfficiency(tuplesRead, tuplesFetched int64) float64 {
+    if tuplesRead == 0 {
+        return 0
+    }
+    return float64(tuplesFetched) / float64(tuplesRead) * 100
+}
+// internal/repository/postgres/company_repository_impl.go
+
+// Update GetEmployee method
+func (r *CompanyRepositoryImpl) GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (*models.CompanyEmployee, error) {
+    query := `
+        SELECT ce.company_id, ce.user_id, ce.employee_id, ce.role_id,
+               ce.hire_date, ce.is_active, ce.reports_to, 
+               ce.created_at, ce.updated_at
+        FROM company_employees ce
+        WHERE ce.company_id = $1 AND ce.user_id = $2`
+
+    var employee models.CompanyEmployee
+    var reportsTo sql.NullString
+
+    err := r.client.QueryRow(ctx, query, companyID, userID).Scan(
+        &employee.CompanyID, &employee.UserID, &employee.EmployeeID, &employee.RoleID,
+        &employee.HireDate, &employee.IsActive, &reportsTo,
+        &employee.CreatedAt, &employee.UpdatedAt,
+    )
+
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("employee not found")
+        }
+        r.recordError()
+        return nil, fmt.Errorf("failed to get employee: %w", err)
+    }
+
+    if reportsTo.Valid {
+        reportsToID, _ := uuid.Parse(reportsTo.String)
+        employee.ReportsTo = &reportsToID
+    }
+
+    r.recordQuery()
+    return &employee, nil
+}
+
+// Update GetEmployeesByRole method
+func (r *CompanyRepositoryImpl) GetEmployeesByRole(ctx context.Context, roleID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
+    if limit <= 0 || limit > DefaultCompanyPageSize {
+        limit = DefaultCompanyPageSize
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    // Get total count
+    var totalCount int
+    countQuery := `SELECT COUNT(*) FROM company_employees WHERE role_id = $1 AND is_active = true`
+    err := r.client.QueryRow(ctx, countQuery, roleID).Scan(&totalCount)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to count role employees: %w", err)
+    }
+
+    // Get paginated results
+    query := `
+        SELECT company_id, user_id, employee_id,
+               hire_date, is_active, reports_to, created_at, updated_at
+        FROM company_employees 
+        WHERE role_id = $1 AND is_active = true
+        ORDER BY hire_date DESC 
+        LIMIT $2 OFFSET $3`
+
+    rows, err := r.client.Query(ctx, query, roleID, limit, offset)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to query role employees: %w", err)
+    }
+    defer rows.Close()
+
+    employees := make([]*models.CompanyEmployee, 0, limit)
+    for rows.Next() {
+        var employee models.CompanyEmployee
+        var reportsTo sql.NullString
+
+        err := rows.Scan(
+            &employee.CompanyID, &employee.UserID, &employee.EmployeeID,
+            &employee.HireDate, &employee.IsActive, &reportsTo,
+            &employee.CreatedAt, &employee.UpdatedAt,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
+            continue
+        }
+
+        employee.RoleID = roleID
+
+        // Handle nullable UUIDs
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            employee.ReportsTo = &reportsToID
+        }
+
+        employees = append(employees, &employee)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
+    }
+
+    r.recordQuery()
+    return employees, totalCount, nil
+}
+
+// Update GetUsersByRoleLevel method
+func (r *CompanyRepositoryImpl) GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error) {
+    query := `
+        SELECT ce.user_id, ce.employee_id, ce.role_id,
+               ce.hire_date, ce.is_active, ce.reports_to, r.role_name, r.role_level
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        WHERE ce.company_id = $1 AND ce.is_active = true 
+          AND r.role_level BETWEEN $2 AND $3
+        ORDER BY r.role_level DESC, ce.hire_date ASC`
+
+    rows, err := r.client.Query(ctx, query, companyID, minLevel, maxLevel)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to query users by role level: %w", err)
+    }
+    defer rows.Close()
+
+    var employees []*models.CompanyEmployee
+    for rows.Next() {
+        var employee models.CompanyEmployee
+        var reportsTo sql.NullString
+        var roleName string
+        var roleLevel int
+
+        err := rows.Scan(
+            &employee.UserID, &employee.EmployeeID, &employee.RoleID,
+            &employee.HireDate, &employee.IsActive, &reportsTo,
+            &roleName, &roleLevel,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
+            continue
+        }
+
+        employee.CompanyID = companyID
+
+        // Handle nullable UUIDs
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            employee.ReportsTo = &reportsToID
+        }
+
+        employees = append(employees, &employee)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("error iterating employee rows: %w", err)
+    }
+
+    r.recordQuery()
+    return employees, nil
+}
+
+// Update GetUsersWithPermission method
+func (r *CompanyRepositoryImpl) GetUsersWithPermission(ctx context.Context, companyID uuid.UUID, permissionName string, limit int) ([]*models.CompanyEmployee, error) {
+    if limit <= 0 || limit > DefaultCompanyPageSize {
+        limit = DefaultCompanyPageSize
+    }
+
+    query := `
+        SELECT ce.user_id, ce.employee_id, ce.role_id,
+               ce.hire_date, ce.is_active, ce.reports_to
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        INNER JOIN role_permissions rp ON r.role_id = rp.role_id
+        INNER JOIN permissions p ON rp.permission_id = p.permission_id
+        WHERE ce.company_id = $1 AND ce.is_active = true 
+          AND p.permission_name = $2
+        LIMIT $3`
+
+    rows, err := r.client.Query(ctx, query, companyID, permissionName, limit)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to query users with permission: %w", err)
+    }
+	defer rows.Close()
+
+    var employees []*models.CompanyEmployee
+    for rows.Next() {
+        var employee models.CompanyEmployee
+        var reportsTo sql.NullString
+
+        err := rows.Scan(
+            &employee.UserID, &employee.EmployeeID, &employee.RoleID,
+            &employee.HireDate, &employee.IsActive, &reportsTo,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
+            continue
+        }
+
+        employee.CompanyID = companyID
+
+        // Handle nullable UUIDs
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            employee.ReportsTo = &reportsToID
+        }
+
+        employees = append(employees, &employee)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("error iterating employee rows: %w", err)
+    }
+
+    r.recordQuery()
+    return employees, nil
+}
+
+// Update GetEmployeesByCompany method
+func (r *CompanyRepositoryImpl) GetEmployeesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
+    if limit <= 0 || limit > DefaultCompanyPageSize {
+        limit = DefaultCompanyPageSize
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    var totalCount int
+    countQuery := `SELECT COUNT(*) FROM company_employees WHERE company_id = $1`
+    err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to count employees: %w", err)
+    }
+
+    query := `
+        SELECT user_id, employee_id, role_id,
+               hire_date, is_active, reports_to, created_at, updated_at
+        FROM company_employees
+        WHERE company_id = $1
+        ORDER BY hire_date DESC
+        LIMIT $2 OFFSET $3`
+
+    rows, err := r.client.Query(ctx, query, companyID, limit, offset)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to query employees: %w", err)
+    }
+    defer rows.Close()
+
+    employees := make([]*models.CompanyEmployee, 0, limit)
+    for rows.Next() {
+        var employee models.CompanyEmployee
+        var reportsTo sql.NullString
+
+        err := rows.Scan(
+            &employee.UserID, &employee.EmployeeID, &employee.RoleID,
+            &employee.HireDate, &employee.IsActive, &reportsTo,
+            &employee.CreatedAt, &employee.UpdatedAt,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan employee row", util.ErrorField(err))
+            continue
+        }
+
+        employee.CompanyID = companyID
+
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            employee.ReportsTo = &reportsToID
+        }
+
+        employees = append(employees, &employee)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
+    }
+
+    r.recordQuery()
+    return employees, totalCount, nil
+}
+
+// Add GetEmployeesByDepartment method implementation
+func (r *CompanyRepositoryImpl) GetEmployeesByDepartment(ctx context.Context, departmentID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error) {
+    if limit <= 0 || limit > DefaultCompanyPageSize {
+        limit = DefaultCompanyPageSize
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    // Get total count
+    var totalCount int
+    countQuery := `
+        SELECT COUNT(DISTINCT ce.user_id)
+        FROM company_employees ce
+        INNER JOIN role_departments rd ON ce.role_id = rd.role_id
+        WHERE rd.department_id = $1 AND ce.is_active = true`
+
+    err := r.client.QueryRow(ctx, countQuery, departmentID).Scan(&totalCount)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to get employees count for department: %w", err)
+    }
+
+    // Get paginated results
+    query := `
+        SELECT DISTINCT 
+            ce.company_id, ce.user_id, ce.employee_id, ce.role_id,
+            ce.hire_date, ce.is_active, ce.reports_to, 
+            ce.created_at, ce.updated_at
+        FROM company_employees ce
+        INNER JOIN role_departments rd ON ce.role_id = rd.role_id
+        WHERE rd.department_id = $1 AND ce.is_active = true
+        ORDER BY ce.hire_date DESC
+        LIMIT $2 OFFSET $3`
+
+    rows, err := r.client.Query(ctx, query, departmentID, limit, offset)
+    if err != nil {
+        r.recordError()
+        return nil, 0, fmt.Errorf("failed to get employees by department: %w", err)
+    }
+    defer rows.Close()
+
+    employees := make([]*models.CompanyEmployee, 0, limit)
+    for rows.Next() {
+        var employee models.CompanyEmployee
+        var reportsTo sql.NullString
+
+        err := rows.Scan(
+            &employee.CompanyID, &employee.UserID, &employee.EmployeeID, &employee.RoleID,
+            &employee.HireDate, &employee.IsActive, &reportsTo,
+            &employee.CreatedAt, &employee.UpdatedAt,
+        )
+        if err != nil {
+            return nil, 0, fmt.Errorf("failed to scan employee: %w", err)
+        }
+
+        if reportsTo.Valid {
+            reportsToID, _ := uuid.Parse(reportsTo.String)
+            employee.ReportsTo = &reportsToID
+        }
+
+        employees = append(employees, &employee)
+    }
+
+    if err = rows.Err(); err != nil {
+        return nil, 0, fmt.Errorf("error iterating employee rows: %w", err)
+    }
+
+    return employees, totalCount, nil
+}
+
+
+// internal/repository/postgres/company_repository_impl.go
+
+// Add these methods to CompanyRepositoryImpl
+
+// GetEmployeeDepartment gets the department for an employee through role → role_departments → department relationship
+func (r *CompanyRepositoryImpl) GetEmployeeDepartment(ctx context.Context, companyID, userID uuid.UUID) (*models.Department, error) {
+    query := `
+        SELECT DISTINCT d.department_id, d.company_id, d.department_name, 
+               d.system_department_id, d.department_head, d.parent_department_id,
+               d.is_active, d.created_at, d.updated_at,
+               sd.name as system_department_name, sd.module_code
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        INNER JOIN role_departments rd ON r.role_id = rd.role_id
+        INNER JOIN departments d ON rd.department_id = d.department_id
+        LEFT JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+        WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+        LIMIT 1`
+
+    var department models.Department
+    var deptHead, parentDeptID, systemDeptID sql.NullString
+    var systemDeptName, moduleCode sql.NullString
+
+    err := r.client.QueryRow(ctx, query, companyID, userID).Scan(
+        &department.DepartmentID, &department.CompanyID, &department.DepartmentName,
+        &systemDeptID, &deptHead, &parentDeptID,
+        &department.IsActive, &department.CreatedAt, &department.UpdatedAt,
+        &systemDeptName, &moduleCode,
+    )
+    
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("employee has no department assigned or not found")
+        }
+        r.recordError()
+        return nil, fmt.Errorf("failed to get employee department: %w", err)
+    }
+    
+    // Handle nullable fields
+    if deptHead.Valid {
+        headID, _ := uuid.Parse(deptHead.String)
+        department.DepartmentHead = &headID
+    }
+    if parentDeptID.Valid {
+        parentID, _ := uuid.Parse(parentDeptID.String)
+        department.ParentDepartmentID = &parentID
+    }
+    if systemDeptID.Valid {
+        systemID, _ := uuid.Parse(systemDeptID.String)
+        department.SystemDepartmentID = &systemID
+    }
+    if systemDeptName.Valid {
+        department.SystemDepartmentName = systemDeptName.String
+    }
+    if moduleCode.Valid {
+        department.ModuleCode = moduleCode.String
+    }
+    
+    r.recordQuery()
+    return &department, nil
+}
+
+// GetEmployeeDepartments gets all departments for an employee (if multiple roles/departments)
+func (r *CompanyRepositoryImpl) GetEmployeeDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error) {
+    query := `
+        SELECT DISTINCT d.department_id, d.company_id, d.department_name, 
+               d.system_department_id, d.department_head, d.parent_department_id,
+               d.is_active, d.created_at, d.updated_at,
+               sd.name as system_department_name, sd.module_code
+        FROM company_employees ce
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        INNER JOIN role_departments rd ON r.role_id = rd.role_id
+        INNER JOIN departments d ON rd.department_id = d.department_id
+        LEFT JOIN system_departments sd ON d.system_department_id = sd.system_department_id
+        WHERE ce.company_id = $1 AND ce.user_id = $2 AND ce.is_active = true
+        ORDER BY d.department_name`
+
+    rows, err := r.client.Query(ctx, query, companyID, userID)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to get employee departments: %w", err)
+    }
+    defer rows.Close()
+
+    var departments []*models.Department
+    for rows.Next() {
+        var department models.Department
+        var deptHead, parentDeptID, systemDeptID sql.NullString
+        var systemDeptName, moduleCode sql.NullString
+
+        err := rows.Scan(
+            &department.DepartmentID, &department.CompanyID, &department.DepartmentName,
+            &systemDeptID, &deptHead, &parentDeptID,
+            &department.IsActive, &department.CreatedAt, &department.UpdatedAt,
+            &systemDeptName, &moduleCode,
+        )
+        
+        if err != nil {
+            r.logger.Warn("Failed to scan department row", util.ErrorField(err))
+            continue
+        }
+        
+        // Handle nullable fields
+        if deptHead.Valid {
+            headID, _ := uuid.Parse(deptHead.String)
+            department.DepartmentHead = &headID
+        }
+        if parentDeptID.Valid {
+            parentID, _ := uuid.Parse(parentDeptID.String)
+            department.ParentDepartmentID = &parentID
+        }
+        if systemDeptID.Valid {
+            systemID, _ := uuid.Parse(systemDeptID.String)
+            department.SystemDepartmentID = &systemID
+        }
+        if systemDeptName.Valid {
+            department.SystemDepartmentName = systemDeptName.String
+        }
+        if moduleCode.Valid {
+            department.ModuleCode = moduleCode.String
+        }
+        
+        departments = append(departments, &department)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("error iterating department rows: %w", err)
+    }
+    
+    r.recordQuery()
+    return departments, nil
+}
+
+// DeleteDepartment permanently deletes a department
+func (r *CompanyRepositoryImpl) DeleteDepartment(ctx context.Context, departmentID uuid.UUID) error {
+    query := `DELETE FROM departments WHERE department_id = $1`
+    
+    result, err := r.client.Exec(ctx, query, departmentID)
+    if err != nil {
+        r.recordError()
+        return fmt.Errorf("failed to delete department: %w", err)
+    }
+    
+    rowsAffected, _ := result.RowsAffected()
+    if rowsAffected == 0 {
+        return fmt.Errorf("department not found: %s", departmentID)
+    }
+    
+    r.recordQuery()
+    r.logger.Debug("Department deleted",
+        util.String("department_id", departmentID.String()),
+        util.Int64("rows_affected", rowsAffected))
+    
+    return nil
+}
+
+// RemoveAllRoleDepartments removes all role-department mappings for a department
+func (r *CompanyRepositoryImpl) RemoveAllRoleDepartments(ctx context.Context, departmentID uuid.UUID) error {
+    query := `DELETE FROM role_departments WHERE department_id = $1`
+    
+    result, err := r.client.Exec(ctx, query, departmentID)
+    if err != nil {
+        r.recordError()
+        return fmt.Errorf("failed to remove role-department mappings: %w", err)
+    }
+    
+    rowsAffected, _ := result.RowsAffected()
+    r.recordQuery()
+    r.logger.Debug("Role-department mappings removed",
+        util.String("department_id", departmentID.String()),
+        util.Int64("rows_affected", rowsAffected))
+    
+    return nil
 }

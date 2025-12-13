@@ -285,6 +285,7 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
+
 func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -337,7 +338,6 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 		DeviceFingerprint: req.DeviceFingerprint,
 		IPAddress:         ipAddress,
 		UserAgent:         r.UserAgent(), // ✅ ADD THIS LINE
-
 	}
 
 	mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, mpinVerifyReq)
@@ -688,7 +688,6 @@ func (h *AdminHandler) ChangeAdminMPINByAdmin(w http.ResponseWriter, r *http.Req
 		Reason:    req.Reason,
 		IPAddress: h.getClientIP(r),
 		UserAgent: r.UserAgent(), // ✅ ADD THIS LINE
-
 	}
 
 	// Call service
@@ -758,120 +757,115 @@ func (h *AdminHandler) LogoutAdmin(w http.ResponseWriter, r *http.Request) {
 type CreateCompanyRequest struct {
 	CompanyName        string   `json:"company_name" validate:"required"`
 	OwnerPhone         string   `json:"owner_phone" validate:"required"`
+	OwnerUsername      string   `json:"owner_username" validate:"required,username"`
+	OwnerFullName      string   `json:"owner_full_name" validate:"required,max=255"`
 	SubscriptionTier   string   `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
 	MaxEmployees       int      `json:"max_employees" validate:"required,min=1,max=2000"`
 	DataRegion         string   `json:"data_region" validate:"required"`
 	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
 	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
-	Departments        []string `json:"departments"` // Departments to create for this company
+	Departments        []string `json:"departments"`
 }
-
 func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
+    adminID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+        return
+    }
 
-	var req CreateCompanyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+    var req CreateCompanyRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
 
-	// Create company using enhanced service (now includes department setup)
-	companyReq := service.CreateCompanyRequest{
-		CompanyName:        req.CompanyName,
-		OwnerPhone:         req.OwnerPhone,
-		SubscriptionTier:   req.SubscriptionTier,
-		MaxEmployees:       req.MaxEmployees,
-		DataRegion:         req.DataRegion,
-		SubscriptionMonths: req.SubscriptionMonths,
-		SubscriptionDays:   req.SubscriptionDays,
-		Departments:        req.Departments, // Pass departments to service
-	}
+    // Validate the request
+    if err := validate.Struct(req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
+        return
+    }
 
-	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
-	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			h.respondWithError(w, http.StatusConflict, err, "Company with this name already exists for the owner")
-			return
-		}
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create company")
-		return
-	}
+    // Create company using enhanced service
+    companyReq := service.CreateCompanyRequest{
+        CompanyName:        req.CompanyName,
+        OwnerPhone:         req.OwnerPhone,
+        OwnerUsername:      req.OwnerUsername,
+        OwnerFullName:      req.OwnerFullName,
+        SubscriptionTier:   req.SubscriptionTier,
+        MaxEmployees:       req.MaxEmployees,
+        DataRegion:         req.DataRegion,
+        SubscriptionMonths: req.SubscriptionMonths,
+        SubscriptionDays:   req.SubscriptionDays,
+        Departments:        req.Departments,
+    }
 
-	h.respondWithJSON(w, http.StatusCreated, successResponse(company, "Company created successfully with RBAC setup"))
+    company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
+    if err != nil {
+        // ✅ UPDATED: Only check for company name conflict
+        if strings.Contains(err.Error(), "company with name") && strings.Contains(err.Error(), "already exists") {
+            h.respondWithError(w, http.StatusConflict, err, "Company with this name already exists for the owner")
+            return
+        }
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to create company")
+        return
+    }
 
-	h.logger.Info("Company created by admin with full RBAC setup",
-		util.String("company_id", company.CompanyID.String()),
-		util.String("company_name", company.CompanyName),
-		util.String("owner_phone", req.OwnerPhone),
-		util.String("subscription_tier", req.SubscriptionTier),
-		util.Int("department_count", len(req.Departments)),
-		util.String("created_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    // Get the actual owner user details
+    actualOwnerUser, err := h.userService.GetUserByPhone(ctx, req.OwnerPhone)
+    var actualUsername, actualFullName string
+    if err == nil && actualOwnerUser != nil {
+        actualUsername = actualOwnerUser.Username
+        actualFullName = actualOwnerUser.FullName
+    } else {
+        actualUsername = req.OwnerUsername
+        actualFullName = req.OwnerFullName
+    }
+
+    response := map[string]interface{}{
+        "success": true,
+        "message": "Company created successfully with RBAC setup",
+        "data": map[string]interface{}{
+            "company_id":        company.CompanyID.String(),
+            "company_name":      company.CompanyName,
+            "owner_username":    actualUsername,
+            "owner_full_name":   actualFullName,
+            "owner_phone":       req.OwnerPhone,
+            "owner_user_id":     company.OwnerUserID.String(),
+            "subscription_tier": company.SubscriptionTier,
+            "departments":       len(req.Departments),
+            "created_at":        company.CreatedAt,
+            "note":              "User may have been assigned a different username if the requested one was already taken",
+        },
+    }
+
+    h.respondWithJSON(w, http.StatusCreated, response)
+
+    h.logger.Info("Company created by admin with full RBAC setup",
+        util.String("company_id", company.CompanyID.String()),
+        util.String("company_name", company.CompanyName),
+        util.String("owner_phone", req.OwnerPhone),
+        util.String("owner_username", actualUsername),
+        util.String("owner_full_name", actualFullName),
+        util.String("subscription_tier", req.SubscriptionTier),
+        util.Int("department_count", len(req.Departments)),
+        util.String("created_by", adminID.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
-
 // ===== DEPARTMENT MANAGEMENT =====
 
-// CreateDepartmentRequest defines the request for creating a department
-type CreateDepartmentRequest struct {
-	CompanyID          uuid.UUID  `json:"company_id" validate:"required"`
-	DepartmentName     string     `json:"department_name" validate:"required"`
-	SystemDepartmentID uuid.UUID  `json:"system_department_id" validate:"required"`
-	DepartmentHead     *uuid.UUID `json:"department_head,omitempty"`
-	ParentDepartmentID *uuid.UUID `json:"parent_department_id,omitempty"`
-}
-
-func (h *AdminHandler) CreateDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
-
-	var req CreateDepartmentRequest
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Convert to service request
-	deptReq := service.CreateDepartmentRequest{
-		CompanyID:          req.CompanyID,
-		DepartmentName:     req.DepartmentName,
-		SystemDepartmentID: req.SystemDepartmentID,
-		DepartmentHead:     req.DepartmentHead,
-		ParentDepartmentID: req.ParentDepartmentID,
-	}
-
-	department, err := h.companyService.CreateDepartment(ctx, &deptReq)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create department")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, successResponse(department, "Department created successfully"))
-
-	h.logger.Info("Department created by admin",
-		util.String("company_id", req.CompanyID.String()),
-		util.String("department_id", department.DepartmentID.String()),
-		util.String("department_name", req.DepartmentName),
-		util.String("created_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// // CreateDepartmentRequest defines the request for creating a department
+// type CreateDepartmentRequest struct {
+// 	CompanyID          uuid.UUID  `json:"company_id" validate:"required"`
+// 	DepartmentName     string     `json:"department_name" validate:"required"`
+// 	SystemDepartmentID uuid.UUID  `json:"system_department_id" validate:"required"`
+// 	DepartmentHead     *uuid.UUID `json:"department_head,omitempty"`
+// 	ParentDepartmentID *uuid.UUID `json:"parent_department_id,omitempty"`
+// }
 
 // ===== ROLE MANAGEMENT =====
 
@@ -1154,12 +1148,12 @@ func (h *AdminHandler) UpdateEmployeeRole(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Update department
-	if err := h.companyService.UpdateEmployeeDepartment(ctx, companyID, userID, req.DepartmentID, adminID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update employee department")
-		return
-	}
+	// // Update department
+	// if err := h.companyService.UpdateEmployeeDepartment(ctx, companyID, userID, req.DepartmentID, adminID); err != nil {
+	// 	statusCode := h.getStatusCode(err)
+	// 	h.respondWithError(w, statusCode, err, "Failed to update employee department")
+	// 	return
+	// }
 
 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee role and department updated successfully"))
 
@@ -1966,42 +1960,6 @@ func (h *AdminHandler) UnbanUser(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-func (h *AdminHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	limit := h.getIntQueryParam(r, "limit", 100)
-	offset := h.getIntQueryParam(r, "offset", 0)
-
-	// Use search with is_active filter
-	filters := map[string]interface{}{
-		"is_active": false,
-	}
-
-	users, total, err := h.userService.SearchUsers(ctx, filters, limit, offset)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get banned users")
-		return
-	}
-
-	response := map[string]interface{}{
-		"users": users,
-		"meta": map[string]interface{}{
-			"count":  len(users),
-			"total":  total,
-			"limit":  limit,
-			"offset": offset,
-		},
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Banned users retrieved successfully"))
-
-	h.logger.Debug("Banned users retrieved by admin",
-		util.Int("count", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
 // UpdateUserKYC - Admin approves/rejects user KYC
 func (h *AdminHandler) UpdateUserKYC(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -2101,67 +2059,150 @@ func (h *AdminHandler) ListUsersByKYCStatus(w http.ResponseWriter, r *http.Reque
 	)
 }
 
-// SearchUsers searches users with various filters
+// get searches users with advanced text search
 func (h *AdminHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	limit := h.getIntQueryParam(r, "limit", 50)
-	offset := h.getIntQueryParam(r, "offset", 0)
+    adminID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+        return
+    }
 
-	// Parse query parameters for filters
-	filters := make(map[string]interface{})
+    // Parse query parameters
+    query := r.URL.Query().Get("q")
+    if query == "" {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("QUERY_REQUIRED"), "Search query is required")
+        return
+    }
 
-	if phoneHash := r.URL.Query().Get("phone_hash"); phoneHash != "" {
-		filters["phone_hash"] = phoneHash
-	}
-	if deviceID := r.URL.Query().Get("device_id"); deviceID != "" {
-		filters["device_id"] = deviceID
-	}
-	if kycStatus := r.URL.Query().Get("kyc_status"); kycStatus != "" {
-		filters["kyc_status"] = kycStatus
-	}
-	if dataRegion := r.URL.Query().Get("data_region"); dataRegion != "" {
-		filters["data_region"] = dataRegion
-	}
-	if isVerified := r.URL.Query().Get("is_verified"); isVerified != "" {
-		filters["is_verified"] = isVerified == "true"
-	}
-	if isActive := r.URL.Query().Get("is_active"); isActive != "" {
-		filters["is_active"] = isActive == "true"
-	}
+    // Parse pagination
+    limit := h.getIntQueryParam(r, "limit", 20)
+    offset := h.getIntQueryParam(r, "offset", 0)
 
-	users, total, err := h.userService.SearchUsers(ctx, filters, limit, offset)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users")
-		return
-	}
+    // Parse search type
+    searchType := r.URL.Query().Get("search_type")
+    if searchType == "" {
+        searchType = "all"
+    }
 
-	// Sanitize users
-	for _, u := range users {
-		h.sanitizeUserForAdmin(u)
-	}
+    // Parse sort parameters
+    sortBy := r.URL.Query().Get("sort_by")
+    if sortBy == "" {
+        sortBy = "relevance"
+    }
+    sortOrder := r.URL.Query().Get("sort_order")
+    if sortOrder == "" {
+        sortOrder = "desc"
+    }
 
-	response := map[string]interface{}{
-		"users": users,
-		"meta": map[string]interface{}{
-			"count":   len(users),
-			"total":   total,
-			"limit":   limit,
-			"offset":  offset,
-			"filters": filters,
-		},
-	}
+    // Parse filters with nil checks
+    var filters *models.UserSearchFilters
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Users search completed successfully"))
+    isActiveParam := r.URL.Query().Get("is_active")
+    kycStatus := r.URL.Query().Get("kyc_status")
+    dataRegion := r.URL.Query().Get("data_region")
+    isVerifiedParam := r.URL.Query().Get("is_verified")
 
-	h.logger.Debug("Users search completed",
-		util.Any("filters", filters),
-		util.Int("count", len(users)),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    if isActiveParam != "" || kycStatus != "" || dataRegion != "" || isVerifiedParam != "" {
+        filters = &models.UserSearchFilters{}
+
+        if isActiveParam != "" {
+            isActive := isActiveParam == "true"
+            filters.IsActive = &isActive
+        }
+
+        if kycStatus != "" {
+            filters.KYCStatus = kycStatus
+        }
+
+        if dataRegion != "" {
+            filters.DataRegion = dataRegion
+        }
+
+        if isVerifiedParam != "" {
+            isVerified := isVerifiedParam == "true"
+            filters.IsVerified = &isVerified
+        }
+    }
+
+    // Build search request
+    searchReq := &models.UserSearchRequest{
+        Query:      query,
+        SearchType: searchType,
+        Filters:    filters,
+        Limit:      limit,
+        Offset:     offset,
+        SortBy:     sortBy,
+        SortOrder:  sortOrder,
+    }
+
+    // Execute search
+    users, total, err := h.userService.SearchUsers(ctx, searchReq)
+    if err != nil {
+        h.logger.Error("Failed to search users", 
+            util.ErrorField(err),
+            util.String("query", query),
+            util.String("admin_id", adminID.String()))
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users")
+        return
+    }
+
+    // Check if users is nil
+    if users == nil {
+        users = []*models.UserSearchResult{}
+    }
+
+    // Sanitize users before returning
+    sanitizedUsers := make([]map[string]interface{}, len(users))
+    for i, user := range users {
+        // Add nil check for user
+        if user == nil {
+            continue
+        }
+        sanitizedUsers[i] = map[string]interface{}{
+            "user_id":         user.UserID,
+            "username":        user.Username,
+            "full_name":       user.FullName,
+            "phone_hash":      user.PhoneHash,
+            "kyc_status":      user.KYCStatus,
+            "kyc_level":       user.KYCLevel,
+            "is_verified":     user.IsVerified,
+            "is_active":       user.IsActive,
+            "data_region":     user.DataRegion,
+            "created_at":      user.CreatedAt,
+            "last_login":      user.LastLogin,
+            "relevance_score": user.RelevanceScore,
+            "match_type":      user.MatchType,
+        }
+    }
+
+    response := map[string]interface{}{
+        "users": sanitizedUsers,
+        "meta": map[string]interface{}{
+            "query":       query,
+            "search_type": searchType,
+            "total":       total,
+            "count":       len(sanitizedUsers),
+            "limit":       limit,
+            "offset":      offset,
+            "has_more":    offset+limit < total,
+        },
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(response, "User search completed"))
+
+    h.logger.Info("User search executed by admin",
+        util.String("admin_id", adminID.String()),
+        util.String("query", query),
+        util.String("search_type", searchType),
+        util.Int("results", len(sanitizedUsers)),
+        util.Int("total", total),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
-
 // GetRecentlyActiveUsers gets users active since the given time
 func (h *AdminHandler) GetRecentlyActiveUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -3138,4 +3179,634 @@ func (h *AdminHandler) hasAdminOrPermission(r *http.Request, permission string) 
 		return true
 	}
 	return h.hasPermission(r, permission)
+}
+
+// ===== ADVANCED COMPANY SEARCH ENDPOINTS =====
+
+// SearchCompanies searches companies with advanced text search
+func (h *AdminHandler) SearchCompanies(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse query parameters
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("QUERY_REQUIRED"), "Search query is required")
+		return
+	}
+
+	// Parse pagination
+	limit := h.getIntQueryParam(r, "limit", 20)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	// Parse search type
+	searchType := r.URL.Query().Get("search_type")
+	if searchType == "" {
+		searchType = "all" // auto-detect based on query length
+	}
+
+	// Parse sort parameters
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "relevance"
+	}
+	sortOrder := r.URL.Query().Get("sort_order")
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
+
+	// Parse filters
+	var filters *models.CompanySearchFilters
+	tier := r.URL.Query().Get("tier")
+	status := r.URL.Query().Get("status")
+	region := r.URL.Query().Get("region")
+
+	if tier != "" || status != "" || region != "" {
+		filters = &models.CompanySearchFilters{
+			SubscriptionTier:   tier,
+			SubscriptionStatus: status,
+			DataRegion:        region,
+		}
+	}
+
+	// Build search request
+	searchReq := &service.SearchCompaniesRequest{
+		Query:      query,
+		SearchType: searchType,
+		Filters:    filters,
+		Limit:      limit,
+		Offset:     offset,
+		SortBy:     sortBy,
+		SortOrder:  sortOrder,
+	}
+
+	// Execute search
+	searchResp, err := h.companyService.SearchCompanies(ctx, searchReq)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search companies")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(searchResp, "Company search completed"))
+
+	h.logger.Info("Company search executed by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("query", query),
+		util.String("search_type", searchType),
+		util.Int("results", len(searchResp.Companies)),
+		util.Int("total", searchResp.Total),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// SearchCompaniesByOwner searches companies owned by a specific user
+func (h *AdminHandler) SearchCompaniesByOwner(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse owner ID from URL
+	ownerIDStr := chi.URLParam(r, "ownerID")
+	ownerID, err := uuid.Parse(ownerIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid owner ID")
+		return
+	}
+
+	// Parse query parameters
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("QUERY_REQUIRED"), "Search query is required")
+		return
+	}
+
+	// Parse pagination
+	limit := h.getIntQueryParam(r, "limit", 20)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	// Parse optional active filter
+	var isActive *bool
+	if activeParam := r.URL.Query().Get("active"); activeParam != "" {
+		active := activeParam == "true"
+		isActive = &active
+	}
+
+	// Execute search
+	searchResp, err := h.companyService.SearchCompaniesByOwner(ctx, ownerID, query, isActive, limit, offset)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search owner companies")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(searchResp, "Owner company search completed"))
+
+	h.logger.Info("Owner company search executed by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("owner_id", ownerID.String()),
+		util.String("query", query),
+		util.Int("results", len(searchResp.Companies)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetCompanySuggestions provides autocomplete suggestions for company names
+func (h *AdminHandler) GetCompanySuggestions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse prefix from query
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("PREFIX_REQUIRED"), "Prefix is required for suggestions")
+		return
+	}
+
+	// Parse limit
+	limit := h.getIntQueryParam(r, "limit", 10)
+
+	// Get suggestions
+	suggestions, err := h.companyService.GetCompanySuggestions(ctx, prefix, limit)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get suggestions")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "Company suggestions retrieved"))
+
+	h.logger.Debug("Company suggestions retrieved by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("prefix", prefix),
+		util.Int("suggestions", len(suggestions)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetCompanySearchAnalytics gets analytics about company search performance
+func (h *AdminHandler) GetCompanySearchAnalytics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Get search analytics
+	analytics, err := h.companyService.GetCompanySearchAnalytics(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get search analytics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(analytics, "Company search analytics retrieved"))
+
+	h.logger.Info("Company search analytics retrieved by admin",
+		util.String("admin_id", adminID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// BenchmarkCompanySearch benchmarks search performance
+func (h *AdminHandler) BenchmarkCompanySearch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	var req struct {
+		TestQueries []string `json:"test_queries"`
+		Iterations  int      `json:"iterations" validate:"min=1,max=100"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Default queries if not provided
+	if len(req.TestQueries) == 0 {
+		req.TestQueries = []string{
+			"tech",
+			"solution",
+			"enterprise",
+			"global",
+			"innov",
+			"corp",
+			"group",
+			"limited",
+		}
+	}
+
+	if req.Iterations == 0 {
+		req.Iterations = 10
+	}
+
+	// Run benchmark
+	results, err := h.companyService.BenchmarkCompanySearch(ctx, req.TestQueries, req.Iterations)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to run search benchmark")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(results, "Search benchmark completed"))
+
+	h.logger.Info("Company search benchmark executed by admin",
+		util.String("admin_id", adminID.String()),
+		util.Int("test_queries", len(req.TestQueries)),
+		util.Int("iterations", req.Iterations),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetUserSuggestions provides autocomplete suggestions for usernames and full names
+func (h *AdminHandler) GetUserSuggestions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse prefix from query
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("PREFIX_REQUIRED"), "Prefix is required for suggestions")
+		return
+	}
+
+	// Parse limit
+	limit := h.getIntQueryParam(r, "limit", 10)
+
+	// Get suggestions
+	suggestions, err := h.userService.GetUserSuggestions(ctx, prefix, limit)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user suggestions")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "User suggestions retrieved"))
+
+	h.logger.Debug("User suggestions retrieved by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("prefix", prefix),
+		util.Int("suggestions", len(suggestions)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// SearchUsersAdvanced searches users with advanced filters
+func (h *AdminHandler) SearchUsersAdvanced(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse query parameters for filters
+	filters := make(map[string]interface{})
+
+	if username := r.URL.Query().Get("username"); username != "" {
+		filters["username"] = username
+	}
+	if fullName := r.URL.Query().Get("full_name"); fullName != "" {
+		filters["full_name"] = fullName
+	}
+	if phoneHash := r.URL.Query().Get("phone_hash"); phoneHash != "" {
+		filters["phone_hash"] = phoneHash
+	}
+	if kycStatus := r.URL.Query().Get("kyc_status"); kycStatus != "" {
+		filters["kyc_status"] = kycStatus
+	}
+	if dataRegion := r.URL.Query().Get("data_region"); dataRegion != "" {
+		filters["data_region"] = dataRegion
+	}
+	if isVerified := r.URL.Query().Get("is_verified"); isVerified != "" {
+		filters["is_verified"] = isVerified == "true"
+	}
+	if isActive := r.URL.Query().Get("is_active"); isActive != "" {
+		filters["is_active"] = isActive == "true"
+	}
+	if deviceID := r.URL.Query().Get("device_id"); deviceID != "" {
+		filters["device_id"] = deviceID
+	}
+	if deviceFingerprint := r.URL.Query().Get("device_fingerprint"); deviceFingerprint != "" {
+		filters["device_fingerprint"] = deviceFingerprint
+	}
+
+	// Parse pagination
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	// Execute advanced search
+	users, total, err := h.userService.SearchUsersAdvanced(ctx, filters, limit, offset)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users with advanced filters")
+		return
+	}
+
+	// Sanitize users before returning
+	for _, user := range users {
+		h.sanitizeUserForAdmin(user)
+	}
+
+	response := map[string]interface{}{
+		"users": users,
+		"meta": map[string]interface{}{
+			"count":   len(users),
+			"total":   total,
+			"limit":   limit,
+			"offset":  offset,
+			"filters": filters,
+			"has_more": offset+limit < total,
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Advanced user search completed"))
+
+	h.logger.Info("Advanced user search executed by admin",
+		util.String("admin_id", adminID.String()),
+		util.Any("filters", filters),
+		util.Int("results", len(users)),
+		util.Int("total", total),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// SearchUsersByUsername searches users by username (partial match)
+func (h *AdminHandler) SearchUsersByUsername(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse username from query
+	username := r.URL.Query().Get("username")
+	if username == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("USERNAME_REQUIRED"), "Username is required")
+		return
+	}
+
+	// Parse limit
+	limit := h.getIntQueryParam(r, "limit", 20)
+
+	// Search by username
+	users, err := h.userService.SearchUsersByUsername(ctx, username, limit)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users by username")
+		return
+	}
+
+	// Sanitize users before returning
+	for _, user := range users {
+		h.sanitizeUserForAdmin(user)
+	}
+
+	response := map[string]interface{}{
+		"users": users,
+		"meta": map[string]interface{}{
+			"username":    username,
+			"count":       len(users),
+			"limit":       limit,
+			"search_type": "partial_match",
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Username search completed"))
+
+	h.logger.Info("Username search executed by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("username", username),
+		util.Int("results", len(users)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// SearchUsersByFullName searches users by full name (partial match)
+func (h *AdminHandler) SearchUsersByFullName(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	// Parse full name from query
+	fullName := r.URL.Query().Get("full_name")
+	if fullName == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("FULL_NAME_REQUIRED"), "Full name is required")
+		return
+	}
+
+	// Parse limit
+	limit := h.getIntQueryParam(r, "limit", 20)
+
+	// Search by full name
+	users, err := h.userService.SearchUsersByFullName(ctx, fullName, limit)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users by full name")
+		return
+	}
+
+	// Sanitize users before returning
+	for _, user := range users {
+		h.sanitizeUserForAdmin(user)
+	}
+
+	response := map[string]interface{}{
+		"users": users,
+		"meta": map[string]interface{}{
+			"full_name":   fullName,
+			"count":       len(users),
+			"limit":       limit,
+			"search_type": "partial_match",
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Full name search completed"))
+
+	h.logger.Info("Full name search executed by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("full_name", fullName),
+		util.Int("results", len(users)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// UpdateUser updates user information (username, full_name, etc.) - ADMIN ONLY
+func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+		return
+	}
+
+	var req struct {
+		Username          *string `json:"username,omitempty" validate:"omitempty,min=3,max=100,alphanum"`
+		FullName          *string `json:"full_name,omitempty" validate:"omitempty,max=255"`
+		DeviceID          *string `json:"device_id,omitempty"`
+		DeviceFingerprint *string `json:"device_fingerprint,omitempty"`
+		DataRegion        *string `json:"data_region,omitempty" validate:"omitempty,oneof=us eu as"`
+		IsVerified        *bool   `json:"is_verified,omitempty"`
+		IsActive          *bool   `json:"is_active,omitempty"`
+		KYCStatus         *string `json:"kyc_status,omitempty" validate:"omitempty,oneof=pending verified rejected under_review expired"`
+		KYCLevel          *string `json:"kyc_level,omitempty" validate:"omitempty,oneof=basic advanced full"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Convert to service request
+	updateReq := &service.UserUpdateRequest{
+		Username:          req.Username,
+		FullName:          req.FullName,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		DataRegion:        req.DataRegion,
+		IsVerified:        req.IsVerified,
+		IsActive:          req.IsActive,
+		KYCStatus:         req.KYCStatus,
+		KYCLevel:          req.KYCLevel,
+	}
+
+	// Call service to update user
+	user, err := h.userService.UpdateUser(ctx, userID, updateReq)
+	if err != nil {
+		statusCode := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") {
+			statusCode = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "already taken") {
+			statusCode = http.StatusConflict
+		} else if strings.Contains(err.Error(), "invalid") {
+			statusCode = http.StatusBadRequest
+		}
+		h.respondWithError(w, statusCode, err, "Failed to update user")
+		return
+	}
+
+	// Sanitize sensitive data
+	h.sanitizeUserForAdmin(user)
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(user, "User updated successfully"))
+
+	h.logger.Info("User updated by admin",
+		util.String("admin_id", adminID.String()),
+		util.String("user_id", userID.String()),
+		util.Any("updates", req),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+
+// GetBannedUsers returns users with is_active = false
+func (h *AdminHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    adminID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+        return
+    }
+
+    // Parse pagination
+    limit := h.getIntQueryParam(r, "limit", 100)
+    offset := h.getIntQueryParam(r, "offset", 0)
+
+    // Get banned users
+    users, total, err := h.userService.GetBannedUsers(ctx, limit, offset)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get banned users")
+        return
+    }
+
+    // Sanitize sensitive data before returning
+    sanitizedUsers := make([]map[string]interface{}, len(users))
+    for i, user := range users {
+        sanitizedUsers[i] = map[string]interface{}{
+            "user_id":           user.UserID,
+            "username":          user.Username,
+            "full_name":         user.FullName,
+            "phone_hash":        user.PhoneHash,
+            "kyc_status":        user.KYCStatus,
+            "kyc_level":         user.KYCLevel,
+            "is_verified":       user.IsVerified,
+            "is_active":         user.IsActive,
+            "data_region":       user.DataRegion,
+            "created_at":        user.CreatedAt,
+            "updated_at":        user.UpdatedAt,
+            "last_login":        user.LastLogin,
+            "device_id":         user.DeviceID,
+            "device_fingerprint": user.DeviceFingerprint,
+        }
+    }
+
+    response := map[string]interface{}{
+        "users": sanitizedUsers,
+        "meta": map[string]interface{}{
+            "count":    len(sanitizedUsers),
+            "total":    total,
+            "limit":    limit,
+            "offset":   offset,
+            "has_more": offset+limit < total,
+        },
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(response, "Banned users retrieved successfully"))
+
+    h.logger.Info("Banned users retrieved by admin",
+        util.String("admin_id", adminID.String()),
+        util.Int("count", len(users)),
+        util.Int("total", total),
+        util.Duration("duration", time.Since(startTime)))
 }

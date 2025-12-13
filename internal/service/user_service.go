@@ -39,6 +39,27 @@ const (
 	MaxConcurrentBatch = 10
 )
 
+
+// CompanyEmployeeSearchResult for company employee search
+type CompanyEmployeeSearchResult struct {
+    UserID          uuid.UUID  `db:"user_id" json:"user_id"`
+    Username        string     `db:"username" json:"username"`
+    FullName        *string    `db:"full_name" json:"full_name,omitempty"`
+    PhoneHash       string     `db:"phone_hash" json:"phone_hash"`
+    EmployeeID      string     `db:"employee_id" json:"employee_id"`
+    RoleID          uuid.UUID  `db:"role_id" json:"role_id"`
+    RoleName        string     `db:"role_name" json:"role_name"`
+    DepartmentID    *uuid.UUID `db:"department_id" json:"department_id,omitempty"`
+    DepartmentName  *string    `db:"department_name" json:"department_name,omitempty"`
+    HireDate        time.Time  `db:"hire_date" json:"hire_date"`
+    IsActive        bool       `db:"is_active" json:"is_active"`
+    ReportsTo       *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
+    ReportsToName   *string    `db:"reports_to_name" json:"reports_to_name,omitempty"`
+    CreatedAt       time.Time  `db:"created_at" json:"created_at"`
+    RelevanceScore  float64    `db:"relevance_score" json:"relevance_score"`
+    MatchType       string     `db:"match_type" json:"match_type"`
+}
+
 type UserService struct {
 	userRepo      postgres.UserRepository
 	hasher        *hashing.Hasher
@@ -58,25 +79,30 @@ type RateLimiter struct {
 }
 
 type UserCreateRequest struct {
-	PhoneNumber       string `json:"phone_number" validate:"required"`
-	DeviceID          string `json:"device_id" validate:"required"`
-	DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
-	DataRegion        string `json:"data_region" validate:"required"`
-	ConsentAgreed     bool   `json:"consent_agreed"`
-	ConsentVersion    string `json:"consent_version" validate:"required"`
+	Username          string    `json:"username" validate:"required,min=3,max=100,alphanum"`
+	FullName          string    `json:"full_name" validate:"max=255"`
+	PhoneNumber       string    `json:"phone_number" validate:"required"`
+	DeviceID          string    `json:"device_id" validate:"required"`
+	DeviceFingerprint string    `json:"device_fingerprint" validate:"required"`
+	DataRegion        string    `json:"data_region" validate:"required"`
+	ConsentAgreed     bool      `json:"consent_agreed"`
+	ConsentVersion    string    `json:"consent_version" validate:"required"`
+	KYCStatus         string    `json:"kyc_status" validate:"omitempty,oneof=pending verified rejected under_review expired"`
+	KYCLevel          string    `json:"kyc_level" validate:"omitempty,oneof=basic advanced full"`
 }
 
 type UserUpdateRequest struct {
+	Username          *string `json:"username,omitempty" validate:"omitempty,min=3,max=100,alphanum"`
+	FullName          *string `json:"full_name,omitempty" validate:"omitempty,max=255"`
 	DeviceID          *string `json:"device_id,omitempty"`
 	DeviceFingerprint *string `json:"device_fingerprint,omitempty"`
-	ProfileServiceID  *string `json:"profile_service_id,omitempty"`
-	DataRegion        *string `json:"data_region,omitempty"`
+	DataRegion        *string `json:"data_region,omitempty" validate:"omitempty,oneof=us eu as"`
+	IsVerified        *bool   `json:"is_verified,omitempty"`
+	IsActive          *bool   `json:"is_active,omitempty"`
+	KYCStatus         *string `json:"kyc_status,omitempty" validate:"omitempty,oneof=pending verified rejected under_review expired"`
+	KYCLevel          *string `json:"kyc_level,omitempty" validate:"omitempty,oneof=basic advanced full"`
 }
-type EncryptedData struct {
-	EncryptedData string
-	EncryptedDEK  string
-	KeyID         string
-}
+
 type KYCUpdateRequest struct {
 	UserID     uuid.UUID `json:"user_id" validate:"required"`
 	Status     string    `json:"status" validate:"required,oneof=pending verified rejected expired under_review"`
@@ -122,6 +148,7 @@ func NewUserServiceWithCache(
 	service.distCache = distCache
 	return service
 }
+
 func (s *UserService) SetLogProducerService(logProducer *LogProducerService) {
 	s.logProducer = logProducer
 }
@@ -141,6 +168,127 @@ func (s *UserService) GeneratePhoneHash(phoneNumber string) string {
 	hash := sha256.Sum256([]byte(normalized))
 	return hex.EncodeToString(hash[:])
 }
+
+// ============================================================================
+// NEW SEARCH METHODS
+// ============================================================================
+
+// SearchUsers searches users with full-text and trigram-based search
+func (s *UserService) SearchUsers(ctx context.Context, req *models.UserSearchRequest) ([]*models.UserSearchResult, int, error) {
+	startTime := time.Now()
+
+	results, total, err := s.userRepo.SearchUsers(ctx, req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to search users: %w", err)
+	}
+
+	s.logger.Debug("User search completed",
+		util.String("query", req.Query),
+		util.String("search_type", req.SearchType),
+		util.Int("results", len(results)),
+		util.Int("total", total),
+		util.Duration("duration", time.Since(startTime)))
+
+	return results, total, nil
+}
+
+// SearchUsersByUsername searches users by username (partial match)
+func (s *UserService) SearchUsersByUsername(ctx context.Context, username string, limit int) ([]*models.User, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	users, err := s.userRepo.SearchUsersByUsername(ctx, username, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search users by username: %w", err)
+	}
+
+	// Cache found users
+	for _, user := range users {
+		s.cacheUser(ctx, user)
+	}
+
+	return users, nil
+}
+
+// SearchUsersByFullName searches users by full name (partial match)
+func (s *UserService) SearchUsersByFullName(ctx context.Context, fullName string, limit int) ([]*models.User, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	users, err := s.userRepo.SearchUsersByFullName(ctx, fullName, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search users by full name: %w", err)
+	}
+
+	// Cache found users
+	for _, user := range users {
+		s.cacheUser(ctx, user)
+	}
+
+	return users, nil
+}
+
+// GetUserSuggestions returns user suggestions for autocomplete
+func (s *UserService) GetUserSuggestions(ctx context.Context, prefix string, limit int) ([]*models.UserSuggestion, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
+
+	suggestions, err := s.userRepo.GetUserSuggestions(ctx, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user suggestions: %w", err)
+	}
+
+	return suggestions, nil
+}
+
+// FindUserByUsername finds a user by exact username
+func (s *UserService) FindUserByUsername(ctx context.Context, username string) (*models.UserByUsername, error) {
+	user, err := s.userRepo.FindUserByUsername(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find user by username: %w", err)
+	}
+
+	return user, nil
+}
+
+// SearchUsersAdvanced searches users with advanced filters
+func (s *UserService) SearchUsersAdvanced(ctx context.Context, filters map[string]interface{}, limit, offset int) ([]*models.User, int, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	users, total, err := s.userRepo.SearchUsersAdvanced(ctx, filters, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to search users: %w", err)
+	}
+
+	// Cache found users
+	for _, user := range users {
+		s.cacheUser(ctx, user)
+	}
+
+	return users, total, nil
+}
+
+// GetUserSearchStats gets search statistics
+func (s *UserService) GetUserSearchStats(ctx context.Context) (map[string]interface{}, error) {
+	stats, err := s.userRepo.GetUserSearchStats(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user search stats: %w", err)
+	}
+
+	return stats, nil
+}
+
+// ============================================================================
+// EXISTING METHODS (UPDATED FOR USERNAME/FULL_NAME)
+// ============================================================================
 
 func (s *UserService) GetUserByPhone(ctx context.Context, phoneNumber string) (*models.User, error) {
 	phoneHash := s.GeneratePhoneHash(phoneNumber)
@@ -167,324 +315,22 @@ func (s *UserService) GetUserByPhone(ctx context.Context, phoneNumber string) (*
 	return user, nil
 }
 
-// DecryptPhoneNumber decrypts the user's phone number - FIXED VERSION
-func (s *UserService) DecryptPhoneNumber(ctx context.Context, user *models.User) (string, error) {
-	if len(user.PhoneEncrypted) == 0 {
-		return "", fmt.Errorf("no encrypted phone data available")
-	}
-
-	// ✅ CORRECT: Create proper encrypted data structure
-	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: string(user.PhoneEncrypted),
-		EncryptedDEK:   user.PhoneEncryptedDEK,
-		KeyID:          user.PhoneKeyID.String(),
-	}
-
-	// ✅ Use DecryptField
-	return s.encryptionMgr.DecryptField(ctx, encryptedData)
-}
-
-// ReencryptPhoneNumber re-encrypts the phone number with a new key - FIXED VERSION
-func (s *UserService) ReencryptPhoneNumber(ctx context.Context, userID uuid.UUID) error {
-	user, err := s.GetUserByID(ctx, userID)
+func (s *UserService) GetUserByUsername(ctx context.Context, username string) (*models.User, error) {
+	user, err := s.userRepo.GetUserByUsername(ctx, username)
 	if err != nil {
-		return err
-	}
-
-	// Decrypt current phone number
-	phoneNumber, err := s.DecryptPhoneNumber(ctx, user)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt phone number: %w", err)
-	}
-
-	// Re-encrypt with new key
-	encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, phoneNumber, "phone")
-	if err != nil {
-		return fmt.Errorf("failed to re-encrypt phone number: %w", err)
-	}
-
-	keyID, err := uuid.Parse(encryptedPhone.KeyID)
-	if err != nil {
-		return fmt.Errorf("failed to parse key ID: %w", err)
-	}
-
-	// ✅ FIXED: Use UpdateUserFields to update all encrypted fields
-	fields := map[string]interface{}{
-		"phone_encrypted":     []byte(encryptedPhone.EncryptedValue),
-		"phone_key_id":        keyID,
-		"phone_encrypted_dek": encryptedPhone.EncryptedDEK,
-		"updated_at":          time.Now().UTC(),
-	}
-
-	if err := s.userRepo.UpdateUserFields(ctx, userID, fields); err != nil {
-		return fmt.Errorf("failed to update user with re-encrypted phone: %w", err)
-	}
-
-	s.invalidateUserCache(ctx, userID)
-	s.logger.Info("Phone number re-encrypted successfully",
-		util.String("user_id", userID.String()),
-	)
-
-	return nil
-}
-
-// CreateUser creates a new user with encrypted phone number
-func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*models.User, error) {
-	startTime := time.Now()
-
-	if err := s.validateCreateRequest(req); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
-	}
-
-	phoneHash := s.GeneratePhoneHash(req.PhoneNumber)
-
-	existingUser, err := s.userRepo.GetUserByPhoneHash(ctx, phoneHash)
-	if err == nil && existingUser != nil {
-		return nil, ErrUserAlreadyExists
-	}
-
-	userID := uuid.New()
-
-	// ✅ FIXED: Use correct encryption method and struct
-	encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, req.PhoneNumber, "phone")
-	if err != nil {
-		s.logUserEvent(ctx, &models.UserLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "user",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to encrypt phone during user creation",
-			},
-			UserID:      userID.String(),
-			Action:      "create_user",
-			PhoneNumber: req.PhoneNumber,
-			Status:      "failed",
-			ErrorCode:   "PHONE_ENCRYPTION_FAILED",
-			Duration:    int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to encrypt phone: %w", err)
-	}
-
-	keyID, err := uuid.Parse(encryptedPhone.KeyID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse key ID: %w", err)
-	}
-
-	now := time.Now().UTC()
-	user := &models.User{
-		UserID:            userID,
-		PhoneHash:         phoneHash,
-		PhoneEncrypted:    []byte(encryptedPhone.EncryptedValue),
-		PhoneKeyID:        keyID,
-		PhoneEncryptedDEK: encryptedPhone.EncryptedDEK, // ✅ This is set
-		DeviceID:          req.DeviceID,
-		DeviceFingerprint: req.DeviceFingerprint,
-		KYCStatus:         models.KYCStatusPending,
-		KYCLevel:          models.KYCLevelBasic,
-		KYCVerifiedAt:     nil,
-		IsVerified:        false,
-		IsActive:          true,
-		DataRegion:        req.DataRegion,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-		LastLogin:         nil,
-	}
-
-	if err := s.userRepo.CreateUser(ctx, user); err != nil {
-		s.logUserEvent(ctx, &models.UserLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "user",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to create user in database",
-			},
-			UserID:      userID.String(),
-			Action:      "create_user",
-			PhoneNumber: req.PhoneNumber,
-			Status:      "failed",
-			ErrorCode:   "CREATE_USER_FAILED",
-			Duration:    int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to create user: %w", err)
+		return nil, fmt.Errorf("failed to get user by username: %w", err)
 	}
 
 	s.cacheUser(ctx, user)
-	s.cachePhoneMapping(ctx, phoneHash, userID)
-
-	s.logUserEvent(ctx, &models.UserLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "user",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "User created successfully",
-		},
-		UserID:      userID.String(),
-		Action:      "create_user",
-		PhoneNumber: req.PhoneNumber,
-		Status:      "success",
-		DeviceID:    req.DeviceID,
-		Changes: map[string]interface{}{
-			"data_region":     req.DataRegion,
-			"consent_agreed":  req.ConsentAgreed,
-			"consent_version": req.ConsentVersion,
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	s.logger.Info("User created successfully",
-		util.String("user_id", userID.String()),
-		util.String("phone_hash", phoneHash),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
-	return user, nil
-}
-
-// CreateUserForCompanyOwner creates a user for a company owner
-func (s *UserService) CreateUserForCompanyOwner(ctx context.Context, phone, dataRegion string) (*models.User, error) {
-	startTime := time.Now()
-
-	if phone == "" {
-		return nil, fmt.Errorf("phone number is required")
-	}
-	if dataRegion == "" {
-		return nil, fmt.Errorf("data region is required")
-	}
-
-	phoneHash := s.GeneratePhoneHash(phone)
-
-	existingUser, err := s.userRepo.GetUserByPhoneHash(ctx, phoneHash)
-	if err == nil && existingUser != nil {
-		return existingUser, nil
-	}
-
-	userID := uuid.New()
-
-	// ✅ FIXED: Use correct encrypt method
-	encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, phone, "phone")
-	if err != nil {
-		s.logUserEvent(ctx, &models.UserLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "user",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to encrypt phone during company owner user creation",
-			},
-			UserID:      userID.String(),
-			Action:      "create_company_owner_user",
-			PhoneNumber: phone,
-			Status:      "failed",
-			ErrorCode:   "PHONE_ENCRYPTION_FAILED",
-			Duration:    int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to encrypt phone: %w", err)
-	}
-
-	keyID, err := uuid.Parse(encryptedPhone.KeyID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse key ID: %w", err)
-	}
-
-	now := time.Now().UTC()
-	user := &models.User{
-		UserID:            userID,
-		PhoneHash:         phoneHash,
-		PhoneEncrypted:    []byte(encryptedPhone.EncryptedValue),
-		PhoneKeyID:        keyID,
-		PhoneEncryptedDEK: encryptedPhone.EncryptedDEK, // ✅ This is set
-		DeviceID:          "company-owner-admin",
-		DeviceFingerprint: "company-owner-admin",
-		KYCStatus:         models.KYCStatusPending,
-		KYCLevel:          models.KYCLevelBasic,
-		KYCVerifiedAt:     nil,
-		IsVerified:        false,
-		IsActive:          true,
-		DataRegion:        dataRegion,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-		LastLogin:         nil,
-	}
-
-	if err := s.userRepo.CreateUser(ctx, user); err != nil {
-		s.logUserEvent(ctx, &models.UserLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "user",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to create company owner user in database",
-			},
-			UserID:      userID.String(),
-			Action:      "create_company_owner_user",
-			PhoneNumber: phone,
-			Status:      "failed",
-			ErrorCode:   "CREATE_USER_FAILED",
-			Duration:    int64(time.Since(startTime).Milliseconds()),
-		})
-		return nil, fmt.Errorf("failed to create user: %w", err)
-	}
-
-	s.cacheUser(ctx, user)
-	s.cachePhoneMapping(ctx, phoneHash, userID)
-
-	s.logUserEvent(ctx, &models.UserLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "user",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Company owner user created successfully",
-		},
-		UserID:      userID.String(),
-		Action:      "create_company_owner_user",
-		PhoneNumber: phone,
-		Status:      "success",
-		Changes: map[string]interface{}{
-			"data_region": dataRegion,
-			"purpose":     "company_owner",
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	s.logger.Info("Company owner user created successfully",
-		util.String("user_id", userID.String()),
-		util.String("phone_hash", phoneHash),
-		util.Duration("duration", time.Since(startTime)),
-	)
-
 	return user, nil
 }
 
 func (s *UserService) GetUserByID(ctx context.Context, userID uuid.UUID) (*models.User, error) {
 	if user, ok := s.localCache.Get(userID); ok {
-		// ✅ Optional: Validate that encrypted data is complete
 		if err := s.validateUserEncryptionData(user); err != nil {
 			s.logger.Warn("User encryption data incomplete in cache",
 				util.String("user_id", userID.String()),
 				util.ErrorField(err))
-			// Continue to fetch from database
 		} else {
 			return user, nil
 		}
@@ -511,18 +357,149 @@ func (s *UserService) GetUserByID(ctx context.Context, userID uuid.UUID) (*model
 	return user, nil
 }
 
-// Helper method to validate encryption data
-func (s *UserService) validateUserEncryptionData(user *models.User) error {
-	if len(user.PhoneEncrypted) == 0 {
-		return fmt.Errorf("phone encrypted data is empty")
+func (s *UserService) CreateUser(ctx context.Context, req *UserCreateRequest) (*models.User, error) {
+	startTime := time.Now()
+
+	if err := s.validateCreateRequest(req); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidInput, err)
 	}
-	if user.PhoneKeyID == uuid.Nil {
-		return fmt.Errorf("phone key ID is empty")
+
+	// Check if username already exists
+	existingByUsername, err := s.userRepo.GetUserByUsername(ctx, req.Username)
+	if err == nil && existingByUsername != nil {
+		return nil, fmt.Errorf("username already exists")
 	}
-	if user.PhoneEncryptedDEK == "" {
-		return fmt.Errorf("phone encrypted DEK is empty")
+
+	phoneHash := s.GeneratePhoneHash(req.PhoneNumber)
+
+	existingByPhone, err := s.userRepo.GetUserByPhoneHash(ctx, phoneHash)
+	if err == nil && existingByPhone != nil {
+		return nil, ErrUserAlreadyExists
 	}
-	return nil
+
+	userID := uuid.New()
+
+	// Encrypt phone number
+	encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, req.PhoneNumber, "phone")
+	if err != nil {
+		s.logUserEvent(ctx, &models.UserLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "user",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to encrypt phone during user creation",
+			},
+			UserID:      userID.String(),
+			Action:      "create_user",
+			Username:    req.Username,
+			PhoneNumber: req.PhoneNumber,
+			Status:      "failed",
+			ErrorCode:   "PHONE_ENCRYPTION_FAILED",
+			Duration:    int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, fmt.Errorf("failed to encrypt phone: %w", err)
+	}
+
+	keyID, err := uuid.Parse(encryptedPhone.KeyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse key ID: %w", err)
+	}
+
+	now := time.Now().UTC()
+	user := &models.User{
+		UserID:            userID,
+		Username:          req.Username,
+		FullName:          req.FullName,
+		PhoneHash:         phoneHash,
+		PhoneEncrypted:    []byte(encryptedPhone.EncryptedValue),
+		PhoneKeyID:        keyID,
+		PhoneEncryptedDEK: encryptedPhone.EncryptedDEK,
+		DeviceID:          req.DeviceID,
+		DeviceFingerprint: req.DeviceFingerprint,
+		KYCStatus:         req.KYCStatus,
+		KYCLevel:          req.KYCLevel,
+		KYCVerifiedAt:     nil,
+		IsVerified:        false,
+		IsActive:          true,
+		DataRegion:        req.DataRegion,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		LastLogin:         nil,
+	}
+
+	if req.KYCStatus == "" {
+		user.KYCStatus = models.KYCStatusPending
+	}
+	if req.KYCLevel == "" {
+		user.KYCLevel = models.KYCLevelBasic
+	}
+
+	if err := s.userRepo.CreateUser(ctx, user); err != nil {
+		s.logUserEvent(ctx, &models.UserLogEvent{
+			LogEnvelope: models.LogEnvelope{
+				EventID:     uuid.New().String(),
+				EventType:   "user",
+				ServiceName: "auth-service",
+				Timestamp:   time.Now(),
+				Environment: "production",
+				Version:     "v1.0.0",
+				Level:       "error",
+				Message:     "Failed to create user in database",
+			},
+			UserID:      userID.String(),
+			Action:      "create_user",
+			Username:    req.Username,
+			PhoneNumber: req.PhoneNumber,
+			Status:      "failed",
+			ErrorCode:   "CREATE_USER_FAILED",
+			Duration:    int64(time.Since(startTime).Milliseconds()),
+		})
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	s.cacheUser(ctx, user)
+	s.cachePhoneMapping(ctx, phoneHash, userID)
+
+	s.logUserEvent(ctx, &models.UserLogEvent{
+		LogEnvelope: models.LogEnvelope{
+			EventID:     uuid.New().String(),
+			EventType:   "user",
+			ServiceName: "auth-service",
+			Timestamp:   time.Now(),
+			Environment: "production",
+			Version:     "v1.0.0",
+			Level:       "info",
+			Message:     "User created successfully",
+		},
+		UserID:      userID.String(),
+		Action:      "create_user",
+		Username:    req.Username,
+		FullName:    req.FullName,
+		PhoneNumber: req.PhoneNumber,
+		Status:      "success",
+		DeviceID:    req.DeviceID,
+		Changes: map[string]interface{}{
+			"data_region":     req.DataRegion,
+			"consent_agreed":  req.ConsentAgreed,
+			"consent_version": req.ConsentVersion,
+			"kyc_status":      user.KYCStatus,
+			"kyc_level":       user.KYCLevel,
+		},
+		Duration: int64(time.Since(startTime).Milliseconds()),
+	})
+
+	s.logger.Info("User created successfully",
+		util.String("user_id", userID.String()),
+		util.String("username", req.Username),
+		util.String("phone_hash", phoneHash),
+		util.Duration("duration", time.Since(startTime)),
+	)
+
+	return user, nil
 }
 
 func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *UserUpdateRequest) (*models.User, error) {
@@ -535,6 +512,27 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 
 	changes := make(map[string]interface{})
 
+	// Check if username is being changed and if it's available
+	if req.Username != nil && *req.Username != user.Username {
+		existingUser, err := s.userRepo.GetUserByUsername(ctx, *req.Username)
+		if err == nil && existingUser != nil && existingUser.UserID != userID {
+			return nil, fmt.Errorf("username already taken")
+		}
+		changes["username"] = map[string]interface{}{
+			"old": user.Username,
+			"new": *req.Username,
+		}
+		user.Username = *req.Username
+	}
+
+	if req.FullName != nil && *req.FullName != user.FullName {
+		changes["full_name"] = map[string]interface{}{
+			"old": user.FullName,
+			"new": *req.FullName,
+		}
+		user.FullName = *req.FullName
+	}
+
 	if req.DeviceID != nil && *req.DeviceID != user.DeviceID {
 		changes["device_id"] = map[string]interface{}{
 			"old": user.DeviceID,
@@ -542,6 +540,7 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 		}
 		user.DeviceID = *req.DeviceID
 	}
+
 	if req.DeviceFingerprint != nil && *req.DeviceFingerprint != user.DeviceFingerprint {
 		changes["device_fingerprint"] = map[string]interface{}{
 			"old": user.DeviceFingerprint,
@@ -549,12 +548,45 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 		}
 		user.DeviceFingerprint = *req.DeviceFingerprint
 	}
+
 	if req.DataRegion != nil && *req.DataRegion != user.DataRegion {
 		changes["data_region"] = map[string]interface{}{
 			"old": user.DataRegion,
 			"new": *req.DataRegion,
 		}
 		user.DataRegion = *req.DataRegion
+	}
+
+	if req.IsVerified != nil && *req.IsVerified != user.IsVerified {
+		changes["is_verified"] = map[string]interface{}{
+			"old": user.IsVerified,
+			"new": *req.IsVerified,
+		}
+		user.IsVerified = *req.IsVerified
+	}
+
+	if req.IsActive != nil && *req.IsActive != user.IsActive {
+		changes["is_active"] = map[string]interface{}{
+			"old": user.IsActive,
+			"new": *req.IsActive,
+		}
+		user.IsActive = *req.IsActive
+	}
+
+	if req.KYCStatus != nil && *req.KYCStatus != user.KYCStatus {
+		changes["kyc_status"] = map[string]interface{}{
+			"old": user.KYCStatus,
+			"new": *req.KYCStatus,
+		}
+		user.KYCStatus = *req.KYCStatus
+	}
+
+	if req.KYCLevel != nil && *req.KYCLevel != user.KYCLevel {
+		changes["kyc_level"] = map[string]interface{}{
+			"old": user.KYCLevel,
+			"new": *req.KYCLevel,
+		}
+		user.KYCLevel = *req.KYCLevel
 	}
 
 	user.UpdatedAt = time.Now().UTC()
@@ -571,12 +603,12 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 				Level:       "error",
 				Message:     "Failed to update user in database",
 			},
-			UserID:    userID.String(),
-			Action:    "update_user",
-			Status:    "failed",
+			UserID:   userID.String(),
+			Action:   "update_user",
+			Status:   "failed",
 			ErrorCode: "UPDATE_USER_FAILED",
-			Changes:   changes,
-			Duration:  int64(time.Since(startTime).Milliseconds()),
+			Changes:  changes,
+			Duration: int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
@@ -608,6 +640,64 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 	)
 
 	return user, nil
+}
+
+// ============================================================================
+// ADDITIONAL METHODS
+// ============================================================================
+
+func (s *UserService) DecryptPhoneNumber(ctx context.Context, user *models.User) (string, error) {
+	if len(user.PhoneEncrypted) == 0 {
+		return "", fmt.Errorf("no encrypted phone data available")
+	}
+
+	encryptedData := &encryption.EncryptedData{
+		EncryptedValue: string(user.PhoneEncrypted),
+		EncryptedDEK:   user.PhoneEncryptedDEK,
+		KeyID:          user.PhoneKeyID.String(),
+	}
+
+	return s.encryptionMgr.DecryptField(ctx, encryptedData)
+}
+
+func (s *UserService) ReencryptPhoneNumber(ctx context.Context, userID uuid.UUID) error {
+	user, err := s.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	phoneNumber, err := s.DecryptPhoneNumber(ctx, user)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt phone number: %w", err)
+	}
+
+	encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, phoneNumber, "phone")
+	if err != nil {
+		return fmt.Errorf("failed to re-encrypt phone number: %w", err)
+	}
+
+	keyID, err := uuid.Parse(encryptedPhone.KeyID)
+	if err != nil {
+		return fmt.Errorf("failed to parse key ID: %w", err)
+	}
+
+	fields := map[string]interface{}{
+		"phone_encrypted":     []byte(encryptedPhone.EncryptedValue),
+		"phone_key_id":        keyID,
+		"phone_encrypted_dek": encryptedPhone.EncryptedDEK,
+		"updated_at":          time.Now().UTC(),
+	}
+
+	if err := s.userRepo.UpdateUserFields(ctx, userID, fields); err != nil {
+		return fmt.Errorf("failed to update user with re-encrypted phone: %w", err)
+	}
+
+	s.invalidateUserCache(ctx, userID)
+	s.logger.Info("Phone number re-encrypted successfully",
+		util.String("user_id", userID.String()),
+	)
+
+	return nil
 }
 
 func (s *UserService) UpdateUserStatus(ctx context.Context, userID uuid.UUID, isVerified, isActive bool) error {
@@ -727,12 +817,19 @@ func (s *UserService) CreateUsersBatch(ctx context.Context, requests []*UserCrea
 	}
 
 	phoneHashes := make(map[string]bool, len(requests))
+	usernames := make(map[string]bool, len(requests))
+	
 	for _, req := range requests {
 		phoneHash := s.GeneratePhoneHash(req.PhoneNumber)
 		if phoneHashes[phoneHash] {
 			return nil, fmt.Errorf("duplicate phone number in batch: %s", req.PhoneNumber)
 		}
 		phoneHashes[phoneHash] = true
+		
+		if usernames[req.Username] {
+			return nil, fmt.Errorf("duplicate username in batch: %s", req.Username)
+		}
+		usernames[req.Username] = true
 	}
 
 	users := make([]*models.User, 0, len(requests))
@@ -779,6 +876,7 @@ func (s *UserService) processUserBatch(ctx context.Context, requests []*UserCrea
 		if err != nil {
 			s.logger.Error("Failed to create user in batch",
 				util.ErrorField(err),
+				util.String("username", req.Username),
 				util.String("phone", req.PhoneNumber),
 			)
 			continue
@@ -834,7 +932,6 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 		return err
 	}
 
-	// FIXED: Use UpdateUserFields instead of UpdateKYCStatus with wrong parameters
 	now := time.Now().UTC()
 	fields := map[string]interface{}{
 		"kyc_status":      req.Status,
@@ -928,12 +1025,52 @@ func (s *UserService) GetUsersByKYCStatus(ctx context.Context, status string, li
 	return s.userRepo.GetUsersByKYCStatus(ctx, status, limit, offset)
 }
 
+func (s *UserService) GetUsersByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.User, int, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	return s.userRepo.GetUsersByCompany(ctx, companyID, limit, offset)
+}
+
+func (s *UserService) GetUsersByRegion(ctx context.Context, region string, limit, offset int) ([]*models.User, int, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	return s.userRepo.GetUsersByRegion(ctx, region, limit, offset)
+}
+
+func (s *UserService) GetUsersCreatedAfter(ctx context.Context, after time.Time, limit, offset int) ([]*models.User, int, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	return s.userRepo.GetUsersCreatedAfter(ctx, after, limit, offset)
+}
+
+func (s *UserService) GetUsersByCreationDateRange(ctx context.Context, start, end time.Time, limit int) ([]*models.User, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	return s.userRepo.GetUsersByCreationDateRange(ctx, start, end, limit)
+}
+
 // ============================================================================
-// CACHE METHODS - FIXED
+// CACHE METHODS
 // ============================================================================
 
 func (s *UserService) cacheUser(ctx context.Context, user *models.User) {
-	// ✅ Validate we have complete encryption data before caching
 	if err := s.validateUserEncryptionData(user); err != nil {
 		s.logger.Warn("Not caching user with incomplete encryption data",
 			util.String("user_id", user.UserID.String()),
@@ -976,11 +1113,33 @@ func (s *UserService) invalidateUserCache(ctx context.Context, userID uuid.UUID)
 	}
 }
 
+func (s *UserService) validateUserEncryptionData(user *models.User) error {
+	if len(user.PhoneEncrypted) == 0 {
+		return fmt.Errorf("phone encrypted data is empty")
+	}
+	if user.PhoneKeyID == uuid.Nil {
+		return fmt.Errorf("phone key ID is empty")
+	}
+	if user.PhoneEncryptedDEK == "" {
+		return fmt.Errorf("phone encrypted DEK is empty")
+	}
+	return nil
+}
+
 // ============================================================================
 // VALIDATION METHODS
 // ============================================================================
 
 func (s *UserService) validateCreateRequest(req *UserCreateRequest) error {
+	if req.Username == "" {
+		return fmt.Errorf("username is required")
+	}
+	if len(req.Username) < 3 || len(req.Username) > 100 {
+		return fmt.Errorf("username must be between 3 and 100 characters")
+	}
+	if req.FullName != "" && len(req.FullName) > 255 {
+		return fmt.Errorf("full name must be less than 255 characters")
+	}
 	if req.PhoneNumber == "" {
 		return fmt.Errorf("phone number is required")
 	}
@@ -999,8 +1158,44 @@ func (s *UserService) validateCreateRequest(req *UserCreateRequest) error {
 	if req.ConsentAgreed && req.ConsentVersion == "" {
 		return fmt.Errorf("consent version is required when consent is agreed")
 	}
+	if req.KYCStatus != "" && !isValidKYCStatus(req.KYCStatus) {
+		return fmt.Errorf("invalid KYC status")
+	}
+	if req.KYCLevel != "" && !isValidKYCLevel(req.KYCLevel) {
+		return fmt.Errorf("invalid KYC level")
+	}
 
 	return nil
+}
+
+func isValidKYCStatus(status string) bool {
+	validStatuses := []string{
+		models.KYCStatusPending,
+		models.KYCStatusVerified,
+		models.KYCStatusRejected,
+		models.KYCStatusUnderReview,
+		models.KYCStatusExpired,
+	}
+	for _, s := range validStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidKYCLevel(level string) bool {
+	validLevels := []string{
+		models.KYCLevelBasic,
+		models.KYCLevelAdvanced,
+		models.KYCLevelFull,
+	}
+	for _, l := range validLevels {
+		if l == level {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *UserService) validateKYCStatusTransition(currentStatus, newStatus string) error {
@@ -1062,14 +1257,9 @@ func (s *UserService) Cleanup() {
 }
 
 // ============================================================================
-// UTILITY FUNCTIONS
+// ADDITIONAL SERVICE METHODS
 // ============================================================================
 
-// ============================================================================
-// NEW SERVICE METHODS
-// ============================================================================
-
-// SoftDeleteUser soft deletes a user by marking as inactive
 func (s *UserService) SoftDeleteUser(ctx context.Context, userID uuid.UUID, reason string) error {
 	startTime := time.Now()
 
@@ -1126,7 +1316,6 @@ func (s *UserService) SoftDeleteUser(ctx context.Context, userID uuid.UUID, reas
 	return nil
 }
 
-// ReactivateUser reactivates a soft-deleted user
 func (s *UserService) ReactivateUser(ctx context.Context, userID uuid.UUID) error {
 	startTime := time.Now()
 
@@ -1182,29 +1371,6 @@ func (s *UserService) ReactivateUser(ctx context.Context, userID uuid.UUID) erro
 	return nil
 }
 
-// SearchUsers searches users with various filters
-func (s *UserService) SearchUsers(ctx context.Context, filters map[string]interface{}, limit, offset int) ([]*models.User, int, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	users, totalCount, err := s.userRepo.SearchUsers(ctx, filters, limit, offset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to search users: %w", err)
-	}
-
-	// Cache the found users
-	for _, user := range users {
-		s.cacheUser(ctx, user)
-	}
-
-	return users, totalCount, nil
-}
-
-// GetRecentlyActiveUsers gets users active since the given time
 func (s *UserService) GetRecentlyActiveUsers(ctx context.Context, since time.Time, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -1215,7 +1381,6 @@ func (s *UserService) GetRecentlyActiveUsers(ctx context.Context, since time.Tim
 		return nil, fmt.Errorf("failed to get recently active users: %w", err)
 	}
 
-	// Cache the found users
 	for _, user := range users {
 		s.cacheUser(ctx, user)
 	}
@@ -1223,7 +1388,6 @@ func (s *UserService) GetRecentlyActiveUsers(ctx context.Context, since time.Tim
 	return users, nil
 }
 
-// GetInactiveUsersSince gets users inactive since the given time
 func (s *UserService) GetInactiveUsersSince(ctx context.Context, since time.Time, limit int) ([]*models.User, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -1237,7 +1401,6 @@ func (s *UserService) GetInactiveUsersSince(ctx context.Context, since time.Time
 	return users, nil
 }
 
-// RecordLoginAttempt records a user login attempt
 func (s *UserService) RecordLoginAttempt(ctx context.Context, userID uuid.UUID, success bool, ip, userAgent string) error {
 	if err := s.userRepo.RecordLoginAttempt(ctx, userID, success, ip, userAgent); err != nil {
 		s.logger.Warn("Failed to record login attempt",
@@ -1246,7 +1409,6 @@ func (s *UserService) RecordLoginAttempt(ctx context.Context, userID uuid.UUID, 
 		return fmt.Errorf("failed to record login attempt: %w", err)
 	}
 
-	// Update last login if successful
 	if success {
 		if err := s.UpdateLastLogin(ctx, userID); err != nil {
 			s.logger.Warn("Failed to update last login after successful attempt",
@@ -1258,7 +1420,6 @@ func (s *UserService) RecordLoginAttempt(ctx context.Context, userID uuid.UUID, 
 	return nil
 }
 
-// GetRecentLoginAttempts gets recent login attempts for a user
 func (s *UserService) GetRecentLoginAttempts(ctx context.Context, userID uuid.UUID, limit int) ([]models.LoginAttempt, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
@@ -1272,7 +1433,6 @@ func (s *UserService) GetRecentLoginAttempts(ctx context.Context, userID uuid.UU
 	return attempts, nil
 }
 
-// GetUserGrowthMetrics gets comprehensive user growth metrics
 func (s *UserService) GetUserGrowthMetrics(ctx context.Context, since time.Time) (map[string]interface{}, error) {
 	metrics, err := s.userRepo.GetUserGrowthMetrics(ctx, since)
 	if err != nil {
@@ -1282,7 +1442,6 @@ func (s *UserService) GetUserGrowthMetrics(ctx context.Context, since time.Time)
 	return metrics, nil
 }
 
-// GetUserActivityStats gets user activity statistics
 func (s *UserService) GetUserActivityStats(ctx context.Context, since time.Time) (map[string]interface{}, error) {
 	stats, err := s.userRepo.GetUserActivityStats(ctx, since)
 	if err != nil {
@@ -1292,7 +1451,6 @@ func (s *UserService) GetUserActivityStats(ctx context.Context, since time.Time)
 	return stats, nil
 }
 
-// GetKYCDistribution gets KYC status distribution
 func (s *UserService) GetKYCDistribution(ctx context.Context) (map[string]int, error) {
 	distribution, err := s.userRepo.GetKYCDistribution(ctx)
 	if err != nil {
@@ -1302,7 +1460,6 @@ func (s *UserService) GetKYCDistribution(ctx context.Context) (map[string]int, e
 	return distribution, nil
 }
 
-// GetActiveUserCountsByRegion gets active user counts by region
 func (s *UserService) GetActiveUserCountsByRegion(ctx context.Context) (map[string]int, error) {
 	counts, err := s.userRepo.GetActiveUserCountsByRegion(ctx)
 	if err != nil {
@@ -1312,7 +1469,6 @@ func (s *UserService) GetActiveUserCountsByRegion(ctx context.Context) (map[stri
 	return counts, nil
 }
 
-// AddUserDevice adds a new device for a user
 func (s *UserService) AddUserDevice(ctx context.Context, device *models.UserDevice) error {
 	if err := s.userRepo.AddUserDevice(ctx, device); err != nil {
 		return fmt.Errorf("failed to add user device: %w", err)
@@ -1325,7 +1481,6 @@ func (s *UserService) AddUserDevice(ctx context.Context, device *models.UserDevi
 	return nil
 }
 
-// GetUserDevices gets all devices for a user
 func (s *UserService) GetUserDevices(ctx context.Context, userID uuid.UUID) ([]models.UserDevice, error) {
 	devices, err := s.userRepo.GetUserDevices(ctx, userID)
 	if err != nil {
@@ -1335,7 +1490,6 @@ func (s *UserService) GetUserDevices(ctx context.Context, userID uuid.UUID) ([]m
 	return devices, nil
 }
 
-// RemoveUserDevice removes a device from a user
 func (s *UserService) RemoveUserDevice(ctx context.Context, userID uuid.UUID, deviceID string) error {
 	if err := s.userRepo.RemoveUserDevice(ctx, userID, deviceID); err != nil {
 		return fmt.Errorf("failed to remove user device: %w", err)
@@ -1348,7 +1502,6 @@ func (s *UserService) RemoveUserDevice(ctx context.Context, userID uuid.UUID, de
 	return nil
 }
 
-// ArchiveInactiveUsers archives users inactive since before the given date
 func (s *UserService) ArchiveInactiveUsers(ctx context.Context, before time.Time) (int, error) {
 	count, err := s.userRepo.ArchiveInactiveUsers(ctx, before)
 	if err != nil {
@@ -1362,9 +1515,16 @@ func (s *UserService) ArchiveInactiveUsers(ctx context.Context, before time.Time
 	return count, nil
 }
 
-// UpdateUserFields updates specific fields of a user
 func (s *UserService) UpdateUserFields(ctx context.Context, userID uuid.UUID, fields map[string]interface{}) error {
 	startTime := time.Now()
+
+	// Check if username is being updated and if it's available
+	if username, ok := fields["username"].(string); ok {
+		existingUser, err := s.userRepo.GetUserByUsername(ctx, username)
+		if err == nil && existingUser != nil && existingUser.UserID != userID {
+			return fmt.Errorf("username already taken")
+		}
+	}
 
 	if err := s.userRepo.UpdateUserFields(ctx, userID, fields); err != nil {
 		s.logUserEvent(ctx, &models.UserLogEvent{
@@ -1410,7 +1570,6 @@ func (s *UserService) UpdateUserFields(ctx context.Context, userID uuid.UUID, fi
 	return nil
 }
 
-// GetUserByDeviceFingerprint gets a user by device fingerprint
 func (s *UserService) GetUserByDeviceFingerprint(ctx context.Context, fingerprint string) (*models.User, error) {
 	user, err := s.userRepo.GetUserByDeviceFingerprint(ctx, fingerprint)
 	if err != nil {
@@ -1421,11 +1580,9 @@ func (s *UserService) GetUserByDeviceFingerprint(ctx context.Context, fingerprin
 	return user, nil
 }
 
-// UpdatePhoneNumber updates a user's phone number with proper encryption and validation
 func (s *UserService) UpdatePhoneNumber(ctx context.Context, userID uuid.UUID, newPhoneNumber string) error {
 	startTime := time.Now()
 
-	// Validate input
 	if newPhoneNumber == "" {
 		return fmt.Errorf("%w: phone number cannot be empty", ErrInvalidInput)
 	}
@@ -1433,22 +1590,18 @@ func (s *UserService) UpdatePhoneNumber(ctx context.Context, userID uuid.UUID, n
 		return fmt.Errorf("%w: phone number must be between 10 and 15 characters", ErrInvalidInput)
 	}
 
-	// Get existing user
 	user, err := s.GetUserByID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 
-	// Generate new phone hash
 	newPhoneHash := s.GeneratePhoneHash(newPhoneNumber)
 
-	// Check if new phone number is already registered to another user
 	existingUser, err := s.userRepo.GetUserByPhoneHash(ctx, newPhoneHash)
 	if err == nil && existingUser != nil && existingUser.UserID != userID {
 		return fmt.Errorf("%w: phone number already registered to another user", ErrUserAlreadyExists)
 	}
 
-	// Encrypt the new phone number
 	encryptedPhone, err := s.encryptionMgr.EncryptField(ctx, newPhoneNumber, "phone")
 	if err != nil {
 		s.logUserEvent(ctx, &models.UserLogEvent{
@@ -1477,12 +1630,11 @@ func (s *UserService) UpdatePhoneNumber(ctx context.Context, userID uuid.UUID, n
 		return fmt.Errorf("failed to parse key ID: %w", err)
 	}
 
-	// ✅ CORRECT: Update all phone encryption fields
 	fields := map[string]interface{}{
 		"phone_hash":          newPhoneHash,
 		"phone_encrypted":     []byte(encryptedPhone.EncryptedValue),
 		"phone_key_id":        keyID,
-		"phone_encrypted_dek": encryptedPhone.EncryptedDEK, // ✅ This is now stored
+		"phone_encrypted_dek": encryptedPhone.EncryptedDEK,
 		"updated_at":          time.Now().UTC(),
 	}
 
@@ -1508,14 +1660,11 @@ func (s *UserService) UpdatePhoneNumber(ctx context.Context, userID uuid.UUID, n
 		return fmt.Errorf("failed to update phone number: %w", err)
 	}
 
-	// Invalidate old phone mapping and cache
 	oldPhoneHash := user.PhoneHash
 	s.invalidateUserCache(ctx, userID)
 
-	// Remove old phone mapping from cache
 	s.phoneCache.Remove(oldPhoneHash)
 	if s.distCache != nil {
-		// Use the correct method to invalidate the old phone mapping in Redis
 		if err := s.distCache.InvalidatePhone(ctx, oldPhoneHash); err != nil {
 			s.logger.Warn("Failed to invalidate old phone mapping in Redis",
 				util.String("old_phone_hash", oldPhoneHash),
@@ -1523,7 +1672,6 @@ func (s *UserService) UpdatePhoneNumber(ctx context.Context, userID uuid.UUID, n
 		}
 	}
 
-	// Update user object and cache
 	user.PhoneHash = newPhoneHash
 	user.PhoneEncrypted = []byte(encryptedPhone.EncryptedValue)
 	user.PhoneKeyID = keyID
@@ -1564,7 +1712,6 @@ func (s *UserService) UpdatePhoneNumber(ctx context.Context, userID uuid.UUID, n
 	return nil
 }
 
-// BanUser bans a user by setting is_active to false and records the ban reason
 func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
 	startTime := time.Now()
 
@@ -1577,7 +1724,6 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
 		return fmt.Errorf("user is already banned")
 	}
 
-	// Update user fields to ban the user
 	fields := map[string]interface{}{
 		"is_active":  false,
 		"updated_at": time.Now().UTC(),
@@ -1604,7 +1750,6 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
 		return fmt.Errorf("failed to ban user: %w", err)
 	}
 
-	// Invalidate cache
 	s.invalidateUserCache(ctx, req.UserID)
 
 	s.logUserEvent(ctx, &models.UserLogEvent{
@@ -1639,22 +1784,18 @@ func (s *UserService) BanUser(ctx context.Context, req *BanUserRequest) error {
 	return nil
 }
 
-// UnbanUser unbans a user by setting is_active to true
 func (s *UserService) UnbanUser(ctx context.Context, userID, unbannedBy uuid.UUID, reason string) error {
 	startTime := time.Now()
 
-	// Use repository directly to get user without active status check
 	user, err := s.userRepo.GetUserByID(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 
-	// If user is already active, no need to unban
 	if user.IsActive {
 		return fmt.Errorf("user is not banned")
 	}
 
-	// Update user fields to unban the user
 	fields := map[string]interface{}{
 		"is_active":  true,
 		"updated_at": time.Now().UTC(),
@@ -1681,7 +1822,6 @@ func (s *UserService) UnbanUser(ctx context.Context, userID, unbannedBy uuid.UUI
 		return fmt.Errorf("failed to unban user: %w", err)
 	}
 
-	// Invalidate cache
 	s.invalidateUserCache(ctx, userID)
 
 	s.logUserEvent(ctx, &models.UserLogEvent{
@@ -1725,4 +1865,138 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+
+
+// SearchCompanyEmployees searches employees within a specific company
+func (s *UserService) SearchCompanyEmployees(ctx context.Context, req *models.CompanyEmployeeSearchRequest) ([]*models.CompanyEmployeeSearchResult, int, error) {
+    startTime := time.Now()
+
+    if req.Limit <= 0 || req.Limit > 100 {
+        req.Limit = 50
+    }
+    if req.Offset < 0 {
+        req.Offset = 0
+    }
+
+    // You might want to add authorization check here
+    // For example, verify that the requesting user has access to this company
+    
+    results, total, err := s.userRepo.SearchCompanyEmployees(ctx, req)
+    if err != nil {
+        return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
+    }
+
+    s.logger.Debug("Company employee search completed",
+        util.String("company_id", req.CompanyID.String()),
+        util.String("query", req.Query),
+        util.Int("results", len(results)),
+        util.Int("total", total),
+        util.Duration("duration", time.Since(startTime)))
+
+    return results, total, nil
+}
+
+// SearchCompanyEmployeesAdvanced searches employees with advanced filters
+func (s *UserService) SearchCompanyEmployeesAdvanced(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*models.User, int, error) {
+    if limit <= 0 || limit > 1000 {
+        limit = 100
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    users, total, err := s.userRepo.SearchCompanyEmployeesAdvanced(ctx, companyID, filters, limit, offset)
+    if err != nil {
+        return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
+    }
+
+    // Cache found users
+    for _, user := range users {
+        s.cacheUser(ctx, user)
+    }
+
+    return users, total, nil
+}
+
+// GetCompanyEmployeeSuggestions returns employee suggestions for autocomplete within a company
+func (s *UserService) GetCompanyEmployeeSuggestions(ctx context.Context, companyID uuid.UUID, prefix string, limit int) ([]*models.UserSuggestion, error) {
+    if limit <= 0 || limit > 20 {
+        limit = 10
+    }
+
+    suggestions, err := s.userRepo.GetCompanyEmployeeSuggestions(ctx, companyID, prefix, limit)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get company employee suggestions: %w", err)
+    }
+
+    return suggestions, nil
+}
+
+
+
+// FindCompanyEmployeeByUsername finds an employee by username within a company
+func (s *UserService) FindCompanyEmployeeByUsername(ctx context.Context, companyID uuid.UUID, username string) (*models.User, error) {
+    empUser, err := s.userRepo.FindCompanyEmployeeByUsername(ctx, companyID, username)
+    if err != nil {
+        return nil, fmt.Errorf("failed to find company employee by username: %w", err)
+    }
+    
+    // Convert CompanyEmployeeUser to User
+    if empUser == nil {
+        return nil, nil
+    }
+    
+    fullName := ""
+    if empUser.FullName != nil {
+        fullName = *empUser.FullName
+    }
+    
+    user := &models.User{
+        UserID:            empUser.UserID,
+        Username:          empUser.Username,
+        FullName:          fullName,
+        PhoneHash:         empUser.PhoneHash,
+        PhoneEncrypted:    nil, // These might not be available in CompanyEmployeeUser
+        PhoneEncryptedDEK: "",
+        PhoneKeyID:        uuid.Nil,
+        DeviceID:          "",
+        DeviceFingerprint: "",
+        KYCStatus:         "",
+        KYCLevel:          "",
+        IsVerified:        false,
+        IsActive:          empUser.IsActive,
+        DataRegion:        "",
+        CreatedAt:         time.Time{},
+        UpdatedAt:         time.Time{},
+    }
+    
+	s.cacheUser(ctx, user)
+    return user, nil
+}
+
+
+// GetBannedUsers returns users with is_active = false
+func (s *UserService) GetBannedUsers(ctx context.Context, limit, offset int) ([]*models.User, int, error) {
+    startTime := time.Now()
+    
+    if limit <= 0 || limit > 1000 {
+        limit = 100
+    }
+    if offset < 0 {
+        offset = 0
+    }
+
+    users, total, err := s.userRepo.GetBannedUsers(ctx, limit, offset)
+    if err != nil {
+        return nil, 0, fmt.Errorf("failed to get banned users: %w", err)
+    }
+
+    s.logger.Debug("Banned users retrieved",
+        util.Int("count", len(users)),
+        util.Int("total", total),
+        util.Duration("duration", time.Since(startTime)))
+
+    return users, total, nil
 }

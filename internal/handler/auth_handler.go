@@ -11,13 +11,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
+	"net/url" 
 	"github.com/go-playground/validator/v10"
-
 	"auth-service/internal/models"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -28,6 +26,11 @@ var validate = validator.New()
 func init() {
 	validate.RegisterValidation("alphanumdash", func(fl validator.FieldLevel) bool {
 		return regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(fl.Field().String())
+	})
+	validate.RegisterValidation("username", func(fl validator.FieldLevel) bool {
+		value := fl.Field().String()
+		re := regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+		return re.MatchString(value)
 	})
 }
 
@@ -79,6 +82,7 @@ type MPINVerifyPhoneRequest struct {
     DeviceID          string `json:"device_id" validate:"required"`
     DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
     UserAgent         string `json:"user_agent,omitempty"`
+	CompanyID         string `json:"company_id,omitempty"` 
 }
 
 type MPINChangePhoneRequest struct {
@@ -115,6 +119,7 @@ func (h *AuthHandler) RegisterPublicRoutes(router chi.Router) {
 		// Complete authentication flow (public)
 		r.Post("/login/initiate", h.InitiateLogin)
 		r.Post("/login/verify-otp", h.VerifyOTPLogin)
+		r.Get("/companies/by-employee-phone", h.GetCompanyByEmployeePhonePublic)
 		r.Post("/login/verify-mpin", h.VerifyMPINLogin)
 		r.Post("/mpin/setup", h.SetupMPIN)
 		r.Post("/otp/send", h.SendOTP)
@@ -154,7 +159,7 @@ func (h *AuthHandler) RegisterProtectedRoutes(r chi.Router) {
 		r.Delete("/{companyID}/employees/{userID}", h.RemoveEmployee)
 		r.Get("/context", h.GetCompanyContext)
 		r.Post("/{companyID}/employees/{userID}/role", h.UpdateEmployeeRole)
-		r.Post("/{companyID}/employees/{userID}/department", h.UpdateEmployeeDepartment)
+		// r.Post("/{companyID}/employees/{userID}/department", h.UpdateEmployeeDepartment)
 		r.Get("/{companyID}/hierarchy", h.GetCompanyHierarchy)
 
 		// Owner operations
@@ -165,7 +170,7 @@ func (h *AuthHandler) RegisterProtectedRoutes(r chi.Router) {
 
 		// Manager operations
 		r.Route("/{companyID}/managers", func(r chi.Router) {
-			r.Post("/", h.AddManager)
+			// r.Post("/", h.AddManager)
 			r.Post("/{managerID}/permissions", h.AssignManagerPermissions)
 			r.Delete("/{managerID}/permissions", h.RevokeManagerPermissions)
 		})
@@ -399,122 +404,122 @@ func (h *AuthHandler) VerifyOTPLogin(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// VerifyMPINLogin handles MPIN verification for daily login
-func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
-    ctx := r.Context()
-    startTime := time.Now()
+// // VerifyMPINLogin handles MPIN verification for daily login
+// func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+//     startTime := time.Now()
 
-    var req MPINVerifyPhoneRequest
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-        return
-    }
+//     var req MPINVerifyPhoneRequest
+//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+//         return
+//     }
 
-    // Sanitize inputs
-    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
-    req.MPIN = util.SanitizeInput(req.MPIN)
-    req.DeviceID = util.SanitizeInput(req.DeviceID)
-    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
-    req.UserAgent = util.SanitizeInput(req.UserAgent)
+//     // Sanitize inputs
+//     req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+//     req.MPIN = util.SanitizeInput(req.MPIN)
+//     req.DeviceID = util.SanitizeInput(req.DeviceID)
+//     req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+//     req.UserAgent = util.SanitizeInput(req.UserAgent)
 
-    // Get user by phone number
-    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
-    if err != nil {
-        h.respondWithError(w, http.StatusNotFound, err, "User not found")
-        return
-    }
+//     // Get user by phone number
+//     user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusNotFound, err, "User not found")
+//         return
+//     }
 
-    // Check user status
-    if !user.IsActive {
-        h.respondWithError(w, http.StatusForbidden,
-            fmt.Errorf("USER_INACTIVE: Account is inactive"),
-            "Account is inactive. Please contact support.")
-        return
-    }
+//     // Check user status
+//     if !user.IsActive {
+//         h.respondWithError(w, http.StatusForbidden,
+//             fmt.Errorf("USER_INACTIVE: Account is inactive"),
+//             "Account is inactive. Please contact support.")
+//         return
+//     }
 
-    // Check company subscription status if user has company
-    companyContext, err := h.companyService.GetCompanyContext(ctx, user.UserID)
-    if err != nil && !strings.Contains(err.Error(), "user is not an active employee") {
-        if strings.Contains(err.Error(), "subscription status:") {
-            h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
-            return
-        }
-        h.logger.Warn("Company context check failed", util.ErrorField(err))
-    }
+//     // Check company subscription status if user has company
+//     companyContext, err := h.companyService.GetCompanyContext(ctx, user.UserID)
+//     if err != nil && !strings.Contains(err.Error(), "user is not an active employee") {
+//         if strings.Contains(err.Error(), "subscription status:") {
+//             h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
+//             return
+//         }
+//         h.logger.Warn("Company context check failed", util.ErrorField(err))
+//     }
 
-    // Verify device trust
-    deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, user.UserID, req.DeviceID)
-    if err != nil || !deviceTrusted {
-        h.respondWithError(w, http.StatusForbidden,
-            fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
-            "MPIN login not allowed on this device")
-        return
-    }
+//     // Verify device trust
+//     deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, user.UserID, req.DeviceID)
+//     if err != nil || !deviceTrusted {
+//         h.respondWithError(w, http.StatusForbidden,
+//             fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
+//             "MPIN login not allowed on this device")
+//         return
+//     }
 
-    // ✅ UPDATED: Enhanced MPIN verification with device fingerprint
-    mpinVerifyReq := service.MPINVerifyRequest{
-        UserID:            user.UserID,
-        MPIN:              req.MPIN,
-        DeviceID:          req.DeviceID,
-        DeviceFingerprint: req.DeviceFingerprint,
-        IPAddress:         h.getClientIP(r),
-        UserAgent:         r.UserAgent(),
-    }
+//     // ✅ UPDATED: Enhanced MPIN verification with device fingerprint
+//     mpinVerifyReq := service.MPINVerifyRequest{
+//         UserID:            user.UserID,
+//         MPIN:              req.MPIN,
+//         DeviceID:          req.DeviceID,
+//         DeviceFingerprint: req.DeviceFingerprint,
+//         IPAddress:         h.getClientIP(r),
+//         UserAgent:         r.UserAgent(),
+//     }
 
-    mpinResult, err := h.mpinService.VerifyMPIN(ctx, &mpinVerifyReq)
-    if err != nil {
-        h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
-        return
-    }
+//     mpinResult, err := h.mpinService.VerifyMPIN(ctx, &mpinVerifyReq)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
+//         return
+//     }
 
-    if !mpinResult.Verified {
-        h.respondWithError(w, http.StatusUnauthorized,
-            fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
-            "MPIN verification failed")
-        return
-    }
+//     if !mpinResult.Verified {
+//         h.respondWithError(w, http.StatusUnauthorized,
+//             fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
+//             "MPIN verification failed")
+//         return
+//     }
 
-    userRole := "user"
-    if companyContext != nil {
-        userRole = companyContext.RoleName
-    }
+//     userRole := "user"
+//     if companyContext != nil {
+//         userRole = companyContext.RoleName
+//     }
 
-    // Issue JWT token pair
-    tokenReq := &service.IssueTokenPairRequest{
-        UserID:      user.UserID.String(),
-        Role:        userRole,
-        DeviceID:    req.DeviceID,
-        SessionType: "user",
-        IPAddress:   h.getClientIP(r),
-    }
+//     // Issue JWT token pair
+//     tokenReq := &service.IssueTokenPairRequest{
+//         UserID:      user.UserID.String(),
+//         Role:        userRole,
+//         DeviceID:    req.DeviceID,
+//         SessionType: "user",
+//         IPAddress:   h.getClientIP(r),
+//     }
 
-    tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
-    if err != nil {
-        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue tokens")
-        return
-    }
+//     tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue tokens")
+//         return
+//     }
 
-    responseData := map[string]interface{}{
-        "tokens":  tokens,
-        "user_id": user.UserID.String(),
-        "phone":   req.PhoneNumber,
-        "message": "MPIN login successful",
-    }
+//     responseData := map[string]interface{}{
+//         "tokens":  tokens,
+//         "user_id": user.UserID.String(),
+//         "phone":   req.PhoneNumber,
+//         "message": "MPIN login successful",
+//     }
 
-    if companyContext != nil {
-        responseData["company_context"] = companyContext
-    }
+//     if companyContext != nil {
+//         responseData["company_context"] = companyContext
+//     }
 
-    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Login successful"))
+//     h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Login successful"))
 
-    h.logger.Info("MPIN login completed with JWT tokens",
-        util.String("user_id", user.UserID.String()),
-        util.String("phone", req.PhoneNumber),
-        util.String("role", userRole),
-        util.Bool("has_company", companyContext != nil),
-        util.Duration("duration", time.Since(startTime)),
-    )
-}
+//     h.logger.Info("MPIN login completed with JWT tokens",
+//         util.String("user_id", user.UserID.String()),
+//         util.String("phone", req.PhoneNumber),
+//         util.String("role", userRole),
+//         util.Bool("has_company", companyContext != nil),
+//         util.Duration("duration", time.Since(startTime)),
+//     )
+// }
 
 // SetupMPIN handles MPIN setup after registration
 func (h *AuthHandler) SetupMPIN(w http.ResponseWriter, r *http.Request) {
@@ -1303,121 +1308,121 @@ func (h *AuthHandler) UpdateEmployeeRole(w http.ResponseWriter, r *http.Request)
 	)
 }
 
-// UpdateEmployeeDepartment updates an employee's department
-func (h *AuthHandler) UpdateEmployeeDepartment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // UpdateEmployeeDepartment updates an employee's department
+// func (h *AuthHandler) UpdateEmployeeDepartment(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
+// 	companyIDStr := chi.URLParam(r, "companyID")
+// 	companyID, err := uuid.Parse(companyIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+// 		return
+// 	}
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+// 	userIDStr := chi.URLParam(r, "userID")
+// 	userID, err := uuid.Parse(userIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+// 		return
+// 	}
 
-	// Get user ID from JWT context
-	updatedBy := r.Context().Value("user_id")
-	if updatedBy == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
+// 	// Get user ID from JWT context
+// 	updatedBy := r.Context().Value("user_id")
+// 	if updatedBy == nil {
+// 		h.respondWithError(w, http.StatusUnauthorized,
+// 			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+// 			"Authentication required")
+// 		return
+// 	}
 
-	updatedByID, err := uuid.Parse(updatedBy.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
+// 	updatedByID, err := uuid.Parse(updatedBy.(string))
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+// 		return
+// 	}
 
-	var req struct {
-		DepartmentID uuid.UUID `json:"department_id" validate:"required"`
-	}
+// 	var req struct {
+// 		DepartmentID uuid.UUID `json:"department_id" validate:"required"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	// Check permission using bitmask
-	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.update")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	if !hasPermission {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to update employee departments"),
-			"Insufficient permissions")
-		return
-	}
+// 	// Check permission using bitmask
+// 	hasPermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.update")
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+// 		return
+// 	}
+// 	if !hasPermission {
+// 		h.respondWithError(w, http.StatusForbidden,
+// 			fmt.Errorf("PERMISSION_DENIED: User lacks permission to update employee departments"),
+// 			"Insufficient permissions")
+// 		return
+// 	}
 
-	if err := h.companyService.UpdateEmployeeDepartment(ctx, companyID, userID, req.DepartmentID, updatedByID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update employee department")
-		return
-	}
+// 	if err := h.companyService.UpdateEmployeeDepartment(ctx, companyID, userID, req.DepartmentID, updatedByID); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to update employee department")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee department updated successfully"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee department updated successfully"))
 
-	h.logger.Info("Employee department updated",
-		util.String("company_id", companyID.String()),
-		util.String("user_id", userID.String()),
-		util.String("new_department_id", req.DepartmentID.String()),
-		util.String("updated_by", updatedByID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Info("Employee department updated",
+// 		util.String("company_id", companyID.String()),
+// 		util.String("user_id", userID.String()),
+// 		util.String("new_department_id", req.DepartmentID.String()),
+// 		util.String("updated_by", updatedByID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
-// GetCompanyContext returns the company context for the authenticated user
-func (h *AuthHandler) GetCompanyContext(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // GetCompanyContext returns the company context for the authenticated user
+// func (h *AuthHandler) GetCompanyContext(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
+// 	// Get user ID from JWT context
+// 	userID := r.Context().Value("user_id")
+// 	if userID == nil {
+// 		h.respondWithError(w, http.StatusUnauthorized,
+// 			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+// 			"Authentication required")
+// 		return
+// 	}
 
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
+// 	userIDParsed, err := uuid.Parse(userID.(string))
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+// 		return
+// 	}
 
-	companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
-	if err != nil {
-		if strings.Contains(err.Error(), "subscription status:") {
-			h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
-			return
-		}
-		if strings.Contains(err.Error(), "user is not an active employee") {
-			h.respondWithError(w, http.StatusForbidden, err, "Not an active employee")
-			return
-		}
-		h.respondWithError(w, http.StatusNotFound, err, "Company context not found")
-		return
-	}
+// 	companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
+// 	if err != nil {
+// 		if strings.Contains(err.Error(), "subscription status:") {
+// 			h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
+// 			return
+// 		}
+// 		if strings.Contains(err.Error(), "user is not an active employee") {
+// 			h.respondWithError(w, http.StatusForbidden, err, "Not an active employee")
+// 			return
+// 		}
+// 		h.respondWithError(w, http.StatusNotFound, err, "Company context not found")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(companyContext, "Company context retrieved"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(companyContext, "Company context retrieved"))
 
-	h.logger.Debug("Company context retrieved",
-		util.String("user_id", userIDParsed.String()),
-		util.String("company_id", companyContext.CompanyID),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Debug("Company context retrieved",
+// 		util.String("user_id", userIDParsed.String()),
+// 		util.String("company_id", companyContext.CompanyID),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 // GetCompanyHierarchy returns the company organizational hierarchy
 func (h *AuthHandler) GetCompanyHierarchy(w http.ResponseWriter, r *http.Request) {
@@ -1520,81 +1525,81 @@ func (h *AuthHandler) AddDepartment(w http.ResponseWriter, r *http.Request) {
 		util.Duration("duration", time.Since(startTime)))
 }
 
-// AddManager adds a new manager (Owner only)
-func (h *AuthHandler) AddManager(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // AddManager adds a new manager (Owner only)
+// func (h *AuthHandler) AddManager(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
+// 	companyIDStr := chi.URLParam(r, "companyID")
+// 	companyID, err := uuid.Parse(companyIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+// 		return
+// 	}
 
-	// Get user ID from JWT context
-	userID := r.Context().Value("user_id")
-	if userID == nil {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
-			"Authentication required")
-		return
-	}
+// 	// Get user ID from JWT context
+// 	userID := r.Context().Value("user_id")
+// 	if userID == nil {
+// 		h.respondWithError(w, http.StatusUnauthorized,
+// 			fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+// 			"Authentication required")
+// 		return
+// 	}
 
-	userIDParsed, err := uuid.Parse(userID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
-		return
-	}
+// 	userIDParsed, err := uuid.Parse(userID.(string))
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+// 		return
+// 	}
 
-	var req service.AddManagerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	var req service.AddManagerRequest
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	req.CompanyID = companyID
+// 	req.CompanyID = companyID
 
-	// Sanitize inputs
-	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
-	req.RoleName = util.SanitizeInput(req.RoleName)
+// 	// Sanitize inputs
+// 	req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+// 	req.RoleName = util.SanitizeInput(req.RoleName)
 
-	// Check permissions using bitmask
-	hasCreatePermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.create")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
-	hasAdminAccess, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
-		return
-	}
+// 	// Check permissions using bitmask
+// 	hasCreatePermission, err := h.companyService.CheckPermissionFromContext(ctx, "hr.employee.create")
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+// 		return
+// 	}
+// 	hasAdminAccess, err := h.companyService.CheckPermissionFromContext(ctx, "admin.department.create")
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Permission check failed")
+// 		return
+// 	}
 
-	if !hasCreatePermission || !hasAdminAccess {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add managers"),
-			"Insufficient permissions")
-		return
-	}
+// 	if !hasCreatePermission || !hasAdminAccess {
+// 		h.respondWithError(w, http.StatusForbidden,
+// 			fmt.Errorf("PERMISSION_DENIED: User lacks permission to add managers"),
+// 			"Insufficient permissions")
+// 		return
+// 	}
 
-	if err := h.companyService.AddManager(ctx, &req); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to add manager")
-		return
-	}
+// 	if err := h.companyService.AddManager(ctx, &req); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to add manager")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Manager added successfully"))
+// 	h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Manager added successfully"))
 
-	h.logger.Info("Manager added",
-		util.String("company_id", companyID.String()),
-		util.String("phone", req.PhoneNumber),
-		util.String("role_name", req.RoleName),
-		util.String("department_id", req.DepartmentID.String()),
-		util.Int("permissions_count", len(req.Permissions)),
-		util.String("added_by", userIDParsed.String()),
-		util.Duration("duration", time.Since(startTime)))
-}
+// 	h.logger.Info("Manager added",
+// 		util.String("company_id", companyID.String()),
+// 		util.String("phone", req.PhoneNumber),
+// 		util.String("role_name", req.RoleName),
+// 		util.String("department_id", req.DepartmentID.String()),
+// 		util.Int("permissions_count", len(req.Permissions)),
+// 		util.String("added_by", userIDParsed.String()),
+// 		util.Duration("duration", time.Since(startTime)))
+// }
 
 // AssignManagerPermissions assigns permissions to a manager (Owner only)
 func (h *AuthHandler) AssignManagerPermissions(w http.ResponseWriter, r *http.Request) {
@@ -1876,6 +1881,8 @@ func (h *AuthHandler) GetUserByPhonePublic(w http.ResponseWriter, r *http.Reques
 
 	response := map[string]interface{}{
 		"user_exists": true,
+		"username":    user.Username,      // Add username
+        "full_name":   user.FullName,      // Add full name
 		"user_id":     user.UserID.String(),
 		"is_verified": user.IsVerified,
 		"is_active":   user.IsActive,
@@ -2289,4 +2296,943 @@ func (h *AuthHandler) ForgotMPIN(w http.ResponseWriter, r *http.Request) {
 		util.String("user_id", userID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)
+}
+
+
+
+// ============================================
+// COMPANY EMPLOYEE SEARCH HANDLERS
+// ============================================
+
+// SearchCompanyEmployees searches employees within a specific company
+// SearchCompanyEmployees searches employees within a specific company
+// SearchCompanyEmployees searches employees within a specific company
+func (h *AuthHandler) SearchCompanyEmployees(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    // ADDED: Start logging
+    h.logger.Info("Starting company employee search",
+        util.String("method", r.Method),
+        util.String("path", r.URL.Path),
+        util.String("query", r.URL.RawQuery))
+
+    companyIDStr := chi.URLParam(r, "companyID")
+    
+    // ADDED: Log raw company ID before parsing
+    h.logger.Debug("Raw company ID from URL",
+        util.String("company_id_str", companyIDStr))
+    
+    companyID, err := uuid.Parse(companyIDStr)
+    if err != nil {
+        // ADDED: Enhanced error logging
+        h.logger.Error("Invalid company ID",
+            util.String("company_id", companyIDStr),
+            util.ErrorField(err))
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+        return
+    }
+
+    // ADDED: Log parsed company ID
+    h.logger.Debug("Parsed company ID successfully",
+        util.String("company_id", companyID.String()))
+
+    var req models.CompanyEmployeeSearchRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        // ADDED: Enhanced error logging for JSON decode
+        h.logger.Error("Failed to decode request body",
+            util.ErrorField(err),
+            util.String("content_type", r.Header.Get("Content-Type")),
+            util.Int64("content_length", r.ContentLength))
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    // ADDED: Log request details before processing
+    h.logger.Debug("Decoded request body",
+        util.String("query", req.Query),
+        util.String("search_type", req.SearchType),
+        util.Any("filters", req.Filters),
+        util.Int("limit", req.Limit),
+        util.Int("offset", req.Offset),
+        util.Bool("has_company_id", req.CompanyID != uuid.Nil))
+
+    // Set company ID from URL param
+    req.CompanyID = companyID
+
+    // Validate required fields
+    if req.Query == "" && req.SearchType == "" {
+        h.logger.Warn("Missing query and search_type",
+            util.String("company_id", companyID.String()))
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("QUERY_OR_SEARCH_TYPE_REQUIRED"), 
+            "Either query or search_type is required")
+        return
+    }
+
+    // Set default values
+    if req.Limit <= 0 || req.Limit > 100 {
+        h.logger.Debug("Setting default limit",
+            util.Int("old_limit", req.Limit),
+            util.Int("new_limit", 50))
+        req.Limit = 50
+    }
+    if req.Offset < 0 {
+        h.logger.Debug("Setting default offset",
+            util.Int("old_offset", req.Offset),
+            util.Int("new_offset", 0))
+        req.Offset = 0
+    }
+    if req.SearchType == "" {
+        h.logger.Debug("Setting default search type",
+            util.String("old_search_type", req.SearchType),
+            util.String("new_search_type", models.SearchTypeFulltext))
+        req.SearchType = models.SearchTypeFulltext
+    }
+
+    // ADDED: Log final request configuration
+    h.logger.Debug("Request configuration after defaults",
+        util.String("company_id", companyID.String()),
+        util.String("query", req.Query),
+        util.String("search_type", req.SearchType),
+        util.Int("limit", req.Limit),
+        util.Int("offset", req.Offset),
+        util.Any("filters", req.Filters))
+
+    // Check permissions - user must be part of the company
+    userID := r.Context().Value("user_id")
+    if userID == nil {
+        h.logger.Error("User ID not found in context")
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+            "Authentication required")
+        return
+    }
+
+    userIDParsed, err := uuid.Parse(userID.(string))
+    if err != nil {
+        h.logger.Error("Invalid user ID in token",
+            util.String("user_id_raw", userID.(string)),
+            util.ErrorField(err))
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+        return
+    }
+
+    // ADDED: Log user attempting search
+    h.logger.Debug("User attempting search",
+        util.String("user_id", userIDParsed.String()),
+        util.String("company_id", companyID.String()))
+
+    // Verify user belongs to the company
+    companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
+    if err != nil {
+        h.logger.Debug("User not found in company context, checking admin permissions",
+            util.String("user_id", userIDParsed.String()),
+            util.ErrorField(err))
+        
+        // User is not an employee in any company, check admin permission
+        hasPermission, permErr := h.companyService.CheckPermissionFromContext(ctx, "admin.company.view")
+        if !hasPermission {
+            h.logger.Warn("Permission denied for user (not in company and not admin)",
+                util.String("user_id", userIDParsed.String()),
+                util.String("company_id", companyID.String()),
+                util.ErrorField(permErr))
+            h.respondWithError(w, http.StatusForbidden,
+                fmt.Errorf("PERMISSION_DENIED: User not authorized to search in this company"),
+                "Insufficient permissions")
+            return
+        }
+        // Admin user can continue
+        h.logger.Debug("Admin permission granted for search",
+            util.String("user_id", userIDParsed.String()))
+    } else if companyContext.CompanyID != companyID.String() {
+        h.logger.Debug("User in different company, checking admin permissions",
+            util.String("user_id", userIDParsed.String()),
+            util.String("user_company", companyContext.CompanyID),
+            util.String("target_company", companyID.String()))
+        
+        // User is in a different company, check admin permission
+        hasPermission, permErr := h.companyService.CheckPermissionFromContext(ctx, "admin.company.view")
+        if !hasPermission {
+            h.logger.Warn("Permission denied for user (different company and not admin)",
+                util.String("user_id", userIDParsed.String()),
+                util.String("user_company", companyContext.CompanyID),
+                util.String("target_company", companyID.String()),
+                util.ErrorField(permErr))
+            h.respondWithError(w, http.StatusForbidden,
+                fmt.Errorf("PERMISSION_DENIED: User not authorized to search in this company"),
+                "Insufficient permissions")
+            return
+        }
+        h.logger.Debug("Admin permission granted for cross-company search",
+            util.String("user_id", userIDParsed.String()))
+    } else {
+        h.logger.Debug("User is part of target company, permission granted",
+            util.String("user_id", userIDParsed.String()),
+            util.String("company_id", companyID.String()))
+    }
+
+    // For fulltext search, ensure query is provided
+    if req.SearchType == models.SearchTypeFulltext && req.Query == "" {
+        h.logger.Warn("Query required for fulltext search",
+            util.String("search_type", req.SearchType))
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("QUERY_REQUIRED_FOR_FULLTEXT"),
+            "Query is required for fulltext search")
+        return
+    }
+
+    // For advanced search, handle different cases
+    if req.SearchType == "advanced" { // Changed from models.SearchTypeAdvanced to "advanced"
+        h.logger.Debug("Processing advanced search",
+            util.String("query", req.Query),
+            util.Any("filters", req.Filters))
+        
+        // For advanced search without query, use different method
+        if req.Query == "" {
+            h.logger.Debug("Advanced search without query, using filter-based search")
+            filters := map[string]interface{}{
+                "company_id": companyID,
+            }
+            
+            // ADDED: Log before calling advanced search
+            h.logger.Debug("Calling SearchCompanyEmployeesAdvanced",
+                util.String("company_id", companyID.String()),
+                util.Any("filters", filters),
+                util.Int("limit", req.Limit),
+                util.Int("offset", req.Offset))
+            
+            results, total, err := h.userService.SearchCompanyEmployeesAdvanced(ctx, companyID, filters, req.Limit, req.Offset)
+            if err != nil {
+                // ADDED: Enhanced error logging for advanced search
+                h.logger.Error("Failed to search company employees (advanced) - DETAILED",
+                    util.ErrorField(err),
+                    util.String("company_id", companyID.String()),
+                    util.Any("filters", filters),
+                    util.Int("limit", req.Limit),
+                    util.Int("offset", req.Offset))
+                h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search employees")
+                return
+            }
+            
+            // ADDED: Success logging for advanced search
+            h.logger.Debug("Advanced search completed successfully",
+                util.Int("results", len(results)),
+                util.Int("total", total),
+                util.String("company_id", companyID.String()))
+            
+            responseData := map[string]interface{}{
+                "employees":   results,
+                "total":       total,
+                "page":        req.Offset/req.Limit + 1,
+                "page_size":   req.Limit,
+                "has_more":    (req.Offset + req.Limit) < total,
+                "company_id":  companyID.String(),
+                "search_type": req.SearchType,
+            }
+            
+            h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Employees search completed"))
+            return
+        }
+    }
+
+    // Use the standard search for other cases
+    h.logger.Debug("Calling SearchCompanyEmployees service method",
+        util.String("company_id", companyID.String()),
+        util.String("query", req.Query),
+        util.String("search_type", req.SearchType),
+        util.Int("limit", req.Limit),
+        util.Int("offset", req.Offset))
+    
+    results, total, err := h.userService.SearchCompanyEmployees(ctx, &req)
+    if err != nil {
+        // ADDED: Enhanced error logging for standard search
+        h.logger.Error("Failed to search company employees - DETAILED",
+            util.ErrorField(err),
+            util.String("company_id", companyID.String()),
+            util.String("query", req.Query),
+            util.String("search_type", req.SearchType),
+            util.Any("filters", req.Filters),
+            util.Int("limit", req.Limit),
+            util.Int("offset", req.Offset))
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search employees")
+        return
+    }
+
+    // ADDED: Success logging for standard search
+    h.logger.Debug("Search completed successfully",
+        util.Int("results", len(results)),
+        util.Int("total", total),
+        util.String("company_id", companyID.String()),
+        util.String("search_type", req.SearchType))
+
+    responseData := map[string]interface{}{
+        "employees":   results,
+        "total":       total,
+        "page":        req.Offset/req.Limit + 1,
+        "page_size":   req.Limit,
+        "has_more":    (req.Offset + req.Limit) < total,
+        "company_id":  companyID.String(),
+        "search_type": req.SearchType,
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Employees search completed"))
+
+    h.logger.Info("Company employees search completed",
+        util.String("company_id", companyID.String()),
+        util.String("query", req.Query),
+        util.String("search_type", req.SearchType),
+        util.Int("results", len(results)),
+        util.Int("total", total),
+        util.Duration("duration", time.Since(startTime)))
+}
+// SearchCompanyEmployeesAdvanced searches employees with advanced filters
+func (h *AuthHandler) SearchCompanyEmployeesAdvanced(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    companyIDStr := chi.URLParam(r, "companyID")
+    companyID, err := uuid.Parse(companyIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+        return
+    }
+
+    // Parse query parameters
+    queryParams := r.URL.Query()
+    filters := make(map[string]interface{})
+
+    // Parse optional filters
+    if roleID := queryParams.Get("role_id"); roleID != "" {
+        roleUUID, err := uuid.Parse(roleID)
+        if err == nil {
+            filters["role_id"] = roleUUID
+        }
+    }
+
+    if deptID := queryParams.Get("department_id"); deptID != "" {
+        deptUUID, err := uuid.Parse(deptID)
+        if err == nil {
+            filters["department_id"] = deptUUID
+        }
+    }
+
+    if reportsTo := queryParams.Get("reports_to"); reportsTo != "" {
+        reportsToUUID, err := uuid.Parse(reportsTo)
+        if err == nil {
+            filters["reports_to"] = reportsToUUID
+        }
+    }
+
+    if isActive := queryParams.Get("is_active"); isActive != "" {
+        filters["is_active"] = strings.ToLower(isActive) == "true"
+    }
+
+    if hireDateFrom := queryParams.Get("hire_date_from"); hireDateFrom != "" {
+        if date, err := time.Parse(time.RFC3339, hireDateFrom); err == nil {
+            filters["hire_date_from"] = date
+        }
+    }
+
+    if hireDateTo := queryParams.Get("hire_date_to"); hireDateTo != "" {
+        if date, err := time.Parse(time.RFC3339, hireDateTo); err == nil {
+            filters["hire_date_to"] = date
+        }
+    }
+
+    // Parse pagination
+    limit := h.getIntQueryParam(r, "limit", 50)
+    offset := h.getIntQueryParam(r, "offset", 0)
+    page := h.getIntQueryParam(r, "page", 1)
+    
+    // If page is provided, calculate offset
+    if r.URL.Query().Get("page") != "" {
+        offset = (page - 1) * limit
+    }
+
+    // Check permissions
+    userID := r.Context().Value("user_id")
+    if userID == nil {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+            "Authentication required")
+        return
+    }
+
+    userIDParsed, err := uuid.Parse(userID.(string))
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+        return
+    }
+
+    // Verify user belongs to the company
+    companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
+    if err != nil || companyContext.CompanyID != companyID.String() {
+        // Check if user has permission to search in any company (admin permission)
+        hasPermission, _ := h.companyService.CheckPermissionFromContext(ctx, "admin.company.view")
+        if !hasPermission {
+            h.respondWithError(w, http.StatusForbidden,
+                fmt.Errorf("PERMISSION_DENIED: User not authorized to search in this company"),
+                "Insufficient permissions")
+            return
+        }
+    }
+
+    users, total, err := h.userService.SearchCompanyEmployeesAdvanced(ctx, companyID, filters, limit, offset)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search employees")
+        return
+    }
+
+    responseData := map[string]interface{}{
+        "employees":   users,
+        "total":       total,
+        "page":        page,
+        "page_size":   limit,
+        "has_more":    (offset + limit) < total,
+        "company_id":  companyID.String(),
+        "filters":     filters,
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Advanced employee search completed"))
+
+    h.logger.Info("Company advanced employee search completed",
+        util.String("company_id", companyID.String()),
+        util.Int("results", len(users)),
+        util.Int("total", total),
+        util.Any("filters", filters),
+        util.Duration("duration", time.Since(startTime)))
+}
+
+// GetCompanyEmployeeSuggestions returns employee suggestions for autocomplete within a company
+func (h *AuthHandler) GetCompanyEmployeeSuggestions(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    companyIDStr := chi.URLParam(r, "companyID")
+    companyID, err := uuid.Parse(companyIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+        return
+    }
+
+    prefix := r.URL.Query().Get("prefix")
+    if prefix == "" {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("PREFIX_REQUIRED"),
+            "Prefix parameter is required")
+        return
+    }
+
+    prefix = util.SanitizeInput(prefix)
+    
+    limit := h.getIntQueryParam(r, "limit", 10)
+    if limit > 20 {
+        limit = 20
+    }
+
+    // Check permissions
+    userID := r.Context().Value("user_id")
+    if userID == nil {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+            "Authentication required")
+        return
+    }
+
+    userIDParsed, err := uuid.Parse(userID.(string))
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+        return
+    }
+
+    // Verify user belongs to the company
+    companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
+    if err != nil || companyContext.CompanyID != companyID.String() {
+        // Check if user has permission to search in any company (admin permission)
+        hasPermission, _ := h.companyService.CheckPermissionFromContext(ctx, "admin.company.view")
+        if !hasPermission {
+            h.respondWithError(w, http.StatusForbidden,
+                fmt.Errorf("PERMISSION_DENIED: User not authorized to search in this company"),
+                "Insufficient permissions")
+            return
+        }
+    }
+
+    suggestions, err := h.userService.GetCompanyEmployeeSuggestions(ctx, companyID, prefix, limit)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get employee suggestions")
+        return
+    }
+
+    responseData := map[string]interface{}{
+        "suggestions": suggestions,
+        "total":       len(suggestions),
+        "company_id":  companyID.String(),
+        "prefix":      prefix,
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Employee suggestions retrieved"))
+
+    h.logger.Info("Company employee suggestions retrieved",
+        util.String("company_id", companyID.String()),
+        util.String("prefix", prefix),
+        util.Int("suggestions", len(suggestions)),
+        util.Duration("duration", time.Since(startTime)))
+}
+
+// FindCompanyEmployeeByUsername finds an employee by username within a company
+func (h *AuthHandler) FindCompanyEmployeeByUsername(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    companyIDStr := chi.URLParam(r, "companyID")
+    companyID, err := uuid.Parse(companyIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+        return
+    }
+
+    username := chi.URLParam(r, "username")
+    if username == "" {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("USERNAME_REQUIRED"),
+            "Username parameter is required")
+        return
+    }
+
+    username = util.SanitizeInput(username)
+
+    // Check permissions
+    userID := r.Context().Value("user_id")
+    if userID == nil {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+            "Authentication required")
+        return
+    }
+
+    userIDParsed, err := uuid.Parse(userID.(string))
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+        return
+    }
+
+    // Verify user belongs to the company
+    companyContext, err := h.companyService.GetCompanyContext(ctx, userIDParsed)
+    if err != nil || companyContext.CompanyID != companyID.String() {
+        // Check if user has permission to search in any company (admin permission)
+        hasPermission, _ := h.companyService.CheckPermissionFromContext(ctx, "admin.company.view")
+        if !hasPermission {
+            h.respondWithError(w, http.StatusForbidden,
+                fmt.Errorf("PERMISSION_DENIED: User not authorized to search in this company"),
+                "Insufficient permissions")
+            return
+        }
+    }
+
+    employee, err := h.userService.FindCompanyEmployeeByUsername(ctx, companyID, username)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "Employee not found")
+        return
+    }
+
+    h.sanitizeUser(employee)
+    
+    responseData := map[string]interface{}{
+        "employee":   employee,
+        "company_id": companyID.String(),
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Employee found"))
+
+    h.logger.Info("Company employee found by username",
+        util.String("company_id", companyID.String()),
+        util.String("username", username),
+        util.String("employee_id", employee.UserID.String()),
+        util.Duration("duration", time.Since(startTime)))
+}
+
+
+func (h *AuthHandler) VerifyMPINLogin(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    var req MPINVerifyPhoneRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    // Sanitize inputs
+    req.PhoneNumber = util.SanitizeInput(req.PhoneNumber)
+    req.MPIN = util.SanitizeInput(req.MPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.UserAgent = util.SanitizeInput(req.UserAgent)
+    req.CompanyID = util.SanitizeInput(req.CompanyID)
+
+    // Get user by phone number
+    user, err := h.userService.GetUserByPhone(ctx, req.PhoneNumber)
+    if err != nil {
+        h.respondWithError(w, http.StatusNotFound, err, "User not found")
+        return
+    }
+
+    // Check user status
+    if !user.IsActive {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("USER_INACTIVE: Account is inactive"),
+            "Account is inactive. Please contact support.")
+        return
+    }
+
+    // Get all active employee records for this user
+    employees, err := h.companyService.GetEmployeesByUser(ctx, user.UserID)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user employment info")
+        return
+    }
+
+    // Filter active employees
+    var activeEmployees []*models.CompanyEmployee
+    for _, emp := range employees {
+        if emp.IsActive {
+            activeEmployees = append(activeEmployees, emp)
+        }
+    }
+
+    if len(activeEmployees) == 0 {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("NO_ACTIVE_EMPLOYMENT: User is not an active employee in any company"),
+            "User is not an active employee in any company")
+        return
+    }
+
+    var selectedCompanyID uuid.UUID
+    var selectedEmployee *models.CompanyEmployee
+
+    // If company ID is provided, use it
+    if req.CompanyID != "" {
+        companyID, err := uuid.Parse(req.CompanyID)
+        if err != nil {
+            h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID format")
+            return
+        }
+
+        // Find the specific employee record for this company
+        for _, emp := range activeEmployees {
+            if emp.CompanyID == companyID {
+                selectedCompanyID = companyID
+                selectedEmployee = emp
+                break
+            }
+        }
+
+        if selectedEmployee == nil {
+            h.respondWithError(w, http.StatusForbidden,
+                fmt.Errorf("COMPANY_ACCESS_DENIED: User is not an active employee in the specified company"),
+                "User does not have access to the specified company")
+            return
+        }
+    } else {
+        // If no company specified and user has multiple companies, return error with company list
+        if len(activeEmployees) > 1 {
+            companyList := make([]map[string]string, len(activeEmployees))
+            for i, emp := range activeEmployees {
+                company, err := h.companyService.GetCompany(ctx, emp.CompanyID)
+                if err != nil {
+                    continue
+                }
+                companyList[i] = map[string]string{
+                    "company_id":   emp.CompanyID.String(),
+                    "company_name": company.CompanyName,
+                }
+            }
+
+            h.respondWithError(w, http.StatusBadRequest,
+                fmt.Errorf("MULTIPLE_COMPANIES: User belongs to multiple companies"),
+                "Please specify which company you want to log into")
+            h.respondWithJSON(w, http.StatusBadRequest, map[string]interface{}{
+                "success": false,
+                "error":   "MULTIPLE_COMPANIES",
+                "message": "User belongs to multiple companies. Please specify a company_id.",
+                "companies": companyList,
+            })
+            return
+        }
+
+        // Only one company - use it
+        selectedEmployee = activeEmployees[0]
+        selectedCompanyID = selectedEmployee.CompanyID
+    }
+
+    // Check company subscription status
+    company, err := h.companyService.GetCompany(ctx, selectedCompanyID)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get company info")
+        return
+    }
+
+    if !company.IsActive {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("COMPANY_INACTIVE: Company account is inactive"),
+            "Company account is inactive")
+        return
+    }
+
+    // Verify device trust for THIS specific company
+    deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, user.UserID, req.DeviceID)
+    if err != nil || !deviceTrusted {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
+            "MPIN login not allowed on this device")
+        return
+    }
+
+    // ✅ Enhanced MPIN verification with device fingerprint
+    mpinVerifyReq := service.MPINVerifyRequest{
+        UserID:            user.UserID,
+        MPIN:              req.MPIN,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        IPAddress:         h.getClientIP(r),
+        UserAgent:         r.UserAgent(),
+    }
+
+    mpinResult, err := h.mpinService.VerifyMPIN(ctx, &mpinVerifyReq)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
+        return
+    }
+
+    if !mpinResult.Verified {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
+            "MPIN verification failed")
+        return
+    }
+
+    // Get company context for THIS specific company
+    companyContext, err := h.companyService.GetCompanyContextForCompany(ctx, user.UserID, selectedCompanyID)
+    if err != nil {
+        h.logger.Warn("Company context check failed", util.ErrorField(err))
+        // Continue without company context if there's an error
+    }
+
+    userRole := "user"
+    if companyContext != nil {
+        userRole = companyContext.RoleName
+    }
+
+    // Issue JWT token pair WITH the specific company ID
+    tokenReq := &service.IssueTokenPairRequest{
+        UserID:      user.UserID.String(),
+        Role:        userRole,
+        DeviceID:    req.DeviceID,
+        SessionType: "user",
+        IPAddress:   h.getClientIP(r),
+        CompanyID:   selectedCompanyID.String(), // Pass the specific company ID
+    }
+
+    tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue tokens")
+        return
+    }
+
+    responseData := map[string]interface{}{
+        "tokens":       tokens,
+        "user_id":      user.UserID.String(),
+        "phone":        req.PhoneNumber,
+        "company_id":   selectedCompanyID.String(),
+        "company_name": company.CompanyName,
+        "message":      "MPIN login successful",
+    }
+
+    if companyContext != nil {
+        responseData["company_context"] = companyContext
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Login successful"))
+
+    h.logger.Info("MPIN login completed with JWT tokens",
+        util.String("user_id", user.UserID.String()),
+        util.String("phone", req.PhoneNumber),
+        util.String("company_id", selectedCompanyID.String()),
+        util.String("role", userRole),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+
+
+func (h *AuthHandler) GetCompanyContext(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    // Get user ID from JWT context
+    userID := r.Context().Value("user_id")
+    if userID == nil {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("UNAUTHORIZED: User not authenticated"),
+            "Authentication required")
+        return
+    }
+
+    userIDParsed, err := uuid.Parse(userID.(string))
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID in token")
+        return
+    }
+
+    // Get company ID from JWT context
+    companyID := r.Context().Value("company_id")
+    if companyID == nil {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("NO_COMPANY_CONTEXT: Token doesn't have company context"),
+            "Token doesn't have company context")
+        return
+    }
+
+    companyIDParsed, err := uuid.Parse(companyID.(string))
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID in token")
+        return
+    }
+
+    // Get company context for THIS specific company
+    companyContext, err := h.companyService.GetCompanyContextForCompany(ctx, userIDParsed, companyIDParsed)
+    if err != nil {
+        if strings.Contains(err.Error(), "subscription status:") {
+            h.respondWithError(w, http.StatusPaymentRequired, err, "Subscription issue")
+            return
+        }
+        if strings.Contains(err.Error(), "employee not found") {
+            h.respondWithError(w, http.StatusForbidden, err, "Not an active employee in this company")
+            return
+        }
+        h.respondWithError(w, http.StatusNotFound, err, "Company context not found")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(companyContext, "Company context retrieved"))
+
+    h.logger.Debug("Company context retrieved",
+        util.String("user_id", userIDParsed.String()),
+        util.String("company_id", companyIDParsed.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// Add this middleware to validate JWT with company context
+func (h *AuthHandler) CompanyContextMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        authHeader := r.Header.Get("Authorization")
+        if authHeader == "" {
+            h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("NO_AUTH_HEADER"), "No Authorization header")
+            return
+        }
+
+        parts := strings.Split(authHeader, " ")
+        if len(parts) != 2 || parts[0] != "Bearer" {
+            h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("INVALID_AUTH_FORMAT"), "Invalid Authorization format")
+            return
+        }
+
+        tokenString := parts[1]
+
+        claims, err := h.jwtService.ValidateAccessToken(r.Context(), tokenString)
+        if err != nil {
+            h.respondWithError(w, http.StatusUnauthorized, err, "Token validation failed")
+            return
+        }
+
+        // Add company ID to context if it exists
+        ctx := r.Context()
+        ctx = context.WithValue(ctx, "user_id", claims.UserID)
+        ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
+        ctx = context.WithValue(ctx, "role", claims.Role)
+        ctx = context.WithValue(ctx, "session_type", claims.SessionType)
+        ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+        
+        if claims.CompanyID != "" {
+            ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
+        }
+
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+
+// internal/handler/auth_handler.go
+func (h *AuthHandler) GetCompanyByEmployeePhonePublic(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    // Get raw query parameter to handle plus signs properly
+    query := r.URL.RawQuery
+    phoneNumber := ""
+    
+    // Parse query parameters manually to handle plus signs
+    if query != "" {
+        pairs := strings.Split(query, "&")
+        for _, pair := range pairs {
+            parts := strings.Split(pair, "=")
+            if len(parts) == 2 && parts[0] == "phone" {
+                // Decode the phone number
+                decoded, err := url.QueryUnescape(parts[1])
+                if err == nil {
+                    phoneNumber = decoded
+                } else {
+                    phoneNumber = parts[1]
+                }
+                break
+            }
+        }
+    }
+    
+    if phoneNumber == "" {
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("PHONE_REQUIRED: Phone number is required"),
+            "Phone number parameter is required")
+        return
+    }
+
+    // Ensure phone number starts with +
+    if !strings.HasPrefix(phoneNumber, "+") && len(phoneNumber) > 0 && phoneNumber[0] != ' ' {
+        phoneNumber = "+" + strings.TrimSpace(phoneNumber)
+    }
+    
+    // Sanitize input
+    phoneNumber = util.SanitizeInput(phoneNumber)
+    
+    // Call the NEW service method to get ALL companies
+    companies, err := h.companyService.GetCompaniesByEmployeePhone(ctx, phoneNumber)
+    if err != nil {
+        if strings.Contains(err.Error(), "not found") || 
+           strings.Contains(err.Error(), "is not an employee") {
+            h.respondWithError(w, http.StatusNotFound, err, "No companies found for this employee phone")
+            return
+        }
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get companies")
+        return
+    }
+
+    // Return array of companies
+    responseData := make([]map[string]interface{}, len(companies))
+    for i, company := range companies {
+        responseData[i] = map[string]interface{}{
+            "company_id":   company.CompanyID.String(),
+            "company_name": company.CompanyName,
+        }
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Companies retrieved successfully"))
+
+    h.logger.Info("Companies retrieved by employee phone",
+        util.String("phone", phoneNumber),
+        util.Int("company_count", len(companies)),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }

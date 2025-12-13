@@ -1,4 +1,3 @@
-// internal/repository/postgres/company_repository.go
 package postgres
 
 import (
@@ -39,7 +38,6 @@ type CompanyRepository interface {
 	CreateRoleWithDetails(ctx context.Context, role *models.Role, departmentID uuid.UUID, permissionIDs []uuid.UUID, createdBy uuid.UUID) error
 
 	// Employee hierarchy
-	GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error)
 
 	// ============================================================
 	// System Department Operations
@@ -61,9 +59,11 @@ type CompanyRepository interface {
 	// ============================================================
 	// Role-Department Mapping Operations
 	// ============================================================
+	DeleteDepartment(ctx context.Context, departmentID uuid.UUID) error
 	CreateRoleDepartment(ctx context.Context, roleID, departmentID uuid.UUID) error
 	RemoveRoleDepartment(ctx context.Context, roleID, departmentID uuid.UUID) error
 	GetRoleDepartments(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error)
+    RemoveAllRoleDepartments(ctx context.Context, departmentID uuid.UUID) error
 
 	// ============================================================
 	// Role & Permission Operations
@@ -94,7 +94,7 @@ type CompanyRepository interface {
 	GetEmployeesByUser(ctx context.Context, userID uuid.UUID) ([]*models.CompanyEmployee, error)
 	UpdateEmployee(ctx context.Context, employee *models.CompanyEmployee) error
 	UpdateEmployeeRole(ctx context.Context, companyID, userID, roleID uuid.UUID) error
-	UpdateEmployeeDepartment(ctx context.Context, companyID, userID, departmentID uuid.UUID) error
+	// UpdateEmployeeDepartment(ctx context.Context, companyID, userID, departmentID uuid.UUID) error
 	DeactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
 	ReactivateEmployee(ctx context.Context, companyID, userID uuid.UUID) error
 
@@ -107,6 +107,8 @@ type CompanyRepository interface {
 	ListActiveEmployees(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.CompanyEmployee, int, error)
 	IsUserActiveEmployee(ctx context.Context, companyID, userID uuid.UUID) (bool, error)
 	GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error)
+	GetEmployeeDepartment(ctx context.Context, companyID, userID uuid.UUID) (*models.Department, error)
+    GetEmployeeDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error)
 
 	// ============================================================
 	// Permission & RBAC Queries
@@ -137,9 +139,38 @@ type CompanyRepository interface {
 	// Analytics & Reporting
 	// ============================================================
 	GetCompanyStats(ctx context.Context, companyID uuid.UUID) (map[string]interface{}, error)
-	GetEmployeeRoleHierarchy(ctx context.Context, companyID uuid.UUID) ([]*EmployeeRoleHierarchy, error)
+	GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error)
 	GetRoleDistribution(ctx context.Context, companyID uuid.UUID) (map[string]int, error)
 	GetPermissionsBySystemDepartments(ctx context.Context, systemDeptIDs []uuid.UUID, module, category, tier string) ([]*models.Permission, error)
+
+	// ============================================================
+	// 🔍 ADVANCED COMPANY SEARCH METHODS (NEW)
+	// ============================================================
+	SearchCompaniesByName(
+		ctx context.Context,
+		searchQuery string,
+		searchType string,
+		filters *models.CompanySearchFilters,
+		limit, offset int,
+	) ([]*models.Company, int, error)
+
+	SearchCompaniesByOwnerAndName(
+		ctx context.Context,
+		ownerID uuid.UUID,
+		searchQuery string,
+		isActive *bool,
+		limit, offset int,
+	) ([]*models.Company, int, error)
+
+	GetCompanySuggestions(
+		ctx context.Context,
+		prefix string,
+		limit int,
+	) ([]string, error)
+
+	GetCompanySearchStats(
+		ctx context.Context,
+	) (map[string]interface{}, error)
 
 	// ============================================================
 	// Utility Methods
@@ -149,4 +180,5 @@ type CompanyRepository interface {
 	Close() error
 }
 
-// EmployeeRoleHierarchy represents employee with role information
+// NOTE: Remove the duplicate EmployeeRoleHierarchy struct from here
+// It's already defined in the models package
