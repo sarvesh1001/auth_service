@@ -169,12 +169,14 @@ func (s *PairingService) GetPairingStatus(ctx context.Context, sessionID string)
 		Status:      session.Status,
 		UserID:      session.UserID,
 		PhoneNumber: session.PhoneNumber,
+		SessionType: session.SessionType,
+		Role:        session.Role,
 		ExpiresAt:   session.ExpiresAt,
 	}, nil
 }
 
 /* -----------------------------------------------------------
-   CONFIRM PAIRING (ADMIN + USER)
+   CONFIRM PAIRING (ADMIN + USER) - UPDATED
 ----------------------------------------------------------- */
 
 func (s *PairingService) ConfirmPairing(ctx context.Context, sessionID string) (*models.TokenPairResponse, error) {
@@ -200,14 +202,31 @@ func (s *PairingService) ConfirmPairing(ctx context.Context, sessionID string) (
 
 	// ADMIN login
 	if session.SessionType == "admin" {
+		// Convert role string to role mask
+		var roleMask uint64
+		switch session.Role {
+		case "owner":
+			roleMask = models.RoleMaskOwner
+		case "super_employee":
+			roleMask = models.RoleMaskSuperEmployee
+		case "employee":
+			roleMask = models.RoleMaskEmployee
+		default:
+			roleMask = 0
+		}
+
+		// Convert permissions to bitmask
+		permMask := s.buildPermissionMask(session.Permissions)
+
 		tokenPair, err = s.sessionService.IssueTokenPair(ctx, &IssueTokenPairRequest{
-			UserID:           session.UserID,
-			Role:             session.Role,
-			DeviceID:         session.WebDeviceID,
-			SessionType:      "admin",
-			IPAddress:        session.IPAddress,
-			AdminRoleLevel:   session.Role,
-			AdminPermissions: session.Permissions,
+			UserID:         session.UserID,
+			Role:           session.Role,
+			DeviceID:       session.WebDeviceID,
+			SessionType:    "admin",
+			IPAddress:      session.IPAddress,
+			CompanyID:      "",
+			AdminRoleMask:  roleMask,
+			PermissionMask: permMask,
 		})
 
 	} else {
@@ -218,6 +237,7 @@ func (s *PairingService) ConfirmPairing(ctx context.Context, sessionID string) (
 			DeviceID:    session.WebDeviceID,
 			SessionType: "web",
 			IPAddress:   session.IPAddress,
+			CompanyID:   "",
 		})
 	}
 
@@ -238,6 +258,17 @@ func (s *PairingService) ConfirmPairing(ctx context.Context, sessionID string) (
 	)
 
 	return tokenPair, nil
+}
+
+// buildPermissionMask converts permission strings to bitmask
+func (s *PairingService) buildPermissionMask(permissions []string) []uint64 {
+	mask := make([]uint64, 4)
+	for _, perm := range permissions {
+		if bitIndex, exists := models.AdminPermissionBitIndices[perm]; exists {
+			mask = models.SetPermission(mask, bitIndex, true)
+		}
+	}
+	return mask
 }
 
 /* -----------------------------------------------------------

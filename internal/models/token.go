@@ -1,26 +1,22 @@
-
-// internal/models/token_models.go
 package models
 
 import (
 	"time"
 	"github.com/golang-jwt/jwt/v5"
-
 )
 
 // JWTClaims represents the JWT claims structure
 type JWTClaims struct {
-	UserID           string    `json:"user_id"`
-	Role             string    `json:"role"`
-	DeviceID         string    `json:"device_id"`
-	SessionType      string    `json:"session_type"`
-	CompanyID        string    `json:"company_id"`
-	JTI              string    `json:"jti"`
-	IssuedAt         int64     `json:"iat"`
-	ExpiresAt        int64     `json:"exp"`
-	PermissionMask   []uint64  `json:"permission_mask,omitempty"`
-	AdminRoleLevel   string    `json:"admin_role_level,omitempty"`
-	AdminPermissions []string  `json:"admin_permissions,omitempty"`
+	UserID           string   `json:"user_id"`
+	Role             string   `json:"role"`
+	DeviceID         string   `json:"device_id"`
+	SessionType      string   `json:"session_type"`
+	CompanyID        string   `json:"company_id"`
+	JTI              string   `json:"jti"`
+	IssuedAt         int64    `json:"iat"`
+	ExpiresAt        int64    `json:"exp"`
+	PermissionMask   []uint64 `json:"permission_mask,omitempty"`
+	AdminRoleMask    uint64   `json:"admin_role_mask,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -36,8 +32,7 @@ type RefreshTokenData struct {
 	LastUsed         time.Time `json:"last_used"`
 	Revoked          bool      `json:"revoked"`
 	IPAddress        string    `json:"ip_address,omitempty"`
-	AdminRoleLevel   string    `json:"admin_role_level,omitempty"`
-	AdminPermissions []string  `json:"admin_permissions,omitempty"`
+	AdminRoleMask    uint64    `json:"admin_role_mask,omitempty"`
 	JTI              string    `json:"jti,omitempty"` // Associated access token JTI
 }
 
@@ -61,7 +56,6 @@ type TokenPairResponse struct {
 	TokenType    string `json:"token_type"`
 	CompanyID    string `json:"company_id,omitempty"`
 }
-
 // // auth-service/internal/models/tokens.go (or wherever your token models are defined)
 
 // package models

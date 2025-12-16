@@ -1,4 +1,3 @@
-// internal/models/pairing.go
 package models
 
 import (
@@ -22,8 +21,6 @@ type WebSocketMessage struct {
 	Payload interface{} `json:"payload"`
 }
 
-// internal/models/pairing.go
-
 type PairingSession struct {
 	SessionID   string    `json:"session_id"`
 	UserID      string    `json:"user_id,omitempty"`
@@ -40,19 +37,44 @@ type PairingSession struct {
 	UserAgent   string    `json:"user_agent,omitempty"`
 	WebDeviceID string    `json:"web_device_id"`
 
-	// ✅ NEW: Session type and role information
+	// Session type and role information
 	SessionType string   `json:"session_type,omitempty"` // "user" or "admin"
 	Role        string   `json:"role,omitempty"`         // user role or admin role level
-	Permissions []string `json:"permissions,omitempty"`  // admin permissions
+	Permissions []string `json:"perm	issions,omitempty"`  // admin permissions
 }
 
-// Update PairingStatusResponse to include session type
+// GetRoleMask converts role string to role mask
+func (p *PairingSession) GetRoleMask() uint64 {
+	switch p.Role {
+	case "owner":
+		return RoleMaskOwner
+	case "super_employee":
+		return RoleMaskSuperEmployee
+	case "employee":
+		return RoleMaskEmployee
+	default:
+		return 0
+	}
+}
+
+// GetPermissionMask converts permission strings to bitmask
+func (p *PairingSession) GetPermissionMask() []uint64 {
+	mask := make([]uint64, 4)
+	for _, perm := range p.Permissions {
+		if bitIndex, exists := AdminPermissionBitIndices[perm]; exists {
+			mask = SetPermission(mask, bitIndex, true)
+		}
+	}
+	return mask
+}
+
+// PairingStatusResponse
 type PairingStatusResponse struct {
 	SessionID   string    `json:"session_id"`
 	Status      string    `json:"status"`
 	UserID      string    `json:"user_id,omitempty"`
 	PhoneNumber string    `json:"phone_number,omitempty"`
-	SessionType string    `json:"session_type,omitempty"` // ✅ NEW
-	Role        string    `json:"role,omitempty"`         // ✅ NEW
+	SessionType string    `json:"session_type,omitempty"`
+	Role        string    `json:"role,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at"`
 }

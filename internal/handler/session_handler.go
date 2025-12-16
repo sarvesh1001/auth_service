@@ -10,7 +10,7 @@ import (
     "fmt"
     "auth-service/internal/service"
     "auth-service/internal/util"
-
+    "strings"
     "github.com/go-chi/chi/v5"
     "github.com/google/uuid"
     "go.uber.org/zap"
@@ -28,6 +28,11 @@ func NewSessionHandler(sessionService *service.SessionService, logger *zap.Logge
     }
 }
 
+var (
+    ErrSessionNotFound = errors.New("session not found")
+    ErrInvalidInput    = errors.New("invalid input")
+    ErrSessionExpired  = errors.New("session expired")
+)
 // ✅ NEW: RegisterPublicRoutes registers public session routes
 func (h *SessionHandler) RegisterPublicRoutes(router chi.Router) {
     router.Route("/sessions", func(r chi.Router) {
@@ -112,15 +117,19 @@ func (h *SessionHandler) CreateAdminSession(w http.ResponseWriter, r *http.Reque
 
     // Validate required fields
     if req.AdminID == uuid.Nil {
-        h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("admin_id required"), "Admin ID is required")
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("admin_id required"), "Admin ID is required")
         return
     }
-    if req.AdminRoleLevel == "" {
-        h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("admin_role_level required"), "Admin role level is required")
+    // ✅ FIXED: Use AdminRoleMask instead of AdminRoleLevel
+    if req.AdminRoleMask == 0 {
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("admin_role_mask required"), "Admin role mask is required")
         return
     }
     if req.DeviceID == "" {
-        h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("device_id required"), "Device ID is required")
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("device_id required"), "Device ID is required")
         return
     }
 
@@ -137,11 +146,11 @@ func (h *SessionHandler) CreateAdminSession(w http.ResponseWriter, r *http.Reque
     h.respondWithJSON(w, http.StatusCreated, successResponse(session, "Admin session created successfully"))
     h.logger.Info("Admin session created via HTTP",
         util.String("admin_id", req.AdminID.String()),
-        util.String("role_level", req.AdminRoleLevel),
+        // ✅ FIXED: Use AdminRoleMask for logging
+        util.Uint64("role_mask", req.AdminRoleMask),
         util.Duration("duration", time.Since(startTime)),
     )
 }
-
 // ✅ NEW: InvalidateAdminSessions invalidates all admin sessions for a user
 // DELETE /api/v1/sessions/admin/user/{userID}
 func (h *SessionHandler) InvalidateAdminSessions(w http.ResponseWriter, r *http.Request) {
@@ -610,18 +619,27 @@ func (h *SessionHandler) GetSessionStats(w http.ResponseWriter, r *http.Request)
 
 // ✅ NEW: getStatusCode determines appropriate HTTP status code
 func (h *SessionHandler) getStatusCode(err error) int {
-    switch {
-    case errors.Is(err, service.ErrSessionNotFound):
-        return http.StatusNotFound
-    case errors.Is(err, service.ErrInvalidInput):
-        return http.StatusBadRequest
-    case errors.Is(err, service.ErrSessionExpired):
-        return http.StatusUnauthorized
-    default:
-        return http.StatusInternalServerError
+    if err == nil {
+        return http.StatusOK
     }
-}
 
+    errMsg := err.Error()
+
+    if errors.Is(err, ErrSessionNotFound) || strings.Contains(errMsg, "not found") {
+        return http.StatusNotFound
+    }
+    if errors.Is(err, ErrInvalidInput) || strings.Contains(errMsg, "invalid") {
+        return http.StatusBadRequest
+    }
+    if errors.Is(err, ErrSessionExpired) || strings.Contains(errMsg, "expired") {
+        return http.StatusUnauthorized
+    }
+    if strings.Contains(errMsg, "unauthorized") || strings.Contains(errMsg, "permission") {
+        return http.StatusForbidden
+    }
+
+    return http.StatusInternalServerError
+}
 // ✅ NEW: Add missing fmt import and error types
 // Make sure to add this import: "fmt"
 

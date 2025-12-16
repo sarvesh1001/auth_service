@@ -1,4 +1,3 @@
-// internal/service/jwt_service.go - WITH ACCESS TOKEN CREATION
 package service
 
 import (
@@ -33,14 +32,14 @@ func NewJWTService(cfg *config.Config, companyRepo postgres.CompanyRepository, l
 }
 
 type CreateAccessTokenRequest struct {
-	UserID           string
-	Role             string
-	DeviceID         string
-	SessionType      string
-	CompanyID        string
-	IPAddress        string
-	AdminRoleLevel   string
-	AdminPermissions []string
+	UserID          string
+	Role            string
+	DeviceID        string
+	SessionType     string
+	CompanyID       string
+	IPAddress       string
+	AdminRoleMask   uint64
+	PermissionMask  []uint64
 }
 
 // CreateAccessToken creates JWT with permission bitmask
@@ -48,9 +47,6 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 	// Validate input parameters
 	if req.UserID == "" {
 		return "", "", fmt.Errorf("user ID is required")
-	}
-	if req.Role == "" {
-		return "", "", fmt.Errorf("role is required")
 	}
 	if req.DeviceID == "" {
 		return "", "", fmt.Errorf("device ID is required")
@@ -62,15 +58,21 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 	jti := uuid.NewString()
 	now := time.Now()
 
-	// Build Permission Mask - use the specific company ID
+	// Build Permission Mask
 	var permissionMask []uint64
+	var role string
 
 	if req.SessionType == "admin" {
-		// Admin → full access to all 229 permissions
-		permissionMask = s.buildFullAccessMask()
-		s.logger.Info("🔐 ADMIN session token - FULL permissions",
+		// Admin session - use provided permission mask
+		permissionMask = req.PermissionMask
+		if permissionMask == nil {
+			permissionMask = models.CreateFullPermissionMask()
+		}
+		role = "admin"
+		
+		s.logger.Info("🔐 ADMIN session token",
 			zap.String("admin_id", req.UserID),
-			zap.String("role", req.Role),
+			zap.Uint64("role_mask", req.AdminRoleMask),
 			zap.Any("permission_mask", permissionMask))
 	} else {
 		// User session type - company RBAC for SPECIFIC company
@@ -118,21 +120,21 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 				zap.Int("total_permissions", len(permissions)),
 				zap.Strings("permissions", permissions))
 		}
+		role = req.Role
 	}
 
 	// Create Claims with Permission Mask and COMPANY ID
 	claims := &models.JWTClaims{
-		UserID:           req.UserID,
-		Role:             req.Role,
-		DeviceID:         req.DeviceID,
-		SessionType:      req.SessionType,
-		CompanyID:        req.CompanyID, // The specific company ID
-		JTI:              jti,
-		IssuedAt:         now.Unix(),
-		ExpiresAt:        now.Add(s.config.JWT.AccessTTL).Unix(),
-		PermissionMask:   permissionMask,
-		AdminRoleLevel:   req.AdminRoleLevel,
-		AdminPermissions: req.AdminPermissions,
+		UserID:         req.UserID,
+		Role:           role,
+		DeviceID:       req.DeviceID,
+		SessionType:    req.SessionType,
+		CompanyID:      req.CompanyID, // The specific company ID
+		JTI:            jti,
+		IssuedAt:       now.Unix(),
+		ExpiresAt:      now.Add(s.config.JWT.AccessTTL).Unix(),
+		PermissionMask: permissionMask,
+		AdminRoleMask:  req.AdminRoleMask,
 	}
 
 	// Sign JWT
@@ -142,26 +144,17 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 		return "", "", fmt.Errorf("failed to sign token: %w", err)
 	}
 
-	s.logger.Info("🎫 JWT access token created for specific company",
+	s.logger.Info("🎫 JWT access token created",
 		zap.String("user_id", req.UserID),
 		zap.String("session_type", req.SessionType),
 		zap.String("company_id", req.CompanyID),
-		zap.String("role", req.Role),
+		zap.String("role", role),
 		zap.String("jti", jti),
 		zap.Int64("expires_at", claims.ExpiresAt),
-		zap.Any("permission_mask", permissionMask))
+		zap.Any("permission_mask", permissionMask),
+		zap.Uint64("admin_role_mask", req.AdminRoleMask))
 
 	return signed, jti, nil
-}
-
-// Helper to build full access mask for admin
-func (s *JWTService) buildFullAccessMask() []uint64 {
-	// We have 229 permissions, so we need 4 uint64s (229/64 = 3.57 -> 4)
-	mask := make([]uint64, 4)
-	for i := range mask {
-		mask[i] = ^uint64(0) // Set all bits to 1
-	}
-	return mask
 }
 
 // ValidateAccessToken validates and parses JWT access token (signature only)
@@ -208,7 +201,8 @@ func (s *JWTService) ValidateAccessToken(ctx context.Context, tokenStr string) (
 	s.logger.Debug("JWT token validated successfully",
 		zap.String("user_id", claims.UserID),
 		zap.String("session_type", claims.SessionType),
-		zap.String("jti", claims.JTI))
+		zap.String("jti", claims.JTI),
+		zap.Uint64("admin_role_mask", claims.AdminRoleMask))
 
 	return claims, nil
 }
@@ -247,7 +241,6 @@ func (s *JWTService) VerifyTokenExpiration(claims *models.JWTClaims) bool {
 	now := time.Now().Unix()
 	return claims.ExpiresAt > now
 }
-
 // // internal/service/jwt_service.go
 // package service
 

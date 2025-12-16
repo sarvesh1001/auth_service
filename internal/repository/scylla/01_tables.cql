@@ -184,8 +184,9 @@ CREATE TABLE IF NOT EXISTS admin_users (
     phone_encrypted blob,
     phone_key_id uuid,
     phone_encrypted_dek text,
-    admin_role_level text,
-    admin_permissions list<text>,
+    admin_role_mask bigint,  -- Changed from admin_role_level text
+    admin_permission_mask list<bigint>,  -- Changed from admin_permissions list<text>
+    department_bitmask bigint,  -- New: Bitmask for departments this admin can manage
     admin_created_at timestamp,
     admin_created_by uuid,
     admin_updated_at timestamp,
@@ -195,22 +196,20 @@ CREATE TABLE IF NOT EXISTS admin_users (
     failed_login_attempts int,
     last_login timestamp
 ) WITH compression = {'sstable_compression': 'LZ4Compressor'};
-
 -- ===============================
 -- ADMIN SESSIONS
 -- ===============================
 CREATE TABLE IF NOT EXISTS admin_sessions (
     admin_id uuid PRIMARY KEY,
     session_token text,
-    role_level text,
-    permissions set<text>,
+    role_mask bigint,  -- Changed from role_level text
+    permissions list<bigint>,  -- Changed from permissions set<text>
     mfa_verified boolean,
     created_at timestamp,
     last_activity timestamp,
     expires_at timestamp,
     ip_address inet
 ) WITH default_time_to_live = 28800;
-
 -- ===============================
 -- ADMIN AUDIT LOG
 -- ===============================
@@ -226,8 +225,10 @@ CREATE TABLE IF NOT EXISTS admin_audit_log (
     operation_status text,
     changes text,
     ip_address inet,
-    old_values text,
-    new_values text,
+    old_role_mask bigint,
+    new_role_mask bigint,
+    old_permission_mask list<bigint>,
+    new_permission_mask list<bigint>,
     error_message text,
     PRIMARY KEY ((audit_bucket, action_date), action_time, audit_id, admin_id)
 ) WITH CLUSTERING ORDER BY (action_time DESC, audit_id DESC, admin_id ASC)

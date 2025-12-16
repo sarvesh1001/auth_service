@@ -314,12 +314,12 @@ type RoleWithPermissions struct {
 // SYSTEM DEPARTMENTS
 // =========================================================
 
-type SystemDepartment struct {
-	SystemDepartmentID uuid.UUID `json:"system_department_id" db:"system_department_id"`
-	Name               string    `json:"name" db:"name"`
-	ModuleCode         string    `json:"module_code" db:"module_code"`
-	Description        string    `json:"description" db:"description"`
-}
+// type SystemDepartment struct {
+// 	SystemDepartmentID uuid.UUID `json:"system_department_id" db:"system_department_id"`
+// 	Name               string    `json:"name" db:"name"`
+// 	ModuleCode         string    `json:"module_code" db:"module_code"`
+// 	Description        string    `json:"description" db:"description"`
+// }
 
 // =========================================================
 // DEPARTMENTS (Updated with SystemDepartmentName and ModuleCode)

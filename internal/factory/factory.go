@@ -649,7 +649,7 @@ func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
-			f.UserRepository(),
+            f.CompanyRepository(),        // ✅ NEW: companyRepo
 			f.GetSessionService(),
 			f.GetOTPService(), // This is now safe
 			f.GetMPINService(),

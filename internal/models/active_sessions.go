@@ -1,6 +1,3 @@
-// internal/models/session.go
-// UPDATE: Add SessionType field to existing ActiveSession struct
-
 package models
 
 import (
@@ -20,12 +17,13 @@ type ActiveSession struct {
 	IPAddress          net.IP    `db:"ip_address" json:"ip_address"`
 	EncryptionKey      []byte    `db:"encryption_key" json:"encryption_key"`
 	
-	// ===== NEW FIELD FOR HYBRID ADMIN APPROACH =====
-	SessionType       string    `db:"session_type" json:"session_type"`          // "user" or "admin"
-    AdminRoleLevel    string    `db:"admin_role_level" json:"admin_role_level,omitempty"`
-    AdminPermissions  []string  `db:"admin_permissions" json:"admin_permissions,omitempty"`
+	// Session type
+	SessionType        string    `db:"session_type" json:"session_type"` // "user" or "admin"
+	
+	// Bitmask fields for admin - ADDED
+	AdminRoleMask      uint64    `db:"admin_role_mask" json:"admin_role_mask,omitempty"`
+	AdminPermissionMask []uint64 `db:"admin_permission_mask" json:"admin_permission_mask,omitempty"`
 }
-
 
 // SessionType constants
 const (
@@ -51,4 +49,18 @@ func (s *ActiveSession) SetAdminSession() {
 // SetUserSession marks this session as user session
 func (s *ActiveSession) SetUserSession() {
 	s.SessionType = SessionTypeUser
+}
+
+// HasPermission checks if admin session has a specific permission
+func (s *ActiveSession) HasPermission(permissionName string) bool {
+	if s.SessionType != SessionTypeAdmin || s.AdminPermissionMask == nil {
+		return false
+	}
+	
+	bitIndex, exists := AdminPermissionBitIndices[permissionName]
+	if !exists {
+		return false
+	}
+	
+	return HasPermission(s.AdminPermissionMask, bitIndex)
 }

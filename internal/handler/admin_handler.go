@@ -10,11 +10,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
+	"strconv"  // Add this
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-
+	"math/bits"
+	"github.com/golang-jwt/jwt/v5"  
 	"auth-service/internal/models"
 	"auth-service/internal/service"
 	"auth-service/internal/util"
@@ -285,110 +286,176 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 		util.Duration("duration", time.Since(startTime)),
 	)
 }
-
 func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+    ctx := r.Context()
+    startTime := time.Now()
 
-	var req struct {
-		AdminID           string `json:"admin_id" validate:"required"`
-		MPIN              string `json:"mpin" validate:"required"`
-		DeviceID          string `json:"device_id" validate:"required"`
-		DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
-		UserAgent         string `json:"user_agent"`
-	}
+    var req struct {
+        AdminID           string `json:"admin_id" validate:"required"`
+        MPIN              string `json:"mpin" validate:"required"`
+        DeviceID          string `json:"device_id" validate:"required"`
+        DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+        UserAgent         string `json:"user_agent"`
+    }
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
 
-	req.MPIN = util.SanitizeInput(req.MPIN)
-	req.DeviceID = util.SanitizeInput(req.DeviceID)
-	req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
+    req.MPIN = util.SanitizeInput(req.MPIN)
+    req.DeviceID = util.SanitizeInput(req.DeviceID)
+    req.DeviceFingerprint = util.SanitizeInput(req.DeviceFingerprint)
 
-	adminID, err := uuid.Parse(req.AdminID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
-		return
-	}
+    adminID, err := uuid.Parse(req.AdminID)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
 
-	// ✅ CHECK: Device trust handled by MPIN service
-	deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, adminID, req.DeviceID)
-	if err != nil || !deviceTrusted {
-		h.respondWithError(w, http.StatusForbidden,
-			fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
-			"MPIN login not allowed on this device")
-		return
-	}
+    // ✅ CHECK: Device trust handled by MPIN service
+    deviceTrusted, err := h.deviceService.IsDeviceTrusted(ctx, adminID, req.DeviceID)
+    if err != nil || !deviceTrusted {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("UNTRUSTED_DEVICE: Device not trusted for MPIN login"),
+            "MPIN login not allowed on this device")
+        return
+    }
 
-	// ✅ FIXED: Enhanced IP handling with validation
-	ipAddress := h.getClientIP(r)
-	if ipAddress == "" {
-		h.logger.Warn("Invalid IP address detected, using safe default",
-			util.String("admin_id", adminID.String()),
-			util.String("device_id", req.DeviceID))
-		ipAddress = "0.0.0.0"
-	}
+    // ✅ FIXED: Enhanced IP handling with validation
+    ipAddress := h.getClientIP(r)
+    if ipAddress == "" {
+        h.logger.Warn("Invalid IP address detected, using safe default",
+            util.String("admin_id", adminID.String()),
+            util.String("device_id", req.DeviceID))
+        ipAddress = "0.0.0.0"
+    }
 
-	mpinVerifyReq := &service.AdminMPINVerifyRequest{
-		AdminID:           adminID,
-		MPIN:              req.MPIN,
-		DeviceID:          req.DeviceID,
-		DeviceFingerprint: req.DeviceFingerprint,
-		IPAddress:         ipAddress,
-		UserAgent:         r.UserAgent(), // ✅ ADD THIS LINE
-	}
+    mpinVerifyReq := &service.AdminMPINVerifyRequest{
+        AdminID:           adminID,
+        MPIN:              req.MPIN,
+        DeviceID:          req.DeviceID,
+        DeviceFingerprint: req.DeviceFingerprint,
+        IPAddress:         ipAddress,
+        UserAgent:         r.UserAgent(),
+    }
 
-	mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, mpinVerifyReq)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
-		return
-	}
+    mpinResult, err := h.mpinService.VerifyAdminMPIN(ctx, mpinVerifyReq)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "MPIN verification failed")
+        return
+    }
 
-	if !mpinResult.Verified {
-		h.respondWithError(w, http.StatusUnauthorized,
-			fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
-			"MPIN verification failed")
-		return
-	}
+    if !mpinResult.Verified {
+        h.respondWithError(w, http.StatusUnauthorized,
+            fmt.Errorf("MPIN_VERIFICATION_FAILED: %s", mpinResult.Message),
+            "MPIN verification failed")
+        return
+    }
 
-	admin, err := h.adminService.GetAdmin(ctx, adminID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get admin details")
-		return
-	}
+    admin, err := h.adminService.GetAdmin(ctx, adminID)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get admin details")
+        return
+    }
 
-	tokenReq := &service.IssueTokenPairRequest{
-		UserID:           admin.AdminID.String(),
-		Role:             "admin",
-		DeviceID:         req.DeviceID,
-		SessionType:      "admin",
-		IPAddress:        ipAddress,
-		AdminRoleLevel:   admin.AdminRoleLevel,
-		AdminPermissions: admin.AdminPermissions,
-	}
+    // ✅ FIXED: Use bitmask fields
+    tokenReq := &service.IssueTokenPairRequest{
+        UserID:         admin.AdminID.String(),
+        Role:           admin.GetRoleString(),
+        DeviceID:       req.DeviceID,
+        SessionType:    "admin",
+        IPAddress:      ipAddress,
+        AdminRoleMask:  admin.AdminRoleMask,
+        PermissionMask: admin.AdminPermissionMask,
+    }
 
-	tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue JWT tokens")
-		return
-	}
+    tokens, err := h.sessionService.IssueTokenPair(ctx, tokenReq)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to issue JWT tokens")
+        return
+    }
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
-		"tokens":  tokens,
-		"admin":   admin,
-		"message": "Admin MPIN login successful",
-	}, "Admin login successful"))
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "tokens":  tokens,
+        "admin": map[string]interface{}{
+            "admin_id":              admin.AdminID.String(),
+            "role_mask":             admin.AdminRoleMask,
+            "permission_mask":       admin.AdminPermissionMask,
+            "role_string":           admin.GetRoleString(),
+            "permission_names":      admin.GetPermissionNames(),
+        },
+        "message": "Admin MPIN login successful",
+    }, "Admin login successful"))
 
-	h.logger.Info("Admin MPIN login completed with JWT tokens",
-		util.String("admin_id", adminID.String()),
-		util.String("role_level", admin.AdminRoleLevel),
-		util.String("ip_address", ipAddress),
-		util.Duration("duration", time.Since(startTime)),
-	)
+    h.logger.Info("Admin MPIN login completed with JWT tokens",
+        util.String("admin_id", adminID.String()),
+        util.Uint64("role_mask", admin.AdminRoleMask),
+        util.String("ip_address", ipAddress),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }
 
+
+// UpdateAdminPermissions updates admin permissions (needs conversion from string to bitmask)
+func (h *AdminHandler) UpdateAdminPermissions(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID format")
+        return
+    }
+
+    var req struct {
+        Permissions []string `json:"permissions"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    if len(req.Permissions) == 0 {
+        h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("empty permissions"), "Permissions list cannot be empty")
+        return
+    }
+
+    // ✅ FIXED: Convert permission names to bitmask
+    permissionMask := make([]uint64, 4)
+    for _, permName := range req.Permissions {
+        if bitIndex, exists := models.AdminPermissionBitIndices[permName]; exists {
+            permissionMask = models.SetPermission(permissionMask, bitIndex, true)
+        } else {
+            h.logger.Warn("Unknown permission name", util.String("permission", permName))
+        }
+    }
+
+    if err := h.adminService.UpdateAdminPermissions(ctx, adminID, permissionMask, requesterID); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to update permissions")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "permission_mask": permissionMask,
+        "permission_names": req.Permissions,
+    }, "Admin permissions updated successfully"))
+    
+    h.logger.Info("Admin permissions updated via HTTP",
+        util.String("admin_id", adminID.String()),
+        util.Strings("permissions", req.Permissions),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
 func (h *AdminHandler) SetupAdminMPIN(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -2245,145 +2312,145 @@ func (h *AdminHandler) GetRecentlyActiveUsers(w http.ResponseWriter, r *http.Req
 
 // ===== EXISTING ADMIN MANAGEMENT METHODS =====
 
-func (h *AdminHandler) ChangeOwnerPhone(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// func (h *AdminHandler) ChangeOwnerPhone(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
+// 	requesterID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+// 		return
+// 	}
 
-	var req struct {
-		NewPhone string `json:"new_phone"`
-	}
+// 	var req struct {
+// 		NewPhone string `json:"new_phone"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	req.NewPhone = strings.TrimSpace(req.NewPhone)
-	if req.NewPhone == "" {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("new_phone required"), "New phone is required")
-		return
-	}
+// 	req.NewPhone = strings.TrimSpace(req.NewPhone)
+// 	if req.NewPhone == "" {
+// 		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("new_phone required"), "New phone is required")
+// 		return
+// 	}
 
-	if err := h.adminService.ChangeOwnerPhone(ctx, requesterID, req.NewPhone); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to change owner phone")
-		return
-	}
+// 	if err := h.adminService.ChangeOwnerPhone(ctx, requesterID, req.NewPhone); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to change owner phone")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Owner phone updated successfully"))
-	h.logger.Info("Owner phone changed via HTTP",
-		util.String("admin_id", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Owner phone updated successfully"))
+// 	h.logger.Info("Owner phone changed via HTTP",
+// 		util.String("admin_id", requesterID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
-func (h *AdminHandler) InviteAdmin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// func (h *AdminHandler) InviteAdmin(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
+// 	requesterID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+// 		return
+// 	}
 
-	requesterRole, err := h.getRequesterRole(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
+// 	requesterRole, err := h.getRequesterRole(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+// 		return
+// 	}
 
-	var req struct {
-		Phone     string `json:"phone"`
-		RoleLevel string `json:"role_level"`
-	}
+// 	var req struct {
+// 		Phone     string `json:"phone"`
+// 		RoleLevel string `json:"role_level"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	req.Phone = strings.TrimSpace(req.Phone)
-	req.RoleLevel = strings.TrimSpace(strings.ToLower(req.RoleLevel))
+// 	req.Phone = strings.TrimSpace(req.Phone)
+// 	req.RoleLevel = strings.TrimSpace(strings.ToLower(req.RoleLevel))
 
-	if req.Phone == "" || req.RoleLevel == "" {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("missing fields"), "Phone and role level are required")
-		return
-	}
+// 	if req.Phone == "" || req.RoleLevel == "" {
+// 		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("missing fields"), "Phone and role level are required")
+// 		return
+// 	}
 
-	if !h.isValidRoleLevel(req.RoleLevel) {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("invalid role"), "Invalid role level")
-		return
-	}
+// 	if !h.isValidRoleLevel(req.RoleLevel) {
+// 		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("invalid role"), "Invalid role level")
+// 		return
+// 	}
 
-	admin, err := h.adminService.InviteAdmin(ctx, req.Phone, req.RoleLevel, requesterID, requesterRole)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to invite user as admin")
-		return
-	}
+// 	admin, err := h.adminService.InviteAdmin(ctx, req.Phone, req.RoleLevel, requesterID, requesterRole)
+// 	if err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to invite user as admin")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusCreated, successResponse(admin, "User invited as admin successfully"))
-	h.logger.Info("User invited as admin via HTTP",
-		util.String("admin_id", admin.AdminID.String()),
-		util.String("role_level", req.RoleLevel),
-		util.String("invited_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.respondWithJSON(w, http.StatusCreated, successResponse(admin, "User invited as admin successfully"))
+// 	h.logger.Info("User invited as admin via HTTP",
+// 		util.String("admin_id", admin.AdminID.String()),
+// 		util.String("role_level", req.RoleLevel),
+// 		util.String("invited_by", requesterID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
-func (h *AdminHandler) PromoteAdmin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// func (h *AdminHandler) PromoteAdmin(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
+// 	requesterID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+// 		return
+// 	}
 
-	adminIDStr := chi.URLParam(r, "adminID")
-	adminID, err := uuid.Parse(adminIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID format")
-		return
-	}
+// 	adminIDStr := chi.URLParam(r, "adminID")
+// 	adminID, err := uuid.Parse(adminIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID format")
+// 		return
+// 	}
 
-	var req struct {
-		NewRole string `json:"new_role"`
-	}
+// 	var req struct {
+// 		NewRole string `json:"new_role"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	req.NewRole = strings.TrimSpace(strings.ToLower(req.NewRole))
-	if !h.isValidRoleLevel(req.NewRole) {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("invalid role"), "Invalid role level")
-		return
-	}
+// 	req.NewRole = strings.TrimSpace(strings.ToLower(req.NewRole))
+// 	if !h.isValidRoleLevel(req.NewRole) {
+// 		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("invalid role"), "Invalid role level")
+// 		return
+// 	}
 
-	if err := h.adminService.PromoteAdmin(ctx, adminID, req.NewRole, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to promote admin")
-		return
-	}
+// 	if err := h.adminService.PromoteAdmin(ctx, adminID, req.NewRole, requesterID); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to promote admin")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin role updated successfully"))
-	h.logger.Info("Admin promoted via HTTP",
-		util.String("admin_id", adminID.String()),
-		util.String("new_role", req.NewRole),
-		util.String("promoted_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin role updated successfully"))
+// 	h.logger.Info("Admin promoted via HTTP",
+// 		util.String("admin_id", adminID.String()),
+// 		util.String("new_role", req.NewRole),
+// 		util.String("promoted_by", requesterID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 func (h *AdminHandler) RemoveAdmin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -2476,50 +2543,50 @@ func (h *AdminHandler) ActivateAdmin(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-func (h *AdminHandler) UpdateAdminPermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// func (h *AdminHandler) UpdateAdminPermissions(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
+// 	requesterID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+// 		return
+// 	}
 
-	adminIDStr := chi.URLParam(r, "adminID")
-	adminID, err := uuid.Parse(adminIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID format")
-		return
-	}
+// 	adminIDStr := chi.URLParam(r, "adminID")
+// 	adminID, err := uuid.Parse(adminIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID format")
+// 		return
+// 	}
 
-	var req struct {
-		Permissions []string `json:"permissions"`
-	}
+// 	var req struct {
+// 		Permissions []string `json:"permissions"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	if len(req.Permissions) == 0 {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("empty permissions"), "Permissions list cannot be empty")
-		return
-	}
+// 	if len(req.Permissions) == 0 {
+// 		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("empty permissions"), "Permissions list cannot be empty")
+// 		return
+// 	}
 
-	if err := h.adminService.UpdateAdminPermissions(ctx, adminID, req.Permissions, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update permissions")
-		return
-	}
+// 	if err := h.adminService.UpdateAdminPermissions(ctx, adminID, req.Permissions, requesterID); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to update permissions")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin permissions updated successfully"))
-	h.logger.Info("Admin permissions updated via HTTP",
-		util.String("admin_id", adminID.String()),
-		util.Strings("permissions", req.Permissions),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin permissions updated successfully"))
+// 	h.logger.Info("Admin permissions updated via HTTP",
+// 		util.String("admin_id", adminID.String()),
+// 		util.Strings("permissions", req.Permissions),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 func (h *AdminHandler) GetAdminByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -2646,42 +2713,42 @@ func (h *AdminHandler) GetAdminsByStatus(w http.ResponseWriter, r *http.Request)
 	)
 }
 
-func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	_, _ = h.getRequesterAdminID(r)
+// 	_, _ = h.getRequesterAdminID(r)
 
-	roleLevel := strings.ToLower(chi.URLParam(r, "roleLevel"))
-	if !h.isValidRoleLevel(roleLevel) {
-		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("invalid role"), "Invalid role level")
-		return
-	}
+// 	roleLevel := strings.ToLower(chi.URLParam(r, "roleLevel"))
+// 	if !h.isValidRoleLevel(roleLevel) {
+// 		h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("invalid role"), "Invalid role level")
+// 		return
+// 	}
 
-	admins, err := h.adminService.GetAdminsByRole(ctx, roleLevel)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to get admins by role")
-		return
-	}
+// 	admins, err := h.adminService.GetAdminsByRole(ctx, roleLevel)
+// 	if err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to get admins by role")
+// 		return
+// 	}
 
-	if admins == nil {
-		admins = []*models.AdminUser{}
-	}
+// 	if admins == nil {
+// 		admins = []*models.AdminUser{}
+// 	}
 
-	response := successResponse(map[string]interface{}{
-		"admins": admins,
-		"role":   roleLevel,
-		"count":  len(admins),
-	}, "Admins retrieved successfully")
+// 	response := successResponse(map[string]interface{}{
+// 		"admins": admins,
+// 		"role":   roleLevel,
+// 		"count":  len(admins),
+// 	}, "Admins retrieved successfully")
 
-	h.respondWithJSON(w, http.StatusOK, response)
-	h.logger.Debug("Admins retrieved by role via HTTP",
-		util.String("role", roleLevel),
-		util.Int("count", len(admins)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.respondWithJSON(w, http.StatusOK, response)
+// 	h.logger.Debug("Admins retrieved by role via HTTP",
+// 		util.String("role", roleLevel),
+// 		util.Int("count", len(admins)),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 // InitializeOwner initializes the system owner (first admin)
 func (h *AdminHandler) InitializeOwner(w http.ResponseWriter, r *http.Request) {
@@ -2873,32 +2940,46 @@ func (h *AdminHandler) respondWithError(w http.ResponseWriter, statusCode int, e
 	h.respondWithJSON(w, statusCode, errorResponse(err, message))
 }
 
-func (h *AdminHandler) isValidRoleLevel(role string) bool {
-	switch role {
-	case models.AdminRoleLevelOwner:
-		return true
-	case models.AdminRoleLevelSuperEmployee:
-		return true
-	case models.AdminRoleLevelEmployee:
-		return true
-	default:
-		return false
-	}
-}
+// func (h *AdminHandler) isValidRoleLevel(role string) bool {
+// 	switch role {
+// 	case models.AdminRoleLevelOwner:
+// 		return true
+// 	case models.AdminRoleLevelSuperEmployee:
+// 		return true
+// 	case models.AdminRoleLevelEmployee:
+// 		return true
+// 	default:
+// 		return false
+// 	}
+// }
 
-func (h *AdminHandler) getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
-	userID, ok := r.Context().Value("user_id").(string)
-	if !ok || userID == "" {
-		return uuid.Nil, fmt.Errorf("user ID not found in request context")
-	}
+// func (h *AdminHandler) getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
+// 	userID, ok := r.Context().Value("user_id").(string)
+// 	if !ok || userID == "" {
+// 		return uuid.Nil, fmt.Errorf("user ID not found in request context")
+// 	}
 
-	adminID, err := uuid.Parse(userID)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid admin ID in request context")
-	}
+// 	adminID, err := uuid.Parse(userID)
+// 	if err != nil {
+// 		return uuid.Nil, fmt.Errorf("invalid admin ID in request context")
+// 	}
 
-	return adminID, nil
-}
+// 	return adminID, nil
+// }
+
+// func (h *AdminHandler) getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
+//     userID, ok := r.Context().Value("user_id").(string)
+//     if !ok || userID == "" {
+//         return uuid.Nil, fmt.Errorf("user ID not found in request context")
+//     }
+
+//     adminID, err := uuid.Parse(userID)
+//     if err != nil {
+//         return uuid.Nil, fmt.Errorf("invalid admin ID in request context")
+//     }
+
+//     return adminID, nil
+// }
 
 func (h *AdminHandler) getRequesterRole(r *http.Request) (string, error) {
 	role, ok := r.Context().Value("admin_role_level").(string)
@@ -3809,4 +3890,1545 @@ func (h *AdminHandler) GetBannedUsers(w http.ResponseWriter, r *http.Request) {
         util.Int("count", len(users)),
         util.Int("total", total),
         util.Duration("duration", time.Since(startTime)))
+}
+
+// ===== CHANGES NEEDED IN ADMIN HANDLER =====
+
+// REMOVE THESE OLD METHODS (using role strings):
+// func (h *AdminHandler) ChangeOwnerPhone(w http.ResponseWriter, r *http.Request)
+// func (h *AdminHandler) InviteAdmin(w http.ResponseWriter, r *http.Request) - old version
+// func (h *AdminHandler) PromoteAdmin(w http.ResponseWriter, r *http.Request) - old version
+// func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) - old version
+
+// ADD/UPDATE THESE METHODS WITH BITMASK:
+
+// // ChangeAdminPhone changes admin phone with hierarchy checks
+// func (h *AdminHandler) ChangeAdminPhone(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+//     startTime := time.Now()
+
+//     requesterID, err := h.getRequesterAdminID(r)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+//         return
+//     }
+
+//     var req struct {
+//         TargetAdminID string `json:"target_admin_id" validate:"required"`
+//         NewPhone      string `json:"new_phone" validate:"required,phone"`
+//     }
+
+//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+//         return
+//     }
+
+//     targetAdminID, err := uuid.Parse(req.TargetAdminID)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid target admin ID")
+//         return
+//     }
+
+//     if err := h.adminService.ChangeAdminPhone(ctx, targetAdminID, req.NewPhone, requesterID); err != nil {
+//         statusCode := h.getStatusCode(err)
+//         h.respondWithError(w, statusCode, err, "Failed to change admin phone")
+//         return
+//     }
+
+//     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin phone updated successfully"))
+//     h.logger.Info("Admin phone changed via HTTP",
+//         util.String("requester_id", requesterID.String()),
+//         util.String("target_admin_id", targetAdminID.String()),
+//         util.Duration("duration", time.Since(startTime)),
+//     )
+// }
+
+// // ChangeOwnPhone allows admin to change their own phone
+// func (h *AdminHandler) ChangeOwnPhone(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+//     startTime := time.Now()
+
+//     requesterID, err := h.getRequesterAdminID(r)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+//         return
+//     }
+
+//     var req struct {
+//         NewPhone string `json:"new_phone" validate:"required,phone"`
+//     }
+
+//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+//         return
+//     }
+
+//     // Use the same service method but target self
+//     if err := h.adminService.ChangeAdminPhone(ctx, requesterID, req.NewPhone, requesterID); err != nil {
+//         statusCode := h.getStatusCode(err)
+//         h.respondWithError(w, statusCode, err, "Failed to change phone")
+//         return
+//     }
+
+//     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Phone updated successfully"))
+//     h.logger.Info("Admin changed own phone via HTTP",
+//         util.String("admin_id", requesterID.String()),
+//         util.Duration("duration", time.Since(startTime)),
+//     )
+// }
+
+// InviteAdminWithBitmask invites admin using bitmask
+func (h *AdminHandler) InviteAdminWithBitmask(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    var req struct {
+        Phone    string `json:"phone" validate:"required,phone"`
+        RoleMask uint64 `json:"role_mask" validate:"required"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    admin, err := h.adminService.InviteAdmin(ctx, req.Phone, req.RoleMask, requesterID)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to invite admin")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusCreated, successResponse(admin, "Admin invited successfully"))
+    h.logger.Info("Admin invited via HTTP (bitmask)",
+        util.String("admin_id", admin.AdminID.String()),
+        util.Uint64("role_mask", req.RoleMask),
+        util.String("invited_by", requesterID.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// PromoteAdminWithBitmask promotes admin using bitmask
+func (h *AdminHandler) PromoteAdminWithBitmask(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID format")
+        return
+    }
+
+    var req struct {
+        NewRoleMask uint64 `json:"new_role_mask" validate:"required"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    if err := h.adminService.PromoteAdmin(ctx, adminID, req.NewRoleMask, requesterID); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to promote admin")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin promoted successfully"))
+    h.logger.Info("Admin promoted via HTTP (bitmask)",
+        util.String("admin_id", adminID.String()),
+        util.Uint64("new_role_mask", req.NewRoleMask),
+        util.String("promoted_by", requesterID.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// // GetAdminsByRoleMask retrieves admins by role mask
+// func (h *AdminHandler) GetAdminsByRoleMask(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+//     startTime := time.Now()
+
+//     requesterID, err := h.getRequesterAdminID(r)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+//         return
+//     }
+
+//     roleMaskStr := chi.URLParam(r, "roleMask")
+//     roleMask, err := strconv.ParseUint(roleMaskStr, 10, 64)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid role mask")
+//         return
+//     }
+
+//     admins, err := h.adminService.GetAdminsByRole(ctx, roleMask)
+//     if err != nil {
+//         statusCode := h.getStatusCode(err)
+//         h.respondWithError(w, statusCode, err, "Failed to get admins by role")
+//         return
+//     }
+
+//     response := successResponse(map[string]interface{}{
+//         "admins": admins,
+//         "role_mask": roleMask,
+//         "count": len(admins),
+//     }, "Admins retrieved by role mask")
+
+//     h.respondWithJSON(w, http.StatusOK, response)
+//     h.logger.Debug("Admins retrieved by role mask via HTTP",
+//         util.String("requester_id", requesterID.String()),
+//         util.Uint64("role_mask", roleMask),
+//         util.Int("count", len(admins)),
+//         util.Duration("duration", time.Since(startTime)),
+//     )
+// }
+
+// // GetAdminsByRoleMask retrieves admins by role mask
+// func (h *AdminHandler) GetAdminsByRoleMask(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+//     startTime := time.Now()
+
+//     requesterID, err := h.getRequesterAdminID(r)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+//         return
+//     }
+
+//     // FIX: Change "roleMask" to "roleLevel" to match the route parameter
+//     roleMaskStr := chi.URLParam(r, "roleLevel")  // Changed from "roleMask"
+//     if roleMaskStr == "" {
+//         h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("role level is required"), "Role level is required")
+//         return
+//     }
+
+//     roleMask, err := strconv.ParseUint(roleMaskStr, 10, 64)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid role mask")
+//         return
+//     }
+
+//     admins, err := h.adminService.GetAdminsByRole(ctx, roleMask)
+//     if err != nil {
+//         statusCode := h.getStatusCode(err)
+//         h.respondWithError(w, statusCode, err, "Failed to get admins by role")
+//         return
+//     }
+
+//     response := successResponse(map[string]interface{}{
+//         "admins": admins,
+//         "role_mask": roleMask,
+//         "count": len(admins),
+//     }, "Admins retrieved by role mask")
+
+//     h.respondWithJSON(w, http.StatusOK, response)
+//     h.logger.Debug("Admins retrieved by role mask via HTTP",
+//         util.String("requester_id", requesterID.String()),
+//         util.Uint64("role_mask", roleMask),
+//         util.Int("count", len(admins)),
+//         util.Duration("duration", time.Since(startTime)),
+//     )
+// }
+// ===== PERMISSION MANAGEMENT HANDLERS =====
+
+// GrantPermissionToAdmin grants a specific permission
+func (h *AdminHandler) GrantPermissionToAdmin(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    grantedBy, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    permissionName := chi.URLParam(r, "permissionName")
+    if permissionName == "" {
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("permission name required"), "Permission name is required")
+        return
+    }
+
+    if err := h.adminService.GrantPermissionToAdmin(ctx, adminID, permissionName, grantedBy); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to grant permission")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Permission granted successfully"))
+    h.logger.Info("Permission granted to admin",
+        util.String("admin_id", adminID.String()),
+        util.String("permission", permissionName),
+        util.String("granted_by", grantedBy.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// RevokePermissionFromAdmin revokes a specific permission
+func (h *AdminHandler) RevokePermissionFromAdmin(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    revokedBy, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    permissionName := chi.URLParam(r, "permissionName")
+    if permissionName == "" {
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("permission name required"), "Permission name is required")
+        return
+    }
+
+    if err := h.adminService.RevokePermissionFromAdmin(ctx, adminID, permissionName, revokedBy); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to revoke permission")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Permission revoked successfully"))
+    h.logger.Info("Permission revoked from admin",
+        util.String("admin_id", adminID.String()),
+        util.String("permission", permissionName),
+        util.String("revoked_by", revokedBy.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// GetAdminPermissions retrieves all permissions for an admin
+func (h *AdminHandler) GetAdminPermissions(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    permissions, err := h.adminService.GetAdminPermissions(ctx, adminID)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to get admin permissions")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "permissions": permissions,
+        "count": len(permissions),
+    }, "Admin permissions retrieved successfully"))
+    
+    h.logger.Debug("Admin permissions retrieved",
+        util.String("admin_id", adminID.String()),
+        util.Int("permission_count", len(permissions)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// CheckAdminPermission checks if admin has a specific permission
+func (h *AdminHandler) CheckAdminPermission(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    permissionName := r.URL.Query().Get("permission")
+    if permissionName == "" {
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("permission parameter required"), "Permission parameter is required")
+        return
+    }
+
+    hasPermission, err := h.adminService.CheckAdminPermission(ctx, adminID, permissionName)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to check permission")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "has_permission": hasPermission,
+        "permission": permissionName,
+    }, "Permission check completed"))
+    
+    h.logger.Debug("Admin permission checked",
+        util.String("admin_id", adminID.String()),
+        util.String("permission", permissionName),
+        util.Bool("has_permission", hasPermission),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// BatchUpdatePermissions updates multiple permissions at once
+func (h *AdminHandler) BatchUpdatePermissions(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    updatedBy, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    var req struct {
+        PermissionsToGrant  []string `json:"permissions_to_grant"`
+        PermissionsToRevoke []string `json:"permissions_to_revoke"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    if err := h.adminService.BatchUpdatePermissions(ctx, adminID, 
+        req.PermissionsToGrant, req.PermissionsToRevoke, updatedBy); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to batch update permissions")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "granted": req.PermissionsToGrant,
+        "revoked": req.PermissionsToRevoke,
+        "total_changes": len(req.PermissionsToGrant) + len(req.PermissionsToRevoke),
+    }, "Permissions batch updated successfully"))
+    
+    h.logger.Info("Admin permissions batch updated",
+        util.String("admin_id", adminID.String()),
+        util.String("updated_by", updatedBy.String()),
+        util.Int("granted_count", len(req.PermissionsToGrant)),
+        util.Int("revoked_count", len(req.PermissionsToRevoke)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// GetAdminPermissionMask retrieves raw permission mask
+func (h *AdminHandler) GetAdminPermissionMask(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    permissionMask, err := h.adminService.GetAdminPermissionMask(ctx, adminID)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to get permission mask")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "permission_mask": permissionMask,
+        "segments": len(permissionMask),
+        "total_bits": len(permissionMask) * 64,
+    }, "Admin permission mask retrieved successfully"))
+    
+    h.logger.Debug("Admin permission mask retrieved",
+        util.String("admin_id", adminID.String()),
+        util.Int("segments", len(permissionMask)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// Helper function to check if requester is admin (from context)
+func (h *AdminHandler) getRequesterAdminID(r *http.Request) (uuid.UUID, error) {
+    userID, ok := r.Context().Value("user_id").(string)
+    if !ok || userID == "" {
+        return uuid.Nil, fmt.Errorf("user ID not found in request context")
+    }
+
+    // For admin sessions, user_id is admin_id
+    adminID, err := uuid.Parse(userID)
+    if err != nil {
+        return uuid.Nil, fmt.Errorf("invalid admin ID in request context")
+    }
+
+    return adminID, nil
+}
+
+// Helper to get admin role mask from context (if needed)
+func (h *AdminHandler) getRequesterAdminRoleMask(r *http.Request) (uint64, error) {
+    // Try to get from JWT token context first (most reliable)
+    if roleMask, ok := r.Context().Value("admin_role_mask").(uint64); ok && roleMask != 0 {
+        return roleMask, nil
+    }
+    
+    // If not in context, try to get from the session token
+    authHeader := r.Header.Get("Authorization")
+    if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+        token := strings.TrimPrefix(authHeader, "Bearer ")
+        
+        // Parse token without validation to check claims
+        parser := jwt.NewParser()
+        claims := &models.JWTClaims{}
+        _, _, err := parser.ParseUnverified(token, claims)
+        
+        if err == nil && claims.AdminRoleMask != 0 {
+            h.logger.Debug("Extracted admin role mask from unverified token",
+                util.Uint64("admin_role_mask", claims.AdminRoleMask))
+            return claims.AdminRoleMask, nil
+        }
+    }
+    
+    // Fallback: get admin from database
+    adminID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        return 0, fmt.Errorf("failed to get admin ID: %w", err)
+    }
+    
+    ctx := r.Context()
+    admin, err := h.adminService.GetAdmin(ctx, adminID)
+    if err != nil {
+        return 0, fmt.Errorf("failed to get admin: %w", err)
+    }
+    
+    return admin.AdminRoleMask, nil
+}
+// GetAdminsByRole - legacy compatibility method
+func (h *AdminHandler) GetAdminsByRole(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    roleLevel := chi.URLParam(r, "roleLevel")
+    
+    // Convert legacy role string to role mask
+    var roleMask uint64
+    switch roleLevel {
+    case "owner":
+        roleMask = models.RoleMaskOwner
+    case "super_employee":
+        roleMask = models.RoleMaskSuperEmployee
+    case "employee":
+        roleMask = models.RoleMaskEmployee
+    default:
+        h.respondWithError(w, http.StatusBadRequest, 
+            fmt.Errorf("invalid role"), "Invalid role level")
+        return
+    }
+
+    admins, err := h.adminService.GetAdminsByRole(ctx, roleMask)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to get admins by role")
+        return
+    }
+
+    response := successResponse(map[string]interface{}{
+        "admins": admins,
+        "role":   roleLevel,
+        "count":  len(admins),
+    }, "Admins retrieved successfully")
+
+    h.respondWithJSON(w, http.StatusOK, response)
+    h.logger.Debug("Admins retrieved by role via HTTP",
+        util.String("requester_id", requesterID.String()),
+        util.String("role", roleLevel),
+        util.Int("count", len(admins)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+
+// ===== ENHANCED ADMIN MANAGEMENT WITH DEPARTMENT BITMASK =====
+
+// // InviteAdminWithDepartments invites admin with specific departments and permissions
+// func (h *AdminHandler) InviteAdminWithDepartments(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+//     startTime := time.Now()
+
+//     requesterID, err := h.getRequesterAdminID(r)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+//         return
+//     }
+
+//     var req struct {
+//         Phone           string   `json:"phone" validate:"required,phone"`
+//         RoleMask        uint64   `json:"role_mask" validate:"required"`
+//         Departments     []string `json:"departments" validate:"required,min=1"`
+//         Permissions     []string `json:"permissions,omitempty"`
+//     }
+
+//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+//         return
+//     }
+
+//     // Validate role mask
+//     if !h.isValidRoleMask(req.RoleMask) {
+//         h.respondWithError(w, http.StatusBadRequest, 
+//             fmt.Errorf("invalid role mask"), "Invalid role mask provided")
+//         return
+//     }
+
+//     // Check if requester has permission to invite admin
+//     if !h.hasAdminPermission(r, "admin.user.create") {
+//         h.respondWithError(w, http.StatusForbidden,
+//             fmt.Errorf("PERMISSION_DENIED"),
+//             "You don't have permission to invite admins")
+//         return
+//     }
+
+//     // Get system departments to validate
+//     systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, 
+//             "Failed to validate departments")
+//         return
+//     }
+
+//     // Validate requested departments exist in system
+//     validDeptNames := make([]string, 0)
+//     for _, deptName := range req.Departments {
+//         found := false
+//         for _, sysDept := range systemDepts {
+//             if strings.EqualFold(sysDept.Name, deptName) {
+//                 validDeptNames = append(validDeptNames, deptName)
+//                 found = true
+//                 break
+//             }
+//         }
+//         if !found {
+//             h.logger.Warn("Invalid department name requested",
+//                 util.String("department", deptName))
+//         }
+//     }
+
+//     if len(validDeptNames) == 0 {
+//         h.respondWithError(w, http.StatusBadRequest,
+//             fmt.Errorf("no valid departments provided"),
+//             "No valid departments found. Please check department names")
+//         return
+//     }
+
+//     // Check if requester has access to requested departments
+//     requester, err := h.adminService.GetAdmin(ctx, requesterID)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, 
+//             "Failed to validate requester permissions")
+//         return
+//     }
+
+//     if !requester.IsOwner() {
+//         for _, deptName := range validDeptNames {
+//             hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, requesterID, deptName)
+//             if err != nil || !hasAccess {
+//                 h.respondWithError(w, http.StatusForbidden,
+//                     fmt.Errorf("permission denied for department: %s", deptName),
+//                     "You don't have access to all requested departments")
+//                 return
+//             }
+//         }
+//     }
+
+//     // Check if requester has requested permissions (for admin permissions)
+//     for _, permName := range req.Permissions {
+//         if strings.HasPrefix(permName, "admin.") {
+//             if !requester.HasPermission(permName) {
+//                 h.respondWithError(w, http.StatusForbidden,
+//                     fmt.Errorf("permission denied: %s", permName),
+//                     "You don't have permission to grant: "+permName)
+//                 return
+//             }
+//         }
+//     }
+
+//     // Call service to invite admin
+//     admin, err := h.adminService.InviteAdminWithDepartments(
+//         ctx, 
+//         req.Phone, 
+//         req.RoleMask, 
+//         validDeptNames, 
+//         req.Permissions, 
+//         requesterID,
+//     )
+//     if err != nil {
+//         statusCode := h.getStatusCode(err)
+//         h.respondWithError(w, statusCode, err, "Failed to invite admin")
+//         return
+//     }
+
+//     // Get accessible departments and permissions for response
+//     accessibleDepartments := admin.GetAccessibleDepartments()
+//     permissionNames := admin.GetPermissionNames()
+
+//     h.respondWithJSON(w, http.StatusCreated, successResponse(map[string]interface{}{
+//         "admin": admin,
+//         "accessible_departments": accessibleDepartments,
+//         "permissions": permissionNames,
+//         "message": "Admin invited successfully with department access",
+//     }, "Admin invited successfully"))
+
+//     h.logger.Info("Admin invited with departments",
+//         util.String("admin_id", admin.AdminID.String()),
+//         util.Uint64("role_mask", req.RoleMask),
+//         util.Strings("departments", validDeptNames),
+//         util.Strings("permissions", req.Permissions),
+//         util.String("invited_by", requesterID.String()),
+//         util.Duration("duration", time.Since(startTime)),
+//     )
+// }
+
+// UpdateAdminDepartments updates admin's accessible departments
+func (h *AdminHandler) UpdateAdminDepartments(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    var req struct {
+        Departments []string `json:"departments" validate:"required,min=1"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    // Check if requester has permission
+    if !h.hasAdminPermission(r, "admin.department.update") {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("PERMISSION_DENIED"),
+            "You don't have permission to update admin departments")
+        return
+    }
+
+    // Get target admin
+    targetAdmin, err := h.adminService.GetAdmin(ctx, adminID)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Admin not found")
+        return
+    }
+
+    // Check hierarchy - can't modify owner or same/higher level
+    requester, err := h.adminService.GetAdmin(ctx, requesterID)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, 
+            "Failed to validate requester")
+        return
+    }
+
+    if !requester.CanManageEmployee(targetAdmin.AdminRoleMask) {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("HIERARCHY_VIOLATION"),
+            "You cannot modify departments for this admin")
+        return
+    }
+
+    // Get system departments to validate
+    systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, 
+            "Failed to validate departments")
+        return
+    }
+
+    // Validate requested departments exist in system
+    validDeptNames := make([]string, 0)
+    for _, deptName := range req.Departments {
+        found := false
+        for _, sysDept := range systemDepts {
+            if strings.EqualFold(sysDept.Name, deptName) {
+                validDeptNames = append(validDeptNames, deptName)
+                found = true
+                break
+            }
+        }
+        if !found {
+            h.logger.Warn("Invalid department name requested",
+                util.String("department", deptName))
+        }
+    }
+
+    if len(validDeptNames) == 0 {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("no valid departments provided"),
+            "No valid departments found. Please check department names")
+        return
+    }
+
+    // Check if requester has access to requested departments
+    if !requester.IsOwner() {
+        for _, deptName := range validDeptNames {
+            hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, requesterID, deptName)
+            if err != nil || !hasAccess {
+                h.respondWithError(w, http.StatusForbidden,
+                    fmt.Errorf("permission denied for department: %s", deptName),
+                    "You don't have access to all requested departments")
+                return
+            }
+        }
+    }
+
+    // Update admin departments
+    err = h.adminService.UpdateAdminDepartments(ctx, adminID, validDeptNames, requesterID)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to update admin departments")
+        return
+    }
+
+    // Get updated admin details
+    admin, depts, perms, err := h.adminService.GetAdminWithDetails(ctx, adminID)
+    if err != nil {
+        h.logger.Warn("Failed to get updated admin details", util.ErrorField(err))
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "admin": admin,
+        "accessible_departments": depts,
+        "permissions": perms,
+        "message": "Admin departments updated successfully",
+    }, "Admin departments updated"))
+
+    h.logger.Info("Admin departments updated",
+        util.String("admin_id", adminID.String()),
+        util.Strings("new_departments", validDeptNames),
+        util.String("updated_by", requesterID.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// GetAdminWithDetails retrieves admin details including accessible departments
+func (h *AdminHandler) GetAdminWithDetails(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    admin, depts, perms, err := h.adminService.GetAdminWithDetails(ctx, adminID)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to get admin details")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "admin": admin,
+        "accessible_departments": depts,
+        "permissions": perms,
+        "department_bitmask": admin.DepartmentBitmask,
+        "role_mask": admin.AdminRoleMask,
+        "permission_mask": admin.AdminPermissionMask,
+    }, "Admin details retrieved successfully"))
+
+    h.logger.Debug("Admin details retrieved with departments",
+        util.String("admin_id", adminID.String()),
+        util.Int("department_count", len(depts)),
+        util.Int("permission_count", len(perms)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// CheckAdminDepartmentAccess checks if admin has access to specific department
+func (h *AdminHandler) CheckAdminDepartmentAccess(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    departmentName := r.URL.Query().Get("department")
+    if departmentName == "" {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("department parameter required"), 
+            "Department name is required")
+        return
+    }
+
+    hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, adminID, departmentName)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to check department access")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "has_access": hasAccess,
+        "department": departmentName,
+        "admin_id": adminID.String(),
+    }, "Department access check completed"))
+
+    h.logger.Debug("Admin department access checked",
+        util.String("admin_id", adminID.String()),
+        util.String("department", departmentName),
+        util.Bool("has_access", hasAccess),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// GetAdminsByDepartment retrieves admins who have access to specific department
+func (h *AdminHandler) GetAdminsByDepartment(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    departmentName := chi.URLParam(r, "departmentName")
+    if departmentName == "" {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("department name required"), 
+            "Department name is required")
+        return
+    }
+
+    // Get all admins and filter by department access
+    limit := h.getIntQueryParam(r, "limit", 50)
+    allAdmins, err := h.adminService.GetActiveAdmins(ctx, 1000) // Get large batch
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to get admins")
+        return
+    }
+
+    // Filter admins by department access
+    var filteredAdmins []*models.AdminUser
+    for _, admin := range allAdmins {
+        hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, admin.AdminID, departmentName)
+        if err == nil && hasAccess {
+            filteredAdmins = append(filteredAdmins, admin)
+            if len(filteredAdmins) >= limit {
+                break
+            }
+        }
+    }
+
+    // Get detailed information for each admin
+    var result []map[string]interface{}
+    for _, admin := range filteredAdmins {
+        _, depts, perms, _ := h.adminService.GetAdminWithDetails(ctx, admin.AdminID)
+        
+        result = append(result, map[string]interface{}{
+            "admin_id":                admin.AdminID.String(),
+            "role_mask":               admin.AdminRoleMask,
+            "role_string":             admin.GetRoleString(),
+            "accessible_departments":  depts,
+            "permissions":             perms,
+            "department_bitmask":      admin.DepartmentBitmask,
+            "is_active":               admin.IsActive,
+            "created_at":              admin.AdminCreatedAt,
+        })
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "admins": result,
+        "department": departmentName,
+        "count": len(result),
+        "total_checked": len(allAdmins),
+    }, "Admins by department retrieved successfully"))
+
+    h.logger.Debug("Admins retrieved by department",
+        util.String("department", departmentName),
+        util.Int("result_count", len(result)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// ===== HELPER METHODS =====
+
+// isValidRoleMask validates role mask value
+func (h *AdminHandler) isValidRoleMask(roleMask uint64) bool {
+    // Valid role masks: Owner (1), SuperEmployee (2), Employee (4)
+    validMasks := map[uint64]bool{
+        models.RoleMaskOwner: true,
+        models.RoleMaskSuperEmployee: true,
+        models.RoleMaskEmployee: true,
+    }
+    return validMasks[roleMask]
+}
+
+// hasAdminPermission checks if requester has specific admin permission
+func (h *AdminHandler) hasAdminPermission(r *http.Request, permission string) bool {
+    sessionType, _ := r.Context().Value("session_type").(string)
+    if sessionType != "admin" {
+        return false
+    }
+    
+    // Get permission mask from context
+    permMask, ok := r.Context().Value("permission_mask").([]uint64)
+    if !ok {
+        return false
+    }
+    
+    // Check permission bit
+    bitIndex, exists := models.AdminPermissionBitIndices[permission]
+    if !exists {
+        return false
+    }
+    
+    return models.HasPermission(permMask, bitIndex)
+}
+
+// ===== SYSTEM DEPARTMENT BITMASK UTILITIES =====
+
+// GetSystemDepartmentsWithBitmask returns system departments with their bitmask values
+func (h *AdminHandler) GetSystemDepartmentsWithBitmask(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
+        return
+    }
+
+    // Format response with bitmask details
+    var result []map[string]interface{}
+    for _, dept := range systemDepts {
+        result = append(result, map[string]interface{}{
+			"department_id": dept.SystemDepartmentID.String(),
+            "name":           dept.Name,
+            "module_code":    dept.ModuleCode,
+            "description":    dept.Description,
+            "bitmask":        dept.Bitmask,
+            "bitmask_hex":    fmt.Sprintf("0x%X", dept.Bitmask),
+			"bit_position": bits.TrailingZeros64(dept.Bitmask),
+        })
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(map[string]interface{}{
+        "departments": result,
+        "total_count": len(result),
+        "max_departments": 16,
+        "bitmask_range": "0-15 (16 bits)",
+        "all_departments_bitmask": models.DeptBitmaskAll,
+        "all_departments_bitmask_hex": fmt.Sprintf("0x%X", models.DeptBitmaskAll),
+    }, "System departments with bitmask retrieved"))
+
+    h.logger.Debug("System departments with bitmask retrieved",
+        util.Int("count", len(result)),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+// Helper function to convert department names to bitmask
+func (h *AdminHandler) convertDepartmentNamesToBitmask(ctx context.Context, departmentNames []string) (uint64, error) {
+    systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+    if err != nil {
+        return 0, fmt.Errorf("failed to get system departments: %w", err)
+    }
+    
+    var bitmask uint64
+    for _, deptName := range departmentNames {
+        found := false
+        for _, sysDept := range systemDepts {
+            if strings.EqualFold(sysDept.Name, deptName) {
+                bitmask |= sysDept.Bitmask
+                found = true
+                break
+            }
+        }
+        if !found {
+            return bitmask, fmt.Errorf("invalid department: %s", deptName)
+        }
+    }
+    return bitmask, nil
+}
+
+// Helper function to get department names from bitmask
+func (h *AdminHandler) getDepartmentNamesFromBitmask(ctx context.Context, bitmask uint64) ([]string, error) {
+    systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get system departments: %w", err)
+    }
+    
+    var departments []string
+    for _, sysDept := range systemDepts {
+        if bitmask&sysDept.Bitmask != 0 {
+            departments = append(departments, sysDept.Name)
+        }
+    }
+    return departments, nil
+}
+
+// Check if admin can manage another admin based on role hierarchy
+func (h *AdminHandler) canManageAdmin(requester, target *models.AdminUser) bool {
+    // Owner can manage everyone
+    if requester.IsOwner() {
+        return true
+    }
+    
+    // Super employee can manage employees
+    if requester.IsSuperEmployee() && target.IsEmployee() {
+        return true
+    }
+    
+    // Employee cannot manage anyone
+    return false
+}
+
+
+func (h *AdminHandler) DebugPermissionCalculation(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    
+    // Test with HR and Finance departments
+    departmentNames := []string{"HR", "Finance"}
+    permissionNames := []string{"admin.user.view", "admin.department.view"}
+    
+    // Get system departments
+    systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
+        return
+    }
+    
+    // Calculate bitmask
+    var deptBitmask uint64
+    accessibleModules := make(map[string]bool)
+    
+    for _, deptName := range departmentNames {
+        for _, sysDept := range systemDepts {
+            if strings.EqualFold(sysDept.Name, deptName) {
+                deptBitmask |= sysDept.Bitmask
+                accessibleModules[sysDept.ModuleCode] = true
+                break
+            }
+        }
+    }
+    
+    // Get permissions for modules
+    var modulePermissions []string
+    for module := range accessibleModules {
+        perms, err := h.companyService.GetPermissionsByModule(ctx, module)
+        if err == nil {
+            for _, perm := range perms {
+                modulePermissions = append(modulePermissions, perm.PermissionName)
+            }
+        }
+    }
+    
+    // Build final permission mask
+    permissionMask := make([]uint64, 4)
+    allPermissions := append(modulePermissions, permissionNames...)
+    
+    for _, permName := range allPermissions {
+        if bitIndex, exists := models.AdminPermissionBitIndices[permName]; exists {
+            permissionMask = models.SetPermission(permissionMask, bitIndex, true)
+        }
+    }
+    
+    h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+        "department_names": departmentNames,
+        "department_bitmask": deptBitmask,
+        "accessible_modules": accessibleModules,
+        "module_permissions": modulePermissions,
+        "admin_permissions": permissionNames,
+        "all_permissions": allPermissions,
+        "permission_mask": permissionMask,
+        "permission_mask_debug": fmt.Sprintf("%v", permissionMask),
+        "permission_names": allPermissions,
+    })
+}
+
+
+func (h *AdminHandler) ChangeAdminPhone(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    // Get requester role mask from JWT token context
+    requesterRoleMask, err := h.getRequesterAdminRoleMask(r)
+    if err != nil {
+        h.logger.Warn("Failed to get admin role mask from token",
+            util.String("admin_id", requesterID.String()),
+            util.ErrorField(err))
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unable to verify admin role")
+        return
+    }
+
+    // Verify role mask is 1 (owner) from the token
+    if requesterRoleMask != models.RoleMaskOwner {
+        h.logger.Warn("Non-owner attempting to change admin phone",
+            util.String("admin_id", requesterID.String()),
+            util.Uint64("role_mask", requesterRoleMask))
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("PERMISSION_DENIED"),
+            "Only system owner can change admin phone numbers")
+        return
+    }
+
+    adminIDStr := chi.URLParam(r, "adminID")
+    adminID, err := uuid.Parse(adminIDStr)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+        return
+    }
+
+    var req struct {
+        NewPhone string `json:"new_phone" validate:"required,phone"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    // Verify token has admin session type
+    sessionType, _ := ctx.Value("session_type").(string)
+    if sessionType != "admin" {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("INVALID_SESSION_TYPE"),
+            "Admin session required")
+        return
+    }
+
+    if err := h.adminService.ChangeAdminPhone(ctx, adminID, req.NewPhone, requesterID); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to change admin phone")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin phone updated successfully"))
+    h.logger.Info("Admin phone changed by owner via HTTP",
+        util.String("requester_id", requesterID.String()),
+        util.String("target_admin_id", adminID.String()),
+        util.Uint64("requester_role_mask", requesterRoleMask),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+
+func (h *AdminHandler) ChangeOwnPhone(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    // Get requester role mask from JWT token context
+    requesterRoleMask, err := h.getRequesterAdminRoleMask(r)
+    if err != nil {
+        h.logger.Warn("Failed to get admin role mask from token",
+            util.String("admin_id", requesterID.String()),
+            util.ErrorField(err))
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unable to verify admin role")
+        return
+    }
+
+    // Verify role mask is 1 (owner) from the token
+    if requesterRoleMask != models.RoleMaskOwner {
+        h.logger.Warn("Non-owner attempting to change own phone via admin endpoint",
+            util.String("admin_id", requesterID.String()),
+            util.Uint64("role_mask", requesterRoleMask))
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("PERMISSION_DENIED"),
+            "Only system owner can change phone numbers")
+        return
+    }
+
+    var req struct {
+        NewPhone string `json:"new_phone" validate:"required,phone"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    // Verify token has admin session type
+    sessionType, _ := ctx.Value("session_type").(string)
+    if sessionType != "admin" {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("INVALID_SESSION_TYPE"),
+            "Admin session required")
+        return
+    }
+
+    if err := h.adminService.ChangeAdminPhone(ctx, requesterID, req.NewPhone, requesterID); err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to change phone")
+        return
+    }
+
+    h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Phone updated successfully"))
+    h.logger.Info("Owner changed own phone via HTTP",
+        util.String("admin_id", requesterID.String()),
+        util.Uint64("requester_role_mask", requesterRoleMask),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+func (h *AdminHandler) InviteAdminWithDepartments(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    var req struct {
+        Phone       string   `json:"phone" validate:"required,phone"`
+        RoleMask    uint64   `json:"role_mask" validate:"required"`
+        Departments []string `json:"departments" validate:"required,min=1"`
+        Permissions []string `json:"permissions,omitempty"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+        return
+    }
+
+    if !h.isValidRoleMask(req.RoleMask) {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("invalid role mask"), "Invalid role mask provided")
+        return
+    }
+
+    if req.RoleMask == models.RoleMaskEmployee {
+        for _, permName := range req.Permissions {
+            if strings.HasPrefix(permName, "admin.") {
+                h.respondWithError(w, http.StatusBadRequest,
+                    fmt.Errorf("employee cannot have admin permissions"),
+                    "Employee role cannot be assigned admin permissions")
+                return
+            }
+        }
+    }
+
+    if !h.hasAdminPermission(r, "admin.user.create") {
+        h.respondWithError(w, http.StatusForbidden,
+            fmt.Errorf("PERMISSION_DENIED"),
+            "You don't have permission to invite admins")
+        return
+    }
+
+    systemDepts, err := h.companyService.GetSystemDepartments(ctx)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err,
+            "Failed to validate departments")
+        return
+    }
+
+    validDeptNames := make([]string, 0)
+    for _, deptName := range req.Departments {
+        found := false
+        for _, sysDept := range systemDepts {
+            if strings.EqualFold(sysDept.Name, deptName) {
+                validDeptNames = append(validDeptNames, deptName)
+                found = true
+                break
+            }
+        }
+        if !found {
+            h.logger.Warn("Invalid department name requested",
+                util.String("department", deptName))
+        }
+    }
+
+    if len(validDeptNames) == 0 {
+        h.respondWithError(w, http.StatusBadRequest,
+            fmt.Errorf("no valid departments provided"),
+            "No valid departments found. Please check department names")
+        return
+    }
+
+    requester, err := h.adminService.GetAdmin(ctx, requesterID)
+    if err != nil {
+        h.respondWithError(w, http.StatusInternalServerError, err,
+            "Failed to validate requester permissions")
+        return
+    }
+
+    if !requester.IsOwner() {
+        for _, deptName := range validDeptNames {
+            hasAccess, err := h.adminService.CheckAdminDepartmentAccess(ctx, requesterID, deptName)
+            if err != nil || !hasAccess {
+                h.respondWithError(w, http.StatusForbidden,
+                    fmt.Errorf("permission denied for department: %s", deptName),
+                    "You don't have access to all requested departments")
+                return
+            }
+        }
+    }
+
+    for _, permName := range req.Permissions {
+        if strings.HasPrefix(permName, "admin.") {
+            if !requester.HasPermission(permName) {
+                h.respondWithError(w, http.StatusForbidden,
+                    fmt.Errorf("permission denied: %s", permName),
+                    "You don't have permission to grant: "+permName)
+                return
+            }
+        }
+    }
+
+    finalPermissions := make([]string, 0)
+    if req.RoleMask == models.RoleMaskEmployee {
+        for _, permName := range req.Permissions {
+            if !strings.HasPrefix(permName, "admin.") {
+                finalPermissions = append(finalPermissions, permName)
+            } else {
+                h.logger.Warn("Filtered out admin permission for employee",
+                    util.String("permission", permName))
+            }
+        }
+    } else {
+        finalPermissions = req.Permissions
+    }
+
+    admin, err := h.adminService.InviteAdminWithDepartments(
+        ctx,
+        req.Phone,
+        req.RoleMask,
+        validDeptNames,
+        finalPermissions,
+        requesterID,
+    )
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to invite admin")
+        return
+    }
+
+    accessibleDepartments := admin.GetAccessibleDepartments()
+    permissionNames := admin.GetPermissionNames()
+
+    // FIXED: Build response data as map, not Response struct
+    responseData := map[string]interface{}{
+        "admin": admin,
+        "accessible_departments": accessibleDepartments,
+        "permissions": permissionNames,
+        "message": "Admin invited successfully with department access",
+    }
+
+    // FIXED: Add warning to data map, not Response struct
+    if req.RoleMask == models.RoleMaskEmployee && len(req.Permissions) != len(finalPermissions) {
+        responseData["warning"] = "Admin permissions were removed as employees cannot have admin permissions"
+    }
+
+    h.respondWithJSON(w, http.StatusCreated, successResponse(responseData, "Admin invited successfully"))
+
+    h.logger.Info("Admin invited with departments",
+        util.String("admin_id", admin.AdminID.String()),
+        util.Uint64("role_mask", req.RoleMask),
+        util.Strings("departments", validDeptNames),
+        util.Strings("permissions", finalPermissions),
+        util.String("invited_by", requesterID.String()),
+        util.Duration("duration", time.Since(startTime)),
+    )
+}
+// GetAdminsByRoleMask retrieves admins by role mask
+func (h *AdminHandler) GetAdminsByRoleMask(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    startTime := time.Now()
+
+    requesterID, err := h.getRequesterAdminID(r)
+    if err != nil {
+        h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+        return
+    }
+
+    // FIX: Change "roleMask" to "roleLevel" to match the route parameter
+    roleMaskStr := chi.URLParam(r, "roleLevel")  // Changed from "roleMask"
+    if roleMaskStr == "" {
+        h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("role level is required"), "Role level is required")
+        return
+    }
+
+    roleMask, err := strconv.ParseUint(roleMaskStr, 10, 64)
+    if err != nil {
+        h.respondWithError(w, http.StatusBadRequest, err, "Invalid role mask")
+        return
+    }
+
+    admins, err := h.adminService.GetAdminsByRole(ctx, roleMask)
+    if err != nil {
+        statusCode := h.getStatusCode(err)
+        h.respondWithError(w, statusCode, err, "Failed to get admins by role")
+        return
+    }
+
+    // FIX: Changed this part to use map[string]interface{} instead of indexing Response struct
+    responseData := map[string]interface{}{
+        "admins": admins,
+        "role_mask": roleMask,
+        "count": len(admins),
+    }
+    
+    h.respondWithJSON(w, http.StatusOK, successResponse(responseData, "Admins retrieved by role mask"))
+
+    h.logger.Debug("Admins retrieved by role mask via HTTP",
+        util.String("requester_id", requesterID.String()),
+        util.Uint64("role_mask", roleMask),
+        util.Int("count", len(admins)),
+        util.Duration("duration", time.Since(startTime)),
+    )
 }

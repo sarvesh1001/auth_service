@@ -178,7 +178,22 @@ type CompanyRepository interface {
 	HealthCheck(ctx context.Context) error
 	GetRepositoryStats(ctx context.Context) (map[string]interface{}, error)
 	Close() error
+
+	GetPermissionsByCompanyModules(
+        ctx context.Context,
+        companyID uuid.UUID,
+        module, category, tier string,
+    ) ([]*models.Permission, error)	
+	GetSystemDepartmentsWithBitmask(ctx context.Context) ([]*models.SystemDepartment, error)
+	GetDepartmentBitmask(ctx context.Context, departmentName string) (uint64, error)
+	// Keep only one of these:
+	// Add this method to the CompanyRepository interface
+	GetModulePermissions(
+		ctx context.Context,
+		modules []string,
+		category, tier string,
+	) ([]*models.Permission, error)	// OR rename the second one:
+	GetPermissionsByModules(ctx context.Context, modules []string) ([]*models.Permission, error)
+	GetAdminPermissions(ctx context.Context) ([]*models.Permission, error)
 }
 
-// NOTE: Remove the duplicate EmployeeRoleHierarchy struct from here
-// It's already defined in the models package

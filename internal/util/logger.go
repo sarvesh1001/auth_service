@@ -209,3 +209,7 @@ func JSONResponse(w http.ResponseWriter, statusCode int, data interface{}) {
 		)
 	}
 }
+
+func Uint64(key string, val uint64) zap.Field {
+    return zap.Uint64(key, val)
+}

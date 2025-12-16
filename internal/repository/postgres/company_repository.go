@@ -502,89 +502,89 @@ func (r *CompanyRepositoryImpl) CheckCompanyExists(ctx context.Context, companyN
 // SYSTEM DEPARTMENT OPERATIONS
 // ============================================================================
 
-// GetSystemDepartments retrieves all global system departments
-func (r *CompanyRepositoryImpl) GetSystemDepartments(ctx context.Context) ([]*models.SystemDepartment, error) {
-	query := `
-		SELECT system_department_id, name, module_code, description
-		FROM system_departments 
-		ORDER BY name`
+// // GetSystemDepartments retrieves all global system departments
+// func (r *CompanyRepositoryImpl) GetSystemDepartments(ctx context.Context) ([]*models.SystemDepartment, error) {
+// 	query := `
+// 		SELECT system_department_id, name, module_code, description
+// 		FROM system_departments 
+// 		ORDER BY name`
 
-	rows, err := r.client.Query(ctx, query)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query system departments: %w", err)
-	}
-	defer rows.Close()
+// 	rows, err := r.client.Query(ctx, query)
+// 	if err != nil {
+// 		r.recordError()
+// 		return nil, fmt.Errorf("failed to query system departments: %w", err)
+// 	}
+// 	defer rows.Close()
 
-	var systemDepartments []*models.SystemDepartment
-	for rows.Next() {
-		var dept models.SystemDepartment
-		err := rows.Scan(
-			&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan system department row", util.ErrorField(err))
-			continue
-		}
-		systemDepartments = append(systemDepartments, &dept)
-	}
+// 	var systemDepartments []*models.SystemDepartment
+// 	for rows.Next() {
+// 		var dept models.SystemDepartment
+// 		err := rows.Scan(
+// 			&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+// 		)
+// 		if err != nil {
+// 			r.logger.Warn("Failed to scan system department row", util.ErrorField(err))
+// 			continue
+// 		}
+// 		systemDepartments = append(systemDepartments, &dept)
+// 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating system department rows: %w", err)
-	}
+// 	if err := rows.Err(); err != nil {
+// 		return nil, fmt.Errorf("error iterating system department rows: %w", err)
+// 	}
 
-	r.recordQuery()
-	return systemDepartments, nil
-}
+// 	r.recordQuery()
+// 	return systemDepartments, nil
+// }
 
-// GetSystemDepartmentByModule retrieves system department by module
-func (r *CompanyRepositoryImpl) GetSystemDepartmentByModule(ctx context.Context, module string) (*models.SystemDepartment, error) {
-	query := `
-		SELECT system_department_id, name, module_code, description
-		FROM system_departments 
-		WHERE module_code = $1
-		LIMIT 1`
+// // GetSystemDepartmentByModule retrieves system department by module
+// func (r *CompanyRepositoryImpl) GetSystemDepartmentByModule(ctx context.Context, module string) (*models.SystemDepartment, error) {
+// 	query := `
+// 		SELECT system_department_id, name, module_code, description
+// 		FROM system_departments 
+// 		WHERE module_code = $1
+// 		LIMIT 1`
 
-	var dept models.SystemDepartment
-	err := r.client.QueryRow(ctx, query, module).Scan(
-		&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
-	)
+// 	var dept models.SystemDepartment
+// 	err := r.client.QueryRow(ctx, query, module).Scan(
+// 		&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+// 	)
 
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("system department not found for module: %s", module)
-		}
-		r.recordError()
-		return nil, fmt.Errorf("failed to get system department: %w", err)
-	}
+// 	if err != nil {
+// 		if err == sql.ErrNoRows {
+// 			return nil, fmt.Errorf("system department not found for module: %s", module)
+// 		}
+// 		r.recordError()
+// 		return nil, fmt.Errorf("failed to get system department: %w", err)
+// 	}
 
-	r.recordQuery()
-	return &dept, nil
-}
+// 	r.recordQuery()
+// 	return &dept, nil
+// }
 
-// GetSystemDepartment retrieves a specific system department by ID
-func (r *CompanyRepositoryImpl) GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error) {
-	query := `
-        SELECT system_department_id, name, module_code, description
-        FROM system_departments 
-        WHERE system_department_id = $1`
+// // GetSystemDepartment retrieves a specific system department by ID
+// func (r *CompanyRepositoryImpl) GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error) {
+// 	query := `
+//         SELECT system_department_id, name, module_code, description
+//         FROM system_departments 
+//         WHERE system_department_id = $1`
 
-	var dept models.SystemDepartment
-	err := r.client.QueryRow(ctx, query, systemDeptID).Scan(
-		&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
-	)
+// 	var dept models.SystemDepartment
+// 	err := r.client.QueryRow(ctx, query, systemDeptID).Scan(
+// 		&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+// 	)
 
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("system department not found: %s", systemDeptID)
-		}
-		r.recordError()
-		return nil, fmt.Errorf("failed to get system department: %w", err)
-	}
+// 	if err != nil {
+// 		if err == sql.ErrNoRows {
+// 			return nil, fmt.Errorf("system department not found: %s", systemDeptID)
+// 		}
+// 		r.recordError()
+// 		return nil, fmt.Errorf("failed to get system department: %w", err)
+// 	}
 
-	r.recordQuery()
-	return &dept, nil
-}
+// 	r.recordQuery()
+// 	return &dept, nil
+// }
 
 // ============================================================================
 // DEPARTMENT OPERATIONS
@@ -2009,46 +2009,50 @@ func (r *CompanyRepositoryImpl) GetPermissionsByCategory(ctx context.Context, ca
 	r.recordQuery()
 	return permissions, nil
 }
-
 // GetPermissionsByModule retrieves permissions by module
 func (r *CompanyRepositoryImpl) GetPermissionsByModule(ctx context.Context, module string) ([]*models.Permission, error) {
-	query := `
-		SELECT permission_id, permission_name, description, 
-			   category, requires_tier, created_at
-		FROM permissions 
-		WHERE module = $1
-		ORDER BY category, permission_name`
+    query := `
+        SELECT permission_id, permission_name, description, 
+               category, module, requires_tier, bit_index, created_at
+        FROM permissions 
+        WHERE module = $1
+        ORDER BY category, permission_name`
 
-	rows, err := r.client.Query(ctx, query, module)
-	if err != nil {
-		r.recordError()
-		return nil, fmt.Errorf("failed to query permissions by module: %w", err)
-	}
-	defer rows.Close()
+    rows, err := r.client.Query(ctx, query, module)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to query permissions by module: %w", err)
+    }
+    defer rows.Close()
 
-	var permissions []*models.Permission
-	for rows.Next() {
-		var perm models.Permission
-		err := rows.Scan(
-			&perm.PermissionID, &perm.PermissionName, &perm.Description,
-			&perm.Category, &perm.RequiresTier, &perm.CreatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
-			continue
-		}
-		perm.Module = module
-		permissions = append(permissions, &perm)
-	}
+    var permissions []*models.Permission
+    for rows.Next() {
+        var perm models.Permission
+        var bitIndex sql.NullInt32
+        
+        err := rows.Scan(
+            &perm.PermissionID, &perm.PermissionName, &perm.Description,
+            &perm.Category, &perm.Module, &perm.RequiresTier, &bitIndex, &perm.CreatedAt,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
+            continue
+        }
+        
+        if bitIndex.Valid {
+            perm.BitIndex = int(bitIndex.Int32)
+        }
+        
+        permissions = append(permissions, &perm)
+    }
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating permission rows: %w", err)
-	}
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("error iterating permission rows: %w", err)
+    }
 
-	r.recordQuery()
-	return permissions, nil
+    r.recordQuery()
+    return permissions, nil
 }
-
 // GetPermissionsByNames retrieves permissions by their names
 func (r *CompanyRepositoryImpl) GetPermissionsByNames(ctx context.Context, permissionNames []string) ([]*models.Permission, error) {
 	if len(permissionNames) == 0 {
@@ -4879,10 +4883,6 @@ func (r *CompanyRepositoryImpl) GetEmployeesByDepartment(ctx context.Context, de
 }
 
 
-// internal/repository/postgres/company_repository_impl.go
-
-// Add these methods to CompanyRepositoryImpl
-
 // GetEmployeeDepartment gets the department for an employee through role → role_departments → department relationship
 func (r *CompanyRepositoryImpl) GetEmployeeDepartment(ctx context.Context, companyID, userID uuid.UUID) (*models.Department, error) {
     query := `
@@ -5052,4 +5052,260 @@ func (r *CompanyRepositoryImpl) RemoveAllRoleDepartments(ctx context.Context, de
         util.Int64("rows_affected", rowsAffected))
     
     return nil
+}
+
+
+// GetSystemDepartmentsWithBitmask returns all system departments with their bitmasks
+func (r *CompanyRepositoryImpl) GetSystemDepartmentsWithBitmask(ctx context.Context) ([]*models.SystemDepartment, error) {
+	query := `
+		SELECT system_department_id, name, module_code, description, bitmask
+		FROM system_departments
+		ORDER BY name`
+
+	rows, err := r.client.Query(ctx, query)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query system departments: %w", err)
+	}
+	defer rows.Close()
+
+	var systemDepartments []*models.SystemDepartment
+	for rows.Next() {
+		var dept models.SystemDepartment
+		var bitmask sql.NullInt64
+		
+		err := rows.Scan(
+			&dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description, &bitmask,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan system department row", util.ErrorField(err))
+			continue
+		}
+		
+		if bitmask.Valid {
+			dept.Bitmask = uint64(bitmask.Int64)
+		}
+		
+		systemDepartments = append(systemDepartments, &dept)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating system department rows: %w", err)
+	}
+
+	r.recordQuery()
+	return systemDepartments, nil
+}
+
+// GetDepartmentBitmask returns bitmask for a specific department
+func (r *CompanyRepositoryImpl) GetDepartmentBitmask(ctx context.Context, departmentName string) (uint64, error) {
+	query := `
+		SELECT bitmask
+		FROM system_departments
+		WHERE name = $1`
+
+	var bitmask sql.NullInt64
+	err := r.client.QueryRow(ctx, query, departmentName).Scan(&bitmask)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, fmt.Errorf("department not found: %s", departmentName)
+		}
+		r.recordError()
+		return 0, fmt.Errorf("failed to get department bitmask: %w", err)
+	}
+
+	if !bitmask.Valid {
+		return 0, nil
+	}
+
+	r.recordQuery()
+	return uint64(bitmask.Int64), nil
+}
+
+// GetPermissionsByModule returns permissions for specific modules
+func (r *CompanyRepositoryImpl) GetPermissionsByModules(ctx context.Context, modules []string) ([]*models.Permission, error) {
+	if len(modules) == 0 {
+		return []*models.Permission{}, nil
+	}
+
+	placeholders := make([]string, len(modules))
+	values := make([]interface{}, len(modules))
+	
+	for i, module := range modules {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		values[i] = module
+	}
+
+	query := fmt.Sprintf(`
+		SELECT permission_id, permission_name, description, category, module, requires_tier, bit_index
+		FROM permissions
+		WHERE module IN (%s)
+		ORDER BY module, bit_index`,
+		strings.Join(placeholders, ", "))
+
+	rows, err := r.client.Query(ctx, query, values...)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query permissions by module: %w", err)
+	}
+	defer rows.Close()
+
+	var permissions []*models.Permission
+	for rows.Next() {
+		var perm models.Permission
+		var bitIndex sql.NullInt32
+
+		err := rows.Scan(
+			&perm.PermissionID, &perm.PermissionName, &perm.Description,
+			&perm.Category, &perm.Module, &perm.RequiresTier, &bitIndex,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
+			continue
+		}
+
+		if bitIndex.Valid {
+			perm.BitIndex = int(bitIndex.Int32)
+		}
+
+		permissions = append(permissions, &perm)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	r.recordQuery()
+	return permissions, nil
+}
+
+// GetAdminPermissions returns all admin permissions
+func (r *CompanyRepositoryImpl) GetAdminPermissions(ctx context.Context) ([]*models.Permission, error) {
+	query := `
+		SELECT permission_id, permission_name, description, category, module, requires_tier, bit_index
+		FROM permissions
+		WHERE module = 'admin'
+		ORDER BY bit_index`
+
+	rows, err := r.client.Query(ctx, query)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query admin permissions: %w", err)
+	}
+	defer rows.Close()
+
+	var permissions []*models.Permission
+	for rows.Next() {
+		var perm models.Permission
+		var bitIndex sql.NullInt32
+
+		err := rows.Scan(
+			&perm.PermissionID, &perm.PermissionName, &perm.Description,
+			&perm.Category, &perm.Module, &perm.RequiresTier, &bitIndex,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan permission row", util.ErrorField(err))
+			continue
+		}
+
+		if bitIndex.Valid {
+			perm.BitIndex = int(bitIndex.Int32)
+		}
+
+		permissions = append(permissions, &perm)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	r.recordQuery()
+	return permissions, nil
+}
+
+// GetSystemDepartments retrieves all global system departments
+func (r *CompanyRepositoryImpl) GetSystemDepartments(ctx context.Context) ([]*models.SystemDepartment, error) {
+    query := `
+        SELECT system_department_id, name, module_code, description, bitmask
+        FROM system_departments 
+        ORDER BY name`
+
+    rows, err := r.client.Query(ctx, query)
+    if err != nil {
+        r.recordError()
+        return nil, fmt.Errorf("failed to query system departments: %w", err)
+    }
+    defer rows.Close()
+
+    var systemDepartments []*models.SystemDepartment
+    for rows.Next() {
+        var dept models.SystemDepartment
+        err := rows.Scan(
+            &dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+            &dept.Bitmask,
+        )
+        if err != nil {
+            r.logger.Warn("Failed to scan system department row", util.ErrorField(err))
+            continue
+        }
+        systemDepartments = append(systemDepartments, &dept)
+    }
+
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("error iterating system department rows: %w", err)
+    }
+
+    r.recordQuery()
+    return systemDepartments, nil
+}
+
+// GetSystemDepartmentByModule retrieves system department by module
+func (r *CompanyRepositoryImpl) GetSystemDepartmentByModule(ctx context.Context, module string) (*models.SystemDepartment, error) {
+    query := `
+        SELECT system_department_id, name, module_code, description, bitmask
+        FROM system_departments 
+        WHERE module_code = $1
+        LIMIT 1`
+
+    var dept models.SystemDepartment
+    err := r.client.QueryRow(ctx, query, module).Scan(
+        &dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+        &dept.Bitmask,
+    )
+
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("system department not found for module: %s", module)
+        }
+        r.recordError()
+        return nil, fmt.Errorf("failed to get system department: %w", err)
+    }
+
+    r.recordQuery()
+    return &dept, nil
+}
+
+// GetSystemDepartment retrieves a specific system department by ID
+func (r *CompanyRepositoryImpl) GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error) {
+    query := `
+        SELECT system_department_id, name, module_code, description, bitmask
+        FROM system_departments 
+        WHERE system_department_id = $1`
+
+    var dept models.SystemDepartment
+    err := r.client.QueryRow(ctx, query, systemDeptID).Scan(
+        &dept.SystemDepartmentID, &dept.Name, &dept.ModuleCode, &dept.Description,
+        &dept.Bitmask,
+    )
+
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("system department not found: %s", systemDeptID)
+        }
+        r.recordError()
+        return nil, fmt.Errorf("failed to get system department: %w", err)
+    }
+
+    r.recordQuery()
+    return &dept, nil
 }

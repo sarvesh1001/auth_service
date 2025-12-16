@@ -84,7 +84,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
         system_department_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         name VARCHAR(255) UNIQUE NOT NULL,
         module_code VARCHAR(100) NOT NULL,
-        description TEXT
+        description TEXT,
+        bitmask BIGINT NOT NULL   
     );
 
     CREATE TABLE permissions (
@@ -913,23 +914,24 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     END;
     \$\$ LANGUAGE plpgsql;
 
-    INSERT INTO system_departments (name, module_code, description) VALUES
-    ('HR', 'hr', 'Human resource management'),
-    ('Finance', 'finance', 'Finance operations'),
-    ('Accounting', 'accounting', 'Accounting and ledger'),
-    ('Procurement', 'procurement', 'Purchasing & vendor mgmt'),
-    ('Inventory', 'inventory', 'Stock & warehouse'),
-    ('Logistics', 'logistics', 'Dispatch & delivery'),
-    ('Sales', 'sales', 'Lead & pipeline mgmt'),
-    ('Marketing', 'marketing', 'Campaigns & analysis'),
-    ('Customer Support', 'support', 'Support & helpdesk'),
-    ('Operations', 'operations', 'Operations & workflows'),
-    ('IT', 'it', 'IT assets & incidents'),
-    ('Production', 'production', 'Manufacturing operations'),
-    ('Quality Control', 'qc', 'QC inspections'),
-    ('Quality Assurance', 'qa', 'QA processes'),
-    ('R&D', 'rnd', 'Research & development'),
-    ('Administration', 'administration', 'Company administration and management')
+    -- Insert default departments with bitmask values
+    INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
+    ('HR', 'hr', 'Human resource management', 1 << 0),
+    ('Finance', 'finance', 'Finance operations', 1 << 1),
+    ('Accounting', 'accounting', 'Accounting and ledger', 1 << 2),
+    ('Procurement', 'procurement', 'Purchasing & vendor mgmt', 1 << 3),
+    ('Inventory', 'inventory', 'Stock & warehouse', 1 << 4),
+    ('Logistics', 'logistics', 'Dispatch & delivery', 1 << 5),
+    ('Sales', 'sales', 'Lead & pipeline mgmt', 1 << 6),
+    ('Marketing', 'marketing', 'Campaigns & analysis', 1 << 7),
+    ('Customer Support', 'support', 'Support & helpdesk', 1 << 8),
+    ('Operations', 'operations', 'Operations & workflows', 1 << 9),
+    ('IT', 'it', 'IT assets & incidents', 1 << 10),
+    ('Production', 'production', 'Manufacturing operations', 1 << 11),
+    ('Quality Control', 'qc', 'QC inspections', 1 << 12),
+    ('Quality Assurance', 'qa', 'QA processes', 1 << 13),
+    ('R&D', 'rnd', 'Research & development', 1 << 14),
+    ('Administration', 'administration', 'Company administration and management', 1 << 15)
     ON CONFLICT (name) DO NOTHING;
 
     -- 🔵 HR MODULE (20 permissions)
