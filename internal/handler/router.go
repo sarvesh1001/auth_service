@@ -366,39 +366,100 @@ func NewRouter(
 
                 // Company Management
                 r.Route("/companies", func(r chi.Router) {
-                    r.Post("/", adminHandler.CreateCompany)
-                    r.Get("/status/{status}", adminHandler.GetCompaniesByStatus)
-                    r.Get("/recent", adminHandler.GetRecentCompanies)
-                    r.Get("/expiring-subscriptions", adminHandler.GetCompaniesWithExpiringSubscription)
-                    r.Get("/tier/{tier}", adminHandler.GetCompaniesByTier)
-
-                    r.Get("/search", adminHandler.SearchCompanies)
-                    r.Get("/suggestions", adminHandler.GetCompanySuggestions)
-                    r.Get("/search-by-owner/{ownerID}", adminHandler.SearchCompaniesByOwner)
-                    r.Get("/owner/{ownerID}/search", adminHandler.SearchCompaniesByOwner)
-                    r.Get("/search-analytics", adminHandler.GetCompanySearchAnalytics)
-                    r.Post("/search-benchmark", adminHandler.BenchmarkCompanySearch)
-
+                    // CREATE COMPANY - requires admin.company.update (since creating is an update operation)
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                        Post("/", adminHandler.CreateCompany)
+                    
+                    // LIST VIEW OPERATIONS - require admin.company.view
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/status/{status}", adminHandler.GetCompaniesByStatus)
+                    
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/recent", adminHandler.GetRecentCompanies)
+                    
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/expiring-subscriptions", adminHandler.GetCompaniesWithExpiringSubscription)
+                    
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/tier/{tier}", adminHandler.GetCompaniesByTier)
+                    
+                    // SEARCH OPERATIONS - require admin.company.view
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/search", adminHandler.SearchCompanies)
+                    
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/suggestions", adminHandler.GetCompanySuggestions)
+                    
+                    // OWNER SEARCH - requires admin.company.view
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/search-by-owner/{ownerID}", adminHandler.SearchCompaniesByOwner)
+                    
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/owner/{ownerID}/search", adminHandler.SearchCompaniesByOwner)
+                    
+                    // ANALYTICS - requires admin.company.view
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                        Get("/search-analytics", adminHandler.GetCompanySearchAnalytics)
+                    
+                    // BENCHMARK - requires admin.company.update (modifying/search operations)
+                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                        Post("/search-benchmark", adminHandler.BenchmarkCompanySearch)
+                    
+                    // COMPANY-SPECIFIC ROUTES
                     r.Route("/{companyID}", func(r chi.Router) {
-                        r.Get("/", adminHandler.GetCompany)
-                        r.Patch("/deactivate", adminHandler.DeactivateCompany)
-                        r.Patch("/deactivate/department", rbacHandler.DeactivateDepartment)
-                        r.Delete("/delete", rbacHandler.DeleteDepartment)
-                        r.Patch("/activate", adminHandler.ReactivateCompany)
-                        r.Patch("/extend-subscription", adminHandler.ExtendSubscription)
-                        r.Patch("/subscription", adminHandler.UpdateSubscription)
-                        r.Get("/stats", adminHandler.GetCompanyStats)
-                        r.Get("/rbac-stats", adminHandler.GetCompanyRBACStats)
-
-                        r.Get("/employees", adminHandler.GetCompanyEmployees)
-                        r.Get("/departments", adminHandler.GetCompanyDepartments)
-                        r.Get("/roles", adminHandler.GetCompanyRoles)
-                        r.Post("/roles", adminHandler.CreateRole)
-                        r.Get("/hierarchy", adminHandler.GetCompanyHierarchy)
-
-                        r.Post("/employees/bulk-assign", adminHandler.BulkAssignRoles)
+                        // VIEW COMPANY DETAILS - requires admin.company.view
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/", adminHandler.GetCompany)
+                        
+                        // DEACTIVATE COMPANY - requires admin.company.suspend
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.suspend", logger)).
+                            Patch("/deactivate", adminHandler.DeactivateCompany)
+                        
+                        // REACTIVATE COMPANY - requires admin.company.update
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                            Patch("/activate", adminHandler.ReactivateCompany)
+                        
+                        // EXTEND SUBSCRIPTION - requires admin.company.update
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                            Patch("/extend-subscription", adminHandler.ExtendSubscription)
+                        
+                        // UPDATE SUBSCRIPTION - requires admin.company.update
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                            Patch("/subscription", adminHandler.UpdateSubscription)
+                        
+                        // VIEW STATS - requires admin.company.view
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/stats", adminHandler.GetCompanyStats)
+                        
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/rbac-stats", adminHandler.GetCompanyRBACStats)
+                        
+                        // VIEW EMPLOYEES - requires admin.company.view
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/employees", adminHandler.GetCompanyEmployees)
+                        
+                        // VIEW DEPARTMENTS - requires admin.company.view
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/departments", adminHandler.GetCompanyDepartments)
+                        
+                        // VIEW ROLES - requires admin.company.view
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/roles", adminHandler.GetCompanyRoles)
+                        
+                        // CREATE ROLE - requires admin.company.update
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                            Post("/roles", rbacHandler.CreateRole)
+                        
+                        // VIEW HIERARCHY - requires admin.company.view
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+                            Get("/hierarchy", adminHandler.GetCompanyHierarchy)
+                        
+                        // BULK ASSIGN ROLES - requires admin.company.update
+                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+                            Post("/employees/bulk-assign", adminHandler.BulkAssignRoles)
                     })
                 })
+                
 
                 // Employee Management
                 r.Route("/employees", func(r chi.Router) {

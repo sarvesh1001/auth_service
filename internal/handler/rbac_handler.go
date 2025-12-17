@@ -28,6 +28,148 @@ func NewRBACHandler(companyService *service.CompanyService, logger *zap.Logger) 
         logger:         logger,
     }
 }
+// // CreateRole creates a new role for a company
+// func (h *RBACHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+
+//     companyIDStr := chi.URLParam(r, "companyID")
+//     companyID, err := uuid.Parse(companyIDStr)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+//         return
+//     }
+
+//     // Get admin ID from context
+//     adminID := r.Context().Value("user_id")
+//     if adminID == nil {
+//         h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("UNAUTHORIZED"), "Authentication required")
+//         return
+//     }
+
+//     adminIDParsed, err := uuid.Parse(adminID.(string))
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+//         return
+//     }
+
+//     var req struct {
+//         RoleName        string      `json:"role_name" validate:"required"`
+//         RoleLevel       int         `json:"role_level" validate:"required"`
+//         Description     string      `json:"description"`
+//         SystemRole      bool        `json:"system_role"`
+//         DepartmentIDs   []uuid.UUID `json:"department_ids"`
+//         PermissionNames []string    `json:"permission_names"` // Changed from PermissionIDs
+//     }
+
+//     // Use DisallowUnknownFields to reject extra fields
+//     decoder := json.NewDecoder(r.Body)
+//     decoder.DisallowUnknownFields()
+//     if err := decoder.Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body: unknown fields not allowed")
+//         return
+//     }
+
+//     // Validate permission names exist
+//     if len(req.PermissionNames) > 0 {
+//         allPermissions, err := h.companyService.GetAllPermissions(ctx, "", "", "")
+//         if err != nil {
+//             h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate permissions")
+//             return
+//         }
+
+//         validPermissionNames := make(map[string]bool)
+//         for _, perm := range allPermissions {
+//             validPermissionNames[perm.PermissionName] = true
+//         }
+
+//         for _, permName := range req.PermissionNames {
+//             if !validPermissionNames[permName] {
+//                 h.respondWithError(w, http.StatusBadRequest,
+//                     fmt.Errorf("PERMISSION_NOT_FOUND"),
+//                     fmt.Sprintf("Permission not found: %s", permName))
+//                 return
+//             }
+//         }
+
+//         // Check if user has the permissions they're trying to assign
+//         currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, adminIDParsed)
+//         if err != nil {
+//             h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate user permissions")
+//             return
+//         }
+
+//         userPermMap := make(map[string]bool)
+//         for _, perm := range currentUserPermissions {
+//             userPermMap[perm.PermissionName] = true
+//         }
+
+//         for _, permName := range req.PermissionNames {
+//             if !userPermMap[permName] {
+//                 h.respondWithError(w, http.StatusForbidden,
+//                     fmt.Errorf("PERMISSION_DENIED"),
+//                     fmt.Sprintf("You cannot assign permission '%s' that you don't possess", permName))
+//                 return
+//             }
+//         }
+//     }
+
+//     // Convert permission names to IDs
+//     permissionIDs := []uuid.UUID{}
+//     if len(req.PermissionNames) > 0 {
+//         allPermissions, err := h.companyService.GetAllPermissions(ctx, "", "", "")
+//         if err != nil {
+//             h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get permissions")
+//             return
+//         }
+
+//         permMap := make(map[string]uuid.UUID)
+//         for _, perm := range allPermissions {
+//             permMap[perm.PermissionName] = perm.PermissionID
+//         }
+
+//         for _, permName := range req.PermissionNames {
+//             if permID, exists := permMap[permName]; exists {
+//                 permissionIDs = append(permissionIDs, permID)
+//             }
+//         }
+//     }
+
+//     // ✅ ADDED: Validate permission-department compatibility
+//     if len(req.DepartmentIDs) > 0 && len(permissionIDs) > 0 {
+//         compatible, errorMsg, err := h.companyService.ValidatePermissionDepartmentCompatibility(
+//             ctx, req.DepartmentIDs, permissionIDs)
+//         if err != nil {
+//             h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate permissions")
+//             return
+//         }
+//         if !compatible {
+//             h.respondWithError(w, http.StatusBadRequest, 
+//                 fmt.Errorf("PERMISSION_DEPARTMENT_MISMATCH"), errorMsg)
+//             return
+//         }
+//     }
+
+//     roleReq := &service.CreateRoleRequest{
+//         CompanyID:     companyID,
+//         RoleName:      req.RoleName,
+//         RoleLevel:     req.RoleLevel,
+//         Description:   req.Description,
+//         DepartmentIDs: req.DepartmentIDs,
+//         PermissionIDs: permissionIDs,
+//         CreatedBy:     adminIDParsed,
+//     }
+
+//     role, err := h.companyService.CreateRole(ctx, roleReq)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to create role")
+//         return
+//     }
+
+//     h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Role created successfully"))
+// }
+
+
+
 // CreateRole creates a new role for a company
 func (h *RBACHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
@@ -50,6 +192,12 @@ func (h *RBACHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
     if err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
         return
+    }
+
+    // Get session type from context
+    sessionType, ok := ctx.Value("session_type").(string)
+    if !ok {
+        sessionType = ""
     }
 
     var req struct {
@@ -91,24 +239,26 @@ func (h *RBACHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
             }
         }
 
-        // Check if user has the permissions they're trying to assign
-        currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, adminIDParsed)
-        if err != nil {
-            h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate user permissions")
-            return
-        }
-
-        userPermMap := make(map[string]bool)
-        for _, perm := range currentUserPermissions {
-            userPermMap[perm.PermissionName] = true
-        }
-
-        for _, permName := range req.PermissionNames {
-            if !userPermMap[permName] {
-                h.respondWithError(w, http.StatusForbidden,
-                    fmt.Errorf("PERMISSION_DENIED"),
-                    fmt.Sprintf("You cannot assign permission '%s' that you don't possess", permName))
+        // ✅ MODIFIED: Only check if user has permissions if they are NOT an admin
+        if sessionType != "admin" {
+            currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, adminIDParsed)
+            if err != nil {
+                h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate user permissions")
                 return
+            }
+
+            userPermMap := make(map[string]bool)
+            for _, perm := range currentUserPermissions {
+                userPermMap[perm.PermissionName] = true
+            }
+
+            for _, permName := range req.PermissionNames {
+                if !userPermMap[permName] {
+                    h.respondWithError(w, http.StatusForbidden,
+                        fmt.Errorf("PERMISSION_DENIED"),
+                        fmt.Sprintf("You cannot assign permission '%s' that you don't possess", permName))
+                    return
+                }
             }
         }
     }
@@ -167,6 +317,7 @@ func (h *RBACHandler) CreateRole(w http.ResponseWriter, r *http.Request) {
 
     h.respondWithJSON(w, http.StatusCreated, successResponse(role, "Role created successfully"))
 }
+
 // ListRoles lists all roles for a company
 func (h *RBACHandler) ListRoles(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
@@ -502,6 +653,94 @@ func (h *RBACHandler) DeactivateDepartment(w http.ResponseWriter, r *http.Reques
     h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department deactivated successfully"))
 }
 // AssignPermissionsToRole assigns permissions to a role
+// func (h *RBACHandler) AssignPermissionsToRole(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+
+//     roleIDStr := chi.URLParam(r, "roleID")
+//     roleID, err := uuid.Parse(roleIDStr)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+//         return
+//     }
+
+//     // Get admin ID from context
+//     adminID := r.Context().Value("user_id")
+//     if adminID == nil {
+//         h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("UNAUTHORIZED"), "Authentication required")
+//         return
+//     }
+
+//     adminIDParsed, err := uuid.Parse(adminID.(string))
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+//         return
+//     }
+
+//     var req struct {
+//         PermissionNames []string `json:"permission_names" validate:"required,min=1"` // Changed from PermissionIDs
+//     }
+
+//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+//         return
+//     }
+
+//     if len(req.PermissionNames) == 0 {
+//         h.respondWithError(w, http.StatusBadRequest, fmt.Errorf("EMPTY_PERMISSIONS"), "At least one permission name is required")
+//         return
+//     }
+
+//     // Convert permission names to IDs
+//     allPermissions, err := h.companyService.GetAllPermissions(ctx, "", "", "")
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get permissions")
+//         return
+//     }
+
+//     permMap := make(map[string]uuid.UUID)
+//     for _, perm := range allPermissions {
+//         permMap[perm.PermissionName] = perm.PermissionID
+//     }
+
+//     var permissionIDs []uuid.UUID
+//     var invalidPermissions []string
+//     for _, permName := range req.PermissionNames {
+//         if permID, exists := permMap[permName]; exists {
+//             permissionIDs = append(permissionIDs, permID)
+//         } else {
+//             invalidPermissions = append(invalidPermissions, permName)
+//         }
+//     }
+
+//     if len(invalidPermissions) > 0 {
+//         h.respondWithError(w, http.StatusBadRequest,
+//             fmt.Errorf("INVALID_PERMISSIONS"),
+//             fmt.Sprintf("Invalid permission names: %v", invalidPermissions))
+//         return
+//     }
+
+//     var grantedCount int
+//     var errors []string
+
+//     for _, permissionID := range permissionIDs {
+//         if err := h.companyService.GrantRolePermission(ctx, roleID, permissionID, adminIDParsed); err != nil {
+//             errors = append(errors, fmt.Sprintf("Failed to grant permission: %v", err))
+//             continue
+//         }
+//         grantedCount++
+//     }
+
+//     if len(errors) > 0 {
+//         h.respondWithError(w, http.StatusPartialContent,
+//             fmt.Errorf("PARTIAL_FAILURE: %v", errors),
+//             fmt.Sprintf("Successfully granted %d out of %d permissions", grantedCount, len(permissionIDs)))
+//         return
+//     }
+
+//     h.respondWithJSON(w, http.StatusOK, successResponse(nil,
+//         fmt.Sprintf("All %d permissions granted successfully to role", grantedCount)))
+// }
+// AssignPermissionsToRole assigns permissions to a role
 func (h *RBACHandler) AssignPermissionsToRole(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
 
@@ -523,6 +762,12 @@ func (h *RBACHandler) AssignPermissionsToRole(w http.ResponseWriter, r *http.Req
     if err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
         return
+    }
+
+    // Get session type from context
+    sessionType, ok := ctx.Value("session_type").(string)
+    if !ok {
+        sessionType = ""
     }
 
     var req struct {
@@ -568,6 +813,29 @@ func (h *RBACHandler) AssignPermissionsToRole(w http.ResponseWriter, r *http.Req
         return
     }
 
+    // ✅ MODIFIED: Only validate user permissions if NOT admin
+    if sessionType != "admin" {
+        currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, adminIDParsed)
+        if err != nil {
+            h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate user permissions")
+            return
+        }
+
+        userPermMap := make(map[string]bool)
+        for _, perm := range currentUserPermissions {
+            userPermMap[perm.PermissionName] = true
+        }
+
+        for _, permName := range req.PermissionNames {
+            if !userPermMap[permName] {
+                h.respondWithError(w, http.StatusForbidden,
+                    fmt.Errorf("PERMISSION_DENIED"),
+                    fmt.Sprintf("You cannot assign permission '%s' that you don't possess", permName))
+                return
+            }
+        }
+    }
+
     var grantedCount int
     var errors []string
 
@@ -589,7 +857,6 @@ func (h *RBACHandler) AssignPermissionsToRole(w http.ResponseWriter, r *http.Req
     h.respondWithJSON(w, http.StatusOK, successResponse(nil,
         fmt.Sprintf("All %d permissions granted successfully to role", grantedCount)))
 }
-
 // RemovePermissionsFromRole removes permissions from a role
 func (h *RBACHandler) RemovePermissionsFromRole(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
@@ -764,6 +1031,104 @@ func (h *RBACHandler) ListPermissionsByModule(w http.ResponseWriter, r *http.Req
 }
 
 // ReplaceRolePermissions replaces all permissions for a role (overwrite existing)
+// func (h *RBACHandler) ReplaceRolePermissions(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+
+//     roleIDStr := chi.URLParam(r, "roleID")
+//     roleID, err := uuid.Parse(roleIDStr)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+//         return
+//     }
+
+//     // Get admin ID from context
+//     adminID := r.Context().Value("user_id")
+//     if adminID == nil {
+//         h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("UNAUTHORIZED"), "Authentication required")
+//         return
+//     }
+
+//     adminIDParsed, err := uuid.Parse(adminID.(string))
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+//         return
+//     }
+
+//     var req struct {
+//         PermissionNames []string `json:"permission_names" validate:"required"` // Changed from PermissionIDs
+//     }
+
+//     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+//         return
+//     }
+
+//     // Convert permission names to IDs
+//     allPermissions, err := h.companyService.GetAllPermissions(ctx, "", "", "")
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get permissions")
+//         return
+//     }
+
+//     permMap := make(map[string]uuid.UUID)
+//     for _, perm := range allPermissions {
+//         permMap[perm.PermissionName] = perm.PermissionID
+//     }
+
+//     var permissionIDs []uuid.UUID
+//     var invalidPermissions []string
+//     for _, permName := range req.PermissionNames {
+//         if permID, exists := permMap[permName]; exists {
+//             permissionIDs = append(permissionIDs, permID)
+//         } else {
+//             invalidPermissions = append(invalidPermissions, permName)
+//         }
+//     }
+
+//     if len(invalidPermissions) > 0 {
+//         h.respondWithError(w, http.StatusBadRequest,
+//             fmt.Errorf("INVALID_PERMISSIONS"),
+//             fmt.Sprintf("Invalid permission names: %v", invalidPermissions))
+//         return
+//     }
+
+//     currentPermissions, _ := h.companyService.GetRolePermissions(ctx, roleID)
+
+//     if len(currentPermissions) > 0 {
+//         for _, perm := range currentPermissions {
+//             _ = h.companyService.RevokeRolePermission(ctx, roleID, perm.PermissionID, adminIDParsed)
+//         }
+//     }
+
+//     var grantedCount int
+//     var errors []string
+
+//     for _, permissionID := range permissionIDs {
+//         if err := h.companyService.GrantRolePermission(ctx, roleID, permissionID, adminIDParsed); err != nil {
+//             errors = append(errors, fmt.Sprintf("Failed to grant permission: %v", err))
+//             continue
+//         }
+//         grantedCount++
+//     }
+
+//     response := map[string]interface{}{
+//         "role_id":             roleID,
+//         "permissions_granted": grantedCount,
+//         "total_requested":     len(permissionIDs),
+//         "errors":              errors,
+//     }
+
+//     if len(errors) > 0 {
+//         h.respondWithError(w, http.StatusPartialContent,
+//             fmt.Errorf("PARTIAL_FAILURE: %v", errors),
+//             fmt.Sprintf("Role permissions replaced with %d out of %d permissions", grantedCount, len(permissionIDs)))
+//         return
+//     }
+
+//     h.respondWithJSON(w, http.StatusOK, successResponse(response,
+//         fmt.Sprintf("All %d permissions successfully assigned to role", grantedCount)))
+// }
+// ReplaceRolePermissions replaces all permissions for a role (overwrite existing)
 func (h *RBACHandler) ReplaceRolePermissions(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
 
@@ -785,6 +1150,12 @@ func (h *RBACHandler) ReplaceRolePermissions(w http.ResponseWriter, r *http.Requ
     if err != nil {
         h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
         return
+    }
+
+    // Get session type from context
+    sessionType, ok := ctx.Value("session_type").(string)
+    if !ok {
+        sessionType = ""
     }
 
     var req struct {
@@ -823,6 +1194,29 @@ func (h *RBACHandler) ReplaceRolePermissions(w http.ResponseWriter, r *http.Requ
             fmt.Errorf("INVALID_PERMISSIONS"),
             fmt.Sprintf("Invalid permission names: %v", invalidPermissions))
         return
+    }
+
+    // ✅ MODIFIED: Only validate user permissions if NOT admin
+    if sessionType != "admin" {
+        currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, adminIDParsed)
+        if err != nil {
+            h.respondWithError(w, http.StatusInternalServerError, err, "Failed to validate user permissions")
+            return
+        }
+
+        userPermMap := make(map[string]bool)
+        for _, perm := range currentUserPermissions {
+            userPermMap[perm.PermissionName] = true
+        }
+
+        for _, permName := range req.PermissionNames {
+            if !userPermMap[permName] {
+                h.respondWithError(w, http.StatusForbidden,
+                    fmt.Errorf("PERMISSION_DENIED"),
+                    fmt.Sprintf("You cannot assign permission '%s' that you don't possess", permName))
+                return
+            }
+        }
     }
 
     currentPermissions, _ := h.companyService.GetRolePermissions(ctx, roleID)
@@ -1495,6 +1889,60 @@ func (h *RBACHandler) AddManager(w http.ResponseWriter, r *http.Request) {
     h.respondWithJSON(w, http.StatusCreated, successResponse(nil, "Manager added successfully"))
 }
 
+// // GetAvailablePermissions returns permissions that the current user can assign
+// func (h *RBACHandler) GetAvailablePermissions(w http.ResponseWriter, r *http.Request) {
+//     ctx := r.Context()
+
+//     companyIDStr := chi.URLParam(r, "companyID")
+//     companyID, err := uuid.Parse(companyIDStr)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+//         return
+//     }
+
+//     // Get current user ID from context
+//     currentUserID := r.Context().Value("user_id")
+//     if currentUserID == nil {
+//         h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("UNAUTHORIZED"), "Authentication required")
+//         return
+//     }
+
+//     currentUserIDParsed, err := uuid.Parse(currentUserID.(string))
+//     if err != nil {
+//         h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+//         return
+//     }
+
+//     // Get current user's permissions
+//     currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, currentUserIDParsed)
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user permissions")
+//         return
+//     }
+
+//     // Get all permissions available for the company
+//     allPermissions, err := h.companyService.GetPermissionsByCompanyDepartments(ctx, companyID, "", "", "")
+//     if err != nil {
+//         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get available permissions")
+//         return
+//     }
+
+//     // Filter permissions to only those the user has
+//     userPermMap := make(map[string]bool)
+//     for _, perm := range currentUserPermissions {
+//         userPermMap[perm.PermissionName] = true
+//     }
+
+//     var availablePermissions []*models.Permission
+//     for _, perm := range allPermissions {
+//         if userPermMap[perm.PermissionName] {
+//             availablePermissions = append(availablePermissions, perm)
+//         }
+//     }
+
+//     h.respondWithJSON(w, http.StatusOK, successResponse(availablePermissions, "Available permissions retrieved successfully"))
+// }
+
 // GetAvailablePermissions returns permissions that the current user can assign
 func (h *RBACHandler) GetAvailablePermissions(w http.ResponseWriter, r *http.Request) {
     ctx := r.Context()
@@ -1519,7 +1967,24 @@ func (h *RBACHandler) GetAvailablePermissions(w http.ResponseWriter, r *http.Req
         return
     }
 
-    // Get current user's permissions
+    // Get session type from context
+    sessionType, ok := ctx.Value("session_type").(string)
+    if !ok {
+        sessionType = ""
+    }
+
+    // ✅ MODIFIED: If admin, return all permissions without filtering
+    if sessionType == "admin" {
+        allPermissions, err := h.companyService.GetPermissionsByCompanyDepartments(ctx, companyID, "", "", "")
+        if err != nil {
+            h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get available permissions")
+            return
+        }
+        h.respondWithJSON(w, http.StatusOK, successResponse(allPermissions, "Available permissions retrieved successfully"))
+        return
+    }
+
+    // Get current user's permissions (for non-admin users)
     currentUserPermissions, err := h.companyService.GetUserPermissions(ctx, currentUserIDParsed)
     if err != nil {
         h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user permissions")

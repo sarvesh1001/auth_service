@@ -985,218 +985,6 @@ func (s *AdminService) AuthenticateAdminWithSession(ctx context.Context, phone s
 
 	return admin, session.SessionToken, nil
 }
-// PromoteAdmin promotes an admin to higher role
-func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newRoleMask uint64, promotedBy uuid.UUID) error {
-    startTime := time.Now()
-
-    // BLOCK ANY ATTEMPT TO PROMOTE TO OWNER (ROLE MASK 1)
-    if newRoleMask == models.RoleMaskOwner {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "error",
-                Message:     "Attempt to promote to owner is forbidden",
-            },
-            AdminID:      promotedBy.String(),
-            Action:       "promote_admin",
-            Status:       "failed",
-            ErrorCode:    "CANNOT_PROMOTE_TO_OWNER",
-            ErrorMessage: "Promotion to owner role is not allowed",
-            Duration:     int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("promotion to owner role is not allowed")
-    }
-
-    admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-    if err != nil {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "error",
-                Message:     "Admin not found for promotion",
-            },
-            AdminID:      promotedBy.String(),
-            Action:       "promote_admin",
-            Status:       "failed",
-            ErrorCode:    "ADMIN_NOT_FOUND",
-            ErrorMessage: err.Error(),
-            Duration:     int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("admin not found: %w", err)
-    }
-
-    promoter, err := s.adminRepo.GetAdminByID(ctx, promotedBy)
-    if err != nil {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "error",
-                Message:     "Promoter not found",
-            },
-            AdminID:      promotedBy.String(),
-            Action:       "promote_admin",
-            Status:       "failed",
-            ErrorCode:    "PROMOTER_NOT_FOUND",
-            ErrorMessage: err.Error(),
-            Duration:     int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("promoter not found: %w", err)
-    }
-
-    // CHECK IF TARGET IS ALREADY OWNER
-    if admin.IsOwner() {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "warning",
-                Message:     "Cannot modify owner admin",
-            },
-            AdminID:   promotedBy.String(),
-            Action:    "promote_admin",
-            Status:    "failed",
-            ErrorCode: "CANNOT_MODIFY_OWNER",
-            Duration:  int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("cannot modify owner admin")
-    }
-
-    if !promoter.CanPromoteToRole(newRoleMask) {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "warning",
-                Message:     "Unauthorized promotion attempt",
-            },
-            AdminID:   promotedBy.String(),
-            Action:    "promote_admin",
-            Status:    "failed",
-            ErrorCode: "UNAUTHORIZED",
-            Duration:  int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("unauthorized: cannot promote to this role")
-    }
-
-    // VALIDATE VALID ROLE MASK (NOT OWNER)
-    if !isValidRoleMask(newRoleMask) {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "warning",
-                Message:     "Invalid role mask provided",
-            },
-            AdminID:   promotedBy.String(),
-            Action:    "promote_admin",
-            Status:    "failed",
-            ErrorCode: "INVALID_ROLE_MASK",
-            Duration:  int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("invalid role mask")
-    }
-
-    oldRoleMask := admin.AdminRoleMask
-
-    if err := s.adminRepo.UpdateAdminRoleMask(ctx, adminID, newRoleMask, promotedBy); err != nil {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "error",
-                Message:     "Failed to update admin role",
-            },
-            AdminID:      promotedBy.String(),
-            Action:       "promote_admin",
-            Status:       "failed",
-            ErrorCode:    "UPDATE_ROLE_FAILED",
-            ErrorMessage: err.Error(),
-            Duration:     int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("failed to promote admin: %w", err)
-    }
-
-    newPermissions := s.getPermissionsForRole(newRoleMask)
-    if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissions); err != nil {
-        s.logAdminEvent(ctx, &models.AdminLogEvent{
-            LogEnvelope: models.LogEnvelope{
-                EventID:     uuid.New().String(),
-                EventType:   "admin",
-                ServiceName: "auth-service",
-                Timestamp:   time.Now(),
-                Environment: "production",
-                Version:     "v1.0.0",
-                Level:       "error",
-                Message:     "Failed to update admin permissions",
-            },
-            AdminID:      promotedBy.String(),
-            Action:       "promote_admin",
-            Status:       "failed",
-            ErrorCode:    "UPDATE_PERMISSIONS_FAILED",
-            ErrorMessage: err.Error(),
-            Duration:     int64(time.Since(startTime).Milliseconds()),
-        })
-        return fmt.Errorf("failed to update permissions: %w", err)
-    }
-
-    s.logAdminEvent(ctx, &models.AdminLogEvent{
-        LogEnvelope: models.LogEnvelope{
-            EventID:     uuid.New().String(),
-            EventType:   "admin",
-            ServiceName: "auth-service",
-            Timestamp:   time.Now(),
-            Environment: "production",
-            Version:     "v1.0.0",
-            Level:       "info",
-            Message:     "Admin promoted successfully",
-        },
-        AdminID:      adminID.String(),
-        AdminRole:    getRoleStringFromMask(newRoleMask),
-        TargetUserID: adminID.String(),
-        Action:       "promote_admin",
-        ResourceType: "admin_user",
-        ResourceID:   adminID.String(),
-        Status:       "success",
-        Changes: map[string]interface{}{
-            "old_role_mask": oldRoleMask,
-            "new_role_mask": newRoleMask,
-        },
-        Duration: int64(time.Since(startTime).Milliseconds()),
-    })
-
-    return nil
-}
 
 // Helper function to validate role masks (exclude owner)
 func isValidRoleMask(roleMask uint64) bool {
@@ -2216,196 +2004,6 @@ func getRoleStringFromMask(roleMask uint64) string {
 
 // Add these methods to your AdminService
 
-// GrantPermissionToAdmin grants a specific permission to an admin
-func (s *AdminService) GrantPermissionToAdmin(ctx context.Context, adminID uuid.UUID, permissionName string, grantedBy uuid.UUID) error {
-	startTime := time.Now()
-
-	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		return fmt.Errorf("admin not found: %w", err)
-	}
-
-	granter, err := s.adminRepo.GetAdminByID(ctx, grantedBy)
-	if err != nil {
-		return fmt.Errorf("granter not found: %w", err)
-	}
-
-	if !granter.CanManageEmployee(admin.AdminRoleMask) {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "warning",
-				Message:     "Unauthorized permission grant attempt",
-			},
-			AdminID:   grantedBy.String(),
-			TargetUserID: adminID.String(),
-			Action:    "grant_permission",
-			Status:    "failed",
-			ErrorCode: "UNAUTHORIZED",
-			Duration:  int64(time.Since(startTime).Milliseconds()),
-		})
-		return fmt.Errorf("unauthorized: cannot grant permission to this admin")
-	}
-
-	// Get bit index for permission
-	bitIndex, exists := models.AdminPermissionBitIndices[permissionName]
-	if !exists {
-		return fmt.Errorf("invalid permission: %s", permissionName)
-	}
-
-	// Create new permission mask with the permission granted
-	newPermissionMask := models.SetPermission(admin.CopyPermissionMask(), bitIndex, true)
-
-	if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissionMask); err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to grant permission",
-			},
-			AdminID:      grantedBy.String(),
-			TargetUserID: adminID.String(),
-			Action:       "grant_permission",
-			Status:       "failed",
-			ErrorCode:    "GRANT_PERMISSION_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return fmt.Errorf("failed to grant permission: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Permission granted successfully",
-		},
-		AdminID:      grantedBy.String(),
-		TargetUserID: adminID.String(),
-		Action:       "grant_permission",
-		ResourceType: "admin_user",
-		ResourceID:   adminID.String(),
-		Status:       "success",
-		Changes: map[string]interface{}{
-			"permission": permissionName,
-			"bit_index":  bitIndex,
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return nil
-}
-
-// RevokePermissionFromAdmin revokes a specific permission from an admin
-func (s *AdminService) RevokePermissionFromAdmin(ctx context.Context, adminID uuid.UUID, permissionName string, revokedBy uuid.UUID) error {
-	startTime := time.Now()
-
-	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		return fmt.Errorf("admin not found: %w", err)
-	}
-
-	revoker, err := s.adminRepo.GetAdminByID(ctx, revokedBy)
-	if err != nil {
-		return fmt.Errorf("revoker not found: %w", err)
-	}
-
-	if !revoker.CanManageEmployee(admin.AdminRoleMask) {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "warning",
-				Message:     "Unauthorized permission revoke attempt",
-			},
-			AdminID:   revokedBy.String(),
-			TargetUserID: adminID.String(),
-			Action:    "revoke_permission",
-			Status:    "failed",
-			ErrorCode: "UNAUTHORIZED",
-			Duration:  int64(time.Since(startTime).Milliseconds()),
-		})
-		return fmt.Errorf("unauthorized: cannot revoke permission from this admin")
-	}
-
-	// Get bit index for permission
-	bitIndex, exists := models.AdminPermissionBitIndices[permissionName]
-	if !exists {
-		return fmt.Errorf("invalid permission: %s", permissionName)
-	}
-
-	// Create new permission mask with the permission revoked
-	newPermissionMask := models.SetPermission(admin.CopyPermissionMask(), bitIndex, false)
-
-	if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissionMask); err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to revoke permission",
-			},
-			AdminID:      revokedBy.String(),
-			TargetUserID: adminID.String(),
-			Action:       "revoke_permission",
-			Status:       "failed",
-			ErrorCode:    "REVOKE_PERMISSION_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return fmt.Errorf("failed to revoke permission: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Permission revoked successfully",
-		},
-		AdminID:      revokedBy.String(),
-		TargetUserID: adminID.String(),
-		Action:       "revoke_permission",
-		ResourceType: "admin_user",
-		ResourceID:   adminID.String(),
-		Status:       "success",
-		Changes: map[string]interface{}{
-			"permission": permissionName,
-			"bit_index":  bitIndex,
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return nil
-}
-
 // GetAdminPermissions returns the list of permissions for an admin
 func (s *AdminService) GetAdminPermissions(ctx context.Context, adminID uuid.UUID) ([]string, error) {
 	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
@@ -2425,104 +2023,36 @@ func (s *AdminService) GetAdminPermissionMask(ctx context.Context, adminID uuid.
 
 	return admin.AdminPermissionMask, nil
 }
-
-// CheckAdminPermission checks if an admin has a specific permission
 func (s *AdminService) CheckAdminPermission(ctx context.Context, adminID uuid.UUID, permissionName string) (bool, error) {
-	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		return false, fmt.Errorf("admin not found: %w", err)
-	}
 
-	return admin.HasPermission(permissionName), nil
+    admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+    if err != nil {
+        return false, fmt.Errorf("admin not found: %w", err)
+    }
+
+    // Check role-based access
+    switch admin.AdminRoleMask {
+    case models.RoleMaskOwner:
+        // Owner has all permissions
+        return true, nil
+    case models.RoleMaskSuperEmployee:
+        // Super employee can have admin permissions
+        hasPermission := admin.HasPermission(permissionName)
+        s.logger.Debug("Super employee permission check",
+            util.String("admin_id", adminID.String()),
+            util.String("permission", permissionName),
+            util.Bool("has_permission", hasPermission))
+        return hasPermission, nil
+    case models.RoleMaskEmployee:
+        // Employees cannot have admin permissions
+        s.logger.Debug("Employee cannot have admin permissions",
+            util.String("admin_id", adminID.String()),
+            util.String("permission", permissionName))
+        return false, nil
+    default:
+        return false, fmt.Errorf("unknown role mask: %d", admin.AdminRoleMask)
+    }
 }
-
-// BatchUpdatePermissions updates multiple permissions at once
-func (s *AdminService) BatchUpdatePermissions(ctx context.Context, adminID uuid.UUID, permissionsToGrant []string, permissionsToRevoke []string, updatedBy uuid.UUID) error {
-	startTime := time.Now()
-
-	admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
-	if err != nil {
-		return fmt.Errorf("admin not found: %w", err)
-	}
-
-	updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
-	if err != nil {
-		return fmt.Errorf("updater not found: %w", err)
-	}
-
-	if !updater.CanManageEmployee(admin.AdminRoleMask) {
-		return fmt.Errorf("unauthorized: cannot update permissions for this admin")
-	}
-
-	// Start with current permission mask
-	newPermissionMask := admin.CopyPermissionMask()
-
-	// Grant permissions
-	for _, perm := range permissionsToGrant {
-		if bitIndex, exists := models.AdminPermissionBitIndices[perm]; exists {
-			newPermissionMask = models.SetPermission(newPermissionMask, bitIndex, true)
-		}
-	}
-
-	// Revoke permissions
-	for _, perm := range permissionsToRevoke {
-		if bitIndex, exists := models.AdminPermissionBitIndices[perm]; exists {
-			newPermissionMask = models.SetPermission(newPermissionMask, bitIndex, false)
-		}
-	}
-
-	if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissionMask); err != nil {
-		s.logAdminEvent(ctx, &models.AdminLogEvent{
-			LogEnvelope: models.LogEnvelope{
-				EventID:     uuid.New().String(),
-				EventType:   "admin",
-				ServiceName: "auth-service",
-				Timestamp:   time.Now(),
-				Environment: "production",
-				Version:     "v1.0.0",
-				Level:       "error",
-				Message:     "Failed to batch update permissions",
-			},
-			AdminID:      updatedBy.String(),
-			TargetUserID: adminID.String(),
-			Action:       "batch_update_permissions",
-			Status:       "failed",
-			ErrorCode:    "BATCH_UPDATE_PERMISSIONS_FAILED",
-			ErrorMessage: err.Error(),
-			Duration:     int64(time.Since(startTime).Milliseconds()),
-		})
-		return fmt.Errorf("failed to batch update permissions: %w", err)
-	}
-
-	s.logAdminEvent(ctx, &models.AdminLogEvent{
-		LogEnvelope: models.LogEnvelope{
-			EventID:     uuid.New().String(),
-			EventType:   "admin",
-			ServiceName: "auth-service",
-			Timestamp:   time.Now(),
-			Environment: "production",
-			Version:     "v1.0.0",
-			Level:       "info",
-			Message:     "Batch permissions updated successfully",
-		},
-		AdminID:      updatedBy.String(),
-		TargetUserID: adminID.String(),
-		Action:       "batch_update_permissions",
-		ResourceType: "admin_user",
-		ResourceID:   adminID.String(),
-		Status:       "success",
-		Changes: map[string]interface{}{
-			"granted":  permissionsToGrant,
-			"revoked":  permissionsToRevoke,
-			"total":    len(permissionsToGrant) + len(permissionsToRevoke),
-		},
-		Duration: int64(time.Since(startTime).Milliseconds()),
-	})
-
-	return nil
-}
-
-
 // // InviteAdminWithDepartments invites a new admin with specific departments and permissions
 // func (s *AdminService) InviteAdminWithDepartments(
 // 	ctx context.Context, 
@@ -5942,4 +5472,657 @@ func (s *AdminService) InviteAdminWithDepartments(
     })
 
     return admin, nil
+}
+func (s *AdminService) GrantPermissionToAdmin(ctx context.Context, adminID uuid.UUID, permissionName string, grantedBy uuid.UUID) error {
+    startTime := time.Now()
+
+    admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+    if err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Admin not found for permission grant",
+            },
+            AdminID:      grantedBy.String(),
+            Action:       "grant_permission",
+            Status:       "failed",
+            ErrorCode:    "ADMIN_NOT_FOUND",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("admin not found: %w", err)
+    }
+
+    granter, err := s.adminRepo.GetAdminByID(ctx, grantedBy)
+    if err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Granter not found",
+            },
+            AdminID:      grantedBy.String(),
+            Action:       "grant_permission",
+            Status:       "failed",
+            ErrorCode:    "GRANTER_NOT_FOUND",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("granter not found: %w", err)
+    }
+
+    if !granter.IsOwner() {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Non-owner attempting to grant permission",
+            },
+            AdminID:   grantedBy.String(),
+            Action:    "grant_permission",
+            Status:    "failed",
+            ErrorCode: "UNAUTHORIZED",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("only owner can grant permissions")
+    }
+
+    // Only allow permission updates for super employees (role mask 2)
+    if admin.AdminRoleMask != models.RoleMaskSuperEmployee {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Cannot grant permission to non-super employee",
+            },
+            AdminID:   grantedBy.String(),
+            Action:    "grant_permission",
+            Status:    "failed",
+            ErrorCode: "INVALID_TARGET_ROLE",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("permissions can only be granted to super employees (role mask 2). Current role mask: %d", admin.AdminRoleMask)
+    }
+
+    bitIndex, exists := models.AdminPermissionBitIndices[permissionName]
+    if !exists {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Invalid permission name",
+            },
+            AdminID:   grantedBy.String(),
+            Action:    "grant_permission",
+            Status:    "failed",
+            ErrorCode: "INVALID_PERMISSION",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("invalid permission: %s", permissionName)
+    }
+
+    newPermissionMask := models.SetPermission(admin.CopyPermissionMask(), bitIndex, true)
+
+    if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissionMask); err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to grant permission",
+            },
+            AdminID:      grantedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:       "grant_permission",
+            Status:       "failed",
+            ErrorCode:    "GRANT_PERMISSION_FAILED",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("failed to grant permission: %w", err)
+    }
+
+    s.logAdminEvent(ctx, &models.AdminLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "admin",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "Permission granted successfully",
+        },
+        AdminID:      grantedBy.String(),
+        TargetUserID: adminID.String(),
+        Action:       "grant_permission",
+        ResourceType: "admin_user",
+        ResourceID:   adminID.String(),
+        Status:       "success",
+        Changes: map[string]interface{}{
+            "permission": permissionName,
+            "bit_index":  bitIndex,
+            "target_role": "super_employee",
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
+    return nil
+}
+
+func (s *AdminService) RevokePermissionFromAdmin(ctx context.Context, adminID uuid.UUID, permissionName string, revokedBy uuid.UUID) error {
+    startTime := time.Now()
+
+    admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+    if err != nil {
+        return fmt.Errorf("admin not found: %w", err)
+    }
+
+    revoker, err := s.adminRepo.GetAdminByID(ctx, revokedBy)
+    if err != nil {
+        return fmt.Errorf("revoker not found: %w", err)
+    }
+
+    if !revoker.IsOwner() {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Non-owner attempting to revoke permission",
+            },
+            AdminID:   revokedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:    "revoke_permission",
+            Status:    "failed",
+            ErrorCode: "UNAUTHORIZED",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("only owner can revoke permissions")
+    }
+
+    // Only allow permission revocation from super employees (role mask 2)
+    if admin.AdminRoleMask != models.RoleMaskSuperEmployee {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Cannot revoke permission from non-super employee",
+            },
+            AdminID:   revokedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:    "revoke_permission",
+            Status:    "failed",
+            ErrorCode: "INVALID_TARGET_ROLE",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("permissions can only be revoked from super employees (role mask 2). Current role mask: %d", admin.AdminRoleMask)
+    }
+
+    bitIndex, exists := models.AdminPermissionBitIndices[permissionName]
+    if !exists {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Invalid permission name",
+            },
+            AdminID:   revokedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:    "revoke_permission",
+            Status:    "failed",
+            ErrorCode: "INVALID_PERMISSION",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("invalid permission: %s", permissionName)
+    }
+
+    newPermissionMask := models.SetPermission(admin.CopyPermissionMask(), bitIndex, false)
+
+    if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissionMask); err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to revoke permission",
+            },
+            AdminID:      revokedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:       "revoke_permission",
+            Status:       "failed",
+            ErrorCode:    "REVOKE_PERMISSION_FAILED",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("failed to revoke permission: %w", err)
+    }
+
+    s.logAdminEvent(ctx, &models.AdminLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "admin",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "Permission revoked successfully",
+        },
+        AdminID:      revokedBy.String(),
+        TargetUserID: adminID.String(),
+        Action:       "revoke_permission",
+        ResourceType: "admin_user",
+        ResourceID:   adminID.String(),
+        Status:       "success",
+        Changes: map[string]interface{}{
+            "permission": permissionName,
+            "bit_index":  bitIndex,
+            "target_role": "super_employee",
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
+    return nil
+}
+
+func (s *AdminService) BatchUpdatePermissions(ctx context.Context, adminID uuid.UUID, permissionsToGrant []string, permissionsToRevoke []string, updatedBy uuid.UUID) error {
+    startTime := time.Now()
+
+    admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+    if err != nil {
+        return fmt.Errorf("admin not found: %w", err)
+    }
+
+    updater, err := s.adminRepo.GetAdminByID(ctx, updatedBy)
+    if err != nil {
+        return fmt.Errorf("updater not found: %w", err)
+    }
+
+    if !updater.IsOwner() {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Non-owner attempting to batch update permissions",
+            },
+            AdminID:   updatedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:    "batch_update_permissions",
+            Status:    "failed",
+            ErrorCode: "UNAUTHORIZED",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("only owner can batch update permissions")
+    }
+
+    // Only allow batch permission updates for super employees (role mask 2)
+    if admin.AdminRoleMask != models.RoleMaskSuperEmployee {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Cannot batch update permissions for non-super employee",
+            },
+            AdminID:   updatedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:    "batch_update_permissions",
+            Status:    "failed",
+            ErrorCode: "INVALID_TARGET_ROLE",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("permissions can only be batch updated for super employees (role mask 2). Current role mask: %d", admin.AdminRoleMask)
+    }
+
+    newPermissionMask := admin.CopyPermissionMask()
+
+    for _, perm := range permissionsToGrant {
+        if bitIndex, exists := models.AdminPermissionBitIndices[perm]; exists {
+            newPermissionMask = models.SetPermission(newPermissionMask, bitIndex, true)
+        } else {
+            s.logger.Warn("Unknown permission in batch grant", util.String("permission", perm))
+        }
+    }
+
+    for _, perm := range permissionsToRevoke {
+        if bitIndex, exists := models.AdminPermissionBitIndices[perm]; exists {
+            newPermissionMask = models.SetPermission(newPermissionMask, bitIndex, false)
+        } else {
+            s.logger.Warn("Unknown permission in batch revoke", util.String("permission", perm))
+        }
+    }
+
+    if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, newPermissionMask); err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to batch update permissions",
+            },
+            AdminID:      updatedBy.String(),
+            TargetUserID: adminID.String(),
+            Action:       "batch_update_permissions",
+            Status:       "failed",
+            ErrorCode:    "BATCH_UPDATE_PERMISSIONS_FAILED",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("failed to batch update permissions: %w", err)
+    }
+
+    s.logAdminEvent(ctx, &models.AdminLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "admin",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "Batch permissions updated successfully",
+        },
+        AdminID:      updatedBy.String(),
+        TargetUserID: adminID.String(),
+        Action:       "batch_update_permissions",
+        ResourceType: "admin_user",
+        ResourceID:   adminID.String(),
+        Status:       "success",
+        Changes: map[string]interface{}{
+            "granted":  permissionsToGrant,
+            "revoked":  permissionsToRevoke,
+            "total":    len(permissionsToGrant) + len(permissionsToRevoke),
+            "target_role": "super_employee",
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
+    return nil
+}
+func (s *AdminService) PromoteAdmin(ctx context.Context, adminID uuid.UUID, newRoleMask uint64, promotedBy uuid.UUID) error {
+    startTime := time.Now()
+
+    // Validate new role mask
+    if newRoleMask == models.RoleMaskOwner {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Attempt to promote to owner is forbidden",
+            },
+            AdminID:      promotedBy.String(),
+            Action:       "promote_admin",
+            Status:       "failed",
+            ErrorCode:    "CANNOT_PROMOTE_TO_OWNER",
+            ErrorMessage: "Promotion to owner role is not allowed",
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("promotion to owner role is not allowed")
+    }
+
+    // Only allow promotion to valid role masks (super_employee=4, employee=2)
+    if newRoleMask != models.RoleMaskSuperEmployee && newRoleMask != models.RoleMaskEmployee {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Invalid role mask for promotion",
+            },
+            AdminID:      promotedBy.String(),
+            Action:       "promote_admin",
+            Status:       "failed",
+            ErrorCode:    "INVALID_ROLE_MASK",
+            ErrorMessage: "Only valid role masks (2 for employee, 4 for super_employee) are allowed",
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("invalid role mask for promotion")
+    }
+
+    admin, err := s.adminRepo.GetAdminByID(ctx, adminID)
+    if err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Admin not found for promotion",
+            },
+            AdminID:      promotedBy.String(),
+            Action:       "promote_admin",
+            Status:       "failed",
+            ErrorCode:    "ADMIN_NOT_FOUND",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("admin not found: %w", err)
+    }
+
+    promoter, err := s.adminRepo.GetAdminByID(ctx, promotedBy)
+    if err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Promoter not found",
+            },
+            AdminID:      promotedBy.String(),
+            Action:       "promote_admin",
+            Status:       "failed",
+            ErrorCode:    "PROMOTER_NOT_FOUND",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("promoter not found: %w", err)
+    }
+
+    // Only owner can promote admins
+    if !promoter.IsOwner() {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Non-owner attempting to promote admin",
+            },
+            AdminID:   promotedBy.String(),
+            Action:    "promote_admin",
+            Status:    "failed",
+            ErrorCode: "UNAUTHORIZED",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("only owner can promote admins")
+    }
+
+    // Cannot modify owner admin
+    if admin.IsOwner() {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Cannot modify owner admin",
+            },
+            AdminID:   promotedBy.String(),
+            Action:    "promote_admin",
+            Status:    "failed",
+            ErrorCode: "CANNOT_MODIFY_OWNER",
+            Duration:  int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("cannot modify owner admin")
+    }
+
+    oldRoleMask := admin.AdminRoleMask
+
+    // Update the role mask
+    if err := s.adminRepo.UpdateAdminRoleMask(ctx, adminID, newRoleMask, promotedBy); err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "error",
+                Message:     "Failed to update admin role",
+            },
+            AdminID:      promotedBy.String(),
+            Action:       "promote_admin",
+            Status:       "failed",
+            ErrorCode:    "UPDATE_ROLE_FAILED",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        return fmt.Errorf("failed to promote admin: %w", err)
+    }
+
+    // Clear all permission bits to 0 for both role masks (2 and 4)
+    emptyPermissionMask := make([]uint64, 4)
+    if err := s.adminRepo.UpdateAdminPermissions(ctx, adminID, emptyPermissionMask); err != nil {
+        s.logAdminEvent(ctx, &models.AdminLogEvent{
+            LogEnvelope: models.LogEnvelope{
+                EventID:     uuid.New().String(),
+                EventType:   "admin",
+                ServiceName: "auth-service",
+                Timestamp:   time.Now(),
+                Environment: "production",
+                Version:     "v1.0.0",
+                Level:       "warning",
+                Message:     "Failed to clear permissions after promotion",
+            },
+            AdminID:      promotedBy.String(),
+            Action:       "promote_admin",
+            Status:       "partial_success",
+            ErrorCode:    "CLEAR_PERMISSIONS_FAILED",
+            ErrorMessage: err.Error(),
+            Duration:     int64(time.Since(startTime).Milliseconds()),
+        })
+        // Don't return error here, as the role was updated successfully
+        // Just log the warning
+    }
+    
+    s.logger.Info("Admin promoted - all permissions cleared",
+        util.String("admin_id", adminID.String()),
+        util.String("promoted_by", promotedBy.String()),
+        util.Uint64("new_role_mask", newRoleMask),
+        util.String("new_role", getRoleStringFromMask(newRoleMask)))
+
+    s.logAdminEvent(ctx, &models.AdminLogEvent{
+        LogEnvelope: models.LogEnvelope{
+            EventID:     uuid.New().String(),
+            EventType:   "admin",
+            ServiceName: "auth-service",
+            Timestamp:   time.Now(),
+            Environment: "production",
+            Version:     "v1.0.0",
+            Level:       "info",
+            Message:     "Admin promoted successfully",
+        },
+        AdminID:      adminID.String(),
+        AdminRole:    getRoleStringFromMask(newRoleMask),
+        TargetUserID: adminID.String(),
+        Action:       "promote_admin",
+        ResourceType: "admin_user",
+        ResourceID:   adminID.String(),
+        Status:       "success",
+        Changes: map[string]interface{}{
+            "old_role_mask": oldRoleMask,
+            "new_role_mask": newRoleMask,
+            "permissions_cleared": true,
+            "old_permissions": admin.AdminPermissionMask,
+            "new_permissions": emptyPermissionMask,
+        },
+        Duration: int64(time.Since(startTime).Milliseconds()),
+    })
+
+    return nil
 }
