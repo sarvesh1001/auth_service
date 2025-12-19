@@ -1125,178 +1125,178 @@ func (h *AdminHandler) GetAllPermissions(w http.ResponseWriter, r *http.Request)
 	)
 }
 
-// GrantRolePermissions grants permissions to a role
-func (h *AdminHandler) GrantRolePermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // GrantRolePermissions grants permissions to a role
+// func (h *AdminHandler) GrantRolePermissions(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
+// 	adminID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+// 		return
+// 	}
 
-	roleIDStr := chi.URLParam(r, "roleID")
-	roleID, err := uuid.Parse(roleIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
-		return
-	}
+// 	roleIDStr := chi.URLParam(r, "roleID")
+// 	roleID, err := uuid.Parse(roleIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+// 		return
+// 	}
 
-	var req struct {
-		PermissionIDs []uuid.UUID `json:"permission_ids" validate:"required"`
-	}
+// 	var req struct {
+// 		PermissionIDs []uuid.UUID `json:"permission_ids" validate:"required"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	grantReq := service.GrantRolePermissionsRequest{
-		RoleID:        roleID,
-		PermissionIDs: req.PermissionIDs,
-	}
+// 	grantReq := service.GrantRolePermissionsRequest{
+// 		RoleID:        roleID,
+// 		PermissionIDs: req.PermissionIDs,
+// 	}
 
-	if err := h.companyService.GrantRolePermissions(ctx, &grantReq); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to grant role permissions")
-		return
-	}
+// 	if err := h.companyService.GrantRolePermissions(ctx, &grantReq); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to grant role permissions")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Permissions granted to role successfully"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Permissions granted to role successfully"))
 
-	h.logger.Info("Permissions granted to role",
-		util.String("role_id", roleID.String()),
-		util.Int("permission_count", len(req.PermissionIDs)),
-		util.String("granted_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Info("Permissions granted to role",
+// 		util.String("role_id", roleID.String()),
+// 		util.Int("permission_count", len(req.PermissionIDs)),
+// 		util.String("granted_by", adminID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
-// UpdateEmployeeRole updates employee role and department
-func (h *AdminHandler) UpdateEmployeeRole(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // UpdateEmployeeRole updates employee role and department
+// func (h *AdminHandler) UpdateEmployeeRole(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
+// 	adminID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+// 		return
+// 	}
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
+// 	companyIDStr := chi.URLParam(r, "companyID")
+// 	companyID, err := uuid.Parse(companyIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+// 		return
+// 	}
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+// 	userIDStr := chi.URLParam(r, "userID")
+// 	userID, err := uuid.Parse(userIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+// 		return
+// 	}
 
-	var req struct {
-		RoleID       uuid.UUID `json:"role_id" validate:"required"`
-		DepartmentID uuid.UUID `json:"department_id" validate:"required"`
-	}
+// 	var req struct {
+// 		RoleID       uuid.UUID `json:"role_id" validate:"required"`
+// 		DepartmentID uuid.UUID `json:"department_id" validate:"required"`
+// 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	// Update role
-	if err := h.companyService.UpdateEmployeeRole(ctx, companyID, userID, req.RoleID, adminID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update employee role")
-		return
-	}
+// 	// Update role
+// 	if err := h.companyService.UpdateEmployeeRole(ctx, companyID, userID, req.RoleID, adminID); err != nil {
+// 		statusCode := h.getStatusCode(err)
+// 		h.respondWithError(w, statusCode, err, "Failed to update employee role")
+// 		return
+// 	}
 
-	// // Update department
-	// if err := h.companyService.UpdateEmployeeDepartment(ctx, companyID, userID, req.DepartmentID, adminID); err != nil {
-	// 	statusCode := h.getStatusCode(err)
-	// 	h.respondWithError(w, statusCode, err, "Failed to update employee department")
-	// 	return
-	// }
+// 	// // Update department
+// 	// if err := h.companyService.UpdateEmployeeDepartment(ctx, companyID, userID, req.DepartmentID, adminID); err != nil {
+// 	// 	statusCode := h.getStatusCode(err)
+// 	// 	h.respondWithError(w, statusCode, err, "Failed to update employee department")
+// 	// 	return
+// 	// }
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee role and department updated successfully"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Employee role and department updated successfully"))
 
-	h.logger.Info("Employee role and department updated",
-		util.String("company_id", companyID.String()),
-		util.String("user_id", userID.String()),
-		util.String("role_id", req.RoleID.String()),
-		util.String("department_id", req.DepartmentID.String()),
-		util.String("updated_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Info("Employee role and department updated",
+// 		util.String("company_id", companyID.String()),
+// 		util.String("user_id", userID.String()),
+// 		util.String("role_id", req.RoleID.String()),
+// 		util.String("department_id", req.DepartmentID.String()),
+// 		util.String("updated_by", adminID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
-// GetEmployeePermissions retrieves permissions for an employee
-func (h *AdminHandler) GetEmployeePermissions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // GetEmployeePermissions retrieves permissions for an employee
+// func (h *AdminHandler) GetEmployeePermissions(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+// 	userIDStr := chi.URLParam(r, "userID")
+// 	userID, err := uuid.Parse(userIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+// 		return
+// 	}
 
-	permissions, err := h.companyService.GetUserPermissions(ctx, userID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get employee permissions")
-		return
-	}
+// 	permissions, err := h.companyService.GetUserPermissions(ctx, userID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get employee permissions")
+// 		return
+// 	}
 
-	response := map[string]interface{}{
-		"permissions": permissions,
-		"meta": map[string]interface{}{
-			"user_id": userID.String(),
-			"count":   len(permissions),
-		},
-	}
+// 	response := map[string]interface{}{
+// 		"permissions": permissions,
+// 		"meta": map[string]interface{}{
+// 			"user_id": userID.String(),
+// 			"count":   len(permissions),
+// 		},
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Employee permissions retrieved successfully"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Employee permissions retrieved successfully"))
 
-	h.logger.Debug("Employee permissions retrieved",
-		util.String("user_id", userID.String()),
-		util.Int("permission_count", len(permissions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Debug("Employee permissions retrieved",
+// 		util.String("user_id", userID.String()),
+// 		util.Int("permission_count", len(permissions)),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
-// CheckEmployeePermission checks if an employee has a specific permission
-func (h *AdminHandler) CheckEmployeePermission(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // CheckEmployeePermission checks if an employee has a specific permission
+// func (h *AdminHandler) CheckEmployeePermission(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	var req service.PermissionCheckRequest
+// 	var req service.PermissionCheckRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	result, err := h.companyService.CheckPermission(ctx, &req)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to check permission")
-		return
-	}
+// 	result, err := h.companyService.CheckPermission(ctx, &req)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to check permission")
+// 		return
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(result, "Permission check completed"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(result, "Permission check completed"))
 
-	h.logger.Debug("Employee permission check completed",
-		util.String("company_id", req.CompanyID.String()),
-		util.String("user_id", req.UserID.String()),
-		util.String("permission", req.PermissionName),
-		util.Bool("has_permission", result.HasPermission),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Debug("Employee permission check completed",
+// 		util.String("company_id", req.CompanyID.String()),
+// 		util.String("user_id", req.UserID.String()),
+// 		util.String("permission", req.PermissionName),
+// 		util.Bool("has_permission", result.HasPermission),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 // ===== COMPANY ORGANIZATIONAL HIERARCHY =====
 
@@ -1335,94 +1335,42 @@ func (h *AdminHandler) GetCompanyHierarchy(w http.ResponseWriter, r *http.Reques
 	)
 }
 
-// GetUserHierarchy retrieves the hierarchy context for a user across companies
-func (h *AdminHandler) GetUserHierarchy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// // GetUserHierarchy retrieves the hierarchy context for a user across companies
+// func (h *AdminHandler) GetUserHierarchy(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
-		return
-	}
+// 	userIDStr := chi.URLParam(r, "userID")
+// 	userID, err := uuid.Parse(userIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+// 		return
+// 	}
 
-	hierarchy, err := h.companyService.GetUserHierarchy(ctx, userID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user hierarchy")
-		return
-	}
+// 	hierarchy, err := h.companyService.GetUserHierarchy(ctx, userID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get user hierarchy")
+// 		return
+// 	}
 
-	response := map[string]interface{}{
-		"hierarchy": hierarchy,
-		"meta": map[string]interface{}{
-			"user_id": userID.String(),
-			"count":   len(hierarchy),
-		},
-	}
+// 	response := map[string]interface{}{
+// 		"hierarchy": hierarchy,
+// 		"meta": map[string]interface{}{
+// 			"user_id": userID.String(),
+// 			"count":   len(hierarchy),
+// 		},
+// 	}
 
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "User hierarchy retrieved successfully"))
+// 	h.respondWithJSON(w, http.StatusOK, successResponse(response, "User hierarchy retrieved successfully"))
 
-	h.logger.Debug("User hierarchy retrieved",
-		util.String("user_id", userID.String()),
-		util.Int("company_count", len(hierarchy)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Debug("User hierarchy retrieved",
+// 		util.String("user_id", userID.String()),
+// 		util.Int("company_count", len(hierarchy)),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 // ===== BULK OPERATIONS =====
-
-// BulkAssignRoles bulk assigns roles to multiple users
-func (h *AdminHandler) BulkAssignRoles(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	var req struct {
-		Assignments []service.BulkAssignment `json:"assignments" validate:"required"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	results, err := h.companyService.BulkAssignRoles(ctx, companyID, req.Assignments, adminID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to bulk assign roles")
-		return
-	}
-
-	response := map[string]interface{}{
-		"results": results,
-		"meta": map[string]interface{}{
-			"company_id":       companyID.String(),
-			"assignment_count": len(req.Assignments),
-			"processed_count":  len(results),
-		},
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Bulk role assignment completed"))
-
-	h.logger.Info("Bulk role assignment completed",
-		util.String("company_id", companyID.String()),
-		util.Int("assignment_count", len(req.Assignments)),
-		util.String("assigned_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
 
 // ===== ENHANCED COMPANY STATS WITH RBAC =====
 
@@ -2126,150 +2074,6 @@ func (h *AdminHandler) ListUsersByKYCStatus(w http.ResponseWriter, r *http.Reque
 	)
 }
 
-// get searches users with advanced text search
-func (h *AdminHandler) SearchUsers(w http.ResponseWriter, r *http.Request) {
-    ctx := r.Context()
-    startTime := time.Now()
-
-    adminID, err := h.getRequesterAdminID(r)
-    if err != nil {
-        h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-        return
-    }
-
-    // Parse query parameters
-    query := r.URL.Query().Get("q")
-    if query == "" {
-        h.respondWithError(w, http.StatusBadRequest,
-            fmt.Errorf("QUERY_REQUIRED"), "Search query is required")
-        return
-    }
-
-    // Parse pagination
-    limit := h.getIntQueryParam(r, "limit", 20)
-    offset := h.getIntQueryParam(r, "offset", 0)
-
-    // Parse search type
-    searchType := r.URL.Query().Get("search_type")
-    if searchType == "" {
-        searchType = "all"
-    }
-
-    // Parse sort parameters
-    sortBy := r.URL.Query().Get("sort_by")
-    if sortBy == "" {
-        sortBy = "relevance"
-    }
-    sortOrder := r.URL.Query().Get("sort_order")
-    if sortOrder == "" {
-        sortOrder = "desc"
-    }
-
-    // Parse filters with nil checks
-    var filters *models.UserSearchFilters
-
-    isActiveParam := r.URL.Query().Get("is_active")
-    kycStatus := r.URL.Query().Get("kyc_status")
-    dataRegion := r.URL.Query().Get("data_region")
-    isVerifiedParam := r.URL.Query().Get("is_verified")
-
-    if isActiveParam != "" || kycStatus != "" || dataRegion != "" || isVerifiedParam != "" {
-        filters = &models.UserSearchFilters{}
-
-        if isActiveParam != "" {
-            isActive := isActiveParam == "true"
-            filters.IsActive = &isActive
-        }
-
-        if kycStatus != "" {
-            filters.KYCStatus = kycStatus
-        }
-
-        if dataRegion != "" {
-            filters.DataRegion = dataRegion
-        }
-
-        if isVerifiedParam != "" {
-            isVerified := isVerifiedParam == "true"
-            filters.IsVerified = &isVerified
-        }
-    }
-
-    // Build search request
-    searchReq := &models.UserSearchRequest{
-        Query:      query,
-        SearchType: searchType,
-        Filters:    filters,
-        Limit:      limit,
-        Offset:     offset,
-        SortBy:     sortBy,
-        SortOrder:  sortOrder,
-    }
-
-    // Execute search
-    users, total, err := h.userService.SearchUsers(ctx, searchReq)
-    if err != nil {
-        h.logger.Error("Failed to search users", 
-            util.ErrorField(err),
-            util.String("query", query),
-            util.String("admin_id", adminID.String()))
-        h.respondWithError(w, http.StatusInternalServerError, err, "Failed to search users")
-        return
-    }
-
-    // Check if users is nil
-    if users == nil {
-        users = []*models.UserSearchResult{}
-    }
-
-    // Sanitize users before returning
-    sanitizedUsers := make([]map[string]interface{}, len(users))
-    for i, user := range users {
-        // Add nil check for user
-        if user == nil {
-            continue
-        }
-        sanitizedUsers[i] = map[string]interface{}{
-            "user_id":         user.UserID,
-            "username":        user.Username,
-            "full_name":       user.FullName,
-            "phone_hash":      user.PhoneHash,
-            "kyc_status":      user.KYCStatus,
-            "kyc_level":       user.KYCLevel,
-            "is_verified":     user.IsVerified,
-            "is_active":       user.IsActive,
-            "data_region":     user.DataRegion,
-            "created_at":      user.CreatedAt,
-            "last_login":      user.LastLogin,
-            "relevance_score": user.RelevanceScore,
-            "match_type":      user.MatchType,
-        }
-    }
-
-    response := map[string]interface{}{
-        "users": sanitizedUsers,
-        "meta": map[string]interface{}{
-            "query":       query,
-            "search_type": searchType,
-            "total":       total,
-            "count":       len(sanitizedUsers),
-            "limit":       limit,
-            "offset":      offset,
-            "has_more":    offset+limit < total,
-        },
-    }
-
-    h.respondWithJSON(w, http.StatusOK, successResponse(response, "User search completed"))
-
-    h.logger.Info("User search executed by admin",
-        util.String("admin_id", adminID.String()),
-        util.String("query", query),
-        util.String("search_type", searchType),
-        util.Int("results", len(sanitizedUsers)),
-        util.Int("total", total),
-        util.Duration("duration", time.Since(startTime)),
-    )
-}
 // GetRecentlyActiveUsers gets users active since the given time
 func (h *AdminHandler) GetRecentlyActiveUsers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

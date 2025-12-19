@@ -1050,30 +1050,6 @@ func (s *CompanyService) GetRolePermissions(ctx context.Context, roleID uuid.UUI
 	return s.companyRepo.GetRolePermissions(ctx, roleID)
 }
 
-func (s *CompanyService) GrantRolePermission(ctx context.Context, roleID, permissionID, grantedBy uuid.UUID) error {
-	if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
-		return fmt.Errorf("role not found: %w", err)
-	}
-
-	hasPermission, err := s.CheckPermissionFromContext(ctx, "administrative.employee.manage")
-	if err != nil {
-		return fmt.Errorf("permission check failed: %w", err)
-	}
-	if !hasPermission {
-		return fmt.Errorf("user lacks permission to grant permissions")
-	}
-
-	if err := s.companyRepo.GrantRolePermission(ctx, roleID, permissionID, grantedBy); err != nil {
-		return fmt.Errorf("failed to grant role permission: %w", err)
-	}
-
-	s.logger.Info("Role permission granted",
-		util.String("role_id", roleID.String()),
-		util.String("permission_id", permissionID.String()),
-		util.String("granted_by", grantedBy.String()))
-
-	return nil
-}
 
 func (s *CompanyService) RevokeRolePermission(ctx context.Context, roleID, permissionID uuid.UUID, revokedBy uuid.UUID) error {
 	if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
@@ -1683,170 +1659,7 @@ func (s *CompanyService) ValidatePermissionDepartmentCompatibility(ctx context.C
 
     return true, "", nil
 }
-func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest) (*models.Role, error) {
-    hasPermission, err := s.CheckPermissionFromContext(ctx, "administrative.employee.manage")
-    if err != nil {
-        return nil, fmt.Errorf("permission check failed: %w", err)
-    }
-    if !hasPermission {
-        return nil, fmt.Errorf("user lacks permission to create roles")
-    }
 
-    currentUserID, ok := ctx.Value("user_id").(string)
-    if !ok {
-        return nil, fmt.Errorf("user ID not found in context")
-    }
-    userID, err := uuid.Parse(currentUserID)
-    if err != nil {
-        return nil, fmt.Errorf("invalid user ID in context")
-    }
-
-    // Validate departments exist and belong to company
-    for _, deptID := range req.DepartmentIDs {
-        dept, err := s.companyRepo.GetDepartment(ctx, deptID)
-        if err != nil {
-            return nil, fmt.Errorf("department not found: %s", deptID)
-        }
-        if dept.CompanyID != req.CompanyID {
-            return nil, fmt.Errorf("department %s does not belong to company", deptID)
-        }
-    }
-
-    // Get all permissions with their details
-    allPerms, err := s.companyRepo.GetAllPermissions(ctx)
-    if err != nil {
-        return nil, fmt.Errorf("failed to get all permissions: %w", err)
-    }
-
-    permMap := make(map[uuid.UUID]*models.Permission)
-    for _, perm := range allPerms {
-        permMap[perm.PermissionID] = perm
-    }
-
-    // Get department modules
-    departmentModules := make(map[string]bool)
-    for _, deptID := range req.DepartmentIDs {
-        dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
-        if dept.SystemDepartmentID != nil {
-            systemDept, err := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
-            if err == nil {
-                departmentModules[systemDept.ModuleCode] = true
-            }
-        }
-    }
-
-    // Validate each permission belongs to one of the department's modules
-    for _, permID := range req.PermissionIDs {
-        perm, exists := permMap[permID]
-        if !exists {
-            return nil, fmt.Errorf("permission not found: %s", permID)
-        }
-
-        // Check if permission's module matches any department's module
-        if !departmentModules[perm.Module] {
-            // Get department names for error message
-            var deptNames []string
-            for _, deptID := range req.DepartmentIDs {
-                dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
-                if dept != nil {
-                    deptNames = append(deptNames, dept.DepartmentName)
-                }
-            }
-            
-            // Get module names for better error message
-            var moduleNames []string
-            for module := range departmentModules {
-                if systemDept, err := s.companyRepo.GetSystemDepartmentByModule(ctx, module); err == nil {
-                    moduleNames = append(moduleNames, systemDept.Name)
-                }
-            }
-            
-            return nil, fmt.Errorf(
-                "permission '%s' (module: %s) cannot be assigned to departments [%s]. "+
-                "Permissions must match the department modules [%s]",
-                perm.PermissionName, perm.Module,
-                strings.Join(deptNames, ", "),
-                strings.Join(moduleNames, ", "))
-        }
-
-        // Check if user has the permission they're trying to assign
-        userPermissions, err := s.GetUserPermissions(ctx, userID)
-        if err != nil {
-            return nil, fmt.Errorf("failed to get user permissions: %w", err)
-        }
-
-        userHasPermission := false
-        for _, userPerm := range userPermissions {
-            if userPerm.PermissionID == permID {
-                userHasPermission = true
-                break
-            }
-        }
-
-        if !userHasPermission {
-            return nil, fmt.Errorf("user cannot assign permission '%s' that they don't possess", perm.PermissionName)
-        }
-    }
-
-    if req.RoleLevel < 1 || req.RoleLevel > 1000 {
-        return nil, fmt.Errorf("role level must be between 1 and 1000")
-    }
-
-    existingRoles, _, err := s.companyRepo.GetRolesByCompany(ctx, req.CompanyID, 1000, 0)
-    if err == nil {
-        for _, role := range existingRoles {
-            if strings.EqualFold(role.RoleName, req.RoleName) {
-                return nil, fmt.Errorf("role with name '%s' already exists in this company", req.RoleName)
-            }
-        }
-    }
-
-    role := &models.Role{
-        RoleID:       uuid.New(),
-        RoleName:     req.RoleName,
-        RoleLevel:    req.RoleLevel,
-        CompanyID:    req.CompanyID,
-        IsSystemRole: false,
-        Description:  req.Description,
-        CreatedAt:    time.Now().UTC(),
-        UpdatedAt:    time.Now().UTC(),
-    }
-
-    if err := s.companyRepo.CreateRole(ctx, role, req.DepartmentIDs); err != nil {
-        if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
-            return nil, fmt.Errorf("role with name '%s' already exists in this company", req.RoleName)
-        }
-        return nil, fmt.Errorf("failed to create role: %w", err)
-    }
-
-    if len(req.PermissionIDs) > 0 {
-        if err := s.companyRepo.GrantMultipleRolePermissions(ctx, role.RoleID, req.PermissionIDs, req.CreatedBy); err != nil {
-            s.logger.Warn("Failed to assign permissions to new role",
-                util.String("role_id", role.RoleID.String()),
-                util.ErrorField(err))
-        }
-    }
-
-    // Log department modules for debugging
-    var moduleNames []string
-    for module := range departmentModules {
-        if systemDept, err := s.companyRepo.GetSystemDepartmentByModule(ctx, module); err == nil {
-            moduleNames = append(moduleNames, systemDept.Name)
-        }
-    }
-
-    s.logger.Info("Role created successfully with validated permissions",
-        util.String("company_id", req.CompanyID.String()),
-        util.String("role_id", role.RoleID.String()),
-        util.String("role_name", req.RoleName),
-        util.Int("role_level", req.RoleLevel),
-        util.Int("department_count", len(req.DepartmentIDs)),
-        util.Int("permission_count", len(req.PermissionIDs)),
-        util.Strings("department_modules", moduleNames),
-        util.String("created_by", req.CreatedBy.String()))
-
-    return role, nil
-}
 type MapRoleToDepartmentRequest struct {
 	RoleID       uuid.UUID `json:"role_id" validate:"required"`
 	DepartmentID uuid.UUID `json:"department_id" validate:"required"`
@@ -2096,26 +1909,450 @@ func (s *CompanyService) GetPermissionsByCompanyDepartments(ctx context.Context,
 	return s.companyRepo.GetPermissionsBySystemDepartments(ctx, systemDeptIDs, module, category, tier)
 }
 
-func (s *CompanyService) ValidatePermissionAssignment(ctx context.Context, assignerID uuid.UUID, permissionsToAssign []string) (bool, error) {
-	assignerPermissions, err := s.GetUserPermissions(ctx, assignerID)
-	if err != nil {
-		return false, err
-	}
+// CreateRoleAdmin - Admin version that skips permission checks
+func (s *CompanyService) CreateRoleAdmin(ctx context.Context, req *CreateRoleRequest) (*models.Role, error) {
+    // Admins can create roles without permission checks
+    // Still validate other constraints
 
-	assignerPermMap := make(map[string]bool)
-	for _, perm := range assignerPermissions {
-		assignerPermMap[perm.PermissionName] = true
-	}
+    for _, deptID := range req.DepartmentIDs {
+        dept, err := s.companyRepo.GetDepartment(ctx, deptID)
+        if err != nil {
+            return nil, fmt.Errorf("department not found: %s", deptID)
+        }
+        if dept.CompanyID != req.CompanyID {
+            return nil, fmt.Errorf("department %s does not belong to company", deptID)
+        }
+    }
 
-	for _, permToAssign := range permissionsToAssign {
-		if !assignerPermMap[permToAssign] {
-			return false, nil
-		}
-	}
+    allPerms, err := s.companyRepo.GetAllPermissions(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get all permissions: %w", err)
+    }
 
-	return true, nil
+    permMap := make(map[uuid.UUID]*models.Permission)
+    for _, perm := range allPerms {
+        permMap[perm.PermissionID] = perm
+    }
+
+    departmentModules := make(map[string]bool)
+    for _, deptID := range req.DepartmentIDs {
+        dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
+        if dept.SystemDepartmentID != nil {
+            systemDept, err := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+            if err == nil {
+                departmentModules[systemDept.ModuleCode] = true
+            }
+        }
+    }
+
+    // ADMIN: Skip permission checks but still validate permissions exist and module compatibility
+    for _, permID := range req.PermissionIDs {
+        perm, exists := permMap[permID]
+        if !exists {
+            return nil, fmt.Errorf("permission not found: %s", permID)
+        }
+
+        // Still check module compatibility even for admin users
+        if !departmentModules[perm.Module] {
+            var deptNames []string
+            for _, deptID := range req.DepartmentIDs {
+                dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
+                if dept != nil {
+                    deptNames = append(deptNames, dept.DepartmentName)
+                }
+            }
+
+            var moduleNames []string
+            for module := range departmentModules {
+                if systemDept, err := s.companyRepo.GetSystemDepartmentByModule(ctx, module); err == nil {
+                    moduleNames = append(moduleNames, systemDept.Name)
+                }
+            }
+
+            return nil, fmt.Errorf(
+                "permission '%s' (module: %s) cannot be assigned to departments [%s]. "+
+                "Permissions must match the department modules [%s]",
+                perm.PermissionName, perm.Module,
+                strings.Join(deptNames, ", "),
+                strings.Join(moduleNames, ", "))
+        }
+    }
+
+    if req.RoleLevel < 1 || req.RoleLevel > 1000 {
+        return nil, fmt.Errorf("role level must be between 1 and 1000")
+    }
+
+    existingRoles, _, err := s.companyRepo.GetRolesByCompany(ctx, req.CompanyID, 1000, 0)
+    if err == nil {
+        for _, role := range existingRoles {
+            if strings.EqualFold(role.RoleName, req.RoleName) {
+                return nil, fmt.Errorf("role with name '%s' already exists in this company", req.RoleName)
+            }
+        }
+    }
+
+    role := &models.Role{
+        RoleID:       uuid.New(),
+        RoleName:     req.RoleName,
+        RoleLevel:    req.RoleLevel,
+        CompanyID:    req.CompanyID,
+        IsSystemRole: false,
+        Description:  req.Description,
+        CreatedAt:    time.Now().UTC(),
+        UpdatedAt:    time.Now().UTC(),
+    }
+
+    if err := s.companyRepo.CreateRole(ctx, role, req.DepartmentIDs); err != nil {
+        if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+            return nil, fmt.Errorf("role with name '%s' already exists in this company", req.RoleName)
+        }
+        return nil, fmt.Errorf("failed to create role: %w", err)
+    }
+
+    if len(req.PermissionIDs) > 0 {
+        if err := s.companyRepo.GrantMultipleRolePermissions(ctx, role.RoleID, req.PermissionIDs, req.CreatedBy); err != nil {
+            s.logger.Warn("Failed to assign permissions to new role",
+                util.String("role_id", role.RoleID.String()),
+                util.ErrorField(err))
+        }
+    }
+
+    var moduleNames []string
+    for module := range departmentModules {
+        if systemDept, err := s.companyRepo.GetSystemDepartmentByModule(ctx, module); err == nil {
+            moduleNames = append(moduleNames, systemDept.Name)
+        }
+    }
+
+    s.logger.Info("Role created successfully by admin",
+        util.String("company_id", req.CompanyID.String()),
+        util.String("role_id", role.RoleID.String()),
+        util.String("role_name", req.RoleName),
+        util.Int("role_level", req.RoleLevel),
+        util.Int("department_count", len(req.DepartmentIDs)),
+        util.Int("permission_count", len(req.PermissionIDs)),
+        util.Strings("department_modules", moduleNames),
+        util.String("created_by", req.CreatedBy.String()))
+
+    return role, nil
 }
 
+// GrantRolePermissionAdmin - Admin version that skips permission checks
+func (s *CompanyService) GrantRolePermissionAdmin(ctx context.Context, roleID, permissionID, grantedBy uuid.UUID) error {
+    if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
+        return fmt.Errorf("role not found: %w", err)
+    }
+
+    // Skip permission check for admin users
+    // Just verify the permission exists
+    allPerms, err := s.companyRepo.GetAllPermissions(ctx)
+    if err != nil {
+        return fmt.Errorf("failed to validate permission: %w", err)
+    }
+
+    permissionExists := false
+    for _, perm := range allPerms {
+        if perm.PermissionID == permissionID {
+            permissionExists = true
+            break
+        }
+    }
+
+    if !permissionExists {
+        return fmt.Errorf("permission not found: %s", permissionID)
+    }
+
+    if err := s.companyRepo.GrantRolePermission(ctx, roleID, permissionID, grantedBy); err != nil {
+        return fmt.Errorf("failed to grant role permission: %w", err)
+    }
+
+    s.logger.Info("Role permission granted by admin",
+        util.String("role_id", roleID.String()),
+        util.String("permission_id", permissionID.String()),
+        util.String("granted_by", grantedBy.String()))
+
+    return nil
+}
+
+// RevokeRolePermissionAdmin - Admin version that skips permission checks
+func (s *CompanyService) RevokeRolePermissionAdmin(ctx context.Context, roleID, permissionID, revokedBy uuid.UUID) error {
+    if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
+        return fmt.Errorf("role not found: %w", err)
+    }
+
+    // Skip permission check for admin users
+
+    if err := s.companyRepo.RevokeRolePermission(ctx, roleID, permissionID); err != nil {
+        return fmt.Errorf("failed to revoke role permission: %w", err)
+    }
+
+    s.logger.Info("Role permission revoked by admin",
+        util.String("role_id", roleID.String()),
+        util.String("permission_id", permissionID.String()),
+        util.String("revoked_by", revokedBy.String()))
+
+    return nil
+}
+
+// Original CreateRole function (for non-admin users)
+func (s *CompanyService) CreateRole(ctx context.Context, req *CreateRoleRequest) (*models.Role, error) {
+    hasPermission, err := s.CheckPermissionFromContext(ctx, "administrative.employee.manage")
+    if err != nil {
+        return nil, fmt.Errorf("permission check failed: %w", err)
+    }
+    if !hasPermission {
+        return nil, fmt.Errorf("user lacks permission to create roles")
+    }
+
+    currentUserID, ok := ctx.Value("user_id").(string)
+    if !ok {
+        return nil, fmt.Errorf("user ID not found in context")
+    }
+    userID, err := uuid.Parse(currentUserID)
+    if err != nil {
+        return nil, fmt.Errorf("invalid user ID in context")
+    }
+
+    for _, deptID := range req.DepartmentIDs {
+        dept, err := s.companyRepo.GetDepartment(ctx, deptID)
+        if err != nil {
+            return nil, fmt.Errorf("department not found: %s", deptID)
+        }
+        if dept.CompanyID != req.CompanyID {
+            return nil, fmt.Errorf("department %s does not belong to company", deptID)
+        }
+    }
+
+    allPerms, err := s.companyRepo.GetAllPermissions(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get all permissions: %w", err)
+    }
+
+    permMap := make(map[uuid.UUID]*models.Permission)
+    for _, perm := range allPerms {
+        permMap[perm.PermissionID] = perm
+    }
+
+    departmentModules := make(map[string]bool)
+    for _, deptID := range req.DepartmentIDs {
+        dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
+        if dept.SystemDepartmentID != nil {
+            systemDept, err := s.companyRepo.GetSystemDepartment(ctx, *dept.SystemDepartmentID)
+            if err == nil {
+                departmentModules[systemDept.ModuleCode] = true
+            }
+        }
+    }
+
+    // Get user permissions for non-admin users
+    userPermissions, err := s.GetUserPermissions(ctx, userID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get user permissions: %w", err)
+    }
+
+    // For non-admin users: check if they have each permission they're trying to assign
+    for _, permID := range req.PermissionIDs {
+        perm, exists := permMap[permID]
+        if !exists {
+            return nil, fmt.Errorf("permission not found: %s", permID)
+        }
+
+        userHasPermission := false
+        for _, userPerm := range userPermissions {
+            if userPerm.PermissionID == permID {
+                userHasPermission = true
+                break
+            }
+        }
+
+        if !userHasPermission {
+            return nil, fmt.Errorf("user cannot assign permission '%s' that they don't possess", perm.PermissionName)
+        }
+
+        // Module compatibility check
+        if !departmentModules[perm.Module] {
+            var deptNames []string
+            for _, deptID := range req.DepartmentIDs {
+                dept, _ := s.companyRepo.GetDepartment(ctx, deptID)
+                if dept != nil {
+                    deptNames = append(deptNames, dept.DepartmentName)
+                }
+            }
+
+            var moduleNames []string
+            for module := range departmentModules {
+                if systemDept, err := s.companyRepo.GetSystemDepartmentByModule(ctx, module); err == nil {
+                    moduleNames = append(moduleNames, systemDept.Name)
+                }
+            }
+
+            return nil, fmt.Errorf(
+                "permission '%s' (module: %s) cannot be assigned to departments [%s]. "+
+                "Permissions must match the department modules [%s]",
+                perm.PermissionName, perm.Module,
+                strings.Join(deptNames, ", "),
+                strings.Join(moduleNames, ", "))
+        }
+    }
+
+    if req.RoleLevel < 1 || req.RoleLevel > 1000 {
+        return nil, fmt.Errorf("role level must be between 1 and 1000")
+    }
+
+    existingRoles, _, err := s.companyRepo.GetRolesByCompany(ctx, req.CompanyID, 1000, 0)
+    if err == nil {
+        for _, role := range existingRoles {
+            if strings.EqualFold(role.RoleName, req.RoleName) {
+                return nil, fmt.Errorf("role with name '%s' already exists in this company", req.RoleName)
+            }
+        }
+    }
+
+    role := &models.Role{
+        RoleID:       uuid.New(),
+        RoleName:     req.RoleName,
+        RoleLevel:    req.RoleLevel,
+        CompanyID:    req.CompanyID,
+        IsSystemRole: false,
+        Description:  req.Description,
+        CreatedAt:    time.Now().UTC(),
+        UpdatedAt:    time.Now().UTC(),
+    }
+
+    if err := s.companyRepo.CreateRole(ctx, role, req.DepartmentIDs); err != nil {
+        if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+            return nil, fmt.Errorf("role with name '%s' already exists in this company", req.RoleName)
+        }
+        return nil, fmt.Errorf("failed to create role: %w", err)
+    }
+
+    if len(req.PermissionIDs) > 0 {
+        if err := s.companyRepo.GrantMultipleRolePermissions(ctx, role.RoleID, req.PermissionIDs, req.CreatedBy); err != nil {
+            s.logger.Warn("Failed to assign permissions to new role",
+                util.String("role_id", role.RoleID.String()),
+                util.ErrorField(err))
+        }
+    }
+
+    var moduleNames []string
+    for module := range departmentModules {
+        if systemDept, err := s.companyRepo.GetSystemDepartmentByModule(ctx, module); err == nil {
+            moduleNames = append(moduleNames, systemDept.Name)
+        }
+    }
+
+    s.logger.Info("Role created successfully",
+        util.String("company_id", req.CompanyID.String()),
+        util.String("role_id", role.RoleID.String()),
+        util.String("role_name", req.RoleName),
+        util.Int("role_level", req.RoleLevel),
+        util.Int("department_count", len(req.DepartmentIDs)),
+        util.Int("permission_count", len(req.PermissionIDs)),
+        util.Strings("department_modules", moduleNames),
+        util.String("created_by", req.CreatedBy.String()))
+
+    return role, nil
+}
+
+// Original GrantRolePermission function (for non-admin users)
+func (s *CompanyService) GrantRolePermission(ctx context.Context, roleID, permissionID, grantedBy uuid.UUID) error {
+    if _, err := s.companyRepo.GetRole(ctx, roleID); err != nil {
+        return fmt.Errorf("role not found: %w", err)
+    }
+
+    hasPermission, err := s.CheckPermissionFromContext(ctx, "administrative.employee.manage")
+    if err != nil {
+        return fmt.Errorf("permission check failed: %w", err)
+    }
+    if !hasPermission {
+        return fmt.Errorf("user lacks permission to grant permissions")
+    }
+
+    currentUserID, ok := ctx.Value("user_id").(string)
+    if !ok {
+        return fmt.Errorf("user ID not found in context")
+    }
+    userID, err := uuid.Parse(currentUserID)
+    if err != nil {
+        return fmt.Errorf("invalid user ID in context")
+    }
+
+    // Get user permissions for non-admin users
+    userPermissions, err := s.GetUserPermissions(ctx, userID)
+    if err != nil {
+        return fmt.Errorf("failed to get user permissions: %w", err)
+    }
+
+    // Check if user has the specific permission
+    userHasSpecificPermission := false
+    for _, userPerm := range userPermissions {
+        if userPerm.PermissionID == permissionID {
+            userHasSpecificPermission = true
+            break
+        }
+    }
+
+    if !userHasSpecificPermission {
+        // Get permission name for error message
+        allPerms, err := s.companyRepo.GetAllPermissions(ctx)
+        if err != nil {
+            return fmt.Errorf("permission not found: %s", permissionID)
+        }
+        
+        var permissionName string
+        for _, perm := range allPerms {
+            if perm.PermissionID == permissionID {
+                permissionName = perm.PermissionName
+                break
+            }
+        }
+        
+        if permissionName == "" {
+            return fmt.Errorf("permission not found: %s", permissionID)
+        }
+        
+        return fmt.Errorf("user cannot assign permission '%s' that they don't possess", permissionName)
+    }
+
+    if err := s.companyRepo.GrantRolePermission(ctx, roleID, permissionID, grantedBy); err != nil {
+        return fmt.Errorf("failed to grant role permission: %w", err)
+    }
+
+    s.logger.Info("Role permission granted",
+        util.String("role_id", roleID.String()),
+        util.String("permission_id", permissionID.String()),
+        util.String("granted_by", grantedBy.String()))
+
+    return nil
+}
+
+func (s *CompanyService) ValidatePermissionAssignment(ctx context.Context, assignerID uuid.UUID, permissionsToAssign []string) (bool, error) {
+    assignerPermissions, err := s.GetUserPermissions(ctx, assignerID)
+    if err != nil {
+        return false, err
+    }
+
+    // Check if user has admin.permission.assign permission
+    for _, perm := range assignerPermissions {
+        if perm.PermissionName == "admin.permission.assign" {
+            return true, nil
+        }
+    }
+
+    // If no admin.permission.assign, check each individual permission
+    assignerPermMap := make(map[string]bool)
+    for _, perm := range assignerPermissions {
+        assignerPermMap[perm.PermissionName] = true
+    }
+
+    for _, permToAssign := range permissionsToAssign {
+        if !assignerPermMap[permToAssign] {
+            return false, nil
+        }
+    }
+
+    return true, nil
+}
 func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest) error {
     hasPermission, err := s.CheckPermissionFromContext(ctx, "administrative.employee.manage")
     if err != nil {

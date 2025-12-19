@@ -1875,14 +1875,29 @@ func (r *CompanyRepositoryImpl) IsUserActiveEmployee(ctx context.Context, compan
 // GetEmployeeHierarchy retrieves employee hierarchy for a company
 func (r *CompanyRepositoryImpl) GetEmployeeHierarchy(ctx context.Context, companyID uuid.UUID) ([]*models.EmployeeHierarchy, error) {
 	query := `
-        SELECT ce.user_id, ce.employee_id, r.role_name, r.role_level,
-               d.department_id, d.department_name, ce.reports_to, ce.is_active
-        FROM company_employees ce
-        INNER JOIN roles r ON ce.role_id = r.role_id
-        LEFT JOIN departments d ON ce.department_id = d.department_id
-        WHERE ce.company_id = $1 AND ce.is_active = true
-        ORDER BY r.role_level ASC, d.department_name, ce.employee_id`
-
+    SELECT
+        ce.user_id,
+        ce.employee_id,
+        r.role_name,
+        r.role_level,
+        d.department_id,
+        d.department_name,
+        ce.reports_to,
+        ce.is_active
+    FROM company_employees ce
+    INNER JOIN roles r
+        ON ce.role_id = r.role_id
+    LEFT JOIN role_departments rd
+        ON ce.role_id = rd.role_id
+    LEFT JOIN departments d
+        ON rd.department_id = d.department_id
+    WHERE ce.company_id = $1
+      AND ce.is_active = true
+    ORDER BY
+        r.role_level ASC,
+        d.department_name NULLS LAST,
+        ce.employee_id
+`
 	rows, err := r.client.Query(ctx, query, companyID)
 	if err != nil {
 		r.recordError()
