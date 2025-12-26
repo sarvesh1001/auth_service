@@ -273,6 +273,7 @@ type Permission struct {
 	Description    string    `json:"description" db:"description"`
 	Category       string    `json:"category" db:"category"`
 	Module         string    `json:"module" db:"module"`
+	Scope          string    `json:"scope" db:"scope"` // Add this field
 	RequiresTier   string    `json:"requires_tier" db:"requires_tier"`
 	BitIndex       int       `json:"bit_index" db:"bit_index"`
 	CreatedAt      time.Time `json:"created_at" db:"created_at"`
@@ -332,7 +333,6 @@ type Department struct {
 	SystemDepartmentID    *uuid.UUID `json:"system_department_id" db:"system_department_id"`
 	SystemDepartmentName  string     `json:"system_department_name" db:"system_department_name"` // Added field
 	ModuleCode            string     `json:"module_code" db:"module_code"`                       // Added field
-	DepartmentHead        *uuid.UUID `json:"department_head" db:"department_head"`
 	ParentDepartmentID    *uuid.UUID `json:"parent_department_id" db:"parent_department_id"`
 	IsActive              bool       `json:"is_active" db:"is_active"`
 	CreatedAt             time.Time  `json:"created_at" db:"created_at"`
@@ -434,6 +434,7 @@ type PermissionWithBitIndex struct {
 	ID       string `json:"id" db:"permission_id"`
 	Name     string `json:"name" db:"permission_name"`
 	BitIndex int    `json:"bit_index" db:"bit_index"`
+	Scope          string    `json:"scope" db:"scope"` // Add this field
 	Module   string `json:"module" db:"module"`
 	Category string `json:"category" db:"category"`
 }

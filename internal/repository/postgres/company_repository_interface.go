@@ -194,6 +194,5 @@ type CompanyRepository interface {
 		category, tier string,
 	) ([]*models.Permission, error)	// OR rename the second one:
 	GetPermissionsByModules(ctx context.Context, modules []string) ([]*models.Permission, error)
-	GetAdminPermissions(ctx context.Context) ([]*models.Permission, error)
 }
 

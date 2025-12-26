@@ -579,3 +579,48 @@ func (r *AdminDeviceRepositoryImpl) BindAdminDevicesBatch(
 
 	return nil
 }
+
+
+func (r *AdminDeviceRepositoryImpl) GetUsersByDevice(
+	ctx context.Context,
+	deviceID string,
+) ([]*models.UserActiveDevice, error) {
+	startTime := time.Now()
+
+	if deviceID == "" {
+		return nil, fmt.Errorf("device ID cannot be empty")
+	}
+
+	query := r.client.Session.Query(`
+        SELECT admin_id, device_id, session_id, bound_at, bind_token
+        FROM admin_active_device
+        WHERE device_id = ?
+        ALLOW FILTERING
+    `, deviceID)
+
+	iter := query.WithContext(ctx).Iter()
+	defer iter.Close()
+
+	var devices []*models.UserActiveDevice
+	var scannedAdminID gocql.UUID
+	var scannedSessionID *gocql.UUID
+	var device models.UserActiveDevice
+
+	for iter.Scan(&scannedAdminID, &device.DeviceID, &scannedSessionID, &device.BoundAt, &device.BindToken) {
+		device.UserID = uuid.UUID(scannedAdminID).String()
+		if scannedSessionID != nil {
+			sessionID := uuid.UUID(*scannedSessionID)
+			device.SessionID = sessionID.String()
+		}
+		devices = append(devices, &device)
+		device = models.UserActiveDevice{}
+	}
+
+	if err := iter.Close(); err != nil {
+		r.metrics.RecordQuery(time.Since(startTime), false)
+		return nil, fmt.Errorf("failed to get admins by device: %w", err)
+	}
+
+	r.metrics.RecordQuery(time.Since(startTime), true)
+	return devices, nil
+}

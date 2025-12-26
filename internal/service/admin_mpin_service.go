@@ -18,7 +18,7 @@ import (
 	"auth-service/internal/models"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/util"
-
+	"auth-service/internal/repository/postgres"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -137,7 +137,7 @@ type AdminMPINForgotWithOTPRequest struct {
 // AdminMPINService handles all admin MPIN-related business logic
 type AdminMPINService struct {
 	mpinRepo        *scylla.AdminMPINRepositoryImpl
-	adminRepo       scylla.AdminRepository
+	adminRepo       postgres.AdminRepository
 	deviceTrustRepo scylla.AdminDeviceTrustRepository
 	otpService      *OTPService
 	encryptionMgr   *encryption.EncryptionManager
@@ -151,7 +151,7 @@ type AdminMPINService struct {
 
 func NewAdminMPINService(
 	mpinRepo *scylla.AdminMPINRepositoryImpl,
-	adminRepo scylla.AdminRepository,
+	adminRepo postgres.AdminRepository,
 	deviceTrustRepo scylla.AdminDeviceTrustRepository,
 	otpService *OTPService,
 	encryptionMgr *encryption.EncryptionManager,
@@ -1339,7 +1339,7 @@ func (s *AdminMPINService) ForgotAdminMPIN(ctx context.Context, req *AdminMPINFo
 	}
 
 	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: admin.PhoneEncrypted,
+		EncryptedValue: string(admin.PhoneEncrypted),
 		EncryptedDEK:   admin.PhoneEncryptedDEK,
 		KeyID:          admin.PhoneKeyID.String(),
 		Version:        "v1",
@@ -1582,7 +1582,7 @@ func (s *AdminMPINService) VerifyForgotAdminMPINOTP(ctx context.Context, req *Ad
 	}
 
 	encryptedData := &encryption.EncryptedData{
-		EncryptedValue: admin.PhoneEncrypted,
+		EncryptedValue: string(admin.PhoneEncrypted),
 		EncryptedDEK:   admin.PhoneEncryptedDEK,
 		KeyID:          admin.PhoneKeyID.String(),
 		Version:        "v1",

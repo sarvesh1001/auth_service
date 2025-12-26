@@ -3,6 +3,8 @@ package models
 import (
 	"net"
 	"time"
+	
+	"auth-service/internal/rbac" // Import rbac package
 )
 
 type ActiveSession struct {
@@ -20,16 +22,10 @@ type ActiveSession struct {
 	// Session type
 	SessionType        string    `db:"session_type" json:"session_type"` // "user" or "admin"
 	
-	// Bitmask fields for admin - ADDED
-	AdminRoleMask      uint64    `db:"admin_role_mask" json:"admin_role_mask,omitempty"`
-	AdminPermissionMask []uint64 `db:"admin_permission_mask" json:"admin_permission_mask,omitempty"`
+	// Role and permissions - UPDATED
+	Role               string    `db:"role" json:"role,omitempty"` // Role string (e.g., "super_admin", "admin_manager", "owner", "employee")
+	PermissionMask     []uint64  `db:"permission_mask" json:"permission_mask,omitempty"`
 }
-
-// SessionType constants
-const (
-	SessionTypeUser  = "user"
-	SessionTypeAdmin = "admin"
-)
 
 // IsAdminSession checks if this is an admin session
 func (s *ActiveSession) IsAdminSession() bool {
@@ -51,16 +47,154 @@ func (s *ActiveSession) SetUserSession() {
 	s.SessionType = SessionTypeUser
 }
 
-// HasPermission checks if admin session has a specific permission
+// HasPermission checks if session has a specific permission
 func (s *ActiveSession) HasPermission(permissionName string) bool {
-	if s.SessionType != SessionTypeAdmin || s.AdminPermissionMask == nil {
+	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
 		return false
 	}
 	
-	bitIndex, exists := AdminPermissionBitIndices[permissionName]
-	if !exists {
+	// Use rbac package for permission checking
+	return rbac.HasPermission(s.PermissionMask, permissionName)
+}
+
+// GetPermissions returns list of permission names from mask
+func (s *ActiveSession) GetPermissions() []string {
+	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
+		return []string{}
+	}
+	
+	// Use rbac package to get permissions from mask
+	return rbac.GetPermissionsFromMask(s.PermissionMask)
+}
+
+// HasAnyPermission checks if session has any of the given permissions
+func (s *ActiveSession) HasAnyPermission(permissions ...string) bool {
+	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
 		return false
 	}
 	
-	return HasPermission(s.AdminPermissionMask, bitIndex)
+	return rbac.HasAnyPermission(s.PermissionMask, permissions...)
+}
+
+// HasAllPermissions checks if session has all of the given permissions
+func (s *ActiveSession) HasAllPermissions(permissions ...string) bool {
+	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
+		return false
+	}
+	
+	return rbac.HasAllPermissions(s.PermissionMask, permissions...)
+}
+
+// IsSuperAdmin checks if session has super admin role
+func (s *ActiveSession) IsSuperAdmin() bool {
+	return s.SessionType == SessionTypeAdmin && s.Role == RoleAdminSuperAdmin
+}
+
+// IsAdminManager checks if session has admin manager role
+func (s *ActiveSession) IsAdminManager() bool {
+	return s.SessionType == SessionTypeAdmin && s.Role == RoleAdminManager
+}
+
+// IsAdminEmployee checks if session has admin employee role
+func (s *ActiveSession) IsAdminEmployee() bool {
+	return s.SessionType == SessionTypeAdmin && s.Role == RoleAdminEmployee
+}
+
+// IsUserOwner checks if session has user owner role
+func (s *ActiveSession) IsUserOwner() bool {
+	return s.SessionType == SessionTypeUser && s.Role == RoleUserOwner
+}
+
+// IsSuperEmployee checks if session has super employee role
+func (s *ActiveSession) IsSuperEmployee() bool {
+	return s.SessionType == SessionTypeUser && s.Role == RoleUserSuperEmployee
+}
+
+// IsRegularEmployee checks if session has regular employee role
+func (s *ActiveSession) IsRegularEmployee() bool {
+	return s.SessionType == SessionTypeUser && s.Role == RoleUserEmployee
+}
+
+// GetRoleLevel returns hierarchical level of the role
+func (s *ActiveSession) GetRoleLevel() int {
+	switch s.Role {
+	case RoleAdminSuperAdmin:
+		return 3
+	case RoleAdminManager:
+		return 2
+	case RoleAdminEmployee:
+		return 1
+	case RoleUserOwner:
+		return 3
+	case RoleUserSuperEmployee:
+		return 2
+	case RoleUserEmployee:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// HasRoleAccess checks if session has required role level or higher
+func (s *ActiveSession) HasRoleAccess(requiredRole string) bool {
+	sessionLevel := s.GetRoleLevel()
+	requiredLevel := s.getRoleLevelFromString(requiredRole)
+	return sessionLevel >= requiredLevel
+}
+
+// Helper function to get role level from string
+func (s *ActiveSession) getRoleLevelFromString(role string) int {
+	switch role {
+	case RoleAdminSuperAdmin:
+		return 3
+	case RoleAdminManager:
+		return 2
+	case RoleAdminEmployee:
+		return 1
+	case RoleUserOwner:
+		return 3
+	case RoleUserSuperEmployee:
+		return 2
+	case RoleUserEmployee:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// CreateFullPermissionMask creates a mask with all bits set
+func (s *ActiveSession) CreateFullPermissionMask() []uint64 {
+	mask := make([]uint64, 4)
+	for i := range mask {
+		mask[i] = ^uint64(0) // Set all bits to 1
+	}
+	return mask
+}
+
+// BuildPermissionMaskFromNames builds a permission mask from permission names
+func (s *ActiveSession) BuildPermissionMaskFromNames(permissionNames []string) []uint64 {
+	return rbac.BuildMaskFromPermissionNames(permissionNames)
+}
+
+// BuildPermissionMaskFromBitPositions builds a permission mask from bit positions
+func (s *ActiveSession) BuildPermissionMaskFromBitPositions(bitPositions []uint64) []uint64 {
+	return rbac.BuildMaskFromBitPositions(bitPositions)
+}
+
+// Add these constants to your main models.go file
+const (
+	
+	// Session type constants
+	SessionTypeUser  = "user"
+	SessionTypeAdmin = "admin"
+	SessionTypeWeb   = "web" // For web sessions
+)
+
+// Global helper function (add this to models.go if not present)
+func CreateFullPermissionMask() []uint64 {
+	mask := make([]uint64, 4)
+	for i := range mask {
+		mask[i] = ^uint64(0) // Set all bits to 1
+	}
+	return mask
 }

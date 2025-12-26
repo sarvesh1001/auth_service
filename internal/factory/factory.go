@@ -1,5 +1,3 @@
-// File: internal/factory/factory.go
-// ✅ UPDATED: Complete implementation with bitmask permissions and JWT hybrid tokens
 
 package factory
 
@@ -79,7 +77,7 @@ type Factory struct {
 	deviceService          *service.DeviceService
 	deviceHistoryRepo      *scylla.DeviceHistoryRepositoryImpl
 	kafkaLoggingMgr        *KafkaLoggingManager
-	adminRepository        scylla.AdminRepository
+	adminRepository        postgres.AdminRepository
 	adminService           *service.AdminService
 
 	// ✅ NEW: JWT and RBAC services
@@ -526,14 +524,14 @@ func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryIm
 	return f.deviceHistoryRepo
 }
 
-func (f *Factory) AdminRepository() scylla.AdminRepository {
-	if f.adminRepository == nil {
-		f.adminRepository = scylla.NewAdminRepository(
-			f.ScyllaClient(),
-			f.logger,
-		)
-	}
-	return f.adminRepository
+func (f *Factory) AdminRepository() postgres.AdminRepository {
+    if f.adminRepository == nil {
+        f.adminRepository = postgres.NewAdminRepositoryPostgres(
+            f.PostgresClient(),
+            f.logger,
+        )
+    }
+    return f.adminRepository
 }
 
 // ============================================================================
@@ -545,6 +543,7 @@ func (f *Factory) GetJWTService() *service.JWTService {
 		f.jwtService = service.NewJWTService(
 			f.Config(),
 			f.CompanyRepository(),
+			f.AdminRepository(),
 			f.logger,
 		)
 	}

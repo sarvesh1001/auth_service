@@ -577,3 +577,11 @@ func (r *AdminMPINRepositoryImpl) GetAdminMPINByAdminID(ctx context.Context, adm
 
 	return &mpin, nil
 }
+
+
+
+// Add this method to ensure AdminMPINRepositoryImpl implements MPINRepository
+func (r *AdminMPINRepositoryImpl) GetMPINByUserID(ctx context.Context, userID uuid.UUID) (*models.MPINCredential, error) {
+	// For admin repository, treat userID as adminID
+	return r.GetMPINByAdminID(ctx, userID)
+}

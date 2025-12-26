@@ -130,7 +130,23 @@ type UserRepository interface {
     // ----------------------------------------------------------------------
     // Close
     // ----------------------------------------------------------------------
-
+    SetUserAvatar(
+        ctx context.Context,
+        userID uuid.UUID,
+        avatarHash string,
+        avatarObjectKey string,
+        avatarMimeType string,
+    ) error
+    
+    GetUserAvatar(
+        ctx context.Context,
+        userID uuid.UUID,
+    ) (*models.UserAvatar, error)
+    
+    DeactivateUserAvatar(
+        ctx context.Context,
+        userID uuid.UUID,
+    ) error
     Close() error
 }
 

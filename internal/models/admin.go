@@ -4,338 +4,424 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
-// Constants for admin role masks
+// Admin role types
 const (
-	RoleMaskOwner         uint64 = 1 << 0 // 1
-	RoleMaskSuperEmployee uint64 = 1 << 1 // 2
-	RoleMaskEmployee      uint64 = 1 << 2 // 4
+	RoleTypeEmployee   = 1 // 1=Employee
+	RoleTypeManager    = 2 // 2=Manager
+	RoleTypeSuperAdmin = 4 // 4=Super Admin
 )
 
-// Constants for system department bitmasks (16 departments)
+// Role strings for JWT and session identification
 const (
-	DeptBitmaskHR         uint64 = 1 << 0  // 1
-	DeptBitmaskFinance    uint64 = 1 << 1  // 2
-	DeptBitmaskAccounting uint64 = 1 << 2  // 4
-	DeptBitmaskProcurement uint64 = 1 << 3 // 8
-	DeptBitmaskInventory  uint64 = 1 << 4  // 16
-	DeptBitmaskLogistics  uint64 = 1 << 5  // 32
-	DeptBitmaskSales      uint64 = 1 << 6  // 64
-	DeptBitmaskMarketing  uint64 = 1 << 7  // 128
-	DeptBitmaskSupport    uint64 = 1 << 8  // 256
-	DeptBitmaskOperations uint64 = 1 << 9  // 512
-	DeptBitmaskIT         uint64 = 1 << 10 // 1024
-	DeptBitmaskProduction uint64 = 1 << 11 // 2048
-	DeptBitmaskQC         uint64 = 1 << 12 // 4096
-	DeptBitmaskQA         uint64 = 1 << 13 // 8192
-	DeptBitmaskRND        uint64 = 1 << 14 // 16384
-	DeptBitmaskAdmin      uint64 = 1 << 15 // 32768
-	
-	// Special bitmasks
-	DeptBitmaskAll        uint64 = 0xFFFF  // All 16 departments
-	DeptBitmaskNone       uint64 = 0       // No departments
+	RoleAdminSuperAdmin   = "super_admin"
+	RoleAdminManager      = "admin_manager"
+	RoleAdminEmployee     = "admin_employee"
+	RoleUserOwner         = "owner"
+	RoleUserSuperEmployee = "manager"
+	RoleUserEmployee      = "employee"
 )
 
-// Admin permissions bit indices (229 permissions total)
-var AdminPermissionBitIndices = map[string]int{
-	// Admin permissions (209-228)
-	"admin.user.create": 209,
-	"admin.user.update": 210,
-	"admin.user.view": 211,
-	"admin.user.delete": 212,
-	"admin.role.create": 213,
-	"admin.role.update": 214,
-	"admin.role.delete": 215,
-	"admin.role.view": 216,
-	"admin.permission.assign": 217,
-	"admin.permission.revoke": 218,
-	"admin.permission.view": 219,
-	"admin.department.create": 220,
-	"admin.department.update": 221,
-	"admin.department.delete": 222,
-	"admin.department.view": 223,
-	"admin.company.update": 224,
-	"admin.company.view": 225,
-	"admin.company.suspend": 226,
-	"admin.audit.logs.view": 227,
-	"admin.audit.logs.export": 228,
-}
+// Role mask constants
+const (
+	RoleMaskEmployee   = 1
+	RoleMaskManager    = 2
+	RoleMaskOwner      = 4
+	RoleMaskSuperAdmin = 4 // Same as Owner
+)
 
+// AdminUser represents an admin user in the system
 type AdminUser struct {
-	AdminID             uuid.UUID   `json:"admin_id" cql:"admin_id"`
-	PhoneHash           string      `json:"phone_hash" cql:"phone_hash"`
-	PhoneEncrypted      string      `json:"phone_encrypted,omitempty" cql:"phone_encrypted"`
-	PhoneKeyID          uuid.UUID   `json:"phone_key_id" cql:"phone_key_id"`
-	PhoneEncryptedDEK   string      `json:"phone_encrypted_dek,omitempty" cql:"phone_encrypted_dek"`
-	AdminRoleMask       uint64      `json:"admin_role_mask" cql:"admin_role_mask"`
-	AdminPermissionMask []uint64    `json:"admin_permission_mask" cql:"admin_permission_mask"`
-	DepartmentBitmask   uint64      `json:"department_bitmask" cql:"department_bitmask"` // Bitmask for accessible departments
-	AdminCreatedAt      time.Time   `json:"admin_created_at" cql:"admin_created_at"`
-	AdminCreatedBy      uuid.UUID   `json:"admin_created_by" cql:"admin_created_by"`
-	AdminUpdatedAt      time.Time   `json:"admin_updated_at" cql:"admin_updated_at"`
-	IsActive            bool        `json:"is_active" cql:"is_active"`
-	DataAccessScope     []string    `json:"data_access_scope" cql:"data_access_scope"`
-	IPWhitelist         []string    `json:"ip_whitelist" cql:"ip_whitelist"`
-	FailedLoginAttempts int         `json:"failed_login_attempts" cql:"failed_login_attempts"`
-	LastLogin           time.Time   `json:"last_login,omitempty" cql:"last_login"`
-}
-// SystemDepartment represents a department in the system
-type SystemDepartment struct {
-    SystemDepartmentID uuid.UUID `json:"system_department_id" db:"system_department_id"`
-    Name               string    `json:"name" db:"name"`
-    ModuleCode         string    `json:"module_code" db:"module_code"`
-    Description        string    `json:"description" db:"description"`
-    Bitmask            uint64    `json:"bitmask" db:"bitmask"`
+	AdminID             uuid.UUID      `json:"admin_id" db:"admin_id"`
+	PhoneHash           string         `json:"phone_hash" db:"phone_hash"`
+	PhoneEncrypted      []byte         `json:"phone_encrypted,omitempty" db:"phone_encrypted"`
+	PhoneKeyID          uuid.UUID      `json:"phone_key_id" db:"phone_key_id"`
+	PhoneEncryptedDEK   string         `json:"phone_encrypted_dek,omitempty" db:"phone_encrypted_dek"`
+	AdminRoleID         uuid.UUID      `json:"admin_role_id" db:"admin_role_id"`
+	RoleType            int            `json:"role_type" db:"role_type"` // 1=Employee, 2=Manager, 4=Super Admin
+	ReportsTo           *uuid.UUID     `json:"reports_to,omitempty" db:"reports_to"`
+	AdminCreatedAt      time.Time      `json:"admin_created_at" db:"admin_created_at"`
+	AdminCreatedBy      *uuid.UUID     `json:"admin_created_by,omitempty" db:"admin_created_by"`
+	AdminUpdatedAt      time.Time      `json:"admin_updated_at" db:"admin_updated_at"`
+	IsActive            bool           `json:"is_active" db:"is_active"`
+	DataAccessScope     pq.StringArray `json:"data_access_scope" db:"data_access_scope"`
+	IPWhitelist         pq.StringArray `json:"ip_whitelist" db:"ip_whitelist"`
+	FailedLoginAttempts int            `json:"failed_login_attempts" db:"failed_login_attempts"`
+	LastLogin           *time.Time     `json:"last_login,omitempty" db:"last_login"`
+	Username            string         `json:"username" db:"username"`
+	FullName            string         `json:"full_name" db:"full_name"`
+	UserSearchTSV       string         `json:"-" db:"user_search_tsv"`
 }
 
-
-// Helper methods for AdminUser
+// IsOwner checks if the admin is a super admin (owner)
 func (a *AdminUser) IsOwner() bool {
-	return a.AdminRoleMask&RoleMaskOwner != 0
+	return a.RoleType == RoleTypeSuperAdmin
 }
 
+// IsSuperEmployee checks if the admin is a manager (super employee)
 func (a *AdminUser) IsSuperEmployee() bool {
-	return a.AdminRoleMask&RoleMaskSuperEmployee != 0
+	return a.RoleType == RoleTypeManager
 }
 
+// IsEmployee checks if the admin is an employee
 func (a *AdminUser) IsEmployee() bool {
-	return a.AdminRoleMask&RoleMaskEmployee != 0
+	return a.RoleType == RoleTypeEmployee
 }
 
-func (a *AdminUser) HasDepartmentAccess(departmentBit uint64) bool {
-	if a.IsOwner() {
-		return true // Owner has access to all departments
-	}
-	return a.DepartmentBitmask&departmentBit != 0
+// IsManager checks if the admin is a manager
+func (a *AdminUser) IsManager() bool {
+	return a.RoleType == RoleTypeManager
 }
 
-func (a *AdminUser) HasAllDepartments() bool {
-	if a.IsOwner() {
-		return true
-	}
-	return a.DepartmentBitmask == DeptBitmaskAll
+// IsSuperAdmin checks if the admin is a super admin
+func (a *AdminUser) IsSuperAdmin() bool {
+	return a.RoleType == RoleTypeSuperAdmin
 }
 
-// Get accessible department names
-func (a *AdminUser) GetAccessibleDepartments() []string {
-	if a.IsOwner() {
-		return []string{"HR", "Finance", "Accounting", "Procurement", "Inventory", 
-			"Logistics", "Sales", "Marketing", "Customer Support", "Operations", 
-			"IT", "Production", "Quality Control", "Quality Assurance", "R&D", "Administration"}
-	}
-	
-	var departments []string
-	if a.DepartmentBitmask&DeptBitmaskHR != 0 {
-		departments = append(departments, "HR")
-	}
-	if a.DepartmentBitmask&DeptBitmaskFinance != 0 {
-		departments = append(departments, "Finance")
-	}
-	if a.DepartmentBitmask&DeptBitmaskAccounting != 0 {
-		departments = append(departments, "Accounting")
-	}
-	if a.DepartmentBitmask&DeptBitmaskProcurement != 0 {
-		departments = append(departments, "Procurement")
-	}
-	if a.DepartmentBitmask&DeptBitmaskInventory != 0 {
-		departments = append(departments, "Inventory")
-	}
-	if a.DepartmentBitmask&DeptBitmaskLogistics != 0 {
-		departments = append(departments, "Logistics")
-	}
-	if a.DepartmentBitmask&DeptBitmaskSales != 0 {
-		departments = append(departments, "Sales")
-	}
-	if a.DepartmentBitmask&DeptBitmaskMarketing != 0 {
-		departments = append(departments, "Marketing")
-	}
-	if a.DepartmentBitmask&DeptBitmaskSupport != 0 {
-		departments = append(departments, "Customer Support")
-	}
-	if a.DepartmentBitmask&DeptBitmaskOperations != 0 {
-		departments = append(departments, "Operations")
-	}
-	if a.DepartmentBitmask&DeptBitmaskIT != 0 {
-		departments = append(departments, "IT")
-	}
-	if a.DepartmentBitmask&DeptBitmaskProduction != 0 {
-		departments = append(departments, "Production")
-	}
-	if a.DepartmentBitmask&DeptBitmaskQC != 0 {
-		departments = append(departments, "Quality Control")
-	}
-	if a.DepartmentBitmask&DeptBitmaskQA != 0 {
-		departments = append(departments, "Quality Assurance")
-	}
-	if a.DepartmentBitmask&DeptBitmaskRND != 0 {
-		departments = append(departments, "R&D")
-	}
-	if a.DepartmentBitmask&DeptBitmaskAdmin != 0 {
-		departments = append(departments, "Administration")
-	}
-	
-	return departments
-}
-
-// Can manage employee of specific role
-func (a *AdminUser) CanManageEmployee(employeeRoleMask uint64) bool {
-	if a.IsOwner() {
-		return true
-	}
-	
-	if a.IsSuperEmployee() {
-		// Super employee can manage employees (but not other super employees or owners)
-		return employeeRoleMask == RoleMaskEmployee
-	}
-	
-	// Employees cannot manage anyone
-	return false
-}
-
-func (a *AdminUser) CanPromoteToRole(targetRoleMask uint64) bool {
-	if a.IsOwner() {
-		return true // Owner can promote to any role
-	}
-	
-	if a.IsSuperEmployee() {
-		// Super employee can only promote to employee role
-		return targetRoleMask == RoleMaskEmployee
-	}
-	
-	return false
-}
-
-// Check if admin has specific permission
-func (a *AdminUser) HasPermission(permissionName string) bool {
-	bitIndex, exists := AdminPermissionBitIndices[permissionName]
-	if !exists {
-		return false
-	}
-	
-	// Owner has all permissions
-	if a.IsOwner() {
-		return true
-	}
-	
-	return HasPermission(a.AdminPermissionMask, bitIndex)
-}
-
-// Get permission names from bitmask
-func (a *AdminUser) GetPermissionNames() []string {
-	var permissions []string
-	for name := range AdminPermissionBitIndices {
-		if a.HasPermission(name) {
-			permissions = append(permissions, name)
-		}
-	}
-	return permissions
-}
-
-// Copy permission mask
-func (a *AdminUser) CopyPermissionMask() []uint64 {
-	if a.AdminPermissionMask == nil {
-		return make([]uint64, 4)
-	}
-	
-	mask := make([]uint64, len(a.AdminPermissionMask))
-	copy(mask, a.AdminPermissionMask)
-	return mask
-}
-
-// Get role as string
+// GetRoleString returns the string representation of the role
 func (a *AdminUser) GetRoleString() string {
+	switch a.RoleType {
+	case RoleTypeSuperAdmin:
+		return RoleAdminSuperAdmin
+	case RoleTypeManager:
+		return RoleAdminManager
+	case RoleTypeEmployee:
+		return RoleAdminEmployee
+	default:
+		return ""
+	}
+}
+
+// CanManage checks if this admin can manage another admin
+func (a *AdminUser) CanManage(target *AdminUser) bool {
+	// Owner can manage everyone
 	if a.IsOwner() {
-		return "owner"
+		return true
 	}
-	if a.IsSuperEmployee() {
-		return "super_employee"
+
+	// Manager can manage employees
+	if a.IsManager() && target.IsEmployee() {
+		return true
 	}
-	if a.IsEmployee() {
-		return "employee"
-	}
-	return "unknown"
+
+	// Employees can't manage anyone
+	return false
 }
 
-// Helper function to check permission in bitmask
-func HasPermission(permissionMask []uint64, bitIndex int) bool {
-	if bitIndex < 0 || bitIndex >= 229 {
-		return false
+// HasPermission checks if admin has a specific permission (placeholder - needs actual permission system)
+func (a *AdminUser) HasPermission(permissionName string) bool {
+	// TODO: Implement actual permission checking based on role and permissions
+	// For now, return true for owner, manager for employee permissions
+	if a.IsOwner() {
+		return true
 	}
-	
-	segment := bitIndex / 64
-	bit := bitIndex % 64
-	
-	if segment >= len(permissionMask) {
-		return false
+
+	if a.IsManager() {
+		// Managers have all employee permissions
+		return true
 	}
-	
-	return (permissionMask[segment] & (1 << bit)) != 0
+
+	// Employees have limited permissions
+	return false
 }
 
-// Helper function to set permission in bitmask
-func SetPermission(permissionMask []uint64, bitIndex int, value bool) []uint64 {
-	if bitIndex < 0 || bitIndex >= 229 {
-		return permissionMask
+// AdminUserSearchResult represents search results for admin users
+type AdminUserSearchResult struct {
+	AdminID        uuid.UUID  `json:"admin_id" db:"admin_id"`
+	Username       string     `json:"username" db:"username"`
+	FullName       string     `json:"full_name" db:"full_name"`
+	PhoneHash      string     `json:"phone_hash" db:"phone_hash"`
+	RoleName       string     `json:"role_name" db:"role_name"`
+	AdminRoleID    uuid.UUID  `json:"admin_role_id" db:"admin_role_id"`
+	RoleType       int        `json:"role_type" db:"role_type"`
+	ReportsTo      *uuid.UUID `json:"reports_to,omitempty" db:"reports_to"`
+	ReportsToName  string     `json:"reports_to_name,omitempty" db:"reports_to_name"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	LastLogin      *time.Time `json:"last_login,omitempty" db:"last_login"`
+	AdminCreatedAt time.Time  `json:"admin_created_at" db:"admin_created_at"`
+	RelevanceScore float64    `json:"relevance_score" db:"relevance_score"`
+	MatchType      string     `json:"match_type" db:"match_type"` // "all", "autocomplete", "fulltext"
+}
+
+// IsOwner checks if the admin is a super admin (owner)
+func (a *AdminUserSearchResult) IsOwner() bool {
+	return a.RoleType == RoleTypeSuperAdmin
+}
+
+// IsSuperEmployee checks if the admin is a manager (super employee)
+func (a *AdminUserSearchResult) IsSuperEmployee() bool {
+	return a.RoleType == RoleTypeManager
+}
+
+// IsEmployee checks if the admin is an employee
+func (a *AdminUserSearchResult) IsEmployee() bool {
+	return a.RoleType == RoleTypeEmployee
+}
+
+// IsManager checks if the admin is a manager
+func (a *AdminUserSearchResult) IsManager() bool {
+	return a.RoleType == RoleTypeManager
+}
+
+// IsSuperAdmin checks if the admin is a super admin
+func (a *AdminUserSearchResult) IsSuperAdmin() bool {
+	return a.RoleType == RoleTypeSuperAdmin
+}
+
+// GetRoleString returns the string representation of the role
+func (a *AdminUserSearchResult) GetRoleString() string {
+	switch a.RoleType {
+	case RoleTypeSuperAdmin:
+		return RoleAdminSuperAdmin
+	case RoleTypeManager:
+		return RoleAdminManager
+	case RoleTypeEmployee:
+		return RoleAdminEmployee
+	default:
+		return ""
 	}
-	
-	segment := bitIndex / 64
-	bit := bitIndex % 64
-	
-	// Ensure mask has enough segments
-	for len(permissionMask) <= segment {
-		permissionMask = append(permissionMask, 0)
+}
+
+// AdminWithPermissions represents admin with full permissions and departments
+type AdminWithPermissions struct {
+	AdminID       uuid.UUID          `json:"admin_id" db:"admin_id"`
+	Username      string             `json:"username" db:"username"`
+	FullName      string             `json:"full_name" db:"full_name"`
+	RoleName      string             `json:"role_name" db:"role_name"`
+	RoleLevel     int                `json:"role_level" db:"role_level"`
+	RoleType      int                `json:"role_type" db:"role_type"`
+	Permissions   []Permission       `json:"permissions"`
+	Departments   []SystemDepartment `json:"departments"`
+	ReportsTo     *uuid.UUID         `json:"reports_to,omitempty" db:"reports_to"`
+	ReportsToName string             `json:"reports_to_name,omitempty" db:"reports_to_name"`
+	IsActive      bool               `json:"is_active" db:"is_active"`
+	LastLogin     *time.Time         `json:"last_login,omitempty" db:"last_login"`
+}
+
+// IsOwner checks if the admin is a super admin (owner)
+func (a *AdminWithPermissions) IsOwner() bool {
+	return a.RoleType == RoleTypeSuperAdmin
+}
+
+// IsSuperEmployee checks if the admin is a manager (super employee)
+func (a *AdminWithPermissions) IsSuperEmployee() bool {
+	return a.RoleType == RoleTypeManager
+}
+
+// IsEmployee checks if the admin is an employee
+func (a *AdminWithPermissions) IsEmployee() bool {
+	return a.RoleType == RoleTypeEmployee
+}
+
+// IsManager checks if the admin is a manager
+func (a *AdminWithPermissions) IsManager() bool {
+	return a.RoleType == RoleTypeManager
+}
+
+// IsSuperAdmin checks if the admin is a super admin
+func (a *AdminWithPermissions) IsSuperAdmin() bool {
+	return a.RoleType == RoleTypeSuperAdmin
+}
+
+// GetRoleString returns the string representation of the role
+func (a *AdminWithPermissions) GetRoleString() string {
+	switch a.RoleType {
+	case RoleTypeSuperAdmin:
+		return RoleAdminSuperAdmin
+	case RoleTypeManager:
+		return RoleAdminManager
+	case RoleTypeEmployee:
+		return RoleAdminEmployee
+	default:
+		return ""
 	}
-	
-	if value {
-		permissionMask[segment] |= (1 << bit)
-	} else {
-		permissionMask[segment] &^= (1 << bit)
+}
+
+type AdminUserSearchRequest struct {
+	Query           string `json:"query"`
+	RoleTypeFilter  *int   `json:"role_type_filter"`
+	IncludeInactive bool   `json:"include_inactive"`
+	SearchType      string `json:"search_type"`
+	Limit           int    `json:"limit"`
+	Offset          int    `json:"offset"`
+}
+
+// AdminRole represents an admin role
+type AdminRole struct {
+	AdminRoleID  uuid.UUID `json:"admin_role_id" db:"admin_role_id"`
+	RoleName     string    `json:"role_name" db:"role_name"`
+	RoleLevel    int       `json:"role_level" db:"role_level"`
+	RoleType     int       `json:"role_type" db:"role_type"` // 1=Employee, 2=Manager, 4=Super Admin
+	IsSystemRole bool      `json:"is_system_role" db:"is_system_role"`
+	Description  string    `json:"description" db:"description"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// AdminHierarchy represents admin hierarchy structure
+type AdminHierarchy struct {
+	AdminID   uuid.UUID `json:"admin_id" db:"admin_id"`
+	Username  string    `json:"username" db:"username"`
+	FullName  string    `json:"full_name" db:"full_name"`
+	RoleType  int       `json:"role_type" db:"role_type"`
+	ReportsTo uuid.UUID `json:"reports_to" db:"reports_to"`
+	Level     int       `json:"level" db:"level"`
+	IsActive  bool      `json:"is_active" db:"is_active"`
+}
+
+// AdminSearchRequest represents admin search request
+type AdminSearchRequest struct {
+	Query           string `json:"query"`
+	RoleTypeFilter  *int   `json:"role_type_filter,omitempty"`
+	IncludeInactive bool   `json:"include_inactive"`
+	SearchType      string `json:"search_type"` // "autocomplete" or "fulltext"
+	Limit           int    `json:"limit"`
+	Offset          int    `json:"offset"`
+}
+
+// AdminSearchFilter - For advanced filtering
+type AdminSearchFilter struct {
+	RoleID          *uuid.UUID `json:"role_id,omitempty"`
+	DepartmentID    *uuid.UUID `json:"department_id,omitempty"`
+	ReportsTo       *uuid.UUID `json:"reports_to,omitempty"`
+	CreatedAfter    *time.Time `json:"created_after,omitempty"`
+	CreatedBefore   *time.Time `json:"created_before,omitempty"`
+	LastLoginAfter  *time.Time `json:"last_login_after,omitempty"`
+	LastLoginBefore *time.Time `json:"last_login_before,omitempty"`
+	HasAvatar       *bool      `json:"has_avatar,omitempty"`
+	IPWhitelist     *string    `json:"ip_whitelist,omitempty"`
+	DataAccessScope *string    `json:"data_access_scope,omitempty"`
+}
+
+// AdminAdvancedSearchRequest - Advanced search with multiple filters
+type AdminAdvancedSearchRequest struct {
+	Query           string            `json:"query,omitempty"`
+	Filters         AdminSearchFilter `json:"filters,omitempty"`
+	IncludeInactive bool              `json:"include_inactive,omitempty"` // Add this
+	SortBy          string            `json:"sort_by,omitempty"`          // "username", "full_name", "created_at", "last_login", "role_type"
+	SortOrder       string            `json:"sort_order,omitempty"`       // "asc", "desc"
+	Limit           int               `json:"limit,omitempty"`
+	Offset          int               `json:"offset,omitempty"`
+}
+
+// AdminSuggestion represents admin suggestion for autocomplete
+type AdminSuggestion struct {
+	AdminID       uuid.UUID  `json:"admin_id" db:"admin_id"`
+	Username      string     `json:"username" db:"username"`
+	FullName      string     `json:"full_name" db:"full_name"`
+	RoleName      string     `json:"role_name" db:"role_name"`
+	RoleLevel     int        `json:"role_level" db:"role_level"`
+	RoleType      int        `json:"role_type" db:"role_type"`
+	ReportsTo     *uuid.UUID `json:"reports_to,omitempty" db:"reports_to"`
+	ReportsToName string     `json:"reports_to_name,omitempty" db:"reports_to_name"`
+	Relevance     float64    `json:"relevance" db:"relevance"`
+}
+
+// IsOwner checks if the admin is a super admin (owner)
+func (a *AdminSuggestion) IsOwner() bool {
+	return a.RoleType == RoleTypeSuperAdmin
+}
+
+// IsSuperEmployee checks if the admin is a manager (super employee)
+func (a *AdminSuggestion) IsSuperEmployee() bool {
+	return a.RoleType == RoleTypeManager
+}
+
+// IsEmployee checks if the admin is an employee
+func (a *AdminSuggestion) IsEmployee() bool {
+	return a.RoleType == RoleTypeEmployee
+}
+
+// GetRoleString returns the string representation of the role
+func (a *AdminSuggestion) GetRoleString() string {
+	switch a.RoleType {
+	case RoleTypeSuperAdmin:
+		return RoleAdminSuperAdmin
+	case RoleTypeManager:
+		return RoleAdminManager
+	case RoleTypeEmployee:
+		return RoleAdminEmployee
+	default:
+		return ""
 	}
-	
-	return permissionMask
 }
 
-// CreateFullPermissionMask creates a permission mask with all bits set (all permissions granted)
-func CreateFullPermissionMask() []uint64 {
-	// We have 229 permissions, which fits in 4 uint64s (4 * 64 = 256 bits)
-	mask := make([]uint64, 4)
-	
-	// Set all bits to 1 in the first 3 segments (192 bits)
-	for i := 0; i < 3; i++ {
-		mask[i] = ^uint64(0) // All bits set to 1
-	}
-	
-	// For the 4th segment, we only need 37 bits (229-192=37)
-	// Set bits 0-36 to 1 (37 bits)
-	for i := 0; i < 37; i++ {
-		mask[3] |= (1 << uint(i))
-	}
-	
-	return mask
+// AdminCreateRequest represents admin creation request
+type AdminCreateRequest struct {
+	Username        string     `json:"username" validate:"required,min=3,max=100"`
+	FullName        string     `json:"full_name" validate:"required,max=255"`
+	PhoneNumber     string     `json:"phone_number" validate:"required"` // Changed from PhoneHash
+	AdminRoleID     uuid.UUID  `json:"admin_role_id" validate:"required"`
+	RoleType        int        `json:"role_type" validate:"required,oneof=1 2 4"`
+	ReportsTo       *uuid.UUID `json:"reports_to,omitempty"`
+	DataAccessScope []string   `json:"data_access_scope,omitempty"`
+	IPWhitelist     []string   `json:"ip_whitelist,omitempty"`
 }
 
-// CreateEmptyPermissionMask creates an empty permission mask with no permissions
-func CreateEmptyPermissionMask() []uint64 {
-	return make([]uint64, 4)
+// AdminProfileUpdateRequest represents admin profile update request
+type AdminProfileUpdateRequest struct {
+	Username string `json:"username,omitempty" validate:"omitempty,min=3,max=100"`
+	FullName string `json:"full_name,omitempty" validate:"omitempty,max=255"`
 }
 
-// AddDepartmentBitmask adds a department bitmask to the user
-func (a *AdminUser) AddDepartmentBitmask(departmentBit uint64) {
-	a.DepartmentBitmask |= departmentBit
+// AdminUpdateRequest represents admin update request
+type AdminUpdateRequest struct {
+	Username        *string    `json:"username,omitempty" validate:"omitempty,min=3,max=100"`
+	FullName        *string    `json:"full_name,omitempty" validate:"omitempty,max=255"`
+	AdminRoleID     *uuid.UUID `json:"admin_role_id,omitempty"`
+	RoleType        *int       `json:"role_type,omitempty" validate:"omitempty,oneof=1 2 4"`
+	ReportsTo       *uuid.UUID `json:"reports_to,omitempty"`
+	IsActive        *bool      `json:"is_active,omitempty"`
+	DataAccessScope []string   `json:"data_access_scope,omitempty"`
+	IPWhitelist     []string   `json:"ip_whitelist,omitempty"`
 }
 
-// RemoveDepartmentBitmask removes a department bitmask from the user
-func (a *AdminUser) RemoveDepartmentBitmask(departmentBit uint64) {
-	a.DepartmentBitmask &^= departmentBit
+type SystemDepartment struct {
+	SystemDepartmentID uuid.UUID `json:"system_department_id"`
+	Name               string    `json:"name"`
+	ModuleCode         string    `json:"module_code"`
+	Description        string    `json:"description"`
+	Bitmask            uint64    `json:"bitmask"`
 }
 
-// GetBitmask returns the bitmask for SystemDepartment (to fix the missing field error)
-func (d *SystemDepartment) GetBitmask() uint64 {
-	return d.Bitmask
+// AdminRoleCreateRequest represents admin role creation request
+type AdminRoleCreateRequest struct {
+	RoleName      string      `json:"role_name" validate:"required"`
+	RoleType      int         `json:"role_type" validate:"required,oneof=1 2 4"`
+	DepartmentIDs []uuid.UUID `json:"department_ids" validate:"required,min=1"`
+	Description   string      `json:"description"`
 }
 
-// SetBitmask sets the bitmask for SystemDepartment
-func (d *SystemDepartment) SetBitmask(bitmask uint64) {
-	d.Bitmask = bitmask
+type AdminRoleUpdateRequest struct {
+	RoleName           *string  `json:"role_name,omitempty"`
+	Description        *string  `json:"description,omitempty"`
+	AddDepartments     []string `json:"add_departments,omitempty"`    // Changed from []uuid.UUID to []string
+	RemoveDepartments  []string `json:"remove_departments,omitempty"` // Changed from []uuid.UUID to []string
+	AddPermissions     []string `json:"add_permissions,omitempty"`
+	RemovePermissions  []string `json:"remove_permissions,omitempty"`
+	ReplacePermissions []string `json:"replace_permissions,omitempty"`
+}
+
+// models.go - Add these new structs
+
+// DepartmentPermission represents department with specific permissions
+type DepartmentPermission struct {
+	DepartmentName string   `json:"department_name" validate:"required"`
+	Permissions    []string `json:"permissions" validate:"required,min=1"`
+}
+
+// EmployeeRoleCreateRequest represents employee role creation request
+type EmployeeRoleCreateRequest struct {
+	RoleName              string                 `json:"role_name" validate:"required"`
+	DepartmentPermissions []DepartmentPermission `json:"department_permissions" validate:"required,min=1"`
+	Description           string                 `json:"description"`
+}
+
+// ManagerRoleCreateRequest represents manager role creation request
+type ManagerRoleCreateRequest struct {
+	RoleName        string   `json:"role_name" validate:"required"`
+	DepartmentNames []string `json:"department_names" validate:"required,min=1"`
+	Description     string   `json:"description"`
 }

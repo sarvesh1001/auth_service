@@ -2432,3 +2432,119 @@ func (r *UserRepositoryImpl) GetBannedUsers(ctx context.Context, limit, offset i
     return users, totalCount, nil
 }
 // GetEmployeeDepartment gets the department for an employee through role mapping
+func (r *UserRepositoryImpl) SetUserAvatar(
+	ctx context.Context,
+	userID uuid.UUID,
+	avatarHash string,
+	avatarObjectKey string,
+	avatarMimeType string,
+) error {
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Deactivate old avatar
+	_, err = tx.ExecContext(ctx, `
+		UPDATE user_avatars
+		SET is_active = false, is_primary = false, updated_at = NOW()
+		WHERE user_id = $1 AND is_primary = true
+	`, userID)
+	if err != nil {
+		return err
+	}
+
+	// Insert new avatar
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO user_avatars (
+			avatar_id,
+			user_id,
+			avatar_type,
+			avatar_hash,
+			avatar_object_key,
+			avatar_mime_type,
+			is_active,
+			is_primary,
+			created_at,
+			updated_at
+		) VALUES (
+			gen_random_uuid(),
+			$1,
+			'uploaded',
+			$2,
+			$3,
+			$4,
+			true,
+			true,
+			NOW(),
+			NOW()
+		)
+	`, userID, avatarHash, avatarObjectKey, avatarMimeType)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *UserRepositoryImpl) GetUserAvatar(
+	ctx context.Context,
+	userID uuid.UUID,
+) (*models.UserAvatar, error) {
+	query := `
+		SELECT
+			avatar_id,
+			user_id,
+			avatar_type,
+			avatar_hash,
+			avatar_object_key,
+			avatar_mime_type,
+			is_active,
+			is_primary,
+			created_at,
+			updated_at
+		FROM user_avatars
+		WHERE user_id = $1
+		  AND is_active = true
+		  AND is_primary = true
+		LIMIT 1
+	`
+
+	var avatar models.UserAvatar
+	err := r.client.QueryRow(ctx, query, userID).Scan(
+		&avatar.AvatarID,
+		&avatar.UserID,
+		&avatar.AvatarType,
+		&avatar.AvatarHash,
+		&avatar.AvatarObjectKey,
+		&avatar.AvatarMimeType,
+		&avatar.IsActive,
+		&avatar.IsPrimary,
+		&avatar.CreatedAt,
+		&avatar.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil // UI fallback to initials
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &avatar, nil
+}
+
+
+func (r *UserRepositoryImpl) DeactivateUserAvatar(
+	ctx context.Context,
+	userID uuid.UUID,
+) error {
+	_, err := r.client.Exec(ctx, `
+		UPDATE user_avatars
+		SET is_active = false, is_primary = false, updated_at = NOW()
+		WHERE user_id = $1 AND is_primary = true
+	`, userID)
+
+	return err
+}

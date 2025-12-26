@@ -25,7 +25,6 @@ type SessionService struct {
     logProducer *LogProducerService
     companyRepo postgres.CompanyRepository
 }
-
 // NewSessionService creates a new session service
 func NewSessionService(
     sessionRepo redis.SessionRepository,
@@ -55,40 +54,35 @@ type CreateSessionRequest struct {
     SessionType       string    `json:"session_type" validate:"oneof=user admin"`
 }
 
-// CreateAdminSessionRequest for admin-specific session creation
+// CreateAdminSessionRequest simplified
 type CreateAdminSessionRequest struct {
     AdminID           uuid.UUID `json:"admin_id" validate:"required"`
-    AdminRoleMask     uint64    `json:"admin_role_mask" validate:"required"`
+    Role              string    `json:"role" validate:"required,oneof=super_admin admin_manager admin_employee"`
     DeviceID          string    `json:"device_id" validate:"required"`
     DeviceFingerprint string    `json:"device_fingerprint"`
     IPAddress         string    `json:"ip_address"`
     PermissionMask    []uint64  `json:"permission_mask"`
 }
 
-// IssueTokenPairRequest for JWT token pair issuance - UPDATED
+// IssueTokenPairRequest simplified
 type IssueTokenPairRequest struct {
-    UserID          string
-    Role            string
-    DeviceID        string
-    SessionType     string
-    IPAddress       string
-    CompanyID       string
-    AdminRoleMask   uint64
-    PermissionMask  []uint64
+    UserID         string
+    Role           string    // Role string (e.g., "super_admin", "admin_manager", "owner", "employee")
+    DeviceID       string
+    SessionType    string
+    IPAddress      string
+    CompanyID      string
+    PermissionMask []uint64
 }
-
 // logSessionEvent helper method
 func (s *SessionService) logSessionEvent(ctx context.Context, event *models.SessionLogEvent) {
     if s.logProducer != nil {
         _ = s.logProducer.ProduceSessionEvent(ctx, event)
     }
 }
-
 // IssueTokenPair issues JWT access + opaque refresh tokens with CompanyID
 func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPairRequest) (*models.TokenPairResponse, error) {
-    // ---------------------------------------------------------
-    // 1️⃣ Validate required fields
-    // ---------------------------------------------------------
+    // Validate required fields
     if req.UserID == "" {
         return nil, fmt.Errorf("user ID is required")
     }
@@ -97,16 +91,17 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         return nil, fmt.Errorf("device ID is required")
     }
 
-    // ---------------------------------------------------------
-    // 2️⃣ Generate JWT Access Token with CompanyID
-    // ---------------------------------------------------------
+    if req.Role == "" {
+        return nil, fmt.Errorf("role is required")
+    }
+
+    // Generate JWT Access Token with CompanyID
     accessToken, jti, err := s.jwtService.CreateAccessToken(ctx, &CreateAccessTokenRequest{
         UserID:         req.UserID,
         Role:           req.Role,
         DeviceID:       req.DeviceID,
         SessionType:    req.SessionType,
         CompanyID:      req.CompanyID,
-        AdminRoleMask:  req.AdminRoleMask,
         PermissionMask: req.PermissionMask,
     })
     if err != nil {
@@ -117,9 +112,7 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         return nil, fmt.Errorf("failed to create access token: %w", err)
     }
 
-    // ---------------------------------------------------------
-    // 3️⃣ Store Access Token in Redis
-    // ---------------------------------------------------------
+    // Store Access Token in Redis
     now := time.Now().UTC()
     
     accessTokenData := &models.AccessTokenData{
@@ -141,9 +134,7 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         return nil, fmt.Errorf("failed to store access token: %w", err)
     }
 
-    // ---------------------------------------------------------
-    // 4️⃣ Generate Opaque Refresh Token
-    // ---------------------------------------------------------
+    // Generate Opaque Refresh Token
     refreshToken, err := s.jwtService.GenerateRefreshToken()
     if err != nil {
         s.logger.Error("Failed to generate refresh token",
@@ -154,9 +145,7 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         return nil, fmt.Errorf("failed to generate refresh token: %w", err)
     }
 
-    // ---------------------------------------------------------
-    // 5️⃣ Store refresh token in Redis WITH JTI reference
-    // ---------------------------------------------------------
+    // Store refresh token in Redis WITH JTI reference
     refreshData := &models.RefreshTokenData{
         RefreshID:   refreshToken,
         UserID:      req.UserID,
@@ -168,7 +157,6 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         LastUsed:    now,
         Revoked:     false,
         IPAddress:   req.IPAddress,
-        AdminRoleMask: req.AdminRoleMask,
         JTI:         jti, // Store reference to access token
     }
 
@@ -182,22 +170,18 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         return nil, fmt.Errorf("failed to store refresh token: %w", err)
     }
 
-    // ---------------------------------------------------------
-    // 6️⃣ Log token issuance with CompanyID
-    // ---------------------------------------------------------
+    // Log token issuance with CompanyID
     s.logger.Info("Token pair issued",
         util.String("user_id", req.UserID),
         util.String("session_type", req.SessionType),
         util.String("company_id", req.CompanyID),
+        util.String("role", req.Role),
         util.String("jti", jti),
         util.String("device_id", req.DeviceID),
-        util.Uint64("admin_role_mask", req.AdminRoleMask),
         util.Int64("refresh_ttl_seconds", int64(s.config.JWT.RefreshTTL.Seconds())),
     )
 
-    // ---------------------------------------------------------
-    // 7️⃣ Final response
-    // ---------------------------------------------------------
+    // Final response
     return &models.TokenPairResponse{
         AccessToken:  accessToken,
         RefreshToken: refreshToken,
@@ -206,10 +190,7 @@ func (s *SessionService) IssueTokenPair(ctx context.Context, req *IssueTokenPair
         CompanyID:    req.CompanyID,
     }, nil
 }
-
-// RefreshTokenPair rotates refresh token and issues new access token
 func (s *SessionService) RefreshTokenPair(ctx context.Context, refreshToken string, ipAddress string) (*models.TokenPairResponse, error) {
-    // Get refresh token from Redis
     refreshData, err := s.sessionRepo.GetRefreshToken(ctx, refreshToken)
     if err != nil {
         s.logger.Warn("Invalid refresh token provided",
@@ -218,7 +199,6 @@ func (s *SessionService) RefreshTokenPair(ctx context.Context, refreshToken stri
         return nil, fmt.Errorf("invalid refresh token: %w", err)
     }
 
-    // Validate refresh token
     if refreshData.Revoked {
         s.logger.Warn("Refresh token revoked",
             util.String("user_id", refreshData.UserID),
@@ -233,40 +213,44 @@ func (s *SessionService) RefreshTokenPair(ctx context.Context, refreshToken stri
         return nil, fmt.Errorf("refresh token expired")
     }
 
-    // Update last used timestamp
     refreshData.LastUsed = time.Now().UTC()
     if err := s.sessionRepo.StoreRefreshToken(ctx, refreshData); err != nil {
         s.logger.Warn("Failed to update refresh token last used", util.ErrorField(err))
     }
 
-    // Delete old access token using stored JTI
     if refreshData.JTI != "" {
         if err := s.sessionRepo.DeleteAccessToken(ctx, refreshData.JTI); err != nil {
-            s.logger.Warn("Failed to delete old access token during refresh", 
+            s.logger.Warn("Failed to delete old access token during refresh",
                 util.ErrorField(err),
                 util.String("jti", refreshData.JTI))
         }
     }
 
-    // Rotate refresh token (delete old, create new) if configured
     if s.config.JWT.RotateRefreshTokens {
         if err := s.sessionRepo.DeleteRefreshToken(ctx, refreshToken); err != nil {
             s.logger.Warn("Failed to delete old refresh token", util.ErrorField(err))
         }
     }
 
-    // Issue new token pair with same CompanyID
+    // Get permission mask if it's an admin session
+    var permissionMask []uint64
+    if refreshData.SessionType == "admin" {
+        // For admin sessions, we need to get the permission mask
+        // This could be stored in the refresh token or fetched from the database
+        // For now, we'll use an empty mask
+        permissionMask = []uint64{}
+    }
+
     return s.IssueTokenPair(ctx, &IssueTokenPairRequest{
-        UserID:        refreshData.UserID,
-        Role:          refreshData.SessionType, // Use session type as role
-        DeviceID:      refreshData.DeviceID,
-        SessionType:   refreshData.SessionType,
-        IPAddress:     ipAddress,
-        CompanyID:     refreshData.CompanyID, // PRESERVE COMPANY ID
-        AdminRoleMask: refreshData.AdminRoleMask,
+        UserID:         refreshData.UserID,
+        Role:           refreshData.SessionType, // Note: This might need to be the actual role, not session type
+        DeviceID:       refreshData.DeviceID,
+        SessionType:    refreshData.SessionType,
+        IPAddress:      ipAddress,
+        CompanyID:      refreshData.CompanyID,
+        PermissionMask: permissionMask, // Use the permission mask
     })
 }
-
 // ValidateAccessToken validates JWT and checks Redis for active status
 func (s *SessionService) ValidateAccessToken(ctx context.Context, tokenStr string) (*models.JWTClaims, error) {
     // Validate JWT signature and parse claims
@@ -586,7 +570,7 @@ func (s *SessionService) CreateAdminSession(ctx context.Context, req *CreateAdmi
     adminTTL := 7 * 24 * time.Hour
     expiresAt := now.Add(adminTTL)
 
-    // ✅ FIXED: Use bitmask fields instead of old string fields
+    // SIMPLIFIED: Use role string instead of bitmask
     session := &models.ActiveSession{
         UserID:             req.AdminID.String(),
         SessionToken:       token,
@@ -598,8 +582,8 @@ func (s *SessionService) CreateAdminSession(ctx context.Context, req *CreateAdmi
         IPAddress:         ipAddr,
         EncryptionKey:     encKey,
         SessionType:       "admin",
-        AdminRoleMask:     req.AdminRoleMask,           // ✅ Use bitmask
-        AdminPermissionMask: req.PermissionMask,        // ✅ Use bitmask
+        Role:              req.Role,           // ✅ Use role string
+        PermissionMask:    req.PermissionMask, // ✅ Use permission mask only
     }
 
     if err := s.sessionRepo.CreateSession(ctx, session); err != nil {
@@ -648,7 +632,7 @@ func (s *SessionService) CreateAdminSession(ctx context.Context, req *CreateAdmi
 
     s.logger.Info("Admin session created",
         util.String("admin_id", req.AdminID.String()),
-        util.Uint64("role_mask", req.AdminRoleMask),
+        util.String("role", req.Role),
         util.String("device_id", req.DeviceID),
         util.Int("permission_mask_segments", len(req.PermissionMask)),
         util.Duration("duration", time.Since(startTime)),

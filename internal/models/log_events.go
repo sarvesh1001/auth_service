@@ -39,6 +39,7 @@ type LogEnvelope struct {
 	Metadata    map[string]interface{} `json:"metadata"`
 	Level       string                 `json:"level"`
 	Message     string                 `json:"message"`
+	
 }
 
 // OTPLogEvent - OTP specific logs

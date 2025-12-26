@@ -1,539 +1,651 @@
 package handler
 
 import (
-    authMiddleware "auth-service/internal/middleware"
-    "auth-service/internal/service"
-    "context"
-    "encoding/json"
-    "net/http"
-    "strings"
-    "time"
+	authMiddleware "auth-service/internal/middleware"
+	"auth-service/internal/service"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
 
-    "github.com/go-chi/chi/v5"
-    chiMiddleware "github.com/go-chi/chi/v5/middleware"
-    "github.com/go-chi/cors"
-    "github.com/google/uuid"
-    "go.uber.org/zap"
+	"github.com/go-chi/chi/v5"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 func NewRouter(
-    otpHandler *OTPHandler,
-    adminHandler *AdminHandler,
-    authHandler *AuthHandler,
-    rbacHandler *RBACHandler,
-    pairingHandler *PairingHandler,
-    wsHandler *WebSocketHandler,
-    sessionService *service.SessionService,
-    jwtService *service.JWTService,
-    logger *zap.Logger,
+	otpHandler *OTPHandler,
+	adminHandler *AdminHandler,
+	authHandler *AuthHandler,
+	rbacHandler *RBACHandler,
+	pairingHandler *PairingHandler,
+	wsHandler *WebSocketHandler,
+	sessionService *service.SessionService,
+	jwtService *service.JWTService,
+	logger *zap.Logger,
 ) chi.Router {
-    router := chi.NewRouter()
+	router := chi.NewRouter()
 
-    // ============================================================
-    // GLOBAL MIDDLEWARES
-    // ============================================================
-    // router.Use(requireHTTPS)
-    router.Use(chiMiddleware.RequestID)
-    router.Use(chiMiddleware.RealIP)
-    router.Use(LoggerMiddleware(logger))
-    router.Use(chiMiddleware.Recoverer)
-    router.Use(chiMiddleware.Timeout(60 * time.Second))
+	// ============================================================
+	// GLOBAL MIDDLEWARES
+	// ============================================================
+	// router.Use(requireHTTPS)
+	router.Use(chiMiddleware.RequestID)
+	router.Use(chiMiddleware.RealIP)
+	router.Use(LoggerMiddleware(logger))
+	router.Use(chiMiddleware.Recoverer)
+	router.Use(chiMiddleware.Timeout(60 * time.Second))
 
-    // CORS - Add required headers
-    router.Use(cors.Handler(cors.Options{
-        AllowedOrigins:   []string{"https://*", "http://localhost:3000", "http://localhost:8080"},
-        AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-        AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", 
-            "X-Session-Type", "X-Device-ID", "X-Company-ID"},
-        AllowCredentials: true,
-        MaxAge:           300,
-    }))
+	// CORS - Add required headers
+	router.Use(cors.Handler(cors.Options{
+		AllowedOrigins: []string{"https://*", "http://localhost:3000", "http://localhost:8080"},
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token",
+			"X-Session-Type", "X-Device-ID", "X-Company-ID"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
 
-    // ============================================================
-    // HEALTH CHECK
-    // ============================================================
-    router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-        logger.Info("Health check requested")
-        w.Header().Set("Content-Type", "application/json")
-        _ = json.NewEncoder(w).Encode(map[string]string{
-            "status":  "healthy",
-            "service": "auth-service",
-            "time":    time.Now().UTC().Format(time.RFC3339),
-        })
-    })
+	// ============================================================
+	// HEALTH CHECK
+	// ============================================================
+	router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("Health check requested")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":  "healthy",
+			"service": "auth-service",
+			"time":    time.Now().UTC().Format(time.RFC3339),
+		})
+	})
 
-    // ============================================================
-    // MAIN API
-    // ============================================================
-    router.Route("/api/v1", func(r chi.Router) {
+	// ============================================================
+	// MAIN API
+	// ============================================================
+	router.Route("/api/v1", func(r chi.Router) {
+		r.Get("/health", adminHandler.HealthCheckHandler)
 
-        //-----------------------------------------------------------
-        // PUBLIC ROUTES
-        //-----------------------------------------------------------
-        authHandler.RegisterPublicRoutes(r)
-        authHandler.RegisterUserPublicRoutes(r)
-        otpHandler.RegisterRoutes(r)
+		// ============================================================
+		// PUBLIC ROUTES (NO AUTH REQUIRED)
+		// ============================================================
 
-        //-----------------------------------------------------------
-        // ADMIN AUTH (PUBLIC)
-        //-----------------------------------------------------------
-        adminHandler.RegisterRoutes(r)
+		// Super admin initialization endpoints (public - for initial setup)
+		r.Route("/setup", func(r chi.Router) {
+			r.Post("/super-admin", adminHandler.InitSuperAdminHandler)
+			r.Get("/super-admin/status", adminHandler.CheckSuperAdminStatusHandler)
+		})
 
-        //-----------------------------------------------------------
-        // WEB LOGIN (QR PAIRING) ROUTES
-        //-----------------------------------------------------------
-        r.Route("/web/login", func(r chi.Router) {
-            r.Get("/qr", pairingHandler.GenerateQR)
-            r.Get("/status", pairingHandler.Status)
-            r.Post("/confirm", pairingHandler.Confirm)
-            r.Get("/ws", pairingHandler.WebSocket)
+		// Admin authentication routes (public)
+		r.Route("/admin-auth", func(r chi.Router) {
+			r.Post("/login/initiate", adminHandler.InitiateAdminLogin)
+			r.Post("/login/verify-otp", adminHandler.VerifyAdminOTPLogin)
+			r.Post("/login/verify-mpin", adminHandler.VerifyAdminMPINLogin)
+			r.Post("/mpin/setup", adminHandler.SetupAdminMPIN)
+			r.Post("/mpin/change", adminHandler.ChangeAdminMPIN)
+			r.Post("/mpin/forgot", adminHandler.ForgotAdminMPIN)
+			r.Post("/mpin/forgot/verify", adminHandler.VerifyForgotAdminMPIN)
+			r.Post("/refresh", adminHandler.RefreshAdminTokens)
+			r.Post("/logout", adminHandler.LogoutAdmin)
+			r.Get("/health", adminHandler.HealthCheck)
+		})
 
-            // Mobile pairing (requires JWT + Session Validation)
-            r.With(
-                authMiddleware.JWTAuthMiddlewareWithRedis(sessionService, logger),
-                authMiddleware.SessionValidationMiddleware(sessionService, logger),
-            ).Post("/pair", pairingHandler.Pair)
-        })
+		// User public routes
+		authHandler.RegisterPublicRoutes(r)
+		authHandler.RegisterUserPublicRoutes(r)
+		otpHandler.RegisterRoutes(r)
 
-        //-----------------------------------------------------------
-        // PROTECTED ROUTES (JWT + SESSION VALIDATION REQUIRED)
-        //-----------------------------------------------------------
-        r.Group(func(r chi.Router) {
-            // JWT Middleware (parses token and adds claims to context)
-            r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService, logger))
-            
-            // 🔥 NEW: Session Validation Middleware (performs all security checks)
-            r.Use(authMiddleware.SessionValidationMiddleware(sessionService, logger))
+		// ============================================================
+		// WEB LOGIN (QR PAIRING) ROUTES (PUBLIC)
+		// ============================================================
+		r.Route("/web/login", func(r chi.Router) {
+			r.Get("/qr", pairingHandler.GenerateQR)
+			r.Get("/status", pairingHandler.Status)
+			r.Post("/confirm", pairingHandler.Confirm)
+			r.Get("/ws", pairingHandler.WebSocket)
 
-            //-----------------------------------------------------------
-            // USER AUTH PROTECTED ROUTES
-            //-----------------------------------------------------------
-            authHandler.RegisterProtectedRoutes(r)
+			// Mobile pairing (requires JWT + Session Validation)
+			r.With(
+				authMiddleware.JWTAuthMiddlewareWithRedis(sessionService, logger),
+				authMiddleware.SessionValidationMiddleware(sessionService, logger),
+			).Post("/pair", pairingHandler.Pair)
+		})
 
-            //-----------------------------------------------------------
-            // COMPANY EMPLOYEE SEARCH ROUTES
-            //-----------------------------------------------------------
-            r.Route("/companies/{companyID}/employees", func(r chi.Router) {
-                // Use EnhancedCompanyAccessMiddleware which checks JWT company ID
-                r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
-                
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Post("/search", authHandler.SearchCompanyEmployees)
-                    
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/search/advanced", authHandler.SearchCompanyEmployeesAdvanced)
-                    
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/search/suggestions", authHandler.GetCompanyEmployeeSuggestions)
-                    
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/suggestions", authHandler.GetCompanyEmployeeSuggestions)
-                    
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/username/{username}", authHandler.FindCompanyEmployeeByUsername)
-            })
+		// ============================================================
+		// PROTECTED ROUTES (JWT + SESSION VALIDATION REQUIRED)
+		// ============================================================
+		r.Group(func(r chi.Router) {
+			// JWT Middleware (parses token and adds claims to context)
+			r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService, logger))
 
-            //-----------------------------------------------------------
-            // COMPANY OWNER ROUTES (NON-ADMIN COMPANY OWNERS)
-            //-----------------------------------------------------------
-            r.Route("/companies/{companyID}", func(r chi.Router) {
-                r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
+			// Session Validation Middleware (performs all security checks)
+			r.Use(authMiddleware.SessionValidationMiddleware(sessionService, logger))
 
-                r.Get("/", adminHandler.GetCompany)
-                r.Get("/getemployees", adminHandler.GetCompanyEmployees)
-                // r.Get("/departments", adminHandler.GetCompanyDepartments)
-                r.Get("/roles", adminHandler.GetCompanyRoles)
-                r.Get("/hierarchy", adminHandler.GetCompanyHierarchy)
-                r.Get("/stats", adminHandler.GetCompanyStats)
+			// ============================================================
+			// USER AUTH PROTECTED ROUTES
+			// ============================================================
+			authHandler.RegisterProtectedRoutes(r)
 
-                // Owner-only operations
-                // r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.create", logger)).
-                //     Post("/departments/create", rbacHandler.CreateDepartment)
+			// ============================================================
+			// COMPANY EMPLOYEE SEARCH ROUTES
+			// ============================================================
+			r.Route("/companies/{companyID}/employees", func(r chi.Router) {
+				// Use EnhancedCompanyAccessMiddleware which checks JWT company ID
+				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
 
-                // r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
-                //     Put("/employees/{userID}/role", adminHandler.UpdateEmployeeRole)
-            })
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Post("/search", authHandler.SearchCompanyEmployees)
 
-            //-----------------------------------------------------------
-            // COMPANY RBAC ROUTES
-            //-----------------------------------------------------------
-            r.Route("/companies/{companyID}/rbac", func(r chi.Router) {
-                r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/search/advanced", authHandler.SearchCompanyEmployeesAdvanced)
 
-                // ===============================
-                // ROLE MANAGEMENT
-                // ===============================
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.create", logger)).
-                    Post("/roles", rbacHandler.CreateRole)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/search/suggestions", authHandler.GetCompanyEmployeeSuggestions)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/roles", rbacHandler.ListRoles)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/suggestions", authHandler.GetCompanyEmployeeSuggestions)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/roles/{roleID}", rbacHandler.GetRole)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/username/{username}", authHandler.FindCompanyEmployeeByUsername)
+			})
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.update", logger)).
-                    Put("/roles/{roleID}", rbacHandler.UpdateRole)
+			// ============================================================
+			// COMPANY OWNER ROUTES (NON-ADMIN COMPANY OWNERS)
+			// ============================================================
+			r.Route("/companies/{companyID}", func(r chi.Router) {
+				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.delete", logger)).
-                    Delete("/roles/{roleID}", rbacHandler.DeleteRole)
+				r.Get("/", adminHandler.GetCompany)
+				r.Get("/getemployees", adminHandler.GetCompanyEmployees)
+				r.Get("/roles", adminHandler.GetCompanyRoles)
+				r.Get("/hierarchy", adminHandler.GetCompanyHierarchy)
+				r.Get("/stats", adminHandler.GetCompanyStats)
 
-                // Employee Management
-                r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.create", logger)).
-                    Post("/employees", rbacHandler.AddEmployee)
+				// Owner-only operations
+				// r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.create", logger)).
+				//     Post("/departments/create", rbacHandler.CreateDepartment)
 
-                // Manager Management
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
-                    Post("/managers", rbacHandler.AddManager)
+				// r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
+				//     Put("/employees/{userID}/role", adminHandler.UpdateEmployeeRole)
+			})
 
-                // Available Permissions
-                r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.create", logger)).
-                    Get("/available-permissions", rbacHandler.GetAvailablePermissions)
+			// ============================================================
+			// COMPANY RBAC ROUTES
+			// ============================================================
+			r.Route("/companies/{companyID}/rbac", func(r chi.Router) {
+				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
 
-                // ===============================
-                // PERMISSION MANAGEMENT
-                // ===============================
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
-                    Post("/roles/{roleID}/permissions", rbacHandler.AssignPermissionsToRole)
+				// ===============================
+				// ROLE MANAGEMENT
+				// ===============================
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.create", logger)).
+					Post("/roles", rbacHandler.CreateRole)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
-                    Delete("/roles/{roleID}/permissions", rbacHandler.RemovePermissionsFromRole)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/roles", rbacHandler.ListRoles)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/roles/{roleID}/permissions", rbacHandler.GetRolePermissions)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/roles/{roleID}", rbacHandler.GetRole)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
-                    Put("/roles/{roleID}/permissions", rbacHandler.ReplaceRolePermissions)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.update", logger)).
+					Put("/roles/{roleID}", rbacHandler.UpdateRole)
 
-                // ===============================
-                // GLOBAL PERMISSION QUERIES
-                // ===============================
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/permissions", rbacHandler.ListAllPermissions)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.delete", logger)).
+					Delete("/roles/{roleID}", rbacHandler.DeleteRole)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/permissions/module/{module}", rbacHandler.ListPermissionsByModule)
+				// Employee Management
+				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.create", logger)).
+					Post("/employees", rbacHandler.AddEmployee)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/permissions/name/{permissionName}", rbacHandler.GetPermissionByName)
+				// Manager Management
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
+					Post("/managers", rbacHandler.AddManager)
 
-                // ===============================
-                // DEPARTMENT MANAGEMENT
-                // ===============================
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
-                    Get("/departments", rbacHandler.ListDepartments)
+				// Available Permissions
+				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.create", logger)).
+					Get("/available-permissions", rbacHandler.GetAvailablePermissions)
 
-                // r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.update", logger)).
-                //     Put("/departments/{departmentID}", rbacHandler.UpdateDepartment)
+				// ===============================
+				// PERMISSION MANAGEMENT
+				// ===============================
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
+					Post("/roles/{roleID}/permissions", rbacHandler.AssignPermissionsToRole)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.update", logger)).
-                    Put("/departments/{departmentID}/rename", rbacHandler.RenameDepartment)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
+					Delete("/roles/{roleID}/permissions", rbacHandler.RemovePermissionsFromRole)
 
-                // ===============================
-                // USER PERMISSIONS & HIERARCHY
-                // ===============================
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/users/{userID}/permissions", rbacHandler.GetUserPermissions)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/roles/{roleID}/permissions", rbacHandler.GetRolePermissions)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/users/{userID}/permissions/bitmask", rbacHandler.GetUserPermissionBitmask)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.manage", logger)).
+					Put("/roles/{roleID}/permissions", rbacHandler.ReplaceRolePermissions)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/users/{userID}/permissions/check", rbacHandler.CheckUserPermission)
+				// ===============================
+				// GLOBAL PERMISSION QUERIES
+				// ===============================
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/permissions", rbacHandler.ListAllPermissions)
 
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
-                    Get("/users/{userID}/hierarchy", rbacHandler.GetUserHierarchy)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/permissions/module/{module}", rbacHandler.ListPermissionsByModule)
 
-                // ===============================
-                // BULK ROLE ASSIGNMENT
-                // ===============================
-                r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.role.assign", logger)).
-                    Post("/bulk-assign", rbacHandler.BulkAssignRoles)
-            })
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/permissions/name/{permissionName}", rbacHandler.GetPermissionByName)
 
-            //-----------------------------------------------------------
-            // ADMIN PROTECTED ROUTES (WITH ADMIN SESSION CHECK)
-            //-----------------------------------------------------------
-            r.Route("/admin", func(r chi.Router) {
-                // Admin session type check
-                r.Use(AdminSessionMiddleware(logger))
+				// ===============================
+				// DEPARTMENT MANAGEMENT
+				// ===============================
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.view", logger)).
+					Get("/departments", rbacHandler.ListDepartments)
 
-                // 🔥 NEW BITMASK ADMIN ROUTES WITH DEPARTMENT SUPPORT
-                r.Route("/admins", func(r chi.Router) {
-                    // Admin stats
-                    r.Get("/stats", adminHandler.GetStats)
-                    
-                    // ===== DEPARTMENT-BASED ADMIN MANAGEMENT =====
-                    // Invite admin with departments and permissions (NEW)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.create", logger)).
-                        Post("/invite-with-departments", adminHandler.InviteAdminWithDepartments)
-                    r.Get("/debug/permission-calculation", adminHandler.DebugPermissionCalculation)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.department.update", logger)).
+					Put("/departments/{departmentID}/rename", rbacHandler.RenameDepartment)
 
-                    // Update admin departments (NEW)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.department.update", logger)).
-                        Put("/{adminID}/departments", adminHandler.UpdateAdminDepartments)
-                    
-                    // Get admin with department details (NEW)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
-                        Get("/{adminID}/details", adminHandler.GetAdminWithDetails)
-                    
-                    // Check admin department access (NEW)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
-                        Get("/{adminID}/check-department-access", adminHandler.CheckAdminDepartmentAccess)
-                    
-                    // Get admins by department (NEW)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
-                        Get("/by-department/{departmentName}", adminHandler.GetAdminsByDepartment)
-                    
-                    // Phone management
-                    r.Patch("/phone", adminHandler.ChangeOwnPhone)  // Change own phone
-                    r.Patch("/{adminID}/phone", adminHandler.ChangeAdminPhone)  // Change other admin's phone
-                    
-                    // Admin invitation with bitmask
-                    r.Post("/invite", adminHandler.InviteAdminWithBitmask)
-                    
-                    // Admin promotion with bitmask
-                    r.Patch("/{adminID}/promote", adminHandler.PromoteAdminWithBitmask)
-                    
-                    // Get admins by role mask
-                    r.Get("/role/{roleMask}", adminHandler.GetAdminsByRoleMask)
-                    
-                    // Admin CRUD operations
-                    r.Get("/", adminHandler.ListAdmins)
-                    r.Get("/{adminID}", adminHandler.GetAdminByID)
-                    r.Get("/phone/{phone}", adminHandler.GetAdminByPhone)
-                    r.Delete("/{adminID}", adminHandler.RemoveAdmin)
-                    r.Patch("/{adminID}/deactivate", adminHandler.DeactivateAdmin)
-                    r.Patch("/{adminID}/activate", adminHandler.ActivateAdmin)
-                    
-                    // ===== PERMISSION MANAGEMENT =====
-                    r.Route("/{adminID}/permissions", func(r chi.Router) {
-                        // Get permissions
-                        r.Get("/", adminHandler.GetAdminPermissions)
-                        r.Get("/mask", adminHandler.GetAdminPermissionMask)
-                        r.Get("/check", adminHandler.CheckAdminPermission)
-                        
-                        // Permission operations
-                        r.Post("/{permissionName}", adminHandler.GrantPermissionToAdmin)
-                        r.Delete("/{permissionName}", adminHandler.RevokePermissionFromAdmin)
-                        r.Post("/batch", adminHandler.BatchUpdatePermissions)
-                    })
-                })
+				// ===============================
+				// USER PERMISSIONS & HIERARCHY
+				// ===============================
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/users/{userID}/permissions", rbacHandler.GetUserPermissions)
 
-                // ===== SYSTEM DEPARTMENT BITMASK UTILITIES =====
-                r.Route("/departments", func(r chi.Router) {
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.department.view", logger)).
-                        Get("/", adminHandler.GetSystemDepartments)
-                    
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.department.view", logger)).
-                        Get("/bitmask", adminHandler.GetSystemDepartmentsWithBitmask)
-                })
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/users/{userID}/permissions/bitmask", rbacHandler.GetUserPermissionBitmask)
 
-                // System owner initialization (admin-only)
-                r.Post("/init-owner", adminHandler.InitializeOwner)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/users/{userID}/permissions/check", rbacHandler.CheckUserPermission)
 
-                // Admin MPIN management
-                r.Post("/mpin/change-by-admin", adminHandler.ChangeAdminMPINByAdmin)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.employee.view", logger)).
+					Get("/users/{userID}/hierarchy", rbacHandler.GetUserHierarchy)
 
-                // User management
-                r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
-                     Put("/users/update/{userID}", adminHandler.UpdateUser)
-                     r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
-                     Put("/users/update/{userID}", adminHandler.UpdateUser)
-                 
-                 // Update User KYC (7.9) - requires admin.user.update
-                 r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
-                     Patch("/users/{userID}/kyc", adminHandler.UpdateUserKYC)
-                 
-                 // Ban User (7.10) - requires admin.user.update (or admin.user.suspend if you have it)
-                 r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.suspend", logger)).
-                     Post("/users/{userID}/ban", adminHandler.BanUser)
-                 
-                 // Unban User (7.11) - requires admin.user.update
-                 r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.suspend", logger)).
-                     Post("/users/{userID}/unban", adminHandler.UnbanUser)
-                 
-                 // Get Banned Users (7.12) - requires admin.user.view
-                 r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
-                     Get("/users/banned", adminHandler.GetBannedUsers)
-             
-                // --------------------------------------------------------
-                // SYSTEM / PERMISSIONS / COMPANY / EMPLOYEE / RBAC
-                // --------------------------------------------------------
-                r.Get("/debug/companies/{companyID}/departments", adminHandler.DebugCompanyDepartments)
-                
-                // Global permissions endpoints
-                r.Route("/permissions", func(r chi.Router) {
-                    r.Get("/", adminHandler.GetAllPermissions)
-                    r.Get("/module/{module}", adminHandler.GetPermissionsByModule)
-                })
+				// ===============================
+				// BULK ROLE ASSIGNMENT
+				// ===============================
+				r.With(authMiddleware.BitmaskPermissionMiddleware("administrative.role.assign", logger)).
+					Post("/bulk-assign", rbacHandler.BulkAssignRoles)
+			})
 
-                // ADVANCED USER SEARCH ENDPOINTS (ADMIN ONLY)
-                r.Route("/users", func(r chi.Router) {
-                    r.Get("/search/advanced", adminHandler.SearchUsersAdvanced)
-                    r.Get("/search/suggestions", adminHandler.GetUserSuggestions)
-                    r.Get("/search/username", adminHandler.SearchUsersByUsername)
-                    r.Get("/search/fullname", adminHandler.SearchUsersByFullName)
-                    r.Get("/recently-active", adminHandler.GetRecentlyActiveUsers)
-                    r.Get("/kyc-status/{status}", adminHandler.ListUsersByKYCStatus)
-                })
+			// ============================================================
+			// ADMIN PROTECTED ROUTES (WITH ADMIN SESSION CHECK)
+			// ============================================================
+			r.Route("/admin", func(r chi.Router) {
+				// Admin session type check
+				r.Use(AdminSessionMiddleware(logger))
 
-                // Company Management
-                r.Route("/companies", func(r chi.Router) {
-                    // CREATE COMPANY - requires admin.company.update (since creating is an update operation)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
-                        Post("/", adminHandler.CreateCompany)
-                    
-                    // LIST VIEW OPERATIONS - require admin.company.view
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/status/{status}", adminHandler.GetCompaniesByStatus)
-                    
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/recent", adminHandler.GetRecentCompanies)
-                    
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/expiring-subscriptions", adminHandler.GetCompaniesWithExpiringSubscription)
-                    
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/tier/{tier}", adminHandler.GetCompaniesByTier)
-                    
-                    // SEARCH OPERATIONS - require admin.company.view
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/search", adminHandler.SearchCompanies)
-                    
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/suggestions", adminHandler.GetCompanySuggestions)
-                    
-                    // OWNER SEARCH - requires admin.company.view
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/search-by-owner/{ownerID}", adminHandler.SearchCompaniesByOwner)
-                    
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/owner/{ownerID}/search", adminHandler.SearchCompaniesByOwner)
-                    
-                    // ANALYTICS - requires admin.company.view
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        Get("/search-analytics", adminHandler.GetCompanySearchAnalytics)
-                    
-                    // BENCHMARK - requires admin.company.update (modifying/search operations)
-                    r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
-                        Post("/search-benchmark", adminHandler.BenchmarkCompanySearch)
-                    
-                    // COMPANY-SPECIFIC ROUTES
-                    r.Route("/{companyID}", func(r chi.Router) {
-                        // VIEW COMPANY DETAILS - requires admin.company.view
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                            Get("/", adminHandler.GetCompany)
-                        
-                        // DEACTIVATE COMPANY - requires admin.company.suspend
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.suspend", logger)).
-                            Patch("/deactivate", adminHandler.DeactivateCompany)
-                        
-                        // REACTIVATE COMPANY - requires admin.company.update
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
-                            Patch("/activate", adminHandler.ReactivateCompany)
-                        
-                        // EXTEND SUBSCRIPTION - requires admin.company.update
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
-                            Patch("/extend-subscription", adminHandler.ExtendSubscription)
-                        
-                        // UPDATE SUBSCRIPTION - requires admin.company.update
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
-                            Patch("/subscription", adminHandler.UpdateSubscription)
-                        
-                        // VIEW STATS - requires admin.company.view
-                        // r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        //     Get("/stats", adminHandler.GetCompanyStats)
-                        
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                            Get("/rbac-stats", adminHandler.GetCompanyRBACStats)
-                        
-                        // VIEW EMPLOYEES - requires admin.company.view
-                        // r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        //     Get("/employees", adminHandler.GetCompanyEmployees)
-                        
-                        // VIEW DEPARTMENTS - requires admin.company.view
-                        // r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        //     Get("/departments", adminHandler.GetCompanyDepartments)
-                        
-                        // VIEW ROLES - requires admin.company.view
-                        // r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        //     Get("/roles", adminHandler.GetCompanyRoles)
-                        
-                        // CREATE ROLE - requires admin.company.update
-                        r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                            Post("/roles", rbacHandler.CreateRole)
-                        
-                        // VIEW HIERARCHY - requires admin.company.view
-                        // r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
-                        //     Get("/hierarchy", adminHandler.GetCompanyHierarchy)
-                        
-                        // BULK ASSIGN ROLES - requires admin.company.update
-                    })
-                })
-                
+				// ===== ADMIN MANAGEMENT ROUTES =====
+				r.Route("/admins", func(r chi.Router) {
+					// Admin stats
+					r.Get("/stats", adminHandler.GetStats)
 
-                // Employee Management
-                r.Route("/employees", func(r chi.Router) {
-                    r.Route("/{userID}", func(r chi.Router) {
-                        r.Put("/role", adminHandler.UpdateEmployeeRole)
-                        // r.Get("/permissions", adminHandler.GetEmployeePermissions)
-                        // r.Get("/hierarchy", adminHandler.GetUserHierarchy)
-                    })
-                    // r.Post("/check-permission", adminHandler.CheckEmployeePermission)
-                })
+					// Create admin
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.create", logger)).
+						Post("/", adminHandler.CreateAdminUser)
 
-                // Role Permission Management
-                // r.Route("/roles", func(r chi.Router) {
-                //     r.Route("/{roleID}", func(r chi.Router) {
-                //         r.Post("/permissions", adminHandler.GrantRolePermissions)
-                //     })
-                // })
+					// Get admin phone (super admin only)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config", logger)).
+						Get("/{adminID}/phone", adminHandler.GetAdminPhoneNumber)
 
-                // ===== LEGACY COMPATIBILITY ROUTES (remove after migration) =====
-                // Keep these temporarily if you need backward compatibility
-                r.Get("/admins/role/{roleLevel}", adminHandler.GetAdminsByRoleMask)  // Legacy string-based
-                r.Get("/admins/status/{status}", adminHandler.GetAdminsByStatus)
-                
-                // Legacy admin management routes (redirect to new ones)
-                r.Patch("/owner/phone", func(w http.ResponseWriter, r *http.Request) {
-                    // Redirect to new endpoint
-                    adminHandler.ChangeOwnPhone(w, r)
-                })
-                r.Post("/invite", func(w http.ResponseWriter, r *http.Request) {
-                    // Redirect to new bitmask endpoint
-                    adminHandler.InviteAdminWithBitmask(w, r)
-                })
-            })
-        })
-    })
+					// List admins
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/", adminHandler.ListAdmins)
 
-    // ============================================================
-    // GLOBAL ERROR HANDLERS
-    // ============================================================
-    router.NotFound(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusNotFound)
-        _ = json.NewEncoder(w).Encode(map[string]interface{}{
-            "error":   "endpoint not found",
-            "path":    r.URL.Path,
-            "method":  r.Method,
-            "service": "auth-service",
-        })
-    })
+					// Get all admins
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/all", adminHandler.GetAllAdmins)
 
-    router.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusMethodNotAllowed)
-        _ = json.NewEncoder(w).Encode(map[string]interface{}{
-            "error":   "method not allowed",
-            "path":    r.URL.Path,
-            "method":  r.Method,
-            "service": "auth-service",
-        })
-    })
+					// Get active admins
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/active", adminHandler.GetActiveAdmins)
 
-    return router
+					// Get inactive admins
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/inactive", adminHandler.GetInactiveAdmins)
+
+					// Get admins by role type
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/role-type/{roleType}", adminHandler.GetAdminsByRoleType)
+
+					// Get admins by role
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/role/{roleID}", adminHandler.GetAdminsByRole)
+
+					// Available managers
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/available-managers", adminHandler.GetAvailableManagers)
+
+					// Admin search routes
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search", adminHandler.SearchAdmins)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/advanced", adminHandler.SearchAdminsAdvanced)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/name", adminHandler.SearchAdminsByName)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/employees", adminHandler.SearchAdminEmployees)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/managers", adminHandler.SearchAdminManagers)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/suggestions", adminHandler.GetAdminSuggestions)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/analytics", adminHandler.GetAdminSearchAnalytics)
+
+					// ===== ADMIN BY ID ROUTES =====
+					r.Route("/{adminID}", func(r chi.Router) {
+						// Get admin
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/", adminHandler.GetAdminUser)
+
+						// Update admin
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Put("/", adminHandler.UpdateAdminUser)
+
+						// Delete admin
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.delete", logger)).
+							Delete("/", adminHandler.DeleteAdminUser)
+
+						// Admin profile management
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Put("/profile", adminHandler.UpdateAdminProfile)
+
+						// Change admin phone
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Put("/phone", adminHandler.ChangeAdminPhone)
+
+						// Update reports to
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Put("/reports-to", adminHandler.UpdateAdminReportsTo)
+
+						// Status management
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Post("/activate", adminHandler.ActivateAdmin)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Post("/deactivate", adminHandler.DeactivateAdmin)
+
+						// Avatar management
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Post("/avatar", adminHandler.SetAdminAvatar)
+
+						r.Get("/avatar", adminHandler.GetAdminAvatar)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Delete("/avatar", adminHandler.DeactivateAdminAvatar)
+
+						r.Get("/avatar/with-fallback", adminHandler.GetAdminAvatarWithFallback)
+						r.Get("/avatar/info", adminHandler.GetAvatarInfo)
+
+						// Hierarchy management
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/direct-reports", adminHandler.GetDirectReports)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/reporting-chain", adminHandler.GetReportingChain)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/hierarchy", adminHandler.GetAdminHierarchy)
+
+						// Permission management
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.permission.view", logger)).
+							Get("/permissions", adminHandler.GetAdminPermissions)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.permission.view", logger)).
+							Get("/permissions/mask", adminHandler.GetAdminPermissionMask)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.permission.view", logger)).
+							Get("/permissions/check", adminHandler.CheckAdminPermission)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.permission.view", logger)).
+							Get("/with-permissions", adminHandler.GetAdminWithPermissions)
+
+						// Admin details
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/details", adminHandler.GetAdminWithDetails)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/with-reports-to-name", adminHandler.GetAdminWithReportsToName)
+
+						// Department access
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+							Get("/department-access/{department}", adminHandler.CheckAdminDepartmentAccess)
+
+						// Failed login management
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Post("/reset-failed-login", adminHandler.ResetAdminFailedLoginAttempts)
+					})
+
+					// Bulk operations
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+						Post("/bulk-update-reports-to", adminHandler.BulkUpdateReportsTo)
+				})
+
+				// ===== ADMIN ROLE MANAGEMENT ROUTES =====
+				// In the router.go file, inside the RegisterRoutes method or NewRouter function:
+
+				r.Route("/roles", func(r chi.Router) {
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Post("/", adminHandler.CreateAdminRole)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.create", logger)).
+						Post("/employee", adminHandler.CreateEmployeeRole)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.manager.create", logger)).
+						Post("/manager", adminHandler.CreateManagerRole)
+						// New routes for getting roles by type
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Get("/type/{roleType}", adminHandler.GetAdminRolesByType)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
+						Get("/employee", adminHandler.GetEmployeeAdminRoles)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.manager.view", logger)).
+						Get("/manager", adminHandler.GetManagerAdminRoles)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Get("/", adminHandler.GetAdminRoles)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Get("/search", adminHandler.SearchAdminRoles)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Get("/{roleID}", adminHandler.GetAdminRole)
+					// ADD THIS NEW LINE:
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Get("/{roleID}/details", adminHandler.GetAdminRoleWithDetails)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Put("/{roleID}", adminHandler.UpdateAdminRole)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Delete("/{roleID}", adminHandler.DeleteAdminRole)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Get("/{roleID}/departments", adminHandler.GetAdminRoleDepartments)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Post("/{roleID}/departments/{departmentID}", adminHandler.AssignDepartmentToAdminRole)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+						Delete("/{roleID}/departments/{departmentID}", adminHandler.RemoveDepartmentFromAdminRole)
+				})
+
+				// ===== SYSTEM DEPARTMENT BITMASK UTILITIES =====
+				r.Route("/departments", func(r chi.Router) {
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.department.view", logger)).
+						Get("/", adminHandler.GetSystemDepartments)
+
+					// Admin by department
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/{departmentID}/admins", adminHandler.GetAdminsByDepartment)
+				})
+
+				// ===== ADMIN MPIN MANAGEMENT BY ADMIN =====
+				r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+					Post("/mpin/change-by-admin", adminHandler.ChangeAdminMPINByAdmin)
+
+				// ===== USER MANAGEMENT ROUTES (NON-ADMIN USERS) =====
+				r.Route("/user-management", func(r chi.Router) {
+					// Advanced user search
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/advanced", adminHandler.SearchUsersAdvanced)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/username", adminHandler.SearchUsersByUsername)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/search/full-name", adminHandler.SearchUsersByFullName)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/suggestions", adminHandler.GetUserSuggestions)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/kyc/{status}", adminHandler.ListUsersByKYCStatus)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/recently-active", adminHandler.GetRecentlyActiveUsers)
+
+					// Get Banned Users
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+						Get("/banned", adminHandler.GetBannedUsers)
+
+					// User by ID routes
+					r.Route("/{userID}", func(r chi.Router) {
+						// Update user
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Put("/", adminHandler.UpdateUser)
+
+						// Update User KYC
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
+							Patch("/kyc", adminHandler.UpdateUserKYC)
+
+						// Ban User
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.suspend", logger)).
+							Post("/ban", adminHandler.BanUser)
+
+						// Unban User
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.suspend", logger)).
+							Post("/unban", adminHandler.UnbanUser)
+					})
+				})
+
+				// ===== COMPANY MANAGEMENT ROUTES =====
+				r.Route("/companies", func(r chi.Router) {
+					// CREATE COMPANY
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+						Post("/", adminHandler.CreateCompany)
+
+					// GET COMPANY
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/", adminHandler.GetRecentCompanies)
+
+					// SEARCH COMPANIES
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/search", adminHandler.SearchCompanies)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/suggestions", adminHandler.GetCompanySuggestions)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/analytics/search", adminHandler.GetCompanySearchAnalytics)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+						Post("/search/benchmark", adminHandler.BenchmarkCompanySearch)
+
+					// COMPANY BY STATUS/TIER
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/status/{status}", adminHandler.GetCompaniesByStatus)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/tier/{tier}", adminHandler.GetCompaniesByTier)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/expiring", adminHandler.GetCompaniesWithExpiringSubscription)
+
+					// OWNER-SPECIFIC SEARCH
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/owner/{ownerID}/search", adminHandler.SearchCompaniesByOwner)
+
+					// COMPANY BY ID ROUTES
+					r.Route("/{companyID}", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/", adminHandler.GetCompany)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/stats", adminHandler.GetCompanyStats)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/employees", adminHandler.GetCompanyEmployees)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/departments", adminHandler.GetCompanyDepartments)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/hierarchy", adminHandler.GetCompanyHierarchy)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/rbac-stats", adminHandler.GetCompanyRBACStats)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/roles", adminHandler.GetCompanyRoles)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+							Put("/subscription", adminHandler.UpdateSubscription)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+							Post("/subscription/extend", adminHandler.ExtendSubscription)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.suspend", logger)).
+							Post("/deactivate", adminHandler.DeactivateCompany)
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+							Post("/reactivate", adminHandler.ReactivateCompany)
+					})
+				})
+
+				// ===== SYSTEM MANAGEMENT ROUTES =====
+				r.Route("/system", func(r chi.Router) {
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.department.view", logger)).
+						Get("/departments", adminHandler.GetSystemDepartments)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.permission.view", logger)).
+						Get("/permissions", adminHandler.GetAllPermissions)
+
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.permission.view", logger)).
+						Get("/permissions/module/{module}", adminHandler.GetPermissionsByModule)
+				})
+
+				// ===== BULK AVATAR INFO =====
+				r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
+					Post("/bulk-avatar-info", adminHandler.BulkGetAvatarInfo)
+
+				// ===== ADMIN OWNER ROUTES =====
+				// r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config", logger)).
+				// 	Get("/owner", adminHandler.GetAdminOwner)
+
+			})
+		})
+	})
+
+	// ============================================================
+	// GLOBAL ERROR HANDLERS
+	// ============================================================
+	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "endpoint not found",
+			"path":    r.URL.Path,
+			"method":  r.Method,
+			"service": "auth-service",
+		})
+	})
+
+	router.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "method not allowed",
+			"path":    r.URL.Path,
+			"method":  r.Method,
+			"service": "auth-service",
+		})
+	})
+
+	return router
 }
 
 // ============================================================================
@@ -541,218 +653,234 @@ func NewRouter(
 // ============================================================================
 
 func AdminSessionMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            sessionType, ok := r.Context().Value("session_type").(string)
-            if !ok || sessionType != "admin" {
-                logger.Warn("Access denied: not an admin session",
-                    zap.String("session_type", sessionType),
-                    zap.String("path", r.URL.Path),
-                )
-                respondWithJWTError(w, logger, http.StatusForbidden, "Access denied: admin session required")
-                return
-            }
-            next.ServeHTTP(w, r)
-        })
-    }
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sessionType, ok := r.Context().Value("session_type").(string)
+			if !ok || sessionType != "admin" {
+				logger.Warn("Access denied: not an admin session",
+					zap.String("session_type", sessionType),
+					zap.String("path", r.URL.Path),
+				)
+				respondWithJWTError(w, logger, http.StatusForbidden, "Access denied: admin session required")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // Enhanced Company Access Middleware
 func EnhancedCompanyAccessMiddleware(jwtService *service.JWTService, logger *zap.Logger) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            // Extract company ID from URL params
-            companyIDStr := chi.URLParam(r, "companyID")
-            companyID, err := uuid.Parse(companyIDStr)
-            if err != nil {
-                respondWithJWTError(w, logger, http.StatusBadRequest, "Invalid company ID")
-                return
-            }
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Extract company ID from URL params
+			companyIDStr := chi.URLParam(r, "companyID")
+			companyID, err := uuid.Parse(companyIDStr)
+			if err != nil {
+				respondWithJWTError(w, logger, http.StatusBadRequest, "Invalid company ID")
+				return
+			}
 
-            // Get session type from context
-            sessionType, ok := r.Context().Value("session_type").(string)
-            if !ok {
-                respondWithJWTError(w, logger, http.StatusUnauthorized, "Session type not found")
-                return
-            }
+			// Get session type from context
+			sessionType, ok := r.Context().Value("session_type").(string)
+			if !ok {
+				respondWithJWTError(w, logger, http.StatusUnauthorized, "Session type not found")
+				return
+			}
 
-            // Get user ID from context
-            userIDStr, ok := r.Context().Value("user_id").(string)
-            if !ok {
-                respondWithJWTError(w, logger, http.StatusUnauthorized, "User not authenticated")
-                return
-            }
+			// Get user ID from context
+			userIDStr, ok := r.Context().Value("user_id").(string)
+			if !ok {
+				respondWithJWTError(w, logger, http.StatusUnauthorized, "User not authenticated")
+				return
+			}
 
-            userID, err := uuid.Parse(userIDStr)
-            if err != nil {
-                respondWithJWTError(w, logger, http.StatusBadRequest, "Invalid user ID")
-                return
-            }
+			userID, err := uuid.Parse(userIDStr)
+			if err != nil {
+				respondWithJWTError(w, logger, http.StatusBadRequest, "Invalid user ID")
+				return
+			}
 
-            // For non-admin users, check company access
-            if sessionType != "admin" {
-                // Get company ID from context (validated by session validation middleware)
-                validatedCompanyID, ok := r.Context().Value("validated_company_id").(string)
-                if !ok || validatedCompanyID == "" {
-                    respondWithJWTError(w, logger, http.StatusForbidden, 
-                        "Company access denied: No validated company context")
-                    return
-                }
+			// For non-admin users, check company access
+			if sessionType != "admin" {
+				// Get company ID from context (validated by session validation middleware)
+				validatedCompanyID, ok := r.Context().Value("validated_company_id").(string)
+				if !ok || validatedCompanyID == "" {
+					respondWithJWTError(w, logger, http.StatusForbidden,
+						"Company access denied: No validated company context")
+					return
+				}
 
-                validatedCompanyUUID, err := uuid.Parse(validatedCompanyID)
-                if err != nil {
-                    respondWithJWTError(w, logger, http.StatusForbidden, 
-                        "Company access denied: Invalid company ID in validated session")
-                    return
-                }
+				validatedCompanyUUID, err := uuid.Parse(validatedCompanyID)
+				if err != nil {
+					respondWithJWTError(w, logger, http.StatusForbidden,
+						"Company access denied: Invalid company ID in validated session")
+					return
+				}
 
-                // Verify the user is accessing their own company
-                if validatedCompanyUUID != companyID {
-                    logger.Warn("Company access violation",
-                        zap.String("user_id", userID.String()),
-                        zap.String("requested_company", companyID.String()),
-                        zap.String("validated_company", validatedCompanyID),
-                        zap.String("session_type", sessionType))
-                    
-                    respondWithJWTError(w, logger, http.StatusForbidden, 
-                        "Company access denied: You can only access your own company")
-                    return
-                }
+				// Verify the user is accessing their own company
+				if validatedCompanyUUID != companyID {
+					logger.Warn("Company access violation",
+						zap.String("user_id", userID.String()),
+						zap.String("requested_company", companyID.String()),
+						zap.String("validated_company", validatedCompanyID),
+						zap.String("session_type", sessionType))
 
-                logger.Debug("Company access verified for non-admin user",
-                    zap.String("user_id", userID.String()),
-                    zap.String("company_id", companyID.String()),
-                    zap.String("session_type", sessionType))
-            } else {
-                logger.Debug("Admin user accessing company - no company restriction",
-                    zap.String("admin_id", userID.String()),
-                    zap.String("company_id", companyID.String()))
-            }
+					respondWithJWTError(w, logger, http.StatusForbidden,
+						"Company access denied: You can only access your own company")
+					return
+				}
 
-            // Add company ID and user ID to context
-            ctx := context.WithValue(r.Context(), "company_id", companyID)
-            ctx = context.WithValue(ctx, "current_user_id", userID)
+				logger.Debug("Company access verified for non-admin user",
+					zap.String("user_id", userID.String()),
+					zap.String("company_id", companyID.String()),
+					zap.String("session_type", sessionType))
+			} else {
+				logger.Debug("Admin user accessing company - no company restriction",
+					zap.String("admin_id", userID.String()),
+					zap.String("company_id", companyID.String()))
+			}
 
-            next.ServeHTTP(w, r.WithContext(ctx))
-        })
-    }
+			// Add company ID and user ID to context
+			ctx := context.WithValue(r.Context(), "company_id", companyID)
+			ctx = context.WithValue(ctx, "current_user_id", userID)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
 
 // Updated JWTAuthMiddlewareWithRedis to include bitmask handling
+// Updated JWTAuthMiddlewareWithRedis to handle role string to role type conversion
 func JWTAuthMiddlewareWithRedis(sessionService *service.SessionService, logger *zap.Logger) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            ctx := r.Context()
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := r.Context()
 
-            authHeader := r.Header.Get("Authorization")
-            if authHeader == "" {
-                respondWithJWTError(w, logger, http.StatusUnauthorized, "Missing authorization header")
-                return
-            }
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				respondWithJWTError(w, logger, http.StatusUnauthorized, "Missing authorization header")
+				return
+			}
 
-            parts := strings.Split(authHeader, " ")
-            if len(parts) != 2 || parts[0] != "Bearer" {
-                respondWithJWTError(w, logger, http.StatusUnauthorized, "Invalid authorization header format")
-                return
-            }
+			parts := strings.Split(authHeader, " ")
+			if len(parts) != 2 || parts[0] != "Bearer" {
+				respondWithJWTError(w, logger, http.StatusUnauthorized, "Invalid authorization header format")
+				return
+			}
 
-            accessToken := parts[1]
-            claims, err := sessionService.ValidateAccessToken(ctx, accessToken)
-            if err != nil {
-                logger.Warn("Invalid JWT token", zap.Error(err))
-                respondWithJWTError(w, logger, http.StatusUnauthorized, "Invalid or expired token")
-                return
-            }
+			accessToken := parts[1]
+			claims, err := sessionService.ValidateAccessToken(ctx, accessToken)
+			if err != nil {
+				logger.Warn("Invalid JWT token", zap.Error(err))
+				respondWithJWTError(w, logger, http.StatusUnauthorized, "Invalid or expired token")
+				return
+			}
 
-            // Add claims to context
-            ctx = context.WithValue(ctx, "user_id", claims.UserID)
-            ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
-            ctx = context.WithValue(ctx, "role", claims.Role)
-            ctx = context.WithValue(ctx, "session_type", claims.SessionType)
-            ctx = context.WithValue(ctx, "jti", claims.JTI)
+			// Add claims to context
+			ctx = context.WithValue(ctx, "user_id", claims.UserID)
+			ctx = context.WithValue(ctx, "device_id", claims.DeviceID)
+			ctx = context.WithValue(ctx, "role", claims.Role)
+			ctx = context.WithValue(ctx, "session_type", claims.SessionType)
+			ctx = context.WithValue(ctx, "jti", claims.JTI)
 
-            // Include permission mask and company ID in context
-            if claims.PermissionMask != nil {
-                ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
-            }
-            
-            if claims.CompanyID != "" {
-                ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
-            }
+			// Include permission mask and company ID in context
+			if claims.PermissionMask != nil {
+				ctx = context.WithValue(ctx, "permission_mask", claims.PermissionMask)
+			}
 
-            // Include bitmask-specific claims
-            if claims.AdminRoleMask != 0 {
-                ctx = context.WithValue(ctx, "admin_role_mask", claims.AdminRoleMask)
-            }
+			if claims.CompanyID != "" {
+				ctx = context.WithValue(ctx, "company_id", claims.CompanyID)
+			}
 
-            next.ServeHTTP(w, r.WithContext(ctx))
-        })
-    }
+			// Derive role type from the role string
+			roleType := deriveRoleTypeFromString(claims.Role)
+			ctx = context.WithValue(ctx, "role_type", roleType)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// Helper function to convert role string to role type integer
+func deriveRoleTypeFromString(role string) int {
+	// Convert role string to role type integer
+	switch role {
+	case "super_admin", "owner":
+		return 4 // RoleTypeSuperAdmin
+	case "admin_manager", "manager":
+		return 2 // RoleTypeManager
+	case "admin_employee", "employee":
+		return 1 // RoleTypeEmployee
+	default:
+		// Default to employee if unknown
+		return 1 // RoleTypeEmployee
+	}
 }
 
 func LoggerMiddleware(logger *zap.Logger) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            start := time.Now()
-            ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
-            next.ServeHTTP(ww, r)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			ww := chiMiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			next.ServeHTTP(ww, r)
 
-            logger.Info("HTTP request",
-                zap.String("method", r.Method),
-                zap.String("path", r.URL.Path),
-                zap.String("query", r.URL.RawQuery),
-                zap.String("remote_addr", r.RemoteAddr),
-                zap.Int("status", ww.Status()),
-                zap.Duration("duration", time.Since(start)),
-                zap.String("user_agent", r.UserAgent()),
-            )
-        })
-    }
+			logger.Info("HTTP request",
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.String("query", r.URL.RawQuery),
+				zap.String("remote_addr", r.RemoteAddr),
+				zap.Int("status", ww.Status()),
+				zap.Duration("duration", time.Since(start)),
+				zap.String("user_agent", r.UserAgent()),
+			)
+		})
+	}
 }
 
 func requireHTTPS(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-        host := r.Host
+		host := r.Host
 
-        // Allow HTTP on local dev networks:
-        if r.TLS == nil &&
-            (strings.HasPrefix(host, "localhost") ||
-                strings.HasPrefix(host, "127.0.0.1") ||
-                strings.HasPrefix(host, "192.168.") ||
-                strings.HasPrefix(host, "10.") ||
-                strings.HasPrefix(host, "172.16.")) {
+		// Allow HTTP on local dev networks:
+		if r.TLS == nil &&
+			(strings.HasPrefix(host, "localhost") ||
+				strings.HasPrefix(host, "127.0.0.1") ||
+				strings.HasPrefix(host, "192.168.") ||
+				strings.HasPrefix(host, "10.") ||
+				strings.HasPrefix(host, "172.16.")) {
 
-            next.ServeHTTP(w, r)
-            return
-        }
+			next.ServeHTTP(w, r)
+			return
+		}
 
-        // All other cases require HTTPS
-        if r.TLS == nil {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(http.StatusUpgradeRequired)
-            _ = json.NewEncoder(w).Encode(map[string]string{"error": "https required"})
-            return
-        }
+		// All other cases require HTTPS
+		if r.TLS == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUpgradeRequired)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "https required"})
+			return
+		}
 
-        next.ServeHTTP(w, r)
-    })
+		next.ServeHTTP(w, r)
+	})
 }
 
 func respondWithJWTError(w http.ResponseWriter, logger *zap.Logger, statusCode int, message string) {
-    if logger != nil {
-        logger.Warn("JWT auth error",
-            zap.Int("status_code", statusCode),
-            zap.String("message", message),
-        )
-    }
+	if logger != nil {
+		logger.Warn("JWT auth error",
+			zap.Int("status_code", statusCode),
+			zap.String("message", message),
+		)
+	}
 
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(statusCode)
-    _ = json.NewEncoder(w).Encode(map[string]interface{}{
-        "success": false,
-        "error":   message,
-        "message": "Authentication failed",
-        "code":    statusCode,
-    })
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"error":   message,
+		"message": "Authentication failed",
+		"code":    statusCode,
+	})
 }

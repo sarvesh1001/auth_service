@@ -39,25 +39,24 @@ const (
 	MaxConcurrentBatch = 10
 )
 
-
 // CompanyEmployeeSearchResult for company employee search
 type CompanyEmployeeSearchResult struct {
-    UserID          uuid.UUID  `db:"user_id" json:"user_id"`
-    Username        string     `db:"username" json:"username"`
-    FullName        *string    `db:"full_name" json:"full_name,omitempty"`
-    PhoneHash       string     `db:"phone_hash" json:"phone_hash"`
-    EmployeeID      string     `db:"employee_id" json:"employee_id"`
-    RoleID          uuid.UUID  `db:"role_id" json:"role_id"`
-    RoleName        string     `db:"role_name" json:"role_name"`
-    DepartmentID    *uuid.UUID `db:"department_id" json:"department_id,omitempty"`
-    DepartmentName  *string    `db:"department_name" json:"department_name,omitempty"`
-    HireDate        time.Time  `db:"hire_date" json:"hire_date"`
-    IsActive        bool       `db:"is_active" json:"is_active"`
-    ReportsTo       *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
-    ReportsToName   *string    `db:"reports_to_name" json:"reports_to_name,omitempty"`
-    CreatedAt       time.Time  `db:"created_at" json:"created_at"`
-    RelevanceScore  float64    `db:"relevance_score" json:"relevance_score"`
-    MatchType       string     `db:"match_type" json:"match_type"`
+	UserID         uuid.UUID  `db:"user_id" json:"user_id"`
+	Username       string     `db:"username" json:"username"`
+	FullName       *string    `db:"full_name" json:"full_name,omitempty"`
+	PhoneHash      string     `db:"phone_hash" json:"phone_hash"`
+	EmployeeID     string     `db:"employee_id" json:"employee_id"`
+	RoleID         uuid.UUID  `db:"role_id" json:"role_id"`
+	RoleName       string     `db:"role_name" json:"role_name"`
+	DepartmentID   *uuid.UUID `db:"department_id" json:"department_id,omitempty"`
+	DepartmentName *string    `db:"department_name" json:"department_name,omitempty"`
+	HireDate       time.Time  `db:"hire_date" json:"hire_date"`
+	IsActive       bool       `db:"is_active" json:"is_active"`
+	ReportsTo      *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
+	ReportsToName  *string    `db:"reports_to_name" json:"reports_to_name,omitempty"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+	RelevanceScore float64    `db:"relevance_score" json:"relevance_score"`
+	MatchType      string     `db:"match_type" json:"match_type"`
 }
 
 type UserService struct {
@@ -79,16 +78,16 @@ type RateLimiter struct {
 }
 
 type UserCreateRequest struct {
-	Username          string    `json:"username" validate:"required,min=3,max=100,alphanum"`
-	FullName          string    `json:"full_name" validate:"max=255"`
-	PhoneNumber       string    `json:"phone_number" validate:"required"`
-	DeviceID          string    `json:"device_id" validate:"required"`
-	DeviceFingerprint string    `json:"device_fingerprint" validate:"required"`
-	DataRegion        string    `json:"data_region" validate:"required"`
-	ConsentAgreed     bool      `json:"consent_agreed"`
-	ConsentVersion    string    `json:"consent_version" validate:"required"`
-	KYCStatus         string    `json:"kyc_status" validate:"omitempty,oneof=pending verified rejected under_review expired"`
-	KYCLevel          string    `json:"kyc_level" validate:"omitempty,oneof=basic advanced full"`
+	Username          string `json:"username" validate:"required,min=3,max=100,alphanum"`
+	FullName          string `json:"full_name" validate:"max=255"`
+	PhoneNumber       string `json:"phone_number" validate:"required"`
+	DeviceID          string `json:"device_id" validate:"required"`
+	DeviceFingerprint string `json:"device_fingerprint" validate:"required"`
+	DataRegion        string `json:"data_region" validate:"required"`
+	ConsentAgreed     bool   `json:"consent_agreed"`
+	ConsentVersion    string `json:"consent_version" validate:"required"`
+	KYCStatus         string `json:"kyc_status" validate:"omitempty,oneof=pending verified rejected under_review expired"`
+	KYCLevel          string `json:"kyc_level" validate:"omitempty,oneof=basic advanced full"`
 }
 
 type UserUpdateRequest struct {
@@ -603,12 +602,12 @@ func (s *UserService) UpdateUser(ctx context.Context, userID uuid.UUID, req *Use
 				Level:       "error",
 				Message:     "Failed to update user in database",
 			},
-			UserID:   userID.String(),
-			Action:   "update_user",
-			Status:   "failed",
+			UserID:    userID.String(),
+			Action:    "update_user",
+			Status:    "failed",
 			ErrorCode: "UPDATE_USER_FAILED",
-			Changes:  changes,
-			Duration: int64(time.Since(startTime).Milliseconds()),
+			Changes:   changes,
+			Duration:  int64(time.Since(startTime).Milliseconds()),
 		})
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
@@ -818,14 +817,14 @@ func (s *UserService) CreateUsersBatch(ctx context.Context, requests []*UserCrea
 
 	phoneHashes := make(map[string]bool, len(requests))
 	usernames := make(map[string]bool, len(requests))
-	
+
 	for _, req := range requests {
 		phoneHash := s.GeneratePhoneHash(req.PhoneNumber)
 		if phoneHashes[phoneHash] {
 			return nil, fmt.Errorf("duplicate phone number in batch: %s", req.PhoneNumber)
 		}
 		phoneHashes[phoneHash] = true
-		
+
 		if usernames[req.Username] {
 			return nil, fmt.Errorf("duplicate username in batch: %s", req.Username)
 		}
@@ -919,7 +918,6 @@ func (s *UserService) GetUsersByIDBatch(ctx context.Context, userIDs []uuid.UUID
 	allUsers := append(cachedUsers, fetchedUsers...)
 	return allUsers, nil
 }
-
 func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest) error {
 	startTime := time.Now()
 
@@ -928,22 +926,38 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 		return err
 	}
 
+	// Check if anything actually changed
+	if user.KYCStatus == req.Status && user.KYCLevel == req.Level {
+		s.logger.Info("KYC status unchanged, skipping update",
+			util.String("user_id", req.UserID.String()),
+			util.String("status", req.Status),
+			util.String("level", req.Level),
+		)
+		return nil // Nothing to update
+	}
+
+	// Validate the transition
 	if err := s.validateKYCStatusTransition(user.KYCStatus, req.Status); err != nil {
 		return err
 	}
 
 	now := time.Now().UTC()
 	fields := map[string]interface{}{
-		"kyc_status":      req.Status,
-		"kyc_level":       req.Level,
-		"kyc_verified_at": &now,
-		"updated_at":      now,
+		"kyc_status": req.Status,
+		"kyc_level":  req.Level,
+		"updated_at": now,
+	}
+
+	// Only set kyc_verified_at if status is changing to verified and wasn't already verified
+	if req.Status == models.KYCStatusVerified && user.KYCStatus != models.KYCStatusVerified {
+		fields["kyc_verified_at"] = &now
 	}
 
 	if req.Status == models.KYCStatusVerified {
 		fields["is_verified"] = true
 	}
 
+	// Update database fields
 	if err := s.userRepo.UpdateUserFields(ctx, req.UserID, fields); err != nil {
 		s.logUserEvent(ctx, &models.UserLogEvent{
 			LogEnvelope: models.LogEnvelope{
@@ -968,10 +982,15 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 	oldStatus := user.KYCStatus
 	oldLevel := user.KYCLevel
 
+	// Update the cached user object
 	user.KYCStatus = req.Status
 	user.KYCLevel = req.Level
-	user.KYCVerifiedAt = &now
 	user.UpdatedAt = now
+
+	// Only update KYCVerifiedAt if status is changing to verified
+	if req.Status == models.KYCStatusVerified && oldStatus != models.KYCStatusVerified {
+		user.KYCVerifiedAt = &now
+	}
 
 	if req.Status == models.KYCStatusVerified {
 		user.IsVerified = true
@@ -1000,6 +1019,7 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 			"old_level":   oldLevel,
 			"new_level":   req.Level,
 			"verified_by": req.VerifiedBy.String(),
+			"reason":      req.Reason,
 		},
 		Duration: int64(time.Since(startTime).Milliseconds()),
 	})
@@ -1009,10 +1029,105 @@ func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest
 		util.String("status", req.Status),
 		util.String("level", req.Level),
 		util.String("verified_by", req.VerifiedBy.String()),
+		util.Duration("duration", time.Since(startTime)),
 	)
 
 	return nil
 }
+
+// func (s *UserService) UpdateKYCStatus(ctx context.Context, req *KYCUpdateRequest) error {
+// 	startTime := time.Now()
+
+// 	user, err := s.GetUserByID(ctx, req.UserID)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	if err := s.validateKYCStatusTransition(user.KYCStatus, req.Status); err != nil {
+// 		return err
+// 	}
+
+// 	now := time.Now().UTC()
+// 	fields := map[string]interface{}{
+// 		"kyc_status":      req.Status,
+// 		"kyc_level":       req.Level,
+// 		"kyc_verified_at": &now,
+// 		"updated_at":      now,
+// 	}
+
+// 	if req.Status == models.KYCStatusVerified {
+// 		fields["is_verified"] = true
+// 	}
+
+// 	if err := s.userRepo.UpdateUserFields(ctx, req.UserID, fields); err != nil {
+// 		s.logUserEvent(ctx, &models.UserLogEvent{
+// 			LogEnvelope: models.LogEnvelope{
+// 				EventID:     uuid.New().String(),
+// 				EventType:   "user",
+// 				ServiceName: "auth-service",
+// 				Timestamp:   time.Now(),
+// 				Environment: "production",
+// 				Version:     "v1.0.0",
+// 				Level:       "error",
+// 				Message:     "Failed to update KYC status in database",
+// 			},
+// 			UserID:    req.UserID.String(),
+// 			Action:    "update_kyc_status",
+// 			Status:    "failed",
+// 			ErrorCode: "UPDATE_KYC_FAILED",
+// 			Duration:  int64(time.Since(startTime).Milliseconds()),
+// 		})
+// 		return fmt.Errorf("failed to update KYC status: %w", err)
+// 	}
+
+// 	oldStatus := user.KYCStatus
+// 	oldLevel := user.KYCLevel
+
+// 	user.KYCStatus = req.Status
+// 	user.KYCLevel = req.Level
+// 	user.KYCVerifiedAt = &now
+// 	user.UpdatedAt = now
+
+// 	if req.Status == models.KYCStatusVerified {
+// 		user.IsVerified = true
+// 	}
+
+// 	s.invalidateUserCache(ctx, req.UserID)
+// 	s.cacheUser(ctx, user)
+
+// 	s.logUserEvent(ctx, &models.UserLogEvent{
+// 		LogEnvelope: models.LogEnvelope{
+// 			EventID:     uuid.New().String(),
+// 			EventType:   "user",
+// 			ServiceName: "auth-service",
+// 			Timestamp:   time.Now(),
+// 			Environment: "production",
+// 			Version:     "v1.0.0",
+// 			Level:       "info",
+// 			Message:     "KYC status updated successfully",
+// 		},
+// 		UserID: req.UserID.String(),
+// 		Action: "update_kyc_status",
+// 		Status: "success",
+// 		Changes: map[string]interface{}{
+// 			"old_status":  oldStatus,
+// 			"new_status":  req.Status,
+// 			"old_level":   oldLevel,
+// 			"new_level":   req.Level,
+// 			"verified_by": req.VerifiedBy.String(),
+// 		},
+// 		Duration: int64(time.Since(startTime).Milliseconds()),
+// 	})
+
+// 	s.logger.Info("KYC status updated",
+// 		util.String("user_id", req.UserID.String()),
+// 		util.String("status", req.Status),
+// 		util.String("level", req.Level),
+// 		util.String("verified_by", req.VerifiedBy.String()),
+// 	)
+
+// 	return nil
+// }
 
 func (s *UserService) GetUsersByKYCStatus(ctx context.Context, status string, limit, offset int) ([]*models.User, int, error) {
 	if limit <= 0 || limit > 1000 {
@@ -1199,6 +1314,11 @@ func isValidKYCLevel(level string) bool {
 }
 
 func (s *UserService) validateKYCStatusTransition(currentStatus, newStatus string) error {
+	// Allow same status transitions (for updating level/reason)
+	if currentStatus == newStatus {
+		return nil
+	}
+
 	validTransitions := map[string][]string{
 		models.KYCStatusPending:     {models.KYCStatusVerified, models.KYCStatusRejected, models.KYCStatusUnderReview},
 		models.KYCStatusVerified:    {models.KYCStatusExpired, models.KYCStatusRejected},
@@ -1867,136 +1987,131 @@ func min(a, b int) int {
 	return b
 }
 
-
-
 // SearchCompanyEmployees searches employees within a specific company
 func (s *UserService) SearchCompanyEmployees(ctx context.Context, req *models.CompanyEmployeeSearchRequest) ([]*models.CompanyEmployeeSearchResult, int, error) {
-    startTime := time.Now()
+	startTime := time.Now()
 
-    if req.Limit <= 0 || req.Limit > 100 {
-        req.Limit = 50
-    }
-    if req.Offset < 0 {
-        req.Offset = 0
-    }
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 50
+	}
+	if req.Offset < 0 {
+		req.Offset = 0
+	}
 
-    // You might want to add authorization check here
-    // For example, verify that the requesting user has access to this company
-    
-    results, total, err := s.userRepo.SearchCompanyEmployees(ctx, req)
-    if err != nil {
-        return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
-    }
+	// You might want to add authorization check here
+	// For example, verify that the requesting user has access to this company
 
-    s.logger.Debug("Company employee search completed",
-        util.String("company_id", req.CompanyID.String()),
-        util.String("query", req.Query),
-        util.Int("results", len(results)),
-        util.Int("total", total),
-        util.Duration("duration", time.Since(startTime)))
+	results, total, err := s.userRepo.SearchCompanyEmployees(ctx, req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
+	}
 
-    return results, total, nil
+	s.logger.Debug("Company employee search completed",
+		util.String("company_id", req.CompanyID.String()),
+		util.String("query", req.Query),
+		util.Int("results", len(results)),
+		util.Int("total", total),
+		util.Duration("duration", time.Since(startTime)))
+
+	return results, total, nil
 }
 
 // SearchCompanyEmployeesAdvanced searches employees with advanced filters
 func (s *UserService) SearchCompanyEmployeesAdvanced(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*models.User, int, error) {
-    if limit <= 0 || limit > 1000 {
-        limit = 100
-    }
-    if offset < 0 {
-        offset = 0
-    }
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
 
-    users, total, err := s.userRepo.SearchCompanyEmployeesAdvanced(ctx, companyID, filters, limit, offset)
-    if err != nil {
-        return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
-    }
+	users, total, err := s.userRepo.SearchCompanyEmployeesAdvanced(ctx, companyID, filters, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to search company employees: %w", err)
+	}
 
-    // Cache found users
-    for _, user := range users {
-        s.cacheUser(ctx, user)
-    }
+	// Cache found users
+	for _, user := range users {
+		s.cacheUser(ctx, user)
+	}
 
-    return users, total, nil
+	return users, total, nil
 }
 
 // GetCompanyEmployeeSuggestions returns employee suggestions for autocomplete within a company
 func (s *UserService) GetCompanyEmployeeSuggestions(ctx context.Context, companyID uuid.UUID, prefix string, limit int) ([]*models.UserSuggestion, error) {
-    if limit <= 0 || limit > 20 {
-        limit = 10
-    }
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
 
-    suggestions, err := s.userRepo.GetCompanyEmployeeSuggestions(ctx, companyID, prefix, limit)
-    if err != nil {
-        return nil, fmt.Errorf("failed to get company employee suggestions: %w", err)
-    }
+	suggestions, err := s.userRepo.GetCompanyEmployeeSuggestions(ctx, companyID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get company employee suggestions: %w", err)
+	}
 
-    return suggestions, nil
+	return suggestions, nil
 }
-
-
 
 // FindCompanyEmployeeByUsername finds an employee by username within a company
 func (s *UserService) FindCompanyEmployeeByUsername(ctx context.Context, companyID uuid.UUID, username string) (*models.User, error) {
-    empUser, err := s.userRepo.FindCompanyEmployeeByUsername(ctx, companyID, username)
-    if err != nil {
-        return nil, fmt.Errorf("failed to find company employee by username: %w", err)
-    }
-    
-    // Convert CompanyEmployeeUser to User
-    if empUser == nil {
-        return nil, nil
-    }
-    
-    fullName := ""
-    if empUser.FullName != nil {
-        fullName = *empUser.FullName
-    }
-    
-    user := &models.User{
-        UserID:            empUser.UserID,
-        Username:          empUser.Username,
-        FullName:          fullName,
-        PhoneHash:         empUser.PhoneHash,
-        PhoneEncrypted:    nil, // These might not be available in CompanyEmployeeUser
-        PhoneEncryptedDEK: "",
-        PhoneKeyID:        uuid.Nil,
-        DeviceID:          "",
-        DeviceFingerprint: "",
-        KYCStatus:         "",
-        KYCLevel:          "",
-        IsVerified:        false,
-        IsActive:          empUser.IsActive,
-        DataRegion:        "",
-        CreatedAt:         time.Time{},
-        UpdatedAt:         time.Time{},
-    }
-    
-	s.cacheUser(ctx, user)
-    return user, nil
-}
+	empUser, err := s.userRepo.FindCompanyEmployeeByUsername(ctx, companyID, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find company employee by username: %w", err)
+	}
 
+	// Convert CompanyEmployeeUser to User
+	if empUser == nil {
+		return nil, nil
+	}
+
+	fullName := ""
+	if empUser.FullName != nil {
+		fullName = *empUser.FullName
+	}
+
+	user := &models.User{
+		UserID:            empUser.UserID,
+		Username:          empUser.Username,
+		FullName:          fullName,
+		PhoneHash:         empUser.PhoneHash,
+		PhoneEncrypted:    nil, // These might not be available in CompanyEmployeeUser
+		PhoneEncryptedDEK: "",
+		PhoneKeyID:        uuid.Nil,
+		DeviceID:          "",
+		DeviceFingerprint: "",
+		KYCStatus:         "",
+		KYCLevel:          "",
+		IsVerified:        false,
+		IsActive:          empUser.IsActive,
+		DataRegion:        "",
+		CreatedAt:         time.Time{},
+		UpdatedAt:         time.Time{},
+	}
+
+	s.cacheUser(ctx, user)
+	return user, nil
+}
 
 // GetBannedUsers returns users with is_active = false
 func (s *UserService) GetBannedUsers(ctx context.Context, limit, offset int) ([]*models.User, int, error) {
-    startTime := time.Now()
-    
-    if limit <= 0 || limit > 1000 {
-        limit = 100
-    }
-    if offset < 0 {
-        offset = 0
-    }
+	startTime := time.Now()
 
-    users, total, err := s.userRepo.GetBannedUsers(ctx, limit, offset)
-    if err != nil {
-        return nil, 0, fmt.Errorf("failed to get banned users: %w", err)
-    }
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
 
-    s.logger.Debug("Banned users retrieved",
-        util.Int("count", len(users)),
-        util.Int("total", total),
-        util.Duration("duration", time.Since(startTime)))
+	users, total, err := s.userRepo.GetBannedUsers(ctx, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get banned users: %w", err)
+	}
 
-    return users, total, nil
+	s.logger.Debug("Banned users retrieved",
+		util.Int("count", len(users)),
+		util.Int("total", total),
+		util.Duration("duration", time.Since(startTime)))
+
+	return users, total, nil
 }
