@@ -5155,7 +5155,7 @@ func (h *AdminHandler) InitSuperAdminHandler(w http.ResponseWriter, r *http.Requ
 		"full_name":          admin.FullName,
 		"role_type":          admin.RoleType,
 		"role_string":        admin.GetRoleString(),
-		"phone_number":       "7206583437", // Returning for reference
+		"phone_number":       "+917206583437", // Returning for reference
 		"is_active":          admin.IsActive,
 		"created_at":         admin.AdminCreatedAt,
 		"message":            "Default super admin (Sarvesh Chhabra) initialized successfully",
@@ -6712,4 +6712,101 @@ func (h *AdminHandler) sanitizeUserForAdminResponse(user *models.User) map[strin
 		"device_id":          user.DeviceID,
 		"device_fingerprint": user.DeviceFingerprint,
 	}
+}
+
+// GetAdminDepartments gets all departments assigned to an admin user
+func (h *AdminHandler) GetAdminDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	adminIDStr := chi.URLParam(r, "adminID")
+	adminID, err := uuid.Parse(adminIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
+
+	departments, err := h.adminService.GetAdminDepartments(ctx, adminID, requesterID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get admin departments")
+		return
+	}
+
+	response := map[string]interface{}{
+		"departments": departments,
+		"meta": map[string]interface{}{
+			"admin_id": adminID.String(),
+			"count":    len(departments),
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Admin departments retrieved successfully"))
+
+	h.logger.Debug("Admin departments retrieved",
+		util.String("requester_id", requesterID.String()),
+		util.String("admin_id", adminID.String()),
+		util.Int("department_count", len(departments)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// UpdateAdminUserRole updates an admin user's role
+func (h *AdminHandler) UpdateAdminUserRole(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	// Get requester admin ID (who is making the change)
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	// Get admin ID from URL parameter
+	adminIDStr := chi.URLParam(r, "adminID")
+	adminID, err := uuid.Parse(adminIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+		return
+	}
+
+	// Parse request body
+	var req struct {
+		NewRoleID string `json:"new_role_id" validate:"required,uuid"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Validate new role ID
+	newRoleID, err := uuid.Parse(req.NewRoleID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid role ID")
+		return
+	}
+
+	// Call the service method
+	if err := h.adminService.UpdateAdminUserRole(ctx, adminID, newRoleID, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update admin user role")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Admin user role updated successfully"))
+
+	h.logger.Info("Admin user role updated",
+		util.String("admin_id", adminID.String()),
+		util.String("new_role_id", newRoleID.String()),
+		util.String("updated_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
 }

@@ -340,6 +340,8 @@ func NewRouter(
 						// Get admin
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.view", logger)).
 							Get("/", adminHandler.GetAdminUser)
+						// Add this new route for getting admin departments
+						r.Get("/departments", adminHandler.GetAdminDepartments)
 
 						// Update admin
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
@@ -349,6 +351,8 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.delete", logger)).
 							Delete("/", adminHandler.DeleteAdminUser)
 
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+							Put("/role", adminHandler.UpdateAdminUserRole)
 						// Admin profile management
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.user.update", logger)).
 							Put("/profile", adminHandler.UpdateAdminProfile)
@@ -427,40 +431,74 @@ func NewRouter(
 				// ===== ADMIN ROLE MANAGEMENT ROUTES =====
 				// In the router.go file, inside the RegisterRoutes method or NewRouter function:
 
+				// ===== ADMIN ROLE MANAGEMENT ROUTES =====
 				r.Route("/roles", func(r chi.Router) {
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Post("/", adminHandler.CreateAdminRole)
+					// ===== EMPLOYEE ROLE MANAGEMENT (Employee Management Dept) =====
+					// Create employee role
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.create", logger)).
 						Post("/employee", adminHandler.CreateEmployeeRole)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.manager.create", logger)).
-						Post("/manager", adminHandler.CreateManagerRole)
-						// New routes for getting roles by type
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Get("/type/{roleType}", adminHandler.GetAdminRolesByType)
+
+					// Get employee roles
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 						Get("/employee", adminHandler.GetEmployeeAdminRoles)
+
+					// ===== MANAGER ROLE MANAGEMENT (Manager Management Dept) =====
+					// Create manager role
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.manager.create", logger)).
+						Post("/manager", adminHandler.CreateManagerRole)
+
+					// Get manager roles
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.manager.view", logger)).
 						Get("/manager", adminHandler.GetManagerAdminRoles)
 
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+					// ===== GENERAL ROLE MANAGEMENT (Company Management Dept) =====
+					// Create general admin role (if needed)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.create", logger)).
+						Post("/", adminHandler.CreateAdminRole)
+
+					// Get all roles
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
 						Get("/", adminHandler.GetAdminRoles)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
+
+					// Search roles
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
 						Get("/search", adminHandler.SearchAdminRoles)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Get("/{roleID}", adminHandler.GetAdminRole)
-					// ADD THIS NEW LINE:
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Get("/{roleID}/details", adminHandler.GetAdminRoleWithDetails)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Put("/{roleID}", adminHandler.UpdateAdminRole)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Delete("/{roleID}", adminHandler.DeleteAdminRole)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Get("/{roleID}/departments", adminHandler.GetAdminRoleDepartments)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Post("/{roleID}/departments/{departmentID}", adminHandler.AssignDepartmentToAdminRole)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_roles", logger)).
-						Delete("/{roleID}/departments/{departmentID}", adminHandler.RemoveDepartmentFromAdminRole)
+
+					// Get roles by type
+					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+						Get("/type/{roleType}", adminHandler.GetAdminRolesByType)
+
+					// ===== ROLE-SPECIFIC OPERATIONS =====
+					r.Route("/{roleID}", func(r chi.Router) {
+						// Get role by ID
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/", adminHandler.GetAdminRole)
+
+						// Get role with details
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/details", adminHandler.GetAdminRoleWithDetails)
+
+						// Update role
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+							Put("/", adminHandler.UpdateAdminRole)
+
+						// Delete role
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.delete", logger)).
+							Delete("/", adminHandler.DeleteAdminRole)
+
+						// ===== ROLE DEPARTMENT MANAGEMENT =====
+						// Get role departments
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
+							Get("/departments", adminHandler.GetAdminRoleDepartments)
+
+						// Assign department to role
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+							Post("/departments/{departmentID}", adminHandler.AssignDepartmentToAdminRole)
+
+						// Remove department from role
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.update", logger)).
+							Delete("/departments/{departmentID}", adminHandler.RemoveDepartmentFromAdminRole)
+					})
 				})
 
 				// ===== SYSTEM DEPARTMENT BITMASK UTILITIES =====

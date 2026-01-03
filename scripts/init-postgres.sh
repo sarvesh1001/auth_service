@@ -759,7 +759,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
                 ar.role_name, au.admin_role_id, au.role_type,
                 au.reports_to, ru.full_name as reports_to_name,
                 au.is_active, au.last_login, au.admin_created_at,
-                ts_rank(au.user_search_tsv, plainto_tsquery('simple', search_query_param)) as relevance_score,
+                ts_rank(au.user_search_tsv, plainto_tsquery('simple', search_query_param))::FLOAT as relevance_score,
                 'fulltext'::TEXT as match_type
             FROM admin_users au
             JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
@@ -957,8 +957,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
                     GREATEST(
                         COALESCE(similarity(u.username, $' || param_counter || '), 0),
                         COALESCE(similarity(u.full_name, $' || param_counter || '), 0)
-                    )::FLOAT as relevance_score,
-                    ''autocomplete'' as match_type
+                    )::FLOAT AS relevance_score,
+                    ''autocomplete'' AS match_type
                 FROM users u
                 WHERE 1=1 ' || where_clause ||
                 ' AND (u.username ILIKE $' || (param_counter + 1) ||
@@ -966,13 +966,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
                 ORDER BY relevance_score DESC, u.username ASC
                 LIMIT $' || (param_counter + 2) || ' OFFSET $' || (param_counter + 3);
 
-            -- Add search query and pattern as parameters
-            query_params := array_append(query_params, search_query); -- For similarity
-            query_params := array_append(query_params, '%' || search_query || '%'); -- For ILIKE pattern
+            -- Add parameters
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, '%' || search_query || '%');
             query_params := array_append(query_params, limit_count::TEXT);
             query_params := array_append(query_params, offset_count::TEXT);
         ELSE
-            -- Full-text search for complete words
+            -- Full-text search (🔥 FIXED)
             base_query := '
                 SELECT
                     u.user_id,
@@ -986,22 +986,26 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
                     u.data_region,
                     u.created_at,
                     u.last_login,
-                    ts_rank(u.user_search_tsv, plainto_tsquery(''simple'', $' || param_counter || '::text)) as relevance_score,
-                    ''fulltext'' as match_type
+                    ts_rank(
+                        u.user_search_tsv,
+                        plainto_tsquery(''simple'', $' || param_counter || '::text)
+                    )::FLOAT AS relevance_score,
+                    ''fulltext'' AS match_type
                 FROM users u
                 WHERE 1=1 ' || where_clause ||
                 ' AND u.user_search_tsv @@ plainto_tsquery(''simple'', $' || param_counter || '::text)
                 ORDER BY relevance_score DESC, u.username ASC
                 LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
 
-            -- Add search query, limit, and offset as parameters
+            -- Add parameters
             query_params := array_append(query_params, search_query);
             query_params := array_append(query_params, limit_count::TEXT);
             query_params := array_append(query_params, offset_count::TEXT);
         END IF;
 
-        -- Execute the query with all parameters
+        -- Execute the query
         RETURN QUERY EXECUTE base_query USING query_params;
+
     EXCEPTION
         WHEN OTHERS THEN
             RAISE NOTICE 'Error in user_search: %', SQLERRM;
@@ -1009,7 +1013,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
             RAISE NOTICE 'Params: %', query_params;
             RAISE;
     END;
-    $$ LANGUAGE plpgsql;
+    $$ LANGUAGE plpgsql STABLE;
+
 
     CREATE OR REPLACE FUNCTION company_search(
         search_query TEXT,

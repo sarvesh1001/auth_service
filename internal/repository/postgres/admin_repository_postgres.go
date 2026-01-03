@@ -537,36 +537,36 @@ func (r *AdminRepositoryPostgres) UpdateAdminProfile(ctx context.Context, adminI
 
 // ===== PHONE & LOGIN =====
 
-func (r *AdminRepositoryPostgres) UpdateAdminPhone(
-	ctx context.Context,
-	adminID uuid.UUID,
-	phoneHash string,
-	phoneEncrypted []byte,
-	phoneKeyID uuid.UUID,
-	phoneEncryptedDEK string,
-) error {
-	query := `
-        UPDATE admin_users 
-        SET phone_hash = $1, phone_encrypted = $2, phone_key_id = $3, 
-            phone_encrypted_dek = $4, admin_updated_at = $5 
-        WHERE admin_id = $6`
+// func (r *AdminRepositoryPostgres) UpdateAdminPhone(
+// 	ctx context.Context,
+// 	adminID uuid.UUID,
+// 	phoneHash string,
+// 	phoneEncrypted []byte,
+// 	phoneKeyID uuid.UUID,
+// 	phoneEncryptedDEK string,
+// ) error {
+// 	query := `
+//         UPDATE admin_users
+//         SET phone_hash = $1, phone_encrypted = $2, phone_key_id = $3,
+//             phone_encrypted_dek = $4, admin_updated_at = $5
+//         WHERE admin_id = $6`
 
-	result, err := r.client.Exec(ctx, query,
-		phoneHash, phoneEncrypted, phoneKeyID, phoneEncryptedDEK, time.Now().UTC(), adminID)
-	if err != nil {
-		return fmt.Errorf("failed to update admin phone: %w", err)
-	}
+// 	result, err := r.client.Exec(ctx, query,
+// 		phoneHash, phoneEncrypted, phoneKeyID, phoneEncryptedDEK, time.Now().UTC(), adminID)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to update admin phone: %w", err)
+// 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("admin not found: %s", adminID)
-	}
+// 	rowsAffected, _ := result.RowsAffected()
+// 	if rowsAffected == 0 {
+// 		return fmt.Errorf("admin not found: %s", adminID)
+// 	}
 
-	r.logger.Info("Admin phone updated",
-		util.String("admin_id", adminID.String()))
+// 	r.logger.Info("Admin phone updated",
+// 		util.String("admin_id", adminID.String()))
 
-	return nil
-}
+// 	return nil
+// }
 
 func (r *AdminRepositoryPostgres) UpdateAdminLastLogin(ctx context.Context, adminID uuid.UUID) error {
 	query := `
@@ -3565,18 +3565,41 @@ func (r *AdminRepositoryPostgres) IsPermissionGrantedToRole(ctx context.Context,
 }
 
 // GetPermissionByName retrieves a permission by its name
+// func (r *AdminRepositoryPostgres) GetPermissionByName(ctx context.Context, name string) (*models.Permission, error) {
+// 	query := `
+//         SELECT permission_id, permission_name, description, category,
+//                module, scope, requires_tier, bit_index, created_at
+//         FROM permissions
+//         WHERE permission_name = $1
+//         AND (scope = 'admin' OR scope = 'both')`
+
+//		var perm models.Permission
+//		err := r.client.QueryRow(ctx, query, name).Scan(
+//			&perm.PermissionID, &perm.PermissionName, &perm.Description, &perm.Category,
+//			&perm.Module, &perm.Scope, &perm.RequiresTier, &perm.BitIndex, &perm.CreatedAt,
+//		)
+//		if err != nil {
+//			if err == sql.ErrNoRows {
+//				return nil, fmt.Errorf("permission not found: %s", name)
+//			}
+//			return nil, fmt.Errorf("failed to get permission: %w", err)
+//		}
+//		return &perm, nil
+//	}
+//
+// GetPermissionByName retrieves a permission by its name (without scope filtering for admin)
 func (r *AdminRepositoryPostgres) GetPermissionByName(ctx context.Context, name string) (*models.Permission, error) {
 	query := `
         SELECT permission_id, permission_name, description, category, 
                module, scope, requires_tier, bit_index, created_at
         FROM permissions
-        WHERE permission_name = $1
-        AND (scope = 'admin' OR scope = 'both')`
+        WHERE permission_name = $1`
 
 	var perm models.Permission
+	var bitIndex sql.NullInt32
 	err := r.client.QueryRow(ctx, query, name).Scan(
 		&perm.PermissionID, &perm.PermissionName, &perm.Description, &perm.Category,
-		&perm.Module, &perm.Scope, &perm.RequiresTier, &perm.BitIndex, &perm.CreatedAt,
+		&perm.Module, &perm.Scope, &perm.RequiresTier, &bitIndex, &perm.CreatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -3584,6 +3607,12 @@ func (r *AdminRepositoryPostgres) GetPermissionByName(ctx context.Context, name 
 		}
 		return nil, fmt.Errorf("failed to get permission: %w", err)
 	}
+
+	// Handle nullable bit_index
+	if bitIndex.Valid {
+		perm.BitIndex = int(bitIndex.Int32)
+	}
+
 	return &perm, nil
 }
 
@@ -3723,62 +3752,63 @@ func (r *AdminRepositoryPostgres) GetAdminRolesByType(ctx context.Context, roleT
 	r.recordQuery()
 	return roles, nil
 }
-func (r *AdminRepositoryPostgres) SearchAdminUsers(ctx context.Context, req *models.AdminUserSearchRequest) ([]*models.AdminUserSearchResult, int, error) {
-	if req.Limit <= 0 || req.Limit > 100 {
-		req.Limit = 50
-	}
-	if req.Offset < 0 {
-		req.Offset = 0
-	}
 
-	// Ensure search_type has a default value
-	if req.SearchType == "" {
-		req.SearchType = "all"
-	}
+// func (r *AdminRepositoryPostgres) SearchAdminUsers(ctx context.Context, req *models.AdminUserSearchRequest) ([]*models.AdminUserSearchResult, int, error) {
+// 	if req.Limit <= 0 || req.Limit > 100 {
+// 		req.Limit = 50
+// 	}
+// 	if req.Offset < 0 {
+// 		req.Offset = 0
+// 	}
 
-	query := `
-        SELECT
-            admin_id, username, full_name, phone_hash,
-            role_name, admin_role_id, role_type,
-            reports_to, reports_to_name,
-            is_active, last_login, admin_created_at,
-            relevance_score, match_type
-        FROM search_admin_users($1, $2, $3, $4, $5, $6)`
+// 	// Ensure search_type has a default value
+// 	if req.SearchType == "" {
+// 		req.SearchType = "all"
+// 	}
 
-	var roleTypeFilter interface{}
-	if req.RoleTypeFilter != nil {
-		roleTypeFilter = *req.RoleTypeFilter
-	} else {
-		roleTypeFilter = nil
-	}
+// 	query := `
+//         SELECT
+//             admin_id, username, full_name, phone_hash,
+//             role_name, admin_role_id, role_type,
+//             reports_to, reports_to_name,
+//             is_active, last_login, admin_created_at,
+//             relevance_score, match_type
+//         FROM search_admin_users($1, $2, $3, $4, $5, $6)`
 
-	rows, err := r.client.Query(ctx, query,
-		req.Query,           // $1: search_query
-		roleTypeFilter,      // $2: role_type_filter (NULL if not specified)
-		req.IncludeInactive, // $3: include_inactive
-		req.SearchType,      // $4: search_type
-		req.Limit,           // $5: limit_count
-		req.Offset,          // $6: offset_count
-	)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to search admin users: %w", err)
-	}
-	defer rows.Close()
+// 	var roleTypeFilter interface{}
+// 	if req.RoleTypeFilter != nil {
+// 		roleTypeFilter = *req.RoleTypeFilter
+// 	} else {
+// 		roleTypeFilter = nil
+// 	}
 
-	results, err := r.scanAdminSearchResults(rows)
-	if err != nil {
-		return nil, 0, err
-	}
+// 	rows, err := r.client.Query(ctx, query,
+// 		req.Query,           // $1: search_query
+// 		roleTypeFilter,      // $2: role_type_filter (NULL if not specified)
+// 		req.IncludeInactive, // $3: include_inactive
+// 		req.SearchType,      // $4: search_type
+// 		req.Limit,           // $5: limit_count
+// 		req.Offset,          // $6: offset_count
+// 	)
+// 	if err != nil {
+// 		r.recordError()
+// 		return nil, 0, fmt.Errorf("failed to search admin users: %w", err)
+// 	}
+// 	defer rows.Close()
 
-	totalCount, err := r.countAdminUserSearchResults(ctx, req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
-	}
+// 	results, err := r.scanAdminSearchResults(rows)
+// 	if err != nil {
+// 		return nil, 0, err
+// 	}
 
-	r.recordQuery()
-	return results, totalCount, nil
-}
+// 	totalCount, err := r.countAdminUserSearchResults(ctx, req)
+// 	if err != nil {
+// 		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
+// 	}
+
+// 	r.recordQuery()
+// 	return results, totalCount, nil
+// }
 
 // In AdminRepositoryPostgres
 func (r *AdminRepositoryPostgres) GetAdminRoleByName(ctx context.Context, roleName string) (*models.AdminRole, error) {
@@ -3802,4 +3832,307 @@ func (r *AdminRepositoryPostgres) GetAdminRoleByName(ctx context.Context, roleNa
 
 	r.recordQuery()
 	return &role, nil
+}
+
+func (r *AdminRepositoryPostgres) GetAdminDepartments(
+	ctx context.Context,
+	adminID uuid.UUID,
+) ([]*models.SystemDepartment, error) {
+	query := `
+        SELECT DISTINCT
+            sd.system_department_id,
+            sd.name,
+            sd.module_code,
+            sd.description,
+            sd.bitmask
+        FROM admin_users au
+        INNER JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+        INNER JOIN admin_role_departments ard ON ar.admin_role_id = ard.admin_role_id
+        INNER JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
+        WHERE au.admin_id = $1
+        AND au.is_active = true
+        ORDER BY sd.name`
+
+	rows, err := r.client.Query(ctx, query, adminID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query admin departments: %w", err)
+	}
+	defer rows.Close()
+
+	var departments []*models.SystemDepartment
+	for rows.Next() {
+		var dept models.SystemDepartment
+		err := rows.Scan(
+			&dept.SystemDepartmentID,
+			&dept.Name,
+			&dept.ModuleCode,
+			&dept.Description,
+			&dept.Bitmask,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan department: %w", err)
+		}
+		departments = append(departments, &dept)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating department rows: %w", err)
+	}
+
+	r.recordQuery()
+	return departments, nil
+}
+func (r *AdminRepositoryPostgres) SearchAdminUsers(
+	ctx context.Context,
+	req *models.AdminUserSearchRequest,
+) ([]*models.AdminUserSearchResult, int, error) {
+
+	// --------- Guards ----------
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 50
+	}
+	if req.Offset < 0 {
+		req.Offset = 0
+	}
+	if req.SearchType == "" {
+		req.SearchType = "autocomplete" // safest default
+	}
+
+	// --------- SQL (explicit casting) ----------
+	query := `
+		SELECT
+			admin_id,
+			username,
+			full_name,
+			phone_hash,
+			role_name,
+			admin_role_id,
+			role_type,
+			reports_to,
+			reports_to_name,
+			is_active,
+			last_login,
+			admin_created_at,
+			relevance_score::float8 AS relevance_score, -- 🔒 HARD CAST
+			match_type
+		FROM search_admin_users(
+			$1::text,
+			$2::int,
+			$3::boolean,
+			$4::text,
+			$5::int,
+			$6::int
+		)
+	`
+
+	// --------- Role type ----------
+	var roleTypeFilter interface{}
+	if req.RoleTypeFilter != nil {
+		roleTypeFilter = *req.RoleTypeFilter
+	} else {
+		roleTypeFilter = nil
+	}
+
+	// --------- Execute ----------
+	rows, err := r.client.Query(
+		ctx,
+		query,
+		req.Query,
+		roleTypeFilter,
+		req.IncludeInactive,
+		req.SearchType,
+		req.Limit,
+		req.Offset,
+	)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to search admin users: %w", err)
+	}
+	defer rows.Close()
+
+	// --------- Scan ----------
+	results, err := r.scanAdminSearchResults(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// --------- Count ----------
+	totalCount, err := r.countAdminUserSearchResults(ctx, req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count search results: %w", err)
+	}
+
+	r.recordQuery()
+	return results, totalCount, nil
+}
+func (r *AdminRepositoryPostgres) UpdateAdminUserRole(
+	ctx context.Context,
+	adminID uuid.UUID,
+	newRoleID uuid.UUID,
+) error {
+
+	// 0. Validate input
+	if adminID == uuid.Nil {
+		return fmt.Errorf("admin ID cannot be empty")
+	}
+	if newRoleID == uuid.Nil {
+		return fmt.Errorf("new role ID cannot be empty")
+	}
+
+	// 1. Start transaction
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 2. Fetch role_type for the new role
+	var newRoleType int
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT role_type FROM admin_roles WHERE admin_role_id = $1`,
+		newRoleID,
+	).Scan(&newRoleType)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("admin role not found: %s", newRoleID)
+		}
+		return fmt.Errorf("failed to fetch admin role: %w", err)
+	}
+
+	// 3. Prevent assigning Super Admin role
+	if newRoleType == models.RoleTypeSuperAdmin {
+		return fmt.Errorf("cannot assign super admin role")
+	}
+
+	// 4. Fetch current admin role (lock row to avoid race conditions)
+	var currentRoleID uuid.UUID
+	var currentRoleType int
+	err = tx.QueryRowContext(
+		ctx,
+		`
+		SELECT admin_role_id, role_type
+		FROM admin_users
+		WHERE admin_id = $1
+		FOR UPDATE
+		`,
+		adminID,
+	).Scan(&currentRoleID, &currentRoleType)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("admin user not found: %s", adminID)
+		}
+		return fmt.Errorf("failed to fetch admin user: %w", err)
+	}
+
+	// 5. Prevent changing Super Admin user
+	if currentRoleType == models.RoleTypeSuperAdmin {
+		return fmt.Errorf("cannot change role of super admin user")
+	}
+
+	// 6. No-op if role is unchanged
+	if currentRoleID == newRoleID {
+		return nil
+	}
+
+	// 7. Update admin_users with BOTH role_id and role_type
+	result, err := tx.ExecContext(
+		ctx,
+		`
+		UPDATE admin_users
+		SET admin_role_id = $1,
+		    role_type     = $2,
+		    admin_updated_at = NOW()
+		WHERE admin_id = $3
+		`,
+		newRoleID,
+		newRoleType,
+		adminID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update admin user role: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read affected rows: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("admin user not found: %s", adminID)
+	}
+
+	// 8. Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// 9. Observability
+	r.recordQuery()
+	r.logger.Info(
+		"Admin user role updated",
+		util.String("admin_id", adminID.String()),
+		util.String("new_role_id", newRoleID.String()),
+		util.Int("new_role_type", newRoleType),
+	)
+
+	return nil
+}
+func (r *AdminRepositoryPostgres) UpdateAdminPhone(
+	ctx context.Context,
+	adminID uuid.UUID,
+	phoneHash string,
+	phoneEncrypted []byte,
+	phoneKeyID uuid.UUID,
+	phoneEncryptedDEK string,
+) error {
+
+	// 1️⃣ Check role type
+	var roleType int
+	err := r.client.QueryRow(ctx,
+		`SELECT role_type FROM admin_users WHERE admin_id = $1`,
+		adminID,
+	).Scan(&roleType)
+
+	if err != nil {
+		return fmt.Errorf("admin not found: %w", err)
+	}
+
+	// 2️⃣ Block Super Admin explicitly
+	if roleType == 4 {
+		return fmt.Errorf("security violation: super admin phone cannot be updated")
+	}
+
+	// 3️⃣ Perform update
+	query := `
+		UPDATE admin_users
+		SET phone_hash = $1,
+		    phone_encrypted = $2,
+		    phone_key_id = $3,
+		    phone_encrypted_dek = $4,
+		    admin_updated_at = $5
+		WHERE admin_id = $6
+	`
+
+	result, err := r.client.Exec(ctx, query,
+		phoneHash,
+		phoneEncrypted,
+		phoneKeyID,
+		phoneEncryptedDEK,
+		time.Now().UTC(),
+		adminID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update admin phone: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("admin not found: %s", adminID)
+	}
+
+	r.logger.Info("Admin phone updated",
+		util.String("admin_id", adminID.String()))
+
+	return nil
 }
