@@ -41,6 +41,7 @@ type Config struct {
 	Encryption    EncryptionConfig
 	QR            QRConfig
 	WebSocket     WebSocketConfig
+	HR            HRConfig
 }
 
 // ----------------------------
@@ -60,6 +61,15 @@ type PostgresConfig struct {
 	ConnMaxLifetime   time.Duration `mapstructure:"conn_max_lifetime"`
 	ConnMaxIdleTime   time.Duration `mapstructure:"conn_max_idle_time"`
 	ConnectionTimeout time.Duration `mapstructure:"connection_timeout"`
+}
+
+type HRConfig struct {
+	Documents DocumentConfig
+}
+
+type DocumentConfig struct {
+	BasePath  string `mapstructure:"base_path"`
+	MaxSizeMB int    `mapstructure:"max_size_mb"`
 }
 
 type JWTConfig struct {
@@ -333,7 +343,12 @@ func LoadConfig() *Config {
 				Database: getEnv("CLICKHOUSE_DATABASE", "auth_analytics"),
 				CAFile:   getEnv("CLICKHOUSE_CA_FILE", ""),
 			},
-
+			HR: HRConfig{
+				Documents: DocumentConfig{
+					BasePath:  getEnv("HR_DOCUMENT_BASE_PATH", "/var/lib/auth-service/hr-documents"),
+					MaxSizeMB: getEnvAsInt("HR_DOCUMENT_MAX_SIZE_MB", 50),
+				},
+			},
 			Security: SecurityConfig{
 				JWTSecret:    getSecureEnv("JWT_SECRET", "default-insecure-secret-change-in-production"),
 				APIKey:       getSecureEnv("API_KEY", ""),
@@ -678,7 +693,20 @@ func validateConfig(cfg *Config) {
 		if cfg.Security.JWTSecret == "default-insecure-secret-change-in-production" {
 			util.Warn("JWT_SECRET is using default value")
 		}
+		// ============================
+		if cfg.HR.Documents.MaxSizeMB <= 0 {
+			util.Warn("HR_DOCUMENT_MAX_SIZE_MB must be greater than 0")
+		}
 
+		if cfg.HR.Documents.BasePath == "" {
+			util.Warn("HR_DOCUMENT_BASE_PATH is empty - documents may not be stored correctly")
+		}
+
+		if cfg.IsProduction() {
+			if strings.HasPrefix(cfg.HR.Documents.BasePath, "/tmp") {
+				util.Warn("HR_DOCUMENT_BASE_PATH uses /tmp in production - data may be lost on restart")
+			}
+		}
 		if cfg.Redis.Password == "" {
 			util.Warn("REDIS_PASSWORD is not set")
 		}

@@ -104,7 +104,7 @@ declare -A TOPIC_CONFIGS=(
     ["admin-events"]="3 1 15552000000 gzip"
     ["user-events"]="3 1 2592000000 gzip"
     ["session-events"]="3 1 604800000 gzip"
-
+    ["audit-logs"]="3 1 2592000000 gzip"  
     ["device-events"]="3 1 2592000000 gzip"
     ["mpin-events"]="3 1 2592000000 gzip"
     ["otp-events"]="3 1 604800000 gzip"

@@ -29,6 +29,9 @@ COPY scripts/certs ./certs
 
 # Optional: create non-root user
 RUN addgroup -S appuser && adduser -S appuser -G appuser
+RUN mkdir -p /data \
+    && chown -R appuser:appuser /data
+
 USER appuser
 
 EXPOSE 8443

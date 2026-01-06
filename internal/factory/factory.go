@@ -1,4 +1,3 @@
-
 package factory
 
 import (
@@ -10,6 +9,9 @@ import (
 	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
+	hrhandler "auth-service/internal/hr/handler" // ✅ ADD
+	hrpostgres "auth-service/internal/hr/repository"
+	a "auth-service/internal/hr/service"
 	"auth-service/internal/models"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
@@ -29,23 +31,50 @@ import (
 )
 
 type Factory struct {
-	config            *config.Config
-	tlsManager        *tls.TLSManager
-	redisClient       *client.RedisClient
-	scyllaClient      *scylla.ScyllaClient
-	kafkaProducer     *client.KafkaProducer
-	esClient          *client.ESClient
-	clickhouseClient  *client.ClickHouseClient
-	hasher            *hashing.Hasher
-	encryptionManager *encryption.EncryptionManager
-	bucketingManager  *bucketing.BucketingManager
-	pairingRepo       redis.PairingRepository
-	pairingService    *service.PairingService
-	wsService         *service.WebSocketService
-	pairingHandler    *handler.PairingHandler
-	wsHandler         *handler.WebSocketHandler
-	qrUtil            *util.QRUtil
-	hmacUtil          *util.HMACUtil
+	config                 *config.Config
+	tlsManager             *tls.TLSManager
+	redisClient            *client.RedisClient
+	scyllaClient           *scylla.ScyllaClient
+	kafkaProducer          *client.KafkaProducer
+	esClient               *client.ESClient
+	clickhouseClient       *client.ClickHouseClient
+	hasher                 *hashing.Hasher
+	encryptionManager      *encryption.EncryptionManager
+	bucketingManager       *bucketing.BucketingManager
+	pairingRepo            redis.PairingRepository
+	pairingService         *service.PairingService
+	wsService              *service.WebSocketService
+	pairingHandler         *handler.PairingHandler
+	wsHandler              *handler.WebSocketHandler
+	qrUtil                 *util.QRUtil
+	hmacUtil               *util.HMACUtil
+	hrEmployeeRepository   hrpostgres.EmployeeRepository
+	attendanceRepository   hrpostgres.AttendanceRepository
+	leaveRepository        hrpostgres.LeaveRepository
+	schedulingRepository   hrpostgres.SchedulingRepository // Combined repository
+	compensationRepository hrpostgres.CompensationRepository
+	// ================= AUDIT =================
+	auditRepository        hrpostgres.AuditRepository
+	auditService           *a.AuditService
+	auditQueryService      *a.AuditQueryService
+	documentStorage        a.DocumentStorage
+	auditOutboxService     *service.AuditOutboxService
+	auditOutboxCancel      context.CancelFunc
+	employeeQueryService   *a.EmployeeQueryService
+	employeeService        *a.EmployeeService
+	attendanceQueryService a.AttendanceQueryService
+	attendanceService      a.AttendanceService
+	leaveService           a.LeaveService
+	leaveQueryService      a.LeaveQueryService
+	schedulingService      a.SchedulingService
+	schedulingQueryService a.SchedulingQueryService
+	compensationService    a.CompensationService // ✅ ADD THIS
+	hrAuditHandler         *hrhandler.AuditHandler
+	hrEmployeeHandler      *hrhandler.EmployeeHandler
+	hrCompensationHandler  *hrhandler.CompensationHandler
+	hrLeaveHandler         *hrhandler.LeaveHandler
+	hrSchedulingHandler    *hrhandler.SchedulingHandler
+
 	// ✅ UPDATED: PostgreSQL repositories for User and Company
 	postgresClient            *client.PostgresClient
 	postgresUserRepository    postgres.UserRepository
@@ -53,32 +82,34 @@ type Factory struct {
 	smsManager                *sms.SMSManager // ADD THIS: SMS Manager field
 	serviceFactory            *service.ServiceFactory
 	// ✅ FIXED: Use concrete types for repositories that need type assertions
-	adminDeviceRepo        *scylla.AdminDeviceRepositoryImpl
-	adminDeviceTrustRepo   scylla.AdminDeviceTrustRepository
-	adminMPINRepo          *scylla.AdminMPINRepositoryImpl
-	adminDeviceHistoryRepo *scylla.AdminDeviceHistoryRepositoryImpl
-	userOTPService         *service.UserOTPService
-	companyService         *service.CompanyService
-	adminDeviceService     *service.AdminDeviceService
-	adminMPINService       *service.AdminMPINService
-	userService            *service.UserService
-	once                   sync.Once
-	closeOnce              sync.Once
-	closed                 chan struct{}
-	mpinRepository         scylla.MPINRepository
-	mpinService            *service.MPINService
-	pepperStoreRepo        pepperstore.PepperStore
-	deviceTrustRepo        scylla.DeviceTrustRepository
-	otpRepository          scylla.OTPRepository
-	otpService             *service.OTPService
-	sessionRepo            redis.SessionRepository
-	sessionService         *service.SessionService
-	deviceRepository       scylla.DeviceRepository
-	deviceService          *service.DeviceService
-	deviceHistoryRepo      *scylla.DeviceHistoryRepositoryImpl
-	kafkaLoggingMgr        *KafkaLoggingManager
-	adminRepository        postgres.AdminRepository
-	adminService           *service.AdminService
+	adminDeviceRepo          *scylla.AdminDeviceRepositoryImpl
+	adminDeviceTrustRepo     scylla.AdminDeviceTrustRepository
+	adminMPINRepo            *scylla.AdminMPINRepositoryImpl
+	adminDeviceHistoryRepo   *scylla.AdminDeviceHistoryRepositoryImpl
+	userOTPService           *service.UserOTPService
+	companyService           *service.CompanyService
+	adminDeviceService       *service.AdminDeviceService
+	adminMPINService         *service.AdminMPINService
+	userService              *service.UserService
+	once                     sync.Once
+	closeOnce                sync.Once
+	closed                   chan struct{}
+	mpinRepository           scylla.MPINRepository
+	mpinService              *service.MPINService
+	pepperStoreRepo          pepperstore.PepperStore
+	deviceTrustRepo          scylla.DeviceTrustRepository
+	otpRepository            scylla.OTPRepository
+	otpService               *service.OTPService
+	sessionRepo              redis.SessionRepository
+	sessionService           *service.SessionService
+	deviceRepository         scylla.DeviceRepository
+	deviceService            *service.DeviceService
+	deviceHistoryRepo        *scylla.DeviceHistoryRepositoryImpl
+	kafkaLoggingMgr          *KafkaLoggingManager
+	adminRepository          postgres.AdminRepository
+	adminService             *service.AdminService
+	compensationQueryService a.CompensationQueryService
+	hrAttendanceHandler      *hrhandler.AttendanceHandler
 
 	// ✅ NEW: JWT and RBAC services
 	jwtService      *service.JWTService
@@ -194,6 +225,30 @@ func NewFactory() (*Factory, error) {
 	if err := f.InitializeRBAC(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
 	}
+	f.initializeManagers()
+
+	if err := f.initializeDocumentStorage(); err != nil {
+		return nil, err
+	}
+
+	// =====================================================================
+	// ✅ START AUDIT OUTBOX SERVICE
+	// =====================================================================
+	if outbox := f.GetAuditOutboxService(); outbox != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		f.auditOutboxCancel = cancel
+
+		go func() {
+			if err := outbox.Start(ctx); err != nil {
+				f.logger.Error(
+					"Audit outbox service stopped with error",
+					zap.Error(err),
+				)
+			}
+		}()
+
+		f.logger.Info("Audit outbox service started")
+	}
 
 	util.Info("Factory initialized successfully",
 		util.String("environment", cfg.Environment),
@@ -209,7 +264,121 @@ func NewFactory() (*Factory, error) {
 // ============================================================================
 // KAFKA LOGGING INITIALIZATION - OPTIMIZED EVENT DISTRIBUTION
 // ============================================================================
+func (f *Factory) initializeDocumentStorage() error {
+	cfg := f.config
 
+	// You can move these to config later
+	basePath := cfg.HR.Documents.BasePath
+	maxSizeMB := cfg.HR.Documents.MaxSizeMB
+
+	ds, err := a.NewLocalDocumentStorage(
+		basePath,
+		maxSizeMB,
+		f.logger,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to initialize document storage: %w", err)
+	}
+
+	// Health check on startup
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := ds.HealthCheck(ctx); err != nil {
+		return fmt.Errorf("document storage health check failed: %w", err)
+	}
+
+	f.documentStorage = ds
+	util.Info("Document storage initialized",
+		util.String("base_path", basePath),
+		util.Int("max_size_mb", maxSizeMB),
+	)
+
+	return nil
+}
+func (f *Factory) GetHRCompensationHandler() *hrhandler.CompensationHandler {
+	if f.hrCompensationHandler == nil {
+		f.hrCompensationHandler = hrhandler.NewCompensationHandler(
+			f.GetCompensationService(),
+			f.GetCompensationQueryService(),
+			f.logger,
+		)
+	}
+	return f.hrCompensationHandler
+}
+
+func (f *Factory) GetCompensationService() a.CompensationService {
+	if f.compensationService == nil {
+		f.compensationService = a.NewCompensationService(
+			f.CompensationRepository(),
+			f.AuditRepository(), // uses auditRepo + logAudit internally
+			f.logger,
+		)
+	}
+	return f.compensationService
+}
+
+func (f *Factory) GetEmployeeQueryService() *a.EmployeeQueryService {
+	if f.employeeQueryService == nil {
+		f.employeeQueryService = a.NewEmployeeQueryService(
+			f.HREmployeeRepository(),
+			f.DocumentStorage(), // ✅ from earlier step
+			f.logger,
+		)
+	}
+	return f.employeeQueryService
+}
+
+func (f *Factory) GetAttendanceQueryService() a.AttendanceQueryService {
+	if f.attendanceQueryService == nil {
+		f.attendanceQueryService = a.NewAttendanceQueryService(
+			f.AttendanceRepository(),
+			f.logger,
+		)
+	}
+	return f.attendanceQueryService
+}
+func (f *Factory) GetLeaveService() a.LeaveService {
+	if f.leaveService == nil {
+		f.leaveService = a.NewLeaveService(
+			f.LeaveRepository(),
+			f.logger,
+		)
+	}
+	return f.leaveService
+}
+
+func (f *Factory) GetHRLeaveHandler() *hrhandler.LeaveHandler {
+	if f.hrLeaveHandler == nil {
+		f.hrLeaveHandler = hrhandler.NewLeaveHandler(
+			f.GetLeaveService(),
+			f.GetLeaveQueryService(),
+			f.logger,
+		)
+	}
+	return f.hrLeaveHandler
+}
+
+func (f *Factory) GetHRAuditHandler() *hrhandler.AuditHandler {
+	if f.hrAuditHandler == nil {
+		f.hrAuditHandler = hrhandler.NewAuditHandler(
+			f.GetAuditQueryService(), // HR audit query service
+			f.logger,
+		)
+	}
+	return f.hrAuditHandler
+}
+
+// GetLeaveQueryService returns the leave query service
+func (f *Factory) GetLeaveQueryService() a.LeaveQueryService {
+	if f.leaveQueryService == nil {
+		f.leaveQueryService = a.NewLeaveQueryService(
+			f.LeaveRepository(),
+			f.logger,
+		)
+	}
+	return f.leaveQueryService
+}
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	logger := util.Get()
 
@@ -371,6 +540,61 @@ func (f *Factory) AdminDeviceTrustRepository() scylla.AdminDeviceTrustRepository
 	return f.adminDeviceTrustRepo
 }
 
+func (f *Factory) GetHREmployeeHandler() *hrhandler.EmployeeHandler {
+	if f.hrEmployeeHandler == nil {
+		f.hrEmployeeHandler = hrhandler.NewEmployeeHandler(
+			f.GetEmployeeService(),      // write service
+			f.GetEmployeeQueryService(), // read service
+			f.GetAuditService(),         // audit service
+			f.logger,
+			f.config.HR.Documents.MaxSizeMB, // ✅ FIXED
+		)
+	}
+	return f.hrEmployeeHandler
+}
+
+func (f *Factory) GetHRSchedulingHandler() *hrhandler.SchedulingHandler {
+	if f.hrSchedulingHandler == nil {
+		f.hrSchedulingHandler = hrhandler.NewSchedulingHandler(
+			f.GetSchedulingService(),
+			f.GetSchedulingQueryService(),
+			f.logger,
+		)
+	}
+	return f.hrSchedulingHandler
+}
+
+func (f *Factory) GetCompensationQueryService() a.CompensationQueryService {
+	if f.compensationQueryService == nil {
+		f.compensationQueryService = a.NewCompensationQueryService(
+			f.CompensationRepository(),
+			f.logger,
+		)
+	}
+	return f.compensationQueryService
+}
+
+func (f *Factory) GetSchedulingService() a.SchedulingService {
+	if f.schedulingService == nil {
+		f.schedulingService = a.NewSchedulingService(
+			f.GetSchedulingRepository(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.schedulingService
+}
+
+// GetSchedulingQueryService returns the scheduling query service
+func (f *Factory) GetSchedulingQueryService() a.SchedulingQueryService {
+	if f.schedulingQueryService == nil {
+		f.schedulingQueryService = a.NewSchedulingQueryService(
+			f.GetSchedulingRepository(),
+			f.logger,
+		)
+	}
+	return f.schedulingQueryService
+}
 func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 	if f.adminMPINRepo == nil {
 		f.adminMPINRepo = scylla.NewAdminMPINRepository(
@@ -379,6 +603,125 @@ func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 		)
 	}
 	return f.adminMPINRepo
+}
+func (f *Factory) GetHRAttendanceHandler() *hrhandler.AttendanceHandler {
+	if f.hrAttendanceHandler == nil {
+		f.hrAttendanceHandler = hrhandler.NewAttendanceHandler(
+			f.GetAttendanceService(),
+			f.GetAttendanceQueryService(),
+			f.logger,
+		)
+	}
+	return f.hrAttendanceHandler
+}
+
+// ============================================================================
+// ✅ AUDIT REPOSITORY
+// ============================================================================
+
+func (f *Factory) AuditRepository() hrpostgres.AuditRepository {
+	if f.auditRepository == nil {
+		f.auditRepository = hrpostgres.NewAuditRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.auditRepository
+}
+
+// ============================================================================
+// ✅ AUDIT SERVICE
+// ============================================================================
+func (f *Factory) GetAuditQueryService() *a.AuditQueryService {
+	if f.auditQueryService == nil {
+		f.auditQueryService = a.NewAuditQueryService(
+			f.AuditRepository(),
+			f.logger,
+		)
+	}
+	return f.auditQueryService
+}
+func (f *Factory) GetAuditService() *a.AuditService {
+	if f.auditService == nil {
+		f.auditService = a.NewAuditService(
+			f.AuditRepository(),
+			f.logger,
+		)
+	}
+	return f.auditService
+}
+
+// ============================================================================
+// ✅ AUDIT OUTBOX SERVICE
+// ============================================================================
+func (f *Factory) GetEmployeeService() *a.EmployeeService {
+	if f.employeeService == nil {
+		f.employeeService = a.NewEmployeeService(
+			f.HREmployeeRepository(),
+			f.GetAuditService(),
+			a.EmployeeServiceConfig{
+				MaxDocumentSizeMB: f.config.HR.Documents.MaxSizeMB,
+				DocumentStorage:   f.DocumentStorage(),
+			},
+			f.logger,
+		)
+	}
+	return f.employeeService
+}
+
+func (f *Factory) GetAuditOutboxService() *service.AuditOutboxService {
+	if f.auditOutboxService == nil {
+
+		// Kafka is optional – if not present, outbox should not start
+		if f.kafkaProducer == nil {
+			f.logger.Warn("Kafka producer not available, audit outbox disabled")
+			return nil
+		}
+
+		f.auditOutboxService = service.NewAuditOutboxService(
+			f.PostgresClient(),
+			f.kafkaProducer,
+			500,            // batch size
+			5*time.Second,  // poll interval
+			"audit-events", // Kafka topic
+		)
+	}
+	return f.auditOutboxService
+}
+
+// ============================================================================
+// ✅ HR EMPLOYEE REPOSITORY GETTER
+// ============================================================================
+
+func (f *Factory) DocumentStorage() a.DocumentStorage {
+	if f.documentStorage == nil {
+		f.logger.Fatal("Document storage not initialized")
+	}
+	return f.documentStorage
+}
+
+func (f *Factory) HREmployeeRepository() hrpostgres.EmployeeRepository {
+	if f.hrEmployeeRepository == nil {
+		f.hrEmployeeRepository = hrpostgres.NewEmployeeRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.hrEmployeeRepository
+}
+
+// ============================================================================
+// ATTENDANCE SERVICE (WRITE / COMMAND)
+// ============================================================================
+
+func (f *Factory) GetAttendanceService() a.AttendanceService {
+	if f.attendanceService == nil {
+		f.attendanceService = a.NewAttendanceService(
+			f.AttendanceRepository(),
+			f.logger,
+		)
+	}
+	return f.attendanceService
 }
 
 func (f *Factory) AdminDeviceHistoryRepository() *scylla.AdminDeviceHistoryRepositoryImpl {
@@ -415,6 +758,42 @@ func (f *Factory) PepperStoreRepository() pepperstore.PepperStore {
 	return f.pepperStoreRepo
 }
 
+// Add getter methods
+func (f *Factory) GetSchedulingRepository() hrpostgres.SchedulingRepository {
+	if f.schedulingRepository == nil {
+		f.schedulingRepository = hrpostgres.NewSchedulingRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.schedulingRepository
+}
+
+func (f *Factory) CompensationRepository() hrpostgres.CompensationRepository {
+	if f.compensationRepository == nil {
+		f.compensationRepository = hrpostgres.NewCompensationRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.compensationRepository
+}
+func (f *Factory) WorkCalendarRepository() hrpostgres.SchedulingRepository {
+	return f.GetSchedulingRepository()
+}
+
+func (f *Factory) ScheduleTemplateRepository() hrpostgres.SchedulingRepository {
+	return f.GetSchedulingRepository()
+}
+
+func (f *Factory) ScheduleAssignmentRepository() hrpostgres.SchedulingRepository {
+	return f.GetSchedulingRepository()
+}
+
+func (f *Factory) ScheduleInstanceRepository() hrpostgres.SchedulingRepository {
+	return f.GetSchedulingRepository()
+}
+
 func (f *Factory) UserRepository() postgres.UserRepository {
 	if f.postgresUserRepository == nil {
 		f.postgresUserRepository = postgres.NewUserRepository(
@@ -445,6 +824,17 @@ func (f *Factory) MPINRepository() scylla.MPINRepository {
 		)
 	}
 	return f.mpinRepository
+}
+
+func (f *Factory) AttendanceRepository() hrpostgres.AttendanceRepository {
+	// Create attendance repository if not exists
+	if f.attendanceRepository == nil {
+		f.attendanceRepository = hrpostgres.NewAttendanceRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.attendanceRepository
 }
 
 // ============================================================================
@@ -524,14 +914,23 @@ func (f *Factory) GetDeviceHistoryRepository() *scylla.DeviceHistoryRepositoryIm
 	return f.deviceHistoryRepo
 }
 
+func (f *Factory) LeaveRepository() hrpostgres.LeaveRepository {
+	if f.leaveRepository == nil {
+		f.leaveRepository = hrpostgres.NewLeaveRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.leaveRepository
+}
 func (f *Factory) AdminRepository() postgres.AdminRepository {
-    if f.adminRepository == nil {
-        f.adminRepository = postgres.NewAdminRepositoryPostgres(
-            f.PostgresClient(),
-            f.logger,
-        )
-    }
-    return f.adminRepository
+	if f.adminRepository == nil {
+		f.adminRepository = postgres.NewAdminRepositoryPostgres(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.adminRepository
 }
 
 // ============================================================================
@@ -648,7 +1047,7 @@ func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
-            f.CompanyRepository(),        // ✅ NEW: companyRepo
+			f.CompanyRepository(), // ✅ NEW: companyRepo
 			f.GetSessionService(),
 			f.GetOTPService(), // This is now safe
 			f.GetMPINService(),
@@ -1088,8 +1487,17 @@ func (f *Factory) InitializeHandlers() error {
 		adminHandler,
 		authHandler,
 		rbacHandler,
-		pairingHandler, // ✅ NEW
-		wsHandler,      // ✅ NEW
+
+		f.GetHRAttendanceHandler(),
+		f.GetHRAuditHandler(),
+		f.GetHRCompensationHandler(),
+		f.GetHREmployeeHandler(),
+		f.GetHRLeaveHandler(),
+		f.GetHRSchedulingHandler(),
+
+		pairingHandler,
+		wsHandler,
+
 		sessionService,
 		jwtService,
 		logger,
@@ -1134,6 +1542,35 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["postgres"] = fmt.Errorf("postgres client not initialized")
 	}
+	if f.employeeQueryService != nil {
+		if err := f.employeeQueryService.HealthCheck(ctx); err != nil {
+			errs["employee_query_service"] = err
+		}
+	} else {
+		errs["employee_query_service"] = fmt.Errorf("employee query service not initialized")
+	}
+	if f.employeeService != nil {
+		if err := f.employeeService.HealthCheck(ctx); err != nil {
+			errs["employee_service"] = err
+		}
+	} else {
+		errs["employee_service"] = fmt.Errorf("employee service not initialized")
+	}
+	if f.attendanceService != nil {
+		if err := f.attendanceService.HealthCheck(ctx); err != nil {
+			errs["attendance_service"] = err
+		}
+	} else {
+		errs["attendance_service"] = fmt.Errorf("attendance service not initialized")
+	}
+
+	if f.attendanceQueryService != nil {
+		if err := f.attendanceQueryService.HealthCheck(ctx); err != nil {
+			errs["attendance_query_service"] = err
+		}
+	} else {
+		errs["attendance_query_service"] = fmt.Errorf("attendance query service not initialized")
+	}
 
 	if f.postgresUserRepository != nil {
 		if err := f.postgresUserRepository.HealthCheck(ctx); err != nil {
@@ -1142,7 +1579,13 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["postgres_user_repository"] = fmt.Errorf("postgres user repository not initialized")
 	}
-
+	if f.hrEmployeeRepository != nil {
+		if err := f.hrEmployeeRepository.HealthCheck(ctx); err != nil {
+			errs["hr_employee_repository"] = err
+		}
+	} else {
+		errs["hr_employee_repository"] = fmt.Errorf("HR employee repository not initialized")
+	}
 	if f.postgresCompanyRepository != nil {
 		if err := f.postgresCompanyRepository.HealthCheck(ctx); err != nil {
 			errs["postgres_company_repository"] = err
@@ -1465,6 +1908,13 @@ func (f *Factory) Close() error {
 		if f.encryptionManager != nil {
 			f.encryptionManager.ClearCache()
 			util.Info("Encryption manager cache cleared")
+		}
+		// =========================================================================
+		// ✅ STOP AUDIT OUTBOX SERVICE
+		// =========================================================================
+		if f.auditOutboxCancel != nil {
+			f.logger.Info("Stopping audit outbox service...")
+			f.auditOutboxCancel()
 		}
 
 		// ============================================================================

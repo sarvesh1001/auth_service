@@ -1,4 +1,4 @@
-diff b?w this     #!/bin/bash
+#!/bin/bash
 set -e
 
 echo "🔧 Starting PostgreSQL initialization..."
@@ -14,11 +14,11 @@ echo "🏗️ Creating database schema..."
 
 # Execute the SQL schema
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'EOSQL'
-    -- Enable UUID extension
+    -- Enable extensions
     CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-    -- Enable trigram extension for fast text search
     CREATE EXTENSION IF NOT EXISTS "pg_trgm";
     CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+    CREATE EXTENSION IF NOT EXISTS "btree_gist";
 
     -- ==============================================
     -- SINGLE PERMISSIONS TABLE (For both Users and Admins)
@@ -147,7 +147,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         data_region VARCHAR(20) NOT NULL DEFAULT 'us',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        last_login TIMESTAMPTZ
+        last_login TIMESTAMPTZ,
+        -- Unique constraint that includes the partition key (required for partitioned tables)
+        CONSTRAINT unique_username UNIQUE (user_id, username)
     ) PARTITION BY HASH (user_id);
 
     -- Create 8 partitions for users (as in old schema)
@@ -159,10 +161,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     CREATE TABLE users_p5 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 5);
     CREATE TABLE users_p6 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 6);
     CREATE TABLE users_p7 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 7);
-
-    -- Create a unique constraint that includes the partition key
-    -- This is required for partitioned tables in PostgreSQL
-    ALTER TABLE users ADD CONSTRAINT unique_username UNIQUE (user_id, username);
 
     CREATE TABLE companies (
         company_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -177,7 +175,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         subscription_start_date TIMESTAMPTZ,
-        subscription_end_date TIMestAMPTZ,
+        subscription_end_date TIMESTAMPTZ,
         -- Keep unique constraint from old schema
         UNIQUE(company_name, owner_user_id),
         -- Foreign key constraint
@@ -236,11 +234,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         user_id UUID NOT NULL,
         employee_id VARCHAR(100) NOT NULL,
         role_id UUID NOT NULL,
-        hire_date TIMestAMPTZ NOT NULL DEFAULT NOW(),
+        hire_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         is_active BOOLEAN NOT NULL DEFAULT true,
         reports_to UUID,
+        position_id UUID,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMestAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (company_id, user_id),
         CONSTRAINT fk_employees_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
         CONSTRAINT fk_employees_user FOREIGN KEY (user_id) REFERENCES users(user_id),
@@ -256,7 +255,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         app_version VARCHAR(50),
         last_active TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         is_active BOOLEAN NOT NULL DEFAULT true,
-        created_at TIMestAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT fk_user_devices_user FOREIGN KEY (user_id) REFERENCES users(user_id)
     );
@@ -275,1407 +274,536 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     );
 
     -- ==============================================
-    -- INDEXES
-    -- ==============================================
-    -- Indexes for admin_users
-    CREATE INDEX idx_admin_users_search_tsv ON admin_users USING GIN (user_search_tsv);
-    CREATE INDEX idx_admin_users_username_trgm ON admin_users USING GIN (username gin_trgm_ops);
-    CREATE INDEX idx_admin_users_fullname_trgm ON admin_users USING GIN (full_name gin_trgm_ops);
-    CREATE INDEX idx_admin_users_role ON admin_users (admin_role_id) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_role_type ON admin_users (role_type) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_role_type_role ON admin_users (role_type, admin_role_id) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_phone_hash ON admin_users (phone_hash);
-    CREATE INDEX idx_admin_users_active ON admin_users (is_active) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_username ON admin_users (username);
-    CREATE INDEX idx_admin_users_role_active_login ON admin_users (admin_role_id, is_active, last_login DESC);
-
-    -- Indexes for admin_roles
-    CREATE INDEX idx_admin_roles_name ON admin_roles (role_name);
-    CREATE INDEX idx_admin_roles_level ON admin_roles (role_level);
-    CREATE INDEX idx_admin_roles_type ON admin_roles (role_type);
-
-    -- Indexes for admin_role_permissions
-    CREATE INDEX idx_admin_role_perms_role ON admin_role_permissions (admin_role_id);
-    CREATE INDEX idx_admin_role_perms_permission ON admin_role_permissions (permission_id);
-
-    -- Indexes for admin_role_departments
-    CREATE INDEX idx_admin_role_departments_role ON admin_role_departments (admin_role_id);
-    CREATE INDEX idx_admin_role_departments_dept ON admin_role_departments (system_department_id);
-
-    -- Indexes for permissions
-    CREATE INDEX idx_permissions_name ON permissions (permission_name);
-    CREATE INDEX idx_permissions_bit_index ON permissions (bit_index);
-    CREATE INDEX idx_permissions_module ON permissions (module);
-    CREATE INDEX idx_permissions_scope ON permissions (scope);
-
-    -- Indexes for system_departments
-    CREATE INDEX idx_system_departments_name ON system_departments (name);
-    CREATE INDEX idx_system_departments_module ON system_departments (module_code);
-    CREATE INDEX idx_system_departments_bitmask ON system_departments (bitmask);
-
-    -- Other indexes (from original schema)
-    CREATE INDEX idx_users_search_tsv ON users USING GIN (user_search_tsv);
-    CREATE INDEX idx_users_username_trgm ON users USING GIN (username gin_trgm_ops);
-    CREATE INDEX idx_users_fullname_trgm ON users USING GIN (full_name gin_trgm_ops);
-    CREATE INDEX idx_users_username ON users (username);
-    CREATE INDEX idx_users_fullname ON users (full_name);
-    CREATE INDEX idx_users_name_search ON users (username, full_name);
-    CREATE INDEX idx_companies_name_tsv ON companies USING GIN (company_name_tsv);
-    CREATE INDEX idx_companies_name_trgm ON companies USING GIN (company_name gin_trgm_ops);
-    CREATE INDEX idx_companies_name ON companies (company_name);
-    CREATE INDEX idx_companies_owner_name ON companies (owner_user_id, company_name);
-    CREATE INDEX idx_users_phone_hash ON users (phone_hash);
-    CREATE INDEX idx_users_created_at ON users (created_at);
-    CREATE INDEX idx_users_status ON users (is_active, kyc_status);
-    CREATE INDEX idx_users_region ON users (data_region);
-    CREATE INDEX idx_users_kyc_status ON users(kyc_status);
-    CREATE INDEX idx_companies_owner ON companies (owner_user_id);
-    CREATE INDEX idx_companies_status ON companies (is_active, subscription_status);
-    CREATE INDEX idx_companies_region ON companies (data_region);
-    CREATE INDEX idx_roles_company ON roles (company_id);
-    CREATE INDEX idx_roles_level ON roles (role_level);
-    CREATE INDEX idx_role_perms_permission ON role_permissions (permission_id);
-    CREATE INDEX idx_employees_user ON company_employees (user_id);
-    CREATE INDEX idx_employees_role ON company_employees (role_id);
-    CREATE INDEX idx_employees_active ON company_employees (is_active);
-    CREATE INDEX idx_employees_company_active ON company_employees (company_id, is_active);
-    CREATE INDEX idx_employees_reports_to ON company_employees (company_id, reports_to);
-    CREATE INDEX idx_departments_company ON departments (company_id);
-    CREATE INDEX idx_departments_parent ON departments (parent_department_id);
-    CREATE INDEX idx_departments_system ON departments (system_department_id);
-    CREATE INDEX idx_role_departments_role ON role_departments (role_id);
-    CREATE INDEX idx_role_departments_department ON role_departments (department_id);
-    CREATE INDEX idx_user_devices_user ON user_devices (user_id);
-    CREATE INDEX idx_user_devices_active ON user_devices (is_active);
-    CREATE INDEX idx_user_devices_last_active ON user_devices (last_active);
-    CREATE INDEX idx_login_attempts_user ON login_attempts (user_id);
-    CREATE INDEX idx_login_attempts_device ON login_attempts (device_id);
-    CREATE INDEX idx_login_attempts_success ON login_attempts (success);
-    CREATE INDEX idx_login_attempts_time ON login_attempts (attempted_at DESC);
-
-    -- ==============================================
-    -- ADMIN USER SEARCH FUNCTIONS - FIXED VERSION
+    -- HR MODULE TABLES
     -- ==============================================
 
-    -- Fixed: Returns admin_role_id instead of role_level
-    CREATE OR REPLACE FUNCTION search_admin_users(
-        search_query_param TEXT DEFAULT NULL,
-        role_type_filter_param INTEGER DEFAULT NULL,
-        include_inactive_param BOOLEAN DEFAULT false,
-        search_type_param TEXT DEFAULT 'autocomplete',
-        limit_count_param INTEGER DEFAULT 50,
-        offset_count_param INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        role_name VARCHAR(100),
-        admin_role_id UUID,
-        role_type INTEGER,
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMESTAMPTZ,
-        admin_created_at TIMESTAMPTZ,
-        relevance_score FLOAT,  -- This is DOUBLE PRECISION
-        match_type TEXT
-    ) AS $$
-    BEGIN
-        -- Normalize empty string to NULL
-        IF search_query_param = '' THEN
-            search_query_param := NULL;
-        END IF;
+    -- Employee Profiles
+    CREATE TABLE employee_profiles (
+        employee_profile_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        company_id UUID NOT NULL,
 
-        -- Build query based on search type
-        IF search_query_param IS NULL THEN
-            -- Return all admins (no search query)
-            RETURN QUERY
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                1.0::FLOAT as relevance_score,  -- Explicit cast
-                'all'::TEXT as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-            WHERE
-                (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
-                AND (include_inactive_param OR au.is_active = true)
-            ORDER BY ar.role_level DESC, au.username ASC
-            LIMIT limit_count_param
-            OFFSET offset_count_param;
-        ELSIF search_type_param = 'autocomplete' OR LENGTH(search_query_param) < 3 THEN
-            -- Autocomplete/partial match
-            RETURN QUERY
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                -- Cast similarity results to FLOAT (DOUBLE PRECISION)
-                GREATEST(
-                    COALESCE(similarity(au.username, search_query_param)::FLOAT, 0),
-                    COALESCE(similarity(au.full_name, search_query_param)::FLOAT, 0)
-                ) as relevance_score,
-                'autocomplete'::TEXT as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-            WHERE
-                (au.username ILIKE '%' || search_query_param || '%'
-                OR au.full_name ILIKE '%' || search_query_param || '%')
-                AND (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
-                AND (include_inactive_param OR au.is_active = true)
-            ORDER BY relevance_score DESC, ar.role_level DESC, au.username ASC
-            LIMIT limit_count_param
-            OFFSET offset_count_param;
-        ELSE
-            -- Full-text search
-            RETURN QUERY
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                -- Cast ts_rank result to FLOAT (DOUBLE PRECISION)
-                ts_rank(au.user_search_tsv, plainto_tsquery('simple', search_query_param))::FLOAT as relevance_score,
-                'fulltext'::TEXT as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-            WHERE
-                au.user_search_tsv @@ plainto_tsquery('simple', search_query_param)
-                AND (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
-                AND (include_inactive_param OR au.is_active = true)
-            ORDER BY relevance_score DESC, ar.role_level DESC, au.username ASC
-            LIMIT limit_count_param
-            OFFSET offset_count_param;
-        END IF;
-        RETURN;
-    END;
-    $$ LANGUAGE plpgsql STABLE;
-    -- Function to search admin employees (role_type = 1)
-    CREATE OR REPLACE FUNCTION search_admin_employees(
-        search_query TEXT DEFAULT NULL,
-        search_type TEXT DEFAULT 'autocomplete',
-        include_inactive BOOLEAN DEFAULT false,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        role_name VARCHAR(100),
-        admin_role_id UUID,  -- Fixed: Changed from role_level to admin_role_id
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMESTAMPTZ,
-        admin_created_at TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT * FROM search_admin_users_by_role_type(
-            1,  -- Employee role type
-            search_query,
-            search_type,
-            include_inactive,
-            limit_count,
-            offset_count
-        );
-    END;
-    $$ LANGUAGE plpgsql;
+        -- Personal
+        date_of_birth DATE,
+        gender VARCHAR(20),
+        marital_status VARCHAR(20),
+        nationality VARCHAR(50),
 
-    -- Function to search admin managers (role_type = 2)
-    CREATE OR REPLACE FUNCTION search_admin_managers(
-        search_query TEXT DEFAULT NULL,
-        search_type TEXT DEFAULT 'autocomplete',
-        include_inactive BOOLEAN DEFAULT false,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        role_name VARCHAR(100),
-        admin_role_id UUID,  -- Fixed: Changed from role_level to admin_role_id
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMestAMPTZ,
-        admin_created_at TIMestAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT * FROM search_admin_users_by_role_type(
-            2,  -- Manager role type
-            search_query,
-            search_type,
-            include_inactive,
-            limit_count,
-            offset_count
-        );
-    END;
-    $$ LANGUAGE plpgsql;
+        -- Employment
+        employment_type VARCHAR(30), -- full_time, contract, intern
+        employment_status VARCHAR(30) NOT NULL DEFAULT 'active', -- active, notice, terminated, on_hold
+        probation_end_date DATE,
+        confirmation_date DATE,
 
-    -- Function to search super admins (role_type = 4)
-    CREATE OR REPLACE FUNCTION search_super_admins(
-        search_query TEXT DEFAULT NULL,
-        search_type TEXT DEFAULT 'autocomplete',
-        include_inactive BOOLEAN DEFAULT false,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        role_name VARCHAR(100),
-        admin_role_id UUID,  -- Fixed: Changed from role_level to admin_role_id
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMESTAMPTZ,
-        admin_created_at TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT * FROM search_admin_users_by_role_type(
-            4,  -- Super Admin role type
-            search_query,
-            search_type,
-            include_inactive,
-            limit_count,
-            offset_count
-        );
-    END;
-    $$ LANGUAGE plpgsql;
+        -- Job
+        job_title VARCHAR(255),
+        grade VARCHAR(50),
+        cost_center VARCHAR(50),
 
-    -- Function to get admins with their permissions and departments
-    CREATE OR REPLACE FUNCTION get_admin_with_permissions(
-        admin_id_param UUID
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        role_name VARCHAR(100),
-        role_level INTEGER,
-        role_type INTEGER,
-        permissions JSONB,
-        departments JSONB,
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMESTAMPTZ
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        WITH admin_perms AS (
-            SELECT
-                arp.admin_role_id,
-                jsonb_agg(
-                    jsonb_build_object(
-                        'permission_id', p.permission_id,
-                        'permission_name', p.permission_name,
-                        'description', p.description,
-                        'category', p.category,
-                        'module', p.module,
-                        'scope', p.scope,
-                        'bit_index', p.bit_index
-                    )
-                ) as permissions
-            FROM admin_role_permissions arp
-            JOIN permissions p ON arp.permission_id = p.permission_id
-            GROUP BY arp.admin_role_id
-        ),
-        admin_depts AS (
-            SELECT
-                ard.admin_role_id,
-                jsonb_agg(
-                    jsonb_build_object(
-                        'department_id', sd.system_department_id,
-                        'name', sd.name,
-                        'module_code', sd.module_code,
-                        'description', sd.description,
-                        'bitmask', sd.bitmask
-                    )
-                ) as departments
-            FROM admin_role_departments ard
-            JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
-            GROUP BY ard.admin_role_id
-        )
-        SELECT
-            au.admin_id,
-            au.username,
-            au.full_name,
-            ar.role_name,
-            ar.role_level,
-            au.role_type,
-            COALESCE(ap.permissions, '[]'::jsonb) as permissions,
-            COALESCE(ad.departments, '[]'::jsonb) as departments,
-            au.reports_to,
-            ru.full_name as reports_to_name,
-            au.is_active,
-            au.last_login
-        FROM admin_users au
-        JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-        LEFT JOIN admin_perms ap ON ar.admin_role_id = ap.admin_role_id
-        LEFT JOIN admin_depts ad ON ar.admin_role_id = ad.admin_role_id
-        LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-        WHERE au.admin_id = admin_id_param;
-    END;
-    $$ LANGUAGE plpgsql;
+        -- Legal
+        tax_id VARCHAR(50),
+        social_security_id VARCHAR(50),
 
-    -- Function to check if admin has permission
-    CREATE OR REPLACE FUNCTION admin_has_permission(
-        admin_id_param UUID,
-        permission_name_param VARCHAR(100)
-    ) RETURNS BOOLEAN AS $$
-    BEGIN
-        RETURN EXISTS (
-            SELECT 1
-            FROM admin_users au
-            JOIN admin_role_permissions arp ON au.admin_role_id = arp.admin_role_id
-            JOIN permissions p ON arp.permission_id = p.permission_id
-            WHERE au.admin_id = admin_id_param
-            AND au.is_active = true
-            AND p.permission_name = permission_name_param
-        );
-    END;
-    $$ LANGUAGE plpgsql;
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
 
-    -- Function to check if admin has department access
-    CREATE OR REPLACE FUNCTION admin_has_department_access(
-        admin_id_param UUID,
-        department_bitmask BIGINT
-    ) RETURNS BOOLEAN AS $$
-    BEGIN
-        RETURN EXISTS (
-            SELECT 1
-            FROM admin_users au
-            JOIN admin_role_departments ard ON au.admin_role_id = ard.admin_role_id
-            JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
-            WHERE au.admin_id = admin_id_param
-            AND au.is_active = true
-            AND (sd.bitmask & department_bitmask) > 0
-        );
-    END;
-    $$ LANGUAGE plpgsql;
+        UNIQUE (company_id, user_id),
+        CONSTRAINT chk_employment_status CHECK (employment_status IN ('active','notice','terminated','on_hold')),
+        CONSTRAINT fk_employee_profile_membership FOREIGN KEY (company_id, user_id) 
+            REFERENCES company_employees (company_id, user_id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
 
-    -- General admin search function - FIXED VERSION
-    -- Drop and recreate the function with proper handling
-    DROP FUNCTION IF EXISTS search_admin_users(TEXT, INTEGER, BOOLEAN, TEXT, INTEGER, INTEGER);
-    CREATE OR REPLACE FUNCTION search_admin_users(
-        search_query_param TEXT DEFAULT NULL,
-        role_type_filter_param INTEGER DEFAULT NULL,
-        include_inactive_param BOOLEAN DEFAULT false,
-        search_type_param TEXT DEFAULT 'autocomplete',
-        limit_count_param INTEGER DEFAULT 50,
-        offset_count_param INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        role_name VARCHAR(100),
-        admin_role_id UUID,
-        role_type INTEGER,
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMESTAMPTZ,
-        admin_created_at TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    BEGIN
-        -- Normalize empty string to NULL
-        IF search_query_param = '' THEN
-            search_query_param := NULL;
-        END IF;
+    -- Employee Department History
+    CREATE TABLE employee_department_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        company_id UUID NOT NULL,
+        department_id UUID NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE,
+        change_reason TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
 
-        -- Build query based on search type
-        IF search_query_param IS NULL THEN
-            -- Return all admins (no search query)
-            RETURN QUERY
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                1.0::FLOAT as relevance_score,
-                'all'::TEXT as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-            WHERE 
-                (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
-                AND (include_inactive_param OR au.is_active = true)
-            ORDER BY ar.role_level DESC, au.username ASC
-            LIMIT limit_count_param
-            OFFSET offset_count_param;
-            
-        ELSIF search_type_param = 'autocomplete' OR LENGTH(search_query_param) < 3 THEN
-            -- Autocomplete/partial match
-            RETURN QUERY
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                GREATEST(
-                    COALESCE(similarity(au.username, search_query_param), 0),
-                    COALESCE(similarity(au.full_name, search_query_param), 0)
-                )::FLOAT as relevance_score,
-                'autocomplete'::TEXT as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-            WHERE 
-                (au.username ILIKE '%' || search_query_param || '%' 
-                OR au.full_name ILIKE '%' || search_query_param || '%')
-                AND (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
-                AND (include_inactive_param OR au.is_active = true)
-            ORDER BY relevance_score DESC, ar.role_level DESC, au.username ASC
-            LIMIT limit_count_param
-            OFFSET offset_count_param;
-            
-        ELSE
-            -- Full-text search
-            RETURN QUERY
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                ts_rank(au.user_search_tsv, plainto_tsquery('simple', search_query_param))::FLOAT as relevance_score,
-                'fulltext'::TEXT as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-            WHERE 
-                au.user_search_tsv @@ plainto_tsquery('simple', search_query_param)
-                AND (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
-                AND (include_inactive_param OR au.is_active = true)
-            ORDER BY relevance_score DESC, ar.role_level DESC, au.username ASC
-            LIMIT limit_count_param
-            OFFSET offset_count_param;
-        END IF;
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (department_id) REFERENCES departments(department_id)
+    );
+
+    CREATE UNIQUE INDEX uq_employee_active_department 
+    ON employee_department_history (user_id) 
+    WHERE end_date IS NULL;
+
+    -- Employee Documents
+    CREATE TABLE employee_documents (
+        document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        company_id UUID NOT NULL,
+
+        document_type VARCHAR(50), -- offer_letter, id_proof, resume
+        document_name VARCHAR(255),
+        document_object_key TEXT NOT NULL,
+        mime_type VARCHAR(50),
+
+        is_confidential BOOLEAN DEFAULT false,
+        uploaded_by UUID,
+        uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+
+    -- Positions
+    CREATE TABLE positions (
+        position_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        department_id UUID NOT NULL,
+        title VARCHAR(255),
+        is_open BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        FOREIGN KEY (department_id) REFERENCES departments(department_id)
+    );
+
+    -- Employee Role History
+    CREATE TABLE employee_role_history (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        role_id UUID NOT NULL,
+        start_date DATE,
+        end_date DATE,
+        reason TEXT,
         
-        RETURN;
-    END;
-    $$ LANGUAGE plpgsql STABLE;
-    -- Function for admin autocomplete suggestions
-    CREATE OR REPLACE FUNCTION get_admin_suggestions(
-        prefix VARCHAR(100),
-        role_type_filter INTEGER DEFAULT NULL,
-        exclude_super_admin BOOLEAN DEFAULT true,
-        limit_suggestions INTEGER DEFAULT 10
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        role_name VARCHAR(100),
-        role_level INTEGER,
-        role_type INTEGER,
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        relevance FLOAT  -- This is DOUBLE PRECISION
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            au.admin_id, au.username, au.full_name,
-            ar.role_name, ar.role_level, au.role_type,
-            au.reports_to, ru.full_name as reports_to_name,
-            -- Cast similarity result to FLOAT (DOUBLE PRECISION)
-            similarity(au.username, prefix)::FLOAT as relevance
-        FROM admin_users au
-        JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-        LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-        WHERE au.is_active = true
-        AND (au.username ILIKE prefix || '%' OR au.full_name ILIKE prefix || '%')
-        AND (role_type_filter IS NULL OR au.role_type = role_type_filter)
-        AND (NOT exclude_super_admin OR au.role_type != 4)
-        ORDER BY
-            CASE
-                WHEN au.username ILIKE prefix || '%' THEN 1
-                WHEN au.full_name ILIKE prefix || '%' THEN 2
-                ELSE 3
-            END,
-            similarity(au.username, prefix) DESC,
-            ar.role_level DESC
-        LIMIT limit_suggestions;
-    END;
-    $$ LANGUAGE plpgsql;
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (role_id) REFERENCES roles(role_id)
+    );
 
-    -- Function to get admin permissions by role
-    CREATE OR REPLACE FUNCTION get_admin_role_permissions(
-        role_id_param UUID
-    ) RETURNS TABLE(
-        permission_id UUID,
-        permission_name VARCHAR(100),
+    CREATE UNIQUE INDEX uq_employee_role_active
+    ON employee_role_history (user_id)
+    WHERE end_date IS NULL;
+
+    -- Employee Exit (Offboarding & Termination)
+    CREATE TABLE employee_exit (
+        exit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        company_id UUID NOT NULL,
+
+        exit_date DATE,
+        exit_reason TEXT,
+        eligible_for_rehire BOOLEAN,
+
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        
+        CONSTRAINT uq_employee_exit UNIQUE (company_id, user_id),
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+    
+    -- ==============================================
+    -- SCHEDULING MODULE TABLES
+    -- ==============================================
+
+    -- Work Calendars
+    CREATE TABLE work_calendars (
+        calendar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
+        working_days INTEGER[] NOT NULL,
+        holidays JSONB,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        CONSTRAINT fk_calendar_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+
+    -- Schedule Templates
+    CREATE TABLE schedule_templates (
+        schedule_template_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        calendar_id UUID NOT NULL,
+        template_type VARCHAR(30) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        rules JSONB NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        CONSTRAINT chk_template_type CHECK (template_type IN ('office', 'shift', 'class')),
+        CONSTRAINT fk_schedule_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_schedule_calendar
+            FOREIGN KEY (calendar_id) REFERENCES work_calendars(calendar_id)
+    );
+
+    -- User Schedule Assignments
+    CREATE TABLE user_schedule_assignments (
+        user_id UUID NOT NULL,
+        schedule_template_id UUID NOT NULL,
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        assigned_by UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        PRIMARY KEY (user_id, schedule_template_id, effective_from),
+        CONSTRAINT no_overlapping_schedules EXCLUDE USING gist (
+            user_id WITH =,
+            daterange(effective_from, COALESCE(effective_to, 'infinity'), '[]') WITH &&
+        ),
+        CONSTRAINT fk_usa_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_usa_template
+            FOREIGN KEY (schedule_template_id)
+            REFERENCES schedule_templates(schedule_template_id)
+    );
+
+    -- Schedule Instances
+    CREATE TABLE schedule_instances (
+        schedule_instance_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        schedule_date DATE NOT NULL,
+        schedule_template_id UUID NOT NULL,
+        expected_start TIMESTAMPTZ,
+        expected_end TIMESTAMPTZ,
+        timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
+        metadata JSONB,
+        generated_at TIMESTAMPTZ DEFAULT NOW(),
+
+        UNIQUE (user_id, schedule_date),
+
+        CONSTRAINT fk_si_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_si_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_si_template FOREIGN KEY (schedule_template_id)
+            REFERENCES schedule_templates(schedule_template_id)
+    );
+
+    -- ==============================================
+    -- COMPENSATION MODULE TABLES
+    -- ==============================================
+
+    -- Pay Units
+    CREATE TABLE pay_units (
+        pay_unit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(30) NOT NULL,
+        description TEXT
+    );
+
+    -- Compensation Structures
+    CREATE TABLE compensation_structures (
+        structure_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        structure_code VARCHAR(50) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+        components JSONB NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        UNIQUE (company_id, structure_code),
+        CONSTRAINT fk_comp_struct_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+
+    -- User Compensations
+    CREATE TABLE user_compensations (
+        user_id UUID NOT NULL,
+        structure_id UUID NOT NULL,
+        pay_unit_id UUID,
+        ctc_amount NUMERIC(12,2) NOT NULL,
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        assigned_by UUID,
+        structure_snapshot JSONB NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        PRIMARY KEY (user_id, structure_id, effective_from),
+        CONSTRAINT no_overlapping_compensation EXCLUDE USING gist (
+            user_id WITH =,
+            daterange(
+            effective_from,
+            COALESCE(effective_to, 'infinity'),
+            '[]'
+            )
+                WITH &&
+        ),
+        CONSTRAINT fk_uc_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_uc_structure FOREIGN KEY (structure_id)
+            REFERENCES compensation_structures(structure_id),
+        CONSTRAINT fk_uc_pay_unit
+            FOREIGN KEY (pay_unit_id) REFERENCES pay_units(pay_unit_id)
+    );
+
+    -- ==============================================
+    -- ATTENDANCE MODULE TABLES
+    -- ==============================================
+
+    -- Attendance Source Types
+    CREATE TABLE attendance_source_types (
+        source_type VARCHAR(30) PRIMARY KEY,
         description TEXT,
-        category VARCHAR(50),
-        module VARCHAR(50),
-        scope VARCHAR(20),
-        bit_index INTEGER
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            p.permission_id,
-            p.permission_name,
-            p.description,
-            p.category,
-            p.module,
-            p.scope,
-            p.bit_index
-        FROM admin_role_permissions arp
-        JOIN permissions p ON arp.permission_id = p.permission_id
-        WHERE arp.admin_role_id = role_id_param
-        ORDER BY p.module, p.bit_index;
-    END;
-    $$ LANGUAGE plpgsql;
+        requires_reference BOOLEAN NOT NULL DEFAULT false
+    );
 
-    -- Function to get admin departments by role
-    CREATE OR REPLACE FUNCTION get_admin_role_departments(
-        role_id_param UUID
-    ) RETURNS TABLE(
+    -- Attendance Sources
+    CREATE TABLE attendance_sources (
+        source_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        source_type VARCHAR(30) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        reference_type VARCHAR(30),
+        reference_id UUID,
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by UUID,
+
+        CONSTRAINT fk_attendance_sources_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_attendance_sources_type
+            FOREIGN KEY (source_type)
+            REFERENCES attendance_source_types(source_type)
+    );
+
+    -- Attendance Events
+    CREATE TABLE attendance_events (
+        attendance_event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        event_type VARCHAR(30) NOT NULL,
+        event_time TIMESTAMPTZ NOT NULL,
+        source_type VARCHAR(30) NOT NULL,
+        source_id UUID,
+        device_id VARCHAR(256),
+        ip_address VARCHAR(64),
+        metadata JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by UUID,
+
+        CONSTRAINT fk_att_events_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_att_events_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_att_events_source_type
+            FOREIGN KEY (source_type)
+            REFERENCES attendance_source_types(source_type),
+        CONSTRAINT fk_att_events_source
+            FOREIGN KEY (source_id)
+            REFERENCES attendance_sources(source_id)
+    );
+
+    ALTER TABLE attendance_events
+    ADD COLUMN event_date DATE
+    GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED;
+
+    CREATE INDEX idx_attendance_events_event_date
+    ON attendance_events (event_date);
+
+    CREATE INDEX idx_attendance_events_company_event_date
+    ON attendance_events (company_id, event_date);
+
+    -- Attendance Policies
+    CREATE TABLE attendance_policies (
+        policy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
         department_id UUID,
-        name VARCHAR(255),
-        module_code VARCHAR(100),
-        description TEXT,
-        bitmask BIGINT
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            sd.system_department_id,
-            sd.name,
-            sd.module_code,
-            sd.description,
-            sd.bitmask
-        FROM admin_role_departments ard
-        JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
-        WHERE ard.admin_role_id = role_id_param
-        ORDER BY sd.bitmask;
-    END;
-    $$ LANGUAGE plpgsql;
+        policy_code VARCHAR(50) NOT NULL,
+        policy_type VARCHAR(30) NOT NULL,
+        rules JSONB NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        UNIQUE (company_id, policy_code),
+        CONSTRAINT fk_attendance_policies_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_attendance_policies_department
+            FOREIGN KEY (department_id) REFERENCES departments(department_id)
+    );
+
+    -- User Attendance Policies
+    CREATE TABLE user_attendance_policies (
+        user_id UUID NOT NULL,
+        policy_id UUID NOT NULL,
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        assigned_by UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        PRIMARY KEY (user_id, policy_id, effective_from),
+
+        CONSTRAINT fk_uap_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_uap_policy FOREIGN KEY (policy_id) REFERENCES attendance_policies(policy_id)
+    );
+
+    -- Attendance Daily Summary
+    CREATE TABLE attendance_daily_summary (
+        attendance_summary_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        attendance_date DATE NOT NULL,
+        status VARCHAR(30) NOT NULL,
+        worked_minutes INTEGER,
+        overtime_minutes INTEGER,
+        late_minutes INTEGER,
+        metadata JSONB,
+        generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        generated_by VARCHAR(30) DEFAULT 'system',
+
+        UNIQUE (company_id, user_id, attendance_date),
+        CONSTRAINT fk_att_summary_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_att_summary_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+
+    -- Attendance Locations
+    CREATE TABLE attendance_locations (
+        location_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        name VARCHAR(100),
+        location_type VARCHAR(30),
+        geo_lat NUMERIC,
+        geo_lng NUMERIC,
+        is_active BOOLEAN DEFAULT true,
+
+        CONSTRAINT fk_att_locations_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
 
     -- ==============================================
-    -- EXISTING USER AND COMPANY SEARCH FUNCTIONS
+    -- LEAVE MODULE TABLES
     -- ==============================================
-    CREATE OR REPLACE FUNCTION user_search(
-        search_query TEXT,
-        search_type TEXT DEFAULT 'fulltext',
-        filter_is_active BOOLEAN DEFAULT NULL,
-        filter_kyc_status TEXT DEFAULT NULL,
-        filter_data_region TEXT DEFAULT NULL,
-        filter_is_verified BOOLEAN DEFAULT NULL,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        user_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        kyc_status VARCHAR(50),
-        kyc_level VARCHAR(20),
-        is_verified BOOLEAN,
-        is_active BOOLEAN,
-        data_region VARCHAR(20),
-        created_at TIMESTAMPTZ,
-        last_login TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    DECLARE
-        base_query TEXT;
-        where_clause TEXT := '';
-        query_params TEXT[];
-        param_counter INTEGER := 1;
-        filter_param_count INTEGER := 0;
-        search_param_index INTEGER := 1;
-    BEGIN
-        -- Build WHERE clause for filters and collect parameters
-        IF filter_is_active IS NOT NULL THEN
-            where_clause := where_clause || ' AND is_active = $' || param_counter;
-            query_params := array_append(query_params, filter_is_active::TEXT);
-            param_counter := param_counter + 1;
-            filter_param_count := filter_param_count + 1;
-        END IF;
 
-        IF filter_kyc_status IS NOT NULL THEN
-            where_clause := where_clause || ' AND kyc_status = $' || param_counter;
-            query_params := array_append(query_params, filter_kyc_status);
-            param_counter := param_counter + 1;
-            filter_param_count := filter_param_count + 1;
-        END IF;
+    -- Leave Types
+    CREATE TABLE leave_types (
+        leave_type_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        leave_code VARCHAR(30) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        category VARCHAR(30) NOT NULL,
+        is_statutory BOOLEAN NOT NULL DEFAULT false,
+        affects_pay BOOLEAN NOT NULL DEFAULT true,
+        requires_approval BOOLEAN NOT NULL DEFAULT true,
+        requires_document BOOLEAN NOT NULL DEFAULT false,
+        allow_half_day BOOLEAN DEFAULT true,
+        allow_hourly BOOLEAN DEFAULT false,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
 
-        IF filter_data_region IS NOT NULL THEN
-            where_clause := where_clause || ' AND data_region = $' || param_counter;
-            query_params := array_append(query_params, filter_data_region);
-            param_counter := param_counter + 1;
-            filter_param_count := filter_param_count + 1;
-        END IF;
+        UNIQUE (company_id, leave_code),
+        CONSTRAINT fk_leave_types_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
 
-        IF filter_is_verified IS NOT NULL THEN
-            where_clause := where_clause || ' AND is_verified = $' || param_counter;
-            query_params := array_append(query_params, filter_is_verified::TEXT);
-            param_counter := param_counter + 1;
-            filter_param_count := filter_param_count + 1;
-        END IF;
-
-        -- Choose search method
-        IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
-            -- Partial matching (autocomplete) using trigram
-            base_query := '
-                SELECT
-                    u.user_id,
-                    u.username,
-                    u.full_name,
-                    u.phone_hash,
-                    u.kyc_status,
-                    u.kyc_level,
-                    u.is_verified,
-                    u.is_active,
-                    u.data_region,
-                    u.created_at,
-                    u.last_login,
-                    GREATEST(
-                        COALESCE(similarity(u.username, $' || param_counter || '), 0),
-                        COALESCE(similarity(u.full_name, $' || param_counter || '), 0)
-                    )::FLOAT AS relevance_score,
-                    ''autocomplete'' AS match_type
-                FROM users u
-                WHERE 1=1 ' || where_clause ||
-                ' AND (u.username ILIKE $' || (param_counter + 1) ||
-                ' OR u.full_name ILIKE $' || (param_counter + 1) || ')
-                ORDER BY relevance_score DESC, u.username ASC
-                LIMIT $' || (param_counter + 2) || ' OFFSET $' || (param_counter + 3);
-
-            -- Add parameters
-            query_params := array_append(query_params, search_query);
-            query_params := array_append(query_params, '%' || search_query || '%');
-            query_params := array_append(query_params, limit_count::TEXT);
-            query_params := array_append(query_params, offset_count::TEXT);
-        ELSE
-            -- Full-text search (🔥 FIXED)
-            base_query := '
-                SELECT
-                    u.user_id,
-                    u.username,
-                    u.full_name,
-                    u.phone_hash,
-                    u.kyc_status,
-                    u.kyc_level,
-                    u.is_verified,
-                    u.is_active,
-                    u.data_region,
-                    u.created_at,
-                    u.last_login,
-                    ts_rank(
-                        u.user_search_tsv,
-                        plainto_tsquery(''simple'', $' || param_counter || '::text)
-                    )::FLOAT AS relevance_score,
-                    ''fulltext'' AS match_type
-                FROM users u
-                WHERE 1=1 ' || where_clause ||
-                ' AND u.user_search_tsv @@ plainto_tsquery(''simple'', $' || param_counter || '::text)
-                ORDER BY relevance_score DESC, u.username ASC
-                LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
-
-            -- Add parameters
-            query_params := array_append(query_params, search_query);
-            query_params := array_append(query_params, limit_count::TEXT);
-            query_params := array_append(query_params, offset_count::TEXT);
-        END IF;
-
-        -- Execute the query
-        RETURN QUERY EXECUTE base_query USING query_params;
-
-    EXCEPTION
-        WHEN OTHERS THEN
-            RAISE NOTICE 'Error in user_search: %', SQLERRM;
-            RAISE NOTICE 'Query: %', base_query;
-            RAISE NOTICE 'Params: %', query_params;
-            RAISE;
-    END;
-    $$ LANGUAGE plpgsql STABLE;
-
-
-    CREATE OR REPLACE FUNCTION company_search(
-        search_query TEXT,
-        search_type TEXT DEFAULT 'fulltext',
-        filter_owner_id UUID DEFAULT NULL,
-        filter_is_active BOOLEAN DEFAULT NULL,
-        filter_subscription_tier TEXT DEFAULT NULL,
-        filter_data_region TEXT DEFAULT NULL,
-        filter_subscription_status TEXT DEFAULT NULL,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        company_id UUID,
-        company_name VARCHAR(255),
-        owner_user_id UUID,
-        subscription_tier VARCHAR(20),
-        subscription_status VARCHAR(20),
-        max_employees INTEGER,
-        is_active BOOLEAN,
-        data_region VARCHAR(10),
-        created_at TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    DECLARE
-        base_query TEXT;
-        where_clause TEXT := '';
-        query_params TEXT[];
-        param_counter INTEGER := 1;
-        filter_param_count INTEGER := 0;
-    BEGIN
-        -- Build WHERE clause
-        IF filter_owner_id IS NOT NULL THEN
-            where_clause := where_clause || ' AND owner_user_id = $' || param_counter;
-            query_params := array_append(query_params, filter_owner_id::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
-
-        IF filter_is_active IS NOT NULL THEN
-            where_clause := where_clause || ' AND is_active = $' || param_counter;
-            query_params := array_append(query_params, filter_is_active::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
-
-        IF filter_subscription_tier IS NOT NULL THEN
-            where_clause := where_clause || ' AND subscription_tier = $' || param_counter;
-            query_params := array_append(query_params, filter_subscription_tier);
-            param_counter := param_counter + 1;
-        END IF;
-
-        IF filter_data_region IS NOT NULL THEN
-            where_clause := where_clause || ' AND data_region = $' || param_counter;
-            query_params := array_append(query_params, filter_data_region);
-            param_counter := param_counter + 1;
-        END IF;
-
-        IF filter_subscription_status IS NOT NULL THEN
-            where_clause := where_clause || ' AND subscription_status = $' || param_counter;
-            query_params := array_append(query_params, filter_subscription_status);
-            param_counter := param_counter + 1;
-        END IF;
-
-        filter_param_count := param_counter - 1; -- Count of filter parameters
-
-        -- Choose search method
-        IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
-            -- Partial matching (autocomplete) using trigram
-            base_query := '
-                SELECT
-                    c.company_id,
-                    c.company_name,
-                    c.owner_user_id,
-                    c.subscription_tier,
-                    c.subscription_status,
-                    c.max_employees,
-                    c.is_active,
-                    c.data_region,
-                    c.created_at,
-                    similarity(c.company_name, $' || (filter_param_count + 1) || ')::FLOAT as relevance_score,
-                    ''autocomplete'' as match_type
-                FROM companies c
-                WHERE 1=1 ' || where_clause ||
-                ' AND c.company_name ILIKE $' || (filter_param_count + 2) ||
-                ' ORDER BY relevance_score DESC, c.company_name ASC
-                LIMIT $' || (filter_param_count + 3) || ' OFFSET $' || (filter_param_count + 4);
-
-            query_params := array_append(query_params, search_query);
-            query_params := array_append(query_params, '%' || search_query || '%');
-            query_params := array_append(query_params, limit_count::TEXT);
-            query_params := array_append(query_params, offset_count::TEXT);
-        ELSE
-            -- Full-text search for complete words
-            base_query := '
-                SELECT
-                    c.company_id,
-                    c.company_name,
-                    c.owner_user_id,
-                    c.subscription_tier,
-                    c.subscription_status,
-                    c.max_employees,
-                    c.is_active,
-                    c.data_region,
-                    c.created_at,
-                    ts_rank(c.company_name_tsv, plainto_tsquery(''simple'', $' || (filter_param_count + 1) || '::text)) as relevance_score,
-                    ''fulltext'' as match_type
-                FROM companies c
-                WHERE 1=1 ' || where_clause ||
-                ' AND c.company_name_tsv @@ plainto_tsquery(''simple'', $' || (filter_param_count + 1) || '::text)
-                ORDER BY relevance_score DESC, c.company_name ASC
-                LIMIT $' || (filter_param_count + 2) || ' OFFSET $' || (filter_param_count + 3);
-
-            query_params := array_append(query_params, search_query);
-            query_params := array_append(query_params, limit_count::TEXT);
-            query_params := array_append(query_params, offset_count::TEXT);
-        END IF;
-
-        -- Execute the query
-        RETURN QUERY EXECUTE base_query USING query_params;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- ==============================================
-    -- ADDED: COMPANY EMPLOYEE SEARCH FUNCTIONS (MISSING FROM NEW SCHEMA)
-    -- ==============================================
-    -- Function: company_employee_search
-    -- Search employees within a specific company
-    CREATE OR REPLACE FUNCTION company_employee_search(
-        search_query TEXT,
-        company_id_param UUID,
-        search_type TEXT DEFAULT 'fulltext',
-        filter_role_id UUID DEFAULT NULL,
-        filter_department_id UUID DEFAULT NULL,
-        filter_is_active BOOLEAN DEFAULT NULL,
-        filter_reports_to UUID DEFAULT NULL,
-        filter_hire_date_from TIMESTAMPTZ DEFAULT NULL,
-        filter_hire_date_to TIMESTAMPTZ DEFAULT NULL,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        user_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        employee_id VARCHAR(100),
-        role_id UUID,
-        role_name VARCHAR(100),
+    -- Leave Policies
+    CREATE TABLE leave_policies (
+        leave_policy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
         department_id UUID,
-        department_name VARCHAR(255),
-        hire_date TIMESTAMPTZ,
-        is_active BOOLEAN,
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        created_at TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    DECLARE
-        base_query TEXT;
-        where_clause TEXT := '';
-        query_params TEXT[];
-        param_counter INTEGER := 1;
-    BEGIN
-        -- Start building parameters
-        query_params := array[]::text[];
+        country_code VARCHAR(10) NOT NULL,
+        policy_code VARCHAR(50) NOT NULL,
+        rules JSONB NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
 
-        -- Add company_id as first parameter
-        where_clause := where_clause || ' AND ce.company_id = $' || param_counter;
-        query_params := array_append(query_params, company_id_param::TEXT);
-        param_counter := param_counter + 1;
+        UNIQUE (company_id, policy_code),
+        CONSTRAINT fk_leave_policies_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_leave_policies_department
+            FOREIGN KEY (department_id) REFERENCES departments(department_id)
+    );
 
-        -- Additional filters
-        IF filter_role_id IS NOT NULL THEN
-            where_clause := where_clause || ' AND ce.role_id = $' || param_counter;
-            query_params := array_append(query_params, filter_role_id::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
+    -- User Leave Policies
+    CREATE TABLE user_leave_policies (
+        user_id UUID NOT NULL,
+        leave_policy_id UUID NOT NULL,
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        assigned_by UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
 
-        IF filter_department_id IS NOT NULL THEN
-            where_clause := where_clause || ' AND rd.department_id = $' || param_counter;
-            query_params := array_append(query_params, filter_department_id::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
+        PRIMARY KEY (user_id, leave_policy_id, effective_from),
 
-        IF filter_is_active IS NOT NULL THEN
-            where_clause := where_clause || ' AND ce.is_active = $' || param_counter;
-            query_params := array_append(query_params, filter_is_active::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
+        CONSTRAINT fk_ulp_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_ulp_policy
+            FOREIGN KEY (leave_policy_id)
+            REFERENCES leave_policies(leave_policy_id)
+    );
 
-        IF filter_reports_to IS NOT NULL THEN
-            where_clause := where_clause || ' AND ce.reports_to = $' || param_counter;
-            query_params := array_append(query_params, filter_reports_to::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
+    -- Leave Balances
+    CREATE TABLE leave_balances (
+    company_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    leave_type_id UUID NOT NULL,
+    balance NUMERIC(5,2) NOT NULL,
+    as_of TIMESTAMPTZ NOT NULL,
+    generated_at TIMESTAMPTZ DEFAULT NOW(),
 
-        IF filter_hire_date_from IS NOT NULL THEN
-            where_clause := where_clause || ' AND ce.hire_date >= $' || param_counter;
-            query_params := array_append(query_params, filter_hire_date_from::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
+    PRIMARY KEY (company_id, user_id, leave_type_id, as_of),
+    CONSTRAINT fk_lb_company
+        FOREIGN KEY (company_id) REFERENCES companies(company_id),
+    CONSTRAINT fk_lb_user
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+    CONSTRAINT fk_lb_type
+        FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
+    );
 
-        IF filter_hire_date_to IS NOT NULL THEN
-            where_clause := where_clause || ' AND ce.hire_date <= $' || param_counter;
-            query_params := array_append(query_params, filter_hire_date_to::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
+    -- Leave Requests
+    CREATE TABLE leave_requests (
+        leave_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        leave_type_id UUID NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        duration NUMERIC(5,2) NOT NULL,
+        reason TEXT,
+        status VARCHAR(30) NOT NULL DEFAULT 'pending',
+        requested_at TIMESTAMPTZ DEFAULT NOW(),
 
-        -- Choose search method
-        IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
-            -- Partial matching (autocomplete) using trigram
-            base_query := '
-                SELECT
-                    u.user_id,
-                    u.username,
-                    u.full_name,
-                    u.phone_hash,
-                    ce.employee_id,
-                    ce.role_id,
-                    r.role_name,
-                    rd.department_id,
-                    d.department_name,
-                    ce.hire_date,
-                    ce.is_active,
-                    ce.reports_to,
-                    ru.username as reports_to_name,
-                    u.created_at,
-                    GREATEST(
-                        COALESCE(similarity(u.username, $' || param_counter || '), 0),
-                        COALESCE(similarity(u.full_name, $' || param_counter || '), 0),
-                        COALESCE(similarity(ce.employee_id, $' || param_counter || '), 0)
-                    )::FLOAT as relevance_score,
-                    ''autocomplete'' as match_type
-                FROM users u
-                INNER JOIN company_employees ce ON u.user_id = ce.user_id
-                INNER JOIN roles r ON ce.role_id = r.role_id
-                INNER JOIN role_departments rd ON r.role_id = rd.role_id
-                LEFT JOIN departments d ON rd.department_id = d.department_id
-                LEFT JOIN users ru ON ce.reports_to = ru.user_id
-                WHERE 1=1 ' || where_clause ||
-                ' AND (u.username ILIKE $' || (param_counter + 1) ||
-                ' OR u.full_name ILIKE $' || (param_counter + 1) ||
-                ' OR ce.employee_id ILIKE $' || (param_counter + 1) || ')
-                ORDER BY relevance_score DESC, ce.hire_date DESC
-                LIMIT $' || (param_counter + 2) || ' OFFSET $' || (param_counter + 3);
+        CONSTRAINT chk_leave_status CHECK (status IN ('pending','approved','rejected','cancelled','withdrawn')),
+        CONSTRAINT no_overlapping_leaves EXCLUDE USING gist (
+            user_id WITH =,
+            daterange(start_date, end_date, '[]') WITH &&
+        ) WHERE (status IN ('pending','approved')),
+        CONSTRAINT fk_lr_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_lr_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_lr_type
+            FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
+    );
 
-            -- Add search query (for similarity) and pattern (for ILIKE)
-            query_params := array_append(query_params, search_query);
-            query_params := array_append(query_params, '%' || search_query || '%');
-            query_params := array_append(query_params, limit_count::TEXT);
-            query_params := array_append(query_params, offset_count::TEXT);
-        ELSE
-            -- Full-text search for complete words
-            base_query := '
-                SELECT
-                    u.user_id,
-                    u.username,
-                    u.full_name,
-                    u.phone_hash,
-                    ce.employee_id,
-                    ce.role_id,
-                    r.role_name,
-                    rd.department_id,
-                    d.department_name,
-                    ce.hire_date,
-                    ce.is_active,
-                    ce.reports_to,
-                    ru.username as reports_to_name,
-                    u.created_at,
-                    ts_rank(u.user_search_tsv, plainto_tsquery(''simple'', $' || param_counter || '::text)) as relevance_score,
-                    ''fulltext'' as match_type
-                FROM users u
-                INNER JOIN company_employees ce ON u.user_id = ce.user_id
-                INNER JOIN roles r ON ce.role_id = r.role_id
-                INNER JOIN role_departments rd ON r.role_id = rd.role_id
-                LEFT JOIN departments d ON rd.department_id = d.department_id
-                LEFT JOIN users ru ON ce.reports_to = ru.user_id
-                WHERE 1=1 ' || where_clause ||
-                ' AND u.user_search_tsv @@ plainto_tsquery(''simple'', $' || param_counter || '::text)
-                ORDER BY relevance_score DESC, ce.hire_date DESC
-                LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
+    -- Leave Approvals
+    CREATE TABLE leave_approvals (
+        approval_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        leave_request_id UUID NOT NULL,
+        approved_by UUID NOT NULL,
+        decision VARCHAR(20) NOT NULL,
+        decision_reason TEXT,
+        approval_level INTEGER NOT NULL DEFAULT 1,
+        decided_at TIMESTAMPTZ DEFAULT NOW(),
 
-            -- Add search query, limit, and offset
-            query_params := array_append(query_params, search_query);
-            query_params := array_append(query_params, limit_count::TEXT);
-            query_params := array_append(query_params, offset_count::TEXT);
-        END IF;
+        CONSTRAINT uq_leave_approval_once UNIQUE (leave_request_id, approved_by),
+        CONSTRAINT fk_la_request
+            FOREIGN KEY (leave_request_id)
+            REFERENCES leave_requests(leave_request_id)
+    );
 
-        -- Execute the query
-        RETURN QUERY EXECUTE base_query USING query_params;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function: get_company_employee_suggestions
-    -- Autocomplete suggestions for company employees
-    CREATE OR REPLACE FUNCTION get_company_employee_suggestions(
-        company_id_param UUID,
-        prefix VARCHAR(100),
-        limit_suggestions INTEGER DEFAULT 10
-    ) RETURNS TABLE(
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        user_id UUID,
-        employee_id VARCHAR(100),
-        role_name VARCHAR(100)
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            u.username,
-            u.full_name,
-            u.user_id,
-            ce.employee_id,
-            r.role_name
-        FROM users u
-        INNER JOIN company_employees ce ON u.user_id = ce.user_id
-        INNER JOIN roles r ON ce.role_id = r.role_id
-        WHERE ce.company_id = company_id_param
-        AND ce.is_active = true
-        AND (u.username ILIKE prefix || '%'
-             OR u.full_name ILIKE prefix || '%'
-             OR ce.employee_id ILIKE prefix || '%')
-        ORDER BY
-            CASE
-                WHEN u.username ILIKE prefix || '%' THEN 1
-                WHEN u.full_name ILIKE prefix || '%' THEN 2
-                WHEN ce.employee_id ILIKE prefix || '%' THEN 3
-                ELSE 4
-            END,
-            u.username
-        LIMIT limit_suggestions;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function: find_company_employee_by_username
-    -- Find company employee by username within a specific company
-    CREATE OR REPLACE FUNCTION find_company_employee_by_username(
-        company_id_search UUID,
-        username_search VARCHAR(100)
-    ) RETURNS TABLE(
-        user_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        employee_id VARCHAR(100),
-        role_id UUID,
-        role_name VARCHAR(100),
-        department_id UUID,
-        department_name VARCHAR(255),
-        is_active BOOLEAN,
-        hire_date TIMESTAMPTZ
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            u.user_id,
-            u.username,
-            u.full_name,
-            u.phone_hash,
-            ce.employee_id,
-            ce.role_id,
-            r.role_name,
-            rd.department_id,
-            d.department_name,
-            ce.is_active,
-            ce.hire_date
-        FROM users u
-        INNER JOIN company_employees ce ON u.user_id = ce.user_id
-        INNER JOIN roles r ON ce.role_id = r.role_id
-        INNER JOIN role_departments rd ON r.role_id = rd.role_id
-        LEFT JOIN departments d ON rd.department_id = d.department_id
-        WHERE ce.company_id = company_id_search
-        AND u.username = username_search
-        LIMIT 1;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- ==============================================
-    -- TRIGGERS
-    -- ==============================================
-    -- Trigger function to update search vector for admin users
-    CREATE OR REPLACE FUNCTION update_admin_user_search_tsv()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF NEW.username IS DISTINCT FROM OLD.username OR NEW.full_name IS DISTINCT FROM OLD.full_name THEN
-            NEW.user_search_tsv = to_tsvector('simple', COALESCE(NEW.username, '')) ||
-                                  to_tsvector('simple', COALESCE(NEW.full_name, ''));
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Create trigger for search vector updates for admin users
-    CREATE TRIGGER update_admin_user_search_tsv
-    BEFORE UPDATE OF username, full_name ON admin_users
-    FOR EACH ROW EXECUTE FUNCTION update_admin_user_search_tsv();
-
-    CREATE OR REPLACE FUNCTION update_user_search_tsv()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF NEW.username IS DISTINCT FROM OLD.username OR NEW.full_name IS DISTINCT FROM OLD.full_name THEN
-            NEW.user_search_tsv = to_tsvector('simple', COALESCE(NEW.username, '')) ||
-                                  to_tsvector('simple', COALESCE(NEW.full_name, ''));
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    CREATE TRIGGER update_user_search_tsv
-    BEFORE UPDATE OF username, full_name ON users
-    FOR EACH ROW EXECUTE FUNCTION update_user_search_tsv();
-
-    CREATE OR REPLACE FUNCTION update_company_name_tsv()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF NEW.company_name IS DISTINCT FROM OLD.company_name THEN
-            NEW.company_name_tsv = to_tsvector('simple', NEW.company_name);
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    CREATE TRIGGER update_company_name_tsv
-    BEFORE UPDATE OF company_name ON companies
-    FOR EACH ROW EXECUTE FUNCTION update_company_name_tsv();
-
-    CREATE OR REPLACE FUNCTION update_updated_at_column()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF TG_TABLE_NAME = 'admin_users' THEN
-            NEW.admin_updated_at = NOW();
-        ELSIF TG_TABLE_NAME = 'admin_roles' THEN
-            NEW.updated_at = NOW();
-        ELSE
-            NEW.updated_at = NOW();
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    CREATE TRIGGER update_admin_users_updated_at
-    BEFORE UPDATE ON admin_users
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_companies_updated_at BEFORE UPDATE ON companies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_roles_updated_at BEFORE UPDATE ON roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_departments_updated_at BEFORE UPDATE ON departments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_company_employees_updated_at BEFORE UPDATE ON company_employees FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_user_devices_updated_at BEFORE UPDATE ON user_devices FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_admin_roles_updated_at BEFORE UPDATE ON admin_roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    -- ==============================================
-    -- HELPER FUNCTIONS
-    -- ==============================================
-    -- Find users by username (exact match)
-    CREATE OR REPLACE FUNCTION find_user_by_username(username_search VARCHAR(100))
-    RETURNS TABLE(
-        user_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        is_active BOOLEAN,
-        created_at TIMESTAMPTZ
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            u.user_id,
-            u.username,
-            u.full_name,
-            u.phone_hash,
-            u.is_active,
-            u.created_at
-        FROM users u
-        WHERE u.username = username_search
-        LIMIT 1;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Find companies by owner with name search
-    CREATE OR REPLACE FUNCTION find_companies_by_owner(
-        owner_id UUID,
-        name_filter VARCHAR(255) DEFAULT NULL
-    ) RETURNS TABLE(
-        company_id UUID,
-        company_name VARCHAR(255),
-        subscription_tier VARCHAR(20),
-        subscription_status VARCHAR(20),
-        is_active BOOLEAN,
-        created_at TIMESTAMPTZ
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            c.company_id,
-            c.company_name,
-            c.subscription_tier,
-            c.subscription_status,
-            c.is_active,
-            c.created_at
-        FROM companies c
-        WHERE c.owner_user_id = owner_id
-        AND (name_filter IS NULL OR c.company_name ILIKE '%' || name_filter || '%')
-        ORDER BY c.created_at DESC;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Get user suggestions for autocomplete
-    CREATE OR REPLACE FUNCTION get_user_suggestions(
-        prefix VARCHAR(100),
-        limit_suggestions INTEGER DEFAULT 10
-    ) RETURNS TABLE(
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        user_id UUID
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            u.username,
-            u.full_name,
-            u.user_id
-        FROM users u
-        WHERE u.username ILIKE prefix || '%'
-           OR u.full_name ILIKE prefix || '%'
-        ORDER BY
-            CASE
-                WHEN u.username ILIKE prefix || '%' THEN 1
-                WHEN u.full_name ILIKE prefix || '%' THEN 2
-                ELSE 3
-            END,
-            u.username
-        LIMIT limit_suggestions;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Get company suggestions for autocomplete
-    CREATE OR REPLACE FUNCTION get_company_suggestions(
-        prefix VARCHAR(255),
-        limit_suggestions INTEGER DEFAULT 10
-    ) RETURNS TABLE(
-        company_name VARCHAR(255),
-        company_id UUID
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT
-            c.company_name,
-            c.company_id
-        FROM companies c
-        WHERE c.company_name ILIKE prefix || '%'
-        ORDER BY c.company_name
-        LIMIT limit_suggestions;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to search admin users with department filtering
-    CREATE OR REPLACE FUNCTION search_admin_users_with_departments(
-        search_query TEXT DEFAULT NULL,
-        role_type_filter INTEGER DEFAULT NULL,
-        include_inactive BOOLEAN DEFAULT false,
-        search_type TEXT DEFAULT 'autocomplete',
-        department_ids UUID[] DEFAULT NULL,
-        limit_count INTEGER DEFAULT 50,
-        offset_count INTEGER DEFAULT 0
-    ) RETURNS TABLE(
-        admin_id UUID,
-        username VARCHAR(100),
-        full_name VARCHAR(255),
-        phone_hash VARCHAR(128),
-        role_name VARCHAR(100),
-        admin_role_id UUID,
-        role_type INTEGER,
-        reports_to UUID,
-        reports_to_name VARCHAR(255),
-        is_active BOOLEAN,
-        last_login TIMESTAMPTZ,
-        admin_created_at TIMESTAMPTZ,
-        relevance_score FLOAT,
-        match_type TEXT
-    ) AS $$
-    DECLARE
-        base_query TEXT;
-        where_clause TEXT := 'WHERE 1=1';
-        query_params TEXT[];
-        param_counter INTEGER := 1;
-    BEGIN
-        -- Add department filter if provided
-        IF department_ids IS NOT NULL AND array_length(department_ids, 1) > 0 THEN
-            where_clause := where_clause || ' AND ard.system_department_id = ANY($' || param_counter || ')';
-            query_params := array_append(query_params, array_to_string(department_ids, ','));
-            param_counter := param_counter + 1;
-        END IF;
-
-        -- Add search query
-        IF search_query IS NOT NULL AND search_query != '' THEN
-            IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
-                where_clause := where_clause || ' AND (au.username ILIKE $' || param_counter ||
-                              ' OR au.full_name ILIKE $' || param_counter || ')';
-                query_params := array_append(query_params, '%' || search_query || '%');
-                param_counter := param_counter + 1;
-            ELSE
-                where_clause := where_clause || ' AND au.user_search_tsv @@ plainto_tsquery(''simple'', $' ||
-                              param_counter || '::text)';
-                query_params := array_append(query_params, search_query);
-                param_counter := param_counter + 1;
-            END IF;
-        END IF;
-
-        -- Add role type filter
-        IF role_type_filter IS NOT NULL THEN
-            where_clause := where_clause || ' AND au.role_type = $' || param_counter;
-            query_params := array_append(query_params, role_type_filter::TEXT);
-            param_counter := param_counter + 1;
-        END IF;
-
-        -- Add active status filter
-        IF NOT include_inactive THEN
-            where_clause := where_clause || ' AND au.is_active = true';
-        END IF;
-
-        -- Build the main query
-        base_query := '
-            SELECT
-                au.admin_id, au.username, au.full_name, au.phone_hash,
-                ar.role_name, au.admin_role_id, au.role_type,
-                au.reports_to, ru.full_name as reports_to_name,
-                au.is_active, au.last_login, au.admin_created_at,
-                CASE
-                    WHEN $' || param_counter || '::text = '''' THEN 1.0
-                    ELSE ts_rank(au.user_search_tsv, plainto_tsquery(''simple'', $' || param_counter || '::text))
-                END as relevance_score,
-                CASE
-                    WHEN $' || param_counter || '::text = '''' THEN ''all''
-                    WHEN LENGTH($' || (param_counter - 1) || '::text) < 3 THEN ''autocomplete''
-                    ELSE ''fulltext''
-                END as match_type
-            FROM admin_users au
-            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
-            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
-        ';
-
-        -- Add department join if filtering
-        IF department_ids IS NOT NULL AND array_length(department_ids, 1) > 0 THEN
-            base_query := base_query || '
-                JOIN admin_role_departments ard ON au.admin_role_id = ard.admin_role_id
-            ';
-        END IF;
-
-        base_query := base_query || where_clause || '
-            ORDER BY relevance_score DESC, au.username ASC
-            LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
-
-        -- Add search query for relevance calculation
-        query_params := array_append(query_params, COALESCE(search_query, ''));
-        query_params := array_append(query_params, limit_count::TEXT);
-        query_params := array_append(query_params, offset_count::TEXT);
-
-        RETURN QUERY EXECUTE base_query USING query_params;
-    END;
-    $$ LANGUAGE plpgsql;
+    -- Leave Transactions
+    CREATE TABLE leave_transactions (
+        transaction_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        leave_type_id UUID NOT NULL,
+        leave_request_id UUID,
+        change_amount NUMERIC(5,2) NOT NULL, -- + or -
+        reason VARCHAR(50), -- accrual | request | cancel | manual
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id),
+        FOREIGN KEY (leave_request_id) REFERENCES leave_requests(leave_request_id)
+    );
 
     -- ==============================================
     -- USER AVATARS (FK → users.user_id)
@@ -1740,7 +868,304 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     WHERE is_active = true AND is_primary = true;
 
     CREATE INDEX idx_admin_avatars_hash ON admin_avatars (avatar_hash);
+
+    -- ==============================================
+    -- AUDIT SCHEMA (SOURCE OF TRUTH)
+    -- ==============================================
+    CREATE SCHEMA IF NOT EXISTS audit;
+
+    CREATE TABLE audit.audit_logs (
+        audit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+        company_id UUID,
+        -- NULL allowed for system-wide events
+
+        module VARCHAR(50) NOT NULL,
+        -- hr | attendance | leave | payroll | admin | system
+
+        action VARCHAR(100) NOT NULL,
+        -- leave.approve | leave.reject
+        -- attendance.manual_add
+        -- attendance.manual_remove
+        -- policy.update
+        -- employee.terminate
+
+        entity_type VARCHAR(50) NOT NULL,
+        -- leave_request | attendance_event | attendance_policy | employee
+
+        entity_id UUID,
+
+        actor_type VARCHAR(20) NOT NULL,
+        -- user | admin | system
+
+        actor_id UUID,
+
+        before_state JSONB,
+        after_state JSONB,
+
+        metadata JSONB,
+        /*
+        {
+            "reason": "Forgot punch",
+            "ip": "1.2.3.4",
+            "device_id": "xyz",
+            "source": "web"
+        }
+        */
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- 🔒 Make audit immutable
+    REVOKE UPDATE, DELETE ON audit.audit_logs FROM PUBLIC;
+
+    -- ==============================================
+    -- OUTBOX PATTERN FOR AUDIT LOGS
+    -- ==============================================
+
+    -- Create audit_logs_outbox table for CDC (Change Data Capture)
+    CREATE TABLE audit.audit_logs_outbox (
+        outbox_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        audit_id UUID NOT NULL,
+        operation VARCHAR(10) NOT NULL, -- INSERT, UPDATE, DELETE
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        processed_at TIMESTAMPTZ,
+        error_message TEXT
+    );
+
+    -- Index for efficient querying of unprocessed records
+    CREATE INDEX idx_audit_logs_outbox_unprocessed 
+    ON audit.audit_logs_outbox (created_at) 
+    WHERE processed_at IS NULL;
+
+    -- ==============================================
+    -- DEBOUNCE TABLE FOR BATCH PROCESSING
+    -- ==============================================
+
+    CREATE TABLE audit.outbox_debounce (
+        debounce_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        last_processed_id UUID,
+        last_processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        batch_size INTEGER DEFAULT 0
+    );
+
+    -- ==============================================
+    -- INDEXES
+    -- ==============================================
+    -- Indexes for admin_users
+    CREATE INDEX idx_admin_users_search_tsv ON admin_users USING GIN (user_search_tsv);
+    CREATE INDEX idx_admin_users_username_trgm ON admin_users USING GIN (username gin_trgm_ops);
+    CREATE INDEX idx_admin_users_fullname_trgm ON admin_users USING GIN (full_name gin_trgm_ops);
+    CREATE INDEX idx_admin_users_role ON admin_users (admin_role_id) WHERE is_active = true;
+    CREATE INDEX idx_admin_users_role_type ON admin_users (role_type) WHERE is_active = true;
+    CREATE INDEX idx_admin_users_role_type_role ON admin_users (role_type, admin_role_id) WHERE is_active = true;
+    CREATE INDEX idx_admin_users_phone_hash ON admin_users (phone_hash);
+    CREATE INDEX idx_admin_users_active ON admin_users (is_active) WHERE is_active = true;
+    CREATE INDEX idx_admin_users_username ON admin_users (username);
+    CREATE INDEX idx_admin_users_role_active_login ON admin_users (admin_role_id, is_active, last_login DESC);
+
+    -- Indexes for admin_roles
+    CREATE INDEX idx_admin_roles_name ON admin_roles (role_name);
+    CREATE INDEX idx_admin_roles_level ON admin_roles (role_level);
+    CREATE INDEX idx_admin_roles_type ON admin_roles (role_type);
+
+    -- Indexes for admin_role_permissions
+    CREATE INDEX idx_admin_role_perms_role ON admin_role_permissions (admin_role_id);
+    CREATE INDEX idx_admin_role_perms_permission ON admin_role_permissions (permission_id);
+
+    -- Indexes for admin_role_departments
+    CREATE INDEX idx_admin_role_departments_role ON admin_role_departments (admin_role_id);
+    CREATE INDEX idx_admin_role_departments_dept ON admin_role_departments (system_department_id);
+
+    -- Indexes for permissions
+    CREATE INDEX idx_permissions_name ON permissions (permission_name);
+    CREATE INDEX idx_permissions_bit_index ON permissions (bit_index);
+    CREATE INDEX idx_permissions_module ON permissions (module);
+    CREATE INDEX idx_permissions_scope ON permissions (scope);
+
+    -- Indexes for system_departments
+    CREATE INDEX idx_system_departments_name ON system_departments (name);
+    CREATE INDEX idx_system_departments_module ON system_departments (module_code);
+    CREATE INDEX idx_system_departments_bitmask ON system_departments (bitmask);
+
+    -- Indexes for HR Module
+    CREATE INDEX idx_employee_profiles_user ON employee_profiles (user_id);
+    CREATE INDEX idx_employee_profiles_company ON employee_profiles (company_id);
+    CREATE INDEX idx_employee_profiles_employment_status ON employee_profiles (employment_status) WHERE employment_status = 'active';
     
+    CREATE INDEX idx_employee_department_history_user ON employee_department_history (user_id);
+    CREATE INDEX idx_employee_department_history_dept ON employee_department_history (department_id);
+    CREATE INDEX idx_employee_department_history_dates ON employee_department_history (start_date, end_date);
+    
+    CREATE INDEX idx_employee_documents_user ON employee_documents (user_id);
+    CREATE INDEX idx_employee_documents_company ON employee_documents (company_id);
+    CREATE INDEX idx_employee_documents_type ON employee_documents (document_type);
+    
+    CREATE INDEX idx_positions_company ON positions (company_id);
+    CREATE INDEX idx_positions_department ON positions (department_id);
+    CREATE INDEX idx_positions_open ON positions (is_open) WHERE is_open = true;
+    
+    CREATE INDEX idx_employee_role_history_user ON employee_role_history (user_id);
+    CREATE INDEX idx_employee_role_history_role ON employee_role_history (role_id);
+    
+    CREATE INDEX idx_employee_exit_user ON employee_exit (user_id);
+    CREATE INDEX idx_employee_exit_company ON employee_exit (company_id);
+    CREATE INDEX idx_employee_exit_date ON employee_exit (exit_date);
+
+    -- Indexes for Scheduling Module
+    CREATE INDEX idx_work_calendars_company ON work_calendars (company_id);
+    CREATE INDEX idx_work_calendars_active ON work_calendars (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_schedule_templates_company ON schedule_templates (company_id);
+    CREATE INDEX idx_schedule_templates_calendar ON schedule_templates (calendar_id);
+    CREATE INDEX idx_schedule_templates_active ON schedule_templates (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_user_schedule_assignments_user ON user_schedule_assignments (user_id);
+    CREATE INDEX idx_user_schedule_assignments_template ON user_schedule_assignments (schedule_template_id);
+    CREATE INDEX idx_user_schedule_assignments_dates ON user_schedule_assignments (effective_from, effective_to);
+    
+    CREATE INDEX idx_schedule_instances_user_date ON schedule_instances (user_id, schedule_date);
+    CREATE INDEX idx_schedule_instances_company ON schedule_instances (company_id);
+    CREATE INDEX idx_schedule_instances_template ON schedule_instances (schedule_template_id);
+
+    -- Indexes for Compensation Module
+    CREATE INDEX idx_pay_units_name ON pay_units (name);
+    
+    CREATE INDEX idx_compensation_structures_company ON compensation_structures (company_id);
+    CREATE INDEX idx_compensation_structures_code ON compensation_structures (structure_code);
+    CREATE INDEX idx_compensation_structures_active ON compensation_structures (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_user_compensations_user ON user_compensations (user_id);
+    CREATE INDEX idx_user_compensations_structure ON user_compensations (structure_id);
+    CREATE INDEX idx_user_compensations_pay_unit ON user_compensations (pay_unit_id);
+    CREATE INDEX idx_user_compensations_dates ON user_compensations (effective_from, effective_to);
+
+    -- Indexes for Attendance Module
+    CREATE INDEX idx_attendance_sources_company ON attendance_sources (company_id);
+    CREATE INDEX idx_attendance_sources_type ON attendance_sources (source_type);
+    CREATE INDEX idx_attendance_sources_active ON attendance_sources (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_attendance_events_user_time ON attendance_events (user_id, event_time DESC);
+    CREATE INDEX idx_attendance_events_company ON attendance_events (company_id);
+    CREATE INDEX idx_attendance_events_type ON attendance_events (event_type);
+    CREATE INDEX idx_attendance_events_source ON attendance_events (source_type, source_id);
+    
+    CREATE INDEX idx_attendance_policies_company ON attendance_policies (company_id);
+    CREATE INDEX idx_attendance_policies_department ON attendance_policies (department_id);
+    CREATE INDEX idx_attendance_policies_active ON attendance_policies (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_user_attendance_policies_user ON user_attendance_policies (user_id);
+    CREATE INDEX idx_user_attendance_policies_policy ON user_attendance_policies (policy_id);
+    CREATE INDEX idx_user_attendance_policies_dates ON user_attendance_policies (effective_from, effective_to);
+    CREATE INDEX idx_attendance_policies_effective ON user_attendance_policies (user_id, effective_from, effective_to);
+    
+    CREATE INDEX idx_attendance_daily_summary_user_date ON attendance_daily_summary (user_id, attendance_date DESC);
+    CREATE INDEX idx_attendance_daily_summary_company ON attendance_daily_summary (company_id);
+    CREATE INDEX idx_attendance_daily_summary_status ON attendance_daily_summary (status);
+    CREATE INDEX idx_attendance_daily_summary_date_status ON attendance_daily_summary (attendance_date, status);
+    
+    CREATE INDEX idx_attendance_locations_company ON attendance_locations (company_id);
+    CREATE INDEX idx_attendance_locations_active ON attendance_locations (is_active) WHERE is_active = true;
+
+    -- Indexes for Leave Module
+    CREATE INDEX idx_leave_types_company ON leave_types (company_id);
+    CREATE INDEX idx_leave_types_code ON leave_types (leave_code);
+    CREATE INDEX idx_leave_types_active ON leave_types (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_leave_policies_company ON leave_policies (company_id);
+    CREATE INDEX idx_leave_policies_department ON leave_policies (department_id);
+    CREATE INDEX idx_leave_policies_active ON leave_policies (is_active) WHERE is_active = true;
+    
+    CREATE INDEX idx_user_leave_policies_user ON user_leave_policies (user_id);
+    CREATE INDEX idx_user_leave_policies_policy ON user_leave_policies (leave_policy_id);
+    CREATE INDEX idx_user_leave_policies_dates ON user_leave_policies (effective_from, effective_to);
+    
+    CREATE INDEX idx_leave_balances_user ON leave_balances (user_id);
+    CREATE INDEX idx_leave_balances_type ON leave_balances (leave_type_id);
+    CREATE INDEX idx_leave_balances_as_of ON leave_balances (as_of);
+    
+    CREATE INDEX idx_leave_requests_user ON leave_requests (user_id);
+    CREATE INDEX idx_leave_requests_company ON leave_requests (company_id);
+    CREATE INDEX idx_leave_requests_type ON leave_requests (leave_type_id);
+    CREATE INDEX idx_leave_requests_status ON leave_requests (status);
+    CREATE INDEX idx_leave_requests_dates ON leave_requests (start_date, end_date);
+    CREATE INDEX idx_leave_requests_requested_at ON leave_requests (requested_at DESC);
+    CREATE INDEX idx_leave_requests_pending ON leave_requests (company_id) WHERE status = 'pending';
+    
+    CREATE INDEX idx_leave_approvals_request ON leave_approvals (leave_request_id);
+    CREATE INDEX idx_leave_approvals_approver ON leave_approvals (approved_by);
+
+    -- Indexes for Audit
+    CREATE INDEX idx_audit_logs_company_time ON audit.audit_logs (company_id, created_at DESC);
+    CREATE INDEX idx_audit_logs_module_action ON audit.audit_logs (module, action);
+    CREATE INDEX idx_audit_logs_entity ON audit.audit_logs (entity_type, entity_id);
+
+    -- Other indexes (from original schema)
+    CREATE INDEX idx_users_search_tsv ON users USING GIN (user_search_tsv);
+    CREATE INDEX idx_users_username_trgm ON users USING GIN (username gin_trgm_ops);
+    CREATE INDEX idx_users_fullname_trgm ON users USING GIN (full_name gin_trgm_ops);
+    CREATE INDEX idx_users_username ON users (username);
+    CREATE INDEX idx_users_fullname ON users (full_name);
+    CREATE INDEX idx_users_name_search ON users (username, full_name);
+    CREATE INDEX idx_companies_name_tsv ON companies USING GIN (company_name_tsv);
+    CREATE INDEX idx_companies_name_trgm ON companies USING GIN (company_name gin_trgm_ops);
+    CREATE INDEX idx_companies_name ON companies (company_name);
+    CREATE INDEX idx_companies_owner_name ON companies (owner_user_id, company_name);
+    CREATE INDEX idx_users_phone_hash ON users (phone_hash);
+    CREATE INDEX idx_users_created_at ON users (created_at);
+    CREATE INDEX idx_users_status ON users (is_active, kyc_status);
+    CREATE INDEX idx_users_region ON users (data_region);
+    CREATE INDEX idx_users_kyc_status ON users(kyc_status);
+    CREATE INDEX idx_companies_owner ON companies (owner_user_id);
+    CREATE INDEX idx_companies_status ON companies (is_active, subscription_status);
+    CREATE INDEX idx_companies_region ON companies (data_region);
+    CREATE INDEX idx_roles_company ON roles (company_id);
+    CREATE INDEX idx_roles_level ON roles (role_level);
+    CREATE INDEX idx_role_perms_permission ON role_permissions (permission_id);
+    CREATE INDEX idx_employees_user ON company_employees (user_id);
+    CREATE INDEX idx_employees_role ON company_employees (role_id);
+    CREATE INDEX idx_employees_active ON company_employees (is_active);
+    CREATE INDEX idx_employees_company_active ON company_employees (company_id, is_active);
+    CREATE INDEX idx_employees_reports_to ON company_employees (company_id, reports_to);
+    CREATE INDEX idx_departments_company ON departments (company_id);
+    CREATE INDEX idx_departments_parent ON departments (parent_department_id);
+    CREATE INDEX idx_departments_system ON departments (system_department_id);
+    CREATE INDEX idx_role_departments_role ON role_departments (role_id);
+    CREATE INDEX idx_role_departments_department ON role_departments (department_id);
+    CREATE INDEX idx_user_devices_user ON user_devices (user_id);
+    CREATE INDEX idx_user_devices_active ON user_devices (is_active);
+    CREATE INDEX idx_user_devices_last_active ON user_devices (last_active);
+    CREATE INDEX idx_login_attempts_user ON login_attempts (user_id);
+    CREATE INDEX idx_login_attempts_device ON login_attempts (device_id);
+    CREATE INDEX idx_login_attempts_success ON login_attempts (success);
+    CREATE INDEX idx_login_attempts_time ON login_attempts (attempted_at DESC);
+
+    -- ==============================================
+    -- SEED DATA FOR ATTENDANCE SOURCE TYPES
+    -- ==============================================
+    INSERT INTO attendance_source_types (source_type, description, requires_reference) VALUES
+    ('biometric', 'Biometric device', false),
+    ('rfid', 'RFID gate', false),
+    ('mobile', 'Mobile application', false),
+    ('web', 'Web portal', false),
+    ('system', 'System generated', false),
+    ('manual', 'Manual HR entry', true),
+    ('classroom', 'Classroom system', true),
+    ('machine', 'Factory machine / gate', true)
+    ON CONFLICT DO NOTHING;
+
+    -- ==============================================
+    -- SEED DATA FOR PAY UNITS
+    -- ==============================================
+    INSERT INTO pay_units (name, description) VALUES
+    ('monthly', 'Monthly salary'),
+    ('daily', 'Daily wage'),
+    ('hourly', 'Hourly wage'),
+    ('per_class', 'Per class/session'),
+    ('per_shift', 'Per shift')
+    ON CONFLICT DO NOTHING;
+
     -- ==============================================
     -- INSERT DEFAULT DATA
     -- ==============================================
@@ -2010,6 +1435,1344 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('admin.super.system_config', 'Configure system settings', 'system', 'super_admin', 'admin', 'super_admin', 253),
     ('admin.super.audit_logs', 'View audit logs', 'audit', 'super_admin', 'admin', 'super_admin', 254)
     ON CONFLICT (permission_name) DO NOTHING;
+
+    -- ==============================================
+    -- FUNCTIONS
+    -- ==============================================
+
+    -- Initial debounce record
+    INSERT INTO audit.outbox_debounce (last_processed_id, last_processed_at, batch_size) 
+    VALUES (NULL, NOW() - INTERVAL '1 hour', 0);
+
+    -- Function to insert into outbox when audit logs are created
+    CREATE OR REPLACE FUNCTION audit.audit_logs_outbox_trigger()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        INSERT INTO audit.audit_logs_outbox (audit_id, operation, payload)
+        VALUES (
+            NEW.audit_id,
+            'INSERT',
+            jsonb_build_object(
+                'audit_id', NEW.audit_id,
+                'company_id', NEW.company_id,
+                'module', NEW.module,
+                'action', NEW.action,
+                'entity_type', NEW.entity_type,
+                'entity_id', NEW.entity_id,
+                'actor_type', NEW.actor_type,
+                'actor_id', NEW.actor_id,
+                'before_state', NEW.before_state,
+                'after_state', NEW.after_state,
+                'metadata', NEW.metadata,
+                'created_at', NEW.created_at
+            )
+        );
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Trigger to automatically populate outbox
+    CREATE TRIGGER audit_logs_outbox_trigger
+    AFTER INSERT ON audit.audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION audit.audit_logs_outbox_trigger();
+
+    -- ADMIN USER SEARCH FUNCTIONS
+    CREATE OR REPLACE FUNCTION search_admin_users(
+        search_query_param TEXT DEFAULT NULL,
+        role_type_filter_param INTEGER DEFAULT NULL,
+        include_inactive_param BOOLEAN DEFAULT false,
+        search_type_param TEXT DEFAULT 'autocomplete',
+        limit_count_param INTEGER DEFAULT 50,
+        offset_count_param INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        role_name VARCHAR(100),
+        admin_role_id UUID,
+        role_type INTEGER,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ,
+        admin_created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    BEGIN
+        IF search_query_param = '' THEN
+            search_query_param := NULL;
+        END IF;
+
+        IF search_query_param IS NULL THEN
+            RETURN QUERY
+            SELECT
+                au.admin_id, au.username, au.full_name, au.phone_hash,
+                ar.role_name, au.admin_role_id, au.role_type,
+                au.reports_to, ru.full_name as reports_to_name,
+                au.is_active, au.last_login, au.admin_created_at,
+                1.0::FLOAT as relevance_score,
+                'all'::TEXT as match_type
+            FROM admin_users au
+            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
+            WHERE
+                (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
+                AND (include_inactive_param OR au.is_active = true)
+            ORDER BY ar.role_level DESC, au.username ASC
+            LIMIT limit_count_param
+            OFFSET offset_count_param;
+        ELSIF search_type_param = 'autocomplete' OR LENGTH(search_query_param) < 3 THEN
+            RETURN QUERY
+            SELECT
+                au.admin_id, au.username, au.full_name, au.phone_hash,
+                ar.role_name, au.admin_role_id, au.role_type,
+                au.reports_to, ru.full_name as reports_to_name,
+                au.is_active, au.last_login, au.admin_created_at,
+                GREATEST(
+                    COALESCE(similarity(au.username, search_query_param)::FLOAT, 0),
+                    COALESCE(similarity(au.full_name, search_query_param)::FLOAT, 0)
+                ) as relevance_score,
+                'autocomplete'::TEXT as match_type
+            FROM admin_users au
+            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
+            WHERE
+                (au.username ILIKE '%' || search_query_param || '%'
+                OR au.full_name ILIKE '%' || search_query_param || '%')
+                AND (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
+                AND (include_inactive_param OR au.is_active = true)
+            ORDER BY relevance_score DESC, ar.role_level DESC, au.username ASC
+            LIMIT limit_count_param
+            OFFSET offset_count_param;
+        ELSE
+            RETURN QUERY
+            SELECT
+                au.admin_id, au.username, au.full_name, au.phone_hash,
+                ar.role_name, au.admin_role_id, au.role_type,
+                au.reports_to, ru.full_name as reports_to_name,
+                au.is_active, au.last_login, au.admin_created_at,
+                ts_rank(au.user_search_tsv, plainto_tsquery('simple', search_query_param))::FLOAT as relevance_score,
+                'fulltext'::TEXT as match_type
+            FROM admin_users au
+            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
+            WHERE
+                au.user_search_tsv @@ plainto_tsquery('simple', search_query_param)
+                AND (role_type_filter_param IS NULL OR au.role_type = role_type_filter_param)
+                AND (include_inactive_param OR au.is_active = true)
+            ORDER BY relevance_score DESC, ar.role_level DESC, au.username ASC
+            LIMIT limit_count_param
+            OFFSET offset_count_param;
+        END IF;
+        RETURN;
+    END;
+    $$ LANGUAGE plpgsql STABLE;
+
+    -- Helper function for role type specific searches
+    CREATE OR REPLACE FUNCTION search_admin_users_by_role_type(
+        role_type_param INTEGER,
+        search_query TEXT DEFAULT NULL,
+        search_type TEXT DEFAULT 'autocomplete',
+        include_inactive BOOLEAN DEFAULT false,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        role_name VARCHAR(100),
+        admin_role_id UUID,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ,
+        admin_created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT * FROM search_admin_users(
+            search_query,
+            role_type_param,
+            include_inactive,
+            search_type,
+            limit_count,
+            offset_count
+        );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to search admin employees (role_type = 1)
+    CREATE OR REPLACE FUNCTION search_admin_employees(
+        search_query TEXT DEFAULT NULL,
+        search_type TEXT DEFAULT 'autocomplete',
+        include_inactive BOOLEAN DEFAULT false,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        role_name VARCHAR(100),
+        admin_role_id UUID,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ,
+        admin_created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT * FROM search_admin_users_by_role_type(
+            1,
+            search_query,
+            search_type,
+            include_inactive,
+            limit_count,
+            offset_count
+        );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to search admin managers (role_type = 2)
+    CREATE OR REPLACE FUNCTION search_admin_managers(
+        search_query TEXT DEFAULT NULL,
+        search_type TEXT DEFAULT 'autocomplete',
+        include_inactive BOOLEAN DEFAULT false,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        role_name VARCHAR(100),
+        admin_role_id UUID,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ,
+        admin_created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT * FROM search_admin_users_by_role_type(
+            2,
+            search_query,
+            search_type,
+            include_inactive,
+            limit_count,
+            offset_count
+        );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to search super admins (role_type = 4)
+    CREATE OR REPLACE FUNCTION search_super_admins(
+        search_query TEXT DEFAULT NULL,
+        search_type TEXT DEFAULT 'autocomplete',
+        include_inactive BOOLEAN DEFAULT false,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        role_name VARCHAR(100),
+        admin_role_id UUID,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ,
+        admin_created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT * FROM search_admin_users_by_role_type(
+            4,
+            search_query,
+            search_type,
+            include_inactive,
+            limit_count,
+            offset_count
+        );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to get admins with their permissions and departments
+    CREATE OR REPLACE FUNCTION get_admin_with_permissions(
+        admin_id_param UUID
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        role_name VARCHAR(100),
+        role_level INTEGER,
+        role_type INTEGER,
+        permissions JSONB,
+        departments JSONB,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        WITH admin_perms AS (
+            SELECT
+                arp.admin_role_id,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'permission_id', p.permission_id,
+                        'permission_name', p.permission_name,
+                        'description', p.description,
+                        'category', p.category,
+                        'module', p.module,
+                        'scope', p.scope,
+                        'bit_index', p.bit_index
+                    )
+                ) as permissions
+            FROM admin_role_permissions arp
+            JOIN permissions p ON arp.permission_id = p.permission_id
+            GROUP BY arp.admin_role_id
+        ),
+        admin_depts AS (
+            SELECT
+                ard.admin_role_id,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'department_id', sd.system_department_id,
+                        'name', sd.name,
+                        'module_code', sd.module_code,
+                        'description', sd.description,
+                        'bitmask', sd.bitmask
+                    )
+                ) as departments
+            FROM admin_role_departments ard
+            JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
+            GROUP BY ard.admin_role_id
+        )
+        SELECT
+            au.admin_id,
+            au.username,
+            au.full_name,
+            ar.role_name,
+            ar.role_level,
+            au.role_type,
+            COALESCE(ap.permissions, '[]'::jsonb) as permissions,
+            COALESCE(ad.departments, '[]'::jsonb) as departments,
+            au.reports_to,
+            ru.full_name as reports_to_name,
+            au.is_active,
+            au.last_login
+        FROM admin_users au
+        JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+        LEFT JOIN admin_perms ap ON ar.admin_role_id = ap.admin_role_id
+        LEFT JOIN admin_depts ad ON ar.admin_role_id = ad.admin_role_id
+        LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
+        WHERE au.admin_id = admin_id_param;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to check if admin has permission
+    CREATE OR REPLACE FUNCTION admin_has_permission(
+        admin_id_param UUID,
+        permission_name_param VARCHAR(100)
+    ) RETURNS BOOLEAN AS $$
+    BEGIN
+        RETURN EXISTS (
+            SELECT 1
+            FROM admin_users au
+            JOIN admin_role_permissions arp ON au.admin_role_id = arp.admin_role_id
+            JOIN permissions p ON arp.permission_id = p.permission_id
+            WHERE au.admin_id = admin_id_param
+            AND au.is_active = true
+            AND p.permission_name = permission_name_param
+        );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to check if admin has department access
+    CREATE OR REPLACE FUNCTION admin_has_department_access(
+        admin_id_param UUID,
+        department_bitmask BIGINT
+    ) RETURNS BOOLEAN AS $$
+    BEGIN
+        RETURN EXISTS (
+            SELECT 1
+            FROM admin_users au
+            JOIN admin_role_departments ard ON au.admin_role_id = ard.admin_role_id
+            JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
+            WHERE au.admin_id = admin_id_param
+            AND au.is_active = true
+            AND (sd.bitmask & department_bitmask) > 0
+        );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function for admin autocomplete suggestions
+    CREATE OR REPLACE FUNCTION get_admin_suggestions(
+        prefix VARCHAR(100),
+        role_type_filter INTEGER DEFAULT NULL,
+        exclude_super_admin BOOLEAN DEFAULT true,
+        limit_suggestions INTEGER DEFAULT 10
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        role_name VARCHAR(100),
+        role_level INTEGER,
+        role_type INTEGER,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        relevance FLOAT
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            au.admin_id, au.username, au.full_name,
+            ar.role_name, ar.role_level, au.role_type,
+            au.reports_to, ru.full_name as reports_to_name,
+            similarity(au.username, prefix)::FLOAT as relevance
+        FROM admin_users au
+        JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+        LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
+        WHERE au.is_active = true
+        AND (au.username ILIKE prefix || '%' OR au.full_name ILIKE prefix || '%')
+        AND (role_type_filter IS NULL OR au.role_type = role_type_filter)
+        AND (NOT exclude_super_admin OR au.role_type != 4)
+        ORDER BY
+            CASE
+                WHEN au.username ILIKE prefix || '%' THEN 1
+                WHEN au.full_name ILIKE prefix || '%' THEN 2
+                ELSE 3
+            END,
+            similarity(au.username, prefix) DESC,
+            ar.role_level DESC
+        LIMIT limit_suggestions;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to get admin permissions by role
+    CREATE OR REPLACE FUNCTION get_admin_role_permissions(
+        role_id_param UUID
+    ) RETURNS TABLE(
+        permission_id UUID,
+        permission_name VARCHAR(100),
+        description TEXT,
+        category VARCHAR(50),
+        module VARCHAR(50),
+        scope VARCHAR(20),
+        bit_index INTEGER
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            p.permission_id,
+            p.permission_name,
+            p.description,
+            p.category,
+            p.module,
+            p.scope,
+            p.bit_index
+        FROM admin_role_permissions arp
+        JOIN permissions p ON arp.permission_id = p.permission_id
+        WHERE arp.admin_role_id = role_id_param
+        ORDER BY p.module, p.bit_index;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to get admin departments by role
+    CREATE OR REPLACE FUNCTION get_admin_role_departments(
+        role_id_param UUID
+    ) RETURNS TABLE(
+        department_id UUID,
+        name VARCHAR(255),
+        module_code VARCHAR(100),
+        description TEXT,
+        bitmask BIGINT
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            sd.system_department_id,
+            sd.name,
+            sd.module_code,
+            sd.description,
+            sd.bitmask
+        FROM admin_role_departments ard
+        JOIN system_departments sd ON ard.system_department_id = sd.system_department_id
+        WHERE ard.admin_role_id = role_id_param
+        ORDER BY sd.bitmask;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to search admin users with department filtering
+    CREATE OR REPLACE FUNCTION search_admin_users_with_departments(
+        search_query TEXT DEFAULT NULL,
+        role_type_filter INTEGER DEFAULT NULL,
+        include_inactive BOOLEAN DEFAULT false,
+        search_type TEXT DEFAULT 'autocomplete',
+        department_ids UUID[] DEFAULT NULL,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        admin_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        role_name VARCHAR(100),
+        admin_role_id UUID,
+        role_type INTEGER,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        is_active BOOLEAN,
+        last_login TIMESTAMPTZ,
+        admin_created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    DECLARE
+        base_query TEXT;
+        where_clause TEXT := 'WHERE 1=1';
+        query_params TEXT[];
+        param_counter INTEGER := 1;
+    BEGIN
+        IF department_ids IS NOT NULL AND array_length(department_ids, 1) > 0 THEN
+            where_clause := where_clause || ' AND ard.system_department_id = ANY($' || param_counter || ')';
+            query_params := array_append(query_params, array_to_string(department_ids, ','));
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF search_query IS NOT NULL AND search_query != '' THEN
+            IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
+                where_clause := where_clause || ' AND (au.username ILIKE $' || param_counter ||
+                              ' OR au.full_name ILIKE $' || param_counter || ')';
+                query_params := array_append(query_params, '%' || search_query || '%');
+                param_counter := param_counter + 1;
+            ELSE
+                where_clause := where_clause || ' AND au.user_search_tsv @@ plainto_tsquery(''simple'', $' ||
+                              param_counter || '::text)';
+                query_params := array_append(query_params, search_query);
+                param_counter := param_counter + 1;
+            END IF;
+        END IF;
+
+        IF role_type_filter IS NOT NULL THEN
+            where_clause := where_clause || ' AND au.role_type = $' || param_counter;
+            query_params := array_append(query_params, role_type_filter::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF NOT include_inactive THEN
+            where_clause := where_clause || ' AND au.is_active = true';
+        END IF;
+
+        base_query := '
+            SELECT
+                au.admin_id, au.username, au.full_name, au.phone_hash,
+                ar.role_name, au.admin_role_id, au.role_type,
+                au.reports_to, ru.full_name as reports_to_name,
+                au.is_active, au.last_login, au.admin_created_at,
+                CASE
+                    WHEN $' || param_counter || '::text = '''' THEN 1.0
+                    ELSE ts_rank(au.user_search_tsv, plainto_tsquery(''simple'', $' || param_counter || '::text))
+                END as relevance_score,
+                CASE
+                    WHEN $' || param_counter || '::text = '''' THEN ''all''
+                    WHEN LENGTH($' || (param_counter - 1) || '::text) < 3 THEN ''autocomplete''
+                    ELSE ''fulltext''
+                END as match_type
+            FROM admin_users au
+            JOIN admin_roles ar ON au.admin_role_id = ar.admin_role_id
+            LEFT JOIN admin_users ru ON au.reports_to = ru.admin_id
+        ';
+
+        IF department_ids IS NOT NULL AND array_length(department_ids, 1) > 0 THEN
+            base_query := base_query || '
+                JOIN admin_role_departments ard ON au.admin_role_id = ard.admin_role_id
+            ';
+        END IF;
+
+        base_query := base_query || where_clause || '
+            ORDER BY relevance_score DESC, au.username ASC
+            LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
+
+        query_params := array_append(query_params, COALESCE(search_query, ''));
+        query_params := array_append(query_params, limit_count::TEXT);
+        query_params := array_append(query_params, offset_count::TEXT);
+
+        RETURN QUERY EXECUTE base_query USING query_params;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ==============================================
+    -- EXISTING USER AND COMPANY SEARCH FUNCTIONS
+    -- ==============================================
+    CREATE OR REPLACE FUNCTION user_search(
+        search_query TEXT,
+        search_type TEXT DEFAULT 'fulltext',
+        filter_is_active BOOLEAN DEFAULT NULL,
+        filter_kyc_status TEXT DEFAULT NULL,
+        filter_data_region TEXT DEFAULT NULL,
+        filter_is_verified BOOLEAN DEFAULT NULL,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        user_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        kyc_status VARCHAR(50),
+        kyc_level VARCHAR(20),
+        is_verified BOOLEAN,
+        is_active BOOLEAN,
+        data_region VARCHAR(20),
+        created_at TIMESTAMPTZ,
+        last_login TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    DECLARE
+        base_query TEXT;
+        where_clause TEXT := '';
+        query_params TEXT[];
+        param_counter INTEGER := 1;
+        filter_param_count INTEGER := 0;
+        search_param_index INTEGER := 1;
+    BEGIN
+        IF filter_is_active IS NOT NULL THEN
+            where_clause := where_clause || ' AND is_active = $' || param_counter;
+            query_params := array_append(query_params, filter_is_active::TEXT);
+            param_counter := param_counter + 1;
+            filter_param_count := filter_param_count + 1;
+        END IF;
+
+        IF filter_kyc_status IS NOT NULL THEN
+            where_clause := where_clause || ' AND kyc_status = $' || param_counter;
+            query_params := array_append(query_params, filter_kyc_status);
+            param_counter := param_counter + 1;
+            filter_param_count := filter_param_count + 1;
+        END IF;
+
+        IF filter_data_region IS NOT NULL THEN
+            where_clause := where_clause || ' AND data_region = $' || param_counter;
+            query_params := array_append(query_params, filter_data_region);
+            param_counter := param_counter + 1;
+            filter_param_count := filter_param_count + 1;
+        END IF;
+
+        IF filter_is_verified IS NOT NULL THEN
+            where_clause := where_clause || ' AND is_verified = $' || param_counter;
+            query_params := array_append(query_params, filter_is_verified::TEXT);
+            param_counter := param_counter + 1;
+            filter_param_count := filter_param_count + 1;
+        END IF;
+
+        IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
+            base_query := '
+                SELECT
+                    u.user_id,
+                    u.username,
+                    u.full_name,
+                    u.phone_hash,
+                    u.kyc_status,
+                    u.kyc_level,
+                    u.is_verified,
+                    u.is_active,
+                    u.data_region,
+                    u.created_at,
+                    u.last_login,
+                    GREATEST(
+                        COALESCE(similarity(u.username, $' || param_counter || '), 0),
+                        COALESCE(similarity(u.full_name, $' || param_counter || '), 0)
+                    )::FLOAT AS relevance_score,
+                    ''autocomplete'' AS match_type
+                FROM users u
+                WHERE 1=1 ' || where_clause ||
+                ' AND (u.username ILIKE $' || (param_counter + 1) ||
+                ' OR u.full_name ILIKE $' || (param_counter + 1) || ')
+                ORDER BY relevance_score DESC, u.username ASC
+                LIMIT $' || (param_counter + 2) || ' OFFSET $' || (param_counter + 3);
+
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, '%' || search_query || '%');
+            query_params := array_append(query_params, limit_count::TEXT);
+            query_params := array_append(query_params, offset_count::TEXT);
+        ELSE
+            base_query := '
+                SELECT
+                    u.user_id,
+                    u.username,
+                    u.full_name,
+                    u.phone_hash,
+                    u.kyc_status,
+                    u.kyc_level,
+                    u.is_verified,
+                    u.is_active,
+                    u.data_region,
+                    u.created_at,
+                    u.last_login,
+                    ts_rank(
+                        u.user_search_tsv,
+                        plainto_tsquery(''simple'', $' || param_counter || '::text)
+                    )::FLOAT AS relevance_score,
+                    ''fulltext'' AS match_type
+                FROM users u
+                WHERE 1=1 ' || where_clause ||
+                ' AND u.user_search_tsv @@ plainto_tsquery(''simple'', $' || param_counter || '::text)
+                ORDER BY relevance_score DESC, u.username ASC
+                LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
+
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, limit_count::TEXT);
+            query_params := array_append(query_params, offset_count::TEXT);
+        END IF;
+
+        RETURN QUERY EXECUTE base_query USING query_params;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE NOTICE 'Error in user_search: %', SQLERRM;
+            RAISE NOTICE 'Query: %', base_query;
+            RAISE NOTICE 'Params: %', query_params;
+            RAISE;
+    END;
+    $$ LANGUAGE plpgsql STABLE;
+
+    CREATE OR REPLACE FUNCTION company_search(
+        search_query TEXT,
+        search_type TEXT DEFAULT 'fulltext',
+        filter_owner_id UUID DEFAULT NULL,
+        filter_is_active BOOLEAN DEFAULT NULL,
+        filter_subscription_tier TEXT DEFAULT NULL,
+        filter_data_region TEXT DEFAULT NULL,
+        filter_subscription_status TEXT DEFAULT NULL,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        company_id UUID,
+        company_name VARCHAR(255),
+        owner_user_id UUID,
+        subscription_tier VARCHAR(20),
+        subscription_status VARCHAR(20),
+        max_employees INTEGER,
+        is_active BOOLEAN,
+        data_region VARCHAR(10),
+        created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    DECLARE
+        base_query TEXT;
+        where_clause TEXT := '';
+        query_params TEXT[];
+        param_counter INTEGER := 1;
+        filter_param_count INTEGER := 0;
+    BEGIN
+        IF filter_owner_id IS NOT NULL THEN
+            where_clause := where_clause || ' AND owner_user_id = $' || param_counter;
+            query_params := array_append(query_params, filter_owner_id::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_is_active IS NOT NULL THEN
+            where_clause := where_clause || ' AND is_active = $' || param_counter;
+            query_params := array_append(query_params, filter_is_active::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_subscription_tier IS NOT NULL THEN
+            where_clause := where_clause || ' AND subscription_tier = $' || param_counter;
+            query_params := array_append(query_params, filter_subscription_tier);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_data_region IS NOT NULL THEN
+            where_clause := where_clause || ' AND data_region = $' || param_counter;
+            query_params := array_append(query_params, filter_data_region);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_subscription_status IS NOT NULL THEN
+            where_clause := where_clause || ' AND subscription_status = $' || param_counter;
+            query_params := array_append(query_params, filter_subscription_status);
+            param_counter := param_counter + 1;
+        END IF;
+
+        filter_param_count := param_counter - 1;
+
+        IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
+            base_query := '
+                SELECT
+                    c.company_id,
+                    c.company_name,
+                    c.owner_user_id,
+                    c.subscription_tier,
+                    c.subscription_status,
+                    c.max_employees,
+                    c.is_active,
+                    c.data_region,
+                    c.created_at,
+                    similarity(c.company_name, $' || (filter_param_count + 1) || ')::FLOAT as relevance_score,
+                    ''autocomplete'' as match_type
+                FROM companies c
+                WHERE 1=1 ' || where_clause ||
+                ' AND c.company_name ILIKE $' || (filter_param_count + 2) ||
+                ' ORDER BY relevance_score DESC, c.company_name ASC
+                LIMIT $' || (filter_param_count + 3) || ' OFFSET $' || (filter_param_count + 4);
+
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, '%' || search_query || '%');
+            query_params := array_append(query_params, limit_count::TEXT);
+            query_params := array_append(query_params, offset_count::TEXT);
+        ELSE
+            base_query := '
+                SELECT
+                    c.company_id,
+                    c.company_name,
+                    c.owner_user_id,
+                    c.subscription_tier,
+                    c.subscription_status,
+                    c.max_employees,
+                    c.is_active,
+                    c.data_region,
+                    c.created_at,
+                    ts_rank(c.company_name_tsv, plainto_tsquery(''simple'', $' || (filter_param_count + 1) || '::text)) as relevance_score,
+                    ''fulltext'' as match_type
+                FROM companies c
+                WHERE 1=1 ' || where_clause ||
+                ' AND c.company_name_tsv @@ plainto_tsquery(''simple'', $' || (filter_param_count + 1) || '::text)
+                ORDER BY relevance_score DESC, c.company_name ASC
+                LIMIT $' || (filter_param_count + 2) || ' OFFSET $' || (filter_param_count + 3);
+
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, limit_count::TEXT);
+            query_params := array_append(query_params, offset_count::TEXT);
+        END IF;
+
+        RETURN QUERY EXECUTE base_query USING query_params;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ==============================================
+    -- COMPANY EMPLOYEE SEARCH FUNCTIONS
+    -- ==============================================
+    CREATE OR REPLACE FUNCTION company_employee_search(
+        search_query TEXT,
+        company_id_param UUID,
+        search_type TEXT DEFAULT 'fulltext',
+        filter_role_id UUID DEFAULT NULL,
+        filter_department_id UUID DEFAULT NULL,
+        filter_is_active BOOLEAN DEFAULT NULL,
+        filter_reports_to UUID DEFAULT NULL,
+        filter_hire_date_from TIMESTAMPTZ DEFAULT NULL,
+        filter_hire_date_to TIMESTAMPTZ DEFAULT NULL,
+        limit_count INTEGER DEFAULT 50,
+        offset_count INTEGER DEFAULT 0
+    ) RETURNS TABLE(
+        user_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        employee_id VARCHAR(100),
+        role_id UUID,
+        role_name VARCHAR(100),
+        department_id UUID,
+        department_name VARCHAR(255),
+        hire_date TIMESTAMPTZ,
+        is_active BOOLEAN,
+        reports_to UUID,
+        reports_to_name VARCHAR(255),
+        created_at TIMESTAMPTZ,
+        relevance_score FLOAT,
+        match_type TEXT
+    ) AS $$
+    DECLARE
+        base_query TEXT;
+        where_clause TEXT := '';
+        query_params TEXT[];
+        param_counter INTEGER := 1;
+    BEGIN
+        query_params := array[]::text[];
+
+        where_clause := where_clause || ' AND ce.company_id = $' || param_counter;
+        query_params := array_append(query_params, company_id_param::TEXT);
+        param_counter := param_counter + 1;
+
+        IF filter_role_id IS NOT NULL THEN
+            where_clause := where_clause || ' AND ce.role_id = $' || param_counter;
+            query_params := array_append(query_params, filter_role_id::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_department_id IS NOT NULL THEN
+            where_clause := where_clause || ' AND rd.department_id = $' || param_counter;
+            query_params := array_append(query_params, filter_department_id::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_is_active IS NOT NULL THEN
+            where_clause := where_clause || ' AND ce.is_active = $' || param_counter;
+            query_params := array_append(query_params, filter_is_active::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_reports_to IS NOT NULL THEN
+            where_clause := where_clause || ' AND ce.reports_to = $' || param_counter;
+            query_params := array_append(query_params, filter_reports_to::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_hire_date_from IS NOT NULL THEN
+            where_clause := where_clause || ' AND ce.hire_date >= $' || param_counter;
+            query_params := array_append(query_params, filter_hire_date_from::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF filter_hire_date_to IS NOT NULL THEN
+            where_clause := where_clause || ' AND ce.hire_date <= $' || param_counter;
+            query_params := array_append(query_params, filter_hire_date_to::TEXT);
+            param_counter := param_counter + 1;
+        END IF;
+
+        IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
+            base_query := '
+                SELECT
+                    u.user_id,
+                    u.username,
+                    u.full_name,
+                    u.phone_hash,
+                    ce.employee_id,
+                    ce.role_id,
+                    r.role_name,
+                    rd.department_id,
+                    d.department_name,
+                    ce.hire_date,
+                    ce.is_active,
+                    ce.reports_to,
+                    ru.username as reports_to_name,
+                    u.created_at,
+                    GREATEST(
+                        COALESCE(similarity(u.username, $' || param_counter || '), 0),
+                        COALESCE(similarity(u.full_name, $' || param_counter || '), 0),
+                        COALESCE(similarity(ce.employee_id, $' || param_counter || '), 0)
+                    )::FLOAT as relevance_score,
+                    ''autocomplete'' as match_type
+                FROM users u
+                INNER JOIN company_employees ce ON u.user_id = ce.user_id
+                INNER JOIN roles r ON ce.role_id = r.role_id
+                INNER JOIN role_departments rd ON r.role_id = rd.role_id
+                LEFT JOIN departments d ON rd.department_id = d.department_id
+                LEFT JOIN users ru ON ce.reports_to = ru.user_id
+                WHERE 1=1 ' || where_clause ||
+                ' AND (u.username ILIKE $' || (param_counter + 1) ||
+                ' OR u.full_name ILIKE $' || (param_counter + 1) ||
+                ' OR ce.employee_id ILIKE $' || (param_counter + 1) || ')
+                ORDER BY relevance_score DESC, ce.hire_date DESC
+                LIMIT $' || (param_counter + 2) || ' OFFSET $' || (param_counter + 3);
+
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, '%' || search_query || '%');
+            query_params := array_append(query_params, limit_count::TEXT);
+            query_params := array_append(query_params, offset_count::TEXT);
+        ELSE
+            base_query := '
+                SELECT
+                    u.user_id,
+                    u.username,
+                    u.full_name,
+                    u.phone_hash,
+                    ce.employee_id,
+                    ce.role_id,
+                    r.role_name,
+                    rd.department_id,
+                    d.department_name,
+                    ce.hire_date,
+                    ce.is_active,
+                    ce.reports_to,
+                    ru.username as reports_to_name,
+                    u.created_at,
+                    ts_rank(u.user_search_tsv, plainto_tsquery(''simple'', $' || param_counter || '::text)) as relevance_score,
+                    ''fulltext'' as match_type
+                FROM users u
+                INNER JOIN company_employees ce ON u.user_id = ce.user_id
+                INNER JOIN roles r ON ce.role_id = r.role_id
+                INNER JOIN role_departments rd ON r.role_id = rd.role_id
+                LEFT JOIN departments d ON rd.department_id = d.department_id
+                LEFT JOIN users ru ON ce.reports_to = ru.user_id
+                WHERE 1=1 ' || where_clause ||
+                ' AND u.user_search_tsv @@ plainto_tsquery(''simple'', $' || param_counter || '::text)
+                ORDER BY relevance_score DESC, ce.hire_date DESC
+                LIMIT $' || (param_counter + 1) || ' OFFSET $' || (param_counter + 2);
+
+            query_params := array_append(query_params, search_query);
+            query_params := array_append(query_params, limit_count::TEXT);
+            query_params := array_append(query_params, offset_count::TEXT);
+        END IF;
+
+        RETURN QUERY EXECUTE base_query USING query_params;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION get_company_employee_suggestions(
+        company_id_param UUID,
+        prefix VARCHAR(100),
+        limit_suggestions INTEGER DEFAULT 10
+    ) RETURNS TABLE(
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        user_id UUID,
+        employee_id VARCHAR(100),
+        role_name VARCHAR(100)
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            u.username,
+            u.full_name,
+            u.user_id,
+            ce.employee_id,
+            r.role_name
+        FROM users u
+        INNER JOIN company_employees ce ON u.user_id = ce.user_id
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        WHERE ce.company_id = company_id_param
+        AND ce.is_active = true
+        AND (u.username ILIKE prefix || '%'
+             OR u.full_name ILIKE prefix || '%'
+             OR ce.employee_id ILIKE prefix || '%')
+        ORDER BY
+            CASE
+                WHEN u.username ILIKE prefix || '%' THEN 1
+                WHEN u.full_name ILIKE prefix || '%' THEN 2
+                WHEN ce.employee_id ILIKE prefix || '%' THEN 3
+                ELSE 4
+            END,
+            u.username
+        LIMIT limit_suggestions;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION find_company_employee_by_username(
+        company_id_search UUID,
+        username_search VARCHAR(100)
+    ) RETURNS TABLE(
+        user_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        employee_id VARCHAR(100),
+        role_id UUID,
+        role_name VARCHAR(100),
+        department_id UUID,
+        department_name VARCHAR(255),
+        is_active BOOLEAN,
+        hire_date TIMESTAMPTZ
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            u.user_id,
+            u.username,
+            u.full_name,
+            u.phone_hash,
+            ce.employee_id,
+            ce.role_id,
+            r.role_name,
+            rd.department_id,
+            d.department_name,
+            ce.is_active,
+            ce.hire_date
+        FROM users u
+        INNER JOIN company_employees ce ON u.user_id = ce.user_id
+        INNER JOIN roles r ON ce.role_id = r.role_id
+        INNER JOIN role_departments rd ON r.role_id = rd.role_id
+        LEFT JOIN departments d ON rd.department_id = d.department_id
+        WHERE ce.company_id = company_id_search
+        AND u.username = username_search
+        LIMIT 1;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ==============================================
+    -- HELPER FUNCTIONS
+    -- ==============================================
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF TG_TABLE_NAME = 'admin_users' THEN
+            NEW.admin_updated_at = NOW();
+        ELSIF TG_TABLE_NAME = 'admin_roles' THEN
+            NEW.updated_at = NOW();
+        ELSE
+            NEW.updated_at = NOW();
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION update_admin_user_search_tsv()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.username IS DISTINCT FROM OLD.username OR NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+            NEW.user_search_tsv = to_tsvector('simple', COALESCE(NEW.username, '')) ||
+                                  to_tsvector('simple', COALESCE(NEW.full_name, ''));
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION update_user_search_tsv()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.username IS DISTINCT FROM OLD.username OR NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+            NEW.user_search_tsv = to_tsvector('simple', COALESCE(NEW.username, '')) ||
+                                  to_tsvector('simple', COALESCE(NEW.full_name, ''));
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION update_company_name_tsv()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.company_name IS DISTINCT FROM OLD.company_name THEN
+            NEW.company_name_tsv = to_tsvector('simple', NEW.company_name);
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Find users by username (exact match)
+    CREATE OR REPLACE FUNCTION find_user_by_username(username_search VARCHAR(100))
+    RETURNS TABLE(
+        user_id UUID,
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        phone_hash VARCHAR(128),
+        is_active BOOLEAN,
+        created_at TIMESTAMPTZ
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            u.user_id,
+            u.username,
+            u.full_name,
+            u.phone_hash,
+            u.is_active,
+            u.created_at
+        FROM users u
+        WHERE u.username = username_search
+        LIMIT 1;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Find companies by owner with name search
+    CREATE OR REPLACE FUNCTION find_companies_by_owner(
+        owner_id UUID,
+        name_filter VARCHAR(255) DEFAULT NULL
+    ) RETURNS TABLE(
+        company_id UUID,
+        company_name VARCHAR(255),
+        subscription_tier VARCHAR(20),
+        subscription_status VARCHAR(20),
+        is_active BOOLEAN,
+        created_at TIMESTAMPTZ
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            c.company_id,
+            c.company_name,
+            c.subscription_tier,
+            c.subscription_status,
+            c.is_active,
+            c.created_at
+        FROM companies c
+        WHERE c.owner_user_id = owner_id
+        AND (name_filter IS NULL OR c.company_name ILIKE '%' || name_filter || '%')
+        ORDER BY c.created_at DESC;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Get user suggestions for autocomplete
+    CREATE OR REPLACE FUNCTION get_user_suggestions(
+        prefix VARCHAR(100),
+        limit_suggestions INTEGER DEFAULT 10
+    ) RETURNS TABLE(
+        username VARCHAR(100),
+        full_name VARCHAR(255),
+        user_id UUID
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            u.username,
+            u.full_name,
+            u.user_id
+        FROM users u
+        WHERE u.username ILIKE prefix || '%'
+           OR u.full_name ILIKE prefix || '%'
+        ORDER BY
+            CASE
+                WHEN u.username ILIKE prefix || '%' THEN 1
+                WHEN u.full_name ILIKE prefix || '%' THEN 2
+                ELSE 3
+            END,
+            u.username
+        LIMIT limit_suggestions;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Get company suggestions for autocomplete
+    CREATE OR REPLACE FUNCTION get_company_suggestions(
+        prefix VARCHAR(255),
+        limit_suggestions INTEGER DEFAULT 10
+    ) RETURNS TABLE(
+        company_name VARCHAR(255),
+        company_id UUID
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT
+            c.company_name,
+            c.company_id
+        FROM companies c
+        WHERE c.company_name ILIKE prefix || '%'
+        ORDER BY c.company_name
+        LIMIT limit_suggestions;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ==============================================
+    -- TRIGGERS
+    -- ==============================================
+    CREATE TRIGGER update_admin_user_search_tsv
+    BEFORE UPDATE OF username, full_name ON admin_users
+    FOR EACH ROW EXECUTE FUNCTION update_admin_user_search_tsv();
+
+    CREATE TRIGGER update_user_search_tsv
+    BEFORE UPDATE OF username, full_name ON users
+    FOR EACH ROW EXECUTE FUNCTION update_user_search_tsv();
+
+    CREATE TRIGGER update_company_name_tsv
+    BEFORE UPDATE OF company_name ON companies
+    FOR EACH ROW EXECUTE FUNCTION update_company_name_tsv();
+
+    CREATE TRIGGER update_admin_users_updated_at
+    BEFORE UPDATE ON admin_users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_companies_updated_at BEFORE UPDATE ON companies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_roles_updated_at BEFORE UPDATE ON roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_departments_updated_at BEFORE UPDATE ON departments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_company_employees_updated_at BEFORE UPDATE ON company_employees FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_user_devices_updated_at BEFORE UPDATE ON user_devices FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_admin_roles_updated_at BEFORE UPDATE ON admin_roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    -- Triggers for HR module tables
+    CREATE TRIGGER update_employee_profiles_updated_at BEFORE UPDATE ON employee_profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_attendance_policies_updated_at BEFORE UPDATE ON attendance_policies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    -- ==============================================
+    -- ADDITIONAL TABLES FOR ATTENDANCE LOOKUPS
+    -- ==============================================
+
+    -- RFID Mappings for employees
+    CREATE TABLE employee_rfid_mappings (
+    rfid_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    company_id UUID NOT NULL,
+    rfid_tag VARCHAR(100) NOT NULL,
+    is_active BOOLEAN DEFAULT true,
+    assigned_at TIMESTAMPTZ DEFAULT NOW(),
+    unassigned_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE (company_id, rfid_tag),
+
+    CONSTRAINT fk_employee_rfid_user 
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_employee_rfid_company 
+        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX uq_employee_rfid_active_user
+    ON employee_rfid_mappings (user_id, company_id)
+    WHERE is_active = true AND unassigned_at IS NULL;
+
+    -- Add location_code to attendance_locations
+    ALTER TABLE attendance_locations ADD COLUMN IF NOT EXISTS location_code VARCHAR(50);
+    ALTER TABLE attendance_locations ADD COLUMN IF NOT EXISTS zone VARCHAR(100);
+
+    -- Work Center to Shift Mapping
+    CREATE TABLE work_center_shifts (
+        mapping_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        work_center_code VARCHAR(100) NOT NULL,
+        shift_id UUID NOT NULL, -- References schedule_templates
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        
+        UNIQUE (company_id, work_center_code, effective_from),
+        
+        CONSTRAINT fk_work_center_company 
+            FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+        CONSTRAINT fk_work_center_shift 
+            FOREIGN KEY (shift_id) REFERENCES schedule_templates(schedule_template_id) ON DELETE CASCADE
+    );
+
+    -- ==============================================
+    -- ADD INDEXES FOR NEW TABLES
+    -- ==============================================
+
+    -- Indexes for employee_rfid_mappings
+    CREATE INDEX idx_employee_rfid_tag ON employee_rfid_mappings (rfid_tag);
+    CREATE INDEX idx_employee_rfid_user ON employee_rfid_mappings (user_id);
+    CREATE INDEX idx_employee_rfid_company ON employee_rfid_mappings (company_id);
+    CREATE INDEX idx_employee_rfid_active ON employee_rfid_mappings (is_active) WHERE is_active = true;
+
+    -- Indexes for attendance_locations new columns
+    CREATE INDEX idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
+    CREATE INDEX idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
+
+    -- Indexes for work_center_shifts
+    CREATE INDEX idx_work_center_shifts_code ON work_center_shifts (work_center_code);
+    CREATE INDEX idx_work_center_shifts_company ON work_center_shifts (company_id);
+    CREATE INDEX idx_work_center_shifts_active ON work_center_shifts (is_active) WHERE is_active = true;
+    CREATE INDEX idx_work_center_shifts_dates ON work_center_shifts (effective_from, effective_to);
+
+    -- ==============================================
+    -- TRIGGERS FOR NEW TABLES
+    -- ==============================================
+    CREATE TRIGGER update_employee_rfid_updated_at 
+    BEFORE UPDATE ON employee_rfid_mappings 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    CREATE TRIGGER update_work_center_shifts_updated_at 
+    BEFORE UPDATE ON work_center_shifts 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+    ALTER TABLE pay_units
+    ADD CONSTRAINT uq_pay_units_name UNIQUE (name);
 
 EOSQL
 

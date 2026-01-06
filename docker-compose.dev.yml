@@ -233,11 +233,16 @@ services:
       - SERVER_TLS_PORT=8443
       - REDIS_URL=redis://redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - HR_DOCUMENT_BASE_PATH=/data
       - SCYLLA_NODES=scylla:9042
       - SCYLLA_USERNAME=${SCYLLA_USERNAME}
       - SCYLLA_PASSWORD=${SCYLLA_PASSWORD}
       - SCYLLA_KEYSPACE=${SCYLLA_KEYSPACE}
       - KAFKA_BROKERS=kafka:9092
+      - AUDIT_OUTBOX_ENABLED=true
+      - AUDIT_OUTBOX_TOPIC=audit-logs
+      - AUDIT_OUTBOX_BATCH_SIZE=100
+      - AUDIT_OUTBOX_POLL_INTERVAL=5s
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - CLICKHOUSE_URL=clickhouse:9000
@@ -279,6 +284,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    volumes:
+      - auth_documents:/data
     networks:
       - dev-net
 
@@ -291,6 +298,8 @@ volumes:
   elasticsearch_data:
   clickhouse_data:
   postgres_data:
+  auth_documents:
+  
 
 networks:
   dev-net:

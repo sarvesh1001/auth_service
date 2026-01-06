@@ -39,7 +39,6 @@ type LogEnvelope struct {
 	Metadata    map[string]interface{} `json:"metadata"`
 	Level       string                 `json:"level"`
 	Message     string                 `json:"message"`
-	
 }
 
 // OTPLogEvent - OTP specific logs
@@ -57,8 +56,7 @@ type OTPLogEvent struct {
 	Purpose       string `json:"purpose,omitempty"`
 	OTPProvider   string `json:"otp_provider,omitempty"`
 	Duration      int64  `json:"duration_ms,omitempty"`
-	UserAgent string `json:"user_agent,omitempty"`
-
+	UserAgent     string `json:"user_agent,omitempty"`
 }
 
 // MPINLogEvent - MPIN specific logs
@@ -76,9 +74,7 @@ type MPINLogEvent struct {
 	DeviceTrust   string `json:"device_trust,omitempty"`
 	Duration      int64  `json:"duration_ms,omitempty"`
 	FailureReason string `json:"failure_reason,omitempty"`
-	UserAgent	 string 	`json:"user_agent,omitempty"`
-
-
+	UserAgent     string `json:"user_agent,omitempty"`
 }
 
 // SecurityLogEvent - Security/fraud logs
@@ -126,18 +122,19 @@ type SessionLogEvent struct {
 
 // In models.go, update UserLogEvent struct:
 type UserLogEvent struct {
-    LogEnvelope
-    UserID      string                 `json:"user_id"`
-    Username    string                 `json:"username,omitempty"`    // ADD THIS
-    FullName    string                 `json:"full_name,omitempty"`   // ADD THIS
-    Action      string                 `json:"action"`
-    PhoneNumber string                 `json:"phone_number,omitempty"`
-    Status      string                 `json:"status"`
-    DeviceID    string                 `json:"device_id,omitempty"`
-    Changes     map[string]interface{} `json:"changes,omitempty"`
-    ErrorCode   string                 `json:"error_code,omitempty"`
-    Duration    int64                  `json:"duration_ms,omitempty"`
+	LogEnvelope
+	UserID      string                 `json:"user_id"`
+	Username    string                 `json:"username,omitempty"`  // ADD THIS
+	FullName    string                 `json:"full_name,omitempty"` // ADD THIS
+	Action      string                 `json:"action"`
+	PhoneNumber string                 `json:"phone_number,omitempty"`
+	Status      string                 `json:"status"`
+	DeviceID    string                 `json:"device_id,omitempty"`
+	Changes     map[string]interface{} `json:"changes,omitempty"`
+	ErrorCode   string                 `json:"error_code,omitempty"`
+	Duration    int64                  `json:"duration_ms,omitempty"`
 }
+
 // DeviceLogEvent - Device binding and validation logs (SIMPLIFIED - only used fields)
 type DeviceLogEvent struct {
 	LogEnvelope
@@ -164,4 +161,26 @@ type AdminMPINLogEvent struct {
 
 	// ✅ Add this
 	UserAgent string `json:"user_agent,omitempty"`
+}
+
+// Add this struct to your existing log_events.go file
+type AuditLogEvent struct {
+	EventID     string      `json:"event_id"`
+	AuditID     string      `json:"audit_id"`
+	Timestamp   time.Time   `json:"timestamp"`
+	EventType   string      `json:"event_type"` // Always "audit"
+	CompanyID   *string     `json:"company_id,omitempty"`
+	Module      string      `json:"module"`      // hr, attendance, leave, payroll, admin, system
+	Action      string      `json:"action"`      // leave.approve, attendance.manual_add, etc.
+	EntityType  string      `json:"entity_type"` // leave_request, attendance_event, etc.
+	EntityID    *string     `json:"entity_id,omitempty"`
+	ActorType   string      `json:"actor_type"` // user, admin, system
+	ActorID     *string     `json:"actor_id,omitempty"`
+	BeforeState interface{} `json:"before_state,omitempty"`
+	AfterState  interface{} `json:"after_state,omitempty"`
+	Metadata    interface{} `json:"metadata,omitempty"`
+	Environment string      `json:"environment"`
+	Version     string      `json:"version"`
+	Message     string      `json:"message"`
+	ServiceName string      `json:"service_name"`
 }

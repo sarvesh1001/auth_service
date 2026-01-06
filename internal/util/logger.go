@@ -211,5 +211,88 @@ func JSONResponse(w http.ResponseWriter, statusCode int, data interface{}) {
 }
 
 func Uint64(key string, val uint64) zap.Field {
-    return zap.Uint64(key, val)
+	return zap.Uint64(key, val)
+}
+
+// ToJSON marshals any value into pretty-printed JSON bytes
+func ToJSON(v any) ([]byte, error) {
+	return json.MarshalIndent(v, "", "  ")
+}
+
+// IsDuplicateError checks whether an error is caused by a duplicate/unique constraint violation
+func IsDuplicateError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Common PostgreSQL duplicate indicators
+	errMsg := err.Error()
+
+	switch {
+	case
+		// lib/pq
+		contains(errMsg, "duplicate key value violates unique constraint"),
+		// pgx
+		contains(errMsg, "SQLSTATE 23505"),
+		// generic
+		contains(errMsg, "unique constraint"),
+		contains(errMsg, "already exists"):
+		return true
+	default:
+		return false
+	}
+}
+
+// small helper to avoid strings import pollution
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (stringIndex(s, substr) >= 0)
+}
+
+// inline implementation to avoid extra imports
+func stringIndex(s, substr string) int {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
+// StringSliceToJSON converts a string slice to JSON string (safe for logs & audits)
+func StringSliceToJSON(values []string) string {
+	if len(values) == 0 {
+		return "[]"
+	}
+
+	b, err := json.Marshal(values)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+func Float64(key string, value float64) zap.Field {
+	return zap.Float64(key, value)
+}
+
+// RespondWithJSON writes a JSON response using the global logger
+func RespondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		Get().Error(
+			"failed to encode JSON response",
+			zap.Int("status", status),
+			zap.Error(err),
+		)
+	}
+}
+
+// RespondWithError writes a standard error JSON response
+func RespondWithError(w http.ResponseWriter, status int, message string) {
+	RespondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
 }

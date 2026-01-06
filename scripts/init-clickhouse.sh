@@ -390,6 +390,55 @@ FROM (
 )
 GROUP BY hour, event_type;
 
+
+
+
+-- Add audit logs table to ClickHouse
+CREATE TABLE IF NOT EXISTS auth_analytics.audit_logs (
+    audit_id UUID,
+    company_id Nullable(UUID),
+    module String,
+    action String,
+    entity_type String,
+    entity_id Nullable(UUID),
+    actor_type String,
+    actor_id Nullable(UUID),
+    before_state Nullable(String),
+    after_state Nullable(String),
+    metadata Nullable(String),
+    created_at DateTime,
+    environment String DEFAULT 'development',
+    version String DEFAULT '1.0.0',
+    message String DEFAULT '',
+    service_name String DEFAULT 'auth-service'
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (created_at, module, action)
+TTL created_at + INTERVAL 180 DAY
+SETTINGS index_granularity = 8192;
+
+-- Create materialized view for daily aggregations
+CREATE MATERIALIZED VIEW IF NOT EXISTS auth_analytics.audit_logs_daily
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (event_date, module, action, actor_type)
+SETTINGS allow_nullable_key = 1 AS
+SELECT
+    toDate(created_at) AS event_date,
+    module,
+    action,
+    actor_type,
+    count() AS total_events,
+    uniq(company_id) AS unique_companies,
+    uniq(actor_id) AS unique_actors
+FROM auth_analytics.audit_logs
+GROUP BY event_date, module, action, actor_type;
+
+
+
+
+
+
 -- 🛡️ NEW: Risk Analysis View
 CREATE VIEW IF NOT EXISTS auth_analytics.risk_analysis_hourly AS
 SELECT

@@ -2,6 +2,7 @@
 // ClickHouse consumer for time-series analytics with support for multiple Kafka topics
 // ✅ COMPAT: Uses internal ClickHouse client (client.ClickHouseClient) and driver.Conn
 // ✅ FIXED: PrepareBatch calls use cc.chClient.Conn().PrepareBatch(...) via the client
+// ✅ ADDED: Audit log support for compliance and auditing requirements
 
 package consumer
 
@@ -61,7 +62,7 @@ func NewClickHouseConsumer(
 		zap.Int("batch_size", batchSize),
 		zap.Duration("batch_timeout", batchTimeout),
 		zap.String("mode", "manual-commit"),
-		zap.String("events_handled", "Device, MPIN, OTP, Security, SecurityRisk"),
+		zap.String("events_handled", "Device, MPIN, OTP, Security, SecurityRisk, Audit"),
 	)
 
 	return &ClickHouseConsumer{
@@ -85,7 +86,7 @@ func (cc *ClickHouseConsumer) Start(ctx context.Context) error {
 	cc.logger.Info("ClickHouse multi-topic consumer started (Time-Series Optimized)",
 		zap.Int("topic_count", len(cc.kafkaConsumers)),
 		zap.Int("batch_size", cc.batchSize),
-		zap.String("events", "Device, MPIN, OTP, Security, SecurityRisk"),
+		zap.String("events", "Device, MPIN, OTP, Security, SecurityRisk, Audit"),
 	)
 
 	// ✅ Start independent consumer goroutine for each topic
@@ -125,17 +126,21 @@ func (cc *ClickHouseConsumer) consumeTopic(ctx context.Context, topic string, ka
 		cc.logger.Info("topic consumer stopped", zap.String("topic", topic))
 	}()
 
+	// Initialize batches for all event types
 	otpBatch := MessageBatch{events: make([]*models.OTPLogEvent, 0, cc.batchSize)}
 	mpinBatch := MessageBatch{events: make([]*models.MPINLogEvent, 0, cc.batchSize)}
 	securityBatch := MessageBatch{events: make([]*models.SecurityLogEvent, 0, cc.batchSize)}
 	deviceBatch := MessageBatch{events: make([]*models.DeviceLogEvent, 0, cc.batchSize)}
 	securityRiskBatch := MessageBatch{events: make([]*models.SecurityEvent, 0, cc.batchSize)}
+	auditBatch := MessageBatch{events: make([]*models.AuditLogEvent, 0, cc.batchSize)} // ✅ NEW: Audit batch
 
+	// Track batch sizes in bytes
 	otpBatchBytes := 0
 	mpinBatchBytes := 0
 	securityBatchBytes := 0
 	deviceBatchBytes := 0
 	securityRiskBatchBytes := 0
+	auditBatchBytes := 0 // ✅ NEW: Audit batch bytes
 
 	ticker := time.NewTicker(cc.batchTimeout)
 	defer ticker.Stop()
@@ -150,26 +155,30 @@ func (cc *ClickHouseConsumer) consumeTopic(ctx context.Context, topic string, ka
 			defer cancel()
 
 			cc.flushAndCommitAll(shutdownCtx, topic,
-				&otpBatch, &mpinBatch, &securityBatch, &deviceBatch, &securityRiskBatch)
+				&otpBatch, &mpinBatch, &securityBatch, &deviceBatch, &securityRiskBatch, &auditBatch)
 
 			cc.logger.Info("topic consumer stopped", zap.String("topic", topic))
 			return
 
 		case <-ticker.C:
 			cc.flushAndCommitAll(ctx, topic,
-				&otpBatch, &mpinBatch, &securityBatch, &deviceBatch, &securityRiskBatch)
+				&otpBatch, &mpinBatch, &securityBatch, &deviceBatch, &securityRiskBatch, &auditBatch)
 
+			// Reset all batches
 			otpBatch = MessageBatch{events: make([]*models.OTPLogEvent, 0, cc.batchSize)}
 			mpinBatch = MessageBatch{events: make([]*models.MPINLogEvent, 0, cc.batchSize)}
 			securityBatch = MessageBatch{events: make([]*models.SecurityLogEvent, 0, cc.batchSize)}
 			deviceBatch = MessageBatch{events: make([]*models.DeviceLogEvent, 0, cc.batchSize)}
 			securityRiskBatch = MessageBatch{events: make([]*models.SecurityEvent, 0, cc.batchSize)}
+			auditBatch = MessageBatch{events: make([]*models.AuditLogEvent, 0, cc.batchSize)} // ✅ NEW: Reset audit batch
 
+			// Reset byte counters
 			otpBatchBytes = 0
 			mpinBatchBytes = 0
 			securityBatchBytes = 0
 			deviceBatchBytes = 0
 			securityRiskBatchBytes = 0
+			auditBatchBytes = 0 // ✅ NEW: Reset audit bytes
 		}
 
 		// -------------------------------------------------------
@@ -323,6 +332,33 @@ func (cc *ClickHouseConsumer) consumeTopic(ctx context.Context, topic string, ka
 				securityRiskBatchBytes = 0
 			}
 
+		case "audit": // ✅ NEW: Audit log processing
+			var e models.AuditLogEvent
+			if err := json.Unmarshal(msg.Value, &e); err != nil {
+				cc.logger.Error("unmarshal Audit failed",
+					zap.String("topic", topic),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			// Sanitize string fields
+			e.Action = cc.sanitizeString(e.Action, 100)
+			e.EntityType = cc.sanitizeString(e.EntityType, 100)
+			e.ActorType = cc.sanitizeString(e.ActorType, 50)
+			e.Module = cc.sanitizeString(e.Module, 100)
+
+			events := auditBatch.events.([]*models.AuditLogEvent)
+			auditBatch.events = append(events, &e)
+			auditBatch.messages = append(auditBatch.messages, msg)
+			auditBatchBytes += len(msg.Value)
+
+			if len(events) >= cc.batchSize || auditBatchBytes >= cc.maxBatchBytes {
+				cc.flushAndCommitAuditBatch(ctx, topic, &auditBatch)
+				auditBatch = MessageBatch{events: make([]*models.AuditLogEvent, 0, cc.batchSize)}
+				auditBatchBytes = 0
+			}
+
 		default:
 			if cc.isTimeSeriesEvent(eventType) {
 				cc.logger.Warn("unknown time-series event type",
@@ -344,7 +380,8 @@ func (cc *ClickHouseConsumer) flushAndCommitAll(
 	mpin *MessageBatch,
 	security *MessageBatch,
 	device *MessageBatch,
-	securityRisk *MessageBatch, // ✅ NEW: Security risk batch
+	securityRisk *MessageBatch,
+	audit *MessageBatch, // ✅ NEW: Audit batch parameter
 ) {
 	if err := cc.flushAndCommitOTPBatch(ctx, topic, otp); err != nil {
 		cc.logger.Error("OTP batch flush failed", zap.String("topic", topic), zap.Error(err))
@@ -358,10 +395,56 @@ func (cc *ClickHouseConsumer) flushAndCommitAll(
 	if err := cc.flushAndCommitDeviceBatch(ctx, topic, device); err != nil {
 		cc.logger.Error("Device batch flush failed", zap.String("topic", topic), zap.Error(err))
 	}
-	// ✅ NEW: Security risk batch
+	// ✅ Security risk batch
 	if err := cc.flushAndCommitSecurityRiskBatch(ctx, topic, securityRisk); err != nil {
 		cc.logger.Error("Security Risk batch flush failed", zap.String("topic", topic), zap.Error(err))
 	}
+	// ✅ NEW: Audit batch
+	if err := cc.flushAndCommitAuditBatch(ctx, topic, audit); err != nil {
+		cc.logger.Error("Audit batch flush failed", zap.String("topic", topic), zap.Error(err))
+	}
+}
+
+// ✅ NEW: Audit Logs - Flush to ClickHouse, THEN commit to Kafka
+func (cc *ClickHouseConsumer) flushAndCommitAuditBatch(ctx context.Context, topic string, batch *MessageBatch) error {
+	if batch == nil || len(batch.messages) == 0 {
+		return nil
+	}
+
+	// ✅ FIXED: Use pointer type assertion
+	events := batch.events.([]*models.AuditLogEvent)
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Step 1: Flush to ClickHouse
+	if err := cc.flushAuditBatch(ctx, events); err != nil {
+		cc.logger.Error("Audit flush to ClickHouse failed",
+			zap.String("topic", topic),
+			zap.Error(err),
+			zap.Int("batch_size", len(events)),
+		)
+		return err // Don't commit on failure
+	}
+
+	// Step 2: ONLY commit after successful ClickHouse write
+	for i, msg := range batch.messages {
+		if err := cc.kafkaConsumers[topic].CommitMessage(ctx, msg); err != nil {
+			cc.logger.Error("failed to commit Audit message",
+				zap.String("topic", topic),
+				zap.Error(err),
+				zap.Int("index", i),
+				zap.Int64("offset", msg.Offset),
+			)
+			// Continue committing other messages
+		}
+	}
+
+	cc.logger.Info("Audit batch flushed and committed",
+		zap.String("topic", topic),
+		zap.Int("count", len(events)),
+	)
+	return nil
 }
 
 // ✅ NEW: Security Risk Events - Flush to ClickHouse, THEN commit to Kafka
@@ -761,6 +844,87 @@ func (cc *ClickHouseConsumer) flushSecurityRiskBatch(ctx context.Context, batch 
 	return nil
 }
 
+// ✅ NEW: Audit Logs - Compliance and auditing requirements
+func (cc *ClickHouseConsumer) flushAuditBatch(ctx context.Context, batch []*models.AuditLogEvent) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	query := `INSERT INTO auth_analytics.audit_logs (
+		audit_id, company_id, module, action, entity_type, entity_id, 
+		actor_type, actor_id, before_state, after_state, metadata,
+		created_at, environment, version, message, service_name
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	batch_, err := cc.chClient.Conn().PrepareBatch(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to prepare Audit batch: %w", err)
+	}
+
+	for _, e := range batch {
+		// Convert before_state, after_state, and metadata to JSON strings
+		var beforeState, afterState, metadata *string
+
+		if e.BeforeState != nil {
+			bs, err := json.Marshal(e.BeforeState)
+			if err != nil {
+				cc.logger.Warn("Failed to marshal before_state", zap.Error(err))
+			} else {
+				s := string(bs)
+				beforeState = &s
+			}
+		}
+
+		if e.AfterState != nil {
+			as, err := json.Marshal(e.AfterState)
+			if err != nil {
+				cc.logger.Warn("Failed to marshal after_state", zap.Error(err))
+			} else {
+				s := string(as)
+				afterState = &s
+			}
+		}
+
+		if e.Metadata != nil {
+			md, err := json.Marshal(e.Metadata)
+			if err != nil {
+				cc.logger.Warn("Failed to marshal metadata", zap.Error(err))
+			} else {
+				s := string(md)
+				metadata = &s
+			}
+		}
+
+		if err := batch_.Append(
+			e.AuditID,
+			e.CompanyID,
+			e.Module,
+			e.Action,
+			e.EntityType,
+			e.EntityID,
+			e.ActorType,
+			e.ActorID,
+			beforeState,
+			afterState,
+			metadata,
+			e.Timestamp,
+			e.Environment,
+			e.Version,
+			e.Message,
+			e.ServiceName,
+		); err != nil {
+			return fmt.Errorf("failed to append Audit row: %w", err)
+		}
+	}
+
+	if err := batch_.Send(); err != nil {
+		return fmt.Errorf("failed to send Audit batch: %w", err)
+	}
+
+	cc.logger.Debug("Audit batch flushed to ClickHouse", zap.Int("count", len(batch)))
+	return nil
+}
+
 // ======== Utility Methods ========
 
 // Health check - verify ClickHouse connection
@@ -802,7 +966,8 @@ func (cc *ClickHouseConsumer) isTimeSeriesEvent(eventType string) bool {
 		"mpin":          true,
 		"security":      true,
 		"device":        true,
-		"security_risk": true, // ✅ NEW: Security risk events
+		"security_risk": true,
+		"audit":         true, // ✅ NEW: Audit events
 	}
 	return timeSeriesEvents[eventType]
 }
