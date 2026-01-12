@@ -14,8 +14,8 @@ import (
 
 type User struct {
 	UserID            uuid.UUID  `db:"user_id" json:"user_id"`
-	Username          string     `db:"username" json:"username"`           // NEW
-	FullName          string     `db:"full_name" json:"full_name"`         // NEW
+	Username          string     `db:"username" json:"username"`   // NEW
+	FullName          string     `db:"full_name" json:"full_name"` // NEW
 	PhoneHash         string     `db:"phone_hash" json:"phone_hash"`
 	PhoneEncrypted    []byte     `db:"phone_encrypted" json:"phone_encrypted"`
 	PhoneEncryptedDEK string     `db:"phone_encrypted_dek" json:"phone_encrypted_dek"`
@@ -60,45 +60,45 @@ type UserSearchFilters struct {
 
 // UserSearchRequest represents a user search request
 type UserSearchRequest struct {
-	Query      string            `json:"query" validate:"required,min=2"`
-	SearchType string            `json:"search_type" validate:"oneof=fulltext autocomplete"`
+	Query      string             `json:"query" validate:"required,min=2"`
+	SearchType string             `json:"search_type" validate:"oneof=fulltext autocomplete"`
 	Filters    *UserSearchFilters `json:"filters,omitempty"`
-	Limit      int               `json:"limit" validate:"min=1,max=100"`
-	Offset     int               `json:"offset" validate:"min=0"`
-	SortBy     string            `json:"sort_by" validate:"oneof=relevance username full_name created_at"`
-	SortOrder  string            `json:"sort_order" validate:"oneof=asc desc"`
+	Limit      int                `json:"limit" validate:"min=1,max=100"`
+	Offset     int                `json:"offset" validate:"min=0"`
+	SortBy     string             `json:"sort_by" validate:"oneof=relevance username full_name created_at"`
+	SortOrder  string             `json:"sort_order" validate:"oneof=asc desc"`
 }
 
 // UserSearchResponse represents a paginated search response
 type UserSearchResponse struct {
-	Users       []*UserSearchResult      `json:"users"`
-	Total       int                      `json:"total"`
-	Page        int                      `json:"page"`
-	PageSize    int                      `json:"page_size"`
-	HasMore     bool                     `json:"has_more"`
-	SearchStats map[string]interface{}   `json:"search_stats,omitempty"`
+	Users       []*UserSearchResult    `json:"users"`
+	Total       int                    `json:"total"`
+	Page        int                    `json:"page"`
+	PageSize    int                    `json:"page_size"`
+	HasMore     bool                   `json:"has_more"`
+	SearchStats map[string]interface{} `json:"search_stats,omitempty"`
 }
 
 // Add these fields to UserSuggestion if not present
 type UserSuggestion struct {
-    Username   string     `db:"username" json:"username"`
-    FullName   *string    `db:"full_name" json:"full_name,omitempty"`
-    UserID     uuid.UUID  `db:"user_id" json:"user_id"`
-    EmployeeID *string    `db:"employee_id" json:"employee_id,omitempty"`
-    RoleName   *string    `db:"role_name" json:"role_name,omitempty"`
+	Username   string    `db:"username" json:"username"`
+	FullName   *string   `db:"full_name" json:"full_name,omitempty"`
+	UserID     uuid.UUID `db:"user_id" json:"user_id"`
+	EmployeeID *string   `db:"employee_id" json:"employee_id,omitempty"`
+	RoleName   *string   `db:"role_name" json:"role_name,omitempty"`
 }
 
 // CompanyEmployeeUser - Combined user and employee data for company context
 type CompanyEmployeeUser struct {
-    UserID            uuid.UUID  `db:"user_id" json:"user_id"`
-    Username          string     `db:"username" json:"username"`
-    FullName          *string    `db:"full_name" json:"full_name,omitempty"`
-    PhoneHash         string     `db:"phone_hash" json:"phone_hash"`
-    EmployeeID        string     `db:"employee_id" json:"employee_id"`
-    RoleID            uuid.UUID  `db:"role_id" json:"role_id"`
-    RoleName          *string    `db:"role_name" json:"role_name,omitempty"`
-    IsActive          bool       `db:"is_active" json:"is_active"`
-    HireDate          time.Time  `db:"hire_date" json:"hire_date"`
+	UserID     uuid.UUID `db:"user_id" json:"user_id"`
+	Username   string    `db:"username" json:"username"`
+	FullName   *string   `db:"full_name" json:"full_name,omitempty"`
+	PhoneHash  string    `db:"phone_hash" json:"phone_hash"`
+	EmployeeID string    `db:"employee_id" json:"employee_id"`
+	RoleID     uuid.UUID `db:"role_id" json:"role_id"`
+	RoleName   *string   `db:"role_name" json:"role_name,omitempty"`
+	IsActive   bool      `db:"is_active" json:"is_active"`
+	HireDate   time.Time `db:"hire_date" json:"hire_date"`
 }
 
 // UserByUsername represents user lookup by exact username
@@ -110,6 +110,7 @@ type UserByUsername struct {
 	IsActive  bool      `db:"is_active" json:"is_active"`
 	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
+
 // UserCreateRequest represents user creation with username
 type UserCreateRequest struct {
 	Username          string    `json:"username" validate:"required,min=3,max=100,regex=^[a-zA-Z0-9._-]+$"`
@@ -184,7 +185,8 @@ type Company struct {
 	OwnerUserID           uuid.UUID  `db:"owner_user_id" json:"owner_user_id"`
 	SubscriptionTier      string     `db:"subscription_tier" json:"subscription_tier"`
 	SubscriptionStatus    string     `db:"subscription_status" json:"subscription_status"`
-	MaxEmployees          int        `db:"max_employees" json:"max_employees"` // NEW field
+	MaxEmployees          int        `db:"max_employees" json:"max_employees"`     // NEW field
+	MaxDepartments        int        `json:"max_departments" db:"max_departments"` // NEW FIELD
 	DataRegion            string     `db:"data_region" json:"data_region"`
 	IsActive              bool       `db:"is_active" json:"is_active"`
 	CreatedAt             time.Time  `db:"created_at" json:"created_at"`
@@ -195,17 +197,17 @@ type Company struct {
 
 // CompanySearchResult represents a company search result with relevance score
 type CompanySearchResult struct {
-	CompanyID          uuid.UUID  `db:"company_id" json:"company_id"`
-	CompanyName        string     `db:"company_name" json:"company_name"`
-	OwnerUserID        uuid.UUID  `db:"owner_user_id" json:"owner_user_id"`
-	SubscriptionTier   string     `db:"subscription_tier" json:"subscription_tier"`
-	SubscriptionStatus string     `db:"subscription_status" json:"subscription_status"`
-	MaxEmployees       int        `db:"max_employees" json:"max_employees"`
-	IsActive           bool       `db:"is_active" json:"is_active"`
-	DataRegion         string     `db:"data_region" json:"data_region"`
-	CreatedAt          time.Time  `db:"created_at" json:"created_at"`
-	RelevanceScore     float64    `db:"relevance_score" json:"relevance_score"`
-	MatchType          string     `db:"match_type" json:"match_type"` // "fulltext" or "autocomplete"
+	CompanyID          uuid.UUID `db:"company_id" json:"company_id"`
+	CompanyName        string    `db:"company_name" json:"company_name"`
+	OwnerUserID        uuid.UUID `db:"owner_user_id" json:"owner_user_id"`
+	SubscriptionTier   string    `db:"subscription_tier" json:"subscription_tier"`
+	SubscriptionStatus string    `db:"subscription_status" json:"subscription_status"`
+	MaxEmployees       int       `db:"max_employees" json:"max_employees"`
+	IsActive           bool      `db:"is_active" json:"is_active"`
+	DataRegion         string    `db:"data_region" json:"data_region"`
+	CreatedAt          time.Time `db:"created_at" json:"created_at"`
+	RelevanceScore     float64   `db:"relevance_score" json:"relevance_score"`
+	MatchType          string    `db:"match_type" json:"match_type"` // "fulltext" or "autocomplete"
 }
 
 // CompanySearchFilters represents filters for company search
@@ -327,16 +329,16 @@ type RoleWithPermissions struct {
 // =========================================================
 
 type Department struct {
-	DepartmentID          uuid.UUID  `json:"department_id" db:"department_id"`
-	CompanyID             uuid.UUID  `json:"company_id" db:"company_id"`
-	DepartmentName        string     `json:"department_name" db:"department_name"`
-	SystemDepartmentID    *uuid.UUID `json:"system_department_id" db:"system_department_id"`
-	SystemDepartmentName  string     `json:"system_department_name" db:"system_department_name"` // Added field
-	ModuleCode            string     `json:"module_code" db:"module_code"`                       // Added field
-	ParentDepartmentID    *uuid.UUID `json:"parent_department_id" db:"parent_department_id"`
-	IsActive              bool       `json:"is_active" db:"is_active"`
-	CreatedAt             time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at" db:"updated_at"`
+	DepartmentID         uuid.UUID  `json:"department_id" db:"department_id"`
+	CompanyID            uuid.UUID  `json:"company_id" db:"company_id"`
+	DepartmentName       string     `json:"department_name" db:"department_name"`
+	SystemDepartmentID   *uuid.UUID `json:"system_department_id" db:"system_department_id"`
+	SystemDepartmentName string     `json:"system_department_name" db:"system_department_name"` // Added field
+	ModuleCode           string     `json:"module_code" db:"module_code"`                       // Added field
+	ParentDepartmentID   *uuid.UUID `json:"parent_department_id" db:"parent_department_id"`
+	IsActive             bool       `json:"is_active" db:"is_active"`
+	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 type DepartmentWithRoles struct {
@@ -349,40 +351,40 @@ type DepartmentWithRoles struct {
 // =========================================================
 
 type CompanyEmployee struct {
-	CompanyID    uuid.UUID  `db:"company_id" json:"company_id"`
-	UserID       uuid.UUID  `db:"user_id" json:"user_id"`
-	EmployeeID   string     `db:"employee_id" json:"employee_id"`
-	RoleID       uuid.UUID  `db:"role_id" json:"role_id"`
-	HireDate     time.Time  `db:"hire_date" json:"hire_date"`
-	IsActive     bool       `db:"is_active" json:"is_active"`
-	ReportsTo    *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
-	CreatedAt    time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt    time.Time  `db:"updated_at" json:"updated_at"`
+	CompanyID  uuid.UUID  `db:"company_id" json:"company_id"`
+	UserID     uuid.UUID  `db:"user_id" json:"user_id"`
+	EmployeeID string     `db:"employee_id" json:"employee_id"`
+	RoleID     uuid.UUID  `db:"role_id" json:"role_id"`
+	PositionID *uuid.UUID `db:"position_id" json:"position_id,omitempty"`
+	HireDate   time.Time  `db:"hire_date" json:"hire_date"`
+	IsActive   bool       `db:"is_active" json:"is_active"`
+	ReportsTo  *uuid.UUID `db:"reports_to" json:"reports_to,omitempty"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt  time.Time  `db:"updated_at" json:"updated_at"`
 }
 
 // =========================================================
 // COMPANY EMPLOYEE SEARCH TYPES (ADDED)
 // =========================================================
 
-
 // CompanyEmployeeSearchFilters for filtering company employees
 type CompanyEmployeeSearchFilters struct {
-	RoleID        *uuid.UUID `json:"role_id,omitempty"`
-	DepartmentID  *uuid.UUID `json:"department_id,omitempty"`
-	IsActive      *bool      `json:"is_active,omitempty"`
-	ReportsTo     *uuid.UUID `json:"reports_to,omitempty"`
-	HireDateFrom  *time.Time `json:"hire_date_from,omitempty"`
-	HireDateTo    *time.Time `json:"hire_date_to,omitempty"`
+	RoleID       *uuid.UUID `json:"role_id,omitempty"`
+	DepartmentID *uuid.UUID `json:"department_id,omitempty"`
+	IsActive     *bool      `json:"is_active,omitempty"`
+	ReportsTo    *uuid.UUID `json:"reports_to,omitempty"`
+	HireDateFrom *time.Time `json:"hire_date_from,omitempty"`
+	HireDateTo   *time.Time `json:"hire_date_to,omitempty"`
 }
 
 // CompanyEmployeeSearchRequest for searching employees within a company
 type CompanyEmployeeSearchRequest struct {
-	Query      string                       `json:"query"`
-	CompanyID  uuid.UUID                    `json:"company_id"`
-	SearchType string                       `json:"search_type"` // "fulltext" or "autocomplete"
+	Query      string                        `json:"query"`
+	CompanyID  uuid.UUID                     `json:"company_id"`
+	SearchType string                        `json:"search_type"` // "fulltext" or "autocomplete"
 	Filters    *CompanyEmployeeSearchFilters `json:"filters,omitempty"`
-	Limit      int                          `json:"limit"`
-	Offset     int                          `json:"offset"`
+	Limit      int                           `json:"limit"`
+	Offset     int                           `json:"offset"`
 }
 
 // EmployeeHierarchy represents employee hierarchy for reporting (ADDED)
@@ -413,11 +415,11 @@ type UserGrowthMetrics struct {
 }
 
 type CompanyAnalytics struct {
-	TotalCompanies     int            `json:"total_companies"`
-	ActiveCompanies    int            `json:"active_companies"`
-	AvgNameLength      float64        `json:"avg_name_length"`
-	SearchPerformance  map[string]int `json:"search_performance"`
-	PopularTiers       map[string]int `json:"popular_tiers"`
+	TotalCompanies    int            `json:"total_companies"`
+	ActiveCompanies   int            `json:"active_companies"`
+	AvgNameLength     float64        `json:"avg_name_length"`
+	SearchPerformance map[string]int `json:"search_performance"`
+	PopularTiers      map[string]int `json:"popular_tiers"`
 }
 
 // =========================================================
@@ -434,7 +436,7 @@ type PermissionWithBitIndex struct {
 	ID       string `json:"id" db:"permission_id"`
 	Name     string `json:"name" db:"permission_name"`
 	BitIndex int    `json:"bit_index" db:"bit_index"`
-	Scope          string    `json:"scope" db:"scope"` // Add this field
+	Scope    string `json:"scope" db:"scope"` // Add this field
 	Module   string `json:"module" db:"module"`
 	Category string `json:"category" db:"category"`
 }
@@ -505,7 +507,6 @@ const (
 const (
 	SearchTypeFulltext     = "fulltext"
 	SearchTypeAutocomplete = "autocomplete"
-	
 )
 
 const (
@@ -513,23 +514,73 @@ const (
 	MatchTypeAutocomplete = "autocomplete"
 )
 
-
 // CompanyEmployeeSearchResult represents a company employee search result
 type CompanyEmployeeSearchResult struct {
-    UserID         uuid.UUID  `json:"user_id" db:"user_id"`
-    Username       string     `json:"username" db:"username"`
-    FullName       string     `json:"full_name" db:"full_name"`
-    PhoneHash      string     `json:"phone_hash" db:"phone_hash"`
-    EmployeeID     string     `json:"employee_id" db:"employee_id"`
-    RoleID         uuid.UUID  `json:"role_id" db:"role_id"`
-    RoleName       string     `json:"role_name" db:"role_name"`
-    DepartmentID   *uuid.UUID `json:"department_id" db:"department_id"`
-    DepartmentName string     `json:"department_name" db:"department_name"`
-    HireDate       time.Time  `json:"hire_date" db:"hire_date"`
-    IsActive       bool       `json:"is_active" db:"is_active"`
-    ReportsTo      *uuid.UUID `json:"reports_to" db:"reports_to"`
-    ReportsToName  string     `json:"reports_to_name" db:"reports_to_name"`
-    CreatedAt      time.Time  `json:"created_at" db:"created_at"`
-    RelevanceScore float64    `json:"relevance_score" db:"relevance_score"`
-    MatchType      string     `json:"match_type" db:"match_type"` // "fulltext" or "autocomplete"
+	UserID         uuid.UUID  `json:"user_id" db:"user_id"`
+	Username       string     `json:"username" db:"username"`
+	FullName       string     `json:"full_name" db:"full_name"`
+	PhoneHash      string     `json:"phone_hash" db:"phone_hash"`
+	EmployeeID     string     `json:"employee_id" db:"employee_id"`
+	RoleID         uuid.UUID  `json:"role_id" db:"role_id"`
+	RoleName       string     `json:"role_name" db:"role_name"`
+	DepartmentID   *uuid.UUID `json:"department_id" db:"department_id"`
+	DepartmentName string     `json:"department_name" db:"department_name"`
+	HireDate       time.Time  `json:"hire_date" db:"hire_date"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	ReportsTo      *uuid.UUID `json:"reports_to" db:"reports_to"`
+	ReportsToName  string     `json:"reports_to_name" db:"reports_to_name"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	RelevanceScore float64    `json:"relevance_score" db:"relevance_score"`
+	MatchType      string     `json:"match_type" db:"match_type"` // "fulltext" or "autocomplete"
+}
+
+// In models package
+type Position struct {
+	PositionID     uuid.UUID `json:"position_id" db:"position_id"`
+	CompanyID      uuid.UUID `json:"company_id" db:"company_id"`
+	DepartmentID   uuid.UUID `json:"department_id" db:"department_id"`
+	DepartmentName string    `json:"department_name,omitempty" db:"-"`
+	Title          string    `json:"title" db:"title"`
+	IsOpen         bool      `json:"is_open" db:"is_open"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+type DepartmentTree struct {
+	DepartmentID       uuid.UUID         `json:"department_id"`
+	DepartmentName     string            `json:"department_name"`
+	ParentDepartmentID *uuid.UUID        `json:"parent_department_id"`
+	Level              int               `json:"level"`
+	Path               []uuid.UUID       `json:"path"`
+	Children           []*DepartmentTree `json:"children,omitempty"`
+}
+type UpdateMaxDepartmentsRequest struct {
+	MaxDepartments int `json:"max_departments" validate:"required,min=1,max=100"`
+}
+
+type CompanyDepartmentInfo struct {
+	CanCreate    bool `json:"can_create"`
+	CurrentCount int  `json:"current_count"`
+	MaxAllowed   int  `json:"max_allowed"`
+	Remaining    int  `json:"remaining"`
+}
+type AdminAddDepartmentRequest struct {
+	DepartmentName     string    `json:"department_name"`
+	SystemDepartmentID uuid.UUID `json:"system_department_id"`
+}
+type DepartmentSearchResult struct {
+	DepartmentID   uuid.UUID `json:"department_id"`
+	CompanyID      uuid.UUID `json:"company_id"`
+	DepartmentName string    `json:"department_name"`
+
+	SystemDepartmentID   *uuid.UUID `json:"system_department_id,omitempty"`
+	SystemDepartmentName string     `json:"system_department_name,omitempty"`
+	ModuleCode           string     `json:"module_code,omitempty"`
+
+	ParentDepartmentID   *uuid.UUID `json:"parent_department_id,omitempty"`
+	ParentDepartmentName string     `json:"parent_department_name,omitempty"`
+
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

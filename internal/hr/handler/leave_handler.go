@@ -35,7 +35,12 @@ func NewLeaveHandler(
 // Leave Type Management
 func (h *LeaveHandler) CreateLeaveType(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID := middleware.GetCompanyIDFromContext(ctx)
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
@@ -76,8 +81,12 @@ func (h *LeaveHandler) GetLeaveType(w http.ResponseWriter, r *http.Request) {
 
 func (h *LeaveHandler) ListLeaveTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID := middleware.GetCompanyIDFromContext(ctx)
-
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 	includeInactive := r.URL.Query().Get("include_inactive") == "true"
 
 	result, err := h.leaveQueryService.ListLeaveTypesByCompany(ctx, companyID, includeInactive)
@@ -92,7 +101,12 @@ func (h *LeaveHandler) ListLeaveTypes(w http.ResponseWriter, r *http.Request) {
 // Leave Policy Management
 func (h *LeaveHandler) CreateLeavePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID := middleware.GetCompanyIDFromContext(ctx)
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
@@ -134,7 +148,12 @@ func (h *LeaveHandler) GetLeavePolicy(w http.ResponseWriter, r *http.Request) {
 // Leave Request Management
 func (h *LeaveHandler) CreateLeaveRequest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID := middleware.GetCompanyIDFromContext(ctx)
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
@@ -180,8 +199,12 @@ func (h *LeaveHandler) GetLeaveRequest(w http.ResponseWriter, r *http.Request) {
 
 func (h *LeaveHandler) ListLeaveRequests(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID := middleware.GetCompanyIDFromContext(ctx)
-
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 	userIDStr := r.URL.Query().Get("user_id")
 	leaveTypeIDStr := r.URL.Query().Get("leave_type_id")
 	status := r.URL.Query().Get("status")
@@ -330,13 +353,19 @@ func (h *LeaveHandler) GetLeaveBalance(w http.ResponseWriter, r *http.Request) {
 // Leave Stats and Reports
 func (h *LeaveHandler) GetLeaveStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID := middleware.GetCompanyIDFromContext(ctx)
+
+	// ✅ FIX: get company ID from URL (NOT context)
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
 
 	var startDate, endDate time.Time
-	var err error
 
 	if startDateStr != "" {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
@@ -358,7 +387,12 @@ func (h *LeaveHandler) GetLeaveStats(w http.ResponseWriter, r *http.Request) {
 		endDate = time.Now()
 	}
 
-	result, err := h.leaveQueryService.GetLeaveSummaryStats(ctx, companyID, startDate, endDate)
+	result, err := h.leaveQueryService.GetLeaveSummaryStats(
+		ctx,
+		companyID,
+		startDate,
+		endDate,
+	)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return

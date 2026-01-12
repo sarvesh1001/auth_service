@@ -9,6 +9,7 @@ import (
 type WorkCalendar struct {
 	CalendarID  uuid.UUID `json:"calendar_id" db:"calendar_id"`
 	CompanyID   uuid.UUID `json:"company_id" db:"company_id"`
+	Year        int       `json:"year" db:"year"` // ✅ ADDED
 	Name        string    `json:"name" db:"name"`
 	Timezone    string    `json:"timezone" db:"timezone"`
 	WorkingDays []int     `json:"working_days" db:"working_days"`

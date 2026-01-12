@@ -96,4 +96,85 @@ type AttendanceRepository interface {
 	// SAP business rules
 	GetSAPBusinessRules(ctx context.Context, companyID uuid.UUID) (*attendance.SAPBusinessRules, error)
 	SaveSAPBusinessRules(ctx context.Context, companyID uuid.UUID, rules *attendance.SAPBusinessRules) error
+
+	// GetAttendanceEventType fetches a single attendance event type by key
+	GetAttendanceEventType(
+		ctx context.Context,
+		eventType string,
+	) (*attendance.AttendanceEventType, error)
+
+	// ListAttendanceEventTypes lists all attendance event types
+	// If activeOnly is true, only active types are returned
+	ListAttendanceEventTypes(
+		ctx context.Context,
+		activeOnly bool,
+	) ([]*attendance.AttendanceEventType, error)
+
+	// =========================================================================
+	// ATTENDANCE SOURCE TYPES
+	// =========================================================================
+
+	// GetAttendanceSourceType fetches a single source type
+	GetAttendanceSourceType(
+		ctx context.Context,
+		sourceType string,
+	) (*attendance.AttendanceSourceType, error)
+
+	// ListAttendanceSourceTypes lists all available source types
+	ListAttendanceSourceTypes(
+		ctx context.Context,
+	) ([]*attendance.AttendanceSourceType, error)
+
+	// =========================================================================
+	// COMPANY ATTENDANCE RULES
+	// =========================================================================
+
+	// GetCompanyAttendanceRules fetches company-level attendance rules.
+	// If rules do not exist, implementation should return defaults.
+	GetCompanyAttendanceRules(
+		ctx context.Context,
+		companyID uuid.UUID,
+	) (*attendance.CompanyAttendanceRules, error)
+
+	// UpsertCompanyAttendanceRules creates or updates company attendance rules
+	UpsertCompanyAttendanceRules(
+		ctx context.Context,
+		rules *attendance.CompanyAttendanceRules,
+	) error
+
+	// =========================================================================
+	// DEPARTMENT ATTENDANCE RULES
+	// =========================================================================
+
+	// GetDepartmentAttendanceRules fetches department-specific rules.
+	// Returns nil if no department override exists.
+	GetDepartmentAttendanceRules(
+		ctx context.Context,
+		companyID uuid.UUID,
+		departmentID uuid.UUID,
+	) (*attendance.DepartmentAttendanceRules, error)
+
+	// =========================================================================
+	// USER ATTENDANCE PROFILE
+	// =========================================================================
+
+	// GetUserAttendanceProfile fetches user-specific attendance overrides.
+	// Returns nil if no user override exists.
+	GetUserAttendanceProfile(
+		ctx context.Context,
+		userID uuid.UUID,
+	) (*attendance.UserAttendanceProfile, error)
+
+	// Department-level attendance rules
+	UpsertDepartmentAttendanceRules(
+		ctx context.Context,
+		rules *attendance.DepartmentAttendanceRules,
+	) error
+
+	// User-level attendance overrides
+	UpsertUserAttendanceProfile(
+		ctx context.Context,
+		profile *attendance.UserAttendanceProfile,
+	) error
+	GetEmployeeDepartment(ctx context.Context, userID uuid.UUID, companyID uuid.UUID) (*uuid.UUID, error)
 }

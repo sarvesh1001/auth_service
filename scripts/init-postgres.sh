@@ -170,6 +170,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         subscription_tier VARCHAR(20) NOT NULL DEFAULT 'basic',
         subscription_status VARCHAR(20) NOT NULL DEFAULT 'active',
         max_employees INTEGER NOT NULL DEFAULT 10,
+        max_departments INTEGER NOT NULL DEFAULT 5,
         data_region VARCHAR(10) NOT NULL DEFAULT 'us',
         is_active BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -179,7 +180,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         -- Keep unique constraint from old schema
         UNIQUE(company_name, owner_user_id),
         -- Foreign key constraint
-        CONSTRAINT fk_companies_owner FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
+        CONSTRAINT fk_companies_owner FOREIGN KEY (owner_user_id) REFERENCES users(user_id),
+        CONSTRAINT check_max_departments CHECK (max_departments > 0 AND max_departments <= 1000)
     );
 
     CREATE TABLE roles (
@@ -214,19 +216,185 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         is_active BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(company_id, department_name),
         CONSTRAINT fk_departments_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
         CONSTRAINT fk_departments_system FOREIGN KEY (system_department_id) REFERENCES system_departments(system_department_id),
         CONSTRAINT fk_departments_parent FOREIGN KEY (parent_department_id) REFERENCES departments(department_id)
     );
+    CREATE INDEX idx_departments_company_active
+    ON departments (company_id)
+    WHERE is_active = true;
+
+    -- Unique constraint for active departments only
+    CREATE UNIQUE INDEX uq_departments_company_name_active
+    ON departments (company_id, department_name)
+    WHERE is_active = true;
+
+    -- ==============================================
+    -- FUNCTION: ENFORCE MAX DEPARTMENTS PER COMPANY
+    -- ==============================================
+    CREATE OR REPLACE FUNCTION enforce_department_limit()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        current_dept_count INTEGER;
+        max_dept_allowed INTEGER;
+    BEGIN
+        -- 🔒 Lock company row to prevent race conditions
+        PERFORM 1
+        FROM companies
+        WHERE company_id = NEW.company_id
+        FOR UPDATE;
+
+        -- Count active departments
+        SELECT COUNT(*)
+        INTO current_dept_count
+        FROM departments
+        WHERE company_id = NEW.company_id
+        AND is_active = true;
+
+        -- Fetch allowed limit
+        SELECT max_departments
+        INTO max_dept_allowed
+        FROM companies
+        WHERE company_id = NEW.company_id;
+
+        -- Absolute safety cap
+        IF max_dept_allowed > 1000 THEN
+            max_dept_allowed := 1000;
+        END IF;
+
+        -- INSERT case
+        IF TG_OP = 'INSERT' THEN
+            IF current_dept_count >= max_dept_allowed THEN
+                RAISE EXCEPTION
+                    'Department limit exceeded (% allowed)',
+                    max_dept_allowed
+                    USING ERRCODE = '23514';
+            END IF;
+        END IF;
+
+        -- UPDATE case (inactive → active)
+        IF TG_OP = 'UPDATE' THEN
+            IF OLD.is_active = false AND NEW.is_active = true THEN
+                IF current_dept_count >= max_dept_allowed THEN
+                    RAISE EXCEPTION
+                        'Department limit exceeded (% allowed)',
+                        max_dept_allowed
+                        USING ERRCODE = '23514';
+                END IF;
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to cascade department deactivation to child departments
+    CREATE OR REPLACE FUNCTION deactivate_child_departments(p_dept_id UUID)
+    RETURNS VOID AS $$
+    DECLARE
+        child_id UUID;
+    BEGIN
+        FOR child_id IN
+            SELECT department_id
+            FROM departments
+            WHERE parent_department_id = p_dept_id
+            AND is_active = true
+        LOOP
+            UPDATE departments
+            SET is_active = false
+            WHERE department_id = child_id;
+
+            PERFORM deactivate_child_departments(child_id);
+        END LOOP;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to cascade department soft delete
+    CREATE OR REPLACE FUNCTION cascade_department_soft_delete()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF OLD.is_active = true AND NEW.is_active = false THEN
+            PERFORM deactivate_child_departments(OLD.department_id);
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to prevent creating/activating department under inactive parent
+    CREATE OR REPLACE FUNCTION prevent_child_on_inactive_parent()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        parent_active BOOLEAN;
+    BEGIN
+        IF NEW.parent_department_id IS NOT NULL THEN
+            SELECT is_active
+            INTO parent_active
+            FROM departments
+            WHERE department_id = NEW.parent_department_id;
+
+            -- Parent missing OR inactive
+            IF parent_active IS DISTINCT FROM true THEN
+                RAISE EXCEPTION 'Cannot create or activate department under inactive or missing parent';
+            END IF;
+        END IF;
+
+        -- Prevent re-activating child under inactive parent
+        IF TG_OP = 'UPDATE'
+        AND OLD.is_active = false
+        AND NEW.is_active = true
+        AND NEW.parent_department_id IS NOT NULL THEN
+
+            SELECT is_active
+            INTO parent_active
+            FROM departments
+            WHERE department_id = NEW.parent_department_id;
+
+            IF parent_active IS DISTINCT FROM true THEN
+                RAISE EXCEPTION 'Cannot activate department under inactive parent';
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to enforce unique active department name
+    CREATE OR REPLACE FUNCTION enforce_unique_active_department_name()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.is_active = true THEN
+            IF EXISTS (
+                SELECT 1
+                FROM departments
+                WHERE company_id = NEW.company_id
+                AND department_name = NEW.department_name
+                AND is_active = true
+                AND department_id <> NEW.department_id
+            ) THEN
+                RAISE EXCEPTION 'Active department name already exists';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to prevent hard delete of departments
+    CREATE OR REPLACE FUNCTION prevent_department_delete()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        RAISE EXCEPTION 'Hard delete of departments is not allowed';
+    END;
+    $$ LANGUAGE plpgsql;
 
     CREATE TABLE role_departments (
         role_id UUID NOT NULL,
         department_id UUID NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (role_id, department_id),
-        CONSTRAINT fk_role_departments_role FOREIGN KEY (role_id) REFERENCES roles(role_id) ON DELETE CASCADE,
-        CONSTRAINT fk_role_departments_department FOREIGN KEY (department_id) REFERENCES departments(department_id) ON DELETE CASCADE
+        CONSTRAINT fk_role_departments_role FOREIGN KEY (role_id)
+            REFERENCES roles(role_id) ON DELETE CASCADE,
+        CONSTRAINT fk_role_departments_department FOREIGN KEY (department_id)
+            REFERENCES departments(department_id)
     );
 
     CREATE TABLE company_employees (
@@ -245,6 +413,57 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_employees_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_employees_role FOREIGN KEY (role_id) REFERENCES roles(role_id)
     );
+
+    -- Function to enforce employee limit per company
+    CREATE OR REPLACE FUNCTION enforce_employee_limit()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        active_count INTEGER;
+        max_allowed INTEGER;
+    BEGIN
+        -- Only check when activating or inserting active employee
+        IF (TG_OP = 'INSERT' AND NEW.is_active = true)
+        OR (TG_OP = 'UPDATE' AND OLD.is_active = false AND NEW.is_active = true) THEN
+
+            SELECT max_employees
+            INTO max_allowed
+            FROM companies
+            WHERE company_id = NEW.company_id
+            FOR UPDATE;
+
+            SELECT COUNT(*)
+            INTO active_count
+            FROM company_employees
+            WHERE company_id = NEW.company_id
+            AND is_active = true;
+
+            IF active_count + 1 > max_allowed THEN
+                RAISE EXCEPTION
+                    'Employee limit exceeded (%/%). Deactivate another employee.',
+                    active_count + 1,
+                    max_allowed;
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to get active employee count
+    CREATE OR REPLACE FUNCTION get_active_employee_count(p_company_id UUID)
+    RETURNS INTEGER AS $$
+    DECLARE
+        total INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+        INTO total
+        FROM company_employees
+        WHERE company_id = p_company_id
+        AND is_active = true;
+
+        RETURN total;
+    END;
+    $$ LANGUAGE plpgsql;
 
     CREATE TABLE user_devices (
         device_id VARCHAR(256) PRIMARY KEY,
@@ -362,8 +581,28 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         is_open BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
+        CONSTRAINT uniq_position_title_per_dept
+            UNIQUE (company_id, department_id, title),
         FOREIGN KEY (department_id) REFERENCES departments(department_id)
     );
+
+    -- Function to prevent assigning position to inactive department
+    CREATE OR REPLACE FUNCTION prevent_position_in_inactive_department()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        dept_active BOOLEAN;
+    BEGIN
+        SELECT is_active INTO dept_active
+        FROM departments
+        WHERE department_id = NEW.department_id;
+
+        IF dept_active = false THEN
+            RAISE EXCEPTION 'Cannot assign position to inactive department';
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
 
     -- Employee Role History
     CREATE TABLE employee_role_history (
@@ -398,25 +637,48 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         FOREIGN KEY (user_id) REFERENCES users(user_id),
         FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
+
+    -- Function to deactivate employee on exit
+    CREATE OR REPLACE FUNCTION deactivate_employee_on_exit()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        UPDATE company_employees
+        SET is_active = false
+        WHERE company_id = NEW.company_id
+        AND user_id = NEW.user_id;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
     
     -- ==============================================
     -- SCHEDULING MODULE TABLES
     -- ==============================================
 
-    -- Work Calendars
-    CREATE TABLE work_calendars (
-        calendar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id UUID NOT NULL,
-        name VARCHAR(100) NOT NULL,
-        timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
-        working_days INTEGER[] NOT NULL,
-        holidays JSONB,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
+-- Work Calendars
+CREATE TABLE work_calendars (
+    calendar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-        CONSTRAINT fk_calendar_company
-            FOREIGN KEY (company_id) REFERENCES companies(company_id)
-    );
+    company_id UUID NOT NULL,
+    year INTEGER NOT NULL,
+
+    name VARCHAR(100) NOT NULL,
+    timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
+    working_days INTEGER[] NOT NULL,
+    holidays JSONB,
+
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    -- Foreign key
+    CONSTRAINT fk_calendar_company
+        FOREIGN KEY (company_id)
+        REFERENCES companies(company_id),
+
+    -- One calendar per company per year
+    CONSTRAINT uq_work_calendar_company_year
+        UNIQUE (company_id, year)
+);
 
     -- Schedule Templates
     CREATE TABLE schedule_templates (
@@ -485,7 +747,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     -- Pay Units
     CREATE TABLE pay_units (
         pay_unit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name VARCHAR(30) NOT NULL,
+        name VARCHAR(30) NOT NULL UNIQUE,
         description TEXT
     );
 
@@ -578,6 +840,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         metadata JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         created_by UUID,
+        event_date DATE GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED,
 
         CONSTRAINT fk_att_events_user
             FOREIGN KEY (user_id) REFERENCES users(user_id),
@@ -590,10 +853,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
             FOREIGN KEY (source_id)
             REFERENCES attendance_sources(source_id)
     );
-
-    ALTER TABLE attendance_events
-    ADD COLUMN event_date DATE
-    GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED;
 
     CREATE INDEX idx_attendance_events_event_date
     ON attendance_events (event_date);
@@ -662,10 +921,60 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         location_type VARCHAR(30),
         geo_lat NUMERIC,
         geo_lng NUMERIC,
+        location_code VARCHAR(50),
+        zone VARCHAR(100),
         is_active BOOLEAN DEFAULT true,
 
         CONSTRAINT fk_att_locations_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+
+    -- ==============================================
+    -- ADDITIONAL TABLES FOR ATTENDANCE LOOKUPS
+    -- ==============================================
+
+    -- RFID Mappings for employees
+    CREATE TABLE employee_rfid_mappings (
+        rfid_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        company_id UUID NOT NULL,
+        rfid_tag VARCHAR(100) NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        assigned_at TIMESTAMPTZ DEFAULT NOW(),
+        unassigned_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+        UNIQUE (company_id, rfid_tag),
+
+        CONSTRAINT fk_employee_rfid_user 
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+        CONSTRAINT fk_employee_rfid_company 
+            FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX uq_employee_rfid_active_user
+    ON employee_rfid_mappings (user_id, company_id)
+    WHERE is_active = true AND unassigned_at IS NULL;
+
+    -- Work Center to Shift Mapping
+    CREATE TABLE work_center_shifts (
+        mapping_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        work_center_code VARCHAR(100) NOT NULL,
+        shift_id UUID NOT NULL, -- References schedule_templates
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        
+        UNIQUE (company_id, work_center_code, effective_from),
+        
+        CONSTRAINT fk_work_center_company 
+            FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+        CONSTRAINT fk_work_center_shift 
+            FOREIGN KEY (shift_id) REFERENCES schedule_templates(schedule_template_id) ON DELETE CASCADE
     );
 
     -- ==============================================
@@ -731,20 +1040,20 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
 
     -- Leave Balances
     CREATE TABLE leave_balances (
-    company_id UUID NOT NULL,
-    user_id UUID NOT NULL,
-    leave_type_id UUID NOT NULL,
-    balance NUMERIC(5,2) NOT NULL,
-    as_of TIMESTAMPTZ NOT NULL,
-    generated_at TIMESTAMPTZ DEFAULT NOW(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        leave_type_id UUID NOT NULL,
+        balance NUMERIC(5,2) NOT NULL,
+        as_of TIMESTAMPTZ NOT NULL,
+        generated_at TIMESTAMPTZ DEFAULT NOW(),
 
-    PRIMARY KEY (company_id, user_id, leave_type_id, as_of),
-    CONSTRAINT fk_lb_company
-        FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_lb_user
-        FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT fk_lb_type
-        FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
+        PRIMARY KEY (company_id, user_id, leave_type_id, as_of),
+        CONSTRAINT fk_lb_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_lb_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_lb_type
+            FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
     );
 
     -- Leave Requests
@@ -1067,6 +1376,20 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     
     CREATE INDEX idx_attendance_locations_company ON attendance_locations (company_id);
     CREATE INDEX idx_attendance_locations_active ON attendance_locations (is_active) WHERE is_active = true;
+    CREATE INDEX idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
+    CREATE INDEX idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
+
+    -- Indexes for employee_rfid_mappings
+    CREATE INDEX idx_employee_rfid_tag ON employee_rfid_mappings (rfid_tag);
+    CREATE INDEX idx_employee_rfid_user ON employee_rfid_mappings (user_id);
+    CREATE INDEX idx_employee_rfid_company ON employee_rfid_mappings (company_id);
+    CREATE INDEX idx_employee_rfid_active ON employee_rfid_mappings (is_active) WHERE is_active = true;
+
+    -- Indexes for work_center_shifts
+    CREATE INDEX idx_work_center_shifts_code ON work_center_shifts (work_center_code);
+    CREATE INDEX idx_work_center_shifts_company ON work_center_shifts (company_id);
+    CREATE INDEX idx_work_center_shifts_active ON work_center_shifts (is_active) WHERE is_active = true;
+    CREATE INDEX idx_work_center_shifts_dates ON work_center_shifts (effective_from, effective_to);
 
     -- Indexes for Leave Module
     CREATE INDEX idx_leave_types_company ON leave_types (company_id);
@@ -1406,7 +1729,30 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('rnd.document.update', 'Update R&D documents', 'document', 'rnd', 'user', 'basic', 206),
     ('rnd.document.view', 'View R&D documents', 'document', 'rnd', 'user', 'basic', 207),
     ('rnd.document.delete', 'Delete R&D documents', 'document', 'rnd', 'user', 'basic', 208),
-    
+
+    -- Company administration
+    ('administration.company.view', 'View company administration settings', 'company', 'administration', 'user', 'basic', 210),
+    ('administration.company.update', 'Update company administration settings', 'company', 'administration', 'user', 'basic', 211),
+
+    -- Policy & configuration
+    ('administration.policy.create', 'Create company policies', 'policy', 'administration', 'user', 'basic', 212),
+    ('administration.policy.update', 'Update company policies', 'policy', 'administration', 'user', 'basic', 213),
+    ('administration.policy.delete', 'Delete company policies', 'policy', 'administration', 'user', 'basic', 214),
+    ('administration.policy.view', 'View company policies', 'policy', 'administration', 'user', 'basic', 215),
+
+    -- Internal approvals
+    ('administration.approval.create', 'Create approval workflows', 'approval', 'administration', 'user', 'basic', 216),
+    ('administration.approval.update', 'Update approval workflows', 'approval', 'administration', 'user', 'basic', 217),
+    ('administration.approval.delete', 'Delete approval workflows', 'approval', 'administration', 'user', 'basic', 218),
+    ('administration.approval.view', 'View approval workflows', 'approval', 'administration', 'user', 'basic', 219),
+
+    -- Internal audit (company only)
+    ('administration.audit.view', 'View company audit logs', 'audit', 'administration', 'user', 'basic', 220),
+
+    -- Security & access (company scope)
+    ('administration.security.view', 'View company security settings', 'security', 'administration', 'user', 'basic', 221),
+    ('administration.security.update', 'Update company security settings', 'security', 'administration', 'user', 'basic', 222),
+
     -- Admin Employee Management permissions (scope = 'admin')
     ('admin.employee.create', 'Create admin employees', 'employee', 'employee_management', 'admin', 'admin', 235),
     ('admin.employee.update', 'Update admin employees', 'employee', 'employee_management', 'admin', 'admin', 236),
@@ -1470,12 +1816,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         RETURN NEW;
     END;
     $$ LANGUAGE plpgsql;
-
-    -- Trigger to automatically populate outbox
-    CREATE TRIGGER audit_logs_outbox_trigger
-    AFTER INSERT ON audit.audit_logs
-    FOR EACH ROW
-    EXECUTE FUNCTION audit.audit_logs_outbox_trigger();
 
     -- ADMIN USER SEARCH FUNCTIONS
     CREATE OR REPLACE FUNCTION search_admin_users(
@@ -1604,6 +1944,21 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
             limit_count,
             offset_count
         );
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- Function to close positions when department is deactivated
+    CREATE OR REPLACE FUNCTION close_positions_on_department_deactivate()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF OLD.is_active = true AND NEW.is_active = false THEN
+            UPDATE positions
+            SET is_open = false
+            WHERE department_id = OLD.department_id
+            AND is_open = true;
+        END IF;
+
+        RETURN NEW;
     END;
     $$ LANGUAGE plpgsql;
 
@@ -2662,6 +3017,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     -- ==============================================
     -- TRIGGERS
     -- ==============================================
+
+    -- Trigger to automatically populate outbox
+    CREATE TRIGGER audit_logs_outbox_trigger
+    AFTER INSERT ON audit.audit_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION audit.audit_logs_outbox_trigger();
+
     CREATE TRIGGER update_admin_user_search_tsv
     BEFORE UPDATE OF username, full_name ON admin_users
     FOR EACH ROW EXECUTE FUNCTION update_admin_user_search_tsv();
@@ -2686,83 +3048,68 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     CREATE TRIGGER update_user_devices_updated_at BEFORE UPDATE ON user_devices FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_admin_roles_updated_at BEFORE UPDATE ON admin_roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+    -- ==============================================
+    -- TRIGGER: ENFORCE DEPARTMENT LIMIT
+    -- ==============================================
+    CREATE TRIGGER trg_enforce_department_limit
+    BEFORE INSERT OR UPDATE OF is_active ON departments
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_department_limit();
+
+    -- Trigger to prevent hard delete of departments
+    CREATE TRIGGER trg_no_department_delete
+    BEFORE DELETE ON departments
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_department_delete();
+
+    -- Trigger to cascade department soft delete to child departments
+    CREATE TRIGGER trg_cascade_department_soft_delete
+    BEFORE UPDATE OF is_active ON departments
+    FOR EACH ROW
+    EXECUTE FUNCTION cascade_department_soft_delete();
+
+    -- Trigger to prevent creating/activating department under inactive parent
+    CREATE TRIGGER trg_prevent_child_on_inactive_parent
+    BEFORE INSERT OR UPDATE OF parent_department_id ON departments
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_child_on_inactive_parent();
+
+    -- Trigger to enforce unique active department name
+    CREATE TRIGGER trg_unique_active_department_name
+    BEFORE INSERT OR UPDATE OF department_name, is_active ON departments
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_unique_active_department_name();
+
     -- Triggers for HR module tables
     CREATE TRIGGER update_employee_profiles_updated_at BEFORE UPDATE ON employee_profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_attendance_policies_updated_at BEFORE UPDATE ON attendance_policies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    -- ==============================================
-    -- ADDITIONAL TABLES FOR ATTENDANCE LOOKUPS
-    -- ==============================================
 
-    -- RFID Mappings for employees
-    CREATE TABLE employee_rfid_mappings (
-    rfid_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL,
-    company_id UUID NOT NULL,
-    rfid_tag VARCHAR(100) NOT NULL,
-    is_active BOOLEAN DEFAULT true,
-    assigned_at TIMESTAMPTZ DEFAULT NOW(),
-    unassigned_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    -- Trigger to close positions when department is deactivated
+    CREATE TRIGGER trg_close_positions_on_department_deactivate
+    BEFORE UPDATE OF is_active ON departments
+    FOR EACH ROW
+    EXECUTE FUNCTION close_positions_on_department_deactivate();
 
-    UNIQUE (company_id, rfid_tag),
+    -- Trigger to prevent assigning position to inactive department
+    CREATE TRIGGER trg_prevent_position_in_inactive_department
+    BEFORE INSERT OR UPDATE ON positions
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_position_in_inactive_department();
 
-    CONSTRAINT fk_employee_rfid_user 
-        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-    CONSTRAINT fk_employee_rfid_company 
-        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
-    );
-    CREATE UNIQUE INDEX uq_employee_rfid_active_user
-    ON employee_rfid_mappings (user_id, company_id)
-    WHERE is_active = true AND unassigned_at IS NULL;
+    -- Trigger to deactivate employee on exit
+    CREATE TRIGGER trg_employee_exit_deactivate
+    AFTER INSERT ON employee_exit
+    FOR EACH ROW
+    EXECUTE FUNCTION deactivate_employee_on_exit();
 
-    -- Add location_code to attendance_locations
-    ALTER TABLE attendance_locations ADD COLUMN IF NOT EXISTS location_code VARCHAR(50);
-    ALTER TABLE attendance_locations ADD COLUMN IF NOT EXISTS zone VARCHAR(100);
+    -- Trigger to enforce employee limit
+    CREATE TRIGGER trg_enforce_employee_limit
+    BEFORE INSERT OR UPDATE OF is_active
+    ON company_employees
+    FOR EACH ROW
+    EXECUTE FUNCTION enforce_employee_limit();
 
-    -- Work Center to Shift Mapping
-    CREATE TABLE work_center_shifts (
-        mapping_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id UUID NOT NULL,
-        work_center_code VARCHAR(100) NOT NULL,
-        shift_id UUID NOT NULL, -- References schedule_templates
-        effective_from DATE NOT NULL,
-        effective_to DATE,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        
-        UNIQUE (company_id, work_center_code, effective_from),
-        
-        CONSTRAINT fk_work_center_company 
-            FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-        CONSTRAINT fk_work_center_shift 
-            FOREIGN KEY (shift_id) REFERENCES schedule_templates(schedule_template_id) ON DELETE CASCADE
-    );
-
-    -- ==============================================
-    -- ADD INDEXES FOR NEW TABLES
-    -- ==============================================
-
-    -- Indexes for employee_rfid_mappings
-    CREATE INDEX idx_employee_rfid_tag ON employee_rfid_mappings (rfid_tag);
-    CREATE INDEX idx_employee_rfid_user ON employee_rfid_mappings (user_id);
-    CREATE INDEX idx_employee_rfid_company ON employee_rfid_mappings (company_id);
-    CREATE INDEX idx_employee_rfid_active ON employee_rfid_mappings (is_active) WHERE is_active = true;
-
-    -- Indexes for attendance_locations new columns
-    CREATE INDEX idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
-    CREATE INDEX idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
-
-    -- Indexes for work_center_shifts
-    CREATE INDEX idx_work_center_shifts_code ON work_center_shifts (work_center_code);
-    CREATE INDEX idx_work_center_shifts_company ON work_center_shifts (company_id);
-    CREATE INDEX idx_work_center_shifts_active ON work_center_shifts (is_active) WHERE is_active = true;
-    CREATE INDEX idx_work_center_shifts_dates ON work_center_shifts (effective_from, effective_to);
-
-    -- ==============================================
-    -- TRIGGERS FOR NEW TABLES
-    -- ==============================================
+    -- Triggers for new tables
     CREATE TRIGGER update_employee_rfid_updated_at 
     BEFORE UPDATE ON employee_rfid_mappings 
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -2771,8 +3118,227 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     BEFORE UPDATE ON work_center_shifts 
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-    ALTER TABLE pay_units
-    ADD CONSTRAINT uq_pay_units_name UNIQUE (name);
+    CREATE INDEX idx_departments_parent_active
+    ON departments (parent_department_id)
+    WHERE is_active = true;
+
+    -- ==============================================
+    -- ATTENDANCE EVENT TYPES (MASTER)
+    -- ==============================================
+    CREATE TABLE attendance_event_types (
+        event_type VARCHAR(30) PRIMARY KEY,
+        category VARCHAR(30) NOT NULL,
+        description TEXT,
+        is_user_triggered BOOLEAN NOT NULL DEFAULT true,
+        is_system_generated BOOLEAN NOT NULL DEFAULT false,
+        is_active BOOLEAN NOT NULL DEFAULT true
+    );
+
+    INSERT INTO attendance_event_types
+    (event_type, category, description, is_user_triggered, is_system_generated)
+    VALUES
+    -- Core
+    ('check_in', 'core', 'User check-in', true, false),
+    ('check_out', 'core', 'User check-out', true, false),
+    ('break_start', 'core', 'Break started', true, false),
+    ('break_end', 'core', 'Break ended', true, false),
+
+    -- Shift
+    ('shift_start', 'shift', 'Shift started', true, false),
+    ('shift_end', 'shift', 'Shift ended', true, false),
+    ('overtime_start', 'shift', 'Overtime started', true, false),
+    ('overtime_end', 'shift', 'Overtime ended', true, false),
+    ('early_exit', 'shift', 'Left early', false, true),
+    ('late_entry', 'shift', 'Late arrival', false, true),
+
+    -- Location
+    ('gate_entry', 'location', 'Gate entry', true, false),
+    ('gate_exit', 'location', 'Gate exit', true, false),
+    ('zone_entry', 'location', 'Zone entry', true, false),
+    ('zone_exit', 'location', 'Zone exit', true, false),
+
+    -- Class / Session
+    ('class_start', 'class', 'Class started', true, false),
+    ('class_end', 'class', 'Class ended', true, false),
+    ('session_join', 'class', 'Joined session', true, false),
+    ('session_leave', 'class', 'Left session', true, false),
+
+    -- Leave
+    ('leave_start', 'leave', 'Leave started', false, true),
+    ('leave_end', 'leave', 'Leave ended', false, true),
+    ('absent_marked', 'leave', 'Absent marked', false, true),
+    ('holiday_marked', 'leave', 'Holiday', false, true),
+    ('weekly_off', 'leave', 'Weekly off', false, true),
+
+    -- Manual / HR
+    ('manual_check_in', 'manual', 'Manual check-in', false, false),
+    ('manual_check_out', 'manual', 'Manual check-out', false, false),
+    ('manual_override', 'manual', 'Manual override', false, false),
+    ('attendance_adjustment', 'manual', 'Attendance adjustment', false, false),
+
+    -- System / Device
+    ('biometric_sync', 'system', 'Biometric sync', false, true),
+    ('rfid_scan', 'system', 'RFID scan', false, true),
+    ('system_generated', 'system', 'System generated event', false, true),
+    ('imported_event', 'system', 'Imported attendance', false, true),
+
+    -- Exceptions
+    ('missing_punch', 'exception', 'Missing punch', false, true),
+    ('duplicate_punch', 'exception', 'Duplicate punch', false, true),
+    ('invalid_punch', 'exception', 'Invalid punch', false, true),
+    ('policy_violation', 'exception', 'Attendance policy violation', false, true)
+    ON CONFLICT DO NOTHING;
+
+        -- Enforce FK from attendance_events
+    ALTER TABLE attendance_events
+    ADD CONSTRAINT fk_attendance_events_event_type
+    FOREIGN KEY (event_type)
+    REFERENCES attendance_event_types(event_type);
+
+
+    -- ==============================================
+    -- COMPANY ATTENDANCE RULES (GLOBAL)
+    -- ==============================================
+    CREATE TABLE company_attendance_rules (
+        company_id UUID PRIMARY KEY,
+        allowed_source_types VARCHAR(30)[] NOT NULL,
+        allow_multiple_checkins BOOLEAN NOT NULL DEFAULT false,
+        timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        CONSTRAINT fk_company_attendance_rules_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+            ON DELETE CASCADE
+    );
+
+    -- ==============================================
+    -- DEPARTMENT ATTENDANCE RULES
+    -- ==============================================
+    CREATE TABLE department_attendance_rules (
+        rule_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        department_id UUID NOT NULL,
+
+        allowed_source_types VARCHAR(30)[] NOT NULL,
+        allowed_event_types VARCHAR(30)[] NOT NULL,
+
+        require_location BOOLEAN NOT NULL DEFAULT false,
+        require_device BOOLEAN NOT NULL DEFAULT false,
+
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        UNIQUE (company_id, department_id),
+
+        CONSTRAINT fk_dept_att_rules_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+            ON DELETE CASCADE,
+
+        CONSTRAINT fk_dept_att_rules_department
+            FOREIGN KEY (department_id) REFERENCES departments(department_id)
+            ON DELETE CASCADE
+    );
+
+    -- ==============================================
+    -- USER ATTENDANCE PROFILES (OVERRIDES)
+    -- ==============================================
+    CREATE TABLE user_attendance_profiles (
+        user_id UUID PRIMARY KEY,
+        company_id UUID NOT NULL,
+
+        override_source_types VARCHAR(30)[],
+        override_event_types VARCHAR(30)[],
+
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        CONSTRAINT fk_user_att_profile_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+            ON DELETE CASCADE,
+
+        CONSTRAINT fk_user_att_profile_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+            ON DELETE CASCADE
+    );
+
+    -- ==============================================
+    -- ATTENDANCE SOURCE TYPES (MASTER - LOCKED)
+    -- ==============================================
+    INSERT INTO attendance_source_types
+    (source_type, description, requires_reference)
+    VALUES
+    -- Physical devices
+    ('biometric', 'Biometric device', false),
+    ('rfid', 'RFID card or gate', false),
+    ('machine', 'Factory machine or terminal', true),
+
+    -- Digital
+    ('mobile', 'Mobile application', false),
+    ('web', 'Web portal', false),
+
+    -- Controlled / Admin
+    ('manual', 'Manual HR entry', true),
+    ('system', 'System generated', false),
+
+    -- Education
+    ('classroom', 'Classroom attendance system', true),
+
+    -- Integration
+    ('import', 'Imported from external system', true)
+
+    ON CONFLICT DO NOTHING;
+
+    CREATE TABLE user_off_entitlements (
+    entitlement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+
+    period_type VARCHAR(20) NOT NULL, -- weekly | monthly
+    off_count INTEGER NOT NULL,        -- e.g. 1 per week, 4 per month
+
+    requires_approval BOOLEAN DEFAULT true,
+    effective_from DATE NOT NULL,
+    effective_to DATE,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT fk_ent_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
+    CONSTRAINT fk_ent_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+    CONSTRAINT chk_period_type CHECK (period_type IN ('weekly','monthly'))
+    );
+CREATE TABLE off_requests (
+    off_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+
+    request_dates DATE[] NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending', -- pending | approved | rejected
+
+    requested_by UUID,
+    approved_by UUID,
+    approved_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT fk_or_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
+    CONSTRAINT fk_or_user FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+CREATE TABLE schedule_overrides (
+    override_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    override_date DATE NOT NULL,
+
+    override_type VARCHAR(20) NOT NULL, -- off | force_work | holiday_override
+    reason TEXT,
+
+    created_by UUID,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE (user_id, override_date),
+
+    CONSTRAINT fk_so_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
+    CONSTRAINT fk_so_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+    CONSTRAINT chk_override_type CHECK (override_type IN ('off','force_work','holiday_override'))
+);
 
 EOSQL
 

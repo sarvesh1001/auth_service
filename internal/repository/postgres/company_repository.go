@@ -6,6 +6,7 @@ import (
 	"auth-service/internal/models"
 	"auth-service/internal/rbac"
 	"auth-service/internal/util"
+	"strconv"
 
 	"context"
 	"database/sql"
@@ -860,7 +861,7 @@ func (r *CompanyRepositoryImpl) DeactivateDepartment(ctx context.Context, depart
 // }
 
 func (r *CompanyRepositoryImpl) GetDepartmentLoad(ctx context.Context, companyID uuid.UUID) (map[string]int, error) {
-    query := `
+	query := `
         SELECT d.department_name, COUNT(DISTINCT ce.user_id) as employee_count
         FROM departments d
         LEFT JOIN role_departments rd ON d.department_id = rd.department_id
@@ -868,32 +869,33 @@ func (r *CompanyRepositoryImpl) GetDepartmentLoad(ctx context.Context, companyID
         WHERE d.company_id = $1 AND d.is_active = true
         GROUP BY d.department_id, d.department_name
         ORDER BY employee_count DESC`
-    
-    rows, err := r.client.Query(ctx, query, companyID)
-    if err != nil {
-        r.recordError()
-        return nil, fmt.Errorf("failed to query department load: %w", err)
-    }
-    defer rows.Close()
-    
-    departmentLoad := make(map[string]int)
-    for rows.Next() {
-        var departmentName string
-        var count int
-        err := rows.Scan(&departmentName, &count)
-        if err != nil {
-            continue
-        }
-        departmentLoad[departmentName] = count
-    }
-    
-    if err := rows.Err(); err != nil {
-        return nil, fmt.Errorf("error iterating department load rows: %w", err)
-    }
-    
-    r.recordQuery()
-    return departmentLoad, nil
+
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query department load: %w", err)
+	}
+	defer rows.Close()
+
+	departmentLoad := make(map[string]int)
+	for rows.Next() {
+		var departmentName string
+		var count int
+		err := rows.Scan(&departmentName, &count)
+		if err != nil {
+			continue
+		}
+		departmentLoad[departmentName] = count
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating department load rows: %w", err)
+	}
+
+	r.recordQuery()
+	return departmentLoad, nil
 }
+
 // GetDepartmentBySystemID retrieves a department by company and system department ID
 func (r *CompanyRepositoryImpl) GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error) {
 	query := `
@@ -3341,218 +3343,283 @@ func (r *CompanyRepositoryImpl) GetUserPermissions(ctx context.Context, companyI
 //	}
 //
 // CreateCompany creates a new company with full RBAC setup
-func (r *CompanyRepositoryImpl) CreateCompany(ctx context.Context, company *models.Company, additionalDepartments []string) error {
+
+func (r *CompanyRepositoryImpl) CreateCompany(
+	ctx context.Context,
+	company *models.Company,
+	additionalDepartments []string,
+	ownerPositionTitle string,
+) error {
+
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// 1. Insert company
+	// ------------------------------------------------------------------
+	// 1. Insert company (WITH max_departments)
+	// ------------------------------------------------------------------
 	companyQuery := `
-        INSERT INTO companies (
-            company_id, company_name, owner_user_id, subscription_tier, 
-            subscription_status, max_employees, data_region, is_active,
-            created_at, updated_at, subscription_start_date, subscription_end_date
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+		INSERT INTO companies (
+			company_id,
+			company_name,
+			owner_user_id,
+			subscription_tier,
+			subscription_status,
+			max_employees,
+			max_departments,
+			data_region,
+			is_active,
+			created_at,
+			updated_at,
+			subscription_start_date,
+			subscription_end_date
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+	`
 
 	_, err = tx.ExecContext(ctx, companyQuery,
-		company.CompanyID, company.CompanyName, company.OwnerUserID, company.SubscriptionTier,
-		company.SubscriptionStatus, company.MaxEmployees, company.DataRegion, company.IsActive,
-		company.CreatedAt, company.UpdatedAt, company.SubscriptionStartDate, company.SubscriptionEndDate,
+		company.CompanyID,
+		company.CompanyName,
+		company.OwnerUserID,
+		company.SubscriptionTier,
+		company.SubscriptionStatus,
+		company.MaxEmployees,
+		company.MaxDepartments,
+		company.DataRegion,
+		company.IsActive,
+		company.CreatedAt,
+		company.UpdatedAt,
+		company.SubscriptionStartDate,
+		company.SubscriptionEndDate,
 	)
 	if err != nil {
-		r.recordError()
 		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
 			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
 		}
 		return fmt.Errorf("failed to create company: %w", err)
 	}
 
-	// 2. Create OWNER role for this company
+	// ------------------------------------------------------------------
+	// 2. Create OWNER role
+	// ------------------------------------------------------------------
 	ownerRoleID := uuid.New()
-	ownerRoleQuery := `
-        INSERT INTO roles (
-            role_id, role_name, role_level, company_id, is_system_role,
-            description, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-
-	_, err = tx.ExecContext(ctx, ownerRoleQuery,
-		ownerRoleID, "Owner", 1000, company.CompanyID, true,
-		"Company owner with full permissions", company.CreatedAt, company.UpdatedAt,
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO roles (
+			role_id, role_name, role_level, company_id,
+			is_system_role, description, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+	`,
+		ownerRoleID,
+		"Owner",
+		1000,
+		company.CompanyID,
+		true,
+		"Company owner with full permissions",
+		company.CreatedAt,
+		company.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create owner role: %w", err)
 	}
 
-	// 3. Get system departments first
+	// ------------------------------------------------------------------
+	// 3. Load system departments
+	// ------------------------------------------------------------------
 	systemDepts, err := r.GetSystemDepartments(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get system departments: %w", err)
 	}
 
-	// Map department names to system departments
 	systemDeptMap := make(map[string]uuid.UUID)
-	for _, dept := range systemDepts {
-		systemDeptMap[strings.ToLower(dept.ModuleCode)] = dept.SystemDepartmentID
+	for _, d := range systemDepts {
+		systemDeptMap[strings.ToLower(d.ModuleCode)] = d.SystemDepartmentID
 	}
 
-	// 4. Create Default Department: ADMINISTRATION with system department
-	adminDeptID := uuid.New()
-	adminDeptQuery := `
-        INSERT INTO departments (
-            department_id, company_id, department_name, system_department_id,
-            is_active, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
-
-	// Get the Administration system department
+	// ------------------------------------------------------------------
+	// 4. Create ADMINISTRATION department (always 1)
+	// ------------------------------------------------------------------
 	adminSystemDeptID, ok := systemDeptMap["administration"]
 	if !ok {
 		return fmt.Errorf("administration system department not found")
 	}
 
-	_, err = tx.ExecContext(ctx, adminDeptQuery,
-		adminDeptID, company.CompanyID, "Administration", adminSystemDeptID,
-		true, company.CreatedAt, company.UpdatedAt,
+	adminDeptID := uuid.New()
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO departments (
+			department_id, company_id, department_name,
+			system_department_id, is_active, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7)
+	`,
+		adminDeptID,
+		company.CompanyID,
+		"Administration",
+		adminSystemDeptID,
+		true,
+		company.CreatedAt,
+		company.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create administration department: %w", err)
 	}
 
-	// 5. Create Additional Department Rows from user input
-	// Store created department IDs and their modules
-	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}   // Owner always has access to Administration
-	ownerAccessModules := []string{"administration"} // Owner always has administration module
+	// ------------------------------------------------------------------
+	// 5. Create OWNER position (Administration)
+	// ------------------------------------------------------------------
+	adminPositionID := uuid.New()
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO positions (
+			position_id, company_id, department_id,
+			title, is_open, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7)
+	`,
+		adminPositionID,
+		company.CompanyID,
+		adminDeptID,
+		ownerPositionTitle,
+		false,
+		company.CreatedAt,
+		company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create owner position: %w", err)
+	}
+
+	// ------------------------------------------------------------------
+	// 6. Create additional departments (LIMITED by max_departments)
+	// ------------------------------------------------------------------
+	remainingSlots := company.MaxDepartments - 1 // 1 = Administration
+	if remainingSlots < 0 {
+		remainingSlots = 0
+	}
+
+	if len(additionalDepartments) > remainingSlots {
+		additionalDepartments = additionalDepartments[:remainingSlots]
+	}
+
+	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}
+	ownerAccessModules := []string{"administration"}
+	positionsByDept := map[uuid.UUID]uuid.UUID{
+		adminDeptID: adminPositionID,
+	}
 
 	for _, deptName := range additionalDepartments {
 		deptID := uuid.New()
-		var systemDeptID uuid.UUID
-		var moduleCode string
 
-		// Map department name to system module
-		switch strings.ToLower(deptName) {
-		case "hr", "human resources":
-			systemDeptID = systemDeptMap["hr"]
-			moduleCode = "hr"
-		case "inventory", "warehouse":
-			systemDeptID = systemDeptMap["inventory"]
-			moduleCode = "inventory"
-		case "sales":
-			systemDeptID = systemDeptMap["sales"]
-			moduleCode = "sales"
-		case "production", "manufacturing":
-			systemDeptID = systemDeptMap["production"]
-			moduleCode = "production"
-		case "finance", "accounting":
-			systemDeptID = systemDeptMap["finance"]
-			moduleCode = "finance"
-		case "logistics", "shipping":
-			systemDeptID = systemDeptMap["logistics"]
-			moduleCode = "logistics"
-		case "it", "technology":
-			systemDeptID = systemDeptMap["it"]
-			moduleCode = "it"
-		case "customer support", "support":
-			systemDeptID = systemDeptMap["support"]
-			moduleCode = "support"
-		case "quality control", "qc":
-			systemDeptID = systemDeptMap["qc"]
-			moduleCode = "qc"
-		case "quality assurance", "qa":
-			systemDeptID = systemDeptMap["qa"]
-			moduleCode = "qa"
-		case "research", "r&d":
-			systemDeptID = systemDeptMap["rnd"]
-			moduleCode = "rnd"
-		case "operations":
+		module := strings.ToLower(strings.TrimSpace(deptName))
+		systemDeptID, ok := systemDeptMap[module]
+		if !ok {
 			systemDeptID = systemDeptMap["operations"]
-			moduleCode = "operations"
-		case "marketing":
-			systemDeptID = systemDeptMap["marketing"]
-			moduleCode = "marketing"
-		case "procurement", "purchasing":
-			systemDeptID = systemDeptMap["procurement"]
-			moduleCode = "procurement"
-		default:
-			// Use operations as default for unknown departments
-			systemDeptID = systemDeptMap["operations"]
-			moduleCode = "operations"
+			module = "operations"
 		}
 
-		deptQuery := `
-            INSERT INTO departments (
-                department_id, company_id, department_name, system_department_id,
-                is_active, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)`
-
-		_, err = tx.ExecContext(ctx, deptQuery,
-			deptID, company.CompanyID, deptName, systemDeptID,
-			true, company.CreatedAt, company.UpdatedAt,
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO departments (
+				department_id, company_id, department_name,
+				system_department_id, is_active, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7)
+		`,
+			deptID,
+			company.CompanyID,
+			deptName,
+			systemDeptID,
+			true,
+			company.CreatedAt,
+			company.UpdatedAt,
 		)
 		if err != nil {
-			r.logger.Warn("Failed to create department",
+			r.logger.Warn("department creation failed",
 				util.String("department", deptName),
 				util.ErrorField(err))
-			continue // Continue with other departments even if one fails
+			continue
 		}
 
-		// Add this department to owner's accessible departments and modules
+		positionID := uuid.New()
+		_, _ = tx.ExecContext(ctx, `
+			INSERT INTO positions (
+				position_id, company_id, department_id,
+				title, is_open, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7)
+		`,
+			positionID,
+			company.CompanyID,
+			deptID,
+			fmt.Sprintf("%s Head", deptName),
+			true,
+			company.CreatedAt,
+			company.UpdatedAt,
+		)
+
+		positionsByDept[deptID] = positionID
 		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
-		ownerAccessModules = append(ownerAccessModules, moduleCode)
+		ownerAccessModules = append(ownerAccessModules, module)
 	}
 
-	// 6. Assign ONLY the specified departments to the Owner role via role_departments
-	roleDeptQuery := `INSERT INTO role_departments (role_id, department_id) VALUES ($1, $2)`
+	// ------------------------------------------------------------------
+	// 7. Assign departments to OWNER role
+	// ------------------------------------------------------------------
 	for _, deptID := range ownerAccessDeptIDs {
-		_, err = tx.ExecContext(ctx, roleDeptQuery, ownerRoleID, deptID)
-		if err != nil {
-			r.logger.Warn("Failed to assign department to owner role via role_departments",
-				util.String("department_id", deptID.String()),
-				util.ErrorField(err))
-			// Continue even if some assignments fail
-		}
+		_, _ = tx.ExecContext(ctx,
+			`INSERT INTO role_departments (role_id, department_id) VALUES ($1,$2)`,
+			ownerRoleID,
+			deptID,
+		)
 	}
 
-	// 7. Grant permissions ONLY for the modules that the owner has access to
-	// This ensures owner only gets permissions for their assigned departments' modules
-	grantPermissionsQuery := `
-        INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
-        SELECT $1, p.permission_id, $2, $3 
-        FROM permissions p
-        WHERE p.module = ANY($4)`
-
-	_, err = tx.ExecContext(ctx, grantPermissionsQuery,
-		ownerRoleID, company.OwnerUserID, company.CreatedAt, pq.Array(ownerAccessModules))
-	if err != nil {
-		return fmt.Errorf("failed to grant permissions to owner role: %w", err)
-	}
-
-	// 8. Insert the Owner as Employee (NO department_id - department comes from role_departments)
-	employeeQuery := `
-        INSERT INTO company_employees (
-            company_id, user_id, employee_id, role_id,
-            hire_date, is_active, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-
-	_, err = tx.ExecContext(ctx, employeeQuery,
-		company.CompanyID, company.OwnerUserID, "OWNER-"+company.CompanyID.String()[:8], ownerRoleID,
-		company.CreatedAt, true, company.CreatedAt, company.UpdatedAt,
+	// ------------------------------------------------------------------
+	// 8. Grant permissions ONLY for allowed modules
+	// ------------------------------------------------------------------
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
+		SELECT $1, p.permission_id, $2, $3
+		FROM permissions p
+		WHERE p.module = ANY($4)
+	`,
+		ownerRoleID,
+		company.OwnerUserID,
+		company.CreatedAt,
+		pq.Array(ownerAccessModules),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to add owner as employee: %w", err)
+		return fmt.Errorf("failed to grant permissions: %w", err)
 	}
 
+	// ------------------------------------------------------------------
+	// 9. Insert OWNER as employee
+	// ------------------------------------------------------------------
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO company_employees (
+			company_id, user_id, employee_id,
+			role_id, position_id,
+			hire_date, is_active, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+	`,
+		company.CompanyID,
+		company.OwnerUserID,
+		"OWNER-"+company.CompanyID.String()[:8],
+		ownerRoleID,
+		adminPositionID,
+		company.CreatedAt,
+		true,
+		company.CreatedAt,
+		company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert owner employee: %w", err)
+	}
+
+	// ------------------------------------------------------------------
+	// COMMIT
+	// ------------------------------------------------------------------
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	r.recordQuery()
-	r.logger.Info("Company created successfully with RBAC setup",
+	r.logger.Info("Company created successfully",
 		util.String("company_id", company.CompanyID.String()),
-		util.String("company_name", company.CompanyName),
-		util.Int("owner_department_count", len(ownerAccessDeptIDs)),
-		util.Int("owner_module_count", len(ownerAccessModules)),
-		util.Strings("owner_modules", ownerAccessModules))
+		util.Int("max_departments", company.MaxDepartments),
+		util.Int("departments_created", len(ownerAccessDeptIDs)),
+	)
 
 	return nil
 }
@@ -5444,4 +5511,1533 @@ func (r *CompanyRepositoryImpl) GetEmployeeDepartments(ctx context.Context, comp
 	}
 	r.recordQuery()
 	return departments, nil
+}
+
+// CreatePosition creates a new position in the database
+func (r *CompanyRepositoryImpl) CreatePosition(ctx context.Context, position *models.Position) error {
+	query := `
+		INSERT INTO positions (
+			position_id, company_id, department_id, title,
+			is_open, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+
+	_, err := r.client.Exec(ctx, query,
+		position.PositionID,
+		position.CompanyID,
+		position.DepartmentID,
+		position.Title,
+		position.IsOpen,
+		position.CreatedAt,
+		position.UpdatedAt,
+	)
+
+	if err != nil {
+		r.recordError()
+
+		// Handle duplicate title
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			return fmt.Errorf("position with same title already exists in this department")
+		}
+
+		return fmt.Errorf("failed to create position: %w", err)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// GetPosition retrieves a position by ID
+func (r *CompanyRepositoryImpl) GetPosition(ctx context.Context, positionID uuid.UUID) (*models.Position, error) {
+	query := `
+        SELECT position_id, company_id, department_id, title,
+               is_open, created_at, updated_at
+        FROM positions
+        WHERE position_id = $1`
+
+	var position models.Position
+	err := r.client.QueryRow(ctx, query, positionID).Scan(
+		&position.PositionID, &position.CompanyID, &position.DepartmentID,
+		&position.Title, &position.IsOpen, &position.CreatedAt, &position.UpdatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("position not found: %s", positionID)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to get position: %w", err)
+	}
+
+	r.recordQuery()
+	return &position, nil
+}
+
+// GetPositionsByCompany retrieves all positions for a company
+func (r *CompanyRepositoryImpl) GetPositionsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	limit, offset int,
+	onlyOpen bool,
+) ([]*models.Position, int, error) {
+	if limit <= 0 || limit > DefaultCompanyPageSize {
+		limit = DefaultCompanyPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var totalCount int
+	countQuery := `SELECT COUNT(*) FROM positions WHERE company_id = $1`
+	if onlyOpen {
+		countQuery += ` AND is_open = true`
+	}
+
+	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
+	}
+
+	query := `
+        SELECT position_id, department_id, title, is_open, created_at, updated_at
+        FROM positions
+        WHERE company_id = $1`
+
+	if onlyOpen {
+		query += ` AND is_open = true`
+	}
+
+	query += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+
+	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to query positions: %w", err)
+	}
+	defer rows.Close()
+
+	positions := make([]*models.Position, 0, limit)
+	for rows.Next() {
+		var position models.Position
+		err := rows.Scan(
+			&position.PositionID, &position.DepartmentID, &position.Title,
+			&position.IsOpen, &position.CreatedAt, &position.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
+			continue
+		}
+		position.CompanyID = companyID
+		positions = append(positions, &position)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
+	}
+
+	r.recordQuery()
+	return positions, totalCount, nil
+}
+
+// GetPositionsByDepartment retrieves all positions for a department
+func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
+	ctx context.Context,
+	departmentID uuid.UUID,
+	limit, offset int,
+	onlyOpen bool,
+) ([]*models.Position, int, error) {
+	if limit <= 0 || limit > DefaultCompanyPageSize {
+		limit = DefaultCompanyPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var totalCount int
+	countQuery := `SELECT COUNT(*) FROM positions WHERE department_id = $1`
+	if onlyOpen {
+		countQuery += ` AND is_open = true`
+	}
+
+	err := r.client.QueryRow(ctx, countQuery, departmentID).Scan(&totalCount)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to count department positions: %w", err)
+	}
+
+	query := `
+        SELECT p.position_id, p.company_id, p.title, p.is_open,
+               p.created_at, p.updated_at, d.department_name
+        FROM positions p
+        INNER JOIN departments d ON p.department_id = d.department_id
+        WHERE p.department_id = $1`
+
+	if onlyOpen {
+		query += ` AND p.is_open = true`
+	}
+
+	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
+
+	rows, err := r.client.Query(ctx, query, departmentID, limit, offset)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to query department positions: %w", err)
+	}
+	defer rows.Close()
+
+	positions := make([]*models.Position, 0, limit)
+	for rows.Next() {
+		var position models.Position
+		var departmentName string
+		err := rows.Scan(
+			&position.PositionID, &position.CompanyID, &position.Title,
+			&position.IsOpen, &position.CreatedAt, &position.UpdatedAt,
+			&departmentName,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department position row", util.ErrorField(err))
+			continue
+		}
+		position.DepartmentID = departmentID
+		position.DepartmentName = departmentName
+		positions = append(positions, &position)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating department position rows: %w", err)
+	}
+
+	r.recordQuery()
+	return positions, totalCount, nil
+}
+
+// UpdatePosition updates position details
+func (r *CompanyRepositoryImpl) UpdatePosition(ctx context.Context, position *models.Position) error {
+	position.UpdatedAt = time.Now().UTC()
+	query := `
+        UPDATE positions SET
+            title = $1, department_id = $2, is_open = $3, updated_at = $4
+        WHERE position_id = $5`
+
+	result, err := r.client.Exec(ctx, query,
+		position.Title, position.DepartmentID, position.IsOpen,
+		position.UpdatedAt, position.PositionID,
+	)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to update position: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("position not found: %s", position.PositionID)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// DeletePosition deletes a position
+func (r *CompanyRepositoryImpl) DeletePosition(ctx context.Context, positionID uuid.UUID) error {
+	query := `DELETE FROM positions WHERE position_id = $1`
+
+	result, err := r.client.Exec(ctx, query, positionID)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to delete position: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("position not found: %s", positionID)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// UpdatePositionStatus updates the open/closed status of a position
+func (r *CompanyRepositoryImpl) UpdatePositionStatus(ctx context.Context, positionID uuid.UUID, isOpen bool) error {
+	query := `UPDATE positions SET is_open = $1, updated_at = $2 WHERE position_id = $3`
+
+	result, err := r.client.Exec(ctx, query, isOpen, time.Now().UTC(), positionID)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to update position status: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("position not found: %s", positionID)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// UpdateDepartmentParent updates a department's parent department
+func (r *CompanyRepositoryImpl) UpdateDepartmentParent(
+	ctx context.Context,
+	departmentID uuid.UUID,
+	parentDepartmentID *uuid.UUID,
+) error {
+	// Check for circular references
+	if parentDepartmentID != nil {
+		if departmentID == *parentDepartmentID {
+			return fmt.Errorf("department cannot be its own parent")
+		}
+
+		// Check if the parent exists and belongs to the same company
+		parentDept, err := r.GetDepartment(ctx, *parentDepartmentID)
+		if err != nil {
+			return fmt.Errorf("parent department not found: %w", err)
+		}
+
+		// Get current department to check company
+		currentDept, err := r.GetDepartment(ctx, departmentID)
+		if err != nil {
+			return fmt.Errorf("department not found: %w", err)
+		}
+
+		if parentDept.CompanyID != currentDept.CompanyID {
+			return fmt.Errorf("parent department belongs to a different company")
+		}
+
+		// Check for circular reference in the hierarchy
+		if r.isCircularReference(ctx, departmentID, parentDepartmentID) {
+			return fmt.Errorf("circular reference detected in department hierarchy")
+		}
+	}
+
+	query := `UPDATE departments SET parent_department_id = $1, updated_at = $2 WHERE department_id = $3`
+
+	result, err := r.client.Exec(ctx, query, parentDepartmentID, time.Now().UTC(), departmentID)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to update department parent: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("department not found: %s", departmentID)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// isCircularReference checks if setting parent would create a circular reference
+func (r *CompanyRepositoryImpl) isCircularReference(
+	ctx context.Context,
+	departmentID uuid.UUID,
+	parentDepartmentID *uuid.UUID,
+) bool {
+	if parentDepartmentID == nil {
+		return false
+	}
+
+	// Follow the parent chain to see if we loop back to the original department
+	visited := make(map[uuid.UUID]bool)
+	current := *parentDepartmentID
+
+	for current != uuid.Nil {
+		if current == departmentID {
+			return true
+		}
+
+		if visited[current] {
+			return true // Loop detected
+		}
+
+		visited[current] = true
+
+		query := `SELECT parent_department_id FROM departments WHERE department_id = $1`
+		var parentID *uuid.UUID
+		err := r.client.QueryRow(ctx, query, current).Scan(&parentID)
+		if err != nil {
+			break
+		}
+
+		if parentID == nil {
+			break
+		}
+
+		current = *parentID
+	}
+
+	return false
+}
+
+// GetDepartmentChildren retrieves immediate children of a department
+func (r *CompanyRepositoryImpl) GetDepartmentChildren(
+	ctx context.Context,
+	departmentID uuid.UUID,
+) ([]*models.Department, error) {
+	query := `
+        SELECT department_id, company_id, department_name,
+               system_department_id, parent_department_id,
+               is_active, created_at, updated_at
+        FROM departments
+        WHERE parent_department_id = $1 AND is_active = true
+        ORDER BY department_name ASC`
+
+	rows, err := r.client.Query(ctx, query, departmentID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query department children: %w", err)
+	}
+	defer rows.Close()
+
+	var children []*models.Department
+	for rows.Next() {
+		var department models.Department
+		var parentDeptID sql.NullString
+		var systemDeptID sql.NullString
+
+		err := rows.Scan(
+			&department.DepartmentID, &department.CompanyID, &department.DepartmentName,
+			&systemDeptID, &parentDeptID,
+			&department.IsActive, &department.CreatedAt, &department.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department child row", util.ErrorField(err))
+			continue
+		}
+
+		if parentDeptID.Valid {
+			parentID, _ := uuid.Parse(parentDeptID.String)
+			department.ParentDepartmentID = &parentID
+		}
+
+		if systemDeptID.Valid {
+			systemID, _ := uuid.Parse(systemDeptID.String)
+			department.SystemDepartmentID = &systemID
+		}
+
+		children = append(children, &department)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating department children rows: %w", err)
+	}
+
+	r.recordQuery()
+	return children, nil
+}
+
+// GetDepartmentTree retrieves entire subtree of a department
+func (r *CompanyRepositoryImpl) GetDepartmentTree(
+	ctx context.Context,
+	departmentID uuid.UUID,
+) ([]*models.DepartmentTree, error) {
+	query := `
+        WITH RECURSIVE dept_tree AS (
+            -- Base case: the starting department
+            SELECT 
+                d.department_id, d.department_name, d.parent_department_id,
+                d.is_active, 1 as level,
+                ARRAY[d.department_id] as path,
+                d.created_at, d.updated_at
+            FROM departments d
+            WHERE d.department_id = $1 AND d.is_active = true
+            
+            UNION ALL
+            
+            -- Recursive case: children of departments in the tree
+            SELECT 
+                d.department_id, d.department_name, d.parent_department_id,
+                d.is_active, dt.level + 1 as level,
+                dt.path || d.department_id as path,
+                d.created_at, d.updated_at
+            FROM departments d
+            INNER JOIN dept_tree dt ON d.parent_department_id = dt.department_id
+            WHERE d.is_active = true
+        )
+        SELECT 
+            department_id, department_name, parent_department_id,
+            level, path
+        FROM dept_tree
+        ORDER BY level, department_name`
+
+	rows, err := r.client.Query(ctx, query, departmentID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query department tree: %w", err)
+	}
+	defer rows.Close()
+
+	var tree []*models.DepartmentTree
+	for rows.Next() {
+		var item models.DepartmentTree
+		var parentDeptID sql.NullString
+		var pathStr string
+
+		err := rows.Scan(
+			&item.DepartmentID, &item.DepartmentName, &parentDeptID,
+			&item.Level, &pathStr,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department tree row", util.ErrorField(err))
+			continue
+		}
+
+		if parentDeptID.Valid {
+			parentID, _ := uuid.Parse(parentDeptID.String)
+			item.ParentDepartmentID = &parentID
+		}
+
+		// Parse path array
+		if pathStr != "" {
+			pathStr = strings.Trim(pathStr, "{}")
+			if pathStr != "" {
+				parts := strings.Split(pathStr, ",")
+				for _, part := range parts {
+					id, err := uuid.Parse(strings.TrimSpace(part))
+					if err == nil {
+						item.Path = append(item.Path, id)
+					}
+				}
+			}
+		}
+
+		tree = append(tree, &item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating department tree rows: %w", err)
+	}
+
+	r.recordQuery()
+	return tree, nil
+}
+
+// GetDepartmentParents gets all parent departments up to root
+func (r *CompanyRepositoryImpl) GetDepartmentParents(
+	ctx context.Context,
+	departmentID uuid.UUID,
+) ([]*models.Department, error) {
+	query := `
+        WITH RECURSIVE dept_parents AS (
+            -- Start with the current department
+            SELECT 
+                d.department_id, d.department_name, d.parent_department_id,
+                d.company_id, d.is_active,
+                0 as level
+            FROM departments d
+            WHERE d.department_id = $1 AND d.is_active = true
+            
+            UNION ALL
+            
+            -- Recursively get parents
+            SELECT 
+                d.department_id, d.department_name, d.parent_department_id,
+                d.company_id, d.is_active,
+                dp.level - 1 as level
+            FROM departments d
+            INNER JOIN dept_parents dp ON d.department_id = dp.parent_department_id
+            WHERE d.is_active = true
+        )
+        SELECT 
+            department_id, department_name, parent_department_id,
+            company_id, is_active, level
+        FROM dept_parents
+        WHERE department_id != $1
+        ORDER BY level ASC`
+
+	rows, err := r.client.Query(ctx, query, departmentID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query department parents: %w", err)
+	}
+	defer rows.Close()
+
+	var parents []*models.Department
+	for rows.Next() {
+		var department models.Department
+		var parentDeptID sql.NullString
+		var level int
+
+		err := rows.Scan(
+			&department.DepartmentID, &department.DepartmentName, &parentDeptID,
+			&department.CompanyID, &department.IsActive, &level,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department parent row", util.ErrorField(err))
+			continue
+		}
+
+		if parentDeptID.Valid {
+			parentID, _ := uuid.Parse(parentDeptID.String)
+			department.ParentDepartmentID = &parentID
+		}
+
+		parents = append(parents, &department)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating department parent rows: %w", err)
+	}
+
+	r.recordQuery()
+	return parents, nil
+}
+
+// MoveDepartmentWithEmployees moves a department and its employees to a new parent
+func (r *CompanyRepositoryImpl) MoveDepartmentWithEmployees(
+	ctx context.Context,
+	departmentID uuid.UUID,
+	newParentDepartmentID *uuid.UUID,
+) error {
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Update department parent
+	updateQuery := `UPDATE departments SET parent_department_id = $1, updated_at = $2 WHERE department_id = $3`
+	_, err = tx.ExecContext(ctx, updateQuery, newParentDepartmentID, time.Now().UTC(), departmentID)
+	if err != nil {
+		return fmt.Errorf("failed to update department parent: %w", err)
+	}
+
+	r.recordQuery()
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// GetRootDepartments gets all root departments (no parent) for a company
+func (r *CompanyRepositoryImpl) GetRootDepartments(
+	ctx context.Context,
+	companyID uuid.UUID,
+) ([]*models.Department, error) {
+	query := `
+        SELECT department_id, department_name,
+               system_department_id, is_active, created_at, updated_at
+        FROM departments
+        WHERE company_id = $1 AND parent_department_id IS NULL AND is_active = true
+        ORDER BY department_name ASC`
+
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to query root departments: %w", err)
+	}
+	defer rows.Close()
+
+	var departments []*models.Department
+	for rows.Next() {
+		var department models.Department
+		var systemDeptID sql.NullString
+
+		err := rows.Scan(
+			&department.DepartmentID, &department.DepartmentName,
+			&systemDeptID, &department.IsActive,
+			&department.CreatedAt, &department.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan root department row", util.ErrorField(err))
+			continue
+		}
+
+		department.CompanyID = companyID
+		if systemDeptID.Valid {
+			systemID, _ := uuid.Parse(systemDeptID.String)
+			department.SystemDepartmentID = &systemID
+		}
+
+		departments = append(departments, &department)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating root department rows: %w", err)
+	}
+
+	r.recordQuery()
+	return departments, nil
+}
+func (r *CompanyRepositoryImpl) CreateSubDepartment(
+	ctx context.Context,
+	companyID uuid.UUID,
+	parentDepartmentID uuid.UUID,
+	departmentName string,
+	systemDepartmentID uuid.UUID,
+) (*models.Department, error) {
+
+	departmentName = strings.TrimSpace(departmentName)
+	if departmentName == "" {
+		return nil, fmt.Errorf("department name cannot be empty")
+	}
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1️⃣ Validate parent department exists, active, and belongs to company
+	var parentCompanyID uuid.UUID
+	err = tx.QueryRowContext(
+		ctx,
+		`
+		SELECT company_id
+		FROM departments
+		WHERE department_id = $1
+		  AND is_active = true
+		`,
+		parentDepartmentID,
+	).Scan(&parentCompanyID)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("parent department not found or inactive")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate parent department: %w", err)
+	}
+
+	if parentCompanyID != companyID {
+		return nil, fmt.Errorf("parent department does not belong to this company")
+	}
+
+	// 2️⃣ Insert sub-department (DB enforces limits & uniqueness)
+	departmentID := uuid.New()
+	now := time.Now().UTC()
+
+	_, err = tx.ExecContext(
+		ctx,
+		`
+		INSERT INTO departments (
+			department_id,
+			company_id,
+			department_name,
+			system_department_id,
+			parent_department_id,
+			is_active,
+			created_at,
+			updated_at
+		) VALUES ($1, $2, $3, $4, $5, true, $6, $7)
+		`,
+		departmentID,
+		companyID,
+		departmentName,
+		systemDepartmentID,
+		parentDepartmentID,
+		now,
+		now,
+	)
+
+	if err != nil {
+		// Let DB constraints speak (name conflict, limit exceeded, etc.)
+		return nil, fmt.Errorf("failed to create sub-department: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	r.recordQuery()
+
+	department := &models.Department{
+		DepartmentID:       departmentID,
+		CompanyID:          companyID,
+		DepartmentName:     departmentName,
+		SystemDepartmentID: &systemDepartmentID,
+		ParentDepartmentID: &parentDepartmentID,
+		IsActive:           true,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+
+	r.logger.Info(
+		"Sub-department created",
+		util.String("department_id", departmentID.String()),
+		util.String("department_name", departmentName),
+		util.String("company_id", companyID.String()),
+		util.String("parent_department_id", parentDepartmentID.String()),
+	)
+
+	return department, nil
+}
+
+func (r *CompanyRepositoryImpl) GetSubDepartments(
+	ctx context.Context,
+	parentDepartmentID uuid.UUID,
+) ([]*models.Department, error) {
+
+	query := `
+		SELECT
+			department_id,
+			company_id,
+			department_name,
+			system_department_id,
+			parent_department_id,
+			is_active,
+			created_at,
+			updated_at
+		FROM departments
+		WHERE parent_department_id = $1
+		ORDER BY department_name ASC
+	`
+
+	rows, err := r.client.DB.QueryContext(ctx, query, parentDepartmentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sub-departments: %w", err)
+	}
+	defer rows.Close()
+
+	var departments []*models.Department
+
+	for rows.Next() {
+		var dept models.Department
+		var systemDeptID *uuid.UUID
+		var parentDeptID *uuid.UUID
+
+		if err := rows.Scan(
+			&dept.DepartmentID,
+			&dept.CompanyID,
+			&dept.DepartmentName,
+			&systemDeptID,
+			&parentDeptID,
+			&dept.IsActive,
+			&dept.CreatedAt,
+			&dept.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan sub-department: %w", err)
+		}
+
+		dept.SystemDepartmentID = systemDeptID
+		dept.ParentDepartmentID = parentDeptID
+
+		departments = append(departments, &dept)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating sub-departments: %w", err)
+	}
+
+	r.recordQuery()
+	return departments, nil
+}
+func (r *CompanyRepositoryImpl) GetCompanyByID(ctx context.Context, companyID uuid.UUID) (*models.Company, error) {
+	query := `
+		SELECT company_id, company_name, owner_user_id,
+			   subscription_tier, subscription_status,
+			   max_employees, max_departments,
+			   data_region, is_active,
+			   created_at, updated_at,
+			   subscription_start_date, subscription_end_date
+		FROM companies
+		WHERE company_id = $1`
+
+	var company models.Company
+	var subStart, subEnd sql.NullTime
+
+	err := r.client.QueryRow(ctx, query, companyID).Scan(
+		&company.CompanyID,
+		&company.CompanyName,
+		&company.OwnerUserID,
+		&company.SubscriptionTier,
+		&company.SubscriptionStatus,
+		&company.MaxEmployees,
+		&company.MaxDepartments,
+		&company.DataRegion,
+		&company.IsActive,
+		&company.CreatedAt,
+		&company.UpdatedAt,
+		&subStart,
+		&subEnd,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("company not found: %s", companyID)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to get company by id: %w", err)
+	}
+
+	if subStart.Valid {
+		company.SubscriptionStartDate = &subStart.Time
+	}
+	if subEnd.Valid {
+		company.SubscriptionEndDate = &subEnd.Time
+	}
+
+	r.recordQuery()
+	return &company, nil
+}
+func (r *CompanyRepositoryImpl) GetActiveDepartmentCount(
+	ctx context.Context,
+	companyID uuid.UUID,
+) (int, error) {
+
+	query := `
+		SELECT COUNT(*)
+		FROM departments
+		WHERE company_id = $1
+		  AND is_active = true`
+
+	var count int
+	err := r.client.QueryRow(ctx, query, companyID).Scan(&count)
+	if err != nil {
+		r.recordError()
+		return 0, fmt.Errorf("failed to get active department count: %w", err)
+	}
+
+	r.recordQuery()
+	return count, nil
+}
+func (r *CompanyRepositoryImpl) UpdateMaxDepartments(
+	ctx context.Context,
+	companyID uuid.UUID,
+	newMaxDepartments int,
+) error {
+
+	if newMaxDepartments <= 0 {
+		return fmt.Errorf("max_departments must be greater than zero")
+	}
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Lock company row
+	var currentMax int
+	err = tx.QueryRowContext(ctx, `
+		SELECT max_departments
+		FROM companies
+		WHERE company_id = $1
+		FOR UPDATE
+	`, companyID).Scan(&currentMax)
+	if err != nil {
+		return fmt.Errorf("company not found: %w", err)
+	}
+
+	// Count active departments
+	var activeCount int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM departments
+		WHERE company_id = $1 AND is_active = true
+	`, companyID).Scan(&activeCount)
+	if err != nil {
+		return fmt.Errorf("failed to count active departments: %w", err)
+	}
+
+	if newMaxDepartments < activeCount {
+		return fmt.Errorf(
+			"cannot reduce max_departments below active departments (%d)",
+			activeCount,
+		)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		UPDATE companies
+		SET max_departments = $1,
+		    updated_at = $2
+		WHERE company_id = $3
+	`, newMaxDepartments, time.Now().UTC(), companyID)
+	if err != nil {
+		return fmt.Errorf("failed to update max_departments: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Info("Max departments updated",
+		util.String("company_id", companyID.String()),
+		util.Int("old_max_departments", currentMax),
+		util.Int("new_max_departments", newMaxDepartments),
+		util.Int("active_departments", activeCount),
+	)
+
+	return nil
+}
+func (r *CompanyRepositoryImpl) CheckDepartmentLimit(
+	ctx context.Context,
+	companyID uuid.UUID,
+) error {
+
+	info, err := r.GetCompanyDepartmentInfo(ctx, companyID)
+	if err != nil {
+		return err
+	}
+
+	if info.ActiveDepartments >= info.MaxDepartments {
+		return fmt.Errorf(
+			"department limit reached (%d/%d)",
+			info.ActiveDepartments,
+			info.MaxDepartments,
+		)
+	}
+
+	return nil
+}
+
+type CompanyDepartmentInfo struct {
+	CompanyID            uuid.UUID
+	MaxDepartments       int
+	ActiveDepartments    int
+	RemainingDepartments int
+}
+
+func (r *CompanyRepositoryImpl) GetCompanyDepartmentInfo(
+	ctx context.Context,
+	companyID uuid.UUID,
+) (*CompanyDepartmentInfo, error) {
+
+	query := `
+		SELECT
+			c.company_id,
+			c.max_departments,
+			COUNT(d.department_id) FILTER (WHERE d.is_active = true)
+		FROM companies c
+		LEFT JOIN departments d ON d.company_id = c.company_id
+		WHERE c.company_id = $1
+		GROUP BY c.company_id, c.max_departments`
+
+	var info CompanyDepartmentInfo
+
+	err := r.client.QueryRow(ctx, query, companyID).Scan(
+		&info.CompanyID,
+		&info.MaxDepartments,
+		&info.ActiveDepartments,
+	)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to get company department info: %w", err)
+	}
+
+	info.RemainingDepartments = info.MaxDepartments - info.ActiveDepartments
+	if info.RemainingDepartments < 0 {
+		info.RemainingDepartments = 0
+	}
+
+	r.recordQuery()
+	return &info, nil
+}
+
+func (r *CompanyRepositoryImpl) CreateCompanyDepartment(
+	ctx context.Context,
+	companyID uuid.UUID,
+	departmentName string,
+	systemDepartmentID uuid.UUID,
+) (*models.Department, error) {
+
+	departmentName = strings.TrimSpace(departmentName)
+	if departmentName == "" {
+		return nil, fmt.Errorf("department name cannot be empty")
+	}
+
+	now := time.Now().UTC()
+	departmentID := uuid.New()
+
+	query := `
+		INSERT INTO departments (
+			department_id,
+			company_id,
+			department_name,
+			system_department_id,
+			parent_department_id,
+			is_active,
+			created_at,
+			updated_at
+		) VALUES ($1, $2, $3, $4, NULL, true, $5, $6)
+	`
+
+	_, err := r.client.Exec(ctx, query,
+		departmentID,
+		companyID,
+		departmentName,
+		systemDepartmentID,
+		now,
+		now,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "departments_company_id_department_name_key") {
+			return nil, fmt.Errorf("department '%s' already exists in this company", departmentName)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to create department: %w", err)
+	}
+
+	r.recordQuery()
+
+	department := &models.Department{
+		DepartmentID:       departmentID,
+		CompanyID:          companyID,
+		DepartmentName:     departmentName,
+		SystemDepartmentID: &systemDepartmentID,
+		IsActive:           true,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+
+	r.logger.Info("Company department created by admin",
+		util.String("department_id", departmentID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_name", departmentName),
+	)
+
+	return department, nil
+}
+
+// GetDepartmentByID retrieves a department by ID with system department info
+func (r *CompanyRepositoryImpl) GetDepartmentByID(
+	ctx context.Context,
+	departmentID uuid.UUID,
+) (*models.Department, error) {
+
+	query := `
+		SELECT
+			d.department_id,
+			d.company_id,
+			d.department_name,
+			d.system_department_id,
+			sd.name AS system_department_name,
+			sd.module_code,
+			d.parent_department_id,
+			d.is_active,
+			d.created_at,
+			d.updated_at
+		FROM departments d
+		LEFT JOIN system_departments sd
+			ON d.system_department_id = sd.system_department_id
+		WHERE d.department_id = $1
+	`
+
+	var dept models.Department
+
+	var systemDeptID sql.NullString
+	var systemDeptName sql.NullString
+	var moduleCode sql.NullString
+	var parentDeptID sql.NullString
+
+	err := r.client.QueryRow(ctx, query, departmentID).Scan(
+		&dept.DepartmentID,
+		&dept.CompanyID,
+		&dept.DepartmentName,
+		&systemDeptID,
+		&systemDeptName,
+		&moduleCode,
+		&parentDeptID,
+		&dept.IsActive,
+		&dept.CreatedAt,
+		&dept.UpdatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("department not found: %s", departmentID)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to get department: %w", err)
+	}
+
+	// Nullable system department
+	if systemDeptID.Valid {
+		id, _ := uuid.Parse(systemDeptID.String)
+		dept.SystemDepartmentID = &id
+	}
+	if systemDeptName.Valid {
+		dept.SystemDepartmentName = systemDeptName.String
+	}
+	if moduleCode.Valid {
+		dept.ModuleCode = moduleCode.String
+	}
+
+	// Nullable parent department
+	if parentDeptID.Valid {
+		id, _ := uuid.Parse(parentDeptID.String)
+		dept.ParentDepartmentID = &id
+	}
+
+	r.recordQuery()
+	return &dept, nil
+}
+
+func (r *CompanyRepositoryImpl) PositionExists(
+	ctx context.Context,
+	companyID, departmentID uuid.UUID,
+	title string,
+) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM positions
+			WHERE company_id = $1
+			  AND department_id = $2
+			  AND LOWER(title) = LOWER($3)
+		)`
+
+	var exists bool
+	err := r.client.QueryRow(ctx, query, companyID, departmentID, title).Scan(&exists)
+	return exists, err
+}
+
+// Add this to your CompanyRepository interface (postgres/company_repository.go)
+func (r *CompanyRepositoryImpl) SearchDepartments(
+	ctx context.Context,
+	companyID uuid.UUID,
+	searchQuery string,
+	limit int,
+	offset int,
+	includeInactive bool,
+) ([]*models.DepartmentSearchResult, int, error) {
+
+	start := time.Now()
+
+	// Base select query
+	baseQuery := `
+		SELECT 
+			d.department_id, 
+			d.company_id, 
+			d.department_name,
+			d.system_department_id,
+			d.parent_department_id,
+			d.is_active,
+			d.created_at,
+			d.updated_at,
+			sd.name AS system_department_name,
+			sd.module_code AS system_module_code,
+			parent.department_name AS parent_department_name
+		FROM departments d
+		LEFT JOIN system_departments sd 
+			ON d.system_department_id = sd.system_department_id
+		LEFT JOIN departments parent 
+			ON d.parent_department_id = parent.department_id
+		WHERE d.company_id = $1
+	`
+
+	// Count query
+	countQuery := `
+		SELECT COUNT(*)
+		FROM departments d
+		WHERE d.company_id = $1
+	`
+
+	var (
+		whereClause string
+		queryParams []interface{}
+	)
+
+	queryParams = append(queryParams, companyID)
+
+	// Active filter
+	if !includeInactive {
+		whereClause += " AND d.is_active = true"
+	}
+
+	// Search filter
+	if searchQuery != "" {
+		whereClause += " AND d.department_name ILIKE $" + strconv.Itoa(len(queryParams)+1)
+		queryParams = append(queryParams, "%"+searchQuery+"%")
+	}
+
+	// Execute count query
+	var totalCount int
+	err := r.client.QueryRow(
+		ctx,
+		countQuery+whereClause,
+		queryParams...,
+	).Scan(&totalCount)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to count departments: %w", err)
+	}
+
+	// Pagination
+	searchSQL := baseQuery + whereClause +
+		` ORDER BY d.department_name ASC
+		  LIMIT $` + strconv.Itoa(len(queryParams)+1) +
+		` OFFSET $` + strconv.Itoa(len(queryParams)+2)
+
+	queryParams = append(queryParams, limit, offset)
+
+	rows, err := r.client.Query(ctx, searchSQL, queryParams...)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to search departments: %w", err)
+	}
+	defer rows.Close()
+
+	var departments []*models.DepartmentSearchResult
+
+	for rows.Next() {
+		var d models.DepartmentSearchResult
+
+		var (
+			systemDeptID, parentDeptID sql.NullString
+			systemDeptName, moduleCode sql.NullString
+			parentDeptName             sql.NullString
+		)
+
+		err := rows.Scan(
+			&d.DepartmentID,
+			&d.CompanyID,
+			&d.DepartmentName,
+			&systemDeptID,
+			&parentDeptID,
+			&d.IsActive,
+			&d.CreatedAt,
+			&d.UpdatedAt,
+			&systemDeptName,
+			&moduleCode,
+			&parentDeptName,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department row", util.ErrorField(err))
+			continue
+		}
+
+		if systemDeptID.Valid {
+			if id, err := uuid.Parse(systemDeptID.String); err == nil {
+				d.SystemDepartmentID = &id
+			}
+		}
+		if parentDeptID.Valid {
+			if id, err := uuid.Parse(parentDeptID.String); err == nil {
+				d.ParentDepartmentID = &id
+			}
+		}
+		if systemDeptName.Valid {
+			d.SystemDepartmentName = systemDeptName.String
+		}
+		if moduleCode.Valid {
+			d.ModuleCode = moduleCode.String
+		}
+		if parentDeptName.Valid {
+			d.ParentDepartmentName = parentDeptName.String
+		}
+
+		departments = append(departments, &d)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating department rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("Department search completed",
+		util.String("company_id", companyID.String()),
+		util.String("query", searchQuery),
+		util.Int("results", len(departments)),
+		util.Duration("duration", time.Since(start)),
+	)
+
+	return departments, totalCount, nil
+}
+
+// Also add this function to get department suggestions
+func (r *CompanyRepositoryImpl) GetDepartmentSuggestions(
+	ctx context.Context,
+	companyID uuid.UUID,
+	prefix string,
+	limit int,
+) ([]*models.Department, error) {
+	query := `
+        SELECT 
+            department_id,
+            department_name,
+            system_department_id,
+            is_active
+        FROM departments
+        WHERE company_id = $1 
+          AND department_name ILIKE $2 || '%'
+          AND is_active = true
+        ORDER BY department_name
+        LIMIT $3`
+
+	rows, err := r.client.Query(ctx, query, companyID, prefix, limit)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to get department suggestions: %w", err)
+	}
+	defer rows.Close()
+
+	var departments []*models.Department
+	for rows.Next() {
+		var department models.Department
+		var systemDeptID sql.NullString
+
+		err := rows.Scan(
+			&department.DepartmentID,
+			&department.DepartmentName,
+			&systemDeptID,
+			&department.IsActive,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department suggestion row", util.ErrorField(err))
+			continue
+		}
+
+		department.CompanyID = companyID
+		if systemDeptID.Valid {
+			systemID, _ := uuid.Parse(systemDeptID.String)
+			department.SystemDepartmentID = &systemID
+		}
+
+		departments = append(departments, &department)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating department suggestion rows: %w", err)
+	}
+
+	r.recordQuery()
+	return departments, nil
+}
+func (r *CompanyRepositoryImpl) SoftDeleteDepartment(
+	ctx context.Context,
+	companyID uuid.UUID,
+	departmentID uuid.UUID,
+) error {
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Fetch current department name
+	var deptName string
+	err = tx.QueryRowContext(ctx, `
+		SELECT department_name
+		FROM departments
+		WHERE department_id = $1
+		  AND company_id = $2
+		  AND is_active = true
+	`, departmentID, companyID).Scan(&deptName)
+
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("department not found or already inactive")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to fetch department name: %w", err)
+	}
+
+	// 2. Create archived name
+	archivedName := fmt.Sprintf(
+		"%s__archived_%d",
+		deptName,
+		time.Now().UnixNano()%10000,
+	)
+
+	// 3. Soft delete (DB trigger handles children + positions)
+	res, err := tx.ExecContext(ctx, `
+		UPDATE departments
+		SET is_active = false,
+		    department_name = $3,
+		    updated_at = $4
+		WHERE department_id = $1
+		  AND company_id = $2
+	`, departmentID, companyID, archivedName, time.Now().UTC())
+
+	if err != nil {
+		return fmt.Errorf("failed to soft delete department: %w", err)
+	}
+
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("department not found")
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Info("Department soft deleted",
+		util.String("department_id", departmentID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("archived_name", archivedName),
+	)
+
+	return nil
+}
+func (r *CompanyRepositoryImpl) ActivateDepartment(
+	ctx context.Context,
+	companyID uuid.UUID,
+	departmentID uuid.UUID,
+) error {
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var deptName string
+	err = tx.QueryRowContext(ctx, `
+		SELECT department_name
+		FROM departments
+		WHERE department_id = $1
+		  AND company_id = $2
+		  AND is_active = false
+	`, departmentID, companyID).Scan(&deptName)
+
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("department not found or already active")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to fetch department: %w", err)
+	}
+
+	finalName := deptName
+
+	// Check name conflict
+	var exists bool
+	err = tx.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM departments
+			WHERE company_id = $1
+			  AND department_name = $2
+			  AND is_active = true
+		)
+	`, companyID, deptName).Scan(&exists)
+
+	if err != nil {
+		return fmt.Errorf("failed to check department name conflict: %w", err)
+	}
+
+	if exists {
+		finalName = fmt.Sprintf(
+			"%s_%d",
+			deptName,
+			time.Now().UnixNano()%1000,
+		)
+	}
+
+	// Activate department
+	_, err = tx.ExecContext(ctx, `
+		UPDATE departments
+		SET is_active = true,
+		    department_name = $3,
+		    updated_at = $4
+		WHERE department_id = $1
+		  AND company_id = $2
+	`, departmentID, companyID, finalName, time.Now().UTC())
+
+	if err != nil {
+		return fmt.Errorf("failed to activate department: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Info("Department activated",
+		util.String("department_id", departmentID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("final_name", finalName),
+	)
+
+	return nil
 }

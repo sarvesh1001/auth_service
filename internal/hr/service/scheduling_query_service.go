@@ -101,7 +101,27 @@ type SchedulingQueryService interface {
 	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error)
 	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error)
 	SearchScheduleInstances(ctx context.Context, filters ScheduleSearchFilters, page, pageSize int) ([]*scheduling.ScheduleInstance, int, error)
+	GetOffEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*scheduling.UserOffEntitlement, error)
+	GetOffEntitlementsByUser(ctx context.Context, userID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error)
+	GetOffEntitlementsByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error)
+	GetUserOffBalance(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
 
+	// Off Requests
+	GetOffRequestByID(ctx context.Context, requestID uuid.UUID) (*scheduling.OffRequest, error)
+	GetOffRequestsByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time, status *string) ([]*scheduling.OffRequest, error)
+	GetOffRequestsByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time, status *string) ([]*scheduling.OffRequest, error)
+	GetPendingOffRequests(ctx context.Context, companyID uuid.UUID) ([]*scheduling.OffRequest, error)
+
+	// Schedule Overrides
+	GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*scheduling.ScheduleOverride, error)
+	GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error)
+	GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error)
+	GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.ScheduleOverride, error)
+
+	// Combined Queries
+	GetUserTimeOffSummary(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
+	GetCompanyTimeOffStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
+	CheckDateAvailability(ctx context.Context, userID uuid.UUID, date time.Time) (map[string]interface{}, error)
 	// Analytics and Reporting
 	GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
 	GetScheduleCoverage(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
@@ -172,7 +192,6 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarsByCompany(
 
 	return calendars, nil
 }
-
 func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
 	ctx context.Context,
 	calendarID uuid.UUID,
@@ -180,19 +199,24 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
 ) ([]CalendarAvailability, error) {
 	startTime := time.Now()
 
-	// Get calendar
 	calendar, err := qs.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get work calendar: %w", err)
 	}
 
-	// Validate date range
+	// Enforce calendar year
+	if startDate.Year() != calendar.Year || endDate.Year() != calendar.Year {
+		return nil, fmt.Errorf(
+			"date range must be within calendar year %d",
+			calendar.Year,
+		)
+	}
+
 	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
 	if calendarDays > 365 {
 		return nil, fmt.Errorf("date range cannot exceed 365 days, got %d days", calendarDays)
 	}
 
-	// Convert holidays to map for quick lookup
 	holidayMap := make(map[string]scheduling.Holiday)
 	for _, holiday := range calendar.Holidays {
 		holidayMap[holiday.Date] = holiday
@@ -200,12 +224,10 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
 
 	var availability []CalendarAvailability
 
-	// Generate availability for each day
 	for currentDate := startDate; !currentDate.After(endDate); currentDate = currentDate.AddDate(0, 0, 1) {
 		dateStr := currentDate.Format("2006-01-02")
-
-		// Check if it's a working day
 		weekday := int(currentDate.Weekday())
+
 		isWorkingDay := false
 		for _, day := range calendar.WorkingDays {
 			if day == weekday {
@@ -214,7 +236,6 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
 			}
 		}
 
-		// Check if it's a holiday
 		holiday, isHoliday := holidayMap[dateStr]
 
 		availability = append(availability, CalendarAvailability{
@@ -227,11 +248,9 @@ func (qs *schedulingQueryServiceImpl) GetWorkCalendarAvailability(
 
 	qs.logger.Debug("Work calendar availability retrieved",
 		util.String("calendar_id", calendarID.String()),
-		util.Time("start_date", startDate),
-		util.Time("end_date", endDate),
-		util.Int("calendar_days", calendarDays),
-		util.Int("availability_days", len(availability)),
-		util.Duration("duration", time.Since(startTime)))
+		util.Int("year", calendar.Year),
+		util.Duration("duration", time.Since(startTime)),
+	)
 
 	return availability, nil
 }
@@ -788,4 +807,497 @@ func (qs *schedulingQueryServiceImpl) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("scheduling repository health check failed: %w", err)
 	}
 	return nil
+}
+
+// Off Entitlement Query Methods
+func (qs *schedulingQueryServiceImpl) GetOffEntitlementByID(
+	ctx context.Context,
+	entitlementID uuid.UUID,
+) (*scheduling.UserOffEntitlement, error) {
+	startTime := time.Now()
+
+	entitlement, err := qs.schedulingRepo.GetOffEntitlementByID(ctx, entitlementID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off entitlement: %w", err)
+	}
+
+	qs.logger.Debug("Off entitlement retrieved by ID",
+		util.String("entitlement_id", entitlementID.String()),
+		util.Duration("duration", time.Since(startTime)))
+
+	return entitlement, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetOffEntitlementsByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	activeOnly bool,
+) ([]*scheduling.UserOffEntitlement, error) {
+	startTime := time.Now()
+
+	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByUser(ctx, userID, activeOnly)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off entitlements by user: %w", err)
+	}
+
+	qs.logger.Debug("Off entitlements retrieved by user",
+		util.String("user_id", userID.String()),
+		util.Bool("active_only", activeOnly),
+		util.Int("entitlement_count", len(entitlements)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return entitlements, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetOffEntitlementsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	activeOnly bool,
+) ([]*scheduling.UserOffEntitlement, error) {
+	startTime := time.Now()
+
+	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByCompany(ctx, companyID, activeOnly)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off entitlements by company: %w", err)
+	}
+
+	qs.logger.Debug("Off entitlements retrieved by company",
+		util.String("company_id", companyID.String()),
+		util.Bool("active_only", activeOnly),
+		util.Int("entitlement_count", len(entitlements)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return entitlements, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetUserOffBalance(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) (map[string]interface{}, error) {
+	startTime := time.Now()
+
+	// Get current entitlement
+	entitlement, err := qs.schedulingRepo.GetCurrentOffEntitlement(ctx, userID, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current entitlement: %w", err)
+	}
+
+	// Get used days
+	var periodType string
+	if entitlement != nil {
+		periodType = entitlement.PeriodType
+	} else {
+		periodType = "monthly" // default
+	}
+
+	usedDays, err := qs.schedulingRepo.GetOffBalance(ctx, userID, periodType, startDate, endDate)
+	if err != nil {
+		usedDays = 0
+	}
+
+	result := map[string]interface{}{
+		"user_id":     userID,
+		"start_date":  startDate.Format("2006-01-02"),
+		"end_date":    endDate.Format("2006-01-02"),
+		"period_type": periodType,
+		"used_days":   usedDays,
+	}
+
+	if entitlement != nil {
+		result["entitlement"] = entitlement
+		result["total_days"] = entitlement.OffCount
+		result["remaining_days"] = entitlement.OffCount - usedDays
+		result["requires_approval"] = entitlement.RequiresApproval
+	}
+
+	qs.logger.Debug("User off balance retrieved",
+		util.String("user_id", userID.String()),
+		util.Int("used_days", usedDays),
+		util.Duration("duration", time.Since(startTime)))
+
+	return result, nil
+}
+
+// Off Request Query Methods
+func (qs *schedulingQueryServiceImpl) GetOffRequestByID(
+	ctx context.Context,
+	requestID uuid.UUID,
+) (*scheduling.OffRequest, error) {
+	startTime := time.Now()
+
+	request, err := qs.schedulingRepo.GetOffRequestByID(ctx, requestID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off request: %w", err)
+	}
+
+	qs.logger.Debug("Off request retrieved by ID",
+		util.String("request_id", requestID.String()),
+		util.Duration("duration", time.Since(startTime)))
+
+	return request, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetOffRequestsByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+	status *string,
+) ([]*scheduling.OffRequest, error) {
+	startTime := time.Now()
+
+	var startPtr, endPtr *time.Time
+	if !startDate.IsZero() && !endDate.IsZero() {
+		startPtr = &startDate
+		endPtr = &endDate
+	}
+
+	requests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, startPtr, endPtr, status)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off requests by user: %w", err)
+	}
+
+	qs.logger.Debug("Off requests retrieved by user",
+		util.String("user_id", userID.String()),
+		util.String("status", getStatusString(status)),
+		util.Int("request_count", len(requests)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return requests, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetOffRequestsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+	status *string,
+) ([]*scheduling.OffRequest, error) {
+	startTime := time.Now()
+
+	var startPtr, endPtr *time.Time
+	if !startDate.IsZero() && !endDate.IsZero() {
+		startPtr = &startDate
+		endPtr = &endDate
+	}
+
+	requests, err := qs.schedulingRepo.GetOffRequestsByCompany(ctx, companyID, startPtr, endPtr, status)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off requests by company: %w", err)
+	}
+
+	qs.logger.Debug("Off requests retrieved by company",
+		util.String("company_id", companyID.String()),
+		util.String("status", getStatusString(status)),
+		util.Int("request_count", len(requests)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return requests, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetPendingOffRequests(
+	ctx context.Context,
+	companyID uuid.UUID,
+) ([]*scheduling.OffRequest, error) {
+	startTime := time.Now()
+
+	status := "pending"
+	requests, err := qs.schedulingRepo.GetOffRequestsByCompany(ctx, companyID, nil, nil, &status)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pending off requests: %w", err)
+	}
+
+	qs.logger.Debug("Pending off requests retrieved",
+		util.String("company_id", companyID.String()),
+		util.Int("request_count", len(requests)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return requests, nil
+}
+
+// Schedule Override Query Methods
+func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByID(
+	ctx context.Context,
+	overrideID uuid.UUID,
+) (*scheduling.ScheduleOverride, error) {
+	startTime := time.Now()
+
+	override, err := qs.schedulingRepo.GetScheduleOverrideByID(ctx, overrideID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule override: %w", err)
+	}
+
+	qs.logger.Debug("Schedule override retrieved by ID",
+		util.String("override_id", overrideID.String()),
+		util.Duration("duration", time.Since(startTime)))
+
+	return override, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetScheduleOverridesByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+	overrideType *string,
+) ([]*scheduling.ScheduleOverride, error) {
+	startTime := time.Now()
+
+	var startPtr, endPtr *time.Time
+	if !startDate.IsZero() && !endDate.IsZero() {
+		startPtr = &startDate
+		endPtr = &endDate
+	}
+
+	overrides, err := qs.schedulingRepo.GetScheduleOverridesByUser(ctx, userID, startPtr, endPtr, overrideType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule overrides by user: %w", err)
+	}
+
+	qs.logger.Debug("Schedule overrides retrieved by user",
+		util.String("user_id", userID.String()),
+		util.String("override_type", getOverrideTypeString(overrideType)),
+		util.Int("override_count", len(overrides)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return overrides, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetScheduleOverridesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+	overrideType *string,
+) ([]*scheduling.ScheduleOverride, error) {
+	startTime := time.Now()
+
+	var startPtr, endPtr *time.Time
+	if !startDate.IsZero() && !endDate.IsZero() {
+		startPtr = &startDate
+		endPtr = &endDate
+	}
+
+	overrides, err := qs.schedulingRepo.GetScheduleOverridesByCompany(ctx, companyID, startPtr, endPtr, overrideType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule overrides by company: %w", err)
+	}
+
+	qs.logger.Debug("Schedule overrides retrieved by company",
+		util.String("company_id", companyID.String()),
+		util.String("override_type", getOverrideTypeString(overrideType)),
+		util.Int("override_count", len(overrides)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return overrides, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByUserDate(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+) (*scheduling.ScheduleOverride, error) {
+	startTime := time.Now()
+
+	override, err := qs.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule override by user date: %w", err)
+	}
+
+	qs.logger.Debug("Schedule override retrieved by user date",
+		util.String("user_id", userID.String()),
+		util.String("date", date.Format("2006-01-02")),
+		util.Duration("duration", time.Since(startTime)))
+
+	return override, nil
+}
+
+// Combined Query Methods
+func (qs *schedulingQueryServiceImpl) GetUserTimeOffSummary(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) (map[string]interface{}, error) {
+	startTime := time.Now()
+
+	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
+	if calendarDays > 90 {
+		return nil, fmt.Errorf("date range cannot exceed 90 days, got %d days", calendarDays)
+	}
+
+	// Get off entitlements
+	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByUser(ctx, userID, true)
+	if err != nil {
+		entitlements = []*scheduling.UserOffEntitlement{}
+	}
+
+	// Get off requests
+	statusApproved := "approved"
+	offRequests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, &startDate, &endDate, &statusApproved)
+	if err != nil {
+		offRequests = []*scheduling.OffRequest{}
+	}
+
+	// Get pending requests
+	statusPending := "pending"
+	pendingRequests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, &startDate, &endDate, &statusPending)
+	if err != nil {
+		pendingRequests = []*scheduling.OffRequest{}
+	}
+
+	// Get schedule overrides
+	overrides, err := qs.schedulingRepo.GetScheduleOverridesByUser(ctx, userID, &startDate, &endDate, nil)
+	if err != nil {
+		overrides = []*scheduling.ScheduleOverride{}
+	}
+
+	// Calculate used days
+	usedDays := 0
+	for _, req := range offRequests {
+		usedDays += len(req.RequestDates)
+	}
+
+	// Get total entitlement
+	totalEntitlement := 0
+	if len(entitlements) > 0 {
+		totalEntitlement = entitlements[0].OffCount
+	}
+
+	summary := map[string]interface{}{
+		"user_id":            userID,
+		"start_date":         startDate.Format("2006-01-02"),
+		"end_date":           endDate.Format("2006-01-02"),
+		"entitlements":       entitlements,
+		"off_requests":       offRequests,
+		"pending_requests":   pendingRequests,
+		"schedule_overrides": overrides,
+		"total_entitlement":  totalEntitlement,
+		"used_days":          usedDays,
+		"remaining_days":     totalEntitlement - usedDays,
+	}
+
+	qs.logger.Debug("User time off summary retrieved",
+		util.String("user_id", userID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("entitlement_count", len(entitlements)),
+		util.Int("off_request_count", len(offRequests)),
+		util.Int("pending_request_count", len(pendingRequests)),
+		util.Int("override_count", len(overrides)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return summary, nil
+}
+
+func (qs *schedulingQueryServiceImpl) GetCompanyTimeOffStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+) (map[string]interface{}, error) {
+	startTime := time.Now()
+
+	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
+	if calendarDays > 31 {
+		return nil, fmt.Errorf("date range cannot exceed 31 days for stats, got %d days", calendarDays)
+	}
+
+	// Get utilization stats
+	stats, err := qs.schedulingRepo.GetOffUtilizationStats(ctx, companyID, startDate, endDate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get off utilization stats: %w", err)
+	}
+
+	// Get pending requests count
+	pendingRequests, err := qs.GetPendingOffRequests(ctx, companyID)
+	if err == nil {
+		stats["pending_requests_count"] = len(pendingRequests)
+	}
+
+	// Get entitlements
+	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByCompany(ctx, companyID, true)
+	if err == nil {
+		stats["active_entitlements"] = len(entitlements)
+	}
+
+	qs.logger.Debug("Company time off stats retrieved",
+		util.String("company_id", companyID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("calendar_days", calendarDays),
+		util.Duration("duration", time.Since(startTime)))
+
+	return stats, nil
+}
+
+func (qs *schedulingQueryServiceImpl) CheckDateAvailability(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+) (map[string]interface{}, error) {
+	startTime := time.Now()
+
+	result := map[string]interface{}{
+		"user_id":   userID,
+		"date":      date.Format("2006-01-02"),
+		"available": true,
+		"reasons":   []string{},
+	}
+
+	// Check schedule override
+	override, err := qs.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
+	if err == nil && override != nil {
+		result["available"] = false
+		result["schedule_override"] = override
+		reasons := result["reasons"].([]string)
+		reasons = append(reasons, fmt.Sprintf("Schedule override: %s", override.OverrideType))
+		result["reasons"] = reasons
+
+		if override.OverrideType == "force_work" {
+			result["available"] = true // Force work means they're available
+			result["forced_work"] = true
+		}
+	}
+
+	// Check off requests
+	statusApproved := "approved"
+	offRequests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, &date, &date, &statusApproved)
+	if err == nil && len(offRequests) > 0 {
+		result["available"] = false
+		result["off_request"] = offRequests[0]
+		reasons := result["reasons"].([]string)
+		reasons = append(reasons, "Approved off request")
+		result["reasons"] = reasons
+	}
+
+	// Check schedule instance
+	instance, err := qs.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, date)
+	if err == nil && instance != nil {
+		result["schedule_instance"] = instance
+		if instance.ExpectedStart != nil && instance.ExpectedEnd != nil {
+			result["scheduled_hours"] = map[string]interface{}{
+				"start": instance.ExpectedStart.Format("15:04"),
+				"end":   instance.ExpectedEnd.Format("15:04"),
+			}
+		}
+	}
+
+	qs.logger.Debug("Date availability checked",
+		util.String("user_id", userID.String()),
+		util.String("date", date.Format("2006-01-02")),
+		util.Bool("available", result["available"].(bool)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return result, nil
+}
+
+// Helper functions
+func getStatusString(status *string) string {
+	if status != nil {
+		return *status
+	}
+	return "all"
+}
+
+func getOverrideTypeString(overrideType *string) string {
+	if overrideType != nil {
+		return *overrideType
+	}
+	return "all"
 }

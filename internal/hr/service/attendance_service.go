@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,53 +18,52 @@ import (
 // ============================================================================
 // CONSTANTS AND TYPES
 // ============================================================================
-
-// EventType constants
+// EventType constants (DB aligned)
 const (
-	EventCheckIn         = "CHECK_IN"
-	EventCheckOut        = "CHECK_OUT"
-	EventBreakStart      = "BREAK_START"
-	EventBreakEnd        = "BREAK_END"
-	EventOvertimeIn      = "OVERTIME_IN"
-	EventOvertimeOut     = "OVERTIME_OUT"
-	EventLeave           = "LEAVE"
-	EventSafetyViolation = "SAFETY_VIOLATION"
-	EventAbsent          = "ABSENT"
-	EventHalfDay         = "HALF_DAY"
-	EventPresent         = "PRESENT"
-	EventClassIn         = "CLASS_IN"
-	EventClassOut        = "CLASS_OUT"
+	EventCheckIn         = "check_in"
+	EventCheckOut        = "check_out"
+	EventBreakStart      = "break_start"
+	EventBreakEnd        = "break_end"
+	EventOvertimeIn      = "overtime_in"
+	EventOvertimeOut     = "overtime_out"
+	EventLeave           = "leave"
+	EventSafetyViolation = "safety_violation"
+	EventAbsent          = "absent"
+	EventHalfDay         = "half_day"
+	EventPresent         = "present"
+	EventClassIn         = "class_in"
+	EventClassOut        = "class_out"
 )
 
-// AttendanceSource constants
+// AttendanceSource constants (DB aligned)
 const (
-	SourceWeb        = "WEB"
-	SourceMobile     = "MOBILE"
-	SourceSAP        = "SAP"
-	SourceFactoryIoT = "FACTORY_IOT"
-	SourceBiometric  = "BIOMETRIC"
-	SourceManual     = "MANUAL"
-	SourceRFID       = "RFID"
+	SourceWeb        = "web"
+	SourceMobile     = "mobile"
+	SourceSAP        = "sap"
+	SourceFactoryIoT = "factory_iot"
+	SourceBiometric  = "biometric"
+	SourceManual     = "manual"
+	SourceRFID       = "rfid"
 )
 
-// Status constants
+// Status constants (DB aligned)
 const (
-	StatusPresent  = "PRESENT"
-	StatusAbsent   = "ABSENT"
-	StatusHalfDay  = "HALF_DAY"
-	StatusLeave    = "LEAVE"
-	StatusLate     = "LATE"
-	StatusOvertime = "OVERTIME"
+	StatusPresent  = "present"
+	StatusAbsent   = "absent"
+	StatusHalfDay  = "half_day"
+	StatusLeave    = "leave"
+	StatusLate     = "late"
+	StatusOvertime = "overtime"
 )
 
-// Safety Zones that require helmets
+// Safety Zones that require helmets (DB / IoT aligned)
 var HelmetRequiredZones = map[string]bool{
-	"PRODUCTION_LINE": true,
-	"WAREHOUSE":       true,
-	"MAINTENANCE":     true,
-	"CONSTRUCTION":    true,
-	"FOUNDRY":         true,
-	"ASSEMBLY":        true,
+	"production_line": true,
+	"warehouse":       true,
+	"maintenance":     true,
+	"construction":    true,
+	"foundry":         true,
+	"assembly":        true,
 }
 
 // ============================================================================
@@ -145,7 +144,52 @@ type AttendanceService interface {
 	GetSAPBusinessRules(ctx context.Context, companyID uuid.UUID) (*attendance.SAPBusinessRules, error)
 	UpdateSAPBusinessRules(ctx context.Context, companyID uuid.UUID, rules *attendance.SAPBusinessRules, updatedBy uuid.UUID) error
 
+	// Event Type Management
+	GetAttendanceEventType(ctx context.Context, eventType string) (*attendance.AttendanceEventType, error)
+	ListAttendanceEventTypes(ctx context.Context, activeOnly bool) ([]*attendance.AttendanceEventType, error)
+
+	// Source Type Management
+	GetAttendanceSourceType(ctx context.Context, sourceType string) (*attendance.AttendanceSourceType, error)
+	ListAttendanceSourceTypes(ctx context.Context) ([]*attendance.AttendanceSourceType, error)
+
+	// Company Rules Management
+	GetCompanyAttendanceRules(ctx context.Context, companyID uuid.UUID) (*attendance.CompanyAttendanceRules, error)
+	UpdateCompanyAttendanceRules(ctx context.Context, rules *attendance.CompanyAttendanceRules, updatedBy uuid.UUID) error
+
+	// Department Rules Management
+	GetDepartmentAttendanceRules(ctx context.Context, companyID, departmentID uuid.UUID) (*attendance.DepartmentAttendanceRules, error)
+
+	// User Profile Management
+	GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*attendance.UserAttendanceProfile, error)
+
+	// Rule Resolution & Validation
+	ResolveAttendanceRules(ctx context.Context, userID, companyID, departmentID uuid.UUID) (*attendance.ResolvedAttendanceRules, error)
+	ValidateAttendanceEventType(ctx context.Context, eventType string) error
+	// 🔴 UPDATED: sourceID added (IMPORTANT)
+	ValidateAttendanceSourceType(
+		ctx context.Context,
+		sourceType string,
+		sourceID *uuid.UUID,
+	) error
+	ValidateEventAgainstRules(ctx context.Context, event *attendance.AttendanceEvent, rules *attendance.ResolvedAttendanceRules) error
 	// Health Check
+	CompleteSAPAttendanceFlow(
+		ctx context.Context,
+		sapEvent *SAPAttendanceEvent,
+		companyID uuid.UUID,
+	) error
+	// Department Rules Management
+	UpsertDepartmentAttendanceRules(
+		ctx context.Context,
+		rules *attendance.DepartmentAttendanceRules,
+	) error
+
+	// User Profile Management
+	UpsertUserAttendanceProfile(
+		ctx context.Context,
+		profile *attendance.UserAttendanceProfile,
+	) error
+
 	HealthCheck(ctx context.Context) error
 }
 
@@ -156,7 +200,6 @@ type AttendanceService interface {
 type attendanceServiceImpl struct {
 	attendanceRepo repository.AttendanceRepository
 	logger         *zap.Logger
-	mu             sync.RWMutex
 }
 
 // NewAttendanceService creates a new attendance service
@@ -173,7 +216,6 @@ func NewAttendanceService(
 // ============================================================================
 // EVENT MANAGEMENT
 // ============================================================================
-
 func (s *attendanceServiceImpl) CreateAttendanceEvent(
 	ctx context.Context,
 	event *attendance.AttendanceEvent,
@@ -183,42 +225,20 @@ func (s *attendanceServiceImpl) CreateAttendanceEvent(
 ) (*attendance.AttendanceEvent, error) {
 	startTime := time.Now()
 
-	// Validate required fields
-	if err := s.validateAttendanceEvent(event); err != nil {
+	// 🔴 Prepare + validate (DB-driven)
+	if err := s.prepareAttendanceEvent(ctx, event); err != nil {
 		return nil, fmt.Errorf("attendance event validation failed: %w", err)
 	}
 
-	// Generate event ID if not provided
-	if event.AttendanceEventID == uuid.Nil {
-		event.AttendanceEventID = uuid.New()
-	}
-
-	// Set timestamps
-	now := time.Now().UTC()
-	if event.CreatedAt.IsZero() {
-		event.CreatedAt = now
-	}
-	if event.EventTime.IsZero() {
-		event.EventTime = now
-	}
-
-	// Apply business rules
+	// Apply attendance rules
 	if err := s.applyAttendanceRules(ctx, event); err != nil {
 		return nil, fmt.Errorf("attendance rules validation failed: %w", err)
 	}
 
-	// Check for duplicate event by external ID (if provided)
-	if metadata != nil {
-		if externalID, ok := metadata["external_event_id"].(string); ok && externalID != "" {
-			s.logger.Debug("Processing event with external ID",
-				util.String("external_id", externalID))
-		}
-	}
-
-	// Create event in repository
-	err := s.attendanceRepo.CreateAttendanceEvent(ctx, event)
-	if err != nil {
+	// Persist event
+	if err := s.persistAttendanceEvent(ctx, event); err != nil {
 		s.logger.Error("Failed to create attendance event",
+			util.String("event_id", event.AttendanceEventID.String()),
 			util.String("user_id", event.UserID.String()),
 			util.String("company_id", event.CompanyID.String()),
 			util.ErrorField(err))
@@ -256,7 +276,7 @@ func (s *attendanceServiceImpl) CreateBulkAttendanceEvents(
 	// Apply all business rules before batch insert
 	for i, event := range events {
 		// Validate each event
-		if err := s.validateAttendanceEvent(event); err != nil {
+		if err := s.validateAttendanceEvent(ctx, event); err != nil {
 			return fmt.Errorf("event %d validation failed: %w", i, err)
 		}
 
@@ -467,22 +487,29 @@ func (s *attendanceServiceImpl) SyncFactoryAttendance(
 		}
 
 		// Create violation event (async or fire-and-forget)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Create violation event (async, SAFE context propagation)
+		go func(parentCtx context.Context) {
+			ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 			defer cancel()
 
-			if _, err := s.CreateAttendanceEvent(ctx, violationEvent, "system", uuid.Nil, map[string]interface{}{
-				"mask_detected":     factoryData.MaskDetected,
-				"helmet_detected":   factoryData.HelmetDetected,
-				"temperature":       factoryData.Temperature,
-				"gate_number":       factoryData.GateNumber,
-				"external_event_id": factoryData.ExternalEventID + "_violation",
-			}); err != nil {
+			if _, err := s.CreateAttendanceEvent(
+				ctx,
+				violationEvent,
+				"system",
+				uuid.Nil,
+				map[string]interface{}{
+					"mask_detected":     factoryData.MaskDetected,
+					"helmet_detected":   factoryData.HelmetDetected,
+					"temperature":       factoryData.Temperature,
+					"gate_number":       factoryData.GateNumber,
+					"external_event_id": factoryData.ExternalEventID + "_violation",
+				},
+			); err != nil {
 				s.logger.Error("Failed to create safety violation event",
 					util.String("rfid", factoryData.EmployeeRFID),
 					util.ErrorField(err))
 			}
-		}()
+		}(ctx)
 
 		// Continue with attendance processing despite violations
 	}
@@ -1406,8 +1433,14 @@ func (s *attendanceServiceImpl) addSAPMetadata(
 // ============================================================================
 // HELPER METHODS
 // ============================================================================
+func (s *attendanceServiceImpl) validateAttendanceEvent(
+	ctx context.Context,
+	event *attendance.AttendanceEvent,
+) error {
+	if event == nil {
+		return fmt.Errorf("attendance event cannot be nil")
+	}
 
-func (s *attendanceServiceImpl) validateAttendanceEvent(event *attendance.AttendanceEvent) error {
 	if event.UserID == uuid.Nil {
 		return fmt.Errorf("user ID is required")
 	}
@@ -1421,25 +1454,13 @@ func (s *attendanceServiceImpl) validateAttendanceEvent(event *attendance.Attend
 		return fmt.Errorf("source type is required")
 	}
 
-	// Validate event type
-	validEventTypes := map[string]bool{
-		EventCheckIn:         true,
-		EventCheckOut:        true,
-		EventBreakStart:      true,
-		EventBreakEnd:        true,
-		EventOvertimeIn:      true,
-		EventOvertimeOut:     true,
-		EventLeave:           true,
-		EventSafetyViolation: true,
-		EventAbsent:          true,
-		EventHalfDay:         true,
-		EventPresent:         true,
-		EventClassIn:         true,
-		EventClassOut:        true,
+	// 🔴 DB is the single source of truth
+	if err := s.ValidateAttendanceEventType(ctx, event.EventType); err != nil {
+		return fmt.Errorf("invalid event type: %w", err)
 	}
 
-	if !validEventTypes[event.EventType] {
-		return fmt.Errorf("invalid event type: %s", event.EventType)
+	if err := s.ValidateAttendanceSourceType(ctx, event.SourceType, event.SourceID); err != nil {
+		return fmt.Errorf("invalid source type: %w", err)
 	}
 
 	return nil
@@ -1825,4 +1846,915 @@ func boolPtr(b bool) *bool {
 // Helper function to convert interface to JSON bytes
 func toJSONBytes(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
+}
+
+// ============================================================================
+// ATTENDANCE EVENT TYPE METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) GetAttendanceEventType(
+	ctx context.Context,
+	eventType string,
+) (*attendance.AttendanceEventType, error) {
+	startTime := time.Now()
+
+	if eventType == "" {
+		return nil, fmt.Errorf("event type cannot be empty")
+	}
+
+	s.logger.Debug("Getting attendance event type",
+		util.String("event_type", eventType))
+
+	// Use the repository method
+	eventTypeObj, err := s.attendanceRepo.GetAttendanceEventType(ctx, eventType)
+	if err != nil {
+		s.logger.Error("Failed to get attendance event type",
+			util.String("event_type", eventType),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance event type: %w", err)
+	}
+
+	// Check if the event type is active
+	if !eventTypeObj.IsActive {
+		s.logger.Warn("Attendance event type is inactive",
+			util.String("event_type", eventType))
+		return eventTypeObj, nil // Still return it, but log warning
+	}
+
+	s.logger.Debug("Attendance event type retrieved",
+		util.String("event_type", eventType),
+		util.String("category", eventTypeObj.Category),
+		util.Duration("duration", time.Since(startTime)))
+
+	return eventTypeObj, nil
+}
+
+func (s *attendanceServiceImpl) ListAttendanceEventTypes(
+	ctx context.Context,
+	activeOnly bool,
+) ([]*attendance.AttendanceEventType, error) {
+	startTime := time.Now()
+
+	s.logger.Debug("Listing attendance event types",
+		util.Bool("active_only", activeOnly))
+
+	eventTypes, err := s.attendanceRepo.ListAttendanceEventTypes(ctx, activeOnly)
+	if err != nil {
+		s.logger.Error("Failed to list attendance event types",
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to list attendance event types: %w", err)
+	}
+
+	// Group by category for easier consumption
+	if len(eventTypes) > 0 {
+		categories := make(map[string]int)
+		for _, et := range eventTypes {
+			categories[et.Category]++
+		}
+
+		s.logger.Debug("Attendance event types listed",
+			util.Int("total_count", len(eventTypes)),
+			util.Int("category_count", len(categories)),
+			util.Duration("duration", time.Since(startTime)))
+	}
+
+	return eventTypes, nil
+}
+
+// ============================================================================
+// ATTENDANCE SOURCE TYPE METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) GetAttendanceSourceType(
+	ctx context.Context,
+	sourceType string,
+) (*attendance.AttendanceSourceType, error) {
+	startTime := time.Now()
+
+	if sourceType == "" {
+		return nil, fmt.Errorf("source type cannot be empty")
+	}
+
+	s.logger.Debug("Getting attendance source type",
+		util.String("source_type", sourceType))
+
+	sourceTypeObj, err := s.attendanceRepo.GetAttendanceSourceType(ctx, sourceType)
+	if err != nil {
+		s.logger.Error("Failed to get attendance source type",
+			util.String("source_type", sourceType),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance source type: %w", err)
+	}
+
+	s.logger.Debug("Attendance source type retrieved",
+		util.String("source_type", sourceType),
+		util.Bool("requires_reference", sourceTypeObj.RequiresReference),
+		util.Duration("duration", time.Since(startTime)))
+
+	return sourceTypeObj, nil
+}
+
+func (s *attendanceServiceImpl) ListAttendanceSourceTypes(
+	ctx context.Context,
+) ([]*attendance.AttendanceSourceType, error) {
+	startTime := time.Now()
+
+	s.logger.Debug("Listing attendance source types")
+
+	sourceTypes, err := s.attendanceRepo.ListAttendanceSourceTypes(ctx)
+	if err != nil {
+		s.logger.Error("Failed to list attendance source types",
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to list attendance source types: %w", err)
+	}
+
+	s.logger.Debug("Attendance source types listed",
+		util.Int("count", len(sourceTypes)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return sourceTypes, nil
+}
+
+// ============================================================================
+// COMPANY ATTENDANCE RULES METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) GetCompanyAttendanceRules(
+	ctx context.Context,
+	companyID uuid.UUID,
+) (*attendance.CompanyAttendanceRules, error) {
+	startTime := time.Now()
+
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID cannot be empty")
+	}
+
+	s.logger.Debug("Getting company attendance rules",
+		util.String("company_id", companyID.String()))
+
+	rules, err := s.attendanceRepo.GetCompanyAttendanceRules(ctx, companyID)
+	if err != nil {
+		s.logger.Error("Failed to get company attendance rules",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get company attendance rules: %w", err)
+	}
+
+	// Apply business logic transformations
+	s.enrichCompanyRules(rules)
+
+	s.logger.Debug("Company attendance rules retrieved",
+		util.String("company_id", companyID.String()),
+		util.Int("allowed_sources", len(rules.AllowedSourceTypes)),
+		util.Bool("allow_multiple_checkins", rules.AllowMultipleCheckins),
+		util.String("timezone", rules.Timezone),
+		util.Duration("duration", time.Since(startTime)))
+
+	return rules, nil
+}
+
+func (s *attendanceServiceImpl) UpdateCompanyAttendanceRules(
+	ctx context.Context,
+	rules *attendance.CompanyAttendanceRules,
+	updatedBy uuid.UUID,
+) error {
+	startTime := time.Now()
+
+	if err := s.validateCompanyRules(rules); err != nil {
+		return fmt.Errorf("company rules validation failed: %w", err)
+	}
+
+	s.logger.Info("Updating company attendance rules",
+		util.String("company_id", rules.CompanyID.String()),
+		util.String("updated_by", updatedBy.String()),
+		util.Int("allowed_sources", len(rules.AllowedSourceTypes)))
+
+	// Validate each source type exists
+	for _, sourceType := range rules.AllowedSourceTypes {
+		if _, err := s.GetAttendanceSourceType(ctx, sourceType); err != nil {
+			return fmt.Errorf("invalid source type '%s': %w", sourceType, err)
+		}
+	}
+
+	// Use repository to upsert
+	if err := s.attendanceRepo.UpsertCompanyAttendanceRules(ctx, rules); err != nil {
+		s.logger.Error("Failed to update company attendance rules",
+			util.String("company_id", rules.CompanyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to update company attendance rules: %w", err)
+	}
+
+	// Create audit log entry
+	metadata := map[string]interface{}{
+		"updated_by":              updatedBy,
+		"allowed_sources":         rules.AllowedSourceTypes,
+		"timezone":                rules.Timezone,
+		"allow_multiple_checkins": rules.AllowMultipleCheckins,
+	}
+
+	// You might want to add audit logging here
+	s.logAuditEvent(ctx, "company_rules_updated", rules.CompanyID, updatedBy, metadata)
+
+	s.logger.Info("Company attendance rules updated successfully",
+		util.String("company_id", rules.CompanyID.String()),
+		util.Duration("duration", time.Since(startTime)))
+
+	return nil
+}
+
+// ============================================================================
+// DEPARTMENT ATTENDANCE RULES METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) GetDepartmentAttendanceRules(
+	ctx context.Context,
+	companyID, departmentID uuid.UUID,
+) (*attendance.DepartmentAttendanceRules, error) {
+	startTime := time.Now()
+
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID cannot be empty")
+	}
+	if departmentID == uuid.Nil {
+		return nil, fmt.Errorf("department ID cannot be empty")
+	}
+
+	s.logger.Debug("Getting department attendance rules",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()))
+
+	rules, err := s.attendanceRepo.GetDepartmentAttendanceRules(ctx, companyID, departmentID)
+	if err != nil {
+		s.logger.Error("Failed to get department attendance rules",
+			util.String("company_id", companyID.String()),
+			util.String("department_id", departmentID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get department attendance rules: %w", err)
+	}
+
+	// If no department-specific rules, return nil (caller should check)
+	if rules == nil {
+		s.logger.Debug("No department-specific attendance rules found",
+			util.String("department_id", departmentID.String()))
+		return nil, nil
+	}
+
+	// Validate that all event types and source types exist
+	if err := s.validateDepartmentRules(ctx, rules); err != nil {
+		s.logger.Warn("Department rules validation warnings",
+			util.String("rule_id", rules.RuleID.String()),
+			util.ErrorField(err))
+		// Continue despite validation warnings
+	}
+
+	s.logger.Debug("Department attendance rules retrieved",
+		util.String("rule_id", rules.RuleID.String()),
+		util.Int("allowed_sources", len(rules.AllowedSourceTypes)),
+		util.Int("allowed_events", len(rules.AllowedEventTypes)),
+		util.Bool("require_location", rules.RequireLocation),
+		util.Bool("require_device", rules.RequireDevice),
+		util.Duration("duration", time.Since(startTime)))
+
+	return rules, nil
+}
+
+// ============================================================================
+// USER ATTENDANCE PROFILE METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) GetUserAttendanceProfile(
+	ctx context.Context,
+	userID uuid.UUID,
+) (*attendance.UserAttendanceProfile, error) {
+	startTime := time.Now()
+
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("user ID cannot be empty")
+	}
+
+	s.logger.Debug("Getting user attendance profile",
+		util.String("user_id", userID.String()))
+
+	profile, err := s.attendanceRepo.GetUserAttendanceProfile(ctx, userID)
+	if err != nil {
+		s.logger.Error("Failed to get user attendance profile",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get user attendance profile: %w", err)
+	}
+
+	// If no user-specific profile, return nil (caller should check)
+	if profile == nil {
+		s.logger.Debug("No user-specific attendance profile found",
+			util.String("user_id", userID.String()))
+		return nil, nil
+	}
+
+	s.logger.Debug("User attendance profile retrieved",
+		util.String("user_id", userID.String()),
+		util.String("company_id", profile.CompanyID.String()),
+		util.Int("override_sources", len(profile.OverrideSourceTypes)),
+		util.Int("override_events", len(profile.OverrideEventTypes)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return profile, nil
+}
+
+// ============================================================================
+// RULE RESOLUTION METHOD
+// ============================================================================
+
+func (s *attendanceServiceImpl) ResolveAttendanceRules(
+	ctx context.Context,
+	userID, companyID, departmentID uuid.UUID,
+) (*attendance.ResolvedAttendanceRules, error) {
+	startTime := time.Now()
+
+	s.logger.Debug("Resolving attendance rules hierarchy",
+		util.String("user_id", userID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()))
+
+	// Get company rules (always exists, defaults if not configured)
+	companyRules, err := s.GetCompanyAttendanceRules(ctx, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get company rules: %w", err)
+	}
+
+	// Get department rules (optional)
+	var deptRules *attendance.DepartmentAttendanceRules
+	if departmentID != uuid.Nil {
+		deptRules, err = s.GetDepartmentAttendanceRules(ctx, companyID, departmentID)
+		if err != nil {
+			s.logger.Warn("Failed to get department rules, using company defaults",
+				util.String("department_id", departmentID.String()),
+				util.ErrorField(err))
+			// Continue without department rules
+		}
+	}
+
+	// Get user profile (optional)
+	userProfile, err := s.GetUserAttendanceProfile(ctx, userID)
+	if err != nil {
+		s.logger.Warn("Failed to get user profile, using department/company rules",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		// Continue without user profile
+	}
+
+	// Resolve hierarchy (User → Department → Company)
+	resolvedRules := s.resolveRulesHierarchy(companyRules, deptRules, userProfile)
+
+	// Apply business logic to final resolved rules
+	s.enrichResolvedRules(resolvedRules)
+
+	s.logger.Debug("Attendance rules resolved",
+		util.String("user_id", userID.String()),
+		util.Int("final_allowed_sources", len(resolvedRules.AllowedSourceTypes)),
+		util.Int("final_allowed_events", len(resolvedRules.AllowedEventTypes)),
+		util.String("timezone", resolvedRules.Timezone),
+		util.Duration("duration", time.Since(startTime)))
+
+	return resolvedRules, nil
+}
+
+// ============================================================================
+// VALIDATION METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) ValidateAttendanceEventType(
+	ctx context.Context,
+	eventType string,
+) error {
+	startTime := time.Now()
+
+	if eventType == "" {
+		return fmt.Errorf("event type cannot be empty")
+	}
+
+	s.logger.Debug("Validating attendance event type",
+		util.String("event_type", eventType))
+
+	// Get the event type from database
+	eventTypeObj, err := s.GetAttendanceEventType(ctx, eventType)
+	if err != nil {
+		return fmt.Errorf("invalid event type '%s': %w", eventType, err)
+	}
+
+	// Check if event type is active
+	if !eventTypeObj.IsActive {
+		return fmt.Errorf("event type '%s' is not active", eventType)
+	}
+
+	// Check if event type can be triggered by user (if applicable)
+	// This might depend on business logic
+
+	s.logger.Debug("Attendance event type validation passed",
+		util.String("event_type", eventType),
+		util.String("category", eventTypeObj.Category),
+		util.Duration("duration", time.Since(startTime)))
+
+	return nil
+}
+
+func (s *attendanceServiceImpl) ValidateAttendanceSourceType(
+	ctx context.Context,
+	sourceType string,
+	sourceID *uuid.UUID,
+) error {
+	startTime := time.Now()
+
+	if sourceType == "" {
+		return fmt.Errorf("source type cannot be empty")
+	}
+
+	s.logger.Debug("Validating attendance source type",
+		util.String("source_type", sourceType))
+
+	sourceTypeObj, err := s.GetAttendanceSourceType(ctx, sourceType)
+	if err != nil {
+		return fmt.Errorf("invalid source type '%s': %w", sourceType, err)
+	}
+
+	// 🔴 IMPORTANT PART
+	if sourceTypeObj.RequiresReference && sourceID == nil {
+		return fmt.Errorf("source type '%s' requires source_id", sourceType)
+	}
+
+	s.logger.Debug("Attendance source type validation passed",
+		util.String("source_type", sourceType),
+		util.Bool("requires_reference", sourceTypeObj.RequiresReference),
+		util.Duration("duration", time.Since(startTime)))
+
+	return nil
+}
+
+func (s *attendanceServiceImpl) ValidateEventAgainstRules(
+	ctx context.Context,
+	event *attendance.AttendanceEvent,
+	rules *attendance.ResolvedAttendanceRules,
+) error {
+	startTime := time.Now()
+
+	if event == nil {
+		return fmt.Errorf("event cannot be nil")
+	}
+	if rules == nil {
+		return fmt.Errorf("rules cannot be nil")
+	}
+
+	s.logger.Debug("Validating event against rules",
+		util.String("event_id", event.AttendanceEventID.String()),
+		util.String("user_id", event.UserID.String()),
+		util.String("event_type", event.EventType),
+		util.String("source_type", event.SourceType))
+
+	var validationErrors []string
+
+	// 1. Validate source type is allowed
+	if !rules.AllowedSourceTypesMap[event.SourceType] {
+		validationErrors = append(validationErrors,
+			fmt.Sprintf("source type '%s' not allowed", event.SourceType))
+	}
+
+	// 2. Validate event type is allowed (if specific event types are restricted)
+	if !rules.AllowAllEventTypes && !rules.AllowedEventTypesMap[event.EventType] {
+		validationErrors = append(validationErrors,
+			fmt.Sprintf("event type '%s' not allowed", event.EventType))
+	}
+
+	// 3. Validate location requirement
+	if rules.RequireLocation && event.Metadata.LocationID == nil {
+		validationErrors = append(validationErrors,
+			"location is required but not provided")
+	}
+
+	// 4. Validate device requirement
+	if rules.RequireDevice && event.DeviceID == nil {
+		validationErrors = append(validationErrors,
+			"device ID is required but not provided")
+	}
+
+	// 5. Validate multiple check-ins
+	if !rules.AllowMultipleCheckins && event.EventType == "check_in" {
+		// Check if user already has a check-in today
+		// This would require additional database check
+		s.logger.Debug("Multiple check-in validation would be performed here")
+	}
+
+	// 6. Validate source-specific requirements
+	if err := s.validateSourceSpecificRequirements(ctx, event, rules); err != nil {
+		validationErrors = append(validationErrors, err.Error())
+	}
+
+	// If any validation errors, return them
+	if len(validationErrors) > 0 {
+		errorMsg := "event validation failed: " + strings.Join(validationErrors, "; ")
+		s.logger.Error("Event validation failed",
+			util.String("event_id", event.AttendanceEventID.String()),
+			util.Strings("errors", validationErrors))
+		return fmt.Errorf(errorMsg)
+	}
+
+	s.logger.Debug("Event validation passed",
+		util.String("event_id", event.AttendanceEventID.String()),
+		util.Duration("duration", time.Since(startTime)))
+
+	return nil
+}
+
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) enrichCompanyRules(rules *attendance.CompanyAttendanceRules) {
+	// Ensure at least basic sources are allowed
+	if len(rules.AllowedSourceTypes) == 0 {
+		rules.AllowedSourceTypes = []string{"mobile", "web", "system"}
+		s.logger.Debug("Enriched company rules with default sources")
+	}
+
+	// Ensure timezone is valid
+	if rules.Timezone == "" {
+		rules.Timezone = "UTC"
+	}
+}
+
+func (s *attendanceServiceImpl) validateCompanyRules(rules *attendance.CompanyAttendanceRules) error {
+	if rules.CompanyID == uuid.Nil {
+		return fmt.Errorf("company ID is required")
+	}
+
+	if len(rules.AllowedSourceTypes) == 0 {
+		return fmt.Errorf("at least one source type must be allowed")
+	}
+
+	// Validate timezone
+	if _, err := time.LoadLocation(rules.Timezone); err != nil {
+		return fmt.Errorf("invalid timezone '%s': %w", rules.Timezone, err)
+	}
+
+	return nil
+}
+
+func (s *attendanceServiceImpl) validateDepartmentRules(
+	ctx context.Context,
+	rules *attendance.DepartmentAttendanceRules,
+) error {
+	var warnings []string
+
+	// Validate source types exist
+	for _, sourceType := range rules.AllowedSourceTypes {
+		if _, err := s.GetAttendanceSourceType(ctx, sourceType); err != nil {
+			warnings = append(warnings, fmt.Sprintf("source type '%s' does not exist", sourceType))
+		}
+	}
+
+	// Validate event types exist
+	for _, eventType := range rules.AllowedEventTypes {
+		if _, err := s.GetAttendanceEventType(ctx, eventType); err != nil {
+			warnings = append(warnings, fmt.Sprintf("event type '%s' does not exist", eventType))
+		}
+	}
+
+	if len(warnings) > 0 {
+		return fmt.Errorf(strings.Join(warnings, "; "))
+	}
+
+	return nil
+}
+
+func (s *attendanceServiceImpl) resolveRulesHierarchy(
+	companyRules *attendance.CompanyAttendanceRules,
+	deptRules *attendance.DepartmentAttendanceRules,
+	userProfile *attendance.UserAttendanceProfile,
+) *attendance.ResolvedAttendanceRules {
+	resolved := &attendance.ResolvedAttendanceRules{
+		Timezone:              companyRules.Timezone,
+		AllowMultipleCheckins: companyRules.AllowMultipleCheckins,
+		// Start with company rules
+		AllowedSourceTypes: companyRules.AllowedSourceTypes,
+		AllowedEventTypes:  []string{}, // Empty means all event types allowed
+		RequireLocation:    false,
+		RequireDevice:      false,
+	}
+
+	// Apply department rules (if they exist)
+	if deptRules != nil {
+		// Department can override source types (must be subset of company allowed)
+		if len(deptRules.AllowedSourceTypes) > 0 {
+			// Intersection of company and department allowed sources
+			resolved.AllowedSourceTypes = intersect(
+				resolved.AllowedSourceTypes,
+				deptRules.AllowedSourceTypes)
+		}
+
+		// Department can restrict event types
+		if len(deptRules.AllowedEventTypes) > 0 {
+			resolved.AllowedEventTypes = deptRules.AllowedEventTypes
+		}
+
+		// Department can add requirements
+		if deptRules.RequireLocation {
+			resolved.RequireLocation = true
+		}
+		if deptRules.RequireDevice {
+			resolved.RequireDevice = true
+		}
+	}
+
+	// Apply user profile overrides (highest priority)
+	if userProfile != nil {
+		// User can override source types (must be subset of department/company allowed)
+		if len(userProfile.OverrideSourceTypes) > 0 {
+			resolved.AllowedSourceTypes = intersect(
+				resolved.AllowedSourceTypes,
+				userProfile.OverrideSourceTypes)
+		}
+
+		// User can restrict event types further
+		if len(userProfile.OverrideEventTypes) > 0 {
+			if len(resolved.AllowedEventTypes) == 0 {
+				// If no department restrictions, use user restrictions
+				resolved.AllowedEventTypes = userProfile.OverrideEventTypes
+			} else {
+				// Intersection of department and user restrictions
+				resolved.AllowedEventTypes = intersect(
+					resolved.AllowedEventTypes,
+					userProfile.OverrideEventTypes)
+			}
+		}
+	}
+
+	return resolved
+}
+
+func (s *attendanceServiceImpl) enrichResolvedRules(rules *attendance.ResolvedAttendanceRules) {
+	// -------- Source Types Map --------
+	rules.AllowedSourceTypesMap = make(map[string]bool)
+	for _, src := range rules.AllowedSourceTypes {
+		rules.AllowedSourceTypesMap[src] = true
+	}
+
+	// -------- Event Types Map --------
+	if len(rules.AllowedEventTypes) == 0 {
+		// Empty = allow all events
+		rules.AllowAllEventTypes = true
+	} else {
+		rules.AllowedEventTypesMap = make(map[string]bool)
+		for _, evt := range rules.AllowedEventTypes {
+			rules.AllowedEventTypesMap[evt] = true
+		}
+
+		// Always allow system-generated events
+		systemEvents := []string{
+			"system_generated",
+			"imported_event",
+			"missing_punch",
+		}
+		for _, evt := range systemEvents {
+			rules.AllowedEventTypesMap[evt] = true
+		}
+	}
+
+	rules.AppliedAt = time.Now().UTC()
+}
+
+func (s *attendanceServiceImpl) validateSourceSpecificRequirements(
+	ctx context.Context,
+	event *attendance.AttendanceEvent,
+	rules *attendance.ResolvedAttendanceRules,
+) error {
+	// Get source type details
+	sourceType, err := s.GetAttendanceSourceType(ctx, event.SourceType)
+	if err != nil {
+		return fmt.Errorf("failed to validate source type: %w", err)
+	}
+
+	// Check if source requires reference and if provided
+	if sourceType.RequiresReference && event.SourceID == nil {
+		return fmt.Errorf("source type '%s' requires a reference ID", event.SourceType)
+	}
+
+	return nil
+}
+
+func (s *attendanceServiceImpl) logAuditEvent(
+	ctx context.Context,
+	action string,
+	companyID uuid.UUID,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) {
+	// This would log to your audit system
+	s.logger.Info("Attendance audit event",
+		util.String("action", action),
+		util.String("company_id", companyID.String()),
+		util.String("actor_id", actorID.String()),
+		util.Any("metadata", metadata))
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func intersect(slice1, slice2 []string) []string {
+	if len(slice1) == 0 {
+		return slice2
+	}
+	if len(slice2) == 0 {
+		return slice1
+	}
+
+	set := make(map[string]bool)
+	for _, s := range slice1 {
+		set[s] = true
+	}
+
+	var result []string
+	for _, s := range slice2 {
+		if set[s] {
+			result = append(result, s)
+		}
+	}
+
+	return result
+}
+func (s *attendanceServiceImpl) prepareAttendanceEvent(
+	ctx context.Context,
+	event *attendance.AttendanceEvent,
+) error {
+	if err := s.validateAttendanceEvent(ctx, event); err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+
+	if event.AttendanceEventID == uuid.Nil {
+		event.AttendanceEventID = uuid.New()
+	}
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = now
+	}
+	if event.EventTime.IsZero() {
+		event.EventTime = now
+	}
+
+	return nil
+}
+
+func (s *attendanceServiceImpl) persistAttendanceEvent(
+	ctx context.Context,
+	event *attendance.AttendanceEvent,
+) error {
+	return s.attendanceRepo.CreateAttendanceEvent(ctx, event)
+}
+
+// service/attendance.go - Enhanced SAP flow
+// service/attendance_service.go - Fix the CompleteSAPAttendanceFlow method
+
+func (s *attendanceServiceImpl) CompleteSAPAttendanceFlow(
+	ctx context.Context,
+	sapEvent *SAPAttendanceEvent,
+	companyID uuid.UUID,
+) error {
+	// Step 1: Identify employee
+	var userID uuid.UUID
+	var err error
+
+	if sapEvent.RFIDTag != nil && *sapEvent.RFIDTag != "" {
+		userID, err = s.lookupUserByRFID(ctx, *sapEvent.RFIDTag, companyID)
+		if err != nil {
+			s.logger.Warn("RFID lookup failed, trying employee ID",
+				util.String("rfid", *sapEvent.RFIDTag),
+				util.ErrorField(err))
+		}
+	}
+
+	if userID == uuid.Nil {
+		userID, err = s.lookupUserByEmployeeID(ctx, sapEvent.EmployeeID, companyID)
+		if err != nil {
+			return fmt.Errorf("employee lookup failed: %w", err)
+		}
+	}
+
+	// Step 2: Get department (OPTIONAL)
+	var departmentID uuid.UUID
+
+	deptPtr, err := s.attendanceRepo.GetEmployeeDepartment(ctx, userID, companyID)
+	if err != nil {
+		s.logger.Warn("Department lookup failed, falling back to company rules",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+	} else if deptPtr != nil {
+		departmentID = *deptPtr
+	}
+
+	// Step 3: Resolve rules
+	rules, err := s.ResolveAttendanceRules(ctx, userID, companyID, departmentID)
+	if err != nil {
+		return fmt.Errorf("rules resolution failed: %w", err)
+	}
+
+	// Step 4: Build event
+	event := &attendance.AttendanceEvent{
+		AttendanceEventID: uuid.New(),
+		CompanyID:         companyID,
+		UserID:            userID,
+		EventType:         s.mapSAPEventType(sapEvent.EventType),
+		EventTime:         sapEvent.EventDateTime,
+		SourceType:        SourceSAP,
+		SourceID:          nil,
+		CreatedAt:         time.Now().UTC(),
+	}
+
+	// Step 5: Validate event
+	if err := s.ValidateEventAgainstRules(ctx, event, rules); err != nil {
+		return fmt.Errorf("event validation failed: %w", err)
+	}
+
+	// Step 6: Apply SAP mappings
+	if sapEvent.WorkCenter != "" {
+		event.Metadata.ShiftID = s.getShiftByWorkCenter(ctx, sapEvent.WorkCenter, companyID)
+	}
+
+	// Step 7: Persist event
+	metadata := map[string]interface{}{
+		"sap_transaction":   sapEvent.SAPTransaction,
+		"work_center":       sapEvent.WorkCenter,
+		"external_event_id": sapEvent.ExternalEventID,
+		"cost_center":       sapEvent.CostCenter,
+	}
+
+	_, err = s.CreateAttendanceEvent(ctx, event, "system", uuid.Nil, metadata)
+	return err
+}
+
+// ============================================================================
+// DEPARTMENT / USER RULE WRITE METHODS
+// ============================================================================
+
+func (s *attendanceServiceImpl) UpsertDepartmentAttendanceRules(
+	ctx context.Context,
+	rules *attendance.DepartmentAttendanceRules,
+) error {
+	if rules.CompanyID == uuid.Nil {
+		return fmt.Errorf("company ID is required")
+	}
+	if rules.DepartmentID == uuid.Nil {
+		return fmt.Errorf("department ID is required")
+	}
+
+	// Validate source types exist
+	for _, src := range rules.AllowedSourceTypes {
+		if _, err := s.GetAttendanceSourceType(ctx, src); err != nil {
+			return fmt.Errorf("invalid source type '%s': %w", src, err)
+		}
+	}
+
+	// Validate event types exist
+	for _, evt := range rules.AllowedEventTypes {
+		if _, err := s.GetAttendanceEventType(ctx, evt); err != nil {
+			return fmt.Errorf("invalid event type '%s': %w", evt, err)
+		}
+	}
+
+	return s.attendanceRepo.UpsertDepartmentAttendanceRules(ctx, rules)
+}
+
+func (s *attendanceServiceImpl) UpsertUserAttendanceProfile(
+	ctx context.Context,
+	profile *attendance.UserAttendanceProfile,
+) error {
+	if profile.UserID == uuid.Nil {
+		return fmt.Errorf("user ID is required")
+	}
+	if profile.CompanyID == uuid.Nil {
+		return fmt.Errorf("company ID is required")
+	}
+
+	// Validate override source types
+	for _, src := range profile.OverrideSourceTypes {
+		if _, err := s.GetAttendanceSourceType(ctx, src); err != nil {
+			return fmt.Errorf("invalid source type '%s': %w", src, err)
+		}
+	}
+
+	// Validate override event types
+	for _, evt := range profile.OverrideEventTypes {
+		if _, err := s.GetAttendanceEventType(ctx, evt); err != nil {
+			return fmt.Errorf("invalid event type '%s': %w", evt, err)
+		}
+	}
+
+	return s.attendanceRepo.UpsertUserAttendanceProfile(ctx, profile)
 }

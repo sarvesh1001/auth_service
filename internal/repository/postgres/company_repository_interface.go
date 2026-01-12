@@ -11,7 +11,12 @@ type CompanyRepository interface {
 	// ============================================================
 	// Company Operations
 	// ============================================================
-	CreateCompany(ctx context.Context, company *models.Company, additionalDepartments []string) error
+	CreateCompany(
+		ctx context.Context,
+		company *models.Company,
+		additionalDepartments []string,
+		ownerPositionTitle string,
+	) error
 	GetCompany(ctx context.Context, companyID uuid.UUID) (*models.Company, error)
 	GetCompaniesByOwner(ctx context.Context, ownerUserID uuid.UUID) ([]*models.Company, error)
 	UpdateCompany(ctx context.Context, company *models.Company) error
@@ -27,7 +32,6 @@ type CompanyRepository interface {
 	GetSystemDepartment(ctx context.Context, systemDeptID uuid.UUID) (*models.SystemDepartment, error)
 
 	// Department operations
-	UpdateDepartmentName(ctx context.Context, departmentID uuid.UUID, newName string) error
 	GetDepartmentBySystemID(ctx context.Context, companyID, systemDepartmentID uuid.UUID) (*models.Department, error)
 
 	// Permission operations
@@ -49,7 +53,6 @@ type CompanyRepository interface {
 	// Department Operations
 	// ============================================================
 	CreateDepartment(ctx context.Context, department *models.Department) error
-	GetDepartment(ctx context.Context, departmentID uuid.UUID) (*models.Department, error)
 	GetDepartmentsByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*models.Department, int, error)
 	UpdateDepartment(ctx context.Context, department *models.Department) error
 	DeactivateDepartment(ctx context.Context, departmentID uuid.UUID) error
@@ -63,7 +66,7 @@ type CompanyRepository interface {
 	CreateRoleDepartment(ctx context.Context, roleID, departmentID uuid.UUID) error
 	RemoveRoleDepartment(ctx context.Context, roleID, departmentID uuid.UUID) error
 	GetRoleDepartments(ctx context.Context, roleID uuid.UUID) ([]*models.Department, error)
-    RemoveAllRoleDepartments(ctx context.Context, departmentID uuid.UUID) error
+	RemoveAllRoleDepartments(ctx context.Context, departmentID uuid.UUID) error
 
 	// ============================================================
 	// Role & Permission Operations
@@ -108,7 +111,7 @@ type CompanyRepository interface {
 	IsUserActiveEmployee(ctx context.Context, companyID, userID uuid.UUID) (bool, error)
 	GetUsersByRoleLevel(ctx context.Context, companyID uuid.UUID, minLevel, maxLevel int) ([]*models.CompanyEmployee, error)
 	GetEmployeeDepartment(ctx context.Context, companyID, userID uuid.UUID) (*models.Department, error)
-    GetEmployeeDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error)
+	GetEmployeeDepartments(ctx context.Context, companyID, userID uuid.UUID) ([]*models.Department, error)
 
 	// ============================================================
 	// Permission & RBAC Queries
@@ -180,10 +183,10 @@ type CompanyRepository interface {
 	Close() error
 
 	GetPermissionsByCompanyModules(
-        ctx context.Context,
-        companyID uuid.UUID,
-        module, category, tier string,
-    ) ([]*models.Permission, error)	
+		ctx context.Context,
+		companyID uuid.UUID,
+		module, category, tier string,
+	) ([]*models.Permission, error)
 	GetSystemDepartmentsWithBitmask(ctx context.Context) ([]*models.SystemDepartment, error)
 	GetDepartmentBitmask(ctx context.Context, departmentName string) (uint64, error)
 	// Keep only one of these:
@@ -192,7 +195,181 @@ type CompanyRepository interface {
 		ctx context.Context,
 		modules []string,
 		category, tier string,
-	) ([]*models.Permission, error)	// OR rename the second one:
+	) ([]*models.Permission, error) // OR rename the second one:
 	GetPermissionsByModules(ctx context.Context, modules []string) ([]*models.Permission, error)
-}
+	CreateSubDepartment(
+		ctx context.Context,
+		companyID uuid.UUID,
+		parentDepartmentID uuid.UUID,
+		departmentName string,
+		systemDepartmentID uuid.UUID,
+	) (*models.Department, error)
 
+	// UpdateDepartmentName updates only the department name
+	UpdateDepartmentName(
+		ctx context.Context,
+		departmentID uuid.UUID,
+		newName string,
+	) error
+
+	// UpdateDepartmentParent changes the parent of a department
+	UpdateDepartmentParent(
+		ctx context.Context,
+		departmentID uuid.UUID,
+		parentDepartmentID *uuid.UUID,
+	) error
+
+	// MoveDepartmentWithEmployees moves a department under a new parent
+	// (transactional operation)
+	MoveDepartmentWithEmployees(
+		ctx context.Context,
+		departmentID uuid.UUID,
+		newParentDepartmentID *uuid.UUID,
+	) error
+
+	// =====================================================
+	// DEPARTMENT — READ OPERATIONS
+	// =====================================================
+
+	// GetDepartment retrieves a department by ID
+	GetDepartment(
+		ctx context.Context,
+		departmentID uuid.UUID,
+	) (*models.Department, error)
+
+	// GetRootDepartments returns all root-level departments for a company
+	GetRootDepartments(
+		ctx context.Context,
+		companyID uuid.UUID,
+	) ([]*models.Department, error)
+
+	// GetDepartmentChildren returns immediate child departments
+	GetDepartmentChildren(
+		ctx context.Context,
+		departmentID uuid.UUID,
+	) ([]*models.Department, error)
+
+	// GetSubDepartments returns all active sub-departments
+	GetSubDepartments(
+		ctx context.Context,
+		parentDepartmentID uuid.UUID,
+	) ([]*models.Department, error)
+
+	// GetDepartmentParents returns all parents up to root
+	GetDepartmentParents(
+		ctx context.Context,
+		departmentID uuid.UUID,
+	) ([]*models.Department, error)
+
+	// GetDepartmentTree returns the entire subtree starting from a department
+	GetDepartmentTree(
+		ctx context.Context,
+		departmentID uuid.UUID,
+	) ([]*models.DepartmentTree, error)
+
+	// =====================================================
+	// POSITION — WRITE OPERATIONS
+	// =====================================================
+
+	// CreatePosition creates a new position
+	CreatePosition(
+		ctx context.Context,
+		position *models.Position,
+	) error
+
+	// UpdatePosition updates position details
+	UpdatePosition(
+		ctx context.Context,
+		position *models.Position,
+	) error
+
+	// UpdatePositionStatus opens or closes a position
+	UpdatePositionStatus(
+		ctx context.Context,
+		positionID uuid.UUID,
+		isOpen bool,
+	) error
+
+	// DeletePosition permanently deletes a position
+	DeletePosition(
+		ctx context.Context,
+		positionID uuid.UUID,
+	) error
+
+	// =====================================================
+	// POSITION — READ OPERATIONS
+	// =====================================================
+
+	// GetPosition retrieves a position by ID
+	GetPosition(
+		ctx context.Context,
+		positionID uuid.UUID,
+	) (*models.Position, error)
+
+	// GetPositionsByCompany returns paginated positions for a company
+	GetPositionsByCompany(
+		ctx context.Context,
+		companyID uuid.UUID,
+		limit int,
+		offset int,
+		onlyOpen bool,
+	) ([]*models.Position, int, error)
+	// GetCompanyByID returns company with max_departments included
+	GetCompanyByID(ctx context.Context, companyID uuid.UUID) (*models.Company, error)
+
+	// GetActiveDepartmentCount returns active department count for a company
+	GetActiveDepartmentCount(ctx context.Context, companyID uuid.UUID) (int, error)
+
+	// GetCompanyDepartmentInfo returns quota & usage info
+	GetCompanyDepartmentInfo(ctx context.Context, companyID uuid.UUID) (*CompanyDepartmentInfo, error)
+
+	// CheckDepartmentLimit validates if a new department can be created
+	CheckDepartmentLimit(ctx context.Context, companyID uuid.UUID) error
+
+	// UpdateMaxDepartments updates department quota safely
+	UpdateMaxDepartments(ctx context.Context, companyID uuid.UUID, newMaxDepartments int) error
+	// GetPositionsByDepartment returns paginated positions for a department
+	GetPositionsByDepartment(
+		ctx context.Context,
+		departmentID uuid.UUID,
+		limit int,
+		offset int,
+		onlyOpen bool,
+	) ([]*models.Position, int, error)
+	SoftDeleteDepartment(ctx context.Context, companyID, departmentID uuid.UUID) error
+	CreateCompanyDepartment(
+		ctx context.Context,
+		companyID uuid.UUID,
+		departmentName string,
+		systemDepartmentID uuid.UUID,
+	) (*models.Department, error)
+	GetDepartmentByID(
+		ctx context.Context,
+		departmentID uuid.UUID,
+	) (*models.Department, error)
+	PositionExists(
+		ctx context.Context,
+		companyID, departmentID uuid.UUID,
+		title string,
+	) (bool, error)
+	// In the interface definition
+	SearchDepartments(
+		ctx context.Context,
+		companyID uuid.UUID,
+		searchQuery string,
+		limit int,
+		offset int,
+		includeInactive bool,
+	) ([]*models.DepartmentSearchResult, int, error)
+	ActivateDepartment(
+		ctx context.Context,
+		companyID uuid.UUID,
+		departmentID uuid.UUID,
+	) error
+	GetDepartmentSuggestions(
+		ctx context.Context,
+		companyID uuid.UUID,
+		prefix string,
+		limit int,
+	) ([]*models.Department, error)
+}

@@ -1958,14 +1958,18 @@ func (h *AdminHandler) respondWithError(w http.ResponseWriter, statusCode int, e
 }
 
 // ==================== Company Management Methods (Maintained from original) ====================
-
 type CreateCompanyRequest struct {
-	CompanyName        string   `json:"company_name" validate:"required"`
-	OwnerPhone         string   `json:"owner_phone" validate:"required"`
-	OwnerUsername      string   `json:"owner_username" validate:"required,username"`
-	OwnerFullName      string   `json:"owner_full_name" validate:"required,max=255"`
-	SubscriptionTier   string   `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
-	MaxEmployees       int      `json:"max_employees" validate:"required,min=1,max=2000"`
+	CompanyName        string `json:"company_name" validate:"required"`
+	OwnerPhone         string `json:"owner_phone" validate:"required"`
+	OwnerUsername      string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
+	OwnerFullName      string `json:"owner_full_name" validate:"required,max=255"`
+	OwnerPositionTitle string `json:"owner_position_title" validate:"required,max=255"`
+	SubscriptionTier   string `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
+	MaxEmployees       int    `json:"max_employees" validate:"required,min=1,max=2000"`
+
+	// ✅ NEW (matches service + repo)
+	MaxDepartments int `json:"max_departments" validate:"required,min=1,max=100"`
+
 	DataRegion         string   `json:"data_region" validate:"required"`
 	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
 	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
@@ -1988,13 +1992,21 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Manual validation
+	if err := validateCreateCompanyRequest(req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
+		return
+	}
+
 	companyReq := service.CreateCompanyRequest{
 		CompanyName:        req.CompanyName,
 		OwnerPhone:         req.OwnerPhone,
 		OwnerUsername:      req.OwnerUsername,
 		OwnerFullName:      req.OwnerFullName,
+		OwnerPositionTitle: req.OwnerPositionTitle,
 		SubscriptionTier:   req.SubscriptionTier,
 		MaxEmployees:       req.MaxEmployees,
+		MaxDepartments:     req.MaxDepartments, // ✅ NEW
 		DataRegion:         req.DataRegion,
 		SubscriptionMonths: req.SubscriptionMonths,
 		SubscriptionDays:   req.SubscriptionDays,
@@ -2003,12 +2015,11 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 
 	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
 	if err != nil {
-		if strings.Contains(err.Error(), "company with name") && strings.Contains(err.Error(), "already exists") {
-			h.respondWithError(w, http.StatusConflict, err, "Company with this name already exists for the owner")
+		if strings.Contains(err.Error(), "already exists") {
+			h.respondWithError(w, http.StatusConflict, err, "Company already exists for this owner")
 			return
 		}
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create company")
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create company")
 		return
 	}
 
@@ -2021,17 +2032,94 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 			"owner_phone":       req.OwnerPhone,
 			"owner_user_id":     company.OwnerUserID.String(),
 			"subscription_tier": company.SubscriptionTier,
-			"departments":       len(req.Departments),
+			"max_departments":   company.MaxDepartments,
+			"departments":       len(req.Departments) + 1, // incl. Administration
 			"created_at":        company.CreatedAt,
 		},
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, response)
+
 	h.logger.Info("Company created by admin",
 		util.String("company_id", company.CompanyID.String()),
+		util.String("company_name", company.CompanyName),
+		util.Int("max_departments", req.MaxDepartments),
 		util.String("created_by", adminID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)
+}
+
+// Helper function for manual validation
+func validateCreateCompanyRequest(req CreateCompanyRequest) error {
+
+	if strings.TrimSpace(req.CompanyName) == "" {
+		return fmt.Errorf("company_name is required")
+	}
+
+	if strings.TrimSpace(req.OwnerPhone) == "" {
+		return fmt.Errorf("owner_phone is required")
+	}
+
+	if strings.TrimSpace(req.OwnerUsername) == "" {
+		return fmt.Errorf("owner_username is required")
+	}
+	if len(req.OwnerUsername) < 3 || len(req.OwnerUsername) > 100 {
+		return fmt.Errorf("owner_username must be between 3 and 100 characters")
+	}
+
+	if strings.TrimSpace(req.OwnerFullName) == "" {
+		return fmt.Errorf("owner_full_name is required")
+	}
+	if len(req.OwnerFullName) > 255 {
+		return fmt.Errorf("owner_full_name must be at most 255 characters")
+	}
+
+	if strings.TrimSpace(req.OwnerPositionTitle) == "" {
+		return fmt.Errorf("owner_position_title is required")
+	}
+	if len(req.OwnerPositionTitle) > 255 {
+		return fmt.Errorf("owner_position_title must be at most 255 characters")
+	}
+
+	validTiers := map[string]bool{
+		"basic": true, "premium": true, "enterprise": true,
+	}
+	if !validTiers[req.SubscriptionTier] {
+		return fmt.Errorf("subscription_tier must be one of: basic, premium, enterprise")
+	}
+
+	if req.MaxEmployees < 1 || req.MaxEmployees > 2000 {
+		return fmt.Errorf("max_employees must be between 1 and 2000")
+	}
+
+	// ✅ NEW: max_departments validation
+	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
+		return fmt.Errorf("max_departments must be between 1 and 100")
+	}
+
+	// +1 for default Administration department
+	totalDepartments := len(req.Departments) + 1
+	if totalDepartments > req.MaxDepartments {
+		return fmt.Errorf(
+			"requested %d departments exceeds max_departments limit of %d",
+			totalDepartments,
+			req.MaxDepartments,
+		)
+	}
+
+	if strings.TrimSpace(req.DataRegion) == "" {
+		return fmt.Errorf("data_region is required")
+	}
+
+	if req.SubscriptionMonths < 1 || req.SubscriptionMonths > 36 {
+		return fmt.Errorf("subscription_months must be between 1 and 36")
+	}
+
+	if req.SubscriptionDays < 0 || req.SubscriptionDays > 30 {
+		return fmt.Errorf("subscription_days must be between 0 and 30")
+	}
+
+	return nil
 }
 
 func (h *AdminHandler) GetCompany(w http.ResponseWriter, r *http.Request) {
@@ -4793,6 +4881,7 @@ func (h *AdminHandler) GetSystemDepartments(w http.ResponseWriter, r *http.Reque
 
 	systemDepts, err := h.companyService.GetSystemDepartments(ctx)
 	if err != nil {
+
 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to get system departments")
 		return
 	}
@@ -6809,4 +6898,1350 @@ func (h *AdminHandler) UpdateAdminUserRole(w http.ResponseWriter, r *http.Reques
 		util.String("updated_by", requesterID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)
+}
+
+// ==================== Position Management Handlers ====================
+
+// CreatePosition creates a new position in a company
+func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	var req service.CreatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Set company ID from URL path
+	req.CompanyID = companyID
+
+	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to create position")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, successResponse(position, "Position created successfully"))
+	h.logger.Info("Position created",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", position.PositionID.String()),
+		util.String("created_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetPosition retrieves a position by ID
+func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	h.logger.Debug(
+		"GetPosition request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+	)
+
+	position, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get position")
+		return
+	}
+
+	// Verify position belongs to the company
+	if position.CompanyID != companyID {
+		h.logger.Warn(
+			"Position access denied: company mismatch",
+			util.String("requested_by", requesterID.String()),
+			util.String("position_company_id", position.CompanyID.String()),
+			util.String("request_company_id", companyID.String()),
+			util.String("position_id", positionID.String()),
+		)
+
+		h.respondWithError(
+			w,
+			http.StatusForbidden,
+			errors.New("position does not belong to company"),
+			"Position not found in this company",
+		)
+		return
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(position, "Position retrieved successfully"),
+	)
+
+	h.logger.Info(
+		"Position retrieved successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// UpdatePosition updates position details
+func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	var req service.UpdatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Set position ID from URL path
+	req.PositionID = positionID
+
+	// Get existing position to verify company
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Position not found")
+		return
+	}
+
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("position does not belong to company"),
+			"Cannot update position in another company")
+		return
+	}
+
+	if err := h.companyService.UpdatePosition(ctx, &req, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update position")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position updated successfully"))
+	h.logger.Info("Position updated",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+		util.String("updated_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ListPositions lists positions with filtering
+func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Parse query parameters
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+	onlyOpen := h.getBoolQueryParam(r, "only_open", false)
+
+	var departmentID *uuid.UUID
+	if deptIDStr := r.URL.Query().Get("department_id"); deptIDStr != "" {
+		deptID, err := uuid.Parse(deptIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+			return
+		}
+		departmentID = &deptID
+	}
+
+	h.logger.Debug(
+		"ListPositions request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.Bool("only_open", onlyOpen),
+		util.Int("limit", limit),
+		util.Int("offset", offset),
+		func() zap.Field {
+			if departmentID != nil {
+				return util.String("department_id", departmentID.String())
+			}
+			return util.String("department_id", "all")
+		}(),
+	)
+
+	positions, total, err := h.companyService.ListPositions(
+		ctx, companyID, departmentID, onlyOpen, limit, offset,
+	)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to list positions")
+		return
+	}
+
+	response := map[string]interface{}{
+		"positions": positions,
+		"meta": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+			"count":  len(positions),
+		},
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(response, "Positions listed successfully"),
+	)
+
+	h.logger.Info(
+		"Positions listed successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.Int("total", total),
+		util.Int("returned_count", len(positions)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// DeletePosition deletes a position
+func (h *AdminHandler) DeletePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	// Get existing position to verify company
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Position not found")
+		return
+	}
+
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("position does not belong to company"),
+			"Cannot delete position in another company")
+		return
+	}
+
+	if err := h.companyService.DeletePosition(ctx, positionID, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to delete position")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position deleted successfully"))
+	h.logger.Info("Position deleted",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+		util.String("deleted_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// UpdatePositionStatus updates the open/closed status of a position
+func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	var req struct {
+		IsOpen bool `json:"is_open"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Get existing position to verify company
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Position not found")
+		return
+	}
+
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("position does not belong to company"),
+			"Cannot update position in another company")
+		return
+	}
+
+	if err := h.companyService.UpdatePositionStatus(ctx, positionID, req.IsOpen, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update position status")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position status updated successfully"))
+	h.logger.Info("Position status updated",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+		util.Bool("is_open", req.IsOpen),
+		util.String("updated_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ==================== Department Hierarchy Handlers ====================
+
+// UpdateDepartmentParent updates a department's parent department
+func (h *AdminHandler) UpdateDepartmentParent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	var req service.UpdateDepartmentParentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Set department ID from URL path
+	req.DepartmentID = departmentID
+
+	// Verify department belongs to company
+	department, err := h.companyService.GetDepartment(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Department not found")
+		return
+	}
+
+	if department.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("department does not belong to company"),
+			"Cannot update department in another company")
+		return
+	}
+
+	if err := h.companyService.UpdateDepartmentParent(ctx, &req, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update department parent")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department parent updated successfully"))
+	h.logger.Info("Department parent updated",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.String("updated_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetDepartmentChildren retrieves immediate children of a department
+// GetDepartmentChildren retrieves immediate children of a department
+func (h *AdminHandler) GetDepartmentChildren(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	h.logger.Debug(
+		"GetDepartmentChildren request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+	)
+
+	// Verify department belongs to company
+	department, err := h.companyService.GetDepartment(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Department not found")
+		return
+	}
+
+	if department.CompanyID != companyID {
+		h.logger.Warn(
+			"Department access denied: company mismatch",
+			util.String("requested_by", requesterID.String()),
+			util.String("department_id", departmentID.String()),
+			util.String("department_company_id", department.CompanyID.String()),
+			util.String("request_company_id", companyID.String()),
+		)
+
+		h.respondWithError(
+			w,
+			http.StatusForbidden,
+			errors.New("department does not belong to company"),
+			"Cannot access department in another company",
+		)
+		return
+	}
+
+	children, err := h.companyService.GetDepartmentChildren(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get department children")
+		return
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(children, "Department children retrieved successfully"),
+	)
+
+	h.logger.Info(
+		"Department children retrieved successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.Int("children_count", len(children)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetDepartmentTree retrieves entire subtree of a department
+// GetDepartmentTree retrieves entire subtree of a department
+func (h *AdminHandler) GetDepartmentTree(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	h.logger.Debug(
+		"GetDepartmentTree request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+	)
+
+	// Verify department belongs to company
+	department, err := h.companyService.GetDepartment(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Department not found")
+		return
+	}
+
+	if department.CompanyID != companyID {
+		h.logger.Warn(
+			"Department tree access denied: company mismatch",
+			util.String("requested_by", requesterID.String()),
+			util.String("department_id", departmentID.String()),
+			util.String("department_company_id", department.CompanyID.String()),
+			util.String("request_company_id", companyID.String()),
+		)
+
+		h.respondWithError(
+			w,
+			http.StatusForbidden,
+			errors.New("department does not belong to company"),
+			"Cannot access department in another company",
+		)
+		return
+	}
+
+	tree, err := h.companyService.GetDepartmentTree(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get department tree")
+		return
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(tree, "Department tree retrieved successfully"),
+	)
+
+	h.logger.Info(
+		"Department tree retrieved successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.Int("tree_size", len(tree)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetDepartmentParents gets all parent departments up to root
+// GetDepartmentParents gets all parent departments up to root
+func (h *AdminHandler) GetDepartmentParents(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	h.logger.Debug(
+		"GetDepartmentParents request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+	)
+
+	// Verify department belongs to company
+	department, err := h.companyService.GetDepartment(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Department not found")
+		return
+	}
+
+	if department.CompanyID != companyID {
+		h.logger.Warn(
+			"Department parents access denied: company mismatch",
+			util.String("requested_by", requesterID.String()),
+			util.String("department_id", departmentID.String()),
+			util.String("department_company_id", department.CompanyID.String()),
+			util.String("request_company_id", companyID.String()),
+		)
+
+		h.respondWithError(
+			w,
+			http.StatusForbidden,
+			errors.New("department does not belong to company"),
+			"Cannot access department in another company",
+		)
+		return
+	}
+
+	parents, err := h.companyService.GetDepartmentParents(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get department parents")
+		return
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(parents, "Department parents retrieved successfully"),
+	)
+
+	h.logger.Info(
+		"Department parents retrieved successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.Int("parents_count", len(parents)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// MoveDepartmentWithEmployees moves a department and its employees to a new parent
+func (h *AdminHandler) MoveDepartmentWithEmployees(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	var req struct {
+		NewParentDepartmentID *uuid.UUID `json:"new_parent_department_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Verify department belongs to company
+	department, err := h.companyService.GetDepartment(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Department not found")
+		return
+	}
+
+	if department.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("department does not belong to company"),
+			"Cannot move department in another company")
+		return
+	}
+
+	if err := h.companyService.MoveDepartmentWithEmployees(ctx, departmentID, req.NewParentDepartmentID, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to move department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Department moved successfully"))
+	h.logger.Info("Department moved with employees",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.String("moved_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// GetRootDepartments gets all root departments (no parent) for a company
+func (h *AdminHandler) GetRootDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	h.logger.Debug(
+		"GetRootDepartments request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+	)
+
+	departments, err := h.companyService.GetRootDepartments(ctx, companyID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get root departments")
+		return
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(departments, "Root departments retrieved successfully"),
+	)
+
+	h.logger.Info(
+		"Root departments retrieved successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.Int("count", len(departments)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// ValidateDepartmentHierarchy validates if a department move is valid
+func (h *AdminHandler) ValidateDepartmentHierarchy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+		return
+	}
+
+	var req struct {
+		NewParentDepartmentID *uuid.UUID `json:"new_parent_department_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	h.logger.Debug(
+		"ValidateDepartmentHierarchy request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		func() zap.Field {
+			if req.NewParentDepartmentID != nil {
+				return util.String("new_parent_department_id", req.NewParentDepartmentID.String())
+			}
+			return util.String("new_parent_department_id", "root")
+		}(),
+	)
+
+	// Verify department belongs to company
+	department, err := h.companyService.GetDepartment(ctx, departmentID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Department not found")
+		return
+	}
+
+	if department.CompanyID != companyID {
+		h.logger.Warn(
+			"Department hierarchy validation denied: company mismatch",
+			util.String("requested_by", requesterID.String()),
+			util.String("department_id", departmentID.String()),
+			util.String("department_company_id", department.CompanyID.String()),
+			util.String("request_company_id", companyID.String()),
+		)
+
+		h.respondWithError(
+			w,
+			http.StatusForbidden,
+			errors.New("department does not belong to company"),
+			"Cannot validate department in another company",
+		)
+		return
+	}
+
+	valid, err := h.companyService.ValidateDepartmentHierarchy(
+		ctx,
+		departmentID,
+		req.NewParentDepartmentID,
+	)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to validate department hierarchy")
+		return
+	}
+
+	response := map[string]interface{}{
+		"is_valid": valid,
+		"message":  "Department hierarchy validation completed",
+	}
+	if !valid {
+		response["message"] = "Department move would create invalid hierarchy"
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(response, "Hierarchy validation completed"),
+	)
+
+	h.logger.Info(
+		"Department hierarchy validated",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.Bool("is_valid", valid),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+func (h *AdminHandler) GetCompanyByID(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	company, err := h.companyService.GetCompanyByID(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to fetch company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    company,
+	})
+}
+func (h *AdminHandler) GetActiveDepartmentCount(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	count, err := h.companyService.GetActiveDepartmentCount(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get department count")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"active_departments": count,
+		},
+	})
+}
+func (h *AdminHandler) GetCompanyDepartmentInfo(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	info, err := h.companyService.GetCompanyDepartmentInfo(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to fetch department quota")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    info,
+	})
+}
+func (h *AdminHandler) CheckDepartmentLimit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	_, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	if err := h.companyService.CheckDepartmentLimit(ctx, companyID); err != nil {
+		h.respondWithError(w, http.StatusConflict, err, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Department creation allowed",
+	})
+}
+
+type UpdateMaxDepartmentsRequest struct {
+	MaxDepartments int `json:"max_departments"`
+}
+
+func (h *AdminHandler) UpdateMaxDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	start := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	var req UpdateMaxDepartmentsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
+		h.respondWithError(w, http.StatusBadRequest, nil, "max_departments must be between 1 and 100")
+		return
+	}
+
+	if err := h.companyService.UpdateMaxDepartments(ctx, companyID, req.MaxDepartments); err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to update max_departments")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Max departments updated successfully",
+	})
+
+	h.logger.Info("Company max_departments updated by admin",
+		util.String("company_id", companyID.String()),
+		util.Int("new_max_departments", req.MaxDepartments),
+		util.String("updated_by", adminID.String()),
+		util.Duration("duration", time.Since(start)),
+	)
+}
+func (h *AdminHandler) SoftDeleteDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid companyID")
+		return
+	}
+
+	departmentID, err := uuid.Parse(chi.URLParam(r, "departmentID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid departmentID")
+		return
+	}
+
+	if err := h.companyService.SoftDeleteDepartment(ctx, companyID, departmentID); err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to delete department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Department soft deleted successfully",
+	})
+}
+
+func (h *AdminHandler) CreateSubDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid companyID")
+		return
+	}
+
+	// IMPORTANT: only ONE param name is correct
+	parentDeptIDStr := chi.URLParam(r, "parentDepartmentID")
+	if parentDeptIDStr == "" {
+		parentDeptIDStr = chi.URLParam(r, "departmentID")
+	}
+
+	parentDeptID, err := uuid.Parse(parentDeptIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid parentDepartmentID")
+		return
+	}
+
+	var req CreateSubDepartmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	if strings.TrimSpace(req.DepartmentName) == "" {
+		h.respondWithError(w, http.StatusBadRequest, nil, "department_name is required")
+		return
+	}
+
+	dept, err := h.companyService.CreateSubDepartment(
+		ctx,
+		companyID,
+		parentDeptID,
+		req.DepartmentName,
+	)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create sub-department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    dept,
+	})
+}
+
+func (h *AdminHandler) ActivateDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid companyID")
+		return
+	}
+
+	departmentID, err := uuid.Parse(chi.URLParam(r, "departmentID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid departmentID")
+		return
+	}
+
+	if err := h.companyService.ActivateDepartment(ctx, companyID, departmentID); err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to activate department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Department activated successfully",
+	})
+}
+
+type CreateSubDepartmentRequest struct {
+	DepartmentName string `json:"department_name" validate:"required"`
+}
+
+func (h *AdminHandler) AdminAddDepartment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	start := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company_id")
+		return
+	}
+
+	var req AdminAddDepartmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	if strings.TrimSpace(req.DepartmentName) == "" {
+		h.respondWithError(w, http.StatusBadRequest, nil, "department_name is required")
+		return
+	}
+
+	department, err := h.companyService.AdminAddDepartment(
+		ctx,
+		companyID,
+		req.DepartmentName,
+		req.SystemDepartmentID,
+	)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to add department")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": "Department added successfully",
+		"data": map[string]interface{}{
+			"department_id":   department.DepartmentID.String(),
+			"department_name": department.DepartmentName,
+			"company_id":      department.CompanyID.String(),
+			"is_active":       department.IsActive,
+			"created_at":      department.CreatedAt,
+		},
+	})
+
+	h.logger.Info("Department added by admin",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", department.DepartmentID.String()),
+		util.String("created_by", adminID.String()),
+		util.Duration("duration", time.Since(start)),
+	)
+}
+
+type AdminAddDepartmentRequest struct {
+	DepartmentName     string    `json:"department_name"`
+	SystemDepartmentID uuid.UUID `json:"system_department_id"`
+}
+
+// Add to handler/admin_handler.go
+func (h *AdminHandler) SearchDepartments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	// Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Parse query parameters
+	query := r.URL.Query().Get("q")
+	limitStr := r.URL.Query().Get("limit")
+	offsetStr := r.URL.Query().Get("offset")
+	includeInactiveStr := r.URL.Query().Get("include_inactive")
+
+	limit := 20
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 100 {
+			limit = l
+		}
+	}
+
+	offset := 0
+	if offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	includeInactive := false
+	if includeInactiveStr == "true" {
+		includeInactive = true
+	}
+
+	// Create search request
+	searchReq := &service.SearchDepartmentsRequest{
+		Query:           query,
+		Limit:           limit,
+		Offset:          offset,
+		IncludeInactive: includeInactive,
+	}
+
+	// Call service
+	response, err := h.companyService.SearchDepartments(ctx, companyID, searchReq)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to search departments")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Departments search completed successfully"))
+
+	h.logger.Info("Department search executed",
+		util.String("company_id", companyID.String()),
+		util.String("query", query),
+		util.Int("limit", limit),
+		util.Int("offset", offset),
+		util.Int("results", len(response.Departments)),
+		util.Duration("duration", time.Since(startTime)))
+}
+
+func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	// Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Parse query parameters
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			errors.New("prefix is required"),
+			"Prefix parameter is required")
+		return
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 10
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 50 {
+			limit = l
+		}
+	}
+
+	// Call service
+	suggestions, err := h.companyService.GetDepartmentSuggestions(ctx, companyID, prefix, limit)
+	if err != nil {
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to get department suggestions")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(suggestions, "Department suggestions retrieved"))
+
+	h.logger.Debug("Department suggestions retrieved",
+		util.String("company_id", companyID.String()),
+		util.String("prefix", prefix),
+		util.Int("suggestions", len(suggestions)),
+		util.Duration("duration", time.Since(startTime)))
 }

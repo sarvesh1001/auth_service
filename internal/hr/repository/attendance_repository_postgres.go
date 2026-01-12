@@ -45,11 +45,11 @@ func (r *AttendanceRepositoryImpl) CreateAttendanceEvent(ctx context.Context, ev
 	startTime := time.Now()
 
 	query := `
-		INSERT INTO attendance_events (
-			attendance_event_id, company_id, user_id, event_type, event_time,
-			source_type, source_id, device_id, ip_address, metadata,
-			created_at, created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+			INSERT INTO attendance_events (
+				attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
 
 	metadataJSON, err := json.Marshal(event.Metadata)
 	if err != nil {
@@ -104,11 +104,11 @@ func (r *AttendanceRepositoryImpl) GetAttendanceEventByID(ctx context.Context, e
 
 	// Fallback to regular query if prepared statement not available
 	query := `
-		SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-		       source_type, source_id, device_id, ip_address, metadata,
-		       created_at, created_by
-		FROM attendance_events 
-		WHERE attendance_event_id = $1`
+			SELECT attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			FROM attendance_events 
+			WHERE attendance_event_id = $1`
 
 	rows, err := r.client.Query(ctx, query, eventID)
 	if err != nil {
@@ -129,14 +129,14 @@ func (r *AttendanceRepositoryImpl) GetAttendanceEventsByUser(ctx context.Context
 	}
 
 	query := `
-		SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-		       source_type, source_id, device_id, ip_address, metadata,
-		       created_at, created_by
-		FROM attendance_events 
-		WHERE user_id = $1 
-		AND event_time BETWEEN $2 AND $3
-		ORDER BY event_time DESC
-		LIMIT $4`
+			SELECT attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			FROM attendance_events 
+			WHERE user_id = $1 
+			AND event_time BETWEEN $2 AND $3
+			ORDER BY event_time DESC
+			LIMIT $4`
 
 	rows, err := r.client.Query(ctx, query, userID, startDate, endDate, limit)
 	if err != nil {
@@ -179,14 +179,14 @@ func (r *AttendanceRepositoryImpl) GetAttendanceEventsByCompany(ctx context.Cont
 
 	// Get events
 	query := `
-		SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-		       source_type, source_id, device_id, ip_address, metadata,
-		       created_at, created_by
-		FROM attendance_events 
-		WHERE company_id = $1 
-		AND event_time BETWEEN $2 AND $3
-		ORDER BY event_time DESC
-		LIMIT $4 OFFSET $5`
+			SELECT attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			FROM attendance_events 
+			WHERE company_id = $1 
+			AND event_time BETWEEN $2 AND $3
+			ORDER BY event_time DESC
+			LIMIT $4 OFFSET $5`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate, limit, offset)
 	if err != nil {
@@ -274,12 +274,12 @@ func (r *AttendanceRepositoryImpl) SearchAttendanceEvents(ctx context.Context, c
 
 	// Search query
 	searchQuery := fmt.Sprintf(`
-		SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-		       source_type, source_id, device_id, ip_address, metadata,
-		       created_at, created_by
-		FROM attendance_events %s
-		ORDER BY event_time DESC
-		LIMIT $%d OFFSET $%d`, whereClause, paramCount, paramCount+1)
+			SELECT attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			FROM attendance_events %s
+			ORDER BY event_time DESC
+			LIMIT $%d OFFSET $%d`, whereClause, paramCount, paramCount+1)
 
 	params = append(params, limit, offset)
 
@@ -313,10 +313,10 @@ func (r *AttendanceRepositoryImpl) UpdateAttendanceEvent(ctx context.Context, ev
 	}
 
 	query := `
-		UPDATE attendance_events SET
-			event_type = $1, event_time = $2, source_type = $3, source_id = $4,
-			device_id = $5, ip_address = $6, metadata = $7
-		WHERE attendance_event_id = $8`
+			UPDATE attendance_events SET
+				event_type = $1, event_time = $2, source_type = $3, source_id = $4,
+				device_id = $5, ip_address = $6, metadata = $7
+			WHERE attendance_event_id = $8`
 
 	result, err := r.client.Exec(ctx, query,
 		event.EventType,
@@ -362,13 +362,13 @@ func (r *AttendanceRepositoryImpl) GetRecentAttendanceEvents(ctx context.Context
 	}
 
 	query := `
-		SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-		       source_type, source_id, device_id, ip_address, metadata,
-		       created_at, created_by
-		FROM attendance_events 
-		WHERE company_id = $1
-		ORDER BY event_time DESC
-		LIMIT $2`
+			SELECT attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			FROM attendance_events 
+			WHERE company_id = $1
+			ORDER BY event_time DESC
+			LIMIT $2`
 
 	rows, err := r.client.Query(ctx, query, companyID, limit)
 	if err != nil {
@@ -404,10 +404,10 @@ func (r *AttendanceRepositoryImpl) CreateAttendancePolicy(ctx context.Context, p
 	}
 
 	query := `
-		INSERT INTO attendance_policies (
-			policy_id, company_id, department_id, policy_code, policy_type,
-			rules, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+			INSERT INTO attendance_policies (
+				policy_id, company_id, department_id, policy_code, policy_type,
+				rules, is_active, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 	_, err = r.client.Exec(ctx, query,
 		policy.PolicyID,
@@ -448,10 +448,10 @@ func (r *AttendanceRepositoryImpl) GetAttendancePolicyByID(ctx context.Context, 
 
 	// Fallback to regular query if prepared statement not available
 	query := `
-		SELECT policy_id, company_id, department_id, policy_code, policy_type,
-		       rules, is_active, created_at, updated_at
-		FROM attendance_policies 
-		WHERE policy_id = $1`
+			SELECT policy_id, company_id, department_id, policy_code, policy_type,
+				rules, is_active, created_at, updated_at
+			FROM attendance_policies 
+			WHERE policy_id = $1`
 
 	rows, err := r.client.Query(ctx, query, policyID)
 	if err != nil {
@@ -482,10 +482,10 @@ func (r *AttendanceRepositoryImpl) GetAttendancePolicyByCode(ctx context.Context
 
 	// Fallback to regular query if prepared statement not available
 	query := `
-		SELECT policy_id, company_id, department_id, policy_code, policy_type,
-		       rules, is_active, created_at, updated_at
-		FROM attendance_policies 
-		WHERE company_id = $1 AND policy_code = $2`
+			SELECT policy_id, company_id, department_id, policy_code, policy_type,
+				rules, is_active, created_at, updated_at
+			FROM attendance_policies 
+			WHERE company_id = $1 AND policy_code = $2`
 
 	rows, err := r.client.Query(ctx, query, companyID, policyCode)
 	if err != nil {
@@ -502,10 +502,10 @@ func (r *AttendanceRepositoryImpl) GetAttendancePolicyByCode(ctx context.Context
 
 func (r *AttendanceRepositoryImpl) GetAttendancePoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*attendance.AttendancePolicy, error) {
 	query := `
-		SELECT policy_id, company_id, department_id, policy_code, policy_type,
-		       rules, is_active, created_at, updated_at
-		FROM attendance_policies 
-		WHERE company_id = $1`
+			SELECT policy_id, company_id, department_id, policy_code, policy_type,
+				rules, is_active, created_at, updated_at
+			FROM attendance_policies 
+			WHERE company_id = $1`
 
 	params := []interface{}{companyID}
 	if activeOnly {
@@ -547,10 +547,10 @@ func (r *AttendanceRepositoryImpl) UpdateAttendancePolicy(ctx context.Context, p
 	}
 
 	query := `
-		UPDATE attendance_policies SET
-			policy_code = $1, policy_type = $2, department_id = $3,
-			rules = $4, is_active = $5, updated_at = $6
-		WHERE policy_id = $7`
+			UPDATE attendance_policies SET
+				policy_code = $1, policy_type = $2, department_id = $3,
+				rules = $4, is_active = $5, updated_at = $6
+			WHERE policy_id = $7`
 
 	result, err := r.client.Exec(ctx, query,
 		policy.PolicyCode,
@@ -595,10 +595,10 @@ func (r *AttendanceRepositoryImpl) DeleteAttendancePolicy(ctx context.Context, p
 
 func (r *AttendanceRepositoryImpl) AssignUserAttendancePolicy(ctx context.Context, userPolicy *attendance.UserAttendancePolicy) error {
 	query := `
-		INSERT INTO user_attendance_policies (
-			user_id, policy_id, effective_from, effective_to,
-			assigned_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6)`
+			INSERT INTO user_attendance_policies (
+				user_id, policy_id, effective_from, effective_to,
+				assigned_by, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6)`
 
 	_, err := r.client.Exec(ctx, query,
 		userPolicy.UserID,
@@ -622,10 +622,10 @@ func (r *AttendanceRepositoryImpl) AssignUserAttendancePolicy(ctx context.Contex
 
 func (r *AttendanceRepositoryImpl) GetUserAttendancePolicy(ctx context.Context, userID uuid.UUID, policyID uuid.UUID) (*attendance.UserAttendancePolicy, error) {
 	query := `
-		SELECT user_id, policy_id, effective_from, effective_to,
-		       assigned_by, created_at
-		FROM user_attendance_policies 
-		WHERE user_id = $1 AND policy_id = $2`
+			SELECT user_id, policy_id, effective_from, effective_to,
+				assigned_by, created_at
+			FROM user_attendance_policies 
+			WHERE user_id = $1 AND policy_id = $2`
 
 	rows, err := r.client.Query(ctx, query, userID, policyID)
 	if err != nil {
@@ -642,15 +642,15 @@ func (r *AttendanceRepositoryImpl) GetUserAttendancePolicy(ctx context.Context, 
 
 func (r *AttendanceRepositoryImpl) GetUserCurrentAttendancePolicy(ctx context.Context, userID uuid.UUID, asOfDate time.Time) (*attendance.AttendancePolicy, error) {
 	query := `
-		SELECT p.policy_id, p.company_id, p.department_id, p.policy_code,
-		       p.policy_type, p.rules, p.is_active, p.created_at, p.updated_at
-		FROM attendance_policies p
-		INNER JOIN user_attendance_policies up ON p.policy_id = up.policy_id
-		WHERE up.user_id = $1 
-		AND (up.effective_from <= $2 AND (up.effective_to IS NULL OR up.effective_to >= $2))
-		AND p.is_active = true
-		ORDER BY up.effective_from DESC
-		LIMIT 1`
+			SELECT p.policy_id, p.company_id, p.department_id, p.policy_code,
+				p.policy_type, p.rules, p.is_active, p.created_at, p.updated_at
+			FROM attendance_policies p
+			INNER JOIN user_attendance_policies up ON p.policy_id = up.policy_id
+			WHERE up.user_id = $1 
+			AND (up.effective_from <= $2 AND (up.effective_to IS NULL OR up.effective_to >= $2))
+			AND p.is_active = true
+			ORDER BY up.effective_from DESC
+			LIMIT 1`
 
 	rows, err := r.client.Query(ctx, query, userID, asOfDate)
 	if err != nil {
@@ -667,11 +667,11 @@ func (r *AttendanceRepositoryImpl) GetUserCurrentAttendancePolicy(ctx context.Co
 
 func (r *AttendanceRepositoryImpl) GetUserAttendancePolicyHistory(ctx context.Context, userID uuid.UUID) ([]*attendance.UserAttendancePolicy, error) {
 	query := `
-		SELECT user_id, policy_id, effective_from, effective_to,
-		       assigned_by, created_at
-		FROM user_attendance_policies 
-		WHERE user_id = $1
-		ORDER BY effective_from DESC`
+			SELECT user_id, policy_id, effective_from, effective_to,
+				assigned_by, created_at
+			FROM user_attendance_policies 
+			WHERE user_id = $1
+			ORDER BY effective_from DESC`
 
 	rows, err := r.client.Query(ctx, query, userID)
 	if err != nil {
@@ -698,9 +698,9 @@ func (r *AttendanceRepositoryImpl) GetUserAttendancePolicyHistory(ctx context.Co
 
 func (r *AttendanceRepositoryImpl) UpdateUserAttendancePolicy(ctx context.Context, userPolicy *attendance.UserAttendancePolicy) error {
 	query := `
-		UPDATE user_attendance_policies SET
-			effective_from = $1, effective_to = $2
-		WHERE user_id = $3 AND policy_id = $4`
+			UPDATE user_attendance_policies SET
+				effective_from = $1, effective_to = $2
+			WHERE user_id = $3 AND policy_id = $4`
 
 	result, err := r.client.Exec(ctx, query,
 		userPolicy.EffectiveFrom,
@@ -742,10 +742,10 @@ func (r *AttendanceRepositoryImpl) RemoveUserAttendancePolicy(ctx context.Contex
 
 func (r *AttendanceRepositoryImpl) CreateAttendanceSource(ctx context.Context, source *attendance.AttendanceSource) error {
 	query := `
-		INSERT INTO attendance_sources (
-			source_id, company_id, source_type, name, reference_type,
-			reference_id, is_active, created_at, created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+			INSERT INTO attendance_sources (
+				source_id, company_id, source_type, name, reference_type,
+				reference_id, is_active, created_at, created_by
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 	_, err := r.client.Exec(ctx, query,
 		source.SourceID,
@@ -786,10 +786,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceSourceByID(ctx context.Context, 
 
 	// Fallback to regular query if prepared statement not available
 	query := `
-		SELECT source_id, company_id, source_type, name, reference_type,
-		       reference_id, is_active, created_at, created_by
-		FROM attendance_sources 
-		WHERE source_id = $1`
+			SELECT source_id, company_id, source_type, name, reference_type,
+				reference_id, is_active, created_at, created_by
+			FROM attendance_sources 
+			WHERE source_id = $1`
 
 	rows, err := r.client.Query(ctx, query, sourceID)
 	if err != nil {
@@ -806,10 +806,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceSourceByID(ctx context.Context, 
 
 func (r *AttendanceRepositoryImpl) GetAttendanceSourcesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*attendance.AttendanceSource, error) {
 	query := `
-		SELECT source_id, company_id, source_type, name, reference_type,
-		       reference_id, is_active, created_at, created_by
-		FROM attendance_sources 
-		WHERE company_id = $1`
+			SELECT source_id, company_id, source_type, name, reference_type,
+				reference_id, is_active, created_at, created_by
+			FROM attendance_sources 
+			WHERE company_id = $1`
 
 	params := []interface{}{companyID}
 	if activeOnly {
@@ -843,10 +843,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceSourcesByCompany(ctx context.Con
 
 func (r *AttendanceRepositoryImpl) UpdateAttendanceSource(ctx context.Context, source *attendance.AttendanceSource) error {
 	query := `
-		UPDATE attendance_sources SET
-			name = $1, source_type = $2, reference_type = $3,
-			reference_id = $4, is_active = $5
-		WHERE source_id = $6`
+			UPDATE attendance_sources SET
+				name = $1, source_type = $2, reference_type = $3,
+				reference_id = $4, is_active = $5
+			WHERE source_id = $6`
 
 	result, err := r.client.Exec(ctx, query,
 		source.Name,
@@ -895,11 +895,11 @@ func (r *AttendanceRepositoryImpl) CreateAttendanceDailySummary(ctx context.Cont
 	}
 
 	query := `
-		INSERT INTO attendance_daily_summary (
-			attendance_summary_id, company_id, user_id, attendance_date,
-			status, worked_minutes, overtime_minutes, late_minutes,
-			metadata, generated_at, generated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+			INSERT INTO attendance_daily_summary (
+				attendance_summary_id, company_id, user_id, attendance_date,
+				status, worked_minutes, overtime_minutes, late_minutes,
+				metadata, generated_at, generated_by
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 
 	_, err = r.client.Exec(ctx, query,
 		summary.AttendanceSummaryID,
@@ -942,11 +942,11 @@ func (r *AttendanceRepositoryImpl) GetAttendanceDailySummaryByID(ctx context.Con
 
 	// Fallback to regular query if prepared statement not available
 	query := `
-		SELECT attendance_summary_id, company_id, user_id, attendance_date,
-		       status, worked_minutes, overtime_minutes, late_minutes,
-		       metadata, generated_at, generated_by
-		FROM attendance_daily_summary 
-		WHERE attendance_summary_id = $1`
+			SELECT attendance_summary_id, company_id, user_id, attendance_date,
+				status, worked_minutes, overtime_minutes, late_minutes,
+				metadata, generated_at, generated_by
+			FROM attendance_daily_summary 
+			WHERE attendance_summary_id = $1`
 
 	rows, err := r.client.Query(ctx, query, summaryID)
 	if err != nil {
@@ -963,11 +963,11 @@ func (r *AttendanceRepositoryImpl) GetAttendanceDailySummaryByID(ctx context.Con
 
 func (r *AttendanceRepositoryImpl) GetAttendanceDailySummaryByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*attendance.AttendanceDailySummary, error) {
 	query := `
-		SELECT attendance_summary_id, company_id, user_id, attendance_date,
-		       status, worked_minutes, overtime_minutes, late_minutes,
-		       metadata, generated_at, generated_by
-		FROM attendance_daily_summary 
-		WHERE user_id = $1 AND attendance_date = $2`
+			SELECT attendance_summary_id, company_id, user_id, attendance_date,
+				status, worked_minutes, overtime_minutes, late_minutes,
+				metadata, generated_at, generated_by
+			FROM attendance_daily_summary 
+			WHERE user_id = $1 AND attendance_date = $2`
 
 	rows, err := r.client.Query(ctx, query, userID, date)
 	if err != nil {
@@ -984,13 +984,13 @@ func (r *AttendanceRepositoryImpl) GetAttendanceDailySummaryByUserDate(ctx conte
 
 func (r *AttendanceRepositoryImpl) GetAttendanceDailySummariesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*attendance.AttendanceDailySummary, error) {
 	query := `
-		SELECT attendance_summary_id, company_id, user_id, attendance_date,
-		       status, worked_minutes, overtime_minutes, late_minutes,
-		       metadata, generated_at, generated_by
-		FROM attendance_daily_summary 
-		WHERE user_id = $1 
-		AND attendance_date BETWEEN $2 AND $3
-		ORDER BY attendance_date DESC`
+			SELECT attendance_summary_id, company_id, user_id, attendance_date,
+				status, worked_minutes, overtime_minutes, late_minutes,
+				metadata, generated_at, generated_by
+			FROM attendance_daily_summary 
+			WHERE user_id = $1 
+			AND attendance_date BETWEEN $2 AND $3
+			ORDER BY attendance_date DESC`
 
 	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
 	if err != nil {
@@ -1017,12 +1017,12 @@ func (r *AttendanceRepositoryImpl) GetAttendanceDailySummariesByUser(ctx context
 
 func (r *AttendanceRepositoryImpl) GetAttendanceDailySummariesByCompany(ctx context.Context, companyID uuid.UUID, date time.Time) ([]*attendance.AttendanceDailySummary, error) {
 	query := `
-		SELECT attendance_summary_id, company_id, user_id, attendance_date,
-		       status, worked_minutes, overtime_minutes, late_minutes,
-		       metadata, generated_at, generated_by
-		FROM attendance_daily_summary 
-		WHERE company_id = $1 AND attendance_date = $2
-		ORDER BY user_id`
+			SELECT attendance_summary_id, company_id, user_id, attendance_date,
+				status, worked_minutes, overtime_minutes, late_minutes,
+				metadata, generated_at, generated_by
+			FROM attendance_daily_summary 
+			WHERE company_id = $1 AND attendance_date = $2
+			ORDER BY user_id`
 
 	rows, err := r.client.Query(ctx, query, companyID, date)
 	if err != nil {
@@ -1054,10 +1054,10 @@ func (r *AttendanceRepositoryImpl) UpdateAttendanceDailySummary(ctx context.Cont
 	}
 
 	query := `
-		UPDATE attendance_daily_summary SET
-			status = $1, worked_minutes = $2, overtime_minutes = $3,
-			late_minutes = $4, metadata = $5, generated_at = $6
-		WHERE attendance_summary_id = $7`
+			UPDATE attendance_daily_summary SET
+				status = $1, worked_minutes = $2, overtime_minutes = $3,
+				late_minutes = $4, metadata = $5, generated_at = $6
+			WHERE attendance_summary_id = $7`
 
 	result, err := r.client.Exec(ctx, query,
 		summary.Status,
@@ -1122,10 +1122,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceSummaryStats(ctx context.Context
 
 	// Attendance by status
 	query := `
-		SELECT status, COUNT(*) as count
-		FROM attendance_daily_summary 
-		WHERE company_id = $1 AND attendance_date BETWEEN $2 AND $3
-		GROUP BY status`
+			SELECT status, COUNT(*) as count
+			FROM attendance_daily_summary 
+			WHERE company_id = $1 AND attendance_date BETWEEN $2 AND $3
+			GROUP BY status`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
 	if err != nil {
@@ -1168,13 +1168,13 @@ func (r *AttendanceRepositoryImpl) GetAttendanceSummaryStats(ctx context.Context
 
 	// Attendance trend (last 7 days)
 	trendQuery := `
-		SELECT attendance_date, COUNT(*) as present_count
-		FROM attendance_daily_summary 
-		WHERE company_id = $1 
-			AND attendance_date BETWEEN $2 AND $3
-			AND status IN ('present', 'half_day')
-		GROUP BY attendance_date
-		ORDER BY attendance_date`
+			SELECT attendance_date, COUNT(*) as present_count
+			FROM attendance_daily_summary 
+			WHERE company_id = $1 
+				AND attendance_date BETWEEN $2 AND $3
+				AND status IN ('present', 'half_day')
+			GROUP BY attendance_date
+			ORDER BY attendance_date`
 
 	trendRows, err := r.client.Query(ctx, trendQuery, companyID, startDate, endDate)
 	if err != nil {
@@ -1205,10 +1205,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceSummaryStats(ctx context.Context
 
 func (r *AttendanceRepositoryImpl) CreateAttendanceLocation(ctx context.Context, location *attendance.AttendanceLocation) error {
 	query := `
-		INSERT INTO attendance_locations (
-			location_id, company_id, name, location_type,
-			geo_lat, geo_lng, is_active
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+			INSERT INTO attendance_locations (
+				location_id, company_id, name, location_type,
+				geo_lat, geo_lng, is_active
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	_, err := r.client.Exec(ctx, query,
 		location.LocationID,
@@ -1247,10 +1247,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceLocationByID(ctx context.Context
 
 	// Fallback to regular query if prepared statement not available
 	query := `
-		SELECT location_id, company_id, name, location_type,
-		       geo_lat, geo_lng, is_active
-		FROM attendance_locations 
-		WHERE location_id = $1`
+			SELECT location_id, company_id, name, location_type,
+				geo_lat, geo_lng, is_active
+			FROM attendance_locations 
+			WHERE location_id = $1`
 
 	rows, err := r.client.Query(ctx, query, locationID)
 	if err != nil {
@@ -1267,10 +1267,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceLocationByID(ctx context.Context
 
 func (r *AttendanceRepositoryImpl) GetAttendanceLocationsByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*attendance.AttendanceLocation, error) {
 	query := `
-		SELECT location_id, company_id, name, location_type,
-		       geo_lat, geo_lng, is_active
-		FROM attendance_locations 
-		WHERE company_id = $1`
+			SELECT location_id, company_id, name, location_type,
+				geo_lat, geo_lng, is_active
+			FROM attendance_locations 
+			WHERE company_id = $1`
 
 	params := []interface{}{companyID}
 	if activeOnly {
@@ -1304,10 +1304,10 @@ func (r *AttendanceRepositoryImpl) GetAttendanceLocationsByCompany(ctx context.C
 
 func (r *AttendanceRepositoryImpl) UpdateAttendanceLocation(ctx context.Context, location *attendance.AttendanceLocation) error {
 	query := `
-		UPDATE attendance_locations SET
-			name = $1, location_type = $2, geo_lat = $3,
-			geo_lng = $4, is_active = $5
-		WHERE location_id = $6`
+			UPDATE attendance_locations SET
+				name = $1, location_type = $2, geo_lat = $3,
+				geo_lng = $4, is_active = $5
+			WHERE location_id = $6`
 
 	result, err := r.client.Exec(ctx, query,
 		location.Name,
@@ -1361,11 +1361,11 @@ func (r *AttendanceRepositoryImpl) CreateAttendanceEventsBatch(ctx context.Conte
 	defer tx.Rollback()
 
 	query := `
-		INSERT INTO attendance_events (
-			attendance_event_id, company_id, user_id, event_type, event_time,
-			source_type, source_id, device_id, ip_address, metadata,
-			created_at, created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+			INSERT INTO attendance_events (
+				attendance_event_id, company_id, user_id, event_type, event_time,
+				source_type, source_id, device_id, ip_address, metadata,
+				created_at, created_by
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -1419,11 +1419,11 @@ func (r *AttendanceRepositoryImpl) CreateAttendanceDailySummariesBatch(ctx conte
 	defer tx.Rollback()
 
 	query := `
-		INSERT INTO attendance_daily_summary (
-			attendance_summary_id, company_id, user_id, attendance_date,
-			status, worked_minutes, overtime_minutes, late_minutes,
-			metadata, generated_at, generated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+			INSERT INTO attendance_daily_summary (
+				attendance_summary_id, company_id, user_id, attendance_date,
+				status, worked_minutes, overtime_minutes, late_minutes,
+				metadata, generated_at, generated_by
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -1472,24 +1472,24 @@ func (r *AttendanceRepositoryImpl) GetAttendanceReportByDepartment(ctx context.C
 	report := make(map[string]interface{})
 
 	query := `
-		SELECT 
-			d.department_name,
-			COUNT(DISTINCT ads.user_id) as total_employees,
-			COUNT(CASE WHEN ads.status = 'present' THEN 1 END) as present_count,
-			COUNT(CASE WHEN ads.status = 'absent' THEN 1 END) as absent_count,
-			COUNT(CASE WHEN ads.status = 'half_day' THEN 1 END) as half_day_count,
-			COALESCE(AVG(ads.worked_minutes), 0) as avg_worked_minutes,
-			COALESCE(SUM(ads.late_minutes), 0) as total_late_minutes
-		FROM attendance_daily_summary ads
-		INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		INNER JOIN role_departments rd ON r.role_id = rd.role_id
-		INNER JOIN departments d ON rd.department_id = d.department_id
-		WHERE ads.company_id = $1 
-			AND ads.attendance_date BETWEEN $2 AND $3
-			AND ce.is_active = true
-		GROUP BY d.department_name
-		ORDER BY d.department_name`
+			SELECT 
+				d.department_name,
+				COUNT(DISTINCT ads.user_id) as total_employees,
+				COUNT(CASE WHEN ads.status = 'present' THEN 1 END) as present_count,
+				COUNT(CASE WHEN ads.status = 'absent' THEN 1 END) as absent_count,
+				COUNT(CASE WHEN ads.status = 'half_day' THEN 1 END) as half_day_count,
+				COALESCE(AVG(ads.worked_minutes), 0) as avg_worked_minutes,
+				COALESCE(SUM(ads.late_minutes), 0) as total_late_minutes
+			FROM attendance_daily_summary ads
+			INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
+			INNER JOIN roles r ON ce.role_id = r.role_id
+			INNER JOIN role_departments rd ON r.role_id = rd.role_id
+			INNER JOIN departments d ON rd.department_id = d.department_id
+			WHERE ads.company_id = $1 
+				AND ads.attendance_date BETWEEN $2 AND $3
+				AND ce.is_active = true
+			GROUP BY d.department_name
+			ORDER BY d.department_name`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
 	if err != nil {
@@ -1537,28 +1537,28 @@ func (r *AttendanceRepositoryImpl) GetAttendanceReportByDepartment(ctx context.C
 
 func (r *AttendanceRepositoryImpl) GetLateArrivalsReport(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]map[string]interface{}, error) {
 	query := `
-		SELECT 
-			u.user_id,
-			u.full_name,
-			u.username,
-			ce.employee_id,
-			d.department_name,
-			COUNT(ads.attendance_summary_id) as late_days,
-			COALESCE(AVG(ads.late_minutes), 0) as avg_late_minutes,
-			MAX(ads.late_minutes) as max_late_minutes
-		FROM attendance_daily_summary ads
-		INNER JOIN users u ON ads.user_id = u.user_id
-		INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		INNER JOIN role_departments rd ON r.role_id = rd.role_id
-		INNER JOIN departments d ON rd.department_id = d.department_id
-		WHERE ads.company_id = $1 
-			AND ads.attendance_date BETWEEN $2 AND $3
-			AND ads.late_minutes > 0
-			AND ce.is_active = true
-		GROUP BY u.user_id, u.full_name, u.username, ce.employee_id, d.department_name
-		ORDER BY late_days DESC, avg_late_minutes DESC
-		LIMIT 50`
+			SELECT 
+				u.user_id,
+				u.full_name,
+				u.username,
+				ce.employee_id,
+				d.department_name,
+				COUNT(ads.attendance_summary_id) as late_days,
+				COALESCE(AVG(ads.late_minutes), 0) as avg_late_minutes,
+				MAX(ads.late_minutes) as max_late_minutes
+			FROM attendance_daily_summary ads
+			INNER JOIN users u ON ads.user_id = u.user_id
+			INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
+			INNER JOIN roles r ON ce.role_id = r.role_id
+			INNER JOIN role_departments rd ON r.role_id = rd.role_id
+			INNER JOIN departments d ON rd.department_id = d.department_id
+			WHERE ads.company_id = $1 
+				AND ads.attendance_date BETWEEN $2 AND $3
+				AND ads.late_minutes > 0
+				AND ce.is_active = true
+			GROUP BY u.user_id, u.full_name, u.username, ce.employee_id, d.department_name
+			ORDER BY late_days DESC, avg_late_minutes DESC
+			LIMIT 50`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
 	if err != nil {
@@ -1596,27 +1596,27 @@ func (r *AttendanceRepositoryImpl) GetLateArrivalsReport(ctx context.Context, co
 
 func (r *AttendanceRepositoryImpl) GetAbsenceReport(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]map[string]interface{}, error) {
 	query := `
-		SELECT 
-			u.user_id,
-			u.full_name,
-			u.username,
-			ce.employee_id,
-			d.department_name,
-			COUNT(ads.attendance_summary_id) as absence_days,
-			STRING_AGG(DISTINCT TO_CHAR(ads.attendance_date, 'YYYY-MM-DD'), ', ') as absence_dates
-		FROM attendance_daily_summary ads
-		INNER JOIN users u ON ads.user_id = u.user_id
-		INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		INNER JOIN role_departments rd ON r.role_id = rd.role_id
-		INNER JOIN departments d ON rd.department_id = d.department_id
-		WHERE ads.company_id = $1 
-			AND ads.attendance_date BETWEEN $2 AND $3
-			AND ads.status = 'absent'
-			AND ce.is_active = true
-		GROUP BY u.user_id, u.full_name, u.username, ce.employee_id, d.department_name
-		ORDER BY absence_days DESC
-		LIMIT 50`
+			SELECT 
+				u.user_id,
+				u.full_name,
+				u.username,
+				ce.employee_id,
+				d.department_name,
+				COUNT(ads.attendance_summary_id) as absence_days,
+				STRING_AGG(DISTINCT TO_CHAR(ads.attendance_date, 'YYYY-MM-DD'), ', ') as absence_dates
+			FROM attendance_daily_summary ads
+			INNER JOIN users u ON ads.user_id = u.user_id
+			INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
+			INNER JOIN roles r ON ce.role_id = r.role_id
+			INNER JOIN role_departments rd ON r.role_id = rd.role_id
+			INNER JOIN departments d ON rd.department_id = d.department_id
+			WHERE ads.company_id = $1 
+				AND ads.attendance_date BETWEEN $2 AND $3
+				AND ads.status = 'absent'
+				AND ce.is_active = true
+			GROUP BY u.user_id, u.full_name, u.username, ce.employee_id, d.department_name
+			ORDER BY absence_days DESC
+			LIMIT 50`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
 	if err != nil {
@@ -1651,28 +1651,28 @@ func (r *AttendanceRepositoryImpl) GetAbsenceReport(ctx context.Context, company
 
 func (r *AttendanceRepositoryImpl) GetOvertimeReport(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]map[string]interface{}, error) {
 	query := `
-		SELECT 
-			u.user_id,
-			u.full_name,
-			u.username,
-			ce.employee_id,
-			d.department_name,
-			COUNT(ads.attendance_summary_id) as overtime_days,
-			COALESCE(SUM(ads.overtime_minutes), 0) as total_overtime_minutes,
-			COALESCE(AVG(ads.overtime_minutes), 0) as avg_overtime_minutes
-		FROM attendance_daily_summary ads
-		INNER JOIN users u ON ads.user_id = u.user_id
-		INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
-		INNER JOIN roles r ON ce.role_id = r.role_id
-		INNER JOIN role_departments rd ON r.role_id = rd.role_id
-		INNER JOIN departments d ON rd.department_id = d.department_id
-		WHERE ads.company_id = $1 
-			AND ads.attendance_date BETWEEN $2 AND $3
-			AND ads.overtime_minutes > 0
-			AND ce.is_active = true
-		GROUP BY u.user_id, u.full_name, u.username, ce.employee_id, d.department_name
-		ORDER BY total_overtime_minutes DESC
-		LIMIT 50`
+			SELECT 
+				u.user_id,
+				u.full_name,
+				u.username,
+				ce.employee_id,
+				d.department_name,
+				COUNT(ads.attendance_summary_id) as overtime_days,
+				COALESCE(SUM(ads.overtime_minutes), 0) as total_overtime_minutes,
+				COALESCE(AVG(ads.overtime_minutes), 0) as avg_overtime_minutes
+			FROM attendance_daily_summary ads
+			INNER JOIN users u ON ads.user_id = u.user_id
+			INNER JOIN company_employees ce ON ads.user_id = ce.user_id AND ads.company_id = ce.company_id
+			INNER JOIN roles r ON ce.role_id = r.role_id
+			INNER JOIN role_departments rd ON r.role_id = rd.role_id
+			INNER JOIN departments d ON rd.department_id = d.department_id
+			WHERE ads.company_id = $1 
+				AND ads.attendance_date BETWEEN $2 AND $3
+				AND ads.overtime_minutes > 0
+				AND ce.is_active = true
+			GROUP BY u.user_id, u.full_name, u.username, ce.employee_id, d.department_name
+			ORDER BY total_overtime_minutes DESC
+			LIMIT 50`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
 	if err != nil {
@@ -1976,36 +1976,36 @@ func (r *AttendanceRepositoryImpl) scanAttendanceLocation(rows *sql.Rows) (*atte
 func (r *AttendanceRepositoryImpl) initializePreparedStatements(ctx context.Context) {
 	statements := map[string]string{
 		"get_attendance_event_by_id": `
-			SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-			       source_type, source_id, device_id, ip_address, metadata,
-			       created_at, created_by
-			FROM attendance_events WHERE attendance_event_id = $1`,
+				SELECT attendance_event_id, company_id, user_id, event_type, event_time,
+					source_type, source_id, device_id, ip_address, metadata,
+					created_at, created_by
+				FROM attendance_events WHERE attendance_event_id = $1`,
 
 		"get_attendance_policy_by_id": `
-			SELECT policy_id, company_id, department_id, policy_code, policy_type,
-			       rules, is_active, created_at, updated_at
-			FROM attendance_policies WHERE policy_id = $1`,
+				SELECT policy_id, company_id, department_id, policy_code, policy_type,
+					rules, is_active, created_at, updated_at
+				FROM attendance_policies WHERE policy_id = $1`,
 
 		"get_attendance_policy_by_code": `
-			SELECT policy_id, company_id, department_id, policy_code, policy_type,
-			       rules, is_active, created_at, updated_at
-			FROM attendance_policies WHERE company_id = $1 AND policy_code = $2`,
+				SELECT policy_id, company_id, department_id, policy_code, policy_type,
+					rules, is_active, created_at, updated_at
+				FROM attendance_policies WHERE company_id = $1 AND policy_code = $2`,
 
 		"get_attendance_source_by_id": `
-			SELECT source_id, company_id, source_type, name, reference_type,
-			       reference_id, is_active, created_at, created_by
-			FROM attendance_sources WHERE source_id = $1`,
+				SELECT source_id, company_id, source_type, name, reference_type,
+					reference_id, is_active, created_at, created_by
+				FROM attendance_sources WHERE source_id = $1`,
 
 		"get_attendance_daily_summary_by_id": `
-			SELECT attendance_summary_id, company_id, user_id, attendance_date,
-			       status, worked_minutes, overtime_minutes, late_minutes,
-			       metadata, generated_at, generated_by
-			FROM attendance_daily_summary WHERE attendance_summary_id = $1`,
+				SELECT attendance_summary_id, company_id, user_id, attendance_date,
+					status, worked_minutes, overtime_minutes, late_minutes,
+					metadata, generated_at, generated_by
+				FROM attendance_daily_summary WHERE attendance_summary_id = $1`,
 
 		"get_attendance_location_by_id": `
-			SELECT location_id, company_id, name, location_type,
-			       geo_lat, geo_lng, is_active
-			FROM attendance_locations WHERE location_id = $1`,
+				SELECT location_id, company_id, name, location_type,
+					geo_lat, geo_lng, is_active
+				FROM attendance_locations WHERE location_id = $1`,
 	}
 
 	for name, query := range statements {
@@ -2053,10 +2053,10 @@ func (r *AttendanceRepositoryImpl) HealthCheck(ctx context.Context) error {
 
 func (r *AttendanceRepositoryImpl) CreateRFIDMapping(ctx context.Context, mapping *attendance.EmployeeRFIDMapping) error {
 	query := `
-		INSERT INTO employee_rfid_mappings (
-			rfid_id, user_id, company_id, rfid_tag, is_active,
-			assigned_at, unassigned_at, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+			INSERT INTO employee_rfid_mappings (
+				rfid_id, user_id, company_id, rfid_tag, is_active,
+				assigned_at, unassigned_at, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 	_, err := r.client.Exec(ctx, query,
 		mapping.RFIDID,
@@ -2084,12 +2084,12 @@ func (r *AttendanceRepositoryImpl) CreateRFIDMapping(ctx context.Context, mappin
 
 func (r *AttendanceRepositoryImpl) GetRFIDMappingByTag(ctx context.Context, rfidTag string, companyID uuid.UUID) (*attendance.EmployeeRFIDMapping, error) {
 	query := `
-		SELECT rfid_id, user_id, company_id, rfid_tag, is_active,
-		       assigned_at, unassigned_at, created_at, updated_at
-		FROM employee_rfid_mappings
-		WHERE company_id = $1 AND rfid_tag = $2
-		ORDER BY assigned_at DESC
-		LIMIT 1`
+			SELECT rfid_id, user_id, company_id, rfid_tag, is_active,
+				assigned_at, unassigned_at, created_at, updated_at
+			FROM employee_rfid_mappings
+			WHERE company_id = $1 AND rfid_tag = $2
+			ORDER BY assigned_at DESC
+			LIMIT 1`
 
 	rows, err := r.client.Query(ctx, query, companyID, rfidTag)
 	if err != nil {
@@ -2106,12 +2106,12 @@ func (r *AttendanceRepositoryImpl) GetRFIDMappingByTag(ctx context.Context, rfid
 
 func (r *AttendanceRepositoryImpl) GetRFIDMappingByUser(ctx context.Context, userID uuid.UUID, companyID uuid.UUID) (*attendance.EmployeeRFIDMapping, error) {
 	query := `
-		SELECT rfid_id, user_id, company_id, rfid_tag, is_active,
-		       assigned_at, unassigned_at, created_at, updated_at
-		FROM employee_rfid_mappings
-		WHERE company_id = $1 AND user_id = $2
-		AND is_active = true AND unassigned_at IS NULL
-		LIMIT 1`
+			SELECT rfid_id, user_id, company_id, rfid_tag, is_active,
+				assigned_at, unassigned_at, created_at, updated_at
+			FROM employee_rfid_mappings
+			WHERE company_id = $1 AND user_id = $2
+			AND is_active = true AND unassigned_at IS NULL
+			LIMIT 1`
 
 	rows, err := r.client.Query(ctx, query, companyID, userID)
 	if err != nil {
@@ -2128,10 +2128,10 @@ func (r *AttendanceRepositoryImpl) GetRFIDMappingByUser(ctx context.Context, use
 
 func (r *AttendanceRepositoryImpl) UpdateRFIDMapping(ctx context.Context, mapping *attendance.EmployeeRFIDMapping) error {
 	query := `
-		UPDATE employee_rfid_mappings SET
-			rfid_tag = $1, is_active = $2, assigned_at = $3,
-			unassigned_at = $4, updated_at = $5
-		WHERE rfid_id = $6`
+			UPDATE employee_rfid_mappings SET
+				rfid_tag = $1, is_active = $2, assigned_at = $3,
+				unassigned_at = $4, updated_at = $5
+			WHERE rfid_id = $6`
 
 	result, err := r.client.Exec(ctx, query,
 		mapping.RFIDTag,
@@ -2156,9 +2156,9 @@ func (r *AttendanceRepositoryImpl) UpdateRFIDMapping(ctx context.Context, mappin
 
 func (r *AttendanceRepositoryImpl) DeactivateRFIDMapping(ctx context.Context, rfidID uuid.UUID) error {
 	query := `
-		UPDATE employee_rfid_mappings SET
-			is_active = false, unassigned_at = NOW(), updated_at = NOW()
-		WHERE rfid_id = $1 AND is_active = true`
+			UPDATE employee_rfid_mappings SET
+				is_active = false, unassigned_at = NOW(), updated_at = NOW()
+			WHERE rfid_id = $1 AND is_active = true`
 
 	result, err := r.client.Exec(ctx, query, rfidID)
 	if err != nil {
@@ -2175,13 +2175,13 @@ func (r *AttendanceRepositoryImpl) DeactivateRFIDMapping(ctx context.Context, rf
 
 func (r *AttendanceRepositoryImpl) GetActiveRFIDMappingsByCompany(ctx context.Context, companyID uuid.UUID) ([]*attendance.EmployeeRFIDMapping, error) {
 	query := `
-		SELECT rfid_id, user_id, company_id, rfid_tag, is_active,
-		       assigned_at, unassigned_at, created_at, updated_at
-		FROM employee_rfid_mappings
-		WHERE company_id = $1
-		AND is_active = true
-		AND unassigned_at IS NULL
-		ORDER BY rfid_tag`
+			SELECT rfid_id, user_id, company_id, rfid_tag, is_active,
+				assigned_at, unassigned_at, created_at, updated_at
+			FROM employee_rfid_mappings
+			WHERE company_id = $1
+			AND is_active = true
+			AND unassigned_at IS NULL
+			ORDER BY rfid_tag`
 
 	rows, err := r.client.Query(ctx, query, companyID)
 	if err != nil {
@@ -2208,10 +2208,10 @@ func (r *AttendanceRepositoryImpl) GetActiveRFIDMappingsByCompany(ctx context.Co
 
 func (r *AttendanceRepositoryImpl) CreateWorkCenterShift(ctx context.Context, wcShift *attendance.WorkCenterShift) error {
 	query := `
-		INSERT INTO work_center_shifts (
-			mapping_id, company_id, work_center_code, shift_id,
-			effective_from, effective_to, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+			INSERT INTO work_center_shifts (
+				mapping_id, company_id, work_center_code, shift_id,
+				effective_from, effective_to, is_active, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 
 	_, err := r.client.Exec(ctx, query,
 		wcShift.MappingID,
@@ -2238,14 +2238,14 @@ func (r *AttendanceRepositoryImpl) CreateWorkCenterShift(ctx context.Context, wc
 
 func (r *AttendanceRepositoryImpl) GetWorkCenterShiftByCode(ctx context.Context, workCenterCode string, companyID uuid.UUID) (*attendance.WorkCenterShift, error) {
 	query := `
-		SELECT mapping_id, company_id, work_center_code, shift_id,
-		       effective_from, effective_to, is_active, created_at, updated_at
-		FROM work_center_shifts
-		WHERE company_id = $1 AND work_center_code = $2
-		AND is_active = true
-		AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
-		ORDER BY effective_from DESC
-		LIMIT 1`
+			SELECT mapping_id, company_id, work_center_code, shift_id,
+				effective_from, effective_to, is_active, created_at, updated_at
+			FROM work_center_shifts
+			WHERE company_id = $1 AND work_center_code = $2
+			AND is_active = true
+			AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+			ORDER BY effective_from DESC
+			LIMIT 1`
 
 	rows, err := r.client.Query(ctx, query, companyID, workCenterCode)
 	if err != nil {
@@ -2262,10 +2262,10 @@ func (r *AttendanceRepositoryImpl) GetWorkCenterShiftByCode(ctx context.Context,
 
 func (r *AttendanceRepositoryImpl) GetWorkCenterShiftsByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*attendance.WorkCenterShift, error) {
 	query := `
-		SELECT mapping_id, company_id, work_center_code, shift_id,
-		       effective_from, effective_to, is_active, created_at, updated_at
-		FROM work_center_shifts
-		WHERE company_id = $1`
+			SELECT mapping_id, company_id, work_center_code, shift_id,
+				effective_from, effective_to, is_active, created_at, updated_at
+			FROM work_center_shifts
+			WHERE company_id = $1`
 
 	if activeOnly {
 		query += " AND is_active = true AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)"
@@ -2294,10 +2294,10 @@ func (r *AttendanceRepositoryImpl) GetWorkCenterShiftsByCompany(ctx context.Cont
 
 func (r *AttendanceRepositoryImpl) UpdateWorkCenterShift(ctx context.Context, wcShift *attendance.WorkCenterShift) error {
 	query := `
-		UPDATE work_center_shifts SET
-			work_center_code = $1, shift_id = $2, effective_from = $3,
-			effective_to = $4, is_active = $5, updated_at = $6
-		WHERE mapping_id = $7`
+			UPDATE work_center_shifts SET
+				work_center_code = $1, shift_id = $2, effective_from = $3,
+				effective_to = $4, is_active = $5, updated_at = $6
+			WHERE mapping_id = $7`
 
 	result, err := r.client.Exec(ctx, query,
 		wcShift.WorkCenterCode,
@@ -2323,9 +2323,9 @@ func (r *AttendanceRepositoryImpl) UpdateWorkCenterShift(ctx context.Context, wc
 
 func (r *AttendanceRepositoryImpl) DeactivateWorkCenterShift(ctx context.Context, mappingID uuid.UUID) error {
 	query := `
-		UPDATE work_center_shifts SET
-			is_active = false, effective_to = CURRENT_DATE, updated_at = NOW()
-		WHERE mapping_id = $1 AND is_active = true`
+			UPDATE work_center_shifts SET
+				is_active = false, effective_to = CURRENT_DATE, updated_at = NOW()
+			WHERE mapping_id = $1 AND is_active = true`
 
 	result, err := r.client.Exec(ctx, query, mappingID)
 	if err != nil {
@@ -2346,12 +2346,12 @@ func (r *AttendanceRepositoryImpl) DeactivateWorkCenterShift(ctx context.Context
 
 func (r *AttendanceRepositoryImpl) GetUserIDByEmployeeID(ctx context.Context, employeeID string, companyID uuid.UUID) (uuid.UUID, error) {
 	query := `
-		SELECT user_id 
-		FROM company_employees 
-		WHERE company_id = $1 
-		AND employee_id = $2 
-		AND is_active = true
-		LIMIT 1`
+			SELECT user_id 
+			FROM company_employees 
+			WHERE company_id = $1 
+			AND employee_id = $2 
+			AND is_active = true
+			LIMIT 1`
 
 	var userID uuid.UUID
 	err := r.client.QueryRow(ctx, query, companyID, employeeID).Scan(&userID)
@@ -2368,13 +2368,13 @@ func (r *AttendanceRepositoryImpl) GetUserIDByEmployeeID(ctx context.Context, em
 
 func (r *AttendanceRepositoryImpl) GetUserIDByRFID(ctx context.Context, rfid string, companyID uuid.UUID) (uuid.UUID, error) {
 	query := `
-		SELECT user_id 
-		FROM employee_rfid_mappings 
-		WHERE company_id = $1 
-		AND rfid_tag = $2 
-		AND is_active = true 
-		AND unassigned_at IS NULL
-		LIMIT 1`
+			SELECT user_id 
+			FROM employee_rfid_mappings 
+			WHERE company_id = $1 
+			AND rfid_tag = $2 
+			AND is_active = true 
+			AND unassigned_at IS NULL
+			LIMIT 1`
 
 	var userID uuid.UUID
 	err := r.client.QueryRow(ctx, query, companyID, rfid).Scan(&userID)
@@ -2395,12 +2395,12 @@ func (r *AttendanceRepositoryImpl) GetLocationIDByCode(ctx context.Context, loca
 	}
 
 	query := `
-		SELECT location_id 
-		FROM attendance_locations 
-		WHERE company_id = $1 
-		AND location_code = $2 
-		AND is_active = true
-		LIMIT 1`
+			SELECT location_id 
+			FROM attendance_locations 
+			WHERE company_id = $1 
+			AND location_code = $2 
+			AND is_active = true
+			LIMIT 1`
 
 	var locationID uuid.UUID
 	err := r.client.QueryRow(ctx, query, companyID, locationCode).Scan(&locationID)
@@ -2421,12 +2421,12 @@ func (r *AttendanceRepositoryImpl) GetLocationIDByFactoryZone(ctx context.Contex
 	}
 
 	query := `
-		SELECT location_id 
-		FROM attendance_locations 
-		WHERE company_id = $1 
-		AND zone = $2 
-		AND is_active = true
-		LIMIT 1`
+			SELECT location_id 
+			FROM attendance_locations 
+			WHERE company_id = $1 
+			AND zone = $2 
+			AND is_active = true
+			LIMIT 1`
 
 	var locationID uuid.UUID
 	err := r.client.QueryRow(ctx, query, companyID, zone).Scan(&locationID)
@@ -2447,14 +2447,14 @@ func (r *AttendanceRepositoryImpl) GetShiftIDByWorkCenter(ctx context.Context, w
 	}
 
 	query := `
-		SELECT shift_id 
-		FROM work_center_shifts 
-		WHERE company_id = $1 
-		AND work_center_code = $2 
-		AND is_active = true
-		AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
-		ORDER BY effective_from DESC
-		LIMIT 1`
+			SELECT shift_id 
+			FROM work_center_shifts 
+			WHERE company_id = $1 
+			AND work_center_code = $2 
+			AND is_active = true
+			AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+			ORDER BY effective_from DESC
+			LIMIT 1`
 
 	var shiftID uuid.UUID
 	err := r.client.QueryRow(ctx, query, companyID, workCenter).Scan(&shiftID)
@@ -2475,12 +2475,12 @@ func (r *AttendanceRepositoryImpl) GetShiftIDByWorkCenter(ctx context.Context, w
 
 func (r *AttendanceRepositoryImpl) GetSAPBusinessRules(ctx context.Context, companyID uuid.UUID) (*attendance.SAPBusinessRules, error) {
 	query := `
-		SELECT rules 
-		FROM attendance_policies 
-		WHERE company_id = $1 
-		AND policy_type = 'sap'
-		AND is_active = true
-		LIMIT 1`
+			SELECT rules 
+			FROM attendance_policies 
+			WHERE company_id = $1 
+			AND policy_type = 'sap'
+			AND is_active = true
+			LIMIT 1`
 
 	var rulesJSON []byte
 	err := r.client.QueryRow(ctx, query, companyID).Scan(&rulesJSON)
@@ -2529,9 +2529,9 @@ func (r *AttendanceRepositoryImpl) SaveSAPBusinessRules(ctx context.Context, com
 	if exists {
 		// Update existing policy
 		query := `
-			UPDATE attendance_policies SET
-				rules = $1, updated_at = NOW()
-			WHERE company_id = $2 AND policy_type = 'sap'`
+				UPDATE attendance_policies SET
+					rules = $1, updated_at = NOW()
+				WHERE company_id = $2 AND policy_type = 'sap'`
 
 		_, err = r.client.Exec(ctx, query, rulesJSON, companyID)
 		if err != nil {
@@ -2540,10 +2540,10 @@ func (r *AttendanceRepositoryImpl) SaveSAPBusinessRules(ctx context.Context, com
 	} else {
 		// Create new policy
 		query := `
-			INSERT INTO attendance_policies (
-				policy_id, company_id, policy_code, policy_type,
-				rules, is_active, created_at, updated_at
-			) VALUES (gen_random_uuid(), $1, 'SAP_BUSINESS_RULES', 'sap', $2, true, NOW(), NOW())`
+				INSERT INTO attendance_policies (
+					policy_id, company_id, policy_code, policy_type,
+					rules, is_active, created_at, updated_at
+				) VALUES (gen_random_uuid(), $1, 'SAP_BUSINESS_RULES', 'sap', $2, true, NOW(), NOW())`
 
 		_, err = r.client.Exec(ctx, query, companyID, rulesJSON)
 		if err != nil {
@@ -2619,4 +2619,445 @@ func boolPtr(b bool) *bool {
 
 func intPtr(i int) *int {
 	return &i
+}
+
+// ============================================================================
+// ATTENDANCE EVENT TYPES METHODS
+// ============================================================================
+
+func (r *AttendanceRepositoryImpl) GetAttendanceEventType(ctx context.Context, eventType string) (*attendance.AttendanceEventType, error) {
+	query := `
+			SELECT event_type, category, description, 
+				is_user_triggered, is_system_generated, is_active
+			FROM attendance_event_types 
+			WHERE event_type = $1`
+
+	rows, err := r.client.Query(ctx, query, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attendance event type: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanAttendanceEventType(rows)
+	}
+
+	return nil, fmt.Errorf("attendance event type not found: %s", eventType)
+}
+
+func (r *AttendanceRepositoryImpl) ListAttendanceEventTypes(ctx context.Context, activeOnly bool) ([]*attendance.AttendanceEventType, error) {
+	query := `
+			SELECT event_type, category, description, 
+				is_user_triggered, is_system_generated, is_active
+			FROM attendance_event_types`
+
+	if activeOnly {
+		query += " WHERE is_active = true"
+	}
+
+	query += " ORDER BY category, event_type"
+
+	rows, err := r.client.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list attendance event types: %w", err)
+	}
+	defer rows.Close()
+
+	eventTypes := make([]*attendance.AttendanceEventType, 0)
+	for rows.Next() {
+		eventType, err := r.scanAttendanceEventType(rows)
+		if err != nil {
+			r.logger.Warn("Failed to scan attendance event type", util.ErrorField(err))
+			continue
+		}
+		eventTypes = append(eventTypes, eventType)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating attendance event types: %w", err)
+	}
+
+	return eventTypes, nil
+}
+
+func (r *AttendanceRepositoryImpl) scanAttendanceEventType(rows *sql.Rows) (*attendance.AttendanceEventType, error) {
+	var eventType attendance.AttendanceEventType
+	var description sql.NullString
+
+	err := rows.Scan(
+		&eventType.EventType,
+		&eventType.Category,
+		&description,
+		&eventType.IsUserTriggered,
+		&eventType.IsSystemGenerated,
+		&eventType.IsActive,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if description.Valid {
+		eventType.Description = &description.String
+	}
+
+	return &eventType, nil
+}
+
+// ============================================================================
+// ATTENDANCE SOURCE TYPES METHODS
+// ============================================================================
+
+func (r *AttendanceRepositoryImpl) GetAttendanceSourceType(ctx context.Context, sourceType string) (*attendance.AttendanceSourceType, error) {
+	query := `
+			SELECT source_type, description, requires_reference
+			FROM attendance_source_types 
+			WHERE source_type = $1`
+
+	rows, err := r.client.Query(ctx, query, sourceType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attendance source type: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanAttendanceSourceType(rows)
+	}
+
+	return nil, fmt.Errorf("attendance source type not found: %s", sourceType)
+}
+
+func (r *AttendanceRepositoryImpl) ListAttendanceSourceTypes(ctx context.Context) ([]*attendance.AttendanceSourceType, error) {
+	query := `
+			SELECT source_type, description, requires_reference
+			FROM attendance_source_types 
+			ORDER BY source_type`
+
+	rows, err := r.client.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list attendance source types: %w", err)
+	}
+	defer rows.Close()
+
+	sourceTypes := make([]*attendance.AttendanceSourceType, 0)
+	for rows.Next() {
+		sourceType, err := r.scanAttendanceSourceType(rows)
+		if err != nil {
+			r.logger.Warn("Failed to scan attendance source type", util.ErrorField(err))
+			continue
+		}
+		sourceTypes = append(sourceTypes, sourceType)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating attendance source types: %w", err)
+	}
+
+	return sourceTypes, nil
+}
+
+func (r *AttendanceRepositoryImpl) scanAttendanceSourceType(rows *sql.Rows) (*attendance.AttendanceSourceType, error) {
+	var sourceType attendance.AttendanceSourceType
+	var description sql.NullString
+
+	err := rows.Scan(
+		&sourceType.SourceType,
+		&description,
+		&sourceType.RequiresReference,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if description.Valid {
+		sourceType.Description = &description.String
+	}
+
+	return &sourceType, nil
+}
+
+// ============================================================================
+// COMPANY ATTENDANCE RULES METHODS
+// ============================================================================
+
+func (r *AttendanceRepositoryImpl) GetCompanyAttendanceRules(ctx context.Context, companyID uuid.UUID) (*attendance.CompanyAttendanceRules, error) {
+	query := `
+			SELECT company_id, allowed_source_types, 
+				allow_multiple_checkins, timezone, created_at
+			FROM company_attendance_rules 
+			WHERE company_id = $1`
+
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get company attendance rules: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanCompanyAttendanceRules(rows)
+	}
+
+	// Return default rules if not found
+	return &attendance.CompanyAttendanceRules{
+		CompanyID:             companyID,
+		AllowedSourceTypes:    []string{"mobile", "web", "biometric", "rfid"}, // Default sources
+		AllowMultipleCheckins: false,
+		Timezone:              "UTC",
+		CreatedAt:             time.Now().UTC(),
+	}, nil
+}
+
+func (r *AttendanceRepositoryImpl) UpsertCompanyAttendanceRules(ctx context.Context, rules *attendance.CompanyAttendanceRules) error {
+	now := time.Now().UTC()
+	rules.CreatedAt = now
+
+	query := `
+			INSERT INTO company_attendance_rules (
+				company_id, allowed_source_types, 
+				allow_multiple_checkins, timezone, created_at
+			) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (company_id) DO UPDATE SET
+				allowed_source_types = EXCLUDED.allowed_source_types,
+				allow_multiple_checkins = EXCLUDED.allow_multiple_checkins,
+				timezone = EXCLUDED.timezone,
+				created_at = EXCLUDED.created_at`
+
+	_, err := r.client.Exec(ctx, query,
+		rules.CompanyID,
+		pq.Array(rules.AllowedSourceTypes),
+		rules.AllowMultipleCheckins,
+		rules.Timezone,
+		rules.CreatedAt,
+	)
+
+	if err != nil {
+		r.logger.Error("Failed to upsert company attendance rules",
+			util.String("company_id", rules.CompanyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to upsert company attendance rules: %w", err)
+	}
+
+	return nil
+}
+
+func (r *AttendanceRepositoryImpl) scanCompanyAttendanceRules(rows *sql.Rows) (*attendance.CompanyAttendanceRules, error) {
+	var rules attendance.CompanyAttendanceRules
+	var sourceTypes []string
+
+	err := rows.Scan(
+		&rules.CompanyID,
+		pq.Array(&sourceTypes),
+		&rules.AllowMultipleCheckins,
+		&rules.Timezone,
+		&rules.CreatedAt,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	rules.AllowedSourceTypes = sourceTypes
+	return &rules, nil
+}
+
+// ============================================================================
+// DEPARTMENT ATTENDANCE RULES METHODS
+// ============================================================================
+
+func (r *AttendanceRepositoryImpl) GetDepartmentAttendanceRules(ctx context.Context, companyID uuid.UUID, departmentID uuid.UUID) (*attendance.DepartmentAttendanceRules, error) {
+	query := `
+			SELECT rule_id, company_id, department_id, 
+				allowed_source_types, allowed_event_types,
+				require_location, require_device, created_at
+			FROM department_attendance_rules 
+			WHERE company_id = $1 AND department_id = $2`
+
+	rows, err := r.client.Query(ctx, query, companyID, departmentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get department attendance rules: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanDepartmentAttendanceRules(rows)
+	}
+
+	// Return nil if no specific rules exist (use company defaults)
+	return nil, nil
+}
+
+func (r *AttendanceRepositoryImpl) scanDepartmentAttendanceRules(rows *sql.Rows) (*attendance.DepartmentAttendanceRules, error) {
+	var rules attendance.DepartmentAttendanceRules
+	var sourceTypes, eventTypes []string
+
+	err := rows.Scan(
+		&rules.RuleID,
+		&rules.CompanyID,
+		&rules.DepartmentID,
+		pq.Array(&sourceTypes),
+		pq.Array(&eventTypes),
+		&rules.RequireLocation,
+		&rules.RequireDevice,
+		&rules.CreatedAt,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	rules.AllowedSourceTypes = sourceTypes
+	rules.AllowedEventTypes = eventTypes
+	return &rules, nil
+}
+
+// ============================================================================
+// USER ATTENDANCE PROFILE METHODS
+// ============================================================================
+
+func (r *AttendanceRepositoryImpl) GetUserAttendanceProfile(ctx context.Context, userID uuid.UUID) (*attendance.UserAttendanceProfile, error) {
+	query := `
+			SELECT user_id, company_id, 
+				override_source_types, override_event_types,
+				created_at
+			FROM user_attendance_profiles 
+			WHERE user_id = $1`
+
+	rows, err := r.client.Query(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user attendance profile: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		return r.scanUserAttendanceProfile(rows)
+	}
+
+	// Return nil if no profile exists (use department/company defaults)
+	return nil, nil
+}
+
+func (r *AttendanceRepositoryImpl) scanUserAttendanceProfile(rows *sql.Rows) (*attendance.UserAttendanceProfile, error) {
+	var profile attendance.UserAttendanceProfile
+	var sourceTypes, eventTypes []string
+
+	err := rows.Scan(
+		&profile.UserID,
+		&profile.CompanyID,
+		pq.Array(&sourceTypes),
+		pq.Array(&eventTypes),
+		&profile.CreatedAt,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	profile.OverrideSourceTypes = sourceTypes
+	profile.OverrideEventTypes = eventTypes
+	return &profile, nil
+}
+
+// repository/attendance.go - Add these methods
+
+func (r *AttendanceRepositoryImpl) UpsertDepartmentAttendanceRules(
+	ctx context.Context,
+	rules *attendance.DepartmentAttendanceRules,
+) error {
+	query := `
+			INSERT INTO department_attendance_rules (
+				rule_id, company_id, department_id, allowed_source_types,
+				allowed_event_types, require_location, require_device, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (company_id, department_id) DO UPDATE SET
+				allowed_source_types = EXCLUDED.allowed_source_types,
+				allowed_event_types = EXCLUDED.allowed_event_types,
+				require_location = EXCLUDED.require_location,
+				require_device = EXCLUDED.require_device,
+				created_at = EXCLUDED.created_at
+			RETURNING rule_id`
+
+	_, err := r.client.Exec(ctx, query,
+		rules.RuleID,
+		rules.CompanyID,
+		rules.DepartmentID,
+		pq.Array(rules.AllowedSourceTypes),
+		pq.Array(rules.AllowedEventTypes),
+		rules.RequireLocation,
+		rules.RequireDevice,
+		rules.CreatedAt,
+	)
+
+	if err != nil {
+		r.logger.Error("Failed to upsert department attendance rules",
+			util.String("company_id", rules.CompanyID.String()),
+			util.String("department_id", rules.DepartmentID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to upsert department attendance rules: %w", err)
+	}
+
+	return nil
+}
+
+func (r *AttendanceRepositoryImpl) UpsertUserAttendanceProfile(
+	ctx context.Context,
+	profile *attendance.UserAttendanceProfile,
+) error {
+	query := `
+			INSERT INTO user_attendance_profiles (
+				user_id, company_id, override_source_types,
+				override_event_types, created_at
+			) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (user_id) DO UPDATE SET
+				override_source_types = EXCLUDED.override_source_types,
+				override_event_types = EXCLUDED.override_event_types,
+				created_at = EXCLUDED.created_at
+			RETURNING user_id`
+
+	_, err := r.client.Exec(ctx, query,
+		profile.UserID,
+		profile.CompanyID,
+		pq.Array(profile.OverrideSourceTypes),
+		pq.Array(profile.OverrideEventTypes),
+		profile.CreatedAt,
+	)
+
+	if err != nil {
+		r.logger.Error("Failed to upsert user attendance profile",
+			util.String("user_id", profile.UserID.String()),
+			util.String("company_id", profile.CompanyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to upsert user attendance profile: %w", err)
+	}
+
+	return nil
+}
+func (r *AttendanceRepositoryImpl) GetEmployeeDepartment(
+	ctx context.Context,
+	userID uuid.UUID,
+	companyID uuid.UUID,
+) (*uuid.UUID, error) {
+
+	query := `
+			SELECT rd.department_id 
+			FROM company_employees ce
+			INNER JOIN roles r ON ce.role_id = r.role_id
+			INNER JOIN role_departments rd ON r.role_id = rd.role_id
+			WHERE ce.user_id = $1
+			AND ce.company_id = $2
+			LIMIT 1
+		`
+
+	var departmentID uuid.UUID
+	err := r.client.QueryRow(ctx, query, userID, companyID).Scan(&departmentID)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// ✅ No department is a valid state
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get employee department: %w", err)
+	}
+
+	return &departmentID, nil
 }

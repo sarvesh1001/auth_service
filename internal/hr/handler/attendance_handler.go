@@ -1158,16 +1158,14 @@ func (h *AttendanceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 // ============================================================================
 // HELPER METHODS
 // ============================================================================
-
 func (h *AttendanceHandler) parseDateRange(r *http.Request) (time.Time, time.Time, error) {
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
 
 	if startDateStr == "" || endDateStr == "" {
-		// Default to last 7 days
-		endDate := time.Now().UTC()
-		startDate := endDate.AddDate(0, 0, -7)
-		return startDate, endDate, nil
+		end := time.Now().UTC()
+		start := end.AddDate(0, 0, -7)
+		return start, end, nil
 	}
 
 	startDate, err := time.Parse("2006-01-02", startDateStr)
@@ -1178,6 +1176,15 @@ func (h *AttendanceHandler) parseDateRange(r *http.Request) (time.Time, time.Tim
 	endDate, err := time.Parse("2006-01-02", endDateStr)
 	if err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("invalid end_date format, use YYYY-MM-DD")
+	}
+
+	if startDate.After(endDate) {
+		return time.Time{}, time.Time{}, fmt.Errorf("start_date cannot be after end_date")
+	}
+
+	// Optional safety limit
+	if endDate.Sub(startDate).Hours() > 24*366 {
+		return time.Time{}, time.Time{}, fmt.Errorf("date range cannot exceed 366 days")
 	}
 
 	return startDate, endDate, nil
@@ -1236,5 +1243,581 @@ func (h *AttendanceHandler) respondWithError(w http.ResponseWriter, status int, 
 		"success": false,
 		"error":   message,
 		"code":    status,
+	})
+}
+
+// ============================================================================
+// ATTENDANCE EVENT TYPE HANDLERS
+// ============================================================================
+
+// GetAttendanceEventType handles retrieving a specific attendance event type
+func (h *AttendanceHandler) GetAttendanceEventType(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	eventType := chi.URLParam(r, "eventType")
+
+	if eventType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Event type is required")
+		return
+	}
+
+	eventTypeObj, err := h.attendanceService.GetAttendanceEventType(ctx, eventType)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Attendance event type not found")
+			return
+		}
+		h.logger.Error("Failed to get attendance event type",
+			util.String("event_type", eventType),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve attendance event type")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, eventTypeObj)
+}
+
+// ListAttendanceEventTypes handles listing all attendance event types
+func (h *AttendanceHandler) ListAttendanceEventTypes(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+
+	eventTypes, err := h.attendanceService.ListAttendanceEventTypes(ctx, activeOnly)
+	if err != nil {
+		h.logger.Error("Failed to list attendance event types",
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve attendance event types")
+		return
+	}
+
+	// Group by category for better frontend consumption
+	groupedResponse := h.groupEventTypesByCategory(eventTypes)
+
+	h.respondWithJSON(w, http.StatusOK, groupedResponse)
+}
+
+// ============================================================================
+// ATTENDANCE SOURCE TYPE HANDLERS
+// ============================================================================
+
+// GetAttendanceSourceType handles retrieving a specific attendance source type
+func (h *AttendanceHandler) GetAttendanceSourceType(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	sourceType := chi.URLParam(r, "sourceType")
+
+	if sourceType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Source type is required")
+		return
+	}
+
+	sourceTypeObj, err := h.attendanceService.GetAttendanceSourceType(ctx, sourceType)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Attendance source type not found")
+			return
+		}
+		h.logger.Error("Failed to get attendance source type",
+			util.String("source_type", sourceType),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve attendance source type")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, sourceTypeObj)
+}
+
+// ListAttendanceSourceTypes handles listing all attendance source types
+func (h *AttendanceHandler) ListAttendanceSourceTypes(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	sourceTypes, err := h.attendanceService.ListAttendanceSourceTypes(ctx)
+	if err != nil {
+		h.logger.Error("Failed to list attendance source types",
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve attendance source types")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, sourceTypes)
+}
+
+// ============================================================================
+// COMPANY ATTENDANCE RULES HANDLERS
+// ============================================================================
+
+// GetCompanyAttendanceRules handles retrieving company attendance rules
+func (h *AttendanceHandler) GetCompanyAttendanceRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	rules, err := h.attendanceService.GetCompanyAttendanceRules(ctx, companyID)
+	if err != nil {
+		h.logger.Error("Failed to get company attendance rules",
+			util.String("company_id", companyIDStr),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve company attendance rules")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, rules)
+}
+
+// UpdateCompanyAttendanceRules handles updating company attendance rules
+func (h *AttendanceHandler) UpdateCompanyAttendanceRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	// Extract user ID from context (assumes authentication middleware)
+	userID := h.extractUserID(ctx)
+	if userID == uuid.Nil {
+		h.respondWithError(w, http.StatusUnauthorized, "User not authenticated")
+		return
+	}
+
+	var rules attendance.CompanyAttendanceRules
+	if err := json.NewDecoder(r.Body).Decode(&rules); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Ensure company ID matches URL parameter
+	rules.CompanyID = companyID
+
+	err = h.attendanceService.UpdateCompanyAttendanceRules(ctx, &rules, userID)
+	if err != nil {
+		h.logger.Error("Failed to update company attendance rules",
+			util.String("company_id", companyIDStr),
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to update company attendance rules")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Company attendance rules updated successfully",
+		"rules":   rules,
+	})
+}
+
+// ============================================================================
+// DEPARTMENT ATTENDANCE RULES HANDLERS
+// ============================================================================
+
+// GetDepartmentAttendanceRules handles retrieving department attendance rules
+func (h *AttendanceHandler) GetDepartmentAttendanceRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	departmentIDStr := chi.URLParam(r, "departmentID")
+	departmentID, err := uuid.Parse(departmentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid department ID")
+		return
+	}
+
+	rules, err := h.attendanceService.GetDepartmentAttendanceRules(ctx, companyID, departmentID)
+	if err != nil {
+		h.logger.Error("Failed to get department attendance rules",
+			util.String("company_id", companyIDStr),
+			util.String("department_id", departmentIDStr),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve department attendance rules")
+		return
+	}
+
+	// Return null if no rules found (caller can decide how to handle)
+	if rules == nil {
+		h.respondWithJSON(w, http.StatusOK, nil)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, rules)
+}
+
+// ============================================================================
+// USER ATTENDANCE PROFILE HANDLERS
+// ============================================================================
+
+// GetUserAttendanceProfile handles retrieving user attendance profile
+func (h *AttendanceHandler) GetUserAttendanceProfile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+
+	profile, err := h.attendanceService.GetUserAttendanceProfile(ctx, userID)
+	if err != nil {
+		h.logger.Error("Failed to get user attendance profile",
+			util.String("user_id", userIDStr),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve user attendance profile")
+		return
+	}
+
+	// Return null if no profile found (caller can decide how to handle)
+	if profile == nil {
+		h.respondWithJSON(w, http.StatusOK, nil)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, profile)
+}
+
+// ============================================================================
+// RULE RESOLUTION HANDLER
+// ============================================================================
+
+// ResolveAttendanceRules handles resolving attendance rules for a user
+func (h *AttendanceHandler) ResolveAttendanceRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Extract parameters from query string
+	userIDStr := r.URL.Query().Get("user_id")
+	companyIDStr := r.URL.Query().Get("company_id")
+	departmentIDStr := r.URL.Query().Get("department_id")
+
+	if userIDStr == "" || companyIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "User ID and Company ID are required")
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	var departmentID uuid.UUID
+	if departmentIDStr != "" {
+		departmentID, err = uuid.Parse(departmentIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid department ID")
+			return
+		}
+	}
+
+	rules, err := h.attendanceService.ResolveAttendanceRules(ctx, userID, companyID, departmentID)
+	if err != nil {
+		h.logger.Error("Failed to resolve attendance rules",
+			util.String("user_id", userIDStr),
+			util.String("company_id", companyIDStr),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to resolve attendance rules")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, rules)
+}
+
+// handler/attendance.go - Add these structs
+type ValidateEventTypeRequest struct {
+	EventType string `json:"event_type"`
+}
+
+type ValidateSourceTypeRequest struct {
+	SourceType string     `json:"source_type"`
+	SourceID   *uuid.UUID `json:"source_id,omitempty"`
+}
+
+// Fix ValidateAttendanceEventType handler
+func (h *AttendanceHandler) ValidateAttendanceEventType(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var req ValidateEventTypeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.EventType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Event type is required")
+		return
+	}
+
+	err := h.attendanceService.ValidateAttendanceEventType(ctx, req.EventType)
+	if err != nil {
+		h.respondWithJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"valid":   false,
+			"message": err.Error(),
+		})
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"valid":   true,
+		"message": "Event type is valid",
+	})
+}
+
+// Fix ValidateAttendanceSourceType handler similarly
+
+// ValidateAttendanceSourceType handles validating an attendance source type
+// ValidateAttendanceSourceType handles validating an attendance source type
+func (h *AttendanceHandler) ValidateAttendanceSourceType(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req ValidateSourceTypeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.SourceType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Source type is required")
+		return
+	}
+
+	err := h.attendanceService.ValidateAttendanceSourceType(ctx, req.SourceType, req.SourceID)
+	if err != nil {
+		h.respondWithJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"valid":   false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"valid":   true,
+		"message": "Source type is valid",
+	})
+}
+
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
+
+// groupEventTypesByCategory groups event types by category for better frontend consumption
+func (h *AttendanceHandler) groupEventTypesByCategory(eventTypes []*attendance.AttendanceEventType) map[string]interface{} {
+	grouped := make(map[string][]*attendance.AttendanceEventType)
+	categoryOrder := []string{"check_in_out", "breaks", "overtime", "leave", "safety", "status", "class"}
+
+	// Define category order (you can customize this)
+	for _, eventType := range eventTypes {
+		grouped[eventType.Category] = append(grouped[eventType.Category], eventType)
+	}
+
+	// Sort categories by predefined order
+	sortedCategories := make([]string, 0, len(grouped))
+	for _, cat := range categoryOrder {
+		if _, exists := grouped[cat]; exists {
+			sortedCategories = append(sortedCategories, cat)
+		}
+	}
+
+	// Add any remaining categories not in predefined order
+	for cat := range grouped {
+		found := false
+		for _, sortedCat := range sortedCategories {
+			if sortedCat == cat {
+				found = true
+				break
+			}
+		}
+		if !found {
+			sortedCategories = append(sortedCategories, cat)
+		}
+	}
+
+	result := map[string]interface{}{
+		"categories": sortedCategories,
+		"events":     grouped,
+	}
+
+	return result
+}
+
+// handler/attendance.go - Add these structs
+type CreateDepartmentRulesRequest struct {
+	DepartmentID       uuid.UUID `json:"department_id"`
+	AllowedSourceTypes []string  `json:"allowed_source_types"`
+	AllowedEventTypes  []string  `json:"allowed_event_types"`
+	RequireLocation    bool      `json:"require_location"`
+	RequireDevice      bool      `json:"require_device"`
+}
+
+type CreateUserProfileRequest struct {
+	UserID              uuid.UUID `json:"user_id"`
+	OverrideSourceTypes []string  `json:"override_source_types,omitempty"`
+	OverrideEventTypes  []string  `json:"override_event_types,omitempty"`
+}
+
+// handler/attendance.go - Add these handler methods
+func (h *AttendanceHandler) CreateOrUpdateDepartmentRules(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ctx := r.Context()
+
+	// 1️⃣ Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	// 2️⃣ Decode request body
+	var req CreateDepartmentRulesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.DepartmentID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "department_id is required")
+		return
+	}
+
+	// 3️⃣ Build domain model
+	rules := &attendance.DepartmentAttendanceRules{
+		RuleID:             uuid.New(),
+		CompanyID:          companyID,
+		DepartmentID:       req.DepartmentID,
+		AllowedSourceTypes: req.AllowedSourceTypes,
+		AllowedEventTypes:  req.AllowedEventTypes,
+		RequireLocation:    req.RequireLocation,
+		RequireDevice:      req.RequireDevice,
+		CreatedAt:          time.Now().UTC(),
+	}
+
+	// 4️⃣ Call SERVICE (NOT repo)
+	if err := h.attendanceService.UpsertDepartmentAttendanceRules(ctx, rules); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 5️⃣ Success response
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "Department attendance rules updated successfully",
+		"rules":   rules,
+	})
+}
+func (h *AttendanceHandler) CreateOrUpdateUserProfile(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ctx := r.Context()
+
+	// 1️⃣ Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	// 2️⃣ Decode request body
+	var req CreateUserProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.UserID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	// 3️⃣ Build domain model
+	profile := &attendance.UserAttendanceProfile{
+		UserID:              req.UserID,
+		CompanyID:           companyID,
+		OverrideSourceTypes: req.OverrideSourceTypes,
+		OverrideEventTypes:  req.OverrideEventTypes,
+		CreatedAt:           time.Now().UTC(),
+	}
+
+	// 4️⃣ Call SERVICE (NOT repo)
+	if err := h.attendanceService.UpsertUserAttendanceProfile(ctx, profile); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 5️⃣ Success response
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "User attendance profile updated successfully",
+		"profile": profile,
+	})
+}
+
+// handler/attendance.go - Add this struct and handler method
+
+type CompleteSAPFlowRequest struct {
+	EmployeeID      string    `json:"employee_id"`
+	RFIDTag         *string   `json:"rfid_tag,omitempty"`
+	EventDateTime   time.Time `json:"event_datetime"`
+	EventType       string    `json:"event_type"`
+	WorkCenter      string    `json:"work_center"`
+	SAPTransaction  string    `json:"sap_transaction"`
+	ExternalEventID string    `json:"external_event_id"`
+	CostCenter      *string   `json:"cost_center,omitempty"`
+}
+
+func (h *AttendanceHandler) CompleteSAPAttendanceFlow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	var req CompleteSAPFlowRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	sapEvent := &service.SAPAttendanceEvent{
+		EmployeeID:      req.EmployeeID,
+		RFIDTag:         req.RFIDTag,
+		EventDateTime:   req.EventDateTime,
+		EventType:       req.EventType,
+		WorkCenter:      req.WorkCenter,
+		SAPTransaction:  req.SAPTransaction,
+		ExternalEventID: req.ExternalEventID,
+		CostCenter:      req.CostCenter,
+	}
+
+	// First, we need to get the service to call the complete flow
+	// Since we don't have this method in the service interface yet,
+	// let's call the existing ProcessSAPAttendanceEvent instead
+	sourceType := "sap"
+	sourceID := uuid.New()
+
+	_, err = h.attendanceService.ProcessSAPAttendanceEvent(ctx, sapEvent, companyID, sourceType, &sourceID)
+	if err != nil {
+		h.logger.Error("Failed to process SAP attendance flow",
+			util.String("company_id", companyID.String()),
+			util.String("employee_id", req.EmployeeID),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to process SAP attendance flow")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"message": "SAP attendance flow completed successfully",
 	})
 }

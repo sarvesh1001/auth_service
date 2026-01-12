@@ -6,12 +6,6 @@ import (
 	"github.com/google/uuid"
 )
 
-type AttendanceSourceType struct {
-	SourceType        string  `json:"source_type" db:"source_type"`
-	Description       *string `json:"description" db:"description"`
-	RequiresReference bool    `json:"requires_reference" db:"requires_reference"`
-}
-
 type AttendanceSource struct {
 	SourceID      uuid.UUID  `json:"source_id" db:"source_id"`
 	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
