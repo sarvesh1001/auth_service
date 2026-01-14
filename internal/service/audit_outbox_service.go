@@ -11,6 +11,7 @@ import (
 	"auth-service/internal/util"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 )
 
@@ -33,7 +34,6 @@ func NewAuditOutboxService(
 	topicName string,
 ) *AuditOutboxService {
 	logger := util.Get()
-
 	return &AuditOutboxService{
 		postgresClient: postgresClient,
 		kafkaProducer:  kafkaProducer,
@@ -46,7 +46,6 @@ func NewAuditOutboxService(
 	}
 }
 
-// Start begins polling the outbox table
 func (s *AuditOutboxService) Start(ctx context.Context) error {
 	s.logger.Info("Starting audit outbox service",
 		zap.String("topic", s.topicName),
@@ -76,36 +75,30 @@ func (s *AuditOutboxService) Start(ctx context.Context) error {
 	}
 }
 
-// processOutboxBatch processes a batch of unprocessed audit logs
 func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
-	db := s.postgresClient.DB // Fixed: DB is a field, not a function
+	db := s.postgresClient.DB
 	if db == nil {
 		return fmt.Errorf("postgres client not initialized")
 	}
 
-	// Use sqlx to wrap the connection
 	sqlxDB := sqlx.NewDb(db, "postgres")
-
-	// Use a transaction to ensure atomic processing
 	tx, err := sqlxDB.BeginTxx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Get the last processed ID from debounce table
 	var lastProcessedID *string
 	err = tx.GetContext(ctx, &lastProcessedID, `
-		SELECT last_processed_id::text 
-		FROM audit.outbox_debounce 
-		ORDER BY last_processed_at DESC 
+		SELECT last_processed_id::text
+		FROM audit.outbox_debounce
+		ORDER BY last_processed_at DESC
 		LIMIT 1
 	`)
 	if err != nil {
 		s.logger.Warn("No debounce record found, starting from beginning")
 	}
 
-	// Query unprocessed outbox records
 	query := `
 		SELECT outbox_id, audit_id, operation, payload, created_at
 		FROM audit.audit_logs_outbox
@@ -115,7 +108,6 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 		LIMIT $2
 		FOR UPDATE SKIP LOCKED
 	`
-
 	rows, err := tx.QueryxContext(ctx, query, lastProcessedID, s.batchSize)
 	if err != nil {
 		return fmt.Errorf("failed to query outbox: %w", err)
@@ -124,7 +116,6 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 
 	var processedIDs []string
 	var lastID string
-
 	for rows.Next() {
 		var outboxID, auditID string
 		var operation string
@@ -136,28 +127,25 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 			continue
 		}
 
-		// Create Kafka message
 		auditEvent := models.AuditLogEvent{
 			EventID:     outboxID,
 			AuditID:     auditID,
 			Timestamp:   createdAt,
 			EventType:   "audit",
-			CompanyID:   nil, // Will be populated from payload
-			Module:      "",  // Will be populated from payload
-			Action:      "",  // Will be populated from payload
-			EntityType:  "",  // Will be populated from payload
-			EntityID:    nil, // Will be populated from payload
-			ActorType:   "",  // Will be populated from payload
-			ActorID:     nil, // Will be populated from payload
+			CompanyID:   nil,
+			Module:      "",
+			Action:      "",
+			EntityType:  "",
+			EntityID:    nil,
+			ActorType:   "",
+			ActorID:     nil,
 			BeforeState: nil,
 			AfterState:  nil,
 			Metadata:    nil,
 		}
 
-		// Parse payload
 		var payload map[string]interface{}
 		if err := json.Unmarshal(payloadBytes, &payload); err == nil {
-			// Populate fields from payload
 			if companyID, ok := payload["company_id"].(string); ok && companyID != "" {
 				auditEvent.CompanyID = &companyID
 			}
@@ -179,20 +167,17 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 			if actorID, ok := payload["actor_id"].(string); ok && actorID != "" {
 				auditEvent.ActorID = &actorID
 			}
-
 			auditEvent.BeforeState = payload["before_state"]
 			auditEvent.AfterState = payload["after_state"]
 			auditEvent.Metadata = payload["metadata"]
 		}
 
-		// Convert to JSON for Kafka
 		messageBytes, err := json.Marshal(auditEvent)
 		if err != nil {
 			s.logger.Error("Failed to marshal audit event", zap.Error(err))
 			continue
 		}
 
-		// Send to Kafka - Fixed: Use ProduceMessage instead of Produce
 		if err := s.kafkaProducer.ProduceMessage(ctx, s.topicName, []byte(auditEvent.EventID), messageBytes, nil); err != nil {
 			s.logger.Error("Failed to produce audit event to Kafka",
 				zap.String("outbox_id", outboxID),
@@ -206,21 +191,20 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 	}
 
 	if len(processedIDs) == 0 {
-		return nil // No records to process
+		return nil
 	}
 
-	// Mark records as processed
+	// FIX: Use pq.Array for PostgreSQL array conversion
 	updateQuery := `
-		UPDATE audit.audit_logs_outbox 
-		SET processed_at = NOW() 
-		WHERE outbox_id = ANY($1)
+		UPDATE audit.audit_logs_outbox
+		SET processed_at = NOW()
+		WHERE outbox_id = ANY($1::uuid[])
 	`
-	_, err = tx.ExecContext(ctx, updateQuery, processedIDs)
+	_, err = tx.ExecContext(ctx, updateQuery, pq.Array(processedIDs))
 	if err != nil {
 		return fmt.Errorf("failed to mark records as processed: %w", err)
 	}
 
-	// Update debounce table
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO audit.outbox_debounce (last_processed_id, last_processed_at, batch_size)
 		VALUES ($1, NOW(), $2)
@@ -229,7 +213,6 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 		return fmt.Errorf("failed to update debounce table: %w", err)
 	}
 
-	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -238,11 +221,9 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 		zap.Int("count", len(processedIDs)),
 		zap.String("last_id", lastID),
 	)
-
 	return nil
 }
 
-// Stop gracefully stops the service
 func (s *AuditOutboxService) Stop() {
 	if s.isRunning {
 		close(s.stopChan)
@@ -251,25 +232,21 @@ func (s *AuditOutboxService) Stop() {
 	}
 }
 
-// HealthCheck checks if the service is healthy
 func (s *AuditOutboxService) HealthCheck(ctx context.Context) error {
-	// Check PostgreSQL connection
 	if err := s.postgresClient.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("postgres health check failed: %w", err)
 	}
 
-	// Check Kafka connection (simplified)
 	if s.kafkaProducer == nil {
 		return fmt.Errorf("kafka producer not initialized")
 	}
 
-	// Check if there are unprocessed records
-	db := s.postgresClient.DB // Fixed: DB is a field
+	db := s.postgresClient.DB
 	sqlxDB := sqlx.NewDb(db, "postgres")
 	var count int
 	err := sqlxDB.GetContext(ctx, &count, `
-		SELECT COUNT(*) 
-		FROM audit.audit_logs_outbox 
+		SELECT COUNT(*)
+		FROM audit.audit_logs_outbox
 		WHERE processed_at IS NULL
 	`)
 	if err != nil {

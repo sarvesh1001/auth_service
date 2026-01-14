@@ -79,9 +79,16 @@ type SchedulingService interface {
 	UpdateScheduleTemplate(ctx context.Context, templateID uuid.UUID, update ScheduleTemplateUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleTemplate, error)
 	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	ValidateScheduleTemplate(ctx context.Context, template *scheduling.ScheduleTemplate) error
+	AssignUserToTemplate(
+		ctx context.Context,
+		companyID uuid.UUID, // Add company ID parameter
+		assignment *scheduling.UserScheduleAssignment,
+		actorType string,
+		actorID uuid.UUID,
+		metadata map[string]interface{},
+	) error
 
 	// User Schedule Assignment Management
-	AssignUserToTemplate(ctx context.Context, assignment *scheduling.UserScheduleAssignment, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	UpdateUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, effectiveFrom time.Time, update UserScheduleAssignmentUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	EndUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, endDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	RemoveUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, effectiveFrom time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
@@ -708,6 +715,7 @@ func (s *schedulingServiceImpl) ValidateScheduleTemplate(ctx context.Context, te
 
 func (s *schedulingServiceImpl) AssignUserToTemplate(
 	ctx context.Context,
+	companyID uuid.UUID,
 	assignment *scheduling.UserScheduleAssignment,
 	actorType string,
 	actorID uuid.UUID,
@@ -726,16 +734,61 @@ func (s *schedulingServiceImpl) AssignUserToTemplate(
 		assignment.EffectiveFrom = time.Now().UTC()
 	}
 
-	// Check if template exists
+	// Check if template exists and belongs to the company
 	template, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, assignment.ScheduleTemplateID)
 	if err != nil {
 		return fmt.Errorf("schedule template not found: %w", err)
 	}
 
-	// Check if user already has an active assignment
+	// Verify template belongs to the requested company
+	if template.CompanyID != companyID {
+		return fmt.Errorf("schedule template does not belong to company %s", companyID)
+	}
+
+	// ✅ Check if user exists and is active in the company
+	userExists, err := s.schedulingRepo.IsUserActiveInCompany(ctx, companyID, assignment.UserID)
+	if err != nil {
+		return fmt.Errorf("failed to validate user: %w", err)
+	}
+	if !userExists {
+		return fmt.Errorf("user %s not found or not an active employee in this company", assignment.UserID)
+	}
+
+	// ✅ NEW: Check if assignment already exists (same user, template, and effective_from)
+	existingAssignment, err := s.schedulingRepo.GetUserScheduleAssignment(
+		ctx,
+		assignment.UserID,
+		assignment.ScheduleTemplateID,
+		assignment.EffectiveFrom,
+	)
+
+	// If assignment already exists, update it instead of creating a new one
+	if err == nil && existingAssignment != nil {
+		// Update the existing assignment
+		existingAssignment.EffectiveTo = assignment.EffectiveTo
+		existingAssignment.AssignedBy = &actorID
+
+		err = s.schedulingRepo.UpdateUserScheduleAssignment(ctx, existingAssignment)
+		if err != nil {
+			s.logger.Error("Failed to update existing schedule assignment",
+				util.String("user_id", assignment.UserID.String()),
+				util.String("template_id", assignment.ScheduleTemplateID.String()),
+				util.ErrorField(err))
+			return fmt.Errorf("failed to update schedule assignment: %w", err)
+		}
+
+		s.logger.Info("Schedule assignment updated",
+			util.String("user_id", assignment.UserID.String()),
+			util.String("template_id", assignment.ScheduleTemplateID.String()),
+			util.String("company_id", companyID.String()))
+
+		return nil
+	}
+
+	// Check if user already has an active assignment on the effective date
 	currentAssignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(ctx, assignment.UserID, assignment.EffectiveFrom)
 	if err == nil && currentAssignment != nil {
-		// End the current assignment if it's for a different template
+		// If the current assignment is for a different template, end it
 		if currentAssignment.ScheduleTemplateID != assignment.ScheduleTemplateID {
 			now := time.Now().UTC()
 			currentAssignment.EffectiveTo = &now
@@ -777,7 +830,7 @@ func (s *schedulingServiceImpl) AssignUserToTemplate(
 
 			assignmentJSON, _ := json.Marshal(assignment)
 			s.auditService.LogAction(auditCtx,
-				&template.CompanyID,
+				&companyID,
 				"scheduling",
 				"user_schedule_assignment.create",
 				"user_schedule_assignment",
@@ -795,6 +848,7 @@ func (s *schedulingServiceImpl) AssignUserToTemplate(
 		util.String("user_id", assignment.UserID.String()),
 		util.String("template_id", assignment.ScheduleTemplateID.String()),
 		util.String("template_name", template.Name),
+		util.String("company_id", companyID.String()),
 		util.Time("effective_from", assignment.EffectiveFrom),
 		util.Duration("duration", time.Since(startTime)))
 

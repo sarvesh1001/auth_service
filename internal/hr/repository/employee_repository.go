@@ -18,6 +18,9 @@ type EmployeeRepository interface {
 	DeleteEmployeeProfile(ctx context.Context, profileID uuid.UUID) error
 	ListEmployeeProfilesByCompany(ctx context.Context, companyID uuid.UUID, limit, offset int) ([]*employee.EmployeeProfile, int, error)
 	SearchEmployeeProfiles(ctx context.Context, companyID uuid.UUID, filters map[string]interface{}, limit, offset int) ([]*employee.EmployeeProfile, int, error)
+	// Validation helpers
+	UserExists(ctx context.Context, userID uuid.UUID) (bool, error)
+	IsUserEmployeeOfCompany(ctx context.Context, userID, companyID uuid.UUID) (bool, error)
 
 	// EmployeeDepartmentHistory operations
 	CreateDepartmentHistory(ctx context.Context, history *employee.EmployeeDepartmentHistory) error
@@ -65,6 +68,19 @@ type EmployeeRepository interface {
 	GetEmployeeCountByDepartment(ctx context.Context, companyID uuid.UUID) (map[uuid.UUID]int, error)
 	GetActiveEmployeesByDateRange(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*employee.EmployeeProfile, error)
 
+	GetActiveDepartmentAssignment(
+		ctx context.Context,
+		userID uuid.UUID,
+	) (*employee.EmployeeDepartmentHistory, error)
+	EnforceScheduledEmployeeExits(
+		ctx context.Context,
+		effectiveDate time.Time,
+		enforcedBy uuid.UUID,
+	) (int, error)
+	RehireEmployee(
+		ctx context.Context,
+		companyID, userID uuid.UUID,
+	) error
 	// Health check
 	HealthCheck(ctx context.Context) error
 }

@@ -248,6 +248,7 @@ type AddEmployeeRequest struct {
 	EmployeeID  string     `json:"employee_id" validate:"required"`
 	RoleID      uuid.UUID  `json:"role_id" validate:"required"`
 	ReportsTo   *uuid.UUID `json:"reports_to,omitempty"`
+	PositionID  *uuid.UUID `json:"position_id,omitempty"`
 }
 
 type AddManagerRequest struct {
@@ -258,6 +259,7 @@ type AddManagerRequest struct {
 	RoleID      uuid.UUID  `json:"role_id" validate:"required"`
 	ReportsTo   *uuid.UUID `json:"reports_to,omitempty"`
 	EmployeeID  string     `json:"employee_id,omitempty"`
+	PositionID  *uuid.UUID `json:"position_id,omitempty"`
 }
 
 type GrantRolePermissionsRequest struct {
@@ -2202,7 +2204,6 @@ func (s *CompanyService) AddManager(ctx context.Context, req *AddManagerRequest)
 
 	return nil
 }
-
 func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeRequest) error {
 	start := time.Now()
 
@@ -2240,6 +2241,35 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 
 	if len(roleDepartments) == 0 {
 		return fmt.Errorf("role is not assigned to any department")
+	}
+
+	// Validate position if provided
+	if req.PositionID != nil {
+		position, err := s.companyRepo.GetPosition(ctx, *req.PositionID)
+		if err != nil {
+			return fmt.Errorf("position not found: %w", err)
+		}
+
+		if position.CompanyID != req.CompanyID {
+			return fmt.Errorf("position does not belong to company")
+		}
+
+		if !position.IsOpen {
+			return fmt.Errorf("position is not open for assignment")
+		}
+
+		// Check if position's department is in role's departments
+		positionInRoleDept := false
+		for _, rd := range roleDepartments {
+			if rd.DepartmentID == position.DepartmentID {
+				positionInRoleDept = true
+				break
+			}
+		}
+
+		if !positionInRoleDept {
+			return fmt.Errorf("position's department is not assigned to the role")
+		}
 	}
 
 	if err := s.validateReportsTo(ctx, req.CompanyID, req.ReportsTo); err != nil {
@@ -2280,6 +2310,7 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		UserID:     user.UserID,
 		EmployeeID: req.EmployeeID,
 		RoleID:     req.RoleID,
+		PositionID: req.PositionID, // NEW FIELD
 		HireDate:   time.Now().UTC(),
 		IsActive:   true,
 		ReportsTo:  reportsTo,
@@ -2297,6 +2328,12 @@ func (s *CompanyService) AddEmployee(ctx context.Context, req *AddEmployeeReques
 		util.String("employee_id", req.EmployeeID),
 		util.String("role_id", req.RoleID.String()),
 		util.String("role_name", role.RoleName),
+		util.String("position_id", func() string {
+			if req.PositionID != nil {
+				return req.PositionID.String()
+			}
+			return "none"
+		}()),
 		util.Duration("duration", time.Since(start)))
 
 	return nil
@@ -3574,4 +3611,179 @@ func (s *CompanyService) GetDepartmentSuggestions(
 		return nil, fmt.Errorf("failed to get department suggestions: %w", err)
 	}
 	return suggestions, nil
+}
+
+func (s *CompanyService) UpdateEmployeePosition(ctx context.Context, companyID, userID uuid.UUID, positionID *uuid.UUID) error {
+	// Get employee
+	employee, err := s.companyRepo.GetEmployee(ctx, companyID, userID)
+	if err != nil {
+		return fmt.Errorf("employee not found: %w", err)
+	}
+
+	if !employee.IsActive {
+		return fmt.Errorf("employee is not active")
+	}
+
+	// Validate position if provided
+	if positionID != nil {
+		position, err := s.companyRepo.GetPosition(ctx, *positionID)
+		if err != nil {
+			return fmt.Errorf("position not found: %w", err)
+		}
+
+		if position.CompanyID != companyID {
+			return fmt.Errorf("position does not belong to company")
+		}
+
+		if !position.IsOpen {
+			return fmt.Errorf("position is not open for assignment")
+		}
+
+		// Get role departments to validate position department
+		roleDepartments, err := s.companyRepo.GetRoleDepartments(ctx, employee.RoleID)
+		if err != nil {
+			return fmt.Errorf("failed to get role departments: %w", err)
+		}
+
+		// Check if position's department is in role's departments
+		positionInRoleDept := false
+		for _, rd := range roleDepartments {
+			if rd.DepartmentID == position.DepartmentID {
+				positionInRoleDept = true
+				break
+			}
+		}
+
+		if !positionInRoleDept {
+			return fmt.Errorf("position's department is not assigned to the employee's role")
+		}
+	}
+
+	// Update employee position
+	if err := s.companyRepo.UpdateEmployeePosition(ctx, companyID, userID, positionID); err != nil {
+		return fmt.Errorf("failed to update employee position: %w", err)
+	}
+
+	s.logger.Info("Employee position updated",
+		util.String("company_id", companyID.String()),
+		util.String("user_id", userID.String()),
+		util.String("position_id", func() string {
+			if positionID != nil {
+				return positionID.String()
+			}
+			return "none"
+		}()))
+
+	return nil
+}
+
+// service/company_service.go
+// Add these methods to the CompanyService struct
+
+func (s *CompanyService) GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error) {
+	start := time.Now()
+
+	// Check permission
+	hasPerm, err := s.CheckPermissionFromContext(ctx, "hr.position.view")
+	if err != nil || !hasPerm {
+		return nil, 0, fmt.Errorf("permission denied for hr.position.view")
+	}
+
+	// Get positions
+	positions, total, err := s.companyRepo.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get open positions: %w", err)
+	}
+
+	s.logger.Info("Open positions retrieved",
+		util.String("company_id", companyID.String()),
+		util.Int("total", total),
+		util.Int("returned", len(positions)),
+		util.Duration("duration", time.Since(start)),
+	)
+
+	return positions, total, nil
+}
+func (s *CompanyService) GetPositionsByDepartment(
+	ctx context.Context,
+	companyID, departmentID uuid.UUID,
+	isOpen *bool,
+	limit, offset int,
+) ([]*models.Position, int, error) {
+
+	start := time.Now()
+
+	// Permission check
+	hasPerm, err := s.CheckPermissionFromContext(ctx, "hr.position.view")
+	if err != nil || !hasPerm {
+		return nil, 0, fmt.Errorf("permission denied for hr.position.view")
+	}
+
+	// Repo supports only bool, so normalize
+	onlyOpen := false
+	if isOpen != nil {
+		onlyOpen = *isOpen
+	}
+
+	positions, total, err := s.companyRepo.GetPositionsByDepartment(
+		ctx,
+		departmentID,
+		limit,
+		offset,
+		onlyOpen,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get positions by department: %w", err)
+	}
+
+	s.logger.Info(
+		"Positions by department retrieved",
+		util.String("company_id", companyID.String()),
+		util.String("department_id", departmentID.String()),
+		util.Int("total", total),
+		util.Int("returned", len(positions)),
+		util.Bool("only_open", onlyOpen),
+		util.Duration("duration", time.Since(start)),
+	)
+
+	return positions, total, nil
+}
+func (s *CompanyService) GetEmployeeWithPosition(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) (*models.CompanyEmployeeWithPosition, error) {
+
+	start := time.Now()
+
+	// Permission check
+	hasPerm, err := s.CheckPermissionFromContext(ctx, "hr.employee.view")
+	if err != nil || !hasPerm {
+		return nil, fmt.Errorf("permission denied for hr.employee.view")
+	}
+
+	employee, position, err := s.companyRepo.GetEmployeeWithPosition(ctx, companyID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get employee with position: %w", err)
+	}
+
+	result := &models.CompanyEmployeeWithPosition{
+		CompanyEmployee: *employee,
+	}
+
+	// Map position fields if present
+	if position != nil {
+		result.PositionID = &position.PositionID
+		result.PositionTitle = position.Title
+		result.IsOpen = &position.IsOpen
+	}
+
+	s.logger.Info(
+		"Employee with position retrieved",
+		util.String("company_id", companyID.String()),
+		util.String("user_id", userID.String()),
+		util.Bool("has_position", position != nil),
+		util.Duration("duration", time.Since(start)),
+	)
+
+	return result, nil
 }

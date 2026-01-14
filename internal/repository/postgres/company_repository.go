@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"go.uber.org/zap"
 )
@@ -1580,14 +1581,21 @@ func (r *CompanyRepositoryImpl) InitializeDefaultPermissions(ctx context.Context
 func (r *CompanyRepositoryImpl) CreateEmployee(ctx context.Context, employee *models.CompanyEmployee) error {
 	query := `
         INSERT INTO company_employees (
-            company_id, user_id, employee_id, role_id,
+            company_id, user_id, employee_id, role_id, position_id,
             hire_date, is_active, reports_to, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 	_, err := r.client.Exec(ctx, query,
-		employee.CompanyID, employee.UserID, employee.EmployeeID, employee.RoleID,
-		employee.HireDate, employee.IsActive, employee.ReportsTo,
-		employee.CreatedAt, employee.UpdatedAt,
+		employee.CompanyID,
+		employee.UserID,
+		employee.EmployeeID,
+		employee.RoleID,
+		employee.PositionID, // NEW: Include position_id
+		employee.HireDate,
+		employee.IsActive,
+		employee.ReportsTo,
+		employee.CreatedAt,
+		employee.UpdatedAt,
 	)
 
 	if err != nil {
@@ -4534,32 +4542,32 @@ func calculateEfficiency(tuplesRead, tuplesFetched int64) float64 {
 // Update GetEmployee method
 func (r *CompanyRepositoryImpl) GetEmployee(ctx context.Context, companyID, userID uuid.UUID) (*models.CompanyEmployee, error) {
 	query := `
-        SELECT ce.company_id, ce.user_id, ce.employee_id, ce.role_id,
-               ce.hire_date, ce.is_active, ce.reports_to, 
-               ce.created_at, ce.updated_at
-        FROM company_employees ce
-        WHERE ce.company_id = $1 AND ce.user_id = $2`
+        SELECT 
+            company_id, user_id, employee_id, role_id, position_id,
+            hire_date, is_active, reports_to, created_at, updated_at
+        FROM company_employees 
+        WHERE company_id = $1 AND user_id = $2`
 
 	var employee models.CompanyEmployee
-	var reportsTo sql.NullString
-
 	err := r.client.QueryRow(ctx, query, companyID, userID).Scan(
-		&employee.CompanyID, &employee.UserID, &employee.EmployeeID, &employee.RoleID,
-		&employee.HireDate, &employee.IsActive, &reportsTo,
-		&employee.CreatedAt, &employee.UpdatedAt,
+		&employee.CompanyID,
+		&employee.UserID,
+		&employee.EmployeeID,
+		&employee.RoleID,
+		&employee.PositionID, // NEW: Scan position_id
+		&employee.HireDate,
+		&employee.IsActive,
+		&employee.ReportsTo,
+		&employee.CreatedAt,
+		&employee.UpdatedAt,
 	)
 
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == pgx.ErrNoRows {
 			return nil, fmt.Errorf("employee not found")
 		}
 		r.recordError()
 		return nil, fmt.Errorf("failed to get employee: %w", err)
-	}
-
-	if reportsTo.Valid {
-		reportsToID, _ := uuid.Parse(reportsTo.String)
-		employee.ReportsTo = &reportsToID
 	}
 
 	r.recordQuery()
@@ -7040,4 +7048,206 @@ func (r *CompanyRepositoryImpl) ActivateDepartment(
 	)
 
 	return nil
+}
+
+// UpdateEmployeePosition updates an employee's position
+func (r *CompanyRepositoryImpl) UpdateEmployeePosition(ctx context.Context, companyID, userID uuid.UUID, positionID *uuid.UUID) error {
+	query := `
+		UPDATE company_employees 
+		SET position_id = $1, updated_at = $2
+		WHERE company_id = $3 AND user_id = $4
+	`
+
+	result, err := r.client.Exec(ctx, query,
+		positionID,
+		time.Now().UTC(),
+		companyID,
+		userID,
+	)
+
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to update employee position: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("employee not found")
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// GetEmployeeWithPosition gets employee details including position
+func (r *CompanyRepositoryImpl) GetEmployeeWithPosition(ctx context.Context, companyID, userID uuid.UUID) (*models.CompanyEmployee, *models.Position, error) {
+	query := `
+		SELECT 
+			ce.company_id, ce.user_id, ce.employee_id, ce.role_id, 
+			ce.position_id, ce.hire_date, ce.is_active, ce.reports_to,
+			ce.created_at, ce.updated_at,
+			p.position_id, p.company_id as pos_company_id, p.department_id,
+			p.title, p.is_open, p.created_at as pos_created_at, p.updated_at as pos_updated_at
+		FROM company_employees ce
+		LEFT JOIN positions p ON ce.position_id = p.position_id
+		WHERE ce.company_id = $1 AND ce.user_id = $2
+	`
+
+	var (
+		emp      models.CompanyEmployee
+		position *models.Position
+	)
+
+	rows, err := r.client.Query(ctx, query, companyID, userID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to query employee: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var (
+			posPositionID, posCompanyID, posDepartmentID *uuid.UUID
+			posTitle                                     *string
+			posIsOpen                                    *bool
+			posCreatedAt, posUpdatedAt                   *time.Time
+		)
+
+		err := rows.Scan(
+			&emp.CompanyID,
+			&emp.UserID,
+			&emp.EmployeeID,
+			&emp.RoleID,
+			&emp.PositionID,
+			&emp.HireDate,
+			&emp.IsActive,
+			&emp.ReportsTo,
+			&emp.CreatedAt,
+			&emp.UpdatedAt,
+			&posPositionID,
+			&posCompanyID,
+			&posDepartmentID,
+			&posTitle,
+			&posIsOpen,
+			&posCreatedAt,
+			&posUpdatedAt,
+		)
+
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to scan employee: %w", err)
+		}
+
+		// If position data exists
+		if posPositionID != nil {
+			position = &models.Position{
+				PositionID:   *posPositionID,
+				CompanyID:    *posCompanyID,
+				DepartmentID: *posDepartmentID,
+				Title:        *posTitle,
+				IsOpen:       *posIsOpen,
+				CreatedAt:    *posCreatedAt,
+				UpdatedAt:    *posUpdatedAt,
+			}
+		}
+	} else {
+		return nil, nil, fmt.Errorf("employee not found")
+	}
+
+	return &emp, position, nil
+}
+func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error) {
+	start := time.Now()
+
+	if limit <= 0 {
+		limit = DefaultCompanyPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Count total
+	var countQuery string
+	var countArgs []interface{}
+	countArgs = append(countArgs, companyID)
+
+	if isOpen != nil {
+		countQuery = `SELECT COUNT(*) FROM positions WHERE company_id = $1 AND is_open = $2`
+		countArgs = append(countArgs, *isOpen)
+	} else {
+		countQuery = `SELECT COUNT(*) FROM positions WHERE company_id = $1`
+	}
+
+	var totalCount int
+	err := r.client.QueryRow(ctx, countQuery, countArgs...).Scan(&totalCount)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
+	}
+
+	// Query positions
+	query := `
+		SELECT 
+			p.position_id, 
+			p.company_id, 
+			p.department_id, 
+			p.title, 
+			p.is_open, 
+			p.created_at, 
+			p.updated_at
+		FROM positions p
+		INNER JOIN departments d ON p.department_id = d.department_id
+		WHERE p.company_id = $1 AND d.is_active = true
+	`
+
+	var queryArgs []interface{}
+	queryArgs = append(queryArgs, companyID)
+	argCounter := 2
+
+	if isOpen != nil {
+		query += fmt.Sprintf(" AND p.is_open = $%d", argCounter)
+		queryArgs = append(queryArgs, *isOpen)
+		argCounter++
+	}
+
+	query += fmt.Sprintf(" ORDER BY p.created_at DESC LIMIT $%d OFFSET $%d", argCounter, argCounter+1)
+	queryArgs = append(queryArgs, limit, offset)
+
+	rows, err := r.client.Query(ctx, query, queryArgs...)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to query open positions: %w", err)
+	}
+	defer rows.Close()
+
+	var positions []*models.Position
+	for rows.Next() {
+		var position models.Position
+		err := rows.Scan(
+			&position.PositionID,
+			&position.CompanyID,
+			&position.DepartmentID,
+			&position.Title,
+			&position.IsOpen,
+			&position.CreatedAt,
+			&position.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
+			continue
+		}
+		positions = append(positions, &position)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
+	}
+
+	r.recordQuery()
+	r.logger.Debug("GetOpenPositions completed",
+		util.String("company_id", companyID.String()),
+		util.Int("total", totalCount),
+		util.Int("returned", len(positions)),
+		util.Duration("duration", time.Since(start)),
+	)
+
+	return positions, totalCount, nil
 }

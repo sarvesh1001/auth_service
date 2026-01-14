@@ -7018,70 +7018,6 @@ func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// UpdatePosition updates position details
-func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	positionIDStr := chi.URLParam(r, "positionID")
-	positionID, err := uuid.Parse(positionIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-		return
-	}
-
-	var req service.UpdatePositionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Set position ID from URL path
-	req.PositionID = positionID
-
-	// Get existing position to verify company
-	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Position not found")
-		return
-	}
-
-	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("position does not belong to company"),
-			"Cannot update position in another company")
-		return
-	}
-
-	if err := h.companyService.UpdatePosition(ctx, &req, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update position")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position updated successfully"))
-	h.logger.Info("Position updated",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
-
 // ListPositions lists positions with filtering
 func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -8244,4 +8180,79 @@ func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.R
 		util.String("prefix", prefix),
 		util.Int("suggestions", len(suggestions)),
 		util.Duration("duration", time.Since(startTime)))
+}
+
+// handler/admin_handler.go
+// Add these methods to the AdminHandler struct
+
+func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	// Get company ID from context or query
+	companyIDStr := r.URL.Query().Get("company_id")
+	if companyIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			errors.New("COMPANY_ID_REQUIRED"),
+			"company_id is required")
+		return
+	}
+
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	// Parse optional parameters
+	var isOpen *bool
+	if isOpenStr := r.URL.Query().Get("is_open"); isOpenStr != "" {
+		openVal, err := strconv.ParseBool(isOpenStr)
+		if err == nil {
+			isOpen = &openVal
+		}
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+
+	// Get open positions
+	positions, total, err := h.companyService.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to get open positions")
+		return
+	}
+
+	// Format response
+	positionResponses := make([]map[string]interface{}, len(positions))
+	for i, pos := range positions {
+		positionResponses[i] = map[string]interface{}{
+			"position_id":   pos.PositionID.String(),
+			"title":         pos.Title,
+			"is_open":       pos.IsOpen,
+			"department_id": pos.DepartmentID.String(),
+			"company_id":    pos.CompanyID.String(),
+			"created_at":    pos.CreatedAt,
+			"updated_at":    pos.UpdatedAt,
+		}
+	}
+
+	response := map[string]interface{}{
+		"positions": positionResponses,
+		"meta": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+			"count":  len(positions),
+		},
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(response, "Open positions retrieved successfully"))
+
+	h.logger.Info("Open positions retrieved",
+		util.String("company_id", companyID.String()),
+		util.Int("count", len(positions)),
+		util.Duration("duration", time.Since(startTime)),
+	)
 }

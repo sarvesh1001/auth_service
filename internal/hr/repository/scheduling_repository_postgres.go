@@ -2280,3 +2280,19 @@ func (r *SchedulingRepositoryImpl) GetOffUtilizationStats(ctx context.Context, c
 
 	return stats, nil
 }
+
+func (r *SchedulingRepositoryImpl) IsUserActiveInCompany(ctx context.Context, companyID, userID uuid.UUID) (bool, error) {
+	query := `
+        SELECT EXISTS(
+            SELECT 1 
+            FROM company_employees 
+            WHERE company_id = $1 AND user_id = $2 AND is_active = true
+        )`
+
+	var exists bool
+	err := r.client.QueryRow(ctx, query, companyID, userID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check user in company: %w", err)
+	}
+	return exists, nil
+}

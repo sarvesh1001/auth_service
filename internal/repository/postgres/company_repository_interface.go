@@ -372,4 +372,22 @@ type CompanyRepository interface {
 		prefix string,
 		limit int,
 	) ([]*models.Department, error)
+
+	// UpdateEmployeePosition assigns or removes a position for an employee
+	// positionID == nil means "remove position"
+	UpdateEmployeePosition(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		positionID *uuid.UUID,
+	) error
+
+	// GetEmployeeWithPosition retrieves employee details along with position (if any)
+	GetEmployeeWithPosition(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+	) (*models.CompanyEmployee, *models.Position, error)
+
+	GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
 }

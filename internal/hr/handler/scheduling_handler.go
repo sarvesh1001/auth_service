@@ -6,6 +6,7 @@ import (
 	"auth-service/internal/middleware"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -199,10 +200,20 @@ func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http
 }
 
 // User Schedule Assignment
+// User Schedule Assignment
+// User Schedule Assignment
 func (h *SchedulingHandler) AssignUserToTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
+
+	// Extract company ID from URL path - using chi.URLParam
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
 
 	var assignment scheduling.UserScheduleAssignment
 	if err := json.NewDecoder(r.Body).Decode(&assignment); err != nil {
@@ -210,9 +221,22 @@ func (h *SchedulingHandler) AssignUserToTemplate(w http.ResponseWriter, r *http.
 		return
 	}
 
-	err := h.schedulingService.AssignUserToTemplate(ctx, &assignment, actorType, actorID, nil)
+	// Pass company ID to service
+	err = h.schedulingService.AssignUserToTemplate(ctx, companyID, &assignment, actorType, actorID, nil)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		// Return appropriate HTTP status codes
+		if strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, err.Error())
+		} else if strings.Contains(err.Error(), "already has an active assignment") {
+			h.respondWithError(w, http.StatusConflict, err.Error())
+		} else if strings.Contains(err.Error(), "user ID is required") ||
+			strings.Contains(err.Error(), "schedule template ID is required") ||
+			strings.Contains(err.Error(), "user not found") ||
+			strings.Contains(err.Error(), "does not belong to this company") {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+		} else {
+			h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 

@@ -681,9 +681,9 @@ func (f *Factory) GetAuditOutboxService() *service.AuditOutboxService {
 		f.auditOutboxService = service.NewAuditOutboxService(
 			f.PostgresClient(),
 			f.kafkaProducer,
-			500,            // batch size
-			5*time.Second,  // poll interval
-			"audit-events", // Kafka topic
+			500,           // batch size
+			5*time.Second, // poll interval
+			"audit-logs",  // Changed from "audit-events" to "audit-logs"
 		)
 	}
 	return f.auditOutboxService

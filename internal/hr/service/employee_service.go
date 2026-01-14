@@ -59,7 +59,7 @@ func NewEmployeeService(
 	}
 }
 
-// CreateEmployeeProfile creates a new employee profile with audit logging
+// CreateEmployeeProfile creates a new employee profile
 func (s *EmployeeService) CreateEmployeeProfile(
 	ctx context.Context,
 	profile *employee.EmployeeProfile,
@@ -307,7 +307,7 @@ func (s *EmployeeService) UploadEmployeeDocument(
 ) (*employee.EmployeeDocument, error) {
 	startTime := time.Now()
 
-	// ✅ ENFORCE MAX FILE SIZE AT SERVICE LEVEL
+	// 🔒 1. ENFORCE MAX FILE SIZE (cheap check first)
 	if header.Size > int64(s.maxDocumentSizeMB)*1024*1024 {
 		return nil, fmt.Errorf(
 			"file size %d exceeds max allowed size %d MB",
@@ -316,13 +316,31 @@ func (s *EmployeeService) UploadEmployeeDocument(
 		)
 	}
 
-	// Upload to document storage
+	// 🔒 2. VALIDATE USER EXISTS
+	userExists, err := s.employeeRepo.UserExists(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate user existence: %w", err)
+	}
+	if !userExists {
+		return nil, fmt.Errorf("user does not exist")
+	}
+
+	// 🔒 3. VALIDATE USER IS EMPLOYEE OF COMPANY
+	isEmployee, err := s.employeeRepo.IsUserEmployeeOfCompany(ctx, userID, companyID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate employee ownership: %w", err)
+	}
+	if !isEmployee {
+		return nil, fmt.Errorf("user is not an employee of this company")
+	}
+
+	// 📤 4. UPLOAD TO DOCUMENT STORAGE (only after validations)
 	uploadResult, err := s.documentStorage.UploadDocument(ctx, file, header, companyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload document: %w", err)
 	}
 
-	// Create document record
+	// 🧾 5. CREATE DOCUMENT RECORD
 	document := &employee.EmployeeDocument{
 		DocumentID:        uuid.New(),
 		UserID:            userID,
@@ -336,15 +354,15 @@ func (s *EmployeeService) UploadEmployeeDocument(
 		UploadedAt:        &uploadResult.UploadedAt,
 	}
 
-	// Save to repository
+	// 💾 6. SAVE TO DATABASE
 	err = s.employeeRepo.CreateEmployeeDocument(ctx, document)
 	if err != nil {
-		// Cleanup uploaded file if DB write fails
+		// 🧹 CLEANUP UPLOADED FILE IF DB WRITE FAILS
 		_ = s.documentStorage.DeleteDocument(ctx, uploadResult.ObjectKey)
 		return nil, fmt.Errorf("failed to save document record: %w", err)
 	}
 
-	// Audit log
+	// 🧠 7. AUDIT LOG (non-blocking)
 	afterState, _ := util.ToJSON(document)
 
 	auditErr := s.auditService.LogAction(
@@ -360,24 +378,29 @@ func (s *EmployeeService) UploadEmployeeDocument(
 		afterState,
 		metadata,
 	)
-
 	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for document upload",
+		s.logger.Warn(
+			"Failed to log audit entry for document upload",
 			util.String("document_id", document.DocumentID.String()),
-			util.ErrorField(auditErr))
+			util.ErrorField(auditErr),
+		)
 	}
 
-	s.logger.Info("Employee document uploaded",
+	// 📊 8. LOG SUCCESS
+	s.logger.Info(
+		"Employee document uploaded",
 		util.String("document_id", document.DocumentID.String()),
 		util.String("user_id", userID.String()),
 		util.String("company_id", companyID.String()),
 		util.String("document_type", documentType),
 		util.Bool("confidential", isConfidential),
 		util.Int64("file_size", uploadResult.FileSize),
-		util.Duration("duration", time.Since(startTime)))
+		util.Duration("duration", time.Since(startTime)),
+	)
 
 	return document, nil
 }
+
 func (s *EmployeeService) DeleteEmployeeDocument(
 	ctx context.Context,
 	documentID uuid.UUID,
@@ -447,18 +470,31 @@ func (s *EmployeeService) CreateDepartmentAssignment(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeDepartmentHistory, error) {
-	startTime := time.Now()
 
-	// End any existing active assignment
+	startTime := time.Now()
 	now := time.Now().UTC()
-	err := s.employeeRepo.EndDepartmentAssignment(ctx, userID, now.Add(-time.Second))
-	if err != nil && !isNotFoundError(err) {
-		s.logger.Warn("Failed to end existing department assignment",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
+
+	// ---------------------------------------------------------------------
+	// 1. Check current active department
+	// ---------------------------------------------------------------------
+	activeAssignment, err := s.employeeRepo.GetActiveDepartmentAssignment(ctx, userID)
+	if err == nil {
+		// Active assignment exists
+		if activeAssignment.DepartmentID == departmentID {
+			// ❌ SAME department → reject
+			return nil, fmt.Errorf("employee is already assigned to this department")
+		}
+
+		// ✅ Different department → end previous assignment
+		err = s.employeeRepo.EndDepartmentAssignment(ctx, userID, now.Add(-time.Second))
+		if err != nil {
+			return nil, fmt.Errorf("failed to end previous department assignment: %w", err)
+		}
 	}
 
-	// Create new assignment
+	// ---------------------------------------------------------------------
+	// 2. Create new department assignment
+	// ---------------------------------------------------------------------
 	history := &employee.EmployeeDepartmentHistory{
 		ID:           uuid.New(),
 		UserID:       userID,
@@ -475,7 +511,9 @@ func (s *EmployeeService) CreateDepartmentAssignment(
 		return nil, fmt.Errorf("failed to create department assignment: %w", err)
 	}
 
-	// Log audit
+	// ---------------------------------------------------------------------
+	// 3. Audit log
+	// ---------------------------------------------------------------------
 	afterState, _ := util.ToJSON(history)
 
 	auditErr := s.auditService.LogAction(
@@ -503,7 +541,8 @@ func (s *EmployeeService) CreateDepartmentAssignment(
 		util.String("user_id", userID.String()),
 		util.String("department_id", departmentID.String()),
 		util.String("company_id", companyID.String()),
-		util.Duration("duration", time.Since(startTime)))
+		util.Duration("duration", time.Since(startTime)),
+	)
 
 	return history, nil
 }
@@ -519,15 +558,13 @@ func (s *EmployeeService) CreateEmployeeExit(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*employee.EmployeeExit, error) {
-	startTime := time.Now()
 
-	// Check if exit record already exists
-	existing, err := s.employeeRepo.GetEmployeeExitByUserID(ctx, userID, companyID)
-	if err == nil && existing != nil {
-		return nil, fmt.Errorf("employee exit record already exists for user: %s", userID)
+	// Prevent duplicate active exits
+	existing, _ := s.employeeRepo.GetEmployeeExitByUserID(ctx, userID, companyID)
+	if existing != nil && existing.ExitState == "scheduled" {
+		return nil, fmt.Errorf("employee exit already scheduled")
 	}
 
-	// Create exit record
 	exit := &employee.EmployeeExit{
 		ExitID:            uuid.New(),
 		UserID:            userID,
@@ -535,22 +572,21 @@ func (s *EmployeeService) CreateEmployeeExit(
 		ExitDate:          &exitDate,
 		ExitReason:        &exitReason,
 		EligibleForRehire: &eligibleForRehire,
+		ExitState:         "scheduled",
 		CreatedAt:         time.Now().UTC(),
 	}
 
-	err = s.employeeRepo.CreateEmployeeExit(ctx, exit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create employee exit record: %w", err)
+	if err := s.employeeRepo.CreateEmployeeExit(ctx, exit); err != nil {
+		return nil, err
 	}
 
-	// Log audit
 	afterState, _ := util.ToJSON(exit)
 
-	auditErr := s.auditService.LogAction(
+	_ = s.auditService.LogAction(
 		ctx,
 		&companyID,
 		"hr",
-		"employee.exit.create",
+		"employee.exit.schedule",
 		"employee_exit",
 		&exit.ExitID,
 		actorType,
@@ -559,19 +595,6 @@ func (s *EmployeeService) CreateEmployeeExit(
 		afterState,
 		metadata,
 	)
-
-	if auditErr != nil {
-		s.logger.Warn("Failed to log audit entry for employee exit",
-			util.String("exit_id", exit.ExitID.String()),
-			util.ErrorField(auditErr))
-	}
-
-	s.logger.Info("Employee exit record created",
-		util.String("exit_id", exit.ExitID.String()),
-		util.String("user_id", userID.String()),
-		util.String("company_id", companyID.String()),
-		util.Time("exit_date", exitDate),
-		util.Duration("duration", time.Since(startTime)))
 
 	return exit, nil
 }
@@ -658,4 +681,74 @@ func (s *EmployeeService) HealthCheck(ctx context.Context) error {
 func isNotFoundError(err error) bool {
 	return err != nil && (err.Error() == "employee profile not found" ||
 		err.Error() == "no active department assignment found for user")
+}
+
+// GetEmployeeProfileByID returns an employee profile by profile ID
+func (s *EmployeeService) GetEmployeeProfileByID(
+	ctx context.Context,
+	profileID uuid.UUID,
+) (*employee.EmployeeProfile, error) {
+
+	if profileID == uuid.Nil {
+		return nil, fmt.Errorf("employee profile id is required")
+	}
+
+	profile, err := s.employeeRepo.GetEmployeeProfileByID(ctx, profileID)
+	if err != nil {
+		return nil, err
+	}
+
+	return profile, nil
+}
+
+func (s *EmployeeService) EnforceScheduledEmployeeExits(
+	ctx context.Context,
+	effectiveDate time.Time,
+	actorID uuid.UUID,
+) (int, error) {
+
+	count, err := s.employeeRepo.EnforceScheduledEmployeeExits(
+		ctx,
+		effectiveDate,
+		actorID,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	s.logger.Info("Employee exits enforced",
+		util.Int("count", count),
+		util.Time("effective_date", effectiveDate),
+	)
+
+	return count, nil
+}
+
+func (s *EmployeeService) RehireEmployee(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+
+	if err := s.employeeRepo.RehireEmployee(ctx, companyID, userID); err != nil {
+		return err
+	}
+
+	_ = s.auditService.LogAction(
+		ctx,
+		&companyID,
+		"hr",
+		"employee.rehire",
+		"employee_exit",
+		nil,
+		actorType,
+		&actorID,
+		nil,
+		nil,
+		metadata,
+	)
+
+	return nil
 }

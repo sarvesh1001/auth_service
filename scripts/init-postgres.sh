@@ -623,33 +623,32 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
 
     -- Employee Exit (Offboarding & Termination)
     CREATE TABLE employee_exit (
-        exit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL,
-        company_id UUID NOT NULL,
+    exit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL,
+    company_id UUID NOT NULL,
 
-        exit_date DATE,
-        exit_reason TEXT,
-        eligible_for_rehire BOOLEAN,
+    exit_date DATE NOT NULL,
+    exit_reason TEXT,
+    eligible_for_rehire BOOLEAN DEFAULT false,
 
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        
-        CONSTRAINT uq_employee_exit UNIQUE (company_id, user_id),
-        FOREIGN KEY (user_id) REFERENCES users(user_id),
-        FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    exit_state VARCHAR(20) NOT NULL DEFAULT 'scheduled',
+    -- scheduled | effective | cancelled | rehired
+
+    enforced_at TIMESTAMPTZ,
+    enforced_by UUID,
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT uq_employee_exit UNIQUE (company_id, user_id),
+    CONSTRAINT chk_exit_state CHECK (
+        exit_state IN ('scheduled','effective','cancelled','rehired')
+    ),
+
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
     -- Function to deactivate employee on exit
-    CREATE OR REPLACE FUNCTION deactivate_employee_on_exit()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        UPDATE company_employees
-        SET is_active = false
-        WHERE company_id = NEW.company_id
-        AND user_id = NEW.user_id;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
     
     -- ==============================================
     -- SCHEDULING MODULE TABLES
@@ -3097,11 +3096,7 @@ CREATE TABLE work_calendars (
     EXECUTE FUNCTION prevent_position_in_inactive_department();
 
     -- Trigger to deactivate employee on exit
-    CREATE TRIGGER trg_employee_exit_deactivate
-    AFTER INSERT ON employee_exit
-    FOR EACH ROW
-    EXECUTE FUNCTION deactivate_employee_on_exit();
-
+    
     -- Trigger to enforce employee limit
     CREATE TRIGGER trg_enforce_employee_limit
     BEFORE INSERT OR UPDATE OF is_active
@@ -3304,41 +3299,234 @@ CREATE TABLE work_calendars (
     CONSTRAINT fk_ent_user FOREIGN KEY (user_id) REFERENCES users(user_id),
     CONSTRAINT chk_period_type CHECK (period_type IN ('weekly','monthly'))
     );
-CREATE TABLE off_requests (
-    off_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id UUID NOT NULL,
-    user_id UUID NOT NULL,
+    CREATE TABLE off_requests (
+        off_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
 
-    request_dates DATE[] NOT NULL,
-    status VARCHAR(20) DEFAULT 'pending', -- pending | approved | rejected
+        request_dates DATE[] NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending', -- pending | approved | rejected
 
-    requested_by UUID,
-    approved_by UUID,
-    approved_at TIMESTAMPTZ,
+        requested_by UUID,
+        approved_by UUID,
+        approved_at TIMESTAMPTZ,
 
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
 
-    CONSTRAINT fk_or_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_or_user FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-CREATE TABLE schedule_overrides (
-    override_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id UUID NOT NULL,
-    user_id UUID NOT NULL,
-    override_date DATE NOT NULL,
+        CONSTRAINT fk_or_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_or_user FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
+    CREATE TABLE schedule_overrides (
+        override_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+        override_date DATE NOT NULL,
 
-    override_type VARCHAR(20) NOT NULL, -- off | force_work | holiday_override
-    reason TEXT,
+        override_type VARCHAR(20) NOT NULL, -- off | force_work | holiday_override
+        reason TEXT,
 
-    created_by UUID,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+        created_by UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
 
-    UNIQUE (user_id, override_date),
+        UNIQUE (user_id, override_date),
 
-    CONSTRAINT fk_so_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_so_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-    CONSTRAINT chk_override_type CHECK (override_type IN ('off','force_work','holiday_override'))
-);
+        CONSTRAINT fk_so_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
+        CONSTRAINT fk_so_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT chk_override_type CHECK (override_type IN ('off','force_work','holiday_override'))
+    );
+
+            -- Add position_id column to company_employees table if not exists
+        ALTER TABLE company_employees 
+        ADD COLUMN IF NOT EXISTS position_id UUID REFERENCES positions(position_id);
+
+        -- Create index for better performance
+        CREATE INDEX IF NOT EXISTS idx_company_employees_position 
+        ON company_employees (position_id) 
+        WHERE position_id IS NOT NULL;
+
+
+        CREATE OR REPLACE FUNCTION sync_employee_department_on_position()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        new_department_id UUID;
+    BEGIN
+        -- Ignore if position is NULL
+        IF NEW.position_id IS NULL THEN
+            RETURN NEW;
+        END IF;
+
+        -- Get department from position
+        SELECT department_id
+        INTO new_department_id
+        FROM positions
+        WHERE position_id = NEW.position_id;
+
+        -- Close existing active department
+        UPDATE employee_department_history
+        SET end_date = CURRENT_DATE
+        WHERE user_id = NEW.user_id
+        AND company_id = NEW.company_id
+        AND end_date IS NULL;
+
+        -- Insert new department history
+        INSERT INTO employee_department_history (
+            user_id,
+            company_id,
+            department_id,
+            start_date,
+            change_reason
+        ) VALUES (
+            NEW.user_id,
+            NEW.company_id,
+            new_department_id,
+            CURRENT_DATE,
+            CASE
+                WHEN TG_OP = 'INSERT' THEN 'initial position assignment'
+                ELSE 'position change'
+            END
+        );
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+        CREATE TRIGGER trg_sync_department_on_position
+    AFTER INSERT OR UPDATE OF position_id
+    ON company_employees
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_employee_department_on_position();
+    CREATE OR REPLACE FUNCTION sync_employee_role_history()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        -- Close existing active role
+        UPDATE employee_role_history
+        SET end_date = CURRENT_DATE
+        WHERE user_id = NEW.user_id
+        AND end_date IS NULL;
+
+        -- Insert new role
+        INSERT INTO employee_role_history (
+            user_id,
+            role_id,
+            start_date,
+            reason
+        ) VALUES (
+            NEW.user_id,
+            NEW.role_id,
+            CURRENT_DATE,
+            CASE
+                WHEN TG_OP = 'INSERT' THEN 'initial role assignment'
+                ELSE 'role change'
+            END
+        );
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER trg_sync_role_history
+    AFTER INSERT OR UPDATE OF role_id
+    ON company_employees
+    FOR EACH ROW
+    EXECUTE FUNCTION sync_employee_role_history();
+CREATE OR REPLACE FUNCTION enforce_scheduled_employee_exits(
+    p_effective_date DATE DEFAULT CURRENT_DATE,
+    p_enforced_by UUID DEFAULT NULL
+)
+RETURNS INTEGER AS $$
+DECLARE
+    affected_count INTEGER := 0;
+BEGIN
+    ------------------------------------------------------------------
+    -- 1️⃣ Mark scheduled exits as EFFECTIVE (date-based enforcement)
+    ------------------------------------------------------------------
+    UPDATE employee_exit
+    SET exit_state  = 'effective',
+        enforced_at = NOW(),
+        enforced_by = p_enforced_by
+    WHERE exit_state = 'scheduled'
+      AND exit_date <= p_effective_date;
+
+    GET DIAGNOSTICS affected_count = ROW_COUNT;
+
+    ------------------------------------------------------------------
+    -- 2️⃣ Deactivate employees whose exit is now effective
+    ------------------------------------------------------------------
+    UPDATE company_employees ce
+    SET is_active = false
+    FROM employee_exit ee
+    WHERE ce.company_id = ee.company_id
+      AND ce.user_id   = ee.user_id
+      AND ee.exit_state = 'effective'
+      AND ce.is_active  = true;
+
+    ------------------------------------------------------------------
+    -- 3️⃣ (Recommended) Sync employee profile employment status
+    ------------------------------------------------------------------
+    UPDATE employee_profiles ep
+    SET employment_status = 'terminated',
+        updated_at        = NOW()
+    FROM employee_exit ee
+    WHERE ep.company_id = ee.company_id
+      AND ep.user_id    = ee.user_id
+      AND ee.exit_state = 'effective'
+      AND ep.employment_status <> 'terminated';
+
+    ------------------------------------------------------------------
+    -- 4️⃣ Return number of exits enforced
+    ------------------------------------------------------------------
+    RETURN affected_count;
+END;
+$$ LANGUAGE plpgsql;
+   CREATE OR REPLACE FUNCTION mark_employee_rehired(
+    p_company_id UUID,
+    p_user_id UUID
+)
+RETURNS VOID AS $$
+BEGIN
+    UPDATE employee_exit
+    SET exit_state = 'rehired'
+    WHERE company_id = p_company_id
+    AND user_id = p_user_id
+    AND exit_state = 'effective';
+
+    UPDATE company_employees
+    SET is_active = true
+    WHERE company_id = p_company_id
+    AND user_id = p_user_id;
+END;
+$$ LANGUAGE plpgsql;
+ 
+   CREATE OR REPLACE FUNCTION prevent_exit_for_inactive_employee()
+RETURNS TRIGGER AS $$
+DECLARE
+    active_status BOOLEAN;
+BEGIN
+    SELECT is_active
+    INTO active_status
+    FROM company_employees
+    WHERE company_id = NEW.company_id
+    AND user_id = NEW.user_id;
+
+    IF active_status IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'Cannot create exit for inactive employee';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_prevent_exit_for_inactive_employee
+BEFORE INSERT ON employee_exit
+FOR EACH ROW
+EXECUTE FUNCTION prevent_exit_for_inactive_employee();
+
+ALTER TABLE employee_exit
+DROP CONSTRAINT IF EXISTS uq_employee_exit;
+
+CREATE UNIQUE INDEX uq_employee_exit_active
+ON employee_exit (company_id, user_id)
+WHERE exit_state IN ('scheduled','effective');
+
 
 EOSQL
 

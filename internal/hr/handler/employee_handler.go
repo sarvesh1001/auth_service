@@ -53,6 +53,7 @@ func NewEmployeeHandler(
 // ============================================================================
 
 // CreateEmployeeProfileRequest represents the request to create an employee profile
+// CreateEmployeeProfileRequest represents the request to create an employee profile
 type CreateEmployeeProfileRequest struct {
 	UserID           uuid.UUID  `json:"user_id" validate:"required"`
 	DateOfBirth      *time.Time `json:"date_of_birth,omitempty"`
@@ -63,11 +64,11 @@ type CreateEmployeeProfileRequest struct {
 	EmploymentStatus *string    `json:"employment_status,omitempty"`
 	ProbationEndDate *time.Time `json:"probation_end_date,omitempty"`
 	ConfirmationDate *time.Time `json:"confirmation_date,omitempty"`
-	JobTitle         *string    `json:"job_title,omitempty"`
-	Grade            *string    `json:"grade,omitempty"`
-	CostCenter       *string    `json:"cost_center,omitempty"`
-	TaxID            *string    `json:"tax_id,omitempty"`
-	SocialSecurityID *string    `json:"social_security_id,omitempty"`
+	// JobTitle REMOVED - will be fetched from positions table
+	Grade            *string `json:"grade,omitempty"`
+	CostCenter       *string `json:"cost_center,omitempty"`
+	TaxID            *string `json:"tax_id,omitempty"`
+	SocialSecurityID *string `json:"social_security_id,omitempty"`
 }
 
 // CreateEmployeeProfile creates a new employee profile
@@ -103,7 +104,7 @@ func (h *EmployeeHandler) CreateEmployeeProfile(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Create employee profile
+	// Create employee profile (JobTitle will be fetched from positions table)
 	profile := &employee.EmployeeProfile{
 		EmployeeProfileID: uuid.New(),
 		UserID:            req.UserID,
@@ -116,13 +117,13 @@ func (h *EmployeeHandler) CreateEmployeeProfile(w http.ResponseWriter, r *http.R
 		EmploymentStatus:  req.EmploymentStatus,
 		ProbationEndDate:  req.ProbationEndDate,
 		ConfirmationDate:  req.ConfirmationDate,
-		JobTitle:          req.JobTitle,
-		Grade:             req.Grade,
-		CostCenter:        req.CostCenter,
-		TaxID:             req.TaxID,
-		SocialSecurityID:  req.SocialSecurityID,
-		CreatedAt:         time.Now().UTC(),
-		UpdatedAt:         time.Now().UTC(),
+		// JobTitle NOT SET - will be fetched from positions table in repository
+		Grade:            req.Grade,
+		CostCenter:       req.CostCenter,
+		TaxID:            req.TaxID,
+		SocialSecurityID: req.SocialSecurityID,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
 	}
 
 	// Prepare metadata for audit
@@ -909,7 +910,9 @@ func (h *EmployeeHandler) CreateDepartmentAssignment(w http.ResponseWriter, r *h
 	startTime := time.Now()
 	ctx := r.Context()
 
-	// Get company ID from URL params
+	// ---------------------------------------------------------------------
+	// 1. Get company ID from URL
+	// ---------------------------------------------------------------------
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -917,35 +920,54 @@ func (h *EmployeeHandler) CreateDepartmentAssignment(w http.ResponseWriter, r *h
 		return
 	}
 
-	// Get user ID from URL params
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	// ---------------------------------------------------------------------
+	// 2. Get EMPLOYEE PROFILE ID (NOT user ID ❗)
+	// Route: /employees/{employeeID}/department-history
+	// ---------------------------------------------------------------------
+	employeeProfileIDStr := chi.URLParam(r, "employeeID")
+	employeeProfileID, err := uuid.Parse(employeeProfileIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
 		return
 	}
 
-	// Get actor info from context
+	// ---------------------------------------------------------------------
+	// 3. Fetch employee profile → get user_id
+	// ---------------------------------------------------------------------
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+
+	userID := profile.UserID
+
+	// ---------------------------------------------------------------------
+	// 4. Get actor info
+	// ---------------------------------------------------------------------
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse request
+	// ---------------------------------------------------------------------
+	// 5. Parse request body
+	// ---------------------------------------------------------------------
 	var req CreateDepartmentAssignmentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Validate required fields
 	if req.DepartmentID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "Department ID is required")
 		return
 	}
 
-	// Prepare metadata for audit
+	// ---------------------------------------------------------------------
+	// 6. Audit metadata
+	// ---------------------------------------------------------------------
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -953,6 +975,9 @@ func (h *EmployeeHandler) CreateDepartmentAssignment(w http.ResponseWriter, r *h
 		"request_method": r.Method,
 	}
 
+	// ---------------------------------------------------------------------
+	// 7. Create department assignment
+	// ---------------------------------------------------------------------
 	history, err := h.employeeService.CreateDepartmentAssignment(
 		ctx,
 		userID,
@@ -966,13 +991,18 @@ func (h *EmployeeHandler) CreateDepartmentAssignment(w http.ResponseWriter, r *h
 	if err != nil {
 		h.logger.Error("Failed to create department assignment",
 			util.String("company_id", companyID.String()),
+			util.String("employee_profile_id", employeeProfileID.String()),
 			util.String("user_id", userID.String()),
 			util.String("department_id", req.DepartmentID.String()),
 			util.ErrorField(err))
+
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to create department assignment")
 		return
 	}
 
+	// ---------------------------------------------------------------------
+	// 8. Success response
+	// ---------------------------------------------------------------------
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    history,
@@ -988,7 +1018,7 @@ func (h *EmployeeHandler) GetDepartmentHistory(w http.ResponseWriter, r *http.Re
 	startTime := time.Now()
 	ctx := r.Context()
 
-	// Get company ID from URL params
+	// Company ID
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -996,13 +1026,22 @@ func (h *EmployeeHandler) GetDepartmentHistory(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Get user ID from URL params
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	// Employee Profile ID (NOT user ID)
+	employeeProfileIDStr := chi.URLParam(r, "employeeID")
+	employeeProfileID, err := uuid.Parse(employeeProfileIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
 		return
 	}
+
+	// Resolve user_id from profile
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+
+	userID := profile.UserID
 
 	history, err := h.employeeQueryService.GetDepartmentHistory(ctx, userID, companyID)
 	if err != nil {
@@ -1040,7 +1079,9 @@ func (h *EmployeeHandler) CreateEmployeeExit(w http.ResponseWriter, r *http.Requ
 	startTime := time.Now()
 	ctx := r.Context()
 
-	// Get company ID from URL params
+	// ---------------------------------------------------------------------
+	// 1. Get company ID from URL params
+	// ---------------------------------------------------------------------
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1048,35 +1089,57 @@ func (h *EmployeeHandler) CreateEmployeeExit(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Get user ID from URL params
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	// ---------------------------------------------------------------------
+	// 2. Get EMPLOYEE PROFILE ID (NOT user ID ❗)
+	// Route: /companies/{companyId}/hr/employees/{employeeID}/exit
+	// ---------------------------------------------------------------------
+	employeeProfileIDStr := chi.URLParam(r, "employeeID")
+	employeeProfileID, err := uuid.Parse(employeeProfileIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
 		return
 	}
 
-	// Get actor info from context
+	// ---------------------------------------------------------------------
+	// 3. Resolve user_id from employee profile
+	// ---------------------------------------------------------------------
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+
+	userID := profile.UserID
+
+	// ---------------------------------------------------------------------
+	// 4. Get actor info
+	// ---------------------------------------------------------------------
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse request
+	// ---------------------------------------------------------------------
+	// 5. Parse request body
+	// ---------------------------------------------------------------------
 	var req CreateEmployeeExitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Validate exit date
+	// ---------------------------------------------------------------------
+	// 6. Validate request
+	// ---------------------------------------------------------------------
 	if req.ExitDate.IsZero() {
 		h.respondWithError(w, http.StatusBadRequest, "Exit date is required")
 		return
 	}
 
-	// Prepare metadata for audit
+	// ---------------------------------------------------------------------
+	// 7. Prepare audit metadata
+	// ---------------------------------------------------------------------
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -1084,6 +1147,9 @@ func (h *EmployeeHandler) CreateEmployeeExit(w http.ResponseWriter, r *http.Requ
 		"request_method": r.Method,
 	}
 
+	// ---------------------------------------------------------------------
+	// 8. Create employee exit record
+	// ---------------------------------------------------------------------
 	exit, err := h.employeeService.CreateEmployeeExit(
 		ctx,
 		userID,
@@ -1098,16 +1164,23 @@ func (h *EmployeeHandler) CreateEmployeeExit(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			h.respondWithError(w, http.StatusConflict, "Employee exit record already exists")
-		} else {
-			h.logger.Error("Failed to create employee exit record",
-				util.String("company_id", companyID.String()),
-				util.String("user_id", userID.String()),
-				util.ErrorField(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to create employee exit record")
+			return
 		}
+
+		h.logger.Error("Failed to create employee exit record",
+			util.String("company_id", companyID.String()),
+			util.String("employee_profile_id", employeeProfileID.String()),
+			util.String("user_id", userID.String()),
+			util.ErrorField(err),
+		)
+
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to create employee exit record")
 		return
 	}
 
+	// ---------------------------------------------------------------------
+	// 9. Success response
+	// ---------------------------------------------------------------------
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    exit,
@@ -1123,7 +1196,7 @@ func (h *EmployeeHandler) GetEmployeeExit(w http.ResponseWriter, r *http.Request
 	startTime := time.Now()
 	ctx := r.Context()
 
-	// Get company ID from URL params
+	// Company ID
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1131,13 +1204,22 @@ func (h *EmployeeHandler) GetEmployeeExit(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Get user ID from URL params
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	// Employee Profile ID
+	employeeProfileIDStr := chi.URLParam(r, "employeeID")
+	employeeProfileID, err := uuid.Parse(employeeProfileIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
 		return
 	}
+
+	// Resolve user_id
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+
+	userID := profile.UserID
 
 	exit, err := h.employeeQueryService.GetEmployeeExit(ctx, userID, companyID)
 	if err != nil {
@@ -1316,13 +1398,22 @@ func (h *EmployeeHandler) GetRoleHistory(w http.ResponseWriter, r *http.Request)
 	startTime := time.Now()
 	ctx := r.Context()
 
-	// Get user ID from URL params
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	// Employee Profile ID
+	employeeProfileIDStr := chi.URLParam(r, "employeeID")
+	employeeProfileID, err := uuid.Parse(employeeProfileIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid employee profile ID")
 		return
 	}
+
+	// Resolve user_id
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+
+	userID := profile.UserID
 
 	history, err := h.employeeQueryService.GetRoleHistory(ctx, userID)
 	if err != nil {
@@ -1493,5 +1584,84 @@ func (h *EmployeeHandler) respondWithError(w http.ResponseWriter, statusCode int
 		"success": false,
 		"error":   message,
 		"code":    statusCode,
+	})
+}
+
+func (h *EmployeeHandler) EnforceEmployeeExits(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType, actorID, err := h.getActorInfo(ctx)
+	if err != nil || actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "Admin access required")
+		return
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	effectiveDate := time.Now().UTC()
+
+	if dateStr != "" {
+		effectiveDate, err = time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
+			return
+		}
+	}
+
+	count, err := h.employeeService.EnforceScheduledEmployeeExits(
+		ctx,
+		effectiveDate,
+		actorID,
+	)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to enforce exits")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Employee exits enforced",
+		"data": map[string]interface{}{
+			"affected_count": count,
+			"effective_date": effectiveDate,
+		},
+	})
+}
+
+func (h *EmployeeHandler) RehireEmployee(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyID := ctx.Value("company_id").(uuid.UUID)
+
+	employeeProfileIDStr := chi.URLParam(r, "employeeID")
+	employeeProfileID, _ := uuid.Parse(employeeProfileIDStr)
+
+	profile, err := h.employeeService.GetEmployeeProfileByID(ctx, employeeProfileID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Employee profile not found")
+		return
+	}
+
+	actorType, actorID, _ := h.getActorInfo(ctx)
+
+	metadata := map[string]interface{}{
+		"endpoint": r.URL.Path,
+		"method":   r.Method,
+	}
+
+	if err := h.employeeService.RehireEmployee(
+		ctx,
+		companyID,
+		profile.UserID,
+		actorType,
+		actorID,
+		metadata,
+	); err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to rehire employee")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Employee rehired successfully",
 	})
 }

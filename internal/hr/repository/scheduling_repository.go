@@ -83,7 +83,7 @@ type SchedulingRepository interface {
 	UpdateScheduleOverride(ctx context.Context, override *scheduling.ScheduleOverride) error
 	DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID) error
 	CheckScheduleOverrideConflict(ctx context.Context, userID uuid.UUID, date time.Time, excludeOverrideID *uuid.UUID) (bool, error)
-
+	IsUserActiveInCompany(ctx context.Context, companyID, userID uuid.UUID) (bool, error)
 	// Statistics
 	GetOffBalance(ctx context.Context, userID uuid.UUID, periodType string, startDate, endDate time.Time) (int, error)
 	GetOffUtilizationStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)

@@ -296,3 +296,12 @@ func RespondWithError(w http.ResponseWriter, status int, message string) {
 		"error":   message,
 	})
 }
+
+// SafeString safely dereferences a *string for logging or JSON
+// Returns empty string if nil
+func SafeString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}

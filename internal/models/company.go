@@ -584,3 +584,35 @@ type DepartmentSearchResult struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+type CompanyEmployeeWithPosition struct {
+	CompanyEmployee
+	PositionTitle string     `db:"position_title" json:"position_title"`
+	PositionID    *uuid.UUID `db:"position_id" json:"position_id,omitempty"`
+	IsOpen        *bool      `db:"is_open" json:"is_open,omitempty"`
+}
+
+type PositionResponse struct {
+	PositionID   string    `json:"position_id"`
+	Title        string    `json:"title"`
+	IsOpen       bool      `json:"is_open"`
+	DepartmentID string    `json:"department_id"`
+	CompanyID    string    `json:"company_id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type OpenPositionsRequest struct {
+	CompanyID uuid.UUID `json:"company_id" validate:"required"`
+	IsOpen    *bool     `json:"is_open,omitempty"`
+	Limit     *int      `json:"limit,omitempty"`
+	Offset    *int      `json:"offset,omitempty"`
+}
+
+type PositionsByDepartmentRequest struct {
+	CompanyID    uuid.UUID `json:"company_id" validate:"required"`
+	DepartmentID uuid.UUID `json:"department_id" validate:"required"`
+	IsOpen       *bool     `json:"is_open,omitempty"`
+	Limit        *int      `json:"limit,omitempty"`
+	Offset       *int      `json:"offset,omitempty"`
+}

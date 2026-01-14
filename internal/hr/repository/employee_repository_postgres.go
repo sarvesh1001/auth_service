@@ -6,12 +6,14 @@ import (
 	"auth-service/internal/util"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v4"
 	"go.uber.org/zap"
 )
 
@@ -38,9 +40,29 @@ func NewEmployeeRepository(postgresClient *client.PostgresClient, logger *zap.Lo
 // ============================================================================
 // EMPLOYEE PROFILE METHODS
 // ============================================================================
-
 func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, profile *employee.EmployeeProfile) error {
 	startTime := time.Now()
+
+	// First, get the position title from the positions table using position_id from company_employees
+	var jobTitle *string
+	queryGetTitle := `
+		SELECT p.title 
+		FROM company_employees ce
+		LEFT JOIN positions p ON ce.position_id = p.position_id
+		WHERE ce.user_id = $1 AND ce.company_id = $2
+		LIMIT 1`
+
+	err := r.client.QueryRow(ctx, queryGetTitle, profile.UserID, profile.CompanyID).Scan(&jobTitle)
+	if err != nil && err != pgx.ErrNoRows {
+		r.logger.Error("Failed to get position title",
+			util.String("user_id", profile.UserID.String()),
+			util.String("company_id", profile.CompanyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to get position title: %w", err)
+	}
+
+	// Use the fetched job title (could be NULL if no position assigned)
+	profile.JobTitle = jobTitle
 
 	query := `
 		INSERT INTO employee_profiles (
@@ -50,7 +72,7 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 			tax_id, social_security_id, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
 
-	_, err := r.client.Exec(ctx, query,
+	_, err = r.client.Exec(ctx, query,
 		profile.EmployeeProfileID,
 		profile.UserID,
 		profile.CompanyID,
@@ -62,7 +84,7 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 		profile.EmploymentStatus,
 		profile.ProbationEndDate,
 		profile.ConfirmationDate,
-		profile.JobTitle,
+		jobTitle, // Use the fetched title
 		profile.Grade,
 		profile.CostCenter,
 		profile.TaxID,
@@ -82,11 +104,11 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 	r.logger.Debug("Employee profile created",
 		util.String("profile_id", profile.EmployeeProfileID.String()),
 		util.String("user_id", profile.UserID.String()),
+		util.String("job_title", util.SafeString(jobTitle)),
 		util.Duration("duration", time.Since(startTime)))
 
 	return nil
 }
-
 func (r *EmployeeRepositoryImpl) GetEmployeeProfileByID(ctx context.Context, profileID uuid.UUID) (*employee.EmployeeProfile, error) {
 	stmt, ok := r.getStmt("get_employee_profile_by_id")
 	if !ok {
@@ -606,13 +628,20 @@ func (r *EmployeeRepositoryImpl) DeleteEmployeeDocument(ctx context.Context, doc
 // ============================================================================
 // EMPLOYEE EXIT METHODS
 // ============================================================================
-
 func (r *EmployeeRepositoryImpl) CreateEmployeeExit(ctx context.Context, exit *employee.EmployeeExit) error {
 	query := `
-		INSERT INTO employee_exit (
-			exit_id, user_id, company_id, exit_date, exit_reason, 
-			eligible_for_rehire, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	INSERT INTO employee_exit (
+		exit_id,
+		user_id,
+		company_id,
+		exit_date,
+		exit_reason,
+		eligible_for_rehire,
+		exit_state,
+		created_at
+	)
+	VALUES ($1, $2, $3, $4, $5, $6, 'scheduled', $7)
+	`
 
 	_, err := r.client.Exec(ctx, query,
 		exit.ExitID,
@@ -625,18 +654,31 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeExit(ctx context.Context, exit *e
 	)
 
 	if err != nil {
-		return fmt.Errorf("failed to create employee exit record: %w", err)
+		return fmt.Errorf("failed to create employee exit: %w", err)
 	}
-
 	return nil
 }
 
-func (r *EmployeeRepositoryImpl) GetEmployeeExitByID(ctx context.Context, exitID uuid.UUID) (*employee.EmployeeExit, error) {
+func (r *EmployeeRepositoryImpl) GetEmployeeExitByID(
+	ctx context.Context,
+	exitID uuid.UUID,
+) (*employee.EmployeeExit, error) {
+
 	query := `
-		SELECT exit_id, user_id, company_id, exit_date, exit_reason, 
-		       eligible_for_rehire, created_at
-		FROM employee_exit 
-		WHERE exit_id = $1`
+		SELECT
+			exit_id,
+			user_id,
+			company_id,
+			exit_date,
+			exit_reason,
+			eligible_for_rehire,
+			exit_state,
+			enforced_at,
+			enforced_by,
+			created_at
+		FROM employee_exit
+		WHERE exit_id = $1
+	`
 
 	rows, err := r.client.Query(ctx, query, exitID)
 	if err != nil {
@@ -650,13 +692,26 @@ func (r *EmployeeRepositoryImpl) GetEmployeeExitByID(ctx context.Context, exitID
 
 	return nil, fmt.Errorf("employee exit record not found: %s", exitID)
 }
+func (r *EmployeeRepositoryImpl) GetEmployeeExitByUserID(
+	ctx context.Context,
+	userID, companyID uuid.UUID,
+) (*employee.EmployeeExit, error) {
 
-func (r *EmployeeRepositoryImpl) GetEmployeeExitByUserID(ctx context.Context, userID, companyID uuid.UUID) (*employee.EmployeeExit, error) {
 	query := `
-		SELECT exit_id, user_id, company_id, exit_date, exit_reason, 
-		       eligible_for_rehire, created_at
-		FROM employee_exit 
-		WHERE user_id = $1 AND company_id = $2`
+		SELECT
+			exit_id,
+			user_id,
+			company_id,
+			exit_date,
+			exit_reason,
+			eligible_for_rehire,
+			exit_state,
+			enforced_at,
+			enforced_by,
+			created_at
+		FROM employee_exit
+		WHERE user_id = $1 AND company_id = $2
+	`
 
 	rows, err := r.client.Query(ctx, query, userID, companyID)
 	if err != nil {
@@ -1435,9 +1490,13 @@ func (r *EmployeeRepositoryImpl) scanEmployeeDocument(rows *sql.Rows) (*employee
 
 func (r *EmployeeRepositoryImpl) scanEmployeeExit(rows *sql.Rows) (*employee.EmployeeExit, error) {
 	var exit employee.EmployeeExit
+
 	var exitDate sql.NullTime
 	var exitReason sql.NullString
 	var eligibleForRehire sql.NullBool
+	var exitState string
+	var enforcedAt sql.NullTime
+	var enforcedBy sql.NullString
 
 	err := rows.Scan(
 		&exit.ExitID,
@@ -1446,13 +1505,16 @@ func (r *EmployeeRepositoryImpl) scanEmployeeExit(rows *sql.Rows) (*employee.Emp
 		&exitDate,
 		&exitReason,
 		&eligibleForRehire,
+		&exitState,
+		&enforcedAt,
+		&enforcedBy,
 		&exit.CreatedAt,
 	)
-
 	if err != nil {
 		return nil, err
 	}
 
+	// Nullable mappings
 	if exitDate.Valid {
 		exit.ExitDate = &exitDate.Time
 	}
@@ -1462,6 +1524,16 @@ func (r *EmployeeRepositoryImpl) scanEmployeeExit(rows *sql.Rows) (*employee.Emp
 	if eligibleForRehire.Valid {
 		exit.EligibleForRehire = &eligibleForRehire.Bool
 	}
+	if enforcedAt.Valid {
+		exit.EnforcedAt = &enforcedAt.Time
+	}
+	if enforcedBy.Valid && enforcedBy.String != "" {
+		if id, err := uuid.Parse(enforcedBy.String); err == nil {
+			exit.EnforcedBy = &id
+		}
+	}
+
+	exit.ExitState = exitState
 
 	return &exit, nil
 }
@@ -1605,4 +1677,145 @@ func (r *EmployeeRepositoryImpl) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("HR employee repository health check failed: %w", err)
 	}
 	return nil
+}
+
+func (r *EmployeeRepositoryImpl) UserExists(
+	ctx context.Context,
+	userID uuid.UUID,
+) (bool, error) {
+	var exists bool
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM users
+			WHERE user_id = $1
+		)
+	`
+
+	err := r.client.QueryRow(ctx, query, userID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
+}
+
+func (r *EmployeeRepositoryImpl) IsUserEmployeeOfCompany(
+	ctx context.Context,
+	userID, companyID uuid.UUID,
+) (bool, error) {
+	var exists bool
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM company_employees
+			WHERE user_id = $1
+			  AND company_id = $2
+			  AND is_active = true
+		)
+	`
+
+	err := r.client.QueryRow(ctx, query, userID, companyID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
+}
+func (r *EmployeeRepositoryImpl) GetActiveDepartmentAssignment(
+	ctx context.Context,
+	userID uuid.UUID,
+) (*employee.EmployeeDepartmentHistory, error) {
+
+	query := `
+		SELECT 
+			id,
+			user_id,
+			company_id,
+			department_id,
+			start_date,
+			end_date,
+			change_reason,
+			created_at
+		FROM employee_department_history
+		WHERE user_id = $1
+		  AND end_date IS NULL
+		LIMIT 1
+	`
+
+	row := r.client.QueryRow(ctx, query, userID)
+
+	var history employee.EmployeeDepartmentHistory
+	err := row.Scan(
+		&history.ID,
+		&history.UserID,
+		&history.CompanyID,
+		&history.DepartmentID,
+		&history.StartDate,
+		&history.EndDate,
+		&history.ChangeReason,
+		&history.CreatedAt,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("no active department assignment found")
+		}
+		return nil, fmt.Errorf("failed to get active department assignment: %w", err)
+	}
+
+	return &history, nil
+}
+
+func (r *EmployeeRepositoryImpl) EnforceScheduledEmployeeExits(
+	ctx context.Context,
+	effectiveDate time.Time,
+	enforcedBy uuid.UUID,
+) (int, error) {
+
+	query := `SELECT enforce_scheduled_employee_exits($1, $2)`
+	var count int
+
+	err := r.client.QueryRow(ctx, query, effectiveDate, enforcedBy).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (r *EmployeeRepositoryImpl) RehireEmployee(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+) error {
+
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx, `
+		UPDATE employee_exit
+		SET exit_state = 'rehired'
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND exit_state = 'effective'
+	`, companyID, userID)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		UPDATE company_employees
+		SET is_active = true
+		WHERE company_id = $1
+		  AND user_id = $2
+	`, companyID, userID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
