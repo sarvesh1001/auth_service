@@ -1046,7 +1046,6 @@ func (s *schedulingServiceImpl) RemoveUserScheduleAssignment(
 // ============================================================================
 // SCHEDULE INSTANCE MANAGEMENT
 // ============================================================================
-
 func (s *schedulingServiceImpl) CreateScheduleInstance(
 	ctx context.Context,
 	instance *scheduling.ScheduleInstance,
@@ -1056,62 +1055,160 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 ) (*scheduling.ScheduleInstance, error) {
 	startTime := time.Now()
 
-	// Validate instance
-	if err := s.validateScheduleInstance(instance); err != nil {
-		return nil, fmt.Errorf("schedule instance validation failed: %w", err)
+	// Get user's current schedule assignment for the given date
+	assignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(ctx, instance.UserID, instance.ScheduleDate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user schedule assignment: %w", err)
 	}
-
-	// Generate instance ID if not provided
-	if instance.ScheduleInstanceID == uuid.Nil {
-		instance.ScheduleInstanceID = uuid.New()
-	}
-
-	// Set timestamps
-	now := time.Now().UTC()
-	if instance.GeneratedAt.IsZero() {
-		instance.GeneratedAt = now
-	}
-
-	// Check for duplicate instance for user on same date
-	existingInstance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, instance.UserID, instance.ScheduleDate)
-	if err == nil && existingInstance != nil {
-		return nil, fmt.Errorf("schedule instance already exists for user on %s",
+	if assignment == nil {
+		return nil, fmt.Errorf("no active schedule assignment found for user on %s",
 			instance.ScheduleDate.Format("2006-01-02"))
 	}
 
-	// Validate template exists
+	instance.ScheduleTemplateID = assignment.ScheduleTemplateID
+
+	// Get template and calendar
 	template, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, instance.ScheduleTemplateID)
 	if err != nil {
 		return nil, fmt.Errorf("schedule template not found: %w", err)
 	}
 
-	// Validate template belongs to same company
+	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, template.CalendarID)
+	if err != nil {
+		return nil, fmt.Errorf("work calendar not found: %w", err)
+	}
+
+	instance.Timezone = calendar.Timezone
+	instance.Metadata = scheduling.InstanceMetadata{}
+
+	// Validate the instance
+	if err := s.validateScheduleInstance(instance); err != nil {
+		return nil, fmt.Errorf("schedule instance validation failed: %w", err)
+	}
+
+	// Set UUID if not provided
+	if instance.ScheduleInstanceID == uuid.Nil {
+		instance.ScheduleInstanceID = uuid.New()
+	}
+
+	// Set generation timestamp if not provided
+	now := time.Now().UTC()
+	if instance.GeneratedAt.IsZero() {
+		instance.GeneratedAt = now
+	}
+
+	// Check for existing instance
+	existingInstance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, instance.UserID, instance.ScheduleDate)
+	if err == nil && existingInstance != nil {
+		// ============================================
+		// UPDATE EXISTING INSTANCE (OVERWRITE)
+		// ============================================
+		beforeState, _ := json.Marshal(existingInstance)
+
+		// Update the existing instance with new values
+		// Keep the original ScheduleInstanceID, CompanyID, UserID, ScheduleDate, and GeneratedAt
+		existingInstance.ScheduleTemplateID = instance.ScheduleTemplateID
+		existingInstance.ExpectedStart = instance.ExpectedStart
+		existingInstance.ExpectedEnd = instance.ExpectedEnd
+		existingInstance.Timezone = instance.Timezone
+
+		// Merge metadata instead of replacing if you want to preserve existing metadata
+		// For now, we'll replace with empty metadata as per original behavior
+		existingInstance.Metadata = scheduling.InstanceMetadata{}
+
+		// Calculate expected times if not provided
+		if existingInstance.ExpectedStart == nil || existingInstance.ExpectedEnd == nil {
+			if err := s.calculateExpectedTimes(existingInstance, template); err != nil {
+				return nil, fmt.Errorf("failed to calculate expected times: %w", err)
+			}
+		}
+
+		// Validate the updated instance
+		if err := s.validateScheduleInstance(existingInstance); err != nil {
+			return nil, fmt.Errorf("schedule instance validation failed: %w", err)
+		}
+
+		// Check for schedule conflict, excluding the current instance
+		if existingInstance.ExpectedStart != nil && existingInstance.ExpectedEnd != nil {
+			hasConflict, err := s.ValidateScheduleConflict(ctx, existingInstance.UserID,
+				*existingInstance.ExpectedStart, *existingInstance.ExpectedEnd,
+				&existingInstance.ScheduleInstanceID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to check schedule conflict: %w", err)
+			}
+			if hasConflict {
+				return nil, fmt.Errorf("schedule conflict detected")
+			}
+		}
+
+		// Update in repository
+		err = s.schedulingRepo.UpdateScheduleInstance(ctx, existingInstance)
+		if err != nil {
+			s.logger.Error("Failed to update schedule instance",
+				util.String("instance_id", existingInstance.ScheduleInstanceID.String()),
+				util.ErrorField(err))
+			return nil, fmt.Errorf("failed to update schedule instance: %w", err)
+		}
+
+		// Audit log for update
+		if s.auditService != nil {
+			go func() {
+				auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				afterState, _ := json.Marshal(existingInstance)
+				s.auditService.LogAction(auditCtx,
+					&existingInstance.CompanyID,
+					"scheduling",
+					"schedule_instance.update",
+					"schedule_instance",
+					&existingInstance.ScheduleInstanceID,
+					actorType,
+					&actorID,
+					beforeState,
+					afterState,
+					metadata,
+				)
+			}()
+		}
+
+		s.logger.Info("Schedule instance updated (overwritten)",
+			util.String("instance_id", existingInstance.ScheduleInstanceID.String()),
+			util.String("user_id", existingInstance.UserID.String()),
+			util.String("template_id", existingInstance.ScheduleTemplateID.String()),
+			util.String("date", existingInstance.ScheduleDate.Format("2006-01-02")),
+			util.Duration("duration", time.Since(startTime)))
+
+		return existingInstance, nil
+	}
+
+	// ============================================
+	// CREATE NEW INSTANCE (NO EXISTING INSTANCE)
+	// ============================================
+
+	// Validate template belongs to company
 	if template.CompanyID != instance.CompanyID {
 		return nil, fmt.Errorf("template does not belong to company")
 	}
 
-	// Validate timezone
-	if err := s.validateTimezone(instance.Timezone); err != nil {
-		return nil, fmt.Errorf("invalid timezone: %w", err)
-	}
-
-	// Calculate expected start/end times if not provided
+	// Calculate expected times if not provided
 	if instance.ExpectedStart == nil || instance.ExpectedEnd == nil {
 		if err := s.calculateExpectedTimes(instance, template); err != nil {
 			return nil, fmt.Errorf("failed to calculate expected times: %w", err)
 		}
 	}
 
-	// Check for schedule conflicts
-	hasConflict, err := s.ValidateScheduleConflict(ctx, instance.UserID, *instance.ExpectedStart, *instance.ExpectedEnd, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check schedule conflict: %w", err)
-	}
-	if hasConflict {
-		return nil, fmt.Errorf("schedule conflict detected")
+	// Check for schedule conflict
+	if instance.ExpectedStart != nil && instance.ExpectedEnd != nil {
+		hasConflict, err := s.ValidateScheduleConflict(ctx, instance.UserID, *instance.ExpectedStart, *instance.ExpectedEnd, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check schedule conflict: %w", err)
+		}
+		if hasConflict {
+			return nil, fmt.Errorf("schedule conflict detected")
+		}
 	}
 
-	// Create instance
+	// Create new instance
 	err = s.schedulingRepo.CreateScheduleInstance(ctx, instance)
 	if err != nil {
 		s.logger.Error("Failed to create schedule instance",
@@ -1121,12 +1218,11 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 		return nil, fmt.Errorf("failed to create schedule instance: %w", err)
 	}
 
-	// Log audit action
+	// Audit log for create
 	if s.auditService != nil {
 		go func() {
 			auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-
 			instanceJSON, _ := json.Marshal(instance)
 			s.auditService.LogAction(auditCtx,
 				&instance.CompanyID,
@@ -1152,7 +1248,6 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 
 	return instance, nil
 }
-
 func (s *schedulingServiceImpl) UpdateScheduleInstance(
 	ctx context.Context,
 	instanceID uuid.UUID,
@@ -1300,7 +1395,6 @@ func (s *schedulingServiceImpl) DeleteScheduleInstance(
 
 	return nil
 }
-
 func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 	ctx context.Context,
 	instances []*scheduling.ScheduleInstance,
@@ -1316,48 +1410,45 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 
 	companyID := instances[0].CompanyID
 
-	// Validate all instances before batch insert
+	// Process each instance
 	for i, instance := range instances {
-		// Validate each instance
 		if err := s.validateScheduleInstance(instance); err != nil {
 			return fmt.Errorf("instance %d validation failed: %w", i, err)
 		}
 
-		// Generate instance ID if not provided
 		if instance.ScheduleInstanceID == uuid.Nil {
 			instance.ScheduleInstanceID = uuid.New()
 		}
 
-		// Set timestamps
 		now := time.Now().UTC()
 		if instance.GeneratedAt.IsZero() {
 			instance.GeneratedAt = now
 		}
 
-		// Check for duplicate instance for user on same date
+		// Check if instance already exists
 		existingInstance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, instance.UserID, instance.ScheduleDate)
 		if err == nil && existingInstance != nil {
-			return fmt.Errorf("instance %d: schedule already exists for user %s on %s",
-				i, instance.UserID, instance.ScheduleDate.Format("2006-01-02"))
+			// Update existing instance
+			existingInstance.ExpectedStart = instance.ExpectedStart
+			existingInstance.ExpectedEnd = instance.ExpectedEnd
+			existingInstance.Timezone = instance.Timezone
+			existingInstance.Metadata = instance.Metadata
+
+			if err := s.schedulingRepo.UpdateScheduleInstance(ctx, existingInstance); err != nil {
+				return fmt.Errorf("instance %d: failed to update existing schedule: %w", i, err)
+			}
+		} else {
+			// Create new instance
+			if err := s.schedulingRepo.CreateScheduleInstance(ctx, instance); err != nil {
+				return fmt.Errorf("instance %d: failed to create schedule: %w", i, err)
+			}
 		}
 	}
 
-	// Create instances in batch
-	err := s.schedulingRepo.BulkCreateScheduleInstances(ctx, instances)
-	if err != nil {
-		s.logger.Error("Failed to create bulk schedule instances",
-			util.Int("instance_count", len(instances)),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to create bulk schedule instances: %w", err)
-	}
-
-	// Log audit action (single audit for bulk operation)
 	if s.auditService != nil {
 		go func() {
 			auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-
 			s.auditService.LogAction(auditCtx,
 				&companyID,
 				"scheduling",
@@ -1377,7 +1468,7 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 		}()
 	}
 
-	s.logger.Info("Bulk schedule instances created",
+	s.logger.Info("Bulk schedule instances created/updated",
 		util.Int("instance_count", len(instances)),
 		util.String("company_id", companyID.String()),
 		util.String("actor_type", actorType),
@@ -1733,12 +1824,9 @@ func (s *schedulingServiceImpl) validateScheduleInstance(instance *scheduling.Sc
 	if instance.Timezone == "" {
 		return fmt.Errorf("timezone is required")
 	}
-
-	// Validate date is not in the past (optional business rule)
 	if instance.ScheduleDate.Before(time.Now().AddDate(0, 0, -1)) {
 		return fmt.Errorf("cannot schedule in the past")
 	}
-
 	return nil
 }
 
@@ -1769,14 +1857,12 @@ func (s *schedulingServiceImpl) validateScheduleGenerationConfig(config Schedule
 
 	return nil
 }
-
 func (s *schedulingServiceImpl) calculateExpectedTimes(instance *scheduling.ScheduleInstance, template *scheduling.ScheduleTemplate) error {
 	loc, err := time.LoadLocation(instance.Timezone)
 	if err != nil {
 		loc = time.UTC
 	}
 
-	// Parse the schedule date in the instance timezone
 	scheduleDate := time.Date(instance.ScheduleDate.Year(), instance.ScheduleDate.Month(),
 		instance.ScheduleDate.Day(), 0, 0, 0, 0, loc)
 
@@ -1785,39 +1871,29 @@ func (s *schedulingServiceImpl) calculateExpectedTimes(instance *scheduling.Sche
 		if template.Rules.StartTime != nil && template.Rules.EndTime != nil {
 			startTime, _ := time.Parse("15:04", *template.Rules.StartTime)
 			endTime, _ := time.Parse("15:04", *template.Rules.EndTime)
-
 			expectedStart := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
 				startTime.Hour(), startTime.Minute(), 0, 0, loc)
 			expectedEnd := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
 				endTime.Hour(), endTime.Minute(), 0, 0, loc)
-
 			instance.ExpectedStart = &expectedStart
 			instance.ExpectedEnd = &expectedEnd
 		}
-
 	case "shift":
-		// For shift templates, we might need additional logic
-		// This is a simplified example
 		defaultStart := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
 			9, 0, 0, 0, loc)
 		defaultEnd := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
 			17, 0, 0, 0, loc)
-
 		instance.ExpectedStart = &defaultStart
 		instance.ExpectedEnd = &defaultEnd
-
 	case "class":
-		// For class templates, use the first period as default
 		if len(template.Rules.Periods) > 0 {
 			period := template.Rules.Periods[0]
 			startTime, _ := time.Parse("15:04", period.Start)
 			endTime, _ := time.Parse("15:04", period.End)
-
 			expectedStart := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
 				startTime.Hour(), startTime.Minute(), 0, 0, loc)
 			expectedEnd := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
 				endTime.Hour(), endTime.Minute(), 0, 0, loc)
-
 			instance.ExpectedStart = &expectedStart
 			instance.ExpectedEnd = &expectedEnd
 		}
@@ -1825,7 +1901,6 @@ func (s *schedulingServiceImpl) calculateExpectedTimes(instance *scheduling.Sche
 
 	return nil
 }
-
 func (s *schedulingServiceImpl) generateScheduleInstances(
 	ctx context.Context,
 	userID uuid.UUID,

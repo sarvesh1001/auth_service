@@ -277,6 +277,14 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 }
 
 // Schedule Instance Management
+// Update the handler to accept a simplified request structure
+type CreateScheduleInstanceRequest struct {
+	UserID        uuid.UUID  `json:"user_id"`
+	ScheduleDate  time.Time  `json:"schedule_date"`
+	ExpectedStart *time.Time `json:"expected_start,omitempty"`
+	ExpectedEnd   *time.Time `json:"expected_end,omitempty"`
+}
+
 func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -285,17 +293,27 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
-	var instance scheduling.ScheduleInstance
-	if err := json.NewDecoder(r.Body).Decode(&instance); err != nil {
+	var req CreateScheduleInstanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 
-	instance.CompanyID = companyID
-	result, err := h.schedulingService.CreateScheduleInstance(ctx, &instance, actorType, actorID, nil)
+	// Create instance from request
+	instance := &scheduling.ScheduleInstance{
+		CompanyID:     companyID,
+		UserID:        req.UserID,
+		ScheduleDate:  req.ScheduleDate,
+		ExpectedStart: req.ExpectedStart,
+		ExpectedEnd:   req.ExpectedEnd,
+		Metadata:      scheduling.InstanceMetadata{},
+	}
+
+	result, err := h.schedulingService.CreateScheduleInstance(ctx, instance, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -381,6 +399,38 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
+// // Schedule Generation
+// func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	userIDStr := chi.URLParam(r, "userID")
+// 	actorType := middleware.GetSessionTypeFromContext(ctx)
+// 	actorID := middleware.GetUserIDFromContext(ctx)
+
+// 	userID, err := uuid.Parse(userIDStr)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+// 		return
+// 	}
+
+// 	var config service.ScheduleGenerationConfig
+// 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+// 		return
+// 	}
+
+// 	result, err := h.schedulingService.GenerateScheduleForUser(ctx, userID, config, actorType, actorID)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+// 		return
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+// 		"message":   "Schedule generated successfully",
+// 		"instances": len(result),
+// 		"data":      result,
+// 	})
+// }
+
 // Schedule Generation
 func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -394,10 +444,63 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		return
 	}
 
-	var config service.ScheduleGenerationConfig
-	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+	// Create a request struct that accepts string dates
+	type GenerateScheduleRequest struct {
+		StartDate       string `json:"start_date"`
+		EndDate         string `json:"end_date"`
+		Timezone        string `json:"timezone"`
+		IncludeHolidays bool   `json:"include_holidays"`
+		Overwrite       bool   `json:"overwrite"`
+		BatchSize       int    `json:"batch_size"`
+	}
+
+	var req GenerateScheduleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
+	}
+
+	// Validate required fields
+	if req.StartDate == "" || req.EndDate == "" {
+		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
+		return
+	}
+
+	// Parse string dates to time.Time
+	startDate, err := time.Parse("2006-01-02", req.StartDate)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
+		return
+	}
+
+	endDate, err := time.Parse("2006-01-02", req.EndDate)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
+		return
+	}
+
+	// Validate date range
+	if startDate.After(endDate) {
+		h.respondWithError(w, http.StatusBadRequest, "start_date must be before or equal to end_date")
+		return
+	}
+
+	// Set defaults
+	if req.Timezone == "" {
+		req.Timezone = "UTC"
+	}
+	if req.BatchSize <= 0 {
+		req.BatchSize = 100
+	}
+
+	// Create the service config
+	config := service.ScheduleGenerationConfig{
+		StartDate:       startDate,
+		EndDate:         endDate,
+		Timezone:        req.Timezone,
+		IncludeHolidays: req.IncludeHolidays,
+		Overwrite:       req.Overwrite,
+		BatchSize:       req.BatchSize,
 	}
 
 	result, err := h.schedulingService.GenerateScheduleForUser(ctx, userID, config, actorType, actorID)
@@ -505,7 +608,19 @@ func (h *SchedulingHandler) GetScheduleCoverage(w http.ResponseWriter, r *http.R
 // Schedule Availability Check
 func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userID := middleware.GetUserIDFromContext(ctx)
+
+	// Get user ID from query parameter (required)
+	userIDParam := r.URL.Query().Get("user_id")
+	if userIDParam == "" {
+		h.respondWithError(w, http.StatusBadRequest, "user_id parameter is required")
+		return
+	}
+
+	userID, err := uuid.Parse(userIDParam)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user_id format")
+		return
+	}
 
 	dateStr := r.URL.Query().Get("date")
 	timezone := r.URL.Query().Get("timezone")
@@ -517,7 +632,7 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 
 	date, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD")
 		return
 	}
 
