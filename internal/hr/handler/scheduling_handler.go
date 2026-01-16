@@ -1082,3 +1082,65 @@ func (h *SchedulingHandler) CheckDateAvailability(w http.ResponseWriter, r *http
 
 	h.respondWithJSON(w, http.StatusOK, result)
 }
+
+type DeclareHolidayRequest struct {
+	CalendarID uuid.UUID `json:"calendar_id"`
+	Date       string    `json:"date"` // YYYY-MM-DD
+	Name       string    `json:"name"`
+}
+
+func (h *SchedulingHandler) DeclareHoliday(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	actorType := middleware.GetSessionTypeFromContext(ctx)
+	actorID := middleware.GetUserIDFromContext(ctx)
+
+	var req DeclareHolidayRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	holidayDate, err := time.Parse("2006-01-02", req.Date)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid date format (YYYY-MM-DD)")
+		return
+	}
+
+	// 1️⃣ Add holiday to work calendar
+	err = h.schedulingService.AddHolidayToCalendar(
+		ctx,
+		req.CalendarID,
+		req.Date,
+		req.Name,
+		actorType,
+		actorID,
+	)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 2️⃣ VERY IMPORTANT: cancel existing schedules for that day
+	err = h.schedulingService.ProcessHolidayForDate(
+		ctx,
+		companyID,
+		holidayDate,
+		actorType,
+		actorID,
+	)
+	if err != nil {
+		h.logger.Warn("Holiday declared but failed to cancel schedules", zap.Error(err))
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]string{
+		"message": "Holiday declared and schedules updated",
+	})
+}

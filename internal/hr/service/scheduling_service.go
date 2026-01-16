@@ -73,6 +73,13 @@ type SchedulingService interface {
 	UpdateWorkCalendar(ctx context.Context, calendarID uuid.UUID, update WorkCalendarUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.WorkCalendar, error)
 	DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	ValidateWorkCalendar(ctx context.Context, calendar *scheduling.WorkCalendar) error
+	ProcessHolidayForDate(
+		ctx context.Context,
+		companyID uuid.UUID,
+		date time.Time,
+		actorType string,
+		actorID uuid.UUID,
+	) error
 
 	// Schedule Template Management
 	CreateScheduleTemplate(ctx context.Context, template *scheduling.ScheduleTemplate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleTemplate, error)
@@ -87,12 +94,24 @@ type SchedulingService interface {
 		actorID uuid.UUID,
 		metadata map[string]interface{},
 	) error
+	AddHolidayToCalendar(
+		ctx context.Context,
+		calendarID uuid.UUID,
+		date string,
+		name string,
+		actorType string,
+		actorID uuid.UUID,
+	) error
 
 	// User Schedule Assignment Management
 	UpdateUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, effectiveFrom time.Time, update UserScheduleAssignmentUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	EndUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, endDate time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	RemoveUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, effectiveFrom time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-
+	ResolveUserDay(
+		ctx context.Context,
+		userID uuid.UUID,
+		at time.Time,
+	) (*scheduling.ResolvedScheduleDay, error)
 	// Schedule Instance Management
 	CreateScheduleInstance(ctx context.Context, instance *scheduling.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleInstance, error)
 	UpdateScheduleInstance(ctx context.Context, instanceID uuid.UUID, update ScheduleInstanceUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleInstance, error)
@@ -297,12 +316,29 @@ func (s *schedulingServiceImpl) UpdateWorkCalendar(
 		}
 		calendar.WorkingDays = update.WorkingDays
 	}
+	// Detect newly added holidays
 	if update.Holidays != nil {
-		if err := s.validateHolidays(update.Holidays); err != nil {
-			return nil, fmt.Errorf("invalid holidays: %w", err)
+		oldHolidayMap := make(map[string]bool)
+		for _, h := range calendar.Holidays {
+			oldHolidayMap[h.Date] = true
 		}
-		calendar.Holidays = update.Holidays
+
+		for _, h := range update.Holidays {
+			if !oldHolidayMap[h.Date] {
+				holidayDate, err := time.Parse("2006-01-02", h.Date)
+				if err == nil {
+					_ = s.ProcessHolidayForDate(
+						ctx,
+						calendar.CompanyID,
+						holidayDate,
+						actorType,
+						actorID,
+					)
+				}
+			}
+		}
 	}
+
 	if update.IsActive != nil {
 		calendar.IsActive = *update.IsActive
 	}
@@ -1536,7 +1572,11 @@ func (s *schedulingServiceImpl) GenerateScheduleForUser(
 			config.StartDate, config.EndDate)
 		if err == nil && len(existingInstances) > 0 {
 			for _, existing := range existingInstances {
-				if err := s.schedulingRepo.DeleteScheduleInstance(ctx, existing.ScheduleInstanceID); err != nil {
+				if err := s.schedulingRepo.CancelScheduleInstance(
+					ctx,
+					existing.ScheduleInstanceID,
+					"regenerated",
+				); err != nil {
 					s.logger.Warn("Failed to delete existing schedule instance",
 						util.String("instance_id", existing.ScheduleInstanceID.String()),
 						util.ErrorField(err))
@@ -1639,10 +1679,16 @@ func (s *schedulingServiceImpl) CheckScheduleAvailability(
 	date time.Time,
 	timezone string,
 ) ([]time.Time, error) {
+
 	// Get schedule instance for the date
 	instance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, date)
 	if err != nil {
 		// No schedule for this date
+		return []time.Time{}, nil
+	}
+
+	// 🔹 STEP 4.5 — BLOCK AVAILABILITY IF CANCELLED
+	if instance.Status == "cancelled" {
 		return []time.Time{}, nil
 	}
 
@@ -3030,6 +3076,244 @@ func (s *schedulingServiceImpl) GetUserTimeOffSummary(
 		result["entitlement"] = entitlement
 		result["total_days"] = entitlement.OffCount
 		result["remaining_days"] = entitlement.OffCount - usedDays
+	}
+
+	return result, nil
+}
+func (s *schedulingServiceImpl) ProcessHolidayForDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	date time.Time,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+
+	// 1. Get all ACTIVE schedule instances for that date
+	instances, err := s.schedulingRepo.GetScheduleInstancesByCompany(
+		ctx,
+		companyID,
+		date,
+		date,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to fetch schedule instances: %w", err)
+	}
+
+	// 2. Cancel each schedule unless force_work override exists
+	for _, instance := range instances {
+
+		override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(
+			ctx,
+			instance.UserID,
+			date,
+		)
+		if err == nil && override != nil && override.OverrideType == "force_work" {
+			continue // user must work on holiday
+		}
+
+		err = s.schedulingRepo.CancelScheduleInstance(
+			ctx,
+			instance.ScheduleInstanceID,
+			"holiday_declared",
+		)
+		if err != nil {
+			s.logger.Warn(
+				"Failed to cancel schedule instance",
+				util.String("instance_id", instance.ScheduleInstanceID.String()),
+				util.ErrorField(err),
+			)
+			continue
+		}
+
+		// Audit (optional but recommended)
+		if s.auditService != nil {
+			go s.logAuditAction(
+				context.Background(),
+				instance.CompanyID,
+				"schedule_instance.cancel",
+				instance.ScheduleInstanceID,
+				actorType,
+				actorID,
+				nil,
+				map[string]string{"reason": "holiday_declared"},
+				nil,
+			)
+		}
+	}
+
+	return nil
+}
+
+func (s *schedulingServiceImpl) AddHolidayToCalendar(
+	ctx context.Context,
+	calendarID uuid.UUID,
+	date string,
+	name string,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+
+	// 1️⃣ Fetch calendar
+	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, calendarID)
+	if err != nil {
+		return fmt.Errorf("work calendar not found: %w", err)
+	}
+
+	// 2️⃣ Check duplicate holiday
+	for _, h := range calendar.Holidays {
+		if h.Date == date {
+			return fmt.Errorf("holiday already exists for date %s", date)
+		}
+	}
+
+	// 3️⃣ Append holiday
+	calendar.Holidays = append(calendar.Holidays, scheduling.Holiday{
+		Date: date,
+		Name: name,
+	})
+
+	// 4️⃣ Persist update
+	err = s.schedulingRepo.UpdateWorkCalendar(ctx, calendar)
+	if err != nil {
+		return fmt.Errorf("failed to update work calendar: %w", err)
+	}
+
+	// 5️⃣ Audit (optional but recommended)
+	if s.auditService != nil {
+		go s.logAuditAction(
+			context.Background(),
+			calendar.CompanyID,
+			"work_calendar.holiday_added",
+			calendar.CalendarID,
+			actorType,
+			actorID,
+			nil,
+			map[string]string{
+				"date": date,
+				"name": name,
+			},
+			nil,
+		)
+	}
+
+	return nil
+}
+
+func (s *schedulingServiceImpl) ResolveUserDay(
+	ctx context.Context,
+	userID uuid.UUID,
+	at time.Time,
+) (*scheduling.ResolvedScheduleDay, error) {
+
+	// Normalize date (important!)
+	date := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, at.Location())
+
+	result := &scheduling.ResolvedScheduleDay{
+		Date: date,
+	}
+
+	// ------------------------------------------------------------------
+	// 1️⃣ Schedule Override (force_work / off / holiday_override)
+	// ------------------------------------------------------------------
+	override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
+	if err == nil && override != nil {
+		switch override.OverrideType {
+		case "force_work":
+			result.IsForceWork = true
+			result.IsWorkingDay = true
+
+		case "off":
+			result.IsOnLeave = true
+			result.IsWorkingDay = false
+			return result, nil // 🔴 OFF overrides everything except force_work
+
+		case "holiday_override":
+			result.IsWorkingDay = true
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// 2️⃣ Approved Off Request (leave)  ✅ FIXED
+	// ------------------------------------------------------------------
+	statusApproved := "approved"
+	offRequests, err := s.schedulingRepo.GetOffRequestsByUser(
+		ctx,
+		userID,
+		&date,
+		&date,
+		&statusApproved,
+	)
+
+	if err != nil {
+		s.logger.Error(
+			"Failed to fetch off requests",
+			util.String("user_id", userID.String()),
+			util.String("date", date.Format("2006-01-02")),
+			util.ErrorField(err),
+		)
+	} else if len(offRequests) > 0 {
+		result.IsOnLeave = true
+		result.IsWorkingDay = false
+		return result, nil
+	}
+
+	// ------------------------------------------------------------------
+	// 3️⃣ Schedule Instance (authoritative for attendance)
+	// ------------------------------------------------------------------
+	instance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, date)
+	if err == nil && instance != nil {
+
+		// Cancelled schedules mean NOT working
+		if instance.Status == "cancelled" {
+			result.IsWorkingDay = false
+			return result, nil
+		}
+
+		result.IsWorkingDay = true
+		result.ExpectedStart = instance.ExpectedStart
+		result.ExpectedEnd = instance.ExpectedEnd
+
+		if instance.ScheduleTemplateID != uuid.Nil {
+			result.ShiftID = &instance.ScheduleTemplateID
+		}
+
+		return result, nil
+	}
+
+	// ------------------------------------------------------------------
+	// 4️⃣ Calendar fallback (working day / holiday)
+	// ------------------------------------------------------------------
+	assignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(ctx, userID, date)
+	if err != nil || assignment == nil {
+		// No assignment → non-working day
+		result.IsWorkingDay = false
+		return result, nil
+	}
+
+	template, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, assignment.ScheduleTemplateID)
+	if err != nil {
+		return nil, err
+	}
+
+	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, template.CalendarID)
+	if err != nil {
+		return nil, err
+	}
+
+	weekday := int(date.Weekday())
+	for _, wd := range calendar.WorkingDays {
+		if wd == weekday {
+			result.IsWorkingDay = true
+			break
+		}
+	}
+
+	for _, h := range calendar.Holidays {
+		if h.Date == date.Format("2006-01-02") {
+			result.IsHoliday = true
+			result.IsWorkingDay = false
+			break
+		}
 	}
 
 	return result, nil

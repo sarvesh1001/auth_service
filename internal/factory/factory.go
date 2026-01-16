@@ -9,7 +9,7 @@ import (
 	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
-	hrhandler "auth-service/internal/hr/handler" // ✅ ADD
+	hrhandler "auth-service/internal/hr/handler"
 	hrpostgres "auth-service/internal/hr/repository"
 	a "auth-service/internal/hr/service"
 	"auth-service/internal/models"
@@ -17,7 +17,7 @@ import (
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
 	"auth-service/internal/service"
-	"auth-service/internal/sms" // ADD THIS: SMS package import
+	"auth-service/internal/sms"
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
 	"context"
@@ -31,93 +31,86 @@ import (
 )
 
 type Factory struct {
-	config                 *config.Config
-	tlsManager             *tls.TLSManager
-	redisClient            *client.RedisClient
-	scyllaClient           *scylla.ScyllaClient
-	kafkaProducer          *client.KafkaProducer
-	esClient               *client.ESClient
-	clickhouseClient       *client.ClickHouseClient
-	hasher                 *hashing.Hasher
-	encryptionManager      *encryption.EncryptionManager
-	bucketingManager       *bucketing.BucketingManager
-	pairingRepo            redis.PairingRepository
-	pairingService         *service.PairingService
-	wsService              *service.WebSocketService
-	pairingHandler         *handler.PairingHandler
-	wsHandler              *handler.WebSocketHandler
-	qrUtil                 *util.QRUtil
-	hmacUtil               *util.HMACUtil
-	hrEmployeeRepository   hrpostgres.EmployeeRepository
-	attendanceRepository   hrpostgres.AttendanceRepository
-	leaveRepository        hrpostgres.LeaveRepository
-	schedulingRepository   hrpostgres.SchedulingRepository // Combined repository
-	compensationRepository hrpostgres.CompensationRepository
-	// ================= AUDIT =================
-	auditRepository        hrpostgres.AuditRepository
-	auditService           *a.AuditService
-	auditQueryService      *a.AuditQueryService
-	documentStorage        a.DocumentStorage
-	auditOutboxService     *service.AuditOutboxService
-	auditOutboxCancel      context.CancelFunc
-	employeeQueryService   *a.EmployeeQueryService
-	employeeService        *a.EmployeeService
-	attendanceQueryService a.AttendanceQueryService
-	attendanceService      a.AttendanceService
-	leaveService           a.LeaveService
-	leaveQueryService      a.LeaveQueryService
-	schedulingService      a.SchedulingService
-	schedulingQueryService a.SchedulingQueryService
-	compensationService    a.CompensationService // ✅ ADD THIS
-	hrAuditHandler         *hrhandler.AuditHandler
-	hrEmployeeHandler      *hrhandler.EmployeeHandler
-	hrCompensationHandler  *hrhandler.CompensationHandler
-	hrLeaveHandler         *hrhandler.LeaveHandler
-	hrSchedulingHandler    *hrhandler.SchedulingHandler
-
-	// ✅ UPDATED: PostgreSQL repositories for User and Company
+	config                    *config.Config
+	tlsManager                *tls.TLSManager
+	redisClient               *client.RedisClient
+	scyllaClient              *scylla.ScyllaClient
+	kafkaProducer             *client.KafkaProducer
+	esClient                  *client.ESClient
+	clickhouseClient          *client.ClickHouseClient
+	hasher                    *hashing.Hasher
+	encryptionManager         *encryption.EncryptionManager
+	bucketingManager          *bucketing.BucketingManager
+	pairingRepo               redis.PairingRepository
+	pairingService            *service.PairingService
+	wsService                 *service.WebSocketService
+	pairingHandler            *handler.PairingHandler
+	wsHandler                 *handler.WebSocketHandler
+	qrUtil                    *util.QRUtil
+	hmacUtil                  *util.HMACUtil
+	hrEmployeeRepository      hrpostgres.EmployeeRepository
+	attendanceRepository      hrpostgres.AttendanceRepository
+	leaveRepository           hrpostgres.LeaveRepository
+	schedulingRepository      hrpostgres.SchedulingRepository
+	compensationRepository    hrpostgres.CompensationRepository
+	auditRepository           hrpostgres.AuditRepository
+	auditService              *a.AuditService
+	auditQueryService         *a.AuditQueryService
+	documentStorage           a.DocumentStorage
+	auditOutboxService        *service.AuditOutboxService
+	auditOutboxCancel         context.CancelFunc
+	employeeQueryService      *a.EmployeeQueryService
+	employeeService           *a.EmployeeService
+	attendanceService         a.AttendanceService // ✅ CHANGED: Use concrete type
+	attendanceQueryService    a.AttendanceQueryService
+	leaveService              a.LeaveService
+	leaveQueryService         a.LeaveQueryService
+	schedulingService         a.SchedulingService
+	schedulingQueryService    a.SchedulingQueryService
+	compensationService       a.CompensationService
+	compensationQueryService  a.CompensationQueryService // ✅ ADD: Compensation query service
+	hrAuditHandler            *hrhandler.AuditHandler
+	hrEmployeeHandler         *hrhandler.EmployeeHandler
+	hrCompensationHandler     *hrhandler.CompensationHandler
+	hrLeaveHandler            *hrhandler.LeaveHandler
+	hrSchedulingHandler       *hrhandler.SchedulingHandler
 	postgresClient            *client.PostgresClient
 	postgresUserRepository    postgres.UserRepository
 	postgresCompanyRepository postgres.CompanyRepository
-	smsManager                *sms.SMSManager // ADD THIS: SMS Manager field
+	smsManager                *sms.SMSManager
 	serviceFactory            *service.ServiceFactory
-	// ✅ FIXED: Use concrete types for repositories that need type assertions
-	adminDeviceRepo          *scylla.AdminDeviceRepositoryImpl
-	adminDeviceTrustRepo     scylla.AdminDeviceTrustRepository
-	adminMPINRepo            *scylla.AdminMPINRepositoryImpl
-	adminDeviceHistoryRepo   *scylla.AdminDeviceHistoryRepositoryImpl
-	userOTPService           *service.UserOTPService
-	companyService           *service.CompanyService
-	adminDeviceService       *service.AdminDeviceService
-	adminMPINService         *service.AdminMPINService
-	userService              *service.UserService
-	once                     sync.Once
-	closeOnce                sync.Once
-	closed                   chan struct{}
-	mpinRepository           scylla.MPINRepository
-	mpinService              *service.MPINService
-	pepperStoreRepo          pepperstore.PepperStore
-	deviceTrustRepo          scylla.DeviceTrustRepository
-	otpRepository            scylla.OTPRepository
-	otpService               *service.OTPService
-	sessionRepo              redis.SessionRepository
-	sessionService           *service.SessionService
-	deviceRepository         scylla.DeviceRepository
-	deviceService            *service.DeviceService
-	deviceHistoryRepo        *scylla.DeviceHistoryRepositoryImpl
-	kafkaLoggingMgr          *KafkaLoggingManager
-	adminRepository          postgres.AdminRepository
-	adminService             *service.AdminService
-	compensationQueryService a.CompensationQueryService
-	hrAttendanceHandler      *hrhandler.AttendanceHandler
-
-	// ✅ NEW: JWT and RBAC services
-	jwtService      *service.JWTService
-	rbacInitService *service.RBACInitService
-	authHandler     *handler.AuthHandler
-	router          chi.Router
-
-	logger *zap.Logger
+	adminDeviceRepo           *scylla.AdminDeviceRepositoryImpl
+	adminDeviceTrustRepo      scylla.AdminDeviceTrustRepository
+	adminMPINRepo             *scylla.AdminMPINRepositoryImpl
+	adminDeviceHistoryRepo    *scylla.AdminDeviceHistoryRepositoryImpl
+	userOTPService            *service.UserOTPService
+	companyService            *service.CompanyService
+	adminDeviceService        *service.AdminDeviceService
+	adminMPINService          *service.AdminMPINService
+	userService               *service.UserService
+	once                      sync.Once
+	closeOnce                 sync.Once
+	closed                    chan struct{}
+	mpinRepository            scylla.MPINRepository
+	mpinService               *service.MPINService
+	pepperStoreRepo           pepperstore.PepperStore
+	deviceTrustRepo           scylla.DeviceTrustRepository
+	otpRepository             scylla.OTPRepository
+	otpService                *service.OTPService
+	sessionRepo               redis.SessionRepository
+	sessionService            *service.SessionService
+	deviceRepository          scylla.DeviceRepository
+	deviceService             *service.DeviceService
+	deviceHistoryRepo         *scylla.DeviceHistoryRepositoryImpl
+	kafkaLoggingMgr           *KafkaLoggingManager
+	adminRepository           postgres.AdminRepository
+	adminService              *service.AdminService
+	hrAttendanceHandler       *hrhandler.AttendanceHandler
+	jwtService                *service.JWTService
+	rbacInitService           *service.RBACInitService
+	authHandler               *handler.AuthHandler
+	router                    chi.Router
+	logger                    *zap.Logger
 }
 
 // ============================================================================
@@ -190,6 +183,7 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 // ============================================================================
 // FACTORY INITIALIZATION
 // ============================================================================
+
 func NewFactory() (*Factory, error) {
 	cfg := config.LoadConfig()
 	util.Init(cfg.Environment, cfg.Logging.Level, cfg.Logging.Format)
@@ -220,12 +214,11 @@ func NewFactory() (*Factory, error) {
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
 
-	// ✅ ADD THIS: Initialize RBAC permission registry
+	// ✅ Initialize RBAC permission registry
 	ctx := context.Background()
 	if err := f.InitializeRBAC(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
 	}
-	f.initializeManagers()
 
 	if err := f.initializeDocumentStorage(); err != nil {
 		return nil, err
@@ -255,7 +248,7 @@ func NewFactory() (*Factory, error) {
 		util.Bool("tls_enabled", cfg.Server.EnableTLS),
 		util.Bool("kms_enabled", cfg.KMS.Enabled),
 		util.Bool("kafka_logging_enabled", f.kafkaLoggingMgr != nil),
-		util.Bool("rbac_initialized", true), // ✅ ADD THIS
+		util.Bool("rbac_initialized", true),
 	)
 
 	return f, nil
@@ -264,10 +257,10 @@ func NewFactory() (*Factory, error) {
 // ============================================================================
 // KAFKA LOGGING INITIALIZATION - OPTIMIZED EVENT DISTRIBUTION
 // ============================================================================
+
 func (f *Factory) initializeDocumentStorage() error {
 	cfg := f.config
 
-	// You can move these to config later
 	basePath := cfg.HR.Documents.BasePath
 	maxSizeMB := cfg.HR.Documents.MaxSizeMB
 
@@ -280,7 +273,6 @@ func (f *Factory) initializeDocumentStorage() error {
 		return fmt.Errorf("failed to initialize document storage: %w", err)
 	}
 
-	// Health check on startup
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -296,11 +288,12 @@ func (f *Factory) initializeDocumentStorage() error {
 
 	return nil
 }
+
 func (f *Factory) GetHRCompensationHandler() *hrhandler.CompensationHandler {
 	if f.hrCompensationHandler == nil {
 		f.hrCompensationHandler = hrhandler.NewCompensationHandler(
 			f.GetCompensationService(),
-			f.GetCompensationQueryService(),
+			f.GetCompensationQueryService(), // ✅ ADD: Query service
 			f.logger,
 		)
 	}
@@ -311,33 +304,34 @@ func (f *Factory) GetCompensationService() a.CompensationService {
 	if f.compensationService == nil {
 		f.compensationService = a.NewCompensationService(
 			f.CompensationRepository(),
-			f.AuditRepository(), // uses auditRepo + logAudit internally
+			f.AuditRepository(),
 			f.logger,
 		)
 	}
 	return f.compensationService
 }
 
+func (f *Factory) GetCompensationQueryService() a.CompensationQueryService {
+	if f.compensationQueryService == nil {
+		f.compensationQueryService = a.NewCompensationQueryService(
+			f.CompensationRepository(),
+			f.logger,
+		)
+	}
+	return f.compensationQueryService
+}
+
 func (f *Factory) GetEmployeeQueryService() *a.EmployeeQueryService {
 	if f.employeeQueryService == nil {
 		f.employeeQueryService = a.NewEmployeeQueryService(
 			f.HREmployeeRepository(),
-			f.DocumentStorage(), // ✅ from earlier step
+			f.DocumentStorage(),
 			f.logger,
 		)
 	}
 	return f.employeeQueryService
 }
 
-func (f *Factory) GetAttendanceQueryService() a.AttendanceQueryService {
-	if f.attendanceQueryService == nil {
-		f.attendanceQueryService = a.NewAttendanceQueryService(
-			f.AttendanceRepository(),
-			f.logger,
-		)
-	}
-	return f.attendanceQueryService
-}
 func (f *Factory) GetLeaveService() a.LeaveService {
 	if f.leaveService == nil {
 		f.leaveService = a.NewLeaveService(
@@ -352,7 +346,7 @@ func (f *Factory) GetHRLeaveHandler() *hrhandler.LeaveHandler {
 	if f.hrLeaveHandler == nil {
 		f.hrLeaveHandler = hrhandler.NewLeaveHandler(
 			f.GetLeaveService(),
-			f.GetLeaveQueryService(),
+			f.GetLeaveQueryService(), // ✅ ADD: Query service
 			f.logger,
 		)
 	}
@@ -362,14 +356,13 @@ func (f *Factory) GetHRLeaveHandler() *hrhandler.LeaveHandler {
 func (f *Factory) GetHRAuditHandler() *hrhandler.AuditHandler {
 	if f.hrAuditHandler == nil {
 		f.hrAuditHandler = hrhandler.NewAuditHandler(
-			f.GetAuditQueryService(), // HR audit query service
+			f.GetAuditQueryService(),
 			f.logger,
 		)
 	}
 	return f.hrAuditHandler
 }
 
-// GetLeaveQueryService returns the leave query service
 func (f *Factory) GetLeaveQueryService() a.LeaveQueryService {
 	if f.leaveQueryService == nil {
 		f.leaveQueryService = a.NewLeaveQueryService(
@@ -379,6 +372,16 @@ func (f *Factory) GetLeaveQueryService() a.LeaveQueryService {
 	}
 	return f.leaveQueryService
 }
+func (f *Factory) GetAttendanceQueryService() a.AttendanceQueryService {
+	if f.attendanceQueryService == nil {
+		f.attendanceQueryService = a.NewAttendanceQueryService(
+			f.AttendanceRepository(),
+			f.logger,
+		)
+	}
+	return f.attendanceQueryService
+}
+
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	logger := util.Get()
 
@@ -411,13 +414,12 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	// ✅ ELASTICSEARCH CONSUMER - Search & Analytics Events (MULTI-TOPIC)
 	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
 		esTopics := []string{
-			"admin-events",    // Audit trails, role searches
-			"user-events",     // User behavior analysis
-			"security-events", // Fraud investigation (dual-purpose)
-			"session-events",  // Session analytics
+			"admin-events",
+			"user-events",
+			"security-events",
+			"session-events",
 		}
 
-		// Create multiple Kafka consumers for ES (one per topic)
 		esConsumers := make(map[string]*client.KafkaConsumer)
 
 		for _, topic := range esTopics {
@@ -462,13 +464,12 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	// ✅ CLICKHOUSE CONSUMER - Time-Series & Metrics Events (MULTI-TOPIC)
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
 		chTopics := []string{
-			"device-events",   // Device metrics, binding trends
-			"mpin-events",     // Authentication patterns
-			"otp-events",      // Delivery metrics
-			"security-events", // Real-time fraud detection (dual-purpose)
+			"device-events",
+			"mpin-events",
+			"otp-events",
+			"security-events",
 		}
 
-		// Create multiple Kafka consumers for ClickHouse (one per topic)
 		chConsumers := make(map[string]*client.KafkaConsumer)
 
 		for _, topic := range chTopics {
@@ -490,9 +491,9 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		if len(chConsumers) > 0 {
 			chConsumer := consumer.NewClickHouseConsumer(
 				chConsumers,
-				f.clickhouseClient, // ✅ PASS THE FULL CLIENT
-				1000,               // batch size
-				5*time.Second,      // flush interval
+				f.clickhouseClient,
+				1000,
+				5*time.Second,
 			)
 			mgr.chConsumer = chConsumer
 			mgr.wg.Add(1)
@@ -517,7 +518,7 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 }
 
 // ============================================================================
-// ADMIN REPOSITORY GETTERS - FIXED
+// ADMIN REPOSITORY GETTERS
 // ============================================================================
 
 func (f *Factory) AdminDeviceRepository() *scylla.AdminDeviceRepositoryImpl {
@@ -543,11 +544,11 @@ func (f *Factory) AdminDeviceTrustRepository() scylla.AdminDeviceTrustRepository
 func (f *Factory) GetHREmployeeHandler() *hrhandler.EmployeeHandler {
 	if f.hrEmployeeHandler == nil {
 		f.hrEmployeeHandler = hrhandler.NewEmployeeHandler(
-			f.GetEmployeeService(),      // write service
-			f.GetEmployeeQueryService(), // read service
-			f.GetAuditService(),         // audit service
+			f.GetEmployeeService(),
+			f.GetEmployeeQueryService(),
+			f.GetAuditService(),
 			f.logger,
-			f.config.HR.Documents.MaxSizeMB, // ✅ FIXED
+			f.config.HR.Documents.MaxSizeMB,
 		)
 	}
 	return f.hrEmployeeHandler
@@ -564,16 +565,6 @@ func (f *Factory) GetHRSchedulingHandler() *hrhandler.SchedulingHandler {
 	return f.hrSchedulingHandler
 }
 
-func (f *Factory) GetCompensationQueryService() a.CompensationQueryService {
-	if f.compensationQueryService == nil {
-		f.compensationQueryService = a.NewCompensationQueryService(
-			f.CompensationRepository(),
-			f.logger,
-		)
-	}
-	return f.compensationQueryService
-}
-
 func (f *Factory) GetSchedulingService() a.SchedulingService {
 	if f.schedulingService == nil {
 		f.schedulingService = a.NewSchedulingService(
@@ -585,7 +576,6 @@ func (f *Factory) GetSchedulingService() a.SchedulingService {
 	return f.schedulingService
 }
 
-// GetSchedulingQueryService returns the scheduling query service
 func (f *Factory) GetSchedulingQueryService() a.SchedulingQueryService {
 	if f.schedulingQueryService == nil {
 		f.schedulingQueryService = a.NewSchedulingQueryService(
@@ -595,6 +585,7 @@ func (f *Factory) GetSchedulingQueryService() a.SchedulingQueryService {
 	}
 	return f.schedulingQueryService
 }
+
 func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 	if f.adminMPINRepo == nil {
 		f.adminMPINRepo = scylla.NewAdminMPINRepository(
@@ -604,8 +595,11 @@ func (f *Factory) AdminMPINRepository() *scylla.AdminMPINRepositoryImpl {
 	}
 	return f.adminMPINRepo
 }
+
 func (f *Factory) GetHRAttendanceHandler() *hrhandler.AttendanceHandler {
 	if f.hrAttendanceHandler == nil {
+		// Create a dummy query service for now since we have combined service
+		// The combined attendance service handles both command and query
 		f.hrAttendanceHandler = hrhandler.NewAttendanceHandler(
 			f.GetAttendanceService(),
 			f.GetAttendanceQueryService(),
@@ -616,7 +610,7 @@ func (f *Factory) GetHRAttendanceHandler() *hrhandler.AttendanceHandler {
 }
 
 // ============================================================================
-// ✅ AUDIT REPOSITORY
+// AUDIT REPOSITORY
 // ============================================================================
 
 func (f *Factory) AuditRepository() hrpostgres.AuditRepository {
@@ -629,9 +623,6 @@ func (f *Factory) AuditRepository() hrpostgres.AuditRepository {
 	return f.auditRepository
 }
 
-// ============================================================================
-// ✅ AUDIT SERVICE
-// ============================================================================
 func (f *Factory) GetAuditQueryService() *a.AuditQueryService {
 	if f.auditQueryService == nil {
 		f.auditQueryService = a.NewAuditQueryService(
@@ -641,6 +632,7 @@ func (f *Factory) GetAuditQueryService() *a.AuditQueryService {
 	}
 	return f.auditQueryService
 }
+
 func (f *Factory) GetAuditService() *a.AuditService {
 	if f.auditService == nil {
 		f.auditService = a.NewAuditService(
@@ -651,28 +643,8 @@ func (f *Factory) GetAuditService() *a.AuditService {
 	return f.auditService
 }
 
-// ============================================================================
-// ✅ AUDIT OUTBOX SERVICE
-// ============================================================================
-func (f *Factory) GetEmployeeService() *a.EmployeeService {
-	if f.employeeService == nil {
-		f.employeeService = a.NewEmployeeService(
-			f.HREmployeeRepository(),
-			f.GetAuditService(),
-			a.EmployeeServiceConfig{
-				MaxDocumentSizeMB: f.config.HR.Documents.MaxSizeMB,
-				DocumentStorage:   f.DocumentStorage(),
-			},
-			f.logger,
-		)
-	}
-	return f.employeeService
-}
-
 func (f *Factory) GetAuditOutboxService() *service.AuditOutboxService {
 	if f.auditOutboxService == nil {
-
-		// Kafka is optional – if not present, outbox should not start
 		if f.kafkaProducer == nil {
 			f.logger.Warn("Kafka producer not available, audit outbox disabled")
 			return nil
@@ -681,17 +653,13 @@ func (f *Factory) GetAuditOutboxService() *service.AuditOutboxService {
 		f.auditOutboxService = service.NewAuditOutboxService(
 			f.PostgresClient(),
 			f.kafkaProducer,
-			500,           // batch size
-			5*time.Second, // poll interval
-			"audit-logs",  // Changed from "audit-events" to "audit-logs"
+			500,
+			5*time.Second,
+			"audit-logs",
 		)
 	}
 	return f.auditOutboxService
 }
-
-// ============================================================================
-// ✅ HR EMPLOYEE REPOSITORY GETTER
-// ============================================================================
 
 func (f *Factory) DocumentStorage() a.DocumentStorage {
 	if f.documentStorage == nil {
@@ -711,14 +679,16 @@ func (f *Factory) HREmployeeRepository() hrpostgres.EmployeeRepository {
 }
 
 // ============================================================================
-// ATTENDANCE SERVICE (WRITE / COMMAND)
+// ATTENDANCE SERVICE (COMBINED COMMAND + QUERY)
 // ============================================================================
 
 func (f *Factory) GetAttendanceService() a.AttendanceService {
 	if f.attendanceService == nil {
 		f.attendanceService = a.NewAttendanceService(
-			f.AttendanceRepository(),
+			f.AttendanceRepository(), // ✅ repo already built with PostgresClient
+			f.GetSchedulingService(),
 			f.logger,
+			f.GetAuditService(),
 		)
 	}
 	return f.attendanceService
@@ -735,7 +705,7 @@ func (f *Factory) AdminDeviceHistoryRepository() *scylla.AdminDeviceHistoryRepos
 }
 
 // ============================================================================
-// ✅ UPDATED REPOSITORY GETTERS - POSTGRESQL MIGRATION
+// REPOSITORY GETTERS - POSTGRESQL MIGRATION
 // ============================================================================
 
 func (f *Factory) CompanyRepository() postgres.CompanyRepository {
@@ -758,7 +728,6 @@ func (f *Factory) PepperStoreRepository() pepperstore.PepperStore {
 	return f.pepperStoreRepo
 }
 
-// Add getter methods
 func (f *Factory) GetSchedulingRepository() hrpostgres.SchedulingRepository {
 	if f.schedulingRepository == nil {
 		f.schedulingRepository = hrpostgres.NewSchedulingRepository(
@@ -778,6 +747,7 @@ func (f *Factory) CompensationRepository() hrpostgres.CompensationRepository {
 	}
 	return f.compensationRepository
 }
+
 func (f *Factory) WorkCalendarRepository() hrpostgres.SchedulingRepository {
 	return f.GetSchedulingRepository()
 }
@@ -825,21 +795,15 @@ func (f *Factory) MPINRepository() scylla.MPINRepository {
 	}
 	return f.mpinRepository
 }
-
 func (f *Factory) AttendanceRepository() hrpostgres.AttendanceRepository {
-	// Create attendance repository if not exists
 	if f.attendanceRepository == nil {
 		f.attendanceRepository = hrpostgres.NewAttendanceRepository(
-			f.PostgresClient(),
+			f.PostgresClient(), // ✅ SAME AS SCHEDULING
 			f.logger,
 		)
 	}
 	return f.attendanceRepository
 }
-
-// ============================================================================
-// ✅ USER OTP SERVICE GETTERS
-// ============================================================================
 
 func (f *Factory) GetUserOTPService() *service.UserOTPService {
 	if f.userOTPService == nil {
@@ -870,13 +834,13 @@ func (f *Factory) GetUserOTPService() *service.UserOTPService {
 			smsManager,
 		)
 
-		// Set admin service after UserOTPService is created to break circular dependency
 		if phoneValidator != nil {
 			phoneValidator.SetAdminService(f.GetAdminService())
 		}
 	}
 	return f.userOTPService
 }
+
 func (f *Factory) GetDeviceTrustRepository() scylla.DeviceTrustRepository {
 	if f.deviceTrustRepo == nil {
 		f.deviceTrustRepo = scylla.NewDeviceTrustRepository(f.scyllaClient, f.logger)
@@ -923,6 +887,7 @@ func (f *Factory) LeaveRepository() hrpostgres.LeaveRepository {
 	}
 	return f.leaveRepository
 }
+
 func (f *Factory) AdminRepository() postgres.AdminRepository {
 	if f.adminRepository == nil {
 		f.adminRepository = postgres.NewAdminRepositoryPostgres(
@@ -934,7 +899,7 @@ func (f *Factory) AdminRepository() postgres.AdminRepository {
 }
 
 // ============================================================================
-// ✅ JWT AND RBAC SERVICES
+// JWT AND RBAC SERVICES
 // ============================================================================
 
 func (f *Factory) GetJWTService() *service.JWTService {
@@ -960,7 +925,7 @@ func (f *Factory) GetRBACInitService() *service.RBACInitService {
 }
 
 // ============================================================================
-// ✅ SERVICE GETTERS - UPDATED WITH JWT AND BITMASK SUPPORT
+// SERVICE GETTERS
 // ============================================================================
 
 func (f *Factory) ServiceFactory() *service.ServiceFactory {
@@ -998,15 +963,16 @@ func (f *Factory) GetUserService() *service.UserService {
 	})
 	return f.userService
 }
+
 func (f *Factory) GetPhoneValidator() *service.PhoneValidatorImpl {
-	// Create phone validator without admin service initially to break circular dependency
 	phoneValidator := service.NewPhoneValidator(
 		f.GetUserService(),
-		nil, // Don't pass admin service yet
+		nil,
 		f.logger,
 	)
 	return phoneValidator
 }
+
 func (f *Factory) GetOTPService() *service.OTPService {
 	if f.otpService == nil {
 		repo := f.OTPRepository()
@@ -1020,8 +986,6 @@ func (f *Factory) GetOTPService() *service.OTPService {
 		}
 
 		logProducer := f.GetLogProducerService()
-
-		// Create phone validator without triggering admin service creation
 		phoneValidator := f.GetPhoneValidator()
 
 		f.otpService = service.NewOTPService(
@@ -1033,23 +997,23 @@ func (f *Factory) GetOTPService() *service.OTPService {
 			logProducer,
 			phoneValidator,
 			f.AdminDeviceTrustRepository(),
-			f.smsManager, // ADD THIS: Pass SMS Manager
+			f.smsManager,
 		)
 
-		// Set admin service after OTPService is created to break circular dependency
 		if phoneValidator != nil {
 			phoneValidator.SetAdminService(f.GetAdminService())
 		}
 	}
 	return f.otpService
 }
+
 func (f *Factory) GetAdminService() *service.AdminService {
 	if f.adminService == nil {
 		f.adminService = service.NewAdminService(
 			f.AdminRepository(),
-			f.CompanyRepository(), // ✅ NEW: companyRepo
+			f.CompanyRepository(),
 			f.GetSessionService(),
-			f.GetOTPService(), // This is now safe
+			f.GetOTPService(),
 			f.GetMPINService(),
 			f.GetDeviceService(),
 			f.Hasher(),
@@ -1065,47 +1029,12 @@ func (f *Factory) GetAdminService() *service.AdminService {
 	return f.adminService
 }
 
-// func (f *Factory) GetPhoneValidator() *service.PhoneValidatorImpl {
-// 	return service.NewPhoneValidator(
-// 		f.GetUserService(),
-// 		nil,
-// 		f.logger,
-// 	)
-// }
-
-// func (f *Factory) GetOTPService() *service.OTPService {
-// 	if f.otpService == nil {
-// 		repo := f.OTPRepository()
-// 		hasher := f.Hasher()
-// 		cfg := f.Config()
-// 		logger := f.logger
-
-// 		var distCache *service.DistributedCache
-// 		if f.redisClient != nil {
-// 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
-// 		}
-
-// 		logProducer := f.GetLogProducerService()
-// 		phoneValidator := f.GetPhoneValidator()
-
-//			f.otpService = service.NewOTPService(
-//				repo,
-//				hasher,
-//				cfg,
-//				distCache,
-//				logger,
-//				logProducer,
-//				phoneValidator,
-//			)
-//		}
-//		return f.otpService
-//	}
 func (f *Factory) GetMPINService() *service.MPINService {
 	if f.mpinService == nil {
 		mpinRepo := f.MPINRepository()
 		userRepo := f.UserRepository()
 		deviceTrustRepo := f.GetDeviceTrustRepository()
-		userOTPService := f.GetUserOTPService() // ✅ NEW: for users
+		userOTPService := f.GetUserOTPService()
 		encryptionMgr := f.EncryptionManager()
 		hasher := f.Hasher()
 		cfg := f.Config()
@@ -1156,11 +1085,12 @@ func (f *Factory) GetSessionService() *service.SessionService {
 	}
 	return f.sessionService
 }
+
 func (f *Factory) GetDeviceService() *service.DeviceService {
 	if f.deviceService == nil {
 		deviceRepo := f.DeviceRepository()
-		deviceTrustRepo := f.GetDeviceTrustRepository()        // NEW
-		adminDeviceTrustRepo := f.AdminDeviceTrustRepository() // NEW
+		deviceTrustRepo := f.GetDeviceTrustRepository()
+		adminDeviceTrustRepo := f.AdminDeviceTrustRepository()
 		cfg := f.Config()
 		logger := f.logger
 
@@ -1171,8 +1101,8 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 
 		f.deviceService = service.NewDeviceService(
 			deviceRepo,
-			deviceTrustRepo,      // NEW ARG
-			adminDeviceTrustRepo, // NEW ARG
+			deviceTrustRepo,
+			adminDeviceTrustRepo,
 			distCache,
 			*cfg,
 			logger,
@@ -1199,10 +1129,6 @@ func (f *Factory) GetCompanyService() *service.CompanyService {
 	}
 	return f.companyService
 }
-
-// ============================================================================
-// ✅ ADMIN SERVICE GETTERS
-// ============================================================================
 
 func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
 	if f.adminDeviceService == nil {
@@ -1271,31 +1197,10 @@ func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
 	return f.adminMPINService
 }
 
-// func (f *Factory) GetAdminService() *service.AdminService {
-// 	if f.adminService == nil {
-// 		f.adminService = service.NewAdminService(
-// 			f.AdminRepository(),
-// 			f.UserRepository(),
-// 			f.GetSessionService(),
-// 			f.GetOTPService(),
-// 			f.GetMPINService(),
-// 			f.GetDeviceService(),
-// 			f.Hasher(),
-// 			f.EncryptionManager(),
-// 			f.logger,
-// 		)
-
-// 		logProducer := f.GetLogProducerService()
-// 		if logProducer != nil {
-// 			f.adminService.SetLogProducerService(logProducer)
-// 		}
-// 	}
-// 	return f.adminService
-// }
-
 // ============================================================================
-// ✅ CLIENT INITIALIZATION
+// CLIENT INITIALIZATION
 // ============================================================================
+
 func (f *Factory) initializeClients() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1370,6 +1275,7 @@ func (f *Factory) initializeClients() error {
 
 	return nil
 }
+
 func (f *Factory) initializeManagers() {
 	pepperStore := f.PepperStoreRepository()
 
@@ -1398,7 +1304,6 @@ func (f *Factory) initializeManagers() {
 	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
 	f.bucketingManager = bucketing.NewBucketingManager(f.config)
 
-	// ADD THIS: Initialize SMS Manager
 	f.smsManager = sms.NewSMSManager(f.logger)
 	util.Info("SMS manager initialized")
 
@@ -1411,22 +1316,18 @@ func (f *Factory) initializeManagers() {
 		util.Bool("hashing_initialized", f.hasher != nil),
 		util.Bool("encryption_initialized", f.encryptionManager != nil),
 		util.Bool("bucketing_initialized", f.bucketingManager != nil),
-		util.Bool("sms_manager_initialized", f.smsManager != nil), // ADD THIS
+		util.Bool("sms_manager_initialized", f.smsManager != nil),
 		util.Bool("pepper_persistence_enabled", f.hasher != nil),
 	)
 }
 
 // ============================================================================
-// ✅ HANDLER INITIALIZATION - UPDATED WITH JWT AND RBAC
-// ============================================================================
-// ============================================================================
-// ✅ HANDLER INITIALIZATION - UPDATED WITH QR WEB LOGIN
+// HANDLER INITIALIZATION
 // ============================================================================
 
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
 
-	// Get all services
 	userService := f.GetUserService()
 	otpService := f.GetOTPService()
 	mpinService := f.GetMPINService()
@@ -1437,13 +1338,11 @@ func (f *Factory) InitializeHandlers() error {
 	adminService := f.GetAdminService()
 	companyService := f.GetCompanyService()
 	jwtService := f.GetJWTService()
-	userOTPService := f.GetUserOTPService() // ✅ NEW: for users
+	userOTPService := f.GetUserOTPService()
 
-	// ✅ NEW: QR Web Login services
 	_ = f.GetPairingService()
 	_ = f.GetWebSocketService()
 
-	// Initialize handlers
 	otpHandler := handler.NewOTPHandler(
 		otpService,
 		sessionService,
@@ -1464,9 +1363,8 @@ func (f *Factory) InitializeHandlers() error {
 
 	rbacHandler := handler.NewRBACHandler(companyService, logger)
 
-	// ✅ FIXED: Auth handler with all required services
 	authHandler := handler.NewAuthHandler(
-		userOTPService, // ✅ NEW: Add UserOTPService
+		userOTPService,
 		mpinService,
 		sessionService,
 		userService,
@@ -1477,27 +1375,22 @@ func (f *Factory) InitializeHandlers() error {
 	)
 	f.authHandler = authHandler
 
-	// ✅ NEW: QR Web Login handlers
 	pairingHandler := f.GetPairingHandler()
 	wsHandler := f.GetWebSocketHandler()
 
-	// ✅ UPDATED: Router with QR Web Login handlers
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
 		authHandler,
 		rbacHandler,
-
 		f.GetHRAttendanceHandler(),
 		f.GetHRAuditHandler(),
 		f.GetHRCompensationHandler(),
 		f.GetHREmployeeHandler(),
 		f.GetHRLeaveHandler(),
 		f.GetHRSchedulingHandler(),
-
 		pairingHandler,
 		wsHandler,
-
 		sessionService,
 		jwtService,
 		logger,
@@ -1506,6 +1399,7 @@ func (f *Factory) InitializeHandlers() error {
 	logger.Info("Handlers and router initialized with JWT, bitmask, and QR web login support")
 	return nil
 }
+
 func (f *Factory) GetRouter() chi.Router {
 	if f.router == nil {
 		if err := f.InitializeHandlers(); err != nil {
@@ -1516,7 +1410,7 @@ func (f *Factory) GetRouter() chi.Router {
 }
 
 // ============================================================================
-// ✅ RBAC INITIALIZATION
+// RBAC INITIALIZATION
 // ============================================================================
 
 func (f *Factory) InitializeRBAC(ctx context.Context) error {
@@ -1529,8 +1423,9 @@ func (f *Factory) InitializeRBAC(ctx context.Context) error {
 }
 
 // ============================================================================
-// ✅ HEALTH CHECK - UPDATED FOR JWT AND RBAC
+// HEALTH CHECK
 // ============================================================================
+
 func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	errs := make(map[string]error)
 
@@ -1542,6 +1437,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["postgres"] = fmt.Errorf("postgres client not initialized")
 	}
+
 	if f.employeeQueryService != nil {
 		if err := f.employeeQueryService.HealthCheck(ctx); err != nil {
 			errs["employee_query_service"] = err
@@ -1549,6 +1445,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["employee_query_service"] = fmt.Errorf("employee query service not initialized")
 	}
+
 	if f.employeeService != nil {
 		if err := f.employeeService.HealthCheck(ctx); err != nil {
 			errs["employee_service"] = err
@@ -1556,20 +1453,14 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["employee_service"] = fmt.Errorf("employee service not initialized")
 	}
+
+	// ✅ CHANGED: Only attendanceService check
 	if f.attendanceService != nil {
 		if err := f.attendanceService.HealthCheck(ctx); err != nil {
 			errs["attendance_service"] = err
 		}
 	} else {
 		errs["attendance_service"] = fmt.Errorf("attendance service not initialized")
-	}
-
-	if f.attendanceQueryService != nil {
-		if err := f.attendanceQueryService.HealthCheck(ctx); err != nil {
-			errs["attendance_query_service"] = err
-		}
-	} else {
-		errs["attendance_query_service"] = fmt.Errorf("attendance query service not initialized")
 	}
 
 	if f.postgresUserRepository != nil {
@@ -1579,6 +1470,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["postgres_user_repository"] = fmt.Errorf("postgres user repository not initialized")
 	}
+
 	if f.hrEmployeeRepository != nil {
 		if err := f.hrEmployeeRepository.HealthCheck(ctx); err != nil {
 			errs["hr_employee_repository"] = err
@@ -1586,6 +1478,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["hr_employee_repository"] = fmt.Errorf("HR employee repository not initialized")
 	}
+
 	if f.postgresCompanyRepository != nil {
 		if err := f.postgresCompanyRepository.HealthCheck(ctx); err != nil {
 			errs["postgres_company_repository"] = err
@@ -1761,9 +1654,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		errs["admin_mpin_service"] = fmt.Errorf("admin MPIN service not initialized")
 	}
 
-	// ======================================================================
-	// ✅ NEW — QR WEB LOGIN HEALTH CHECKS
-	// ======================================================================
+	// QR WEB LOGIN HEALTH CHECKS
 	if f.pairingRepo != nil {
 		testSession := &models.PairingSession{
 			SessionID: "health-check",
@@ -1776,7 +1667,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 		if err := f.pairingRepo.CreatePairingSession(ctx, testSession); err != nil {
 			errs["pairing_repository"] = fmt.Errorf("pairing repository health check failed: %w", err)
 		} else {
-			// cleanup
 			_ = f.pairingRepo.DeletePairingSession(ctx, "health-check")
 		}
 	} else {
@@ -1799,43 +1689,30 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 }
 
 // ============================================================================
-// ✅ CLEANUP
+// CLEANUP
 // ============================================================================
-// ============================================================================
-// ✅ CLEANUP (UPDATED — NO INVALID Close() CALLS ON KAFKA CONSUMERS)
-// ============================================================================
-// ============================================================================
-// ✅ CLEANUP (FINAL — WITH ES & CLICKHOUSE CONSUMER STOP + KAFKA PRODUCER CLOSE)
-// ============================================================================
+
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)
 		util.Info("Shutting down factory...")
 
-		// ============================================================================
 		// 1️⃣ SHUTDOWN KAFKA LOGGING MANAGER
-		//    - Cancels consumer contexts
-		//    - Waits for goroutines to exit
-		// ============================================================================
 		if f.kafkaLoggingMgr != nil {
 			util.Info("Shutting down Kafka logging manager...")
 
-			// Stop all consumer goroutines
 			if f.kafkaLoggingMgr.cancelCtx != nil {
 				f.kafkaLoggingMgr.cancelCtx()
 			}
 
-			// Wait for ES/ClickHouse consumers to exit
 			f.kafkaLoggingMgr.wg.Wait()
 
-			// Close log producer (this wraps KafkaProducer)
 			if f.kafkaLoggingMgr.producer != nil {
 				if err := f.kafkaLoggingMgr.producer.Close(); err != nil {
 					util.Error("Failed to close log producer", util.ErrorField(err))
 				}
 			}
 
-			// Explicit status logs
 			if f.kafkaLoggingMgr.esConsumer != nil {
 				util.Info("Elasticsearch Kafka consumer stopped")
 			}
@@ -1846,11 +1723,7 @@ func (f *Factory) Close() error {
 			util.Info("Kafka logging system fully shut down")
 		}
 
-		// ============================================================================
 		// 2️⃣ SHUTDOWN KAFKA PRODUCER (GLOBAL)
-		//    Note: LogProducerService already closed its producer, but we still
-		//    close the factory-level one as safety.
-		// ============================================================================
 		if f.kafkaProducer != nil {
 			if err := f.kafkaProducer.Close(); err != nil {
 				util.Error("Failed to close Kafka producer", util.ErrorField(err))
@@ -1859,9 +1732,7 @@ func (f *Factory) Close() error {
 			}
 		}
 
-		// ============================================================================
 		// 3️⃣ CLOSE DATABASES
-		// ============================================================================
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
 			util.Info("PostgreSQL client closed")
@@ -1877,17 +1748,13 @@ func (f *Factory) Close() error {
 			util.Info("Elasticsearch client closed")
 		}
 
-		// ============================================================================
 		// 4️⃣ SERVICE FACTORY CLEANUP
-		// ============================================================================
 		if f.serviceFactory != nil {
 			f.serviceFactory.Cleanup()
 			util.Info("Service factory cleaned up")
 		}
 
-		// ============================================================================
 		// 5️⃣ CLOSE SCYLLA + REDIS
-		// ============================================================================
 		if f.scyllaClient != nil {
 			f.scyllaClient.Close()
 			util.Info("ScyllaDB client closed")
@@ -1898,9 +1765,7 @@ func (f *Factory) Close() error {
 			util.Info("Redis client closed")
 		}
 
-		// ============================================================================
 		// 6️⃣ SECURITY MANAGERS
-		// ============================================================================
 		if f.hasher != nil {
 			util.Info("Hasher shut down")
 		}
@@ -1909,17 +1774,14 @@ func (f *Factory) Close() error {
 			f.encryptionManager.ClearCache()
 			util.Info("Encryption manager cache cleared")
 		}
-		// =========================================================================
+
 		// ✅ STOP AUDIT OUTBOX SERVICE
-		// =========================================================================
 		if f.auditOutboxCancel != nil {
 			f.logger.Info("Stopping audit outbox service...")
 			f.auditOutboxCancel()
 		}
 
-		// ============================================================================
 		// 7️⃣ WEBSOCKET SERVICE
-		// ============================================================================
 		if f.wsService != nil {
 			if closer, ok := interface{}(f.wsService).(interface{ Close() error }); ok {
 				_ = closer.Close()
@@ -1927,9 +1789,7 @@ func (f *Factory) Close() error {
 			util.Info("WebSocket service shut down")
 		}
 
-		// ============================================================================
 		// 8️⃣ FINAL LOGGING SYNC
-		// ============================================================================
 		util.Sync()
 		util.Info("Factory shutdown completed")
 	})
@@ -1938,7 +1798,7 @@ func (f *Factory) Close() error {
 }
 
 // ============================================================================
-// ✅ SIMPLE GETTERS
+// SIMPLE GETTERS
 // ============================================================================
 
 func (f *Factory) Config() *config.Config                           { return f.config }
@@ -1955,7 +1815,6 @@ func (f *Factory) GetLogProducerService() *service.LogProducerService {
 	return f.kafkaLoggingMgr.GetLogProducerService()
 }
 
-// ✅ UPDATED: PostgreSQL repository getters
 func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	if f.postgresUserRepository == nil {
 		f.postgresUserRepository = postgres.NewUserRepository(
@@ -1976,7 +1835,6 @@ func (f *Factory) PostgresCompanyRepository() postgres.CompanyRepository {
 	return f.postgresCompanyRepository
 }
 
-// GetPairingRepository returns the pairing repository
 func (f *Factory) GetPairingRepository() redis.PairingRepository {
 	if f.pairingRepo == nil {
 		f.pairingRepo = redis.NewPairingRepository(
@@ -1987,10 +1845,9 @@ func (f *Factory) GetPairingRepository() redis.PairingRepository {
 	return f.pairingRepo
 }
 
-// GetHMACUtil returns HMAC utility
 func (f *Factory) GetHMACUtil() *util.HMACUtil {
 	if f.hmacUtil == nil {
-		secret := f.config.Security.JWTSecret // Use JWT secret or separate config
+		secret := f.config.Security.JWTSecret
 		if secret == "" {
 			secret = "default-qr-hmac-secret-change-in-production"
 		}
@@ -1999,7 +1856,6 @@ func (f *Factory) GetHMACUtil() *util.HMACUtil {
 	return f.hmacUtil
 }
 
-// GetQRUtil returns QR utility
 func (f *Factory) GetQRUtil() *util.QRUtil {
 	if f.qrUtil == nil {
 		f.qrUtil = util.NewQRUtil(f.config.Security.JWTSecret)
@@ -2007,7 +1863,6 @@ func (f *Factory) GetQRUtil() *util.QRUtil {
 	return f.qrUtil
 }
 
-// GetPairingService returns the pairing service
 func (f *Factory) GetPairingService() *service.PairingService {
 	if f.pairingService == nil {
 		f.pairingService = service.NewPairingService(
@@ -2021,12 +1876,10 @@ func (f *Factory) GetPairingService() *service.PairingService {
 	return f.pairingService
 }
 
-// GetWebSocketService returns the WebSocket service
 func (f *Factory) GetWebSocketService() *service.WebSocketService {
 	if f.wsService == nil {
 		f.wsService = service.NewWebSocketService(f.logger)
 
-		// Start the WebSocket service in background
 		go f.wsService.Run()
 
 		f.logger.Info("WebSocket service started")
@@ -2034,7 +1887,6 @@ func (f *Factory) GetWebSocketService() *service.WebSocketService {
 	return f.wsService
 }
 
-// GetPairingHandler returns the pairing handler
 func (f *Factory) GetPairingHandler() *handler.PairingHandler {
 	if f.pairingHandler == nil {
 		f.pairingHandler = handler.NewPairingHandler(
@@ -2046,7 +1898,6 @@ func (f *Factory) GetPairingHandler() *handler.PairingHandler {
 	return f.pairingHandler
 }
 
-// GetWebSocketHandler returns the WebSocket handler
 func (f *Factory) GetWebSocketHandler() *handler.WebSocketHandler {
 	if f.wsHandler == nil {
 		f.wsHandler = handler.NewWebSocketHandler(
@@ -2057,7 +1908,21 @@ func (f *Factory) GetWebSocketHandler() *handler.WebSocketHandler {
 	return f.wsHandler
 }
 
-// GetSMSManager returns the SMS manager instance
 func (f *Factory) GetSMSManager() *sms.SMSManager {
 	return f.smsManager
+}
+
+func (f *Factory) GetEmployeeService() *a.EmployeeService {
+	if f.employeeService == nil {
+		f.employeeService = a.NewEmployeeService(
+			f.HREmployeeRepository(),
+			f.GetAuditService(),
+			a.EmployeeServiceConfig{
+				MaxDocumentSizeMB: f.config.HR.Documents.MaxSizeMB,
+				DocumentStorage:   f.DocumentStorage(),
+			},
+			f.logger,
+		)
+	}
+	return f.employeeService
 }

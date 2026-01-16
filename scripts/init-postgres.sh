@@ -3527,6 +3527,79 @@ CREATE UNIQUE INDEX uq_employee_exit_active
 ON employee_exit (company_id, user_id)
 WHERE exit_state IN ('scheduled','effective');
 
+-- Add cancellation support to schedule_instances
+ALTER TABLE schedule_instances
+ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active',
+ADD COLUMN IF NOT EXISTS cancel_reason VARCHAR(50),
+ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+
+-- Drop old UNIQUE constraint (NOT index)
+ALTER TABLE schedule_instances
+DROP CONSTRAINT IF EXISTS schedule_instances_user_id_schedule_date_key;
+
+-- Enforce uniqueness only for active schedules
+CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_instances_user_date_active
+ON schedule_instances (user_id, schedule_date)
+WHERE status = 'active';
+
+INSERT INTO system_departments
+(name, module_code, description, bitmask)
+VALUES
+(
+  'Attendance',
+  'attendance',
+  'Attendance and time tracking management',
+  1 << 20
+)
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO permissions
+(permission_name, description, category, module, scope, requires_tier, bit_index)
+VALUES
+-- 223
+(
+  'attendance.self.punch',
+  'Allow user to punch their own attendance (check-in/check-out)',
+  'attendance',
+  'attendance',
+  'user',
+  'basic',
+  223
+),
+
+-- 224
+(
+  'attendance.team.punch',
+  'Allow manager/lead to punch attendance for team members',
+  'attendance',
+  'attendance',
+  'user',
+  'basic',
+  224
+),
+
+-- 225
+(
+  'attendance.correct',
+  'Allow correction or adjustment of attendance records',
+  'attendance',
+  'attendance',
+  'user',
+  'basic',
+  225
+),
+
+-- 226
+(
+  'attendance.configure',
+  'Configure attendance rules, sources, and policies',
+  'attendance',
+  'attendance',
+  'user',
+  'basic',
+  226
+)
+ON CONFLICT (permission_name) DO NOTHING;
 
 EOSQL
 

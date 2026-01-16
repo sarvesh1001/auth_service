@@ -37,3 +37,37 @@ type AttendanceLocation struct {
 	GeoLng       *float64  `json:"geo_lng" db:"geo_lng"`
 	IsActive     bool      `json:"is_active" db:"is_active"`
 }
+
+// AttendanceStats for analytics
+type AttendanceStats struct {
+	CompanyID          uuid.UUID `json:"company_id"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	TotalEmployees     int       `json:"total_employees"`
+	PresentCount       int       `json:"present_count"`
+	AbsentCount        int       `json:"absent_count"`
+	LateCount          int       `json:"late_count"`
+	HalfDayCount       int       `json:"half_day_count"`
+	LeaveCount         int       `json:"leave_count"`
+	HolidayCount       int       `json:"holiday_count"`
+	TotalWorkedHours   float64   `json:"total_worked_hours"`
+	TotalOvertimeHours float64   `json:"total_overtime_hours"`
+	AverageAttendance  float64   `json:"average_attendance"`
+}
+
+// UserAttendanceStats for user analytics
+type UserAttendanceStats struct {
+	UserID             uuid.UUID `json:"user_id"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	PresentDays        int       `json:"present_days"`
+	AbsentDays         int       `json:"absent_days"`
+	LateDays           int       `json:"late_days"`
+	HalfDays           int       `json:"half_days"`
+	LeaveDays          int       `json:"leave_days"`
+	TotalWorkedHours   float64   `json:"total_worked_hours"`
+	TotalOvertimeHours float64   `json:"total_overtime_hours"`
+	AverageInTime      string    `json:"average_in_time"`
+	AverageOutTime     string    `json:"average_out_time"`
+	AttendancePercent  float64   `json:"attendance_percent"`
+}

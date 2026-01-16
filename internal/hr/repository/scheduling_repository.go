@@ -44,6 +44,7 @@ type SchedulingRepository interface {
 	GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error)
 	GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error)
 	UpdateScheduleInstance(ctx context.Context, instance *scheduling.ScheduleInstance) error
+	CancelScheduleInstance(ctx context.Context, instanceID uuid.UUID, reason string) error // ✅ NEW: Add cancel method
 	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID) error
 	BulkCreateScheduleInstances(ctx context.Context, instances []*scheduling.ScheduleInstance) error
 

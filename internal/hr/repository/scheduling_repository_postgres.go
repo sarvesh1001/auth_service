@@ -682,8 +682,8 @@ func (r *SchedulingRepositoryImpl) CreateScheduleInstance(ctx context.Context, i
 		INSERT INTO schedule_instances (
 			schedule_instance_id, company_id, user_id, schedule_date, 
 			schedule_template_id, expected_start, expected_end, timezone,
-			metadata, generated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+			metadata, generated_at, status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active')`
 
 	_, err = r.client.Exec(ctx, query,
 		instance.ScheduleInstanceID,
@@ -716,7 +716,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstanceByID(ctx context.Context, 
 		query := `
 			SELECT schedule_instance_id, company_id, user_id, schedule_date, 
 				   schedule_template_id, expected_start, expected_end, timezone,
-				   metadata, generated_at
+				   metadata, generated_at, status, cancel_reason, cancelled_at
 			FROM schedule_instances WHERE schedule_instance_id = $1`
 
 		rows, err := r.client.Query(ctx, query, instanceID)
@@ -748,9 +748,9 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstanceByUserDate(ctx context.Con
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date, 
 		       schedule_template_id, expected_start, expected_end, timezone,
-		       metadata, generated_at
+		       metadata, generated_at, status, cancel_reason, cancelled_at
 		FROM schedule_instances 
-		WHERE user_id = $1 AND schedule_date = $2`
+		WHERE user_id = $1 AND schedule_date = $2 AND status = 'active'`
 
 	rows, err := r.client.Query(ctx, query, userID, date)
 	if err != nil {
@@ -769,9 +769,9 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByUser(ctx context.Contex
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date, 
 		       schedule_template_id, expected_start, expected_end, timezone,
-		       metadata, generated_at
+		       metadata, generated_at, status, cancel_reason, cancelled_at
 		FROM schedule_instances 
-		WHERE user_id = $1 AND schedule_date BETWEEN $2 AND $3
+		WHERE user_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'
 		ORDER BY schedule_date`
 
 	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
@@ -801,9 +801,9 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByCompany(ctx context.Con
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date, 
 		       schedule_template_id, expected_start, expected_end, timezone,
-		       metadata, generated_at
+		       metadata, generated_at, status, cancel_reason, cancelled_at
 		FROM schedule_instances 
-		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3
+		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'
 		ORDER BY schedule_date, user_id`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
@@ -833,9 +833,9 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByTemplate(ctx context.Co
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date, 
 		       schedule_template_id, expected_start, expected_end, timezone,
-		       metadata, generated_at
+		       metadata, generated_at, status, cancel_reason, cancelled_at
 		FROM schedule_instances 
-		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3
+		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'
 		ORDER BY schedule_date, user_id`
 
 	rows, err := r.client.Query(ctx, query, templateID, startDate, endDate)
@@ -871,7 +871,7 @@ func (r *SchedulingRepositoryImpl) UpdateScheduleInstance(ctx context.Context, i
 	query := `
 		UPDATE schedule_instances SET
 			expected_start = $1, expected_end = $2, metadata = $3, timezone = $4
-		WHERE schedule_instance_id = $5`
+		WHERE schedule_instance_id = $5 AND status = 'active'`
 
 	result, err := r.client.Exec(ctx, query,
 		instance.ExpectedStart,
@@ -887,7 +887,34 @@ func (r *SchedulingRepositoryImpl) UpdateScheduleInstance(ctx context.Context, i
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return fmt.Errorf("schedule instance not found: %s", instance.ScheduleInstanceID)
+		return fmt.Errorf("schedule instance not found or is cancelled: %s", instance.ScheduleInstanceID)
+	}
+
+	return nil
+}
+
+func (r *SchedulingRepositoryImpl) CancelScheduleInstance(
+	ctx context.Context,
+	instanceID uuid.UUID,
+	reason string,
+) error {
+	query := `
+		UPDATE schedule_instances
+		SET status = 'cancelled',
+		    cancel_reason = $2,
+		    cancelled_at = NOW()
+		WHERE schedule_instance_id = $1
+		  AND status = 'active'
+	`
+
+	result, err := r.client.Exec(ctx, query, instanceID, reason)
+	if err != nil {
+		return fmt.Errorf("failed to cancel schedule instance: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("schedule instance not found or already cancelled")
 	}
 
 	return nil
@@ -923,8 +950,8 @@ func (r *SchedulingRepositoryImpl) BulkCreateScheduleInstances(ctx context.Conte
 		INSERT INTO schedule_instances (
 			schedule_instance_id, company_id, user_id, schedule_date, 
 			schedule_template_id, expected_start, expected_end, timezone,
-			metadata, generated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+			metadata, generated_at, status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active')`
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -977,7 +1004,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleCoverage(ctx context.Context, comp
 	err := r.client.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT schedule_date) 
 		FROM schedule_instances 
-		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3`,
+		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
 		companyID, startDate, endDate).Scan(&totalScheduledDays)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total scheduled days: %w", err)
@@ -989,7 +1016,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleCoverage(ctx context.Context, comp
 	err = r.client.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT user_id) 
 		FROM schedule_instances 
-		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3`,
+		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
 		companyID, startDate, endDate).Scan(&totalScheduledUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total scheduled users: %w", err)
@@ -1001,7 +1028,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleCoverage(ctx context.Context, comp
 		SELECT st.template_type, COUNT(si.schedule_instance_id) as count
 		FROM schedule_instances si
 		JOIN schedule_templates st ON si.schedule_template_id = st.schedule_template_id
-		WHERE si.company_id = $1 AND si.schedule_date BETWEEN $2 AND $3
+		WHERE si.company_id = $1 AND si.schedule_date BETWEEN $2 AND $3 AND si.status = 'active'
 		GROUP BY st.template_type`
 
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
@@ -1032,7 +1059,7 @@ func (r *SchedulingRepositoryImpl) GetUserScheduleSummary(ctx context.Context, u
 	err := r.client.QueryRow(ctx, `
 		SELECT COUNT(*) 
 		FROM schedule_instances 
-		WHERE user_id = $1 AND schedule_date BETWEEN $2 AND $3`,
+		WHERE user_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
 		userID, startDate, endDate).Scan(&totalScheduledDays)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total scheduled days: %w", err)
@@ -1054,7 +1081,7 @@ func (r *SchedulingRepositoryImpl) GetUserScheduleSummary(ctx context.Context, u
 		SELECT st.template_type, COUNT(*) as count
 		FROM schedule_instances si
 		JOIN schedule_templates st ON si.schedule_template_id = st.schedule_template_id
-		WHERE si.user_id = $1 AND si.schedule_date BETWEEN $2 AND $3
+		WHERE si.user_id = $1 AND si.schedule_date BETWEEN $2 AND $3 AND si.status = 'active'
 		GROUP BY st.template_type`
 
 	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
@@ -1096,7 +1123,7 @@ func (r *SchedulingRepositoryImpl) GetTemplateUtilization(ctx context.Context, t
 	err = r.client.QueryRow(ctx, `
 		SELECT COUNT(*) 
 		FROM schedule_instances 
-		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3`,
+		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
 		templateID, startDate, endDate).Scan(&totalInstances)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total instances: %w", err)
@@ -1108,7 +1135,7 @@ func (r *SchedulingRepositoryImpl) GetTemplateUtilization(ctx context.Context, t
 	err = r.client.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT user_id) 
 		FROM schedule_instances 
-		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3`,
+		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
 		templateID, startDate, endDate).Scan(&uniqueUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get unique users: %w", err)
@@ -1119,7 +1146,7 @@ func (r *SchedulingRepositoryImpl) GetTemplateUtilization(ctx context.Context, t
 	query := `
 		SELECT schedule_date, COUNT(*) as count
 		FROM schedule_instances 
-		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3
+		WHERE schedule_template_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'
 		GROUP BY schedule_date
 		ORDER BY schedule_date`
 
@@ -1254,8 +1281,10 @@ func (r *SchedulingRepositoryImpl) scanUserScheduleAssignment(rows *sql.Rows) (*
 
 func (r *SchedulingRepositoryImpl) scanScheduleInstance(rows *sql.Rows) (*scheduling.ScheduleInstance, error) {
 	var instance scheduling.ScheduleInstance
-	var expectedStart, expectedEnd sql.NullTime
+	var expectedStart, expectedEnd, cancelledAt sql.NullTime
 	var metadataJSON []byte
+	var cancelReason sql.NullString
+	var status sql.NullString
 
 	err := rows.Scan(
 		&instance.ScheduleInstanceID,
@@ -1268,21 +1297,32 @@ func (r *SchedulingRepositoryImpl) scanScheduleInstance(rows *sql.Rows) (*schedu
 		&instance.Timezone,
 		&metadataJSON,
 		&instance.GeneratedAt,
+		&status,
+		&cancelReason,
+		&cancelledAt,
 	)
-
 	if err != nil {
 		return nil, err
 	}
 
-	// Handle nullable times
 	if expectedStart.Valid {
 		instance.ExpectedStart = &expectedStart.Time
 	}
 	if expectedEnd.Valid {
 		instance.ExpectedEnd = &expectedEnd.Time
 	}
+	if status.Valid {
+		instance.Status = status.String
+	} else {
+		instance.Status = "active"
+	}
+	if cancelReason.Valid {
+		instance.CancelReason = &cancelReason.String
+	}
+	if cancelledAt.Valid {
+		instance.CancelledAt = &cancelledAt.Time
+	}
 
-	// Unmarshal metadata
 	if len(metadataJSON) > 0 {
 		if err := json.Unmarshal(metadataJSON, &instance.Metadata); err != nil {
 			r.logger.Warn("Failed to unmarshal instance metadata", util.ErrorField(err))
@@ -1325,7 +1365,7 @@ func (r *SchedulingRepositoryImpl) initializePreparedStatements(ctx context.Cont
 		"get_schedule_instance_by_id": `
 			SELECT schedule_instance_id, company_id, user_id, schedule_date, 
 			       schedule_template_id, expected_start, expected_end, timezone,
-			       metadata, generated_at
+			       metadata, generated_at, status, cancel_reason, cancelled_at
 			FROM schedule_instances WHERE schedule_instance_id = $1
 		`,
 
@@ -1589,19 +1629,34 @@ func (r *SchedulingRepositoryImpl) GetOffRequestByID(ctx context.Context, reques
 	return nil, fmt.Errorf("off request not found: %s", requestID)
 }
 
-func (r *SchedulingRepositoryImpl) GetOffRequestsByUser(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time, status *string) ([]*scheduling.OffRequest, error) {
+func (r *SchedulingRepositoryImpl) GetOffRequestsByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate *time.Time,
+	status *string,
+) ([]*scheduling.OffRequest, error) {
+
 	query := `
 		SELECT off_request_id, company_id, user_id, request_dates, status,
 			   requested_by, approved_by, approved_at, created_at
 		FROM off_requests
-		WHERE user_id = $1`
+		WHERE user_id = $1
+	`
 
 	args := []interface{}{userID}
 	argIndex := 2
 
+	// ✅ FIX: use unnest(date[]) instead of jsonb_array_elements_text
 	if startDate != nil && endDate != nil {
-		query += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(request_dates) AS date WHERE date::date BETWEEN $%d AND $%d)", argIndex, argIndex+1)
-		args = append(args, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+		query += fmt.Sprintf(`
+			AND EXISTS (
+				SELECT 1
+				FROM unnest(request_dates) AS d
+				WHERE d BETWEEN $%d AND $%d
+			)
+		`, argIndex, argIndex+1)
+
+		args = append(args, *startDate, *endDate)
 		argIndex += 2
 	}
 
