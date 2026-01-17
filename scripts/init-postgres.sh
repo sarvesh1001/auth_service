@@ -1474,7 +1474,9 @@ CREATE TABLE work_calendars (
     ('system', 'System generated', false),
     ('manual', 'Manual HR entry', true),
     ('classroom', 'Classroom system', true),
-    ('machine', 'Factory machine / gate', true)
+    ('machine', 'Factory machine / gate', true),
+    ('correction', 'Manual correction of attendance event', false)
+
     ON CONFLICT DO NOTHING;
 
     -- ==============================================
@@ -3601,6 +3603,111 @@ VALUES
 )
 ON CONFLICT (permission_name) DO NOTHING;
 
+-- ==============================================
+-- DUPLICATE PROTECTION FOR ATTENDANCE EVENTS
+-- ==============================================
+
+-- Unique constraint for correction events
+-- Prevents multiple corrections for the same event
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_correction_event
+ON attendance_events (
+  company_id,
+  user_id,
+  event_type,
+  event_time
+)
+WHERE source_type = 'correction';
+
+-- Index for efficient duplicate detection for regular events
+-- Helps with time-window based duplicate prevention
+CREATE INDEX IF NOT EXISTS idx_attendance_events_user_type_time
+ON attendance_events (
+  company_id,
+  user_id,
+  event_type,
+  event_time DESC
+)
+WHERE source_type != 'correction';
+
+-- Index for device-based duplicate detection
+CREATE INDEX IF NOT EXISTS idx_attendance_events_device_time
+ON attendance_events (
+  company_id,
+  user_id,
+  device_id,
+  event_type,
+  event_time DESC
+)
+WHERE device_id IS NOT NULL AND source_type != 'correction';
+
+-- Function to check for recent duplicates
+CREATE OR REPLACE FUNCTION check_recent_attendance_duplicate(
+    p_company_id UUID,
+    p_user_id UUID,
+    p_event_type VARCHAR(30),
+    p_event_time TIMESTAMPTZ,
+    p_time_window_minutes INTEGER DEFAULT 5
+) RETURNS BOOLEAN AS $$
+DECLARE
+    duplicate_count INTEGER;
+BEGIN
+    SELECT COUNT(*)
+    INTO duplicate_count
+    FROM attendance_events
+    WHERE company_id = p_company_id
+      AND user_id = p_user_id
+      AND event_type = p_event_type
+      AND source_type != 'correction'
+      AND ABS(EXTRACT(EPOCH FROM (event_time - p_event_time))) <= p_time_window_minutes * 60;
+    
+    RETURN duplicate_count > 0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to find existing correction
+CREATE OR REPLACE FUNCTION find_existing_correction(
+    p_company_id UUID,
+    p_user_id UUID,
+    p_event_type VARCHAR(30),
+    p_event_time TIMESTAMPTZ
+) RETURNS TABLE (
+    attendance_event_id UUID,
+    company_id UUID,
+    user_id UUID,
+    event_type VARCHAR(30),
+    event_time TIMESTAMPTZ,
+    source_type VARCHAR(30),
+    source_id UUID,
+    device_id VARCHAR(256),
+    ip_address VARCHAR(64),
+    metadata JSONB,
+    created_at TIMESTAMPTZ,
+    created_by UUID
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        ae.attendance_event_id,
+        ae.company_id,
+        ae.user_id,
+        ae.event_type,
+        ae.event_time,
+        ae.source_type,
+        ae.source_id,
+        ae.device_id,
+        ae.ip_address,
+        ae.metadata,
+        ae.created_at,
+        ae.created_by
+    FROM attendance_events ae
+    WHERE ae.company_id = p_company_id
+      AND ae.user_id = p_user_id
+      AND ae.event_type = p_event_type
+      AND ae.event_time = p_event_time
+      AND ae.source_type = 'correction'
+    LIMIT 1;
+END;
+$$ LANGUAGE plpgsql;
 EOSQL
 
 echo "✅ Database schema created successfully!"

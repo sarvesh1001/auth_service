@@ -208,8 +208,19 @@ func NewRouter(
 
 					// Event Management
 					r.Route("/events", func(r chi.Router) {
+						// NEW: Normal punch (self/team) - auto-derived data
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.self.punch", logger)).
+							Post("/punch", attendanceHandler.PunchAttendance)
+
+						// NEW: Correction - requires permission, allows backdating
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
+							Post("/correct", attendanceHandler.CorrectAttendance)
+
+						// OLD: Keep for backward compatibility (for HR/admin tools)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
 							Post("/", attendanceHandler.CreateAttendanceEvent)
+
+						// Existing routes remain
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
 							Post("/bulk", attendanceHandler.CreateBulkAttendanceEvents)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
@@ -218,6 +229,7 @@ func NewRouter(
 							Get("/search", attendanceHandler.SearchAttendanceEvents)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 							Get("/", attendanceHandler.GetAttendanceEventsByCompany)
+
 						r.Route("/user/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 								Get("/", attendanceHandler.GetAttendanceEventsByUser)
@@ -317,14 +329,6 @@ func NewRouter(
 							Post("/map", attendanceHandler.MapWorkCenterToShift)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 							Get("/shift/{workCenterCode}", attendanceHandler.GetShiftForWorkCenter)
-					})
-
-					// SAP Business Rules
-					r.Route("/sap-rules", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/", attendanceHandler.GetSAPBusinessRules)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Put("/", attendanceHandler.UpdateSAPBusinessRules)
 					})
 
 					// Reports

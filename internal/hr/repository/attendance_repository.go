@@ -270,20 +270,6 @@ type AttendanceRepository interface {
 	) error
 
 	// ============================================================
-	// SAP BUSINESS RULES
-	// ============================================================
-	GetSAPBusinessRules(
-		ctx context.Context,
-		companyID uuid.UUID,
-	) (*attendance.SAPBusinessRules, error)
-
-	UpdateSAPBusinessRules(
-		ctx context.Context,
-		companyID uuid.UUID,
-		rules *attendance.SAPBusinessRules,
-	) error
-
-	// ============================================================
 	// ANALYTICS
 	// ============================================================
 	GetAttendanceStats(
@@ -302,6 +288,30 @@ type AttendanceRepository interface {
 	// HEALTH
 	// ============================================================
 	HealthCheck(ctx context.Context) error
+
+	// New methods for duplicate detection
+	FindExistingCorrection(
+		ctx context.Context,
+		companyID, userID uuid.UUID,
+		eventType string,
+		eventTime time.Time,
+	) (*attendance.AttendanceEvent, error)
+	UpsertAttendanceDailySummary(
+		ctx context.Context,
+		summary *attendance.AttendanceDailySummary,
+	) error
+	GetDistinctUsersWithEvents(
+		ctx context.Context,
+		companyID uuid.UUID,
+		startDate, endDate time.Time,
+	) ([]uuid.UUID, error)
+
+	GetLastAttendanceEvent(
+		ctx context.Context,
+		companyID, userID uuid.UUID,
+		eventType string,
+		since time.Time,
+	) (*attendance.AttendanceEvent, error)
 }
 
 type AttendanceEventFilter struct {

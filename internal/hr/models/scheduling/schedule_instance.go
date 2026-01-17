@@ -31,7 +31,11 @@ type InstanceMetadata struct {
 }
 
 type ResolvedScheduleDay struct {
+	// Authoritative business date (normalized in schedule timezone)
 	Date time.Time
+
+	// Timezone used to resolve this day (VERY IMPORTANT)
+	Timezone string
 
 	// Calendar-level
 	IsWorkingDay  bool
@@ -42,7 +46,7 @@ type ResolvedScheduleDay struct {
 	IsForceWork bool
 	IsOnLeave   bool
 
-	// Schedule expectations
+	// Schedule expectations (in schedule timezone)
 	ExpectedStart *time.Time
 	ExpectedEnd   *time.Time
 	ShiftID       *uuid.UUID

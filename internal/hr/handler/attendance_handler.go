@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -822,26 +823,26 @@ func (h *AttendanceHandler) DeleteAttendancePolicy(w http.ResponseWriter, r *htt
 }
 
 // AssignUserAttendancePolicy handles POST /api/attendance/users/{userID}/policies
-func (h *AttendanceHandler) AssignUserAttendancePolicy(w http.ResponseWriter, r *http.Request) {
+func (h *AttendanceHandler) AssignUserAttendancePolicy(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
 
+	// ------------------------------------------------------------
 	// Get actor information from context
+	// ------------------------------------------------------------
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse user ID from URL
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID format")
-		return
-	}
-
+	// ------------------------------------------------------------
 	// Parse request body
+	// ------------------------------------------------------------
 	var req struct {
+		UserID        uuid.UUID  `json:"user_id" validate:"required"`
 		PolicyID      uuid.UUID  `json:"policy_id" validate:"required"`
 		EffectiveFrom time.Time  `json:"effective_from"`
 		EffectiveTo   *time.Time `json:"effective_to"`
@@ -852,28 +853,54 @@ func (h *AttendanceHandler) AssignUserAttendancePolicy(w http.ResponseWriter, r 
 		return
 	}
 
-	// Set default effective from if not provided
+	// ------------------------------------------------------------
+	// Basic validation
+	// ------------------------------------------------------------
+	if req.UserID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	if req.PolicyID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "policy_id is required")
+		return
+	}
+
+	// ------------------------------------------------------------
+	// Default effective_from
+	// ------------------------------------------------------------
 	if req.EffectiveFrom.IsZero() {
 		req.EffectiveFrom = time.Now().UTC()
 	}
 
-	// Create user policy assignment
+	// ------------------------------------------------------------
+	// Build domain model
+	// ------------------------------------------------------------
 	userPolicy := &attendance.UserAttendancePolicy{
-		UserID:        userID,
+		UserID:        req.UserID,
 		PolicyID:      req.PolicyID,
 		EffectiveFrom: req.EffectiveFrom,
 		EffectiveTo:   req.EffectiveTo,
 		AssignedBy:    &actorID,
 	}
 
-	// Assign policy to user
+	// ------------------------------------------------------------
+	// Assign policy
+	// ------------------------------------------------------------
 	err = h.attendanceService.AssignUserAttendancePolicy(
-		ctx, userPolicy, actorType, actorID, nil)
+		ctx,
+		userPolicy,
+		actorType,
+		actorID,
+		nil,
+	)
 	if err != nil {
-		h.logger.Error("Failed to assign user attendance policy",
-			util.String("user_id", userID.String()),
+		h.logger.Error(
+			"Failed to assign user attendance policy",
+			util.String("user_id", req.UserID.String()),
 			util.String("policy_id", req.PolicyID.String()),
-			util.ErrorField(err))
+			util.ErrorField(err),
+		)
 
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") ||
@@ -885,6 +912,9 @@ func (h *AttendanceHandler) AssignUserAttendancePolicy(w http.ResponseWriter, r 
 		return
 	}
 
+	// ------------------------------------------------------------
+	// Success response
+	// ------------------------------------------------------------
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Attendance policy assigned to user successfully",
@@ -1789,77 +1819,6 @@ func (h *AttendanceHandler) GetAttendanceSourceTypes(w http.ResponseWriter, r *h
 // SAP BUSINESS RULES
 // ============================================================================
 
-// GetSAPBusinessRules handles GET /api/attendance/sap/rules
-func (h *AttendanceHandler) GetSAPBusinessRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Parse company ID from URL
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
-		return
-	}
-
-	// Get SAP business rules
-	rules, err := h.attendanceService.GetSAPBusinessRules(ctx, companyID)
-	if err != nil {
-		h.logger.Error("Failed to get SAP business rules",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to get SAP business rules")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    rules,
-	})
-}
-
-// UpdateSAPBusinessRules handles PUT /api/attendance/sap/rules
-func (h *AttendanceHandler) UpdateSAPBusinessRules(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Get actor information from context
-	_, actorID, err := h.getActorFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-
-	// Parse company ID from URL
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
-		return
-	}
-
-	// Parse request body
-	var rules attendance.SAPBusinessRules
-
-	if err := json.NewDecoder(r.Body).Decode(&rules); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-
-	// Update SAP business rules
-	err = h.attendanceService.UpdateSAPBusinessRules(ctx, companyID, &rules, actorID)
-	if err != nil {
-		h.logger.Error("Failed to update SAP business rules",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to update SAP business rules")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "SAP business rules updated successfully",
-	})
-}
-
 // ============================================================================
 // REPORTS
 // ============================================================================
@@ -2024,14 +1983,23 @@ func (h *AttendanceHandler) getActorFromContext(
 
 	return userType, userID, nil
 }
-
 func (h *AttendanceHandler) getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	companyIDStr, ok := ctx.Value("company_id").(string)
-	if !ok || companyIDStr == "" {
+	v := ctx.Value("company_id")
+	if v == nil {
 		return uuid.Nil, fmt.Errorf("company ID not found in context")
 	}
 
-	return uuid.Parse(companyIDStr)
+	switch id := v.(type) {
+	case uuid.UUID:
+		return id, nil
+	case string:
+		if id == "" {
+			return uuid.Nil, fmt.Errorf("company ID empty in context")
+		}
+		return uuid.Parse(id)
+	default:
+		return uuid.Nil, fmt.Errorf("invalid company ID type in context")
+	}
 }
 
 func (h *AttendanceHandler) getPointerValue(s *string) string {
@@ -2039,4 +2007,530 @@ func (h *AttendanceHandler) getPointerValue(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+
+// 	// Get user and company from context (set by middleware)
+// 	actorType, actorID, err := h.getActorFromContext(ctx)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+// 		return
+// 	}
+
+// 	companyID, err := h.getCompanyIDFromContext(ctx)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Company context required")
+// 		return
+// 	}
+
+// 	var req struct {
+// 		EventType  string                   `json:"event_type" validate:"required"`
+// 		SourceType string                   `json:"source_type" validate:"required"`
+// 		Metadata   attendance.EventMetadata `json:"metadata,omitempty"`
+// 	}
+
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+// 		return
+// 	}
+
+// 	// Auto-derive all data - client cannot send these
+// 	now := time.Now().UTC()
+// 	clientIP := h.getClientIP(r)
+// 	deviceID := r.Header.Get("X-Device-ID")
+// 	userID := actorID // User punches for themselves
+
+// 	event := &attendance.AttendanceEvent{
+// 		AttendanceEventID: uuid.New(),
+// 		CompanyID:         companyID,
+// 		UserID:            userID,
+// 		EventType:         req.EventType,
+// 		EventTime:         now, // Server time, not client time
+// 		SourceType:        req.SourceType,
+// 		DeviceID:          &deviceID,
+// 		IPAddress:         &clientIP,
+// 		Metadata:          req.Metadata,
+// 		CreatedAt:         now,
+// 		CreatedBy:         &actorID,
+// 	}
+
+// 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
+// 		ctx, event, actorType, actorID, map[string]interface{}{
+// 			"auto_derived": true,
+// 			"source":       "real_time_punch",
+// 		})
+
+// 	if err != nil {
+// 		h.logger.Error("Failed to create punch attendance event",
+// 			util.String("user_id", userID.String()),
+// 			util.String("event_type", req.EventType),
+// 			util.ErrorField(err))
+
+// 		status := http.StatusInternalServerError
+// 		if strings.Contains(err.Error(), "invalid") ||
+// 			strings.Contains(err.Error(), "required") ||
+// 			strings.Contains(err.Error(), "not allowed") {
+// 			status = http.StatusBadRequest
+// 		}
+// 		h.respondWithError(w, status, err.Error())
+// 		return
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+// 		"success": true,
+// 		"data":    createdEvent,
+// 		"auto_derived": map[string]interface{}{
+// 			"event_time": now,
+// 			"ip_address": clientIP,
+// 			"device_id":  deviceID,
+// 		},
+// 	})
+// }
+
+// func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+
+// 	// Get actor info
+// 	actorType, actorID, err := h.getActorFromContext(ctx)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+// 		return
+// 	}
+
+// 	companyID, err := h.getCompanyIDFromContext(ctx)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Company context required")
+// 		return
+// 	}
+
+// 	var req struct {
+// 		UserID     uuid.UUID                `json:"user_id" validate:"required"`
+// 		EventType  string                   `json:"event_type" validate:"required"`
+// 		EventTime  time.Time                `json:"event_time" validate:"required"`
+// 		SourceType string                   `json:"source_type"`
+// 		Reason     string                   `json:"reason" validate:"required"`
+// 		DeviceID   *string                  `json:"device_id,omitempty"`
+// 		IPAddress  *string                  `json:"ip_address,omitempty"`
+// 		Metadata   attendance.EventMetadata `json:"metadata,omitempty"`
+// 	}
+
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+// 		return
+// 	}
+
+// 	// Validate required fields
+// 	if req.Reason == "" {
+// 		h.respondWithError(w, http.StatusBadRequest, "Reason is required for correction")
+// 		return
+// 	}
+
+// 	if req.EventTime.After(time.Now().UTC()) {
+// 		h.respondWithError(w, http.StatusBadRequest, "Cannot correct future events")
+// 		return
+// 	}
+
+// 	// Use provided source type or default
+// 	sourceType := req.SourceType
+// 	if sourceType == "" {
+// 		sourceType = "correction"
+// 	}
+
+// 	now := time.Now().UTC()
+// 	event := &attendance.AttendanceEvent{
+// 		AttendanceEventID: uuid.New(),
+// 		CompanyID:         companyID,
+// 		UserID:            req.UserID,
+// 		EventType:         req.EventType,
+// 		EventTime:         req.EventTime,
+// 		SourceType:        sourceType,
+// 		DeviceID:          req.DeviceID,
+// 		IPAddress:         req.IPAddress,
+// 		Metadata:          req.Metadata,
+// 		CreatedAt:         now,
+// 		CreatedBy:         &actorID,
+// 	}
+
+// 	// Add reason to metadata if not already present
+// 	if event.Metadata.Reason == nil {
+// 		event.Metadata.Reason = &req.Reason
+// 	}
+
+// 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
+// 		ctx, event, actorType, actorID, map[string]interface{}{
+// 			"correction":   true,
+// 			"reason":       req.Reason,
+// 			"corrected_by": actorID.String(),
+// 			"corrected_at": now,
+// 		})
+
+// 	if err != nil {
+// 		h.logger.Error("Failed to create correction attendance event",
+// 			util.String("user_id", req.UserID.String()),
+// 			util.String("event_type", req.EventType),
+// 			util.String("reason", req.Reason),
+// 			util.ErrorField(err))
+
+// 		status := http.StatusInternalServerError
+// 		if strings.Contains(err.Error(), "invalid") ||
+// 			strings.Contains(err.Error(), "required") ||
+// 			strings.Contains(err.Error(), "not allowed") {
+// 			status = http.StatusBadRequest
+// 		}
+// 		h.respondWithError(w, status, err.Error())
+// 		return
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+// 		"success": true,
+// 		"data":    createdEvent,
+// 		"correction_info": map[string]interface{}{
+// 			"reason":       req.Reason,
+// 			"corrected_by": actorID.String(),
+// 			"corrected_at": now,
+// 		},
+// 	})
+// }
+
+// ====================================
+// HELPER FUNCTIONS
+// ====================================
+
+// getClientIP extracts client IP address from request
+func (h *AttendanceHandler) getClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return ip
+			}
+		}
+	}
+
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+			return realIP
+		}
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+
+// 	actorType, actorID, err := h.getActorFromContext(ctx)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+// 		return
+// 	}
+
+// 	companyID, err := h.getCompanyIDFromContext(ctx)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Company context required")
+// 		return
+// 	}
+
+// 	var req struct {
+// 		UserID    uuid.UUID                `json:"user_id" validate:"required"`
+// 		EventType string                   `json:"event_type" validate:"required"`
+// 		EventTime time.Time                `json:"event_time" validate:"required"`
+// 		Reason    string                   `json:"reason" validate:"required"`
+// 		Metadata  attendance.EventMetadata `json:"metadata,omitempty"`
+// 	}
+
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+// 		return
+// 	}
+
+// 	if req.Reason == "" {
+// 		h.respondWithError(w, http.StatusBadRequest, "Reason is required for correction")
+// 		return
+// 	}
+
+// 	if req.EventTime.After(time.Now().UTC()) {
+// 		h.respondWithError(w, http.StatusBadRequest, "Cannot correct future events")
+// 		return
+// 	}
+
+// 	now := time.Now().UTC()
+
+// 	// 🔒 FORCE correction source type (client never sends it)
+// 	event := &attendance.AttendanceEvent{
+// 		AttendanceEventID: uuid.New(),
+// 		CompanyID:         companyID,
+// 		UserID:            req.UserID,
+// 		EventType:         req.EventType,
+// 		EventTime:         req.EventTime,
+// 		SourceType:        "correction", // ✅ HARD-SET
+// 		Metadata:          req.Metadata,
+// 		CreatedAt:         now,
+// 		CreatedBy:         &actorID,
+// 	}
+
+// 	// Always store reason in metadata
+// 	if event.Metadata.Reason == nil {
+// 		event.Metadata.Reason = &req.Reason
+// 	}
+
+// 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
+// 		ctx,
+// 		event,
+// 		actorType,
+// 		actorID,
+// 		map[string]interface{}{
+// 			"correction":   true,
+// 			"reason":       req.Reason,
+// 			"corrected_by": actorID.String(),
+// 			"corrected_at": now,
+// 		},
+// 	)
+
+// 	if err != nil {
+// 		h.logger.Error(
+// 			"Failed to create correction attendance event",
+// 			util.String("user_id", req.UserID.String()),
+// 			util.String("event_type", req.EventType),
+// 			util.String("reason", req.Reason),
+// 			util.ErrorField(err),
+// 		)
+
+// 		status := http.StatusInternalServerError
+// 		if strings.Contains(err.Error(), "invalid") ||
+// 			strings.Contains(err.Error(), "required") ||
+// 			strings.Contains(err.Error(), "not allowed") {
+// 			status = http.StatusBadRequest
+// 		}
+
+// 		h.respondWithError(w, status, err.Error())
+// 		return
+// 	}
+
+// 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+// 		"success": true,
+// 		"data":    createdEvent,
+// 		"correction_info": map[string]interface{}{
+// 			"reason":       req.Reason,
+// 			"corrected_by": actorID.String(),
+// 			"corrected_at": now,
+// 		},
+// 	})
+// }
+
+func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType, actorID, err := h.getActorFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Company context required")
+		return
+	}
+
+	var req struct {
+		UserID    uuid.UUID                `json:"user_id" validate:"required"`
+		EventType string                   `json:"event_type" validate:"required"`
+		EventTime time.Time                `json:"event_time" validate:"required"`
+		Reason    string                   `json:"reason" validate:"required"`
+		Metadata  attendance.EventMetadata `json:"metadata,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Validate required fields
+	if req.Reason == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Reason is required for correction")
+		return
+	}
+
+	if req.EventTime.After(time.Now().UTC()) {
+		h.respondWithError(w, http.StatusBadRequest, "Cannot correct future events")
+		return
+	}
+
+	// Check if correction is too old (e.g., more than 30 days)
+	if time.Since(req.EventTime) > 30*24*time.Hour {
+		h.respondWithError(w, http.StatusBadRequest, "Cannot correct events older than 30 days")
+		return
+	}
+
+	// Create correction event
+	now := time.Now().UTC()
+	event := &attendance.AttendanceEvent{
+		AttendanceEventID: uuid.New(),
+		CompanyID:         companyID,
+		UserID:            req.UserID,
+		EventType:         req.EventType,
+		EventTime:         req.EventTime,
+		SourceType:        "correction",
+		Metadata:          req.Metadata,
+		CreatedAt:         now,
+		CreatedBy:         &actorID,
+	}
+
+	// Set correction reason in metadata
+	if event.Metadata.Reason == nil {
+		event.Metadata.Reason = &req.Reason
+	}
+
+	// Create the correction event
+	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
+		ctx,
+		event,
+		actorType,
+		actorID,
+		map[string]interface{}{
+			"correction":   true,
+			"reason":       req.Reason,
+			"corrected_by": actorID.String(),
+			"corrected_at": now,
+		},
+	)
+
+	if err != nil {
+		h.logger.Error(
+			"Failed to create correction attendance event",
+			util.String("user_id", req.UserID.String()),
+			util.String("event_type", req.EventType),
+			util.String("reason", req.Reason),
+			util.ErrorField(err),
+		)
+
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "duplicate") {
+			status = http.StatusConflict
+			h.respondWithError(w, status, "A correction for this event already exists")
+			return
+		} else if strings.Contains(err.Error(), "invalid") ||
+			strings.Contains(err.Error(), "required") ||
+			strings.Contains(err.Error(), "not allowed") {
+			status = http.StatusBadRequest
+		}
+
+		h.respondWithError(w, status, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    createdEvent,
+		"correction_info": map[string]interface{}{
+			"reason":       req.Reason,
+			"corrected_by": actorID.String(),
+			"corrected_at": now,
+			"is_duplicate": createdEvent.AttendanceEventID != event.AttendanceEventID,
+		},
+	})
+}
+
+func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	actorType, actorID, err := h.getActorFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Company context required")
+		return
+	}
+
+	var req struct {
+		EventType  string                   `json:"event_type" validate:"required"`
+		SourceType string                   `json:"source_type" validate:"required"`
+		Metadata   attendance.EventMetadata `json:"metadata,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	// Get current time
+	now := time.Now().UTC()
+	clientIP := h.getClientIP(r)
+	deviceID := r.Header.Get("X-Device-ID")
+	userID := actorID
+
+	// Create punch event
+	event := &attendance.AttendanceEvent{
+		AttendanceEventID: uuid.New(),
+		CompanyID:         companyID,
+		UserID:            userID,
+		EventType:         req.EventType,
+		EventTime:         now,
+		SourceType:        req.SourceType,
+		DeviceID:          &deviceID,
+		IPAddress:         &clientIP,
+		Metadata:          req.Metadata,
+		CreatedAt:         now,
+		CreatedBy:         &actorID,
+	}
+
+	// Create the attendance event with duplicate protection
+	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
+		ctx, event, actorType, actorID, map[string]interface{}{
+			"auto_derived": true,
+			"source":       "real_time_punch",
+			"device_id":    deviceID,
+			"ip_address":   clientIP,
+		})
+
+	if err != nil {
+		h.logger.Error("Failed to create punch attendance event",
+			util.String("user_id", userID.String()),
+			util.String("event_type", req.EventType),
+			util.ErrorField(err))
+
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "duplicate") {
+			status = http.StatusConflict
+			h.respondWithError(w, status, "A similar punch was recently recorded")
+			return
+		} else if strings.Contains(err.Error(), "invalid") ||
+			strings.Contains(err.Error(), "required") ||
+			strings.Contains(err.Error(), "not allowed") {
+			status = http.StatusBadRequest
+		}
+
+		h.respondWithError(w, status, err.Error())
+		return
+	}
+
+	response := map[string]interface{}{
+		"success": true,
+		"data":    createdEvent,
+		"auto_derived": map[string]interface{}{
+			"event_time": now,
+			"ip_address": clientIP,
+			"device_id":  deviceID,
+		},
+	}
+
+	// Add duplicate warning if event was actually a duplicate
+	if createdEvent.AttendanceEventID != event.AttendanceEventID {
+		response["warning"] = "Duplicate punch prevented - returned existing record"
+		response["is_duplicate"] = true
+		response["original_event_id"] = createdEvent.AttendanceEventID
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, response)
 }

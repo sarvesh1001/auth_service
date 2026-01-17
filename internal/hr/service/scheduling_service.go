@@ -3205,17 +3205,53 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 	at time.Time,
 ) (*scheduling.ResolvedScheduleDay, error) {
 
-	// Normalize date (important!)
-	date := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, at.Location())
-
-	result := &scheduling.ResolvedScheduleDay{
-		Date: date,
+	// -------------------------------------------------------------
+	// 1️⃣ Determine schedule timezone (authoritative)
+	// -------------------------------------------------------------
+	assignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(ctx, userID, at)
+	if err != nil || assignment == nil {
+		// No assignment → non-working day in caller timezone
+		date := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, at.Location())
+		return &scheduling.ResolvedScheduleDay{
+			Date:         date,
+			Timezone:     at.Location().String(),
+			IsWorkingDay: false,
+		}, nil
 	}
 
-	// ------------------------------------------------------------------
-	// 1️⃣ Schedule Override (force_work / off / holiday_override)
-	// ------------------------------------------------------------------
-	override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
+	template, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, assignment.ScheduleTemplateID)
+	if err != nil {
+		return nil, err
+	}
+
+	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, template.CalendarID)
+	if err != nil {
+		return nil, err
+	}
+
+	loc, err := time.LoadLocation(calendar.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("invalid calendar timezone: %w", err)
+	}
+
+	// Normalize business date in schedule timezone
+	businessDate := time.Date(
+		at.In(loc).Year(),
+		at.In(loc).Month(),
+		at.In(loc).Day(),
+		0, 0, 0, 0,
+		loc,
+	)
+
+	result := &scheduling.ResolvedScheduleDay{
+		Date:     businessDate,
+		Timezone: calendar.Timezone,
+	}
+
+	// -------------------------------------------------------------
+	// 2️⃣ Schedule Override (force_work / off / holiday_override)
+	// -------------------------------------------------------------
+	override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, businessDate)
 	if err == nil && override != nil {
 		switch override.OverrideType {
 		case "force_work":
@@ -3225,45 +3261,37 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 		case "off":
 			result.IsOnLeave = true
 			result.IsWorkingDay = false
-			return result, nil // 🔴 OFF overrides everything except force_work
+			return result, nil
 
 		case "holiday_override":
 			result.IsWorkingDay = true
 		}
 	}
 
-	// ------------------------------------------------------------------
-	// 2️⃣ Approved Off Request (leave)  ✅ FIXED
-	// ------------------------------------------------------------------
+	// -------------------------------------------------------------
+	// 3️⃣ Approved Leave
+	// -------------------------------------------------------------
 	statusApproved := "approved"
 	offRequests, err := s.schedulingRepo.GetOffRequestsByUser(
 		ctx,
 		userID,
-		&date,
-		&date,
+		&businessDate,
+		&businessDate,
 		&statusApproved,
 	)
 
-	if err != nil {
-		s.logger.Error(
-			"Failed to fetch off requests",
-			util.String("user_id", userID.String()),
-			util.String("date", date.Format("2006-01-02")),
-			util.ErrorField(err),
-		)
-	} else if len(offRequests) > 0 {
+	if err == nil && len(offRequests) > 0 {
 		result.IsOnLeave = true
 		result.IsWorkingDay = false
 		return result, nil
 	}
 
-	// ------------------------------------------------------------------
-	// 3️⃣ Schedule Instance (authoritative for attendance)
-	// ------------------------------------------------------------------
-	instance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, date)
+	// -------------------------------------------------------------
+	// 4️⃣ Schedule Instance (authoritative for attendance)
+	// -------------------------------------------------------------
+	instance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, businessDate)
 	if err == nil && instance != nil {
 
-		// Cancelled schedules mean NOT working
 		if instance.Status == "cancelled" {
 			result.IsWorkingDay = false
 			return result, nil
@@ -3280,27 +3308,10 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 		return result, nil
 	}
 
-	// ------------------------------------------------------------------
-	// 4️⃣ Calendar fallback (working day / holiday)
-	// ------------------------------------------------------------------
-	assignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(ctx, userID, date)
-	if err != nil || assignment == nil {
-		// No assignment → non-working day
-		result.IsWorkingDay = false
-		return result, nil
-	}
-
-	template, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, assignment.ScheduleTemplateID)
-	if err != nil {
-		return nil, err
-	}
-
-	calendar, err := s.schedulingRepo.GetWorkCalendarByID(ctx, template.CalendarID)
-	if err != nil {
-		return nil, err
-	}
-
-	weekday := int(date.Weekday())
+	// -------------------------------------------------------------
+	// 5️⃣ Calendar fallback (working day / holiday)
+	// -------------------------------------------------------------
+	weekday := int(businessDate.Weekday())
 	for _, wd := range calendar.WorkingDays {
 		if wd == weekday {
 			result.IsWorkingDay = true
@@ -3309,8 +3320,9 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 	}
 
 	for _, h := range calendar.Holidays {
-		if h.Date == date.Format("2006-01-02") {
+		if h.Date == businessDate.Format("2006-01-02") {
 			result.IsHoliday = true
+			result.IsPaidHoliday = false // not supported yet
 			result.IsWorkingDay = false
 			break
 		}
