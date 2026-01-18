@@ -4,6 +4,7 @@ import (
 	"auth-service/internal/hr/models/scheduling"
 	"auth-service/internal/hr/service"
 	"auth-service/internal/middleware"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -32,7 +33,65 @@ func NewSchedulingHandler(
 	}
 }
 
-// Work Calendar Management
+// Helper function to normalize business dates
+func normalizeBusinessDateFromString(dateStr, tz string) (time.Time, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.Time{}, err
+	}
+	d, err := time.ParseInLocation("2006-01-02", dateStr, loc)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc), nil
+}
+
+// Helper to normalize existing time.Time to business date in specific timezone
+func normalizeBusinessDate(t time.Time, tz string) (time.Time, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.Time{}, err
+	}
+	local := t.In(loc) // FIX: Convert to target timezone first
+	return time.Date(
+		local.Year(), local.Month(), local.Day(),
+		0, 0, 0, 0,
+		loc,
+	), nil
+}
+
+// Helper to get user's timezone from their current assignment
+func (h *SchedulingHandler) getUserTimezone(ctx context.Context, userID uuid.UUID) string {
+	assignment, err := h.schedulingQueryService.GetUserCurrentScheduleAssignment(ctx, userID, time.Now())
+	if err != nil {
+		return "UTC"
+	}
+
+	template, err := h.schedulingQueryService.GetScheduleTemplateByID(ctx, assignment.ScheduleTemplateID)
+	if err != nil {
+		return "UTC"
+	}
+
+	calendar, err := h.schedulingQueryService.GetWorkCalendarByID(ctx, template.CalendarID)
+	if err != nil {
+		return "UTC"
+	}
+
+	return calendar.Timezone
+}
+
+// Helper to get company's default calendar timezone
+func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, companyID uuid.UUID) string {
+	calendars, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID)
+	if err != nil || len(calendars) == 0 {
+		return "UTC"
+	}
+
+	// TODO: Implement proper default calendar logic
+	// For now, use the first calendar as default
+	return calendars[0].Timezone
+}
+
 func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -41,6 +100,7 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
@@ -63,7 +123,6 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 func (h *SchedulingHandler) GetWorkCalendar(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	calendarIDStr := chi.URLParam(r, "calendarID")
-
 	calendarID, err := uuid.Parse(calendarIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
@@ -87,6 +146,7 @@ func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	result, err := h.schedulingQueryService.GetWorkCalendarsByCompany(ctx, companyID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -99,7 +159,6 @@ func (h *SchedulingHandler) ListWorkCalendars(w http.ResponseWriter, r *http.Req
 func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	calendarIDStr := chi.URLParam(r, "calendarID")
-
 	calendarID, err := uuid.Parse(calendarIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid calendar ID")
@@ -108,19 +167,26 @@ func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *ht
 
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
 
-	startDate, err := time.Parse("2006-01-02", startDateStr)
+	// Get calendar to get timezone
+	calendar, err := h.schedulingQueryService.GetWorkCalendarByID(ctx, calendarID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, "Work calendar not found")
+		return
+	}
+
+	// Normalize dates using calendar timezone
+	startDate, err := normalizeBusinessDateFromString(startDateStr, calendar.Timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 		return
 	}
 
-	endDate, err := time.Parse("2006-01-02", endDateStr)
+	endDate, err := normalizeBusinessDateFromString(endDateStr, calendar.Timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
@@ -135,7 +201,6 @@ func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *ht
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// Schedule Template Management
 func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -144,6 +209,7 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
@@ -166,7 +232,6 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 func (h *SchedulingHandler) GetScheduleTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	templateIDStr := chi.URLParam(r, "templateID")
-
 	templateID, err := uuid.Parse(templateIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
@@ -190,6 +255,7 @@ func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	result, err := h.schedulingQueryService.GetScheduleTemplatesByCompany(ctx, companyID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -199,15 +265,11 @@ func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// User Schedule Assignment
-// User Schedule Assignment
-// User Schedule Assignment
 func (h *SchedulingHandler) AssignUserToTemplate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
-	// Extract company ID from URL path - using chi.URLParam
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -221,10 +283,8 @@ func (h *SchedulingHandler) AssignUserToTemplate(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Pass company ID to service
 	err = h.schedulingService.AssignUserToTemplate(ctx, companyID, &assignment, actorType, actorID, nil)
 	if err != nil {
-		// Return appropriate HTTP status codes
 		if strings.Contains(err.Error(), "not found") {
 			h.respondWithError(w, http.StatusNotFound, err.Error())
 		} else if strings.Contains(err.Error(), "already has an active assignment") {
@@ -248,7 +308,6 @@ func (h *SchedulingHandler) AssignUserToTemplate(w http.ResponseWriter, r *http.
 func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
-
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
@@ -257,14 +316,23 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 
 	dateStr := r.URL.Query().Get("date")
 	var date time.Time
+
+	// Get user's timezone using helper
+	userTimezone := h.getUserTimezone(ctx, userID)
+
 	if dateStr != "" {
-		date, err = time.Parse("2006-01-02", dateStr)
+		date, err = normalizeBusinessDateFromString(dateStr, userTimezone)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
 			return
 		}
 	} else {
-		date = time.Now()
+		// Normalize current time to user's timezone
+		date, err = normalizeBusinessDate(time.Now(), userTimezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to normalize date")
+			return
+		}
 	}
 
 	result, err := h.schedulingQueryService.GetUserCurrentScheduleAssignment(ctx, userID, date)
@@ -276,11 +344,9 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// Schedule Instance Management
-// Update the handler to accept a simplified request structure
 type CreateScheduleInstanceRequest struct {
 	UserID        uuid.UUID  `json:"user_id"`
-	ScheduleDate  time.Time  `json:"schedule_date"`
+	ScheduleDate  string     `json:"schedule_date"` // YYYY-MM-DD
 	ExpectedStart *time.Time `json:"expected_start,omitempty"`
 	ExpectedEnd   *time.Time `json:"expected_end,omitempty"`
 }
@@ -303,13 +369,40 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Create instance from request
+	// Get user's current assignment to determine calendar timezone
+	assignment, err := h.schedulingQueryService.GetUserCurrentScheduleAssignment(ctx, req.UserID, time.Now())
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "User has no active schedule assignment")
+		return
+	}
+
+	// Get template and calendar for timezone
+	template, err := h.schedulingQueryService.GetScheduleTemplateByID(ctx, assignment.ScheduleTemplateID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Schedule template not found")
+		return
+	}
+
+	calendar, err := h.schedulingQueryService.GetWorkCalendarByID(ctx, template.CalendarID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Work calendar not found")
+		return
+	}
+
+	// Normalize business date using calendar timezone
+	businessDate, err := normalizeBusinessDateFromString(req.ScheduleDate, calendar.Timezone)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid schedule date format")
+		return
+	}
+
 	instance := &scheduling.ScheduleInstance{
 		CompanyID:     companyID,
 		UserID:        req.UserID,
-		ScheduleDate:  req.ScheduleDate,
+		ScheduleDate:  businessDate,
 		ExpectedStart: req.ExpectedStart,
 		ExpectedEnd:   req.ExpectedEnd,
+		Timezone:      calendar.Timezone,
 		Metadata:      scheduling.InstanceMetadata{},
 	}
 
@@ -325,7 +418,6 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 func (h *SchedulingHandler) GetScheduleInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	instanceIDStr := chi.URLParam(r, "instanceID")
-
 	instanceID, err := uuid.Parse(instanceIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid instance ID")
@@ -349,6 +441,7 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	userIDStr := r.URL.Query().Get("user_id")
 	templateIDStr := r.URL.Query().Get("template_id")
 	startDateStr := r.URL.Query().Get("start_date")
@@ -359,20 +452,52 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 		return
 	}
 
-	startDate, err := time.Parse("2006-01-02", startDateStr)
+	// For date normalization, we need a timezone
+	// For user-specific queries, use user's calendar timezone
+	// For template queries, use template's calendar timezone
+	// For company queries, use company's default timezone
+	timezone := "UTC"
+
+	if userIDStr != "" {
+		userID, err := uuid.Parse(userIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+			return
+		}
+		// Use helper to get user's timezone
+		timezone = h.getUserTimezone(ctx, userID)
+	} else if templateIDStr != "" {
+		templateID, err := uuid.Parse(templateIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid template ID")
+			return
+		}
+		// Get template's calendar timezone
+		template, err := h.schedulingQueryService.GetScheduleTemplateByID(ctx, templateID)
+		if err == nil && template != nil {
+			calendar, err := h.schedulingQueryService.GetWorkCalendarByID(ctx, template.CalendarID)
+			if err == nil && calendar != nil {
+				timezone = calendar.Timezone
+			}
+		}
+	} else {
+		// For company queries, use company's default timezone
+		timezone = h.getCompanyDefaultTimezone(ctx, companyID)
+	}
+
+	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 		return
 	}
 
-	endDate, err := time.Parse("2006-01-02", endDateStr)
+	endDate, err := normalizeBusinessDateFromString(endDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
 	}
 
 	var result []*scheduling.ScheduleInstance
-
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
 		if err != nil {
@@ -399,39 +524,6 @@ func (h *SchedulingHandler) ListScheduleInstances(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// // Schedule Generation
-// func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-// 	userIDStr := chi.URLParam(r, "userID")
-// 	actorType := middleware.GetSessionTypeFromContext(ctx)
-// 	actorID := middleware.GetUserIDFromContext(ctx)
-
-// 	userID, err := uuid.Parse(userIDStr)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-// 		return
-// 	}
-
-// 	var config service.ScheduleGenerationConfig
-// 	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-// 		return
-// 	}
-
-// 	result, err := h.schedulingService.GenerateScheduleForUser(ctx, userID, config, actorType, actorID)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-// 		"message":   "Schedule generated successfully",
-// 		"instances": len(result),
-// 		"data":      result,
-// 	})
-// }
-
-// Schedule Generation
 func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -444,7 +536,6 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Create a request struct that accepts string dates
 	type GenerateScheduleRequest struct {
 		StartDate       string `json:"start_date"`
 		EndDate         string `json:"end_date"`
@@ -460,40 +551,37 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Validate required fields
 	if req.StartDate == "" || req.EndDate == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
 
-	// Parse string dates to time.Time
-	startDate, err := time.Parse("2006-01-02", req.StartDate)
+	// If timezone not provided, get from user's calendar using helper
+	if req.Timezone == "" {
+		req.Timezone = h.getUserTimezone(ctx, userID)
+	}
+
+	startDate, err := normalizeBusinessDateFromString(req.StartDate, req.Timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
 		return
 	}
 
-	endDate, err := time.Parse("2006-01-02", req.EndDate)
+	endDate, err := normalizeBusinessDateFromString(req.EndDate, req.Timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
 		return
 	}
 
-	// Validate date range
 	if startDate.After(endDate) {
 		h.respondWithError(w, http.StatusBadRequest, "start_date must be before or equal to end_date")
 		return
 	}
 
-	// Set defaults
-	if req.Timezone == "" {
-		req.Timezone = "UTC"
-	}
 	if req.BatchSize <= 0 {
 		req.BatchSize = 100
 	}
 
-	// Create the service config
 	config := service.ScheduleGenerationConfig{
 		StartDate:       startDate,
 		EndDate:         endDate,
@@ -516,11 +604,8 @@ func (h *SchedulingHandler) GenerateScheduleForUser(w http.ResponseWriter, r *ht
 	})
 }
 
-// Schedule Stats and Reports
 func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ company from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -532,26 +617,38 @@ func (h *SchedulingHandler) GetScheduleStats(w http.ResponseWriter, r *http.Requ
 	endDateStr := r.URL.Query().Get("end_date")
 
 	var startDate, endDate time.Time
-	// ❌ DO NOT redeclare err here
+
+	// FIX: Use company's default calendar timezone instead of hardcoded UTC
+	timezone := h.getCompanyDefaultTimezone(ctx, companyID)
 
 	if startDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
+		startDate, err = normalizeBusinessDateFromString(startDateStr, timezone)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 			return
 		}
 	} else {
 		startDate = time.Now().AddDate(0, -1, 0)
+		startDate, err = normalizeBusinessDate(startDate, timezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to normalize start date")
+			return
+		}
 	}
 
 	if endDateStr != "" {
-		endDate, err = time.Parse("2006-01-02", endDateStr)
+		endDate, err = normalizeBusinessDateFromString(endDateStr, timezone)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 			return
 		}
 	} else {
 		endDate = time.Now()
+		endDate, err = normalizeBusinessDate(endDate, timezone)
+		if err != nil {
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to normalize end date")
+			return
+		}
 	}
 
 	result, err := h.schedulingQueryService.GetScheduleStats(
@@ -576,21 +673,24 @@ func (h *SchedulingHandler) GetScheduleCoverage(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
+
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
 	}
 
-	startDate, err := time.Parse("2006-01-02", startDateStr)
+	// FIX: Use company's default calendar timezone instead of hardcoded UTC
+	timezone := h.getCompanyDefaultTimezone(ctx, companyID)
+
+	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 		return
 	}
 
-	endDate, err := time.Parse("2006-01-02", endDateStr)
+	endDate, err := normalizeBusinessDateFromString(endDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
@@ -605,11 +705,8 @@ func (h *SchedulingHandler) GetScheduleCoverage(w http.ResponseWriter, r *http.R
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// Schedule Availability Check
 func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Get user ID from query parameter (required)
 	userIDParam := r.URL.Query().Get("user_id")
 	if userIDParam == "" {
 		h.respondWithError(w, http.StatusBadRequest, "user_id parameter is required")
@@ -624,20 +721,20 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 
 	dateStr := r.URL.Query().Get("date")
 	timezone := r.URL.Query().Get("timezone")
-
 	if dateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "date is required")
 		return
 	}
 
-	date, err := time.Parse("2006-01-02", dateStr)
+	// If timezone not provided, get from user's calendar using helper
+	if timezone == "" {
+		timezone = h.getUserTimezone(ctx, userID)
+	}
+
+	date, err := normalizeBusinessDateFromString(dateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD")
 		return
-	}
-
-	if timezone == "" {
-		timezone = "UTC"
 	}
 
 	result, err := h.schedulingService.CheckScheduleAvailability(ctx, userID, date, timezone)
@@ -654,7 +751,6 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 	})
 }
 
-// Health Check
 func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	err := h.schedulingQueryService.HealthCheck(ctx)
@@ -669,7 +765,6 @@ func (h *SchedulingHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// Helper methods
 func (h *SchedulingHandler) respondWithJSON(w http.ResponseWriter, status int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -685,9 +780,6 @@ func (h *SchedulingHandler) respondWithError(w http.ResponseWriter, status int, 
 	})
 }
 
-// Time Off Management Handlers
-
-// CreateOffEntitlement creates a new off entitlement for a user
 func (h *SchedulingHandler) CreateOffEntitlement(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -727,7 +819,6 @@ func (h *SchedulingHandler) CreateOffEntitlement(w http.ResponseWriter, r *http.
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetOffEntitlements retrieves off entitlements for a user
 func (h *SchedulingHandler) GetOffEntitlements(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -738,7 +829,6 @@ func (h *SchedulingHandler) GetOffEntitlements(w http.ResponseWriter, r *http.Re
 	}
 
 	activeOnly := r.URL.Query().Get("active_only") != "false"
-
 	result, err := h.schedulingQueryService.GetOffEntitlementsByUser(ctx, userID, activeOnly)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -748,7 +838,6 @@ func (h *SchedulingHandler) GetOffEntitlements(w http.ResponseWriter, r *http.Re
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// CreateOffRequest creates a new off request
 func (h *SchedulingHandler) CreateOffRequest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -790,7 +879,6 @@ func (h *SchedulingHandler) CreateOffRequest(w http.ResponseWriter, r *http.Requ
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetOffRequests retrieves off requests for a user or company
 func (h *SchedulingHandler) GetOffRequests(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -807,12 +895,13 @@ func (h *SchedulingHandler) GetOffRequests(w http.ResponseWriter, r *http.Reques
 
 	var startDate, endDate time.Time
 	if startDateStr != "" && endDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
+		// For off requests, we use UTC for date normalization
+		startDate, err = normalizeBusinessDateFromString(startDateStr, "UTC")
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 			return
 		}
-		endDate, err = time.Parse("2006-01-02", endDateStr)
+		endDate, err = normalizeBusinessDateFromString(endDateStr, "UTC")
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 			return
@@ -839,7 +928,6 @@ func (h *SchedulingHandler) GetOffRequests(w http.ResponseWriter, r *http.Reques
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// ApproveOffRequest approves a pending off request
 func (h *SchedulingHandler) ApproveOffRequest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	requestIDStr := chi.URLParam(r, "requestID")
@@ -863,7 +951,6 @@ func (h *SchedulingHandler) ApproveOffRequest(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// RejectOffRequest rejects a pending off request
 func (h *SchedulingHandler) RejectOffRequest(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	requestIDStr := chi.URLParam(r, "requestID")
@@ -887,7 +974,14 @@ func (h *SchedulingHandler) RejectOffRequest(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// CreateScheduleOverride creates a schedule override
+type ScheduleOverrideCreate struct {
+	UserID       uuid.UUID `json:"user_id"`
+	OverrideDate string    `json:"override_date"` // YYYY-MM-DD
+	OverrideType string    `json:"override_type"`
+	Reason       string    `json:"reason,omitempty"`
+	// CreatedBy is ignored - always use actorID for security
+}
+
 func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -900,20 +994,39 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
-	var createReq scheduling.ScheduleOverrideCreate
+	var createReq ScheduleOverrideCreate
 	if err := json.NewDecoder(r.Body).Decode(&createReq); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 
+	// Get user's calendar timezone for date normalization using helper
+	userTimezone := h.getUserTimezone(ctx, createReq.UserID)
+
+	// Normalize override date using calendar timezone
+	overrideDate, err := normalizeBusinessDateFromString(createReq.OverrideDate, userTimezone)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid override date format")
+		return
+	}
+
+	// Create a pointer to the reason string if it's not empty
+	var reasonPtr *string
+	if createReq.Reason != "" {
+		reasonPtr = &createReq.Reason
+	}
+
+	// Create a pointer to actorID for CreatedBy field
+	createdByPtr := &actorID
+
 	override := &scheduling.ScheduleOverride{
 		OverrideID:   uuid.New(),
 		CompanyID:    companyID,
 		UserID:       createReq.UserID,
-		OverrideDate: createReq.OverrideDate,
+		OverrideDate: overrideDate,
 		OverrideType: createReq.OverrideType,
-		Reason:       createReq.Reason,
-		CreatedBy:    createReq.CreatedBy,
+		Reason:       reasonPtr,
+		CreatedBy:    createdByPtr,
 		CreatedAt:    time.Now().UTC(),
 	}
 
@@ -926,7 +1039,6 @@ func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetScheduleOverrides retrieves schedule overrides
 func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -946,12 +1058,25 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 		return
 	}
 
-	startDate, err := time.Parse("2006-01-02", startDateStr)
+	// Determine timezone for normalization
+	timezone := "UTC"
+	if userIDStr != "" {
+		userID, err := uuid.Parse(userIDStr)
+		if err == nil {
+			timezone = h.getUserTimezone(ctx, userID)
+		}
+	} else {
+		// For company-wide queries, use company's default timezone
+		timezone = h.getCompanyDefaultTimezone(ctx, companyID)
+	}
+
+	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 		return
 	}
-	endDate, err := time.Parse("2006-01-02", endDateStr)
+
+	endDate, err := normalizeBusinessDateFromString(endDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
@@ -977,7 +1102,6 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// RequestTimeOff creates a time off request with validation
 func (h *SchedulingHandler) RequestTimeOff(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1020,7 +1144,6 @@ func (h *SchedulingHandler) RequestTimeOff(w http.ResponseWriter, r *http.Reques
 	h.respondWithJSON(w, http.StatusCreated, result)
 }
 
-// GetUserTimeOffSummary gets time off summary for a user
 func (h *SchedulingHandler) GetUserTimeOffSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -1037,12 +1160,16 @@ func (h *SchedulingHandler) GetUserTimeOffSummary(w http.ResponseWriter, r *http
 		return
 	}
 
-	startDate, err := time.Parse("2006-01-02", startDateStr)
+	// Get user's calendar timezone for date normalization using helper
+	userTimezone := h.getUserTimezone(ctx, userID)
+
+	startDate, err := normalizeBusinessDateFromString(startDateStr, userTimezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
 		return
 	}
-	endDate, err := time.Parse("2006-01-02", endDateStr)
+
+	endDate, err := normalizeBusinessDateFromString(endDateStr, userTimezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
 		return
@@ -1057,18 +1184,20 @@ func (h *SchedulingHandler) GetUserTimeOffSummary(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// CheckDateAvailability checks if a date is available for time off
 func (h *SchedulingHandler) CheckDateAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID := middleware.GetUserIDFromContext(ctx)
-	dateStr := r.URL.Query().Get("date")
 
+	dateStr := r.URL.Query().Get("date")
 	if dateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "date parameter is required")
 		return
 	}
 
-	date, err := time.Parse("2006-01-02", dateStr)
+	// Get user's calendar timezone for date normalization using helper
+	userTimezone := h.getUserTimezone(ctx, userID)
+
+	date, err := normalizeBusinessDateFromString(dateStr, userTimezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
 		return
@@ -1085,13 +1214,12 @@ func (h *SchedulingHandler) CheckDateAvailability(w http.ResponseWriter, r *http
 
 type DeclareHolidayRequest struct {
 	CalendarID uuid.UUID `json:"calendar_id"`
-	Date       string    `json:"date"` // YYYY-MM-DD
+	Date       string    `json:"date"`
 	Name       string    `json:"name"`
 }
 
 func (h *SchedulingHandler) DeclareHoliday(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1108,13 +1236,19 @@ func (h *SchedulingHandler) DeclareHoliday(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	holidayDate, err := time.Parse("2006-01-02", req.Date)
+	// Get calendar to get timezone for date normalization
+	calendar, err := h.schedulingQueryService.GetWorkCalendarByID(ctx, req.CalendarID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Calendar not found")
+		return
+	}
+
+	holidayDate, err := normalizeBusinessDateFromString(req.Date, calendar.Timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid date format (YYYY-MM-DD)")
 		return
 	}
 
-	// 1️⃣ Add holiday to work calendar
 	err = h.schedulingService.AddHolidayToCalendar(
 		ctx,
 		req.CalendarID,
@@ -1128,7 +1262,6 @@ func (h *SchedulingHandler) DeclareHoliday(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// 2️⃣ VERY IMPORTANT: cancel existing schedules for that day
 	err = h.schedulingService.ProcessHolidayForDate(
 		ctx,
 		companyID,

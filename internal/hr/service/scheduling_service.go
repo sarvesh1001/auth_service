@@ -1089,21 +1089,28 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 	actorID uuid.UUID,
 	metadata map[string]interface{},
 ) (*scheduling.ScheduleInstance, error) {
-	startTime := time.Now()
 
-	// Get user's current schedule assignment for the given date
-	assignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(ctx, instance.UserID, instance.ScheduleDate)
+	_ = time.Now()
+
+	// Get user's current schedule assignment
+	assignment, err := s.schedulingRepo.GetUserCurrentScheduleAssignment(
+		ctx,
+		instance.UserID,
+		instance.ScheduleDate,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user schedule assignment: %w", err)
 	}
 	if assignment == nil {
-		return nil, fmt.Errorf("no active schedule assignment found for user on %s",
-			instance.ScheduleDate.Format("2006-01-02"))
+		return nil, fmt.Errorf(
+			"no active schedule assignment found for user on %s",
+			instance.ScheduleDate.Format("2006-01-02"),
+		)
 	}
 
 	instance.ScheduleTemplateID = assignment.ScheduleTemplateID
 
-	// Get template and calendar
+	// Load template + calendar
 	template, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, instance.ScheduleTemplateID)
 	if err != nil {
 		return nil, fmt.Errorf("schedule template not found: %w", err)
@@ -1114,61 +1121,67 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 		return nil, fmt.Errorf("work calendar not found: %w", err)
 	}
 
+	// ✅ FORCE calendar timezone
 	instance.Timezone = calendar.Timezone
+
+	// ✅ Normalize schedule date (BUSINESS DATE)
+	instance.ScheduleDate = normalizeBusinessDate(
+		instance.ScheduleDate,
+		instance.Timezone,
+	)
+
 	instance.Metadata = scheduling.InstanceMetadata{}
 
-	// Validate the instance
+	// Validate
 	if err := s.validateScheduleInstance(instance); err != nil {
 		return nil, fmt.Errorf("schedule instance validation failed: %w", err)
 	}
 
-	// Set UUID if not provided
 	if instance.ScheduleInstanceID == uuid.Nil {
 		instance.ScheduleInstanceID = uuid.New()
 	}
 
-	// Set generation timestamp if not provided
-	now := time.Now().UTC()
 	if instance.GeneratedAt.IsZero() {
-		instance.GeneratedAt = now
+		instance.GeneratedAt = time.Now().UTC()
 	}
 
-	// Check for existing instance
-	existingInstance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, instance.UserID, instance.ScheduleDate)
+	// ---------------------------------------------
+	// CHECK EXISTING INSTANCE (OVERWRITE)
+	// ---------------------------------------------
+	existingInstance, err := s.schedulingRepo.GetScheduleInstanceByUserDate(
+		ctx,
+		instance.UserID,
+		instance.ScheduleDate,
+	)
+
 	if err == nil && existingInstance != nil {
-		// ============================================
-		// UPDATE EXISTING INSTANCE (OVERWRITE)
-		// ============================================
+
 		beforeState, _ := json.Marshal(existingInstance)
 
-		// Update the existing instance with new values
-		// Keep the original ScheduleInstanceID, CompanyID, UserID, ScheduleDate, and GeneratedAt
 		existingInstance.ScheduleTemplateID = instance.ScheduleTemplateID
 		existingInstance.ExpectedStart = instance.ExpectedStart
 		existingInstance.ExpectedEnd = instance.ExpectedEnd
 		existingInstance.Timezone = instance.Timezone
-
-		// Merge metadata instead of replacing if you want to preserve existing metadata
-		// For now, we'll replace with empty metadata as per original behavior
 		existingInstance.Metadata = scheduling.InstanceMetadata{}
 
-		// Calculate expected times if not provided
 		if existingInstance.ExpectedStart == nil || existingInstance.ExpectedEnd == nil {
 			if err := s.calculateExpectedTimes(existingInstance, template); err != nil {
 				return nil, fmt.Errorf("failed to calculate expected times: %w", err)
 			}
 		}
 
-		// Validate the updated instance
 		if err := s.validateScheduleInstance(existingInstance); err != nil {
 			return nil, fmt.Errorf("schedule instance validation failed: %w", err)
 		}
 
-		// Check for schedule conflict, excluding the current instance
 		if existingInstance.ExpectedStart != nil && existingInstance.ExpectedEnd != nil {
-			hasConflict, err := s.ValidateScheduleConflict(ctx, existingInstance.UserID,
-				*existingInstance.ExpectedStart, *existingInstance.ExpectedEnd,
-				&existingInstance.ScheduleInstanceID)
+			hasConflict, err := s.ValidateScheduleConflict(
+				ctx,
+				existingInstance.UserID,
+				*existingInstance.ExpectedStart,
+				*existingInstance.ExpectedEnd,
+				&existingInstance.ScheduleInstanceID,
+			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to check schedule conflict: %w", err)
 			}
@@ -1177,22 +1190,17 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 			}
 		}
 
-		// Update in repository
-		err = s.schedulingRepo.UpdateScheduleInstance(ctx, existingInstance)
-		if err != nil {
-			s.logger.Error("Failed to update schedule instance",
-				util.String("instance_id", existingInstance.ScheduleInstanceID.String()),
-				util.ErrorField(err))
+		if err := s.schedulingRepo.UpdateScheduleInstance(ctx, existingInstance); err != nil {
 			return nil, fmt.Errorf("failed to update schedule instance: %w", err)
 		}
 
-		// Audit log for update
 		if s.auditService != nil {
 			go func() {
 				auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				afterState, _ := json.Marshal(existingInstance)
-				s.auditService.LogAction(auditCtx,
+				s.auditService.LogAction(
+					auditCtx,
 					&existingInstance.CompanyID,
 					"scheduling",
 					"schedule_instance.update",
@@ -1207,35 +1215,26 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 			}()
 		}
 
-		s.logger.Info("Schedule instance updated (overwritten)",
-			util.String("instance_id", existingInstance.ScheduleInstanceID.String()),
-			util.String("user_id", existingInstance.UserID.String()),
-			util.String("template_id", existingInstance.ScheduleTemplateID.String()),
-			util.String("date", existingInstance.ScheduleDate.Format("2006-01-02")),
-			util.Duration("duration", time.Since(startTime)))
-
 		return existingInstance, nil
 	}
 
-	// ============================================
-	// CREATE NEW INSTANCE (NO EXISTING INSTANCE)
-	// ============================================
-
-	// Validate template belongs to company
-	if template.CompanyID != instance.CompanyID {
-		return nil, fmt.Errorf("template does not belong to company")
-	}
-
-	// Calculate expected times if not provided
+	// ---------------------------------------------
+	// CREATE NEW INSTANCE
+	// ---------------------------------------------
 	if instance.ExpectedStart == nil || instance.ExpectedEnd == nil {
 		if err := s.calculateExpectedTimes(instance, template); err != nil {
 			return nil, fmt.Errorf("failed to calculate expected times: %w", err)
 		}
 	}
 
-	// Check for schedule conflict
 	if instance.ExpectedStart != nil && instance.ExpectedEnd != nil {
-		hasConflict, err := s.ValidateScheduleConflict(ctx, instance.UserID, *instance.ExpectedStart, *instance.ExpectedEnd, nil)
+		hasConflict, err := s.ValidateScheduleConflict(
+			ctx,
+			instance.UserID,
+			*instance.ExpectedStart,
+			*instance.ExpectedEnd,
+			nil,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check schedule conflict: %w", err)
 		}
@@ -1244,46 +1243,13 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 		}
 	}
 
-	// Create new instance
-	err = s.schedulingRepo.CreateScheduleInstance(ctx, instance)
-	if err != nil {
-		s.logger.Error("Failed to create schedule instance",
-			util.String("user_id", instance.UserID.String()),
-			util.String("date", instance.ScheduleDate.Format("2006-01-02")),
-			util.ErrorField(err))
+	if err := s.schedulingRepo.CreateScheduleInstance(ctx, instance); err != nil {
 		return nil, fmt.Errorf("failed to create schedule instance: %w", err)
 	}
 
-	// Audit log for create
-	if s.auditService != nil {
-		go func() {
-			auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			instanceJSON, _ := json.Marshal(instance)
-			s.auditService.LogAction(auditCtx,
-				&instance.CompanyID,
-				"scheduling",
-				"schedule_instance.create",
-				"schedule_instance",
-				&instance.ScheduleInstanceID,
-				actorType,
-				&actorID,
-				nil,
-				instanceJSON,
-				metadata,
-			)
-		}()
-	}
-
-	s.logger.Info("Schedule instance created",
-		util.String("instance_id", instance.ScheduleInstanceID.String()),
-		util.String("user_id", instance.UserID.String()),
-		util.String("template_id", instance.ScheduleTemplateID.String()),
-		util.String("date", instance.ScheduleDate.Format("2006-01-02")),
-		util.Duration("duration", time.Since(startTime)))
-
 	return instance, nil
 }
+
 func (s *schedulingServiceImpl) UpdateScheduleInstance(
 	ctx context.Context,
 	instanceID uuid.UUID,
@@ -1853,8 +1819,10 @@ func (s *schedulingServiceImpl) validateTemplateRules(templateType string, rules
 	}
 	return nil
 }
+func (s *schedulingServiceImpl) validateScheduleInstance(
+	instance *scheduling.ScheduleInstance,
+) error {
 
-func (s *schedulingServiceImpl) validateScheduleInstance(instance *scheduling.ScheduleInstance) error {
 	if instance.CompanyID == uuid.Nil {
 		return fmt.Errorf("company ID is required")
 	}
@@ -1870,9 +1838,45 @@ func (s *schedulingServiceImpl) validateScheduleInstance(instance *scheduling.Sc
 	if instance.Timezone == "" {
 		return fmt.Errorf("timezone is required")
 	}
-	if instance.ScheduleDate.Before(time.Now().AddDate(0, 0, -1)) {
+
+	loc, err := time.LoadLocation(instance.Timezone)
+	if err != nil {
+		return fmt.Errorf("invalid timezone: %s", instance.Timezone)
+	}
+
+	// ✅ normalize schedule date
+	instance.ScheduleDate = normalizeBusinessDate(instance.ScheduleDate, instance.Timezone)
+
+	// ✅ prevent scheduling in the past (business date)
+	nowInLoc := time.Now().In(loc)
+	today := time.Date(
+		nowInLoc.Year(),
+		nowInLoc.Month(),
+		nowInLoc.Day(),
+		0, 0, 0, 0,
+		loc,
+	)
+
+	if instance.ScheduleDate.Before(today) {
 		return fmt.Errorf("cannot schedule in the past")
 	}
+
+	// ✅ validate expected times
+	if instance.ExpectedStart != nil && instance.ExpectedEnd != nil {
+		start := instance.ExpectedStart.In(loc)
+		end := instance.ExpectedEnd.In(loc)
+
+		if start.After(end) {
+			return fmt.Errorf("expected start must be before expected end")
+		}
+
+		if start.Year() != end.Year() ||
+			start.Month() != end.Month() ||
+			start.Day() != end.Day() {
+			return fmt.Errorf("expected times must be within the same business day")
+		}
+	}
+
 	return nil
 }
 
@@ -1903,50 +1907,77 @@ func (s *schedulingServiceImpl) validateScheduleGenerationConfig(config Schedule
 
 	return nil
 }
-func (s *schedulingServiceImpl) calculateExpectedTimes(instance *scheduling.ScheduleInstance, template *scheduling.ScheduleTemplate) error {
+
+func (s *schedulingServiceImpl) calculateExpectedTimes(
+	instance *scheduling.ScheduleInstance,
+	template *scheduling.ScheduleTemplate,
+) error {
+
 	loc, err := time.LoadLocation(instance.Timezone)
 	if err != nil {
 		loc = time.UTC
 	}
 
-	scheduleDate := time.Date(instance.ScheduleDate.Year(), instance.ScheduleDate.Month(),
-		instance.ScheduleDate.Day(), 0, 0, 0, 0, loc)
+	// ✅ normalize business date
+	businessDate := normalizeBusinessDate(instance.ScheduleDate, instance.Timezone)
 
 	switch template.TemplateType {
+
 	case "office":
 		if template.Rules.StartTime != nil && template.Rules.EndTime != nil {
-			startTime, _ := time.Parse("15:04", *template.Rules.StartTime)
-			endTime, _ := time.Parse("15:04", *template.Rules.EndTime)
-			expectedStart := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
-				startTime.Hour(), startTime.Minute(), 0, 0, loc)
-			expectedEnd := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
-				endTime.Hour(), endTime.Minute(), 0, 0, loc)
-			instance.ExpectedStart = &expectedStart
-			instance.ExpectedEnd = &expectedEnd
+			startClock, _ := time.Parse("15:04", *template.Rules.StartTime)
+			endClock, _ := time.Parse("15:04", *template.Rules.EndTime)
+
+			start := time.Date(
+				businessDate.Year(), businessDate.Month(), businessDate.Day(),
+				startClock.Hour(), startClock.Minute(), 0, 0, loc,
+			)
+
+			end := time.Date(
+				businessDate.Year(), businessDate.Month(), businessDate.Day(),
+				endClock.Hour(), endClock.Minute(), 0, 0, loc,
+			)
+
+			instance.ExpectedStart = &start
+			instance.ExpectedEnd = &end
 		}
+
 	case "shift":
-		defaultStart := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
-			9, 0, 0, 0, loc)
-		defaultEnd := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
-			17, 0, 0, 0, loc)
-		instance.ExpectedStart = &defaultStart
-		instance.ExpectedEnd = &defaultEnd
+		start := time.Date(
+			businessDate.Year(), businessDate.Month(), businessDate.Day(),
+			9, 0, 0, 0, loc,
+		)
+		end := time.Date(
+			businessDate.Year(), businessDate.Month(), businessDate.Day(),
+			17, 0, 0, 0, loc,
+		)
+
+		instance.ExpectedStart = &start
+		instance.ExpectedEnd = &end
+
 	case "class":
 		if len(template.Rules.Periods) > 0 {
-			period := template.Rules.Periods[0]
-			startTime, _ := time.Parse("15:04", period.Start)
-			endTime, _ := time.Parse("15:04", period.End)
-			expectedStart := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
-				startTime.Hour(), startTime.Minute(), 0, 0, loc)
-			expectedEnd := time.Date(scheduleDate.Year(), scheduleDate.Month(), scheduleDate.Day(),
-				endTime.Hour(), endTime.Minute(), 0, 0, loc)
-			instance.ExpectedStart = &expectedStart
-			instance.ExpectedEnd = &expectedEnd
+			p := template.Rules.Periods[0]
+			startClock, _ := time.Parse("15:04", p.Start)
+			endClock, _ := time.Parse("15:04", p.End)
+
+			start := time.Date(
+				businessDate.Year(), businessDate.Month(), businessDate.Day(),
+				startClock.Hour(), startClock.Minute(), 0, 0, loc,
+			)
+			end := time.Date(
+				businessDate.Year(), businessDate.Month(), businessDate.Day(),
+				endClock.Hour(), endClock.Minute(), 0, 0, loc,
+			)
+
+			instance.ExpectedStart = &start
+			instance.ExpectedEnd = &end
 		}
 	}
 
 	return nil
 }
+
 func (s *schedulingServiceImpl) generateScheduleInstances(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -1966,35 +1997,33 @@ func (s *schedulingServiceImpl) generateScheduleInstances(
 
 	var instances []*scheduling.ScheduleInstance
 
-	loc, err := time.LoadLocation(config.Timezone)
-	if err != nil {
-		loc = time.UTC
-	}
-
-	holidayMap := make(map[string]bool)
+	// Build holiday map (YYYY-MM-DD)
+	holidayMap := map[string]bool{}
 	if !config.IncludeHolidays {
-		for _, holiday := range calendar.Holidays {
-			holidayMap[holiday.Date] = true
+		for _, h := range calendar.Holidays {
+			holidayMap[h.Date] = true
 		}
 	}
 
-	for currentDate := config.StartDate; !currentDate.After(config.EndDate); currentDate = currentDate.AddDate(0, 0, 1) {
-		currentDateInLoc := currentDate.In(loc)
-		weekday := int(currentDateInLoc.Weekday())
+	for d := config.StartDate; !d.After(config.EndDate); d = d.AddDate(0, 0, 1) {
 
-		isWorkingDay := false
-		for _, day := range calendar.WorkingDays {
-			if day == weekday {
-				isWorkingDay = true
+		// ✅ Normalize to BUSINESS DATE in schedule timezone
+		businessDate := normalizeBusinessDate(d, config.Timezone)
+
+		weekday := int(businessDate.Weekday())
+
+		isWorking := false
+		for _, wd := range calendar.WorkingDays {
+			if wd == weekday {
+				isWorking = true
 				break
 			}
 		}
-		if !isWorkingDay {
+		if !isWorking {
 			continue
 		}
 
-		dateStr := currentDateInLoc.Format("2006-01-02")
-		if holidayMap[dateStr] {
+		if holidayMap[businessDate.Format("2006-01-02")] {
 			continue
 		}
 
@@ -2002,18 +2031,16 @@ func (s *schedulingServiceImpl) generateScheduleInstances(
 			ScheduleInstanceID: uuid.New(),
 			CompanyID:          template.CompanyID,
 			UserID:             userID,
-			ScheduleDate:       currentDate,
 			ScheduleTemplateID: template.ScheduleTemplateID,
-			Timezone:           config.Timezone,
+			ScheduleDate:       businessDate,    // 🔥 BUSINESS DATE
+			Timezone:           config.Timezone, // 🔥 SOURCE OF TRUTH
 			Metadata:           scheduling.InstanceMetadata{},
-			GeneratedAt:        time.Now().UTC(),
+			GeneratedAt:        time.Now().UTC(), // infra time
+			Status:             "active",
 		}
 
+		// ExpectedStart / ExpectedEnd created in SAME timezone
 		if err := s.calculateExpectedTimes(instance, template); err != nil {
-			s.logger.Warn("Failed to calculate expected times",
-				util.String("user_id", userID.String()),
-				util.String("date", dateStr),
-				util.ErrorField(err))
 			continue
 		}
 
@@ -3329,4 +3356,13 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 	}
 
 	return result, nil
+}
+
+func normalizeBusinessDate(date time.Time, timezone string) time.Time {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	d := date.In(loc)
+	return time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc)
 }

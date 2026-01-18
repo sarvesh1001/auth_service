@@ -521,76 +521,79 @@ func (s *attendanceServiceImpl) resolveAttendanceDay(
 // ==============================================
 // ATTENDANCE VALIDATION LAYER
 // ==============================================
-
-// validateEventAgainstDay validates if an event can be created for the given day context
 func (s *attendanceServiceImpl) validateEventAgainstDay(
 	ctx context.Context,
 	event *attendance.AttendanceEvent,
 	day *AttendanceDayContext,
 ) error {
 
-	// Reject if holiday without force work
 	if day.IsHoliday && !day.IsForceWork {
 		return fmt.Errorf("cannot create attendance event on holiday")
 	}
 
-	// Reject if on leave
 	if day.IsOnLeave {
 		return fmt.Errorf("cannot create attendance event while on leave")
 	}
 
-	// Reject if not a working day
 	if !day.IsWorkingDay {
 		return fmt.Errorf("cannot create attendance event on non-working day")
 	}
 
-	// Validate time bounds for check-in / check-out
-	if event.EventType == "check_in" || event.EventType == "check_out" {
+	// Only validate time window for check-in / check-out
+	if event.EventType != "check_in" && event.EventType != "check_out" {
+		return nil
+	}
 
-		if day.ExpectedStart != nil && day.ExpectedEnd != nil {
+	if day.ExpectedStart == nil || day.ExpectedEnd == nil {
+		return nil
+	}
 
-			loc, err := time.LoadLocation(day.Timezone)
-			if err != nil {
-				return fmt.Errorf("invalid schedule timezone: %s", day.Timezone)
-			}
+	loc, err := time.LoadLocation(day.Timezone)
+	if err != nil {
+		return fmt.Errorf("invalid schedule timezone: %s", day.Timezone)
+	}
 
-			// Convert event time to schedule timezone
-			eventLocal := event.EventTime.In(loc)
+	eventLocal := event.EventTime.In(loc)
 
-			// Business date in schedule timezone
-			businessDate := time.Date(
-				eventLocal.Year(),
-				eventLocal.Month(),
-				eventLocal.Day(),
-				0, 0, 0, 0,
-				loc,
+	// ✅ BUSINESS DATE MUST COME FROM SCHEDULING
+	businessDate := day.Date.In(loc)
+
+	expectedStart := time.Date(
+		businessDate.Year(),
+		businessDate.Month(),
+		businessDate.Day(),
+		day.ExpectedStart.Hour(),
+		day.ExpectedStart.Minute(),
+		0, 0,
+		loc,
+	)
+
+	expectedEnd := time.Date(
+		businessDate.Year(),
+		businessDate.Month(),
+		businessDate.Day(),
+		day.ExpectedEnd.Hour(),
+		day.ExpectedEnd.Minute(),
+		0, 0,
+		loc,
+	)
+
+	// ✅ Handle night / cross-midnight shifts
+	if expectedEnd.Before(expectedStart) {
+		expectedEnd = expectedEnd.Add(24 * time.Hour)
+	}
+
+	if event.EventType == "check_in" {
+		earliestAllowed := expectedStart.Add(-4 * time.Hour)
+		latestAllowed := expectedEnd.Add(2 * time.Hour)
+
+		if eventLocal.Before(earliestAllowed) || eventLocal.After(latestAllowed) {
+			return fmt.Errorf(
+				"check-in time %s is outside allowed range (%s - %s)",
+				eventLocal.Format(time.RFC3339),
+				earliestAllowed.Format(time.RFC3339),
+				latestAllowed.Format(time.RFC3339),
 			)
-
-			expectedStart := time.Date(
-				businessDate.Year(), businessDate.Month(), businessDate.Day(),
-				day.ExpectedStart.Hour(), day.ExpectedStart.Minute(), 0, 0,
-				loc,
-			)
-
-			expectedEnd := time.Date(
-				businessDate.Year(), businessDate.Month(), businessDate.Day(),
-				day.ExpectedEnd.Hour(), day.ExpectedEnd.Minute(), 0, 0,
-				loc,
-			)
-
-			if event.EventType == "check_in" {
-				earliestAllowed := expectedStart.Add(-4 * time.Hour)
-				latestAllowed := expectedEnd.Add(2 * time.Hour)
-
-				if eventLocal.Before(earliestAllowed) || eventLocal.After(latestAllowed) {
-					return fmt.Errorf(
-						"check-in time %s is outside allowed range (%s - %s)",
-						eventLocal.Format(time.RFC3339),
-						earliestAllowed.Format(time.RFC3339),
-						latestAllowed.Format(time.RFC3339),
-					)
-				}
-			}
 		}
 	}
 
@@ -1120,16 +1123,15 @@ func (s *attendanceServiceImpl) GenerateDailySummary(
 	ctx context.Context,
 	companyID, userID uuid.UUID,
 	at time.Time,
-	_ string, // ⚠️ timezone param is ignored
+	_ string,
 ) (*attendance.AttendanceDailySummary, error) {
 
-	// 1️⃣ Resolve schedule day (🔥 SINGLE SOURCE OF TRUTH 🔥)
 	dayContext, err := s.resolveAttendanceDay(ctx, userID, at, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve attendance day: %w", err)
 	}
 
-	attendanceDate := dayContext.Date // ✅ authoritative business date
+	attendanceDate := dayContext.Date
 
 	loc, err := time.LoadLocation(dayContext.Timezone)
 	if err != nil {
@@ -1144,7 +1146,6 @@ func (s *attendanceServiceImpl) GenerateDailySummary(
 		overtime *int
 	)
 
-	// 2️⃣ Decide status
 	switch {
 	case dayContext.IsOnLeave:
 		status = "leave"
@@ -1156,29 +1157,52 @@ func (s *attendanceServiceImpl) GenerateDailySummary(
 		status = "absent"
 
 	default:
-		// 3️⃣ Build TIMEZONE-AWARE day window
-		dayStart := time.Date(
-			attendanceDate.Year(),
-			attendanceDate.Month(),
-			attendanceDate.Day(),
-			0, 0, 0, 0,
-			loc,
-		)
+		// ✅ Build event window from schedule
+		var from, to time.Time
 
-		dayEnd := dayStart.Add(24 * time.Hour)
+		if dayContext.ExpectedStart != nil && dayContext.ExpectedEnd != nil {
+			from = time.Date(
+				attendanceDate.Year(),
+				attendanceDate.Month(),
+				attendanceDate.Day(),
+				dayContext.ExpectedStart.Hour(),
+				dayContext.ExpectedStart.Minute(),
+				0, 0,
+				loc,
+			)
+
+			to = time.Date(
+				attendanceDate.Year(),
+				attendanceDate.Month(),
+				attendanceDate.Day(),
+				dayContext.ExpectedEnd.Hour(),
+				dayContext.ExpectedEnd.Minute(),
+				0, 0,
+				loc,
+			)
+
+			// ✅ Night shift support
+			if to.Before(from) {
+				to = to.Add(24 * time.Hour)
+			}
+		} else {
+			// Fallback (should rarely happen)
+			from = time.Date(attendanceDate.Year(), attendanceDate.Month(), attendanceDate.Day(), 0, 0, 0, 0, loc)
+			to = from.Add(24 * time.Hour)
+		}
 
 		events, err := s.attendanceRepo.GetAttendanceEventsByUser(
 			ctx,
 			userID,
-			dayStart,
-			dayEnd,
+			from,
+			to,
 			100,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get attendance events: %w", err)
 		}
 
-		policy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, dayStart)
+		policy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, from)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get attendance policy: %w", err)
 		}
@@ -1202,12 +1226,11 @@ func (s *attendanceServiceImpl) GenerateDailySummary(
 		overtime = calculated.OvertimeMinutes
 	}
 
-	// 4️⃣ Build & UPSERT summary
 	summary := &attendance.AttendanceDailySummary{
 		AttendanceSummaryID: uuid.New(),
 		CompanyID:           companyID,
 		UserID:              userID,
-		AttendanceDate:      attendanceDate, // ✅ schedule date
+		AttendanceDate:      attendanceDate,
 		Status:              status,
 		WorkedMinutes:       worked,
 		LateMinutes:         late,

@@ -47,20 +47,18 @@ func NewAttendanceHandler(
 func (h *AttendanceHandler) CreateAttendanceEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Get actor information from context
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse request body
 	var req struct {
-		UserID     uuid.UUID                `json:"user_id" validate:"required"`
-		CompanyID  uuid.UUID                `json:"company_id" validate:"required"`
-		EventType  string                   `json:"event_type" validate:"required"`
-		EventTime  time.Time                `json:"event_time" validate:"required"`
-		SourceType string                   `json:"source_type" validate:"required"`
+		UserID     uuid.UUID                `json:"user_id"`
+		CompanyID  uuid.UUID                `json:"company_id"`
+		EventType  string                   `json:"event_type"`
+		EventTime  time.Time                `json:"event_time"`
+		SourceType string                   `json:"source_type"`
 		SourceID   *uuid.UUID               `json:"source_id"`
 		DeviceID   *string                  `json:"device_id"`
 		IPAddress  *string                  `json:"ip_address"`
@@ -72,12 +70,17 @@ func (h *AttendanceHandler) CreateAttendanceEvent(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Create attendance event
+	// ✅ NORMALIZE EVENT TIME
+	eventTime := req.EventTime
+	if eventTime.Location() == time.Local {
+		eventTime = eventTime.UTC()
+	}
+
 	event := &attendance.AttendanceEvent{
 		CompanyID:  req.CompanyID,
 		UserID:     req.UserID,
 		EventType:  req.EventType,
-		EventTime:  req.EventTime,
+		EventTime:  eventTime,
 		SourceType: req.SourceType,
 		SourceID:   req.SourceID,
 		DeviceID:   req.DeviceID,
@@ -86,20 +89,20 @@ func (h *AttendanceHandler) CreateAttendanceEvent(w http.ResponseWriter, r *http
 	}
 
 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
-		ctx, event, actorType, actorID, nil)
-	if err != nil {
-		h.logger.Error("Failed to create attendance event",
-			util.String("user_id", req.UserID.String()),
-			util.ErrorField(err))
+		ctx,
+		event,
+		actorType,
+		actorID,
+		nil,
+	)
 
+	if err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "invalid") ||
 			strings.Contains(err.Error(), "required") ||
-			strings.Contains(err.Error(), "not allowed") ||
-			strings.Contains(err.Error(), "cannot create") {
+			strings.Contains(err.Error(), "not allowed") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -196,7 +199,6 @@ func (h *AttendanceHandler) GetAttendanceEvent(w http.ResponseWriter, r *http.Re
 func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -204,47 +206,45 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
-
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
+
 	if startDateStr == "" || endDateStr == "" {
-		// Default to last 30 days
 		endDate = time.Now().UTC()
 		startDate = endDate.AddDate(0, 0, -30)
 	} else {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format")
 			return
 		}
-
 		endDate, err = time.Parse("2006-01-02", endDateStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format")
 			return
 		}
-
-		// Add time to end date to include entire day
-		endDate = endDate.Add(24*time.Hour - time.Second)
 	}
 
-	// Parse limit
+	// ✅ EXTEND WINDOW FOR NIGHT SHIFTS
+	endDate = endDate.Add(36 * time.Hour)
+
 	limit, err := strconv.Atoi(query.Get("limit"))
-	if err != nil || limit < 1 || limit > 1000 {
+	if err != nil || limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 
-	// Get attendance events
-	events, err := h.queryService.GetAttendanceEventsByUser(ctx, userID, startDate, endDate, limit)
+	events, err := h.queryService.GetAttendanceEventsByUser(
+		ctx,
+		userID,
+		startDate,
+		endDate,
+		limit,
+	)
+
 	if err != nil {
-		h.logger.Error("Failed to get attendance events by user",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to get attendance events")
 		return
 	}
@@ -254,10 +254,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 		"data": map[string]interface{}{
 			"events": events,
 			"count":  len(events),
-			"period": map[string]interface{}{
-				"start_date": startDate.Format("2006-01-02"),
-				"end_date":   endDate.Format("2006-01-02"),
-			},
 		},
 	})
 }
@@ -266,7 +262,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -274,86 +269,68 @@ func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, 
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
-
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
+
 	if startDateStr == "" || endDateStr == "" {
-		// Default to last 7 days
 		endDate = time.Now().UTC()
 		startDate = endDate.AddDate(0, 0, -7)
 	} else {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format")
 			return
 		}
-
 		endDate, err = time.Parse("2006-01-02", endDateStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format")
 			return
 		}
-
-		// Add time to end date to include entire day
-		endDate = endDate.Add(24*time.Hour - time.Second)
 	}
 
-	// Parse pagination
-	page, err := strconv.Atoi(query.Get("page"))
-	if err != nil || page < 1 {
+	// ✅ EXTEND WINDOW
+	endDate = endDate.Add(36 * time.Hour)
+
+	page, _ := strconv.Atoi(query.Get("page"))
+	if page < 1 {
 		page = 1
 	}
 
-	pageSize, err := strconv.Atoi(query.Get("page_size"))
-	if err != nil || pageSize < 1 || pageSize > 100 {
+	pageSize, _ := strconv.Atoi(query.Get("page_size"))
+	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
 	}
 
-	// Get attendance events
-	events, total, err := h.queryService.GetAttendanceEventsByCompany(ctx, companyID, startDate, endDate, page, pageSize)
+	events, total, err := h.queryService.GetAttendanceEventsByCompany(
+		ctx,
+		companyID,
+		startDate,
+		endDate,
+		page,
+		pageSize,
+	)
+
 	if err != nil {
-		h.logger.Error("Failed to get attendance events by company",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to get attendance events")
 		return
 	}
-
-	totalPages := (total + pageSize - 1) / pageSize
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
 			"events": events,
-			"pagination": map[string]interface{}{
-				"page":         page,
-				"page_size":    pageSize,
-				"total":        total,
-				"total_pages":  totalPages,
-				"has_next":     page < totalPages,
-				"has_previous": page > 1,
-			},
-			"period": map[string]interface{}{
-				"start_date": startDate.Format("2006-01-02"),
-				"end_date":   endDate.Format("2006-01-02"),
-			},
+			"total":  total,
 		},
 	})
 }
 
-// SearchAttendanceEvents handles GET /api/attendance/events/search
 func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse query parameters
 	query := r.URL.Query()
-
-	// Parse company ID
 	companyIDStr := query.Get("company_id")
 	if companyIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
@@ -362,28 +339,15 @@ func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *htt
 
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 
-	// Parse filters
 	var filters service.AttendanceSearchFilters
 	filters.CompanyID = companyID
 
-	// Parse user ID (optional)
-	if userIDStr := query.Get("user_id"); userIDStr != "" {
-		userID, err := uuid.Parse(userIDStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid user ID format")
-			return
-		}
-		filters.UserID = &userID
-	}
-
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
@@ -391,93 +355,47 @@ func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *htt
 
 	filters.StartDate, err = time.Parse("2006-01-02", startDateStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date")
 		return
 	}
 
 	filters.EndDate, err = time.Parse("2006-01-02", endDateStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date")
 		return
 	}
 
-	// Add time to end date to include entire day
-	filters.EndDate = filters.EndDate.Add(24*time.Hour - time.Second)
+	// ✅ EXTEND WINDOW
+	filters.EndDate = filters.EndDate.Add(36 * time.Hour)
 
-	// Parse event type (optional)
-	if eventType := query.Get("event_type"); eventType != "" {
-		filters.EventType = &eventType
-	}
-
-	// Parse source type (optional)
-	if sourceType := query.Get("source_type"); sourceType != "" {
-		filters.SourceType = &sourceType
-	}
-
-	// Parse department ID (optional)
-	if deptIDStr := query.Get("department_id"); deptIDStr != "" {
-		deptID, err := uuid.Parse(deptIDStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid department ID format")
-			return
-		}
-		filters.DepartmentID = &deptID
-	}
-
-	// Parse shift ID (optional)
-	if shiftIDStr := query.Get("shift_id"); shiftIDStr != "" {
-		shiftID, err := uuid.Parse(shiftIDStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid shift ID format")
-			return
-		}
-		filters.ShiftID = &shiftID
-	}
-
-	// Parse pagination
-	page, err := strconv.Atoi(query.Get("page"))
-	if err != nil || page < 1 {
+	page, _ := strconv.Atoi(query.Get("page"))
+	if page < 1 {
 		page = 1
 	}
 
-	pageSize, err := strconv.Atoi(query.Get("page_size"))
-	if err != nil || pageSize < 1 || pageSize > 100 {
+	pageSize, _ := strconv.Atoi(query.Get("page_size"))
+	if pageSize < 1 || pageSize > 100 {
 		pageSize = 50
 	}
 
-	// Search attendance events
-	events, total, err := h.queryService.SearchAttendanceEventsTyped(ctx, companyID, filters, page, pageSize)
+	events, total, err := h.queryService.SearchAttendanceEventsTyped(
+		ctx,
+		companyID,
+		filters,
+		page,
+		pageSize,
+	)
+
 	if err != nil {
-		h.logger.Error("Failed to search attendance events",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to search attendance events")
 		return
 	}
-
-	totalPages := (total + pageSize - 1) / pageSize
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
 			"events": events,
-			"pagination": map[string]interface{}{
-				"page":         page,
-				"page_size":    pageSize,
-				"total":        total,
-				"total_pages":  totalPages,
-				"has_next":     page < totalPages,
-				"has_previous": page > 1,
-			},
-			"filters": map[string]interface{}{
-				"company_id":    companyID,
-				"start_date":    filters.StartDate.Format("2006-01-02"),
-				"end_date":      filters.EndDate.Format("2006-01-02"),
-				"event_type":    filters.EventType,
-				"source_type":   filters.SourceType,
-				"department_id": filters.DepartmentID,
-				"shift_id":      filters.ShiftID,
-			},
+			"total":  total,
 		},
 	})
 }

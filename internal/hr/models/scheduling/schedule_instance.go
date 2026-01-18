@@ -14,7 +14,7 @@ type ScheduleInstance struct {
 	ScheduleTemplateID uuid.UUID        `json:"schedule_template_id" db:"schedule_template_id"`
 	ExpectedStart      *time.Time       `json:"expected_start" db:"expected_start"`
 	ExpectedEnd        *time.Time       `json:"expected_end" db:"expected_end"`
-	Timezone           string           `db:"timezone"`
+	Timezone           string           `json:"timezone" db:"timezone"`
 	Metadata           InstanceMetadata `json:"metadata" db:"metadata"`
 	GeneratedAt        time.Time        `json:"generated_at" db:"generated_at"`
 
