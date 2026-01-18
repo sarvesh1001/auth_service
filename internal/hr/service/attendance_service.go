@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort" // ✅ ADD THIS LINE
 	"strings"
 	"sync"
 	"time"
@@ -1117,217 +1118,6 @@ func (s *attendanceServiceImpl) AssignUserAttendancePolicy(
 		util.Duration("duration", time.Since(startTime)))
 
 	return nil
-}
-
-func (s *attendanceServiceImpl) GenerateDailySummary(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	at time.Time,
-	_ string,
-) (*attendance.AttendanceDailySummary, error) {
-
-	dayContext, err := s.resolveAttendanceDay(ctx, userID, at, "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve attendance day: %w", err)
-	}
-
-	attendanceDate := dayContext.Date
-
-	loc, err := time.LoadLocation(dayContext.Timezone)
-	if err != nil {
-		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
-	}
-
-	var (
-		status   string
-		metadata attendance.SummaryMetadata
-		worked   *int
-		late     *int
-		overtime *int
-	)
-
-	switch {
-	case dayContext.IsOnLeave:
-		status = "leave"
-
-	case dayContext.IsHoliday && !dayContext.IsForceWork:
-		status = "holiday"
-
-	case !dayContext.IsWorkingDay:
-		status = "absent"
-
-	default:
-		// ✅ Build event window from schedule
-		var from, to time.Time
-
-		if dayContext.ExpectedStart != nil && dayContext.ExpectedEnd != nil {
-			from = time.Date(
-				attendanceDate.Year(),
-				attendanceDate.Month(),
-				attendanceDate.Day(),
-				dayContext.ExpectedStart.Hour(),
-				dayContext.ExpectedStart.Minute(),
-				0, 0,
-				loc,
-			)
-
-			to = time.Date(
-				attendanceDate.Year(),
-				attendanceDate.Month(),
-				attendanceDate.Day(),
-				dayContext.ExpectedEnd.Hour(),
-				dayContext.ExpectedEnd.Minute(),
-				0, 0,
-				loc,
-			)
-
-			// ✅ Night shift support
-			if to.Before(from) {
-				to = to.Add(24 * time.Hour)
-			}
-		} else {
-			// Fallback (should rarely happen)
-			from = time.Date(attendanceDate.Year(), attendanceDate.Month(), attendanceDate.Day(), 0, 0, 0, 0, loc)
-			to = from.Add(24 * time.Hour)
-		}
-
-		events, err := s.attendanceRepo.GetAttendanceEventsByUser(
-			ctx,
-			userID,
-			from,
-			to,
-			100,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get attendance events: %w", err)
-		}
-
-		policy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, from)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get attendance policy: %w", err)
-		}
-
-		calculated, err := s.calculateDailySummary(
-			ctx,
-			userID,
-			attendanceDate,
-			events,
-			policy,
-			dayContext,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to calculate summary: %w", err)
-		}
-
-		status = calculated.Status
-		metadata = calculated.Metadata
-		worked = calculated.WorkedMinutes
-		late = calculated.LateMinutes
-		overtime = calculated.OvertimeMinutes
-	}
-
-	summary := &attendance.AttendanceDailySummary{
-		AttendanceSummaryID: uuid.New(),
-		CompanyID:           companyID,
-		UserID:              userID,
-		AttendanceDate:      attendanceDate,
-		Status:              status,
-		WorkedMinutes:       worked,
-		LateMinutes:         late,
-		OvertimeMinutes:     overtime,
-		Metadata:            metadata,
-		GeneratedAt:         time.Now().UTC(),
-		GeneratedBy:         "system",
-	}
-
-	if err := s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary); err != nil {
-		return nil, err
-	}
-
-	return summary, nil
-}
-
-func (s *attendanceServiceImpl) calculateDailySummary(
-	ctx context.Context,
-	userID uuid.UUID,
-	date time.Time,
-	events []*attendance.AttendanceEvent,
-	policy *attendance.AttendancePolicy,
-	dayContext *AttendanceDayContext,
-) (*attendance.AttendanceDailySummary, error) {
-
-	if len(events) == 0 {
-		return &attendance.AttendanceDailySummary{Status: "absent"}, nil
-	}
-
-	loc, err := time.LoadLocation(dayContext.Timezone)
-	if err != nil {
-		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
-	}
-
-	var checkInTime, checkOutTime *time.Time
-	var workedMinutes, lateMinutes, overtimeMinutes int
-
-	for _, event := range events {
-		switch event.EventType {
-		case "check_in":
-			if checkInTime == nil || event.EventTime.Before(*checkInTime) {
-				t := event.EventTime.In(loc)
-				checkInTime = &t
-			}
-		case "check_out":
-			if checkOutTime == nil || event.EventTime.After(*checkOutTime) {
-				t := event.EventTime.In(loc)
-				checkOutTime = &t
-			}
-		}
-	}
-
-	if checkInTime != nil && checkOutTime != nil {
-		workedMinutes = int(checkOutTime.Sub(*checkInTime).Minutes())
-
-		if dayContext.ExpectedStart != nil {
-			expectedStart := time.Date(
-				date.Year(), date.Month(), date.Day(),
-				dayContext.ExpectedStart.Hour(),
-				dayContext.ExpectedStart.Minute(),
-				0, 0, loc,
-			)
-
-			if checkInTime.After(expectedStart) {
-				lateMinutes = int(checkInTime.Sub(expectedStart).Minutes())
-			}
-		}
-
-		if dayContext.ExpectedEnd != nil {
-			expectedEnd := time.Date(
-				date.Year(), date.Month(), date.Day(),
-				dayContext.ExpectedEnd.Hour(),
-				dayContext.ExpectedEnd.Minute(),
-				0, 0, loc,
-			)
-
-			if checkOutTime.After(expectedEnd) {
-				overtimeMinutes = int(checkOutTime.Sub(expectedEnd).Minutes())
-			}
-		}
-	}
-
-	status := "present"
-	if policy != nil && policy.Rules.GracePeriod != nil && lateMinutes > *policy.Rules.GracePeriod {
-		status = "late"
-	}
-	if policy != nil && policy.Rules.HalfDayAfter != nil && workedMinutes < *policy.Rules.HalfDayAfter {
-		status = "half_day"
-	}
-
-	return &attendance.AttendanceDailySummary{
-		Status:          status,
-		WorkedMinutes:   &workedMinutes,
-		LateMinutes:     &lateMinutes,
-		OvertimeMinutes: &overtimeMinutes,
-		Metadata:        attendance.SummaryMetadata{},
-	}, nil
 }
 
 func (s *attendanceServiceImpl) GenerateBulkDailySummaries(
@@ -3181,7 +2971,9 @@ func (s *attendanceServiceImpl) CreateAttendanceEvent(
 
 	startTime := time.Now()
 
+	// =========================
 	// Basic validation
+	// =========================
 	if event.UserID == uuid.Nil {
 		return nil, fmt.Errorf("user ID is required")
 	}
@@ -3205,10 +2997,17 @@ func (s *attendanceServiceImpl) CreateAttendanceEvent(
 		return nil, err
 	}
 
-	// 🔒 Duplicate protection (unchanged)
+	// =========================
+	// Duplicate protection
+	// =========================
 	if event.SourceType == "correction" {
 		existing, err := s.attendanceRepo.FindExistingCorrection(
-			ctx, event.CompanyID, event.UserID, event.EventType, event.EventTime)
+			ctx,
+			event.CompanyID,
+			event.UserID,
+			event.EventType,
+			event.EventTime,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -3231,20 +3030,16 @@ func (s *attendanceServiceImpl) CreateAttendanceEvent(
 		}
 	}
 
-	// ✅ Resolve business day (NO timezone passed)
-	dayContext, err := s.resolveAttendanceDay(ctx, event.UserID, event.EventTime, "")
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.validateEventAgainstDay(ctx, event, dayContext); err != nil {
-		return nil, err
-	}
-
+	// =========================
+	// Rules validation (SOURCE / EVENT only)
+	// =========================
 	if err := s.validateEventRules(ctx, event); err != nil {
 		return nil, err
 	}
 
+	// =========================
+	// Persist event (FACT)
+	// =========================
 	if event.AttendanceEventID == uuid.Nil {
 		event.AttendanceEventID = uuid.New()
 	}
@@ -3259,8 +3054,12 @@ func (s *attendanceServiceImpl) CreateAttendanceEvent(
 		return nil, err
 	}
 
+	// =========================
+	// Audit
+	// =========================
 	if s.auditService != nil {
-		go s.logAuditAction(ctx,
+		go s.logAuditAction(
+			context.Background(),
 			event.CompanyID,
 			"attendance_event.create",
 			event.AttendanceEventID,
@@ -3272,10 +3071,824 @@ func (s *attendanceServiceImpl) CreateAttendanceEvent(
 		)
 	}
 
-	s.logger.Info("Attendance event created",
+	s.logger.Info(
+		"Attendance event created",
 		util.String("event_id", event.AttendanceEventID.String()),
+		util.String("event_type", event.EventType),
+		util.Time("event_time", event.EventTime),
 		util.Duration("duration", time.Since(startTime)),
 	)
 
 	return event, nil
+}
+
+// func (s *attendanceServiceImpl) GenerateDailySummary(
+// 	ctx context.Context,
+// 	companyID, userID uuid.UUID,
+// 	at time.Time,
+// 	_ string,
+// ) (*attendance.AttendanceDailySummary, error) {
+
+// 	dayContext, err := s.resolveAttendanceDay(ctx, userID, at, "")
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to resolve attendance day: %w", err)
+// 	}
+
+// 	attendanceDate := dayContext.Date
+
+// 	loc, err := time.LoadLocation(dayContext.Timezone)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
+// 	}
+
+// 	// =====================================================
+// 	// 🔥 BUILD EXTENDED EVENT WINDOW (early + late + night)
+// 	// =====================================================
+// 	var from, to time.Time
+
+// 	if dayContext.ExpectedStart != nil && dayContext.ExpectedEnd != nil {
+// 		shiftStart := time.Date(
+// 			attendanceDate.Year(),
+// 			attendanceDate.Month(),
+// 			attendanceDate.Day(),
+// 			dayContext.ExpectedStart.Hour(),
+// 			dayContext.ExpectedStart.Minute(),
+// 			0, 0,
+// 			loc,
+// 		)
+
+// 		shiftEnd := time.Date(
+// 			attendanceDate.Year(),
+// 			attendanceDate.Month(),
+// 			attendanceDate.Day(),
+// 			dayContext.ExpectedEnd.Hour(),
+// 			dayContext.ExpectedEnd.Minute(),
+// 			0, 0,
+// 			loc,
+// 		)
+
+// 		// Night shift
+// 		if shiftEnd.Before(shiftStart) {
+// 			shiftEnd = shiftEnd.Add(24 * time.Hour)
+// 		}
+
+// 		from = shiftStart.Add(-6 * time.Hour)
+// 		to = shiftEnd.Add(6 * time.Hour)
+
+// 	} else {
+// 		from = time.Date(attendanceDate.Year(), attendanceDate.Month(), attendanceDate.Day(), 0, 0, 0, 0, loc)
+// 		to = from.Add(24 * time.Hour)
+// 	}
+
+// 	events, err := s.attendanceRepo.GetAttendanceEventsByUser(
+// 		ctx,
+// 		userID,
+// 		from,
+// 		to,
+// 		100,
+// 	)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// =====================================================
+// 	// STATUS RESOLUTION
+// 	// =====================================================
+// 	var (
+// 		status   string
+// 		worked   *int
+// 		late     *int
+// 		overtime *int
+// 	)
+
+// 	switch {
+// 	case dayContext.IsOnLeave && len(events) == 0:
+// 		status = "leave"
+
+// 	case dayContext.IsHoliday && len(events) == 0:
+// 		status = "holiday"
+
+// 	case !dayContext.IsWorkingDay && len(events) == 0:
+// 		status = "week_off"
+
+// 	case len(events) == 0:
+// 		status = "absent"
+
+// 	default:
+// 		policy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, from)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		calculated, err := s.calculateDailySummary(
+// 			ctx,
+// 			userID,
+// 			attendanceDate,
+// 			events,
+// 			policy,
+// 			dayContext,
+// 		)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		status = calculated.Status
+// 		worked = calculated.WorkedMinutes
+// 		late = calculated.LateMinutes
+// 		overtime = calculated.OvertimeMinutes
+
+// 		// ✅ FINAL SAP-STYLE OVERRIDE (ONLY IF WORK EXISTS)
+// 		if dayContext.IsHoliday {
+// 			if worked != nil && *worked > 0 {
+// 				status = "worked_on_holiday"
+// 			} else {
+// 				status = "holiday"
+// 			}
+// 		} else if !dayContext.IsWorkingDay {
+// 			if worked != nil && *worked > 0 {
+// 				status = "worked_on_week_off"
+// 			} else {
+// 				status = "week_off"
+// 			}
+// 		}
+// 	}
+
+// 	summary := &attendance.AttendanceDailySummary{
+// 		AttendanceSummaryID: uuid.New(),
+// 		CompanyID:           companyID,
+// 		UserID:              userID,
+// 		AttendanceDate:      attendanceDate,
+// 		Status:              status,
+// 		WorkedMinutes:       worked,
+// 		LateMinutes:         late,
+// 		OvertimeMinutes:     overtime,
+// 		Metadata:            attendance.SummaryMetadata{},
+// 		GeneratedAt:         time.Now().UTC(),
+// 		GeneratedBy:         "system",
+// 	}
+
+// 	if err := s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary); err != nil {
+// 		return nil, err
+// 	}
+
+//		return summary, nil
+//	}
+// func (s *attendanceServiceImpl) calculateDailySummary(
+// 	ctx context.Context,
+// 	userID uuid.UUID,
+// 	date time.Time,
+// 	events []*attendance.AttendanceEvent,
+// 	policy *attendance.AttendancePolicy,
+// 	dayContext *AttendanceDayContext,
+// ) (*attendance.AttendanceDailySummary, error) {
+
+// 	loc, err := time.LoadLocation(dayContext.Timezone)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
+// 	}
+
+// 	// =====================================================
+// 	// Sort events ASCENDING (CRITICAL)
+// 	// =====================================================
+// 	sort.Slice(events, func(i, j int) bool {
+// 		return events[i].EventTime.Before(events[j].EventTime)
+// 	})
+
+// 	var (
+// 		totalWorkedMinutes int
+// 		lateMinutes        int
+// 		overtimeMinutes    int
+// 		lastCheckIn        *time.Time
+// 	)
+
+// 	for _, event := range events {
+// 		t := event.EventTime.In(loc)
+
+// 		switch event.EventType {
+
+// 		case "check_in":
+// 			lastCheckIn = &t
+
+// 		case "check_out":
+// 			if lastCheckIn != nil && t.After(*lastCheckIn) {
+// 				totalWorkedMinutes += int(t.Sub(*lastCheckIn).Minutes())
+// 				lastCheckIn = nil
+// 			}
+// 		}
+// 	}
+
+// 	// =====================================================
+// 	// Late calculation
+// 	// =====================================================
+// 	if dayContext.ExpectedStart != nil && len(events) > 0 {
+// 		expectedStart := time.Date(
+// 			date.Year(), date.Month(), date.Day(),
+// 			dayContext.ExpectedStart.Hour(),
+// 			dayContext.ExpectedStart.Minute(),
+// 			0, 0, loc,
+// 		)
+
+// 		for _, e := range events {
+// 			if e.EventType == "check_in" {
+// 				in := e.EventTime.In(loc)
+// 				if in.After(expectedStart) {
+// 					lateMinutes = int(in.Sub(expectedStart).Minutes())
+// 				}
+// 				break
+// 			}
+// 		}
+// 	}
+
+// 	// =====================================================
+// 	// Overtime calculation
+// 	// =====================================================
+// 	if dayContext.ExpectedEnd != nil && len(events) > 0 {
+// 		expectedEnd := time.Date(
+// 			date.Year(), date.Month(), date.Day(),
+// 			dayContext.ExpectedEnd.Hour(),
+// 			dayContext.ExpectedEnd.Minute(),
+// 			0, 0, loc,
+// 		)
+
+// 		for i := len(events) - 1; i >= 0; i-- {
+// 			if events[i].EventType == "check_out" {
+// 				out := events[i].EventTime.In(loc)
+// 				if out.After(expectedEnd) {
+// 					overtimeMinutes = int(out.Sub(expectedEnd).Minutes())
+// 				}
+// 				break
+// 			}
+// 		}
+// 	}
+
+// 	// =====================================================
+// 	// Status resolution
+// 	// =====================================================
+// 	status := "present"
+
+// 	if policy != nil && policy.Rules.HalfDayAfter != nil {
+// 		if totalWorkedMinutes < (*policy.Rules.HalfDayAfter * 60) {
+// 			status = "half_day"
+// 		}
+// 	}
+
+// 	if policy != nil && policy.Rules.GracePeriod != nil {
+// 		if lateMinutes > *policy.Rules.GracePeriod {
+// 			status = "late"
+// 		}
+// 	}
+
+// 	return &attendance.AttendanceDailySummary{
+// 		Status:          status,
+// 		WorkedMinutes:   &totalWorkedMinutes,
+// 		LateMinutes:     &lateMinutes,
+// 		OvertimeMinutes: &overtimeMinutes,
+// 		Metadata:        attendance.SummaryMetadata{},
+// 	}, nil
+// }
+
+// func (s *attendanceServiceImpl) GenerateDailySummary(
+// 	ctx context.Context,
+// 	companyID, userID uuid.UUID,
+// 	at time.Time,
+// 	_ string,
+// ) (*attendance.AttendanceDailySummary, error) {
+
+// 	// =====================================================
+// 	// Resolve authoritative business context
+// 	// =====================================================
+// 	dayContext, err := s.resolveAttendanceDay(ctx, userID, at, "")
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to resolve attendance day: %w", err)
+// 	}
+
+// 	loc, err := time.LoadLocation(dayContext.Timezone)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
+// 	}
+
+// 	// =====================================================
+// 	// ✅ AUTHORITATIVE attendance date (FROM INPUT TIME)
+// 	// =====================================================
+// 	atLocal := at.In(loc)
+// 	attendanceDate := time.Date(
+// 		atLocal.Year(),
+// 		atLocal.Month(),
+// 		atLocal.Day(),
+// 		0, 0, 0, 0,
+// 		loc,
+// 	)
+
+// 	// =====================================================
+// 	// Build LOCAL event window
+// 	// =====================================================
+// 	var localFrom, localTo time.Time
+
+// 	if dayContext.ExpectedStart != nil && dayContext.ExpectedEnd != nil {
+
+// 		shiftStart := time.Date(
+// 			attendanceDate.Year(),
+// 			attendanceDate.Month(),
+// 			attendanceDate.Day(),
+// 			dayContext.ExpectedStart.Hour(),
+// 			dayContext.ExpectedStart.Minute(),
+// 			0, 0,
+// 			loc,
+// 		)
+
+// 		shiftEnd := time.Date(
+// 			attendanceDate.Year(),
+// 			attendanceDate.Month(),
+// 			attendanceDate.Day(),
+// 			dayContext.ExpectedEnd.Hour(),
+// 			dayContext.ExpectedEnd.Minute(),
+// 			0, 0,
+// 			loc,
+// 		)
+
+// 		// Night shift handling
+// 		if shiftEnd.Before(shiftStart) {
+// 			shiftEnd = shiftEnd.Add(24 * time.Hour)
+// 		}
+
+// 		localFrom = shiftStart.Add(-6 * time.Hour)
+// 		localTo = shiftEnd.Add(6 * time.Hour)
+
+// 	} else {
+// 		// No shift → calendar day
+// 		localFrom = attendanceDate
+// 		localTo = attendanceDate.Add(24 * time.Hour)
+// 	}
+
+// 	// =====================================================
+// 	// Convert window to UTC (DB is UTC)
+// 	// =====================================================
+// 	fromUTC := localFrom.UTC()
+// 	toUTC := localTo.UTC()
+
+// 	events, err := s.attendanceRepo.GetAttendanceEventsByUser(
+// 		ctx,
+// 		userID,
+// 		fromUTC,
+// 		toUTC,
+// 		0,
+// 	)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// =====================================================
+// 	// Status resolution
+// 	// =====================================================
+// 	var (
+// 		status   string
+// 		worked   *int
+// 		late     *int
+// 		overtime *int
+// 	)
+
+// 	switch {
+// 	case dayContext.IsOnLeave && len(events) == 0:
+// 		status = "leave"
+
+// 	case dayContext.IsHoliday && len(events) == 0:
+// 		status = "holiday"
+
+// 	case !dayContext.IsWorkingDay && len(events) == 0:
+// 		status = "week_off"
+
+// 	case len(events) == 0:
+// 		status = "absent"
+
+// 	default:
+// 		policy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, fromUTC)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		calculated, err := s.calculateDailySummary(
+// 			ctx,
+// 			userID,
+// 			attendanceDate,
+// 			events,
+// 			policy,
+// 			dayContext,
+// 		)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		status = calculated.Status
+// 		worked = calculated.WorkedMinutes
+// 		late = calculated.LateMinutes
+// 		overtime = calculated.OvertimeMinutes
+
+// 		// Holiday / Week-off override
+// 		if dayContext.IsHoliday {
+// 			if worked != nil && *worked > 0 {
+// 				status = "worked_on_holiday"
+// 			} else {
+// 				status = "holiday"
+// 			}
+// 		} else if !dayContext.IsWorkingDay {
+// 			if worked != nil && *worked > 0 {
+// 				status = "worked_on_week_off"
+// 			} else {
+// 				status = "week_off"
+// 			}
+// 		}
+// 	}
+
+// 	// =====================================================
+// 	// Persist summary
+// 	// =====================================================
+// 	summary := &attendance.AttendanceDailySummary{
+// 		AttendanceSummaryID: uuid.New(),
+// 		CompanyID:           companyID,
+// 		UserID:              userID,
+// 		AttendanceDate:      attendanceDate,
+// 		Status:              status,
+// 		WorkedMinutes:       worked,
+// 		LateMinutes:         late,
+// 		OvertimeMinutes:     overtime,
+// 		Metadata:            attendance.SummaryMetadata{},
+// 		GeneratedAt:         time.Now().UTC(),
+// 		GeneratedBy:         "system",
+// 	}
+
+// 	if err := s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary); err != nil {
+// 		return nil, err
+// 	}
+
+// 	return summary, nil
+// }
+
+func (s *attendanceServiceImpl) calculateDailySummary(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+	events []*attendance.AttendanceEvent,
+	policy *attendance.AttendancePolicy,
+	dayContext *AttendanceDayContext,
+) (*attendance.AttendanceDailySummary, error) {
+
+	loc, err := time.LoadLocation(dayContext.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
+	}
+
+	s.logger.Info("=== calculateDailySummary START ===",
+		util.String("user_id", userID.String()),
+		util.String("date_local", date.Format(time.RFC3339)),
+	)
+
+	// =====================================================
+	// Sort events by time (ASC)
+	// =====================================================
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].EventTime.Before(events[j].EventTime)
+	})
+
+	var (
+		totalWorkedMinutes int
+		lateMinutes        int
+		overtimeMinutes    int
+		lastCheckIn        *time.Time
+	)
+
+	// =====================================================
+	// Work duration calculation
+	// =====================================================
+	for _, event := range events {
+		tLocal := event.EventTime.In(loc)
+
+		s.logger.Info("Processing event",
+			util.String("event_type", event.EventType),
+			util.String("event_time_utc", event.EventTime.Format(time.RFC3339)),
+			util.String("event_time_local", tLocal.Format(time.RFC3339)),
+		)
+
+		switch event.EventType {
+
+		case "check_in":
+			lastCheckIn = &tLocal
+			s.logger.Info("Check-in registered",
+				util.String("time_local", tLocal.Format(time.RFC3339)),
+			)
+
+		case "check_out":
+			if lastCheckIn == nil {
+				s.logger.Warn("Check-out without matching check-in",
+					util.String("time_local", tLocal.Format(time.RFC3339)),
+				)
+				continue
+			}
+
+			if tLocal.After(*lastCheckIn) {
+				diff := int(tLocal.Sub(*lastCheckIn).Minutes())
+				totalWorkedMinutes += diff
+
+				s.logger.Info("Work segment closed",
+					util.Int("minutes", diff),
+					util.String("from_local", lastCheckIn.Format(time.RFC3339)),
+					util.String("to_local", tLocal.Format(time.RFC3339)),
+				)
+
+				lastCheckIn = nil
+			}
+		}
+	}
+
+	// =====================================================
+	// Late calculation (FIXED UTC → LOCAL)
+	// =====================================================
+	if dayContext.ExpectedStart != nil && len(events) > 0 {
+
+		expectedStartLocal := dayContext.ExpectedStart.In(loc)
+
+		expectedStart := time.Date(
+			date.Year(),
+			date.Month(),
+			date.Day(),
+			expectedStartLocal.Hour(),
+			expectedStartLocal.Minute(),
+			0, 0,
+			loc,
+		)
+
+		s.logger.Info("Expected start resolved",
+			util.String("expected_start_utc", dayContext.ExpectedStart.Format(time.RFC3339)),
+			util.String("expected_start_local", expectedStart.Format(time.RFC3339)),
+		)
+
+		for _, e := range events {
+			if e.EventType == "check_in" {
+				inLocal := e.EventTime.In(loc)
+
+				if inLocal.After(expectedStart) {
+					lateMinutes = int(inLocal.Sub(expectedStart).Minutes())
+				}
+
+				s.logger.Info("Late calculation",
+					util.String("actual_in_local", inLocal.Format(time.RFC3339)),
+					util.Int("late_minutes", lateMinutes),
+				)
+				break
+			}
+		}
+	}
+
+	// =====================================================
+	// Overtime calculation (FIXED UTC → LOCAL)
+	// =====================================================
+	if dayContext.ExpectedEnd != nil && len(events) > 0 {
+
+		expectedEndLocal := dayContext.ExpectedEnd.In(loc)
+
+		expectedEnd := time.Date(
+			date.Year(),
+			date.Month(),
+			date.Day(),
+			expectedEndLocal.Hour(),
+			expectedEndLocal.Minute(),
+			0, 0,
+			loc,
+		)
+
+		s.logger.Info("Expected end resolved",
+			util.String("expected_end_utc", dayContext.ExpectedEnd.Format(time.RFC3339)),
+			util.String("expected_end_local", expectedEnd.Format(time.RFC3339)),
+		)
+
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i].EventType == "check_out" {
+				outLocal := events[i].EventTime.In(loc)
+
+				if outLocal.After(expectedEnd) {
+					overtimeMinutes = int(outLocal.Sub(expectedEnd).Minutes())
+				}
+
+				s.logger.Info("Overtime calculation",
+					util.String("actual_out_local", outLocal.Format(time.RFC3339)),
+					util.Int("overtime_minutes", overtimeMinutes),
+				)
+				break
+			}
+		}
+	}
+
+	// =====================================================
+	// Final summary
+	// =====================================================
+	s.logger.Info("=== calculateDailySummary END ===",
+		util.Int("worked_minutes", totalWorkedMinutes),
+		util.Int("late_minutes", lateMinutes),
+		util.Int("overtime_minutes", overtimeMinutes),
+	)
+
+	status := "present"
+	if policy != nil && policy.Rules.GracePeriod != nil && lateMinutes > *policy.Rules.GracePeriod {
+		status = "late"
+	}
+
+	return &attendance.AttendanceDailySummary{
+		Status:          status,
+		WorkedMinutes:   &totalWorkedMinutes,
+		LateMinutes:     &lateMinutes,
+		OvertimeMinutes: &overtimeMinutes,
+		Metadata:        attendance.SummaryMetadata{},
+	}, nil
+}
+
+func (s *attendanceServiceImpl) GenerateDailySummary(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	at time.Time,
+	_ string,
+) (*attendance.AttendanceDailySummary, error) {
+
+	s.logger.Info("=== GenerateDailySummary START ===",
+		util.String("user_id", userID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("input_at", at.Format(time.RFC3339)),
+	)
+
+	// =====================================================
+	// Resolve business context (calendar intent only)
+	// =====================================================
+	dayContext, err := s.resolveAttendanceDay(ctx, userID, at, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve attendance day: %w", err)
+	}
+
+	s.logger.Info("Resolved day context",
+		util.String("timezone", dayContext.Timezone),
+		util.Bool("is_working_day", dayContext.IsWorkingDay),
+		util.Bool("is_holiday", dayContext.IsHoliday),
+		util.Bool("is_on_leave", dayContext.IsOnLeave),
+		util.Any("expected_start_utc", dayContext.ExpectedStart),
+		util.Any("expected_end_utc", dayContext.ExpectedEnd),
+	)
+
+	loc, err := time.LoadLocation(dayContext.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("invalid schedule timezone: %s", dayContext.Timezone)
+	}
+
+	// =====================================================
+	// ✅ AUTHORITATIVE attendance date (FROM INPUT TIME)
+	// =====================================================
+	atLocal := at.In(loc)
+	attendanceDate := time.Date(
+		atLocal.Year(),
+		atLocal.Month(),
+		atLocal.Day(),
+		0, 0, 0, 0,
+		loc,
+	)
+
+	s.logger.Info("Attendance date resolved",
+		util.String("attendance_date_local", attendanceDate.Format(time.RFC3339)),
+	)
+
+	// =====================================================
+	// 🔥 FIX: FETCH FULL LOCAL DAY (+ NIGHT SHIFT BUFFER)
+	// =====================================================
+	localFrom := attendanceDate
+	localTo := attendanceDate.Add(36 * time.Hour) // 24h + night shift safety
+
+	fromUTC := localFrom.UTC()
+	toUTC := localTo.UTC()
+
+	s.logger.Info("FIXED UTC query window",
+		util.String("local_from", localFrom.Format(time.RFC3339)),
+		util.String("local_to", localTo.Format(time.RFC3339)),
+		util.String("from_utc", fromUTC.Format(time.RFC3339)),
+		util.String("to_utc", toUTC.Format(time.RFC3339)),
+	)
+
+	// =====================================================
+	// Fetch events
+	// =====================================================
+	events, err := s.attendanceRepo.GetAttendanceEventsByUser(
+		ctx,
+		userID,
+		fromUTC,
+		toUTC,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	s.logger.Info("Events fetched",
+		util.Int("event_count", len(events)),
+	)
+
+	for i, e := range events {
+		s.logger.Info("Event",
+			util.Int("idx", i),
+			util.String("event_id", e.AttendanceEventID.String()),
+			util.String("type", e.EventType),
+			util.String("event_time_utc", e.EventTime.Format(time.RFC3339)),
+			util.String("event_time_local", e.EventTime.In(loc).Format(time.RFC3339)),
+			util.String("source_type", e.SourceType),
+		)
+	}
+
+	// =====================================================
+	// Status resolution
+	// =====================================================
+	var (
+		status   string
+		worked   *int
+		late     *int
+		overtime *int
+	)
+
+	switch {
+	case dayContext.IsOnLeave && len(events) == 0:
+		status = "leave"
+
+	case dayContext.IsHoliday && len(events) == 0:
+		status = "holiday"
+
+	case !dayContext.IsWorkingDay && len(events) == 0:
+		status = "week_off"
+
+	case len(events) == 0:
+		status = "absent"
+
+	default:
+		policy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, fromUTC)
+		if err != nil {
+			return nil, err
+		}
+
+		calculated, err := s.calculateDailySummary(
+			ctx,
+			userID,
+			attendanceDate,
+			events,
+			policy,
+			dayContext,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		status = calculated.Status
+		worked = calculated.WorkedMinutes
+		late = calculated.LateMinutes
+		overtime = calculated.OvertimeMinutes
+
+		// Holiday / Week-off override
+		if dayContext.IsHoliday {
+			if worked != nil && *worked > 0 {
+				status = "worked_on_holiday"
+			} else {
+				status = "holiday"
+			}
+		} else if !dayContext.IsWorkingDay {
+			if worked != nil && *worked > 0 {
+				status = "worked_on_week_off"
+			} else {
+				status = "week_off"
+			}
+		}
+	}
+
+	s.logger.Info("Summary computed",
+		util.String("status", status),
+		util.Any("worked_minutes", worked),
+		util.Any("late_minutes", late),
+		util.Any("overtime_minutes", overtime),
+	)
+
+	// =====================================================
+	// Persist summary
+	// =====================================================
+	summary := &attendance.AttendanceDailySummary{
+		AttendanceSummaryID: uuid.New(),
+		CompanyID:           companyID,
+		UserID:              userID,
+		AttendanceDate:      attendanceDate,
+		Status:              status,
+		WorkedMinutes:       worked,
+		LateMinutes:         late,
+		OvertimeMinutes:     overtime,
+		Metadata:            attendance.SummaryMetadata{},
+		GeneratedAt:         time.Now().UTC(),
+		GeneratedBy:         "system",
+	}
+
+	if err := s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary); err != nil {
+		return nil, err
+	}
+
+	s.logger.Info("=== GenerateDailySummary END ===",
+		util.String("summary_id", summary.AttendanceSummaryID.String()),
+	)
+
+	return summary, nil
 }

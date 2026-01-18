@@ -277,18 +277,18 @@ func (r *attendanceRepository) GetAttendanceEventsByUser(
 	startDate, endDate time.Time,
 	limit int,
 ) ([]*attendance.AttendanceEvent, error) {
+
 	query := `
         SELECT attendance_event_id, company_id, user_id, event_type, event_time,
                source_type, source_id, device_id, ip_address, metadata,
                created_at, created_by
-        FROM attendance_events 
-        WHERE user_id = $1 
-        AND event_time BETWEEN $2 AND $3
-        ORDER BY event_time DESC
-        LIMIT $4
+        FROM attendance_events
+        WHERE user_id = $1
+          AND event_time BETWEEN $2 AND $3
+        ORDER BY event_time ASC
     `
 
-	rows, err := r.client.Query(ctx, query, userID, startDate, endDate, limit)
+	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
 	if err != nil {
 		r.logger.Error("Failed to get attendance events by user",
 			util.String("user_id", userID.String()),
