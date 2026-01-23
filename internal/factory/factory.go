@@ -10,8 +10,10 @@ import (
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
 	hrhandler "auth-service/internal/hr/handler"
+	orgunithandler "auth-service/internal/hr/handler"
 	hrpostgres "auth-service/internal/hr/repository"
 	a "auth-service/internal/hr/service"
+	orgunitservice "auth-service/internal/hr/service"
 	"auth-service/internal/models"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
@@ -31,29 +33,38 @@ import (
 )
 
 type Factory struct {
-	config                    *config.Config
-	tlsManager                *tls.TLSManager
-	redisClient               *client.RedisClient
-	scyllaClient              *scylla.ScyllaClient
-	kafkaProducer             *client.KafkaProducer
-	esClient                  *client.ESClient
-	clickhouseClient          *client.ClickHouseClient
-	hasher                    *hashing.Hasher
-	encryptionManager         *encryption.EncryptionManager
-	bucketingManager          *bucketing.BucketingManager
-	pairingRepo               redis.PairingRepository
-	pairingService            *service.PairingService
-	wsService                 *service.WebSocketService
-	pairingHandler            *handler.PairingHandler
-	wsHandler                 *handler.WebSocketHandler
-	qrUtil                    *util.QRUtil
-	hmacUtil                  *util.HMACUtil
-	hrEmployeeRepository      hrpostgres.EmployeeRepository
-	attendanceRepository      hrpostgres.AttendanceRepository
-	leaveRepository           hrpostgres.LeaveRepository
-	schedulingRepository      hrpostgres.SchedulingRepository
-	compensationRepository    hrpostgres.CompensationRepository
-	auditRepository           hrpostgres.AuditRepository
+	config                 *config.Config
+	tlsManager             *tls.TLSManager
+	redisClient            *client.RedisClient
+	scyllaClient           *scylla.ScyllaClient
+	kafkaProducer          *client.KafkaProducer
+	esClient               *client.ESClient
+	clickhouseClient       *client.ClickHouseClient
+	hasher                 *hashing.Hasher
+	encryptionManager      *encryption.EncryptionManager
+	bucketingManager       *bucketing.BucketingManager
+	pairingRepo            redis.PairingRepository
+	pairingService         *service.PairingService
+	wsService              *service.WebSocketService
+	pairingHandler         *handler.PairingHandler
+	wsHandler              *handler.WebSocketHandler
+	qrUtil                 *util.QRUtil
+	hmacUtil               *util.HMACUtil
+	hrEmployeeRepository   hrpostgres.EmployeeRepository
+	attendanceRepository   hrpostgres.AttendanceRepository
+	leaveRepository        hrpostgres.LeaveRepository
+	schedulingRepository   hrpostgres.SchedulingRepository
+	compensationRepository hrpostgres.CompensationRepository
+	auditRepository        hrpostgres.AuditRepository
+	workCenterRepository   hrpostgres.WorkCenterRepository
+	workCenterService      *a.WorkCenterService
+	workCenterQueryService *a.WorkCenterQueryService
+	workCenterHandler      *hrhandler.WorkCenterHandler
+	orgUnitRepository      hrpostgres.OrgUnitRepository
+	orgUnitService         *orgunitservice.OrgUnitService
+	orgUnitQueryService    *orgunitservice.OrgUnitQueryService
+	orgUnitHandler         *orgunithandler.OrgUnitHandler
+
 	auditService              *a.AuditService
 	auditQueryService         *a.AuditQueryService
 	documentStorage           a.DocumentStorage
@@ -152,7 +163,48 @@ func (m *KafkaLoggingManager) Shutdown() error {
 func (m *KafkaLoggingManager) GetLogProducerService() *service.LogProducerService {
 	return m.producer
 }
+func (f *Factory) OrgUnitRepository() hrpostgres.OrgUnitRepository {
+	if f.orgUnitRepository == nil {
+		f.orgUnitRepository = hrpostgres.NewOrgUnitRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.orgUnitRepository
+}
 
+func (f *Factory) GetOrgUnitService() *orgunitservice.OrgUnitService {
+	if f.orgUnitService == nil {
+		f.orgUnitService = orgunitservice.NewOrgUnitService(
+			f.OrgUnitRepository(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.orgUnitService
+}
+
+func (f *Factory) GetOrgUnitQueryService() *orgunitservice.OrgUnitQueryService {
+	if f.orgUnitQueryService == nil {
+		f.orgUnitQueryService = orgunitservice.NewOrgUnitQueryService(
+			f.OrgUnitRepository(),
+			f.logger,
+		)
+	}
+	return f.orgUnitQueryService
+}
+
+func (f *Factory) GetOrgUnitHandler() *orgunithandler.OrgUnitHandler {
+	if f.orgUnitHandler == nil {
+		f.orgUnitHandler = orgunithandler.NewOrgUnitHandler(
+			f.GetOrgUnitService(),
+			f.GetOrgUnitQueryService(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.orgUnitHandler
+}
 func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error {
 	errs := make(map[string]error)
 
@@ -351,6 +403,50 @@ func (f *Factory) GetHRLeaveHandler() *hrhandler.LeaveHandler {
 		)
 	}
 	return f.hrLeaveHandler
+}
+
+// Add these methods to Factory
+func (f *Factory) WorkCenterRepository() hrpostgres.WorkCenterRepository {
+	if f.workCenterRepository == nil {
+		f.workCenterRepository = hrpostgres.NewWorkCenterRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.workCenterRepository
+}
+
+func (f *Factory) GetWorkCenterService() *a.WorkCenterService {
+	if f.workCenterService == nil {
+		f.workCenterService = a.NewWorkCenterService(
+			f.WorkCenterRepository(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.workCenterService
+}
+
+func (f *Factory) GetWorkCenterQueryService() *a.WorkCenterQueryService {
+	if f.workCenterQueryService == nil {
+		f.workCenterQueryService = a.NewWorkCenterQueryService(
+			f.WorkCenterRepository(),
+			f.logger,
+		)
+	}
+	return f.workCenterQueryService
+}
+
+func (f *Factory) GetWorkCenterHandler() *hrhandler.WorkCenterHandler {
+	if f.workCenterHandler == nil {
+		f.workCenterHandler = hrhandler.NewWorkCenterHandler(
+			f.GetWorkCenterService(),
+			f.GetWorkCenterQueryService(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.workCenterHandler
 }
 
 func (f *Factory) GetHRAuditHandler() *hrhandler.AuditHandler {
@@ -681,13 +777,13 @@ func (f *Factory) HREmployeeRepository() hrpostgres.EmployeeRepository {
 // ============================================================================
 // ATTENDANCE SERVICE (COMBINED COMMAND + QUERY)
 // ============================================================================
-
 func (f *Factory) GetAttendanceService() a.AttendanceService {
 	if f.attendanceService == nil {
 		f.attendanceService = a.NewAttendanceService(
-			f.AttendanceRepository(), // ✅ repo already built with PostgresClient
-			f.GetSchedulingService(),
-			f.logger,
+			f.AttendanceRepository(),
+			f.GetSchedulingRepository(),
+			f.GetSchedulingService(), // ✅ REQUIRED
+			f.logger,                 // ✅ correct position
 			f.GetAuditService(),
 		)
 	}
@@ -1377,6 +1473,7 @@ func (f *Factory) InitializeHandlers() error {
 
 	pairingHandler := f.GetPairingHandler()
 	wsHandler := f.GetWebSocketHandler()
+	workCenterHandler := f.GetWorkCenterHandler()
 
 	f.router = handler.NewRouter(
 		otpHandler,
@@ -1390,10 +1487,12 @@ func (f *Factory) InitializeHandlers() error {
 		f.GetHRLeaveHandler(),
 		f.GetHRSchedulingHandler(),
 		pairingHandler,
+		workCenterHandler, // Add this line
 		wsHandler,
 		sessionService,
 		jwtService,
 		logger,
+		f.GetOrgUnitHandler(),
 	)
 
 	logger.Info("Handlers and router initialized with JWT, bitmask, and QR web login support")

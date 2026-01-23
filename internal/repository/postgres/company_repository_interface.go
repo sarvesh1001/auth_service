@@ -16,6 +16,8 @@ type CompanyRepository interface {
 		company *models.Company,
 		additionalDepartments []string,
 		ownerPositionTitle string,
+		positionDetails *models.Position,
+		workCenterDetails *models.WorkCenter,
 	) error
 	GetCompany(ctx context.Context, companyID uuid.UUID) (*models.Company, error)
 	GetCompaniesByOwner(ctx context.Context, ownerUserID uuid.UUID) ([]*models.Company, error)
@@ -388,6 +390,6 @@ type CompanyRepository interface {
 		companyID uuid.UUID,
 		userID uuid.UUID,
 	) (*models.CompanyEmployee, *models.Position, error)
-
+	WorkCenterExists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error)
 	GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
 }

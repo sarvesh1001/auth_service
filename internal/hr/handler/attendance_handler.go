@@ -1,4 +1,3 @@
-// internal/hr/handler/attendance/attendance_handler.go
 package handler
 
 import (
@@ -19,14 +18,12 @@ import (
 	"go.uber.org/zap"
 )
 
-// AttendanceHandler handles HTTP requests for attendance operations
 type AttendanceHandler struct {
 	attendanceService service.AttendanceService
 	queryService      service.AttendanceQueryService
 	logger            *zap.Logger
 }
 
-// NewAttendanceHandler creates a new attendance handler
 func NewAttendanceHandler(
 	attendanceService service.AttendanceService,
 	queryService service.AttendanceQueryService,
@@ -39,14 +36,8 @@ func NewAttendanceHandler(
 	}
 }
 
-// ============================================================================
-// ATTENDANCE EVENTS
-// ============================================================================
-
-// CreateAttendanceEvent handles POST /api/attendance/events
 func (h *AttendanceHandler) CreateAttendanceEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -70,7 +61,6 @@ func (h *AttendanceHandler) CreateAttendanceEvent(w http.ResponseWriter, r *http
 		return
 	}
 
-	// ✅ NORMALIZE EVENT TIME
 	eventTime := req.EventTime
 	if eventTime.Location() == time.Local {
 		eventTime = eventTime.UTC()
@@ -113,18 +103,14 @@ func (h *AttendanceHandler) CreateAttendanceEvent(w http.ResponseWriter, r *http
 	})
 }
 
-// CreateBulkAttendanceEvents handles POST /api/attendance/events/bulk
 func (h *AttendanceHandler) CreateBulkAttendanceEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Get actor information from context
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse request body
 	var req struct {
 		Events []*attendance.AttendanceEvent `json:"events" validate:"required,min=1"`
 	}
@@ -139,7 +125,6 @@ func (h *AttendanceHandler) CreateBulkAttendanceEvents(w http.ResponseWriter, r 
 		return
 	}
 
-	// Limit bulk operations
 	if len(req.Events) > 1000 {
 		h.respondWithError(w, http.StatusBadRequest, "Cannot process more than 1000 events at once")
 		return
@@ -151,7 +136,6 @@ func (h *AttendanceHandler) CreateBulkAttendanceEvents(w http.ResponseWriter, r 
 		h.logger.Error("Failed to create bulk attendance events",
 			util.Int("event_count", len(req.Events)),
 			util.ErrorField(err))
-
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to create bulk events")
 		return
 	}
@@ -162,11 +146,9 @@ func (h *AttendanceHandler) CreateBulkAttendanceEvents(w http.ResponseWriter, r 
 	})
 }
 
-// GetAttendanceEvent handles GET /api/attendance/events/{eventID}
 func (h *AttendanceHandler) GetAttendanceEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse event ID from URL
 	eventIDStr := chi.URLParam(r, "eventID")
 	eventID, err := uuid.Parse(eventIDStr)
 	if err != nil {
@@ -174,7 +156,6 @@ func (h *AttendanceHandler) GetAttendanceEvent(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Get attendance event
 	event, err := h.queryService.GetAttendanceEventByID(ctx, eventID)
 	if err != nil {
 		h.logger.Error("Failed to get attendance event",
@@ -195,7 +176,6 @@ func (h *AttendanceHandler) GetAttendanceEvent(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// GetAttendanceEventsByUser handles GET /api/attendance/users/{userID}/events
 func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -211,7 +191,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
-
 	if startDateStr == "" || endDateStr == "" {
 		endDate = time.Now().UTC()
 		startDate = endDate.AddDate(0, 0, -30)
@@ -228,7 +207,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 		}
 	}
 
-	// ✅ EXTEND WINDOW FOR NIGHT SHIFTS
 	endDate = endDate.Add(36 * time.Hour)
 
 	limit, err := strconv.Atoi(query.Get("limit"))
@@ -243,7 +221,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 		endDate,
 		limit,
 	)
-
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to get attendance events")
 		return
@@ -258,7 +235,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByUser(w http.ResponseWriter, r *
 	})
 }
 
-// GetAttendanceEventsByCompany handles GET /api/attendance/companies/{companyID}/events
 func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -274,7 +250,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, 
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
-
 	if startDateStr == "" || endDateStr == "" {
 		endDate = time.Now().UTC()
 		startDate = endDate.AddDate(0, 0, -7)
@@ -291,7 +266,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, 
 		}
 	}
 
-	// ✅ EXTEND WINDOW
 	endDate = endDate.Add(36 * time.Hour)
 
 	page, _ := strconv.Atoi(query.Get("page"))
@@ -312,7 +286,6 @@ func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, 
 		page,
 		pageSize,
 	)
-
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to get attendance events")
 		return
@@ -329,14 +302,13 @@ func (h *AttendanceHandler) GetAttendanceEventsByCompany(w http.ResponseWriter, 
 
 func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	query := r.URL.Query()
+
 	companyIDStr := query.Get("company_id")
 	if companyIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
 		return
 	}
-
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
@@ -364,8 +336,6 @@ func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date")
 		return
 	}
-
-	// ✅ EXTEND WINDOW
 	filters.EndDate = filters.EndDate.Add(36 * time.Hour)
 
 	page, _ := strconv.Atoi(query.Get("page"))
@@ -385,7 +355,6 @@ func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *htt
 		page,
 		pageSize,
 	)
-
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to search attendance events")
 		return
@@ -400,15 +369,9 @@ func (h *AttendanceHandler) SearchAttendanceEvents(w http.ResponseWriter, r *htt
 	})
 }
 
-// ============================================================================
-// SAP INTEGRATION
-// ============================================================================
-
-// ProcessSAPAttendanceEvent handles POST /api/attendance/sap/events
 func (h *AttendanceHandler) ProcessSAPAttendanceEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse request body
 	var req struct {
 		SapEvent   service.SAPAttendanceEvent `json:"sap_event" validate:"required"`
 		CompanyID  uuid.UUID                  `json:"company_id" validate:"required"`
@@ -425,7 +388,6 @@ func (h *AttendanceHandler) ProcessSAPAttendanceEvent(w http.ResponseWriter, r *
 		req.SourceType = "sap"
 	}
 
-	// Process SAP event
 	event, err := h.attendanceService.ProcessSAPAttendanceEvent(
 		ctx, &req.SapEvent, req.CompanyID, req.SourceType, req.SourceID)
 	if err != nil {
@@ -433,14 +395,12 @@ func (h *AttendanceHandler) ProcessSAPAttendanceEvent(w http.ResponseWriter, r *
 			util.String("company_id", req.CompanyID.String()),
 			util.String("employee_id", req.SapEvent.EmployeeID),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "invalid") ||
 			strings.Contains(err.Error(), "required") ||
 			strings.Contains(err.Error(), "not found") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -451,19 +411,15 @@ func (h *AttendanceHandler) ProcessSAPAttendanceEvent(w http.ResponseWriter, r *
 	})
 }
 
-// SyncFactoryAttendance handles POST /api/attendance/factory/sync
 func (h *AttendanceHandler) SyncFactoryAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse request body
 	var req service.FactoryAttendanceData
-
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Validate company ID from URL if provided
 	companyIDStr := chi.URLParam(r, "companyID")
 	if companyIDStr != "" {
 		companyID, err := uuid.Parse(companyIDStr)
@@ -474,7 +430,6 @@ func (h *AttendanceHandler) SyncFactoryAttendance(w http.ResponseWriter, r *http
 		req.CompanyID = companyID
 	}
 
-	// Sync factory attendance
 	err := h.attendanceService.SyncFactoryAttendance(ctx, &req, req.CompanyID)
 	if err != nil {
 		h.logger.Error("Failed to sync factory attendance",
@@ -482,7 +437,6 @@ func (h *AttendanceHandler) SyncFactoryAttendance(w http.ResponseWriter, r *http
 			util.String("work_center", req.WorkCenterCode),
 			util.Int("event_count", len(req.Events)),
 			util.ErrorField(err))
-
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to sync factory attendance")
 		return
 	}
@@ -493,44 +447,32 @@ func (h *AttendanceHandler) SyncFactoryAttendance(w http.ResponseWriter, r *http
 	})
 }
 
-// ============================================================================
-// ATTENDANCE POLICIES
-// ============================================================================
-
-// CreateAttendancePolicy handles POST /api/attendance/policies
 func (h *AttendanceHandler) CreateAttendancePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Get actor information from context
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse request body
 	var policy attendance.AttendancePolicy
-
 	if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Create attendance policy
 	createdPolicy, err := h.attendanceService.CreateAttendancePolicy(
 		ctx, &policy, actorType, actorID, nil)
 	if err != nil {
 		h.logger.Error("Failed to create attendance policy",
 			util.String("company_id", policy.CompanyID.String()),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "already exists") {
 			status = http.StatusConflict
 		} else if strings.Contains(err.Error(), "required") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -541,11 +483,9 @@ func (h *AttendanceHandler) CreateAttendancePolicy(w http.ResponseWriter, r *htt
 	})
 }
 
-// GetAttendancePolicy handles GET /api/attendance/policies/{policyID}
 func (h *AttendanceHandler) GetAttendancePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse policy ID from URL
 	policyIDStr := chi.URLParam(r, "policyID")
 	policyID, err := uuid.Parse(policyIDStr)
 	if err != nil {
@@ -553,7 +493,6 @@ func (h *AttendanceHandler) GetAttendancePolicy(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Get attendance policy
 	policy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get attendance policy",
@@ -574,11 +513,9 @@ func (h *AttendanceHandler) GetAttendancePolicy(w http.ResponseWriter, r *http.R
 	})
 }
 
-// GetAttendancePoliciesByCompany handles GET /api/attendance/companies/{companyID}/policies
 func (h *AttendanceHandler) GetAttendancePoliciesByCompany(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -586,11 +523,9 @@ func (h *AttendanceHandler) GetAttendancePoliciesByCompany(w http.ResponseWriter
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
 	activeOnly := query.Get("active_only") == "true"
 
-	// Get attendance policies
 	policies, err := h.queryService.GetAttendancePoliciesByCompany(ctx, companyID, activeOnly)
 	if err != nil {
 		h.logger.Error("Failed to get attendance policies",
@@ -609,18 +544,14 @@ func (h *AttendanceHandler) GetAttendancePoliciesByCompany(w http.ResponseWriter
 	})
 }
 
-// UpdateAttendancePolicy handles PUT /api/attendance/policies/{policyID}
 func (h *AttendanceHandler) UpdateAttendancePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Get actor information from context
 	_, _, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse policy ID from URL
 	policyIDStr := chi.URLParam(r, "policyID")
 	policyID, err := uuid.Parse(policyIDStr)
 	if err != nil {
@@ -628,7 +559,6 @@ func (h *AttendanceHandler) UpdateAttendancePolicy(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Get existing policy
 	existingPolicy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get existing policy",
@@ -643,7 +573,6 @@ func (h *AttendanceHandler) UpdateAttendancePolicy(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Parse request body
 	var updates struct {
 		DepartmentID *uuid.UUID              `json:"department_id"`
 		PolicyCode   *string                 `json:"policy_code"`
@@ -657,7 +586,6 @@ func (h *AttendanceHandler) UpdateAttendancePolicy(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Apply updates
 	if updates.DepartmentID != nil {
 		existingPolicy.DepartmentID = updates.DepartmentID
 	}
@@ -674,23 +602,19 @@ func (h *AttendanceHandler) UpdateAttendancePolicy(w http.ResponseWriter, r *htt
 		existingPolicy.IsActive = *updates.IsActive
 	}
 
-	// Update policy
 	err = h.attendanceService.UpdateAttendancePolicy(ctx, existingPolicy)
 	if err != nil {
 		h.logger.Error("Failed to update attendance policy",
 			util.String("policy_id", policyID.String()),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
 
-	// Get updated policy
 	updatedPolicy, err := h.queryService.GetAttendancePolicyByID(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to get updated policy",
@@ -706,11 +630,9 @@ func (h *AttendanceHandler) UpdateAttendancePolicy(w http.ResponseWriter, r *htt
 	})
 }
 
-// DeleteAttendancePolicy handles DELETE /api/attendance/policies/{policyID}
 func (h *AttendanceHandler) DeleteAttendancePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse policy ID from URL
 	policyIDStr := chi.URLParam(r, "policyID")
 	policyID, err := uuid.Parse(policyIDStr)
 	if err != nil {
@@ -718,18 +640,15 @@ func (h *AttendanceHandler) DeleteAttendancePolicy(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Delete attendance policy
 	err = h.attendanceService.DeleteAttendancePolicy(ctx, policyID)
 	if err != nil {
 		h.logger.Error("Failed to delete attendance policy",
 			util.String("policy_id", policyID.String()),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -740,25 +659,17 @@ func (h *AttendanceHandler) DeleteAttendancePolicy(w http.ResponseWriter, r *htt
 	})
 }
 
-// AssignUserAttendancePolicy handles POST /api/attendance/users/{userID}/policies
 func (h *AttendanceHandler) AssignUserAttendancePolicy(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	ctx := r.Context()
-
-	// ------------------------------------------------------------
-	// Get actor information from context
-	// ------------------------------------------------------------
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Parse request body
-	// ------------------------------------------------------------
 	var req struct {
 		UserID        uuid.UUID  `json:"user_id" validate:"required"`
 		PolicyID      uuid.UUID  `json:"policy_id" validate:"required"`
@@ -771,9 +682,6 @@ func (h *AttendanceHandler) AssignUserAttendancePolicy(
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Basic validation
-	// ------------------------------------------------------------
 	if req.UserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
 		return
@@ -784,16 +692,10 @@ func (h *AttendanceHandler) AssignUserAttendancePolicy(
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Default effective_from
-	// ------------------------------------------------------------
 	if req.EffectiveFrom.IsZero() {
 		req.EffectiveFrom = time.Now().UTC()
 	}
 
-	// ------------------------------------------------------------
-	// Build domain model
-	// ------------------------------------------------------------
 	userPolicy := &attendance.UserAttendancePolicy{
 		UserID:        req.UserID,
 		PolicyID:      req.PolicyID,
@@ -802,9 +704,6 @@ func (h *AttendanceHandler) AssignUserAttendancePolicy(
 		AssignedBy:    &actorID,
 	}
 
-	// ------------------------------------------------------------
-	// Assign policy
-	// ------------------------------------------------------------
 	err = h.attendanceService.AssignUserAttendancePolicy(
 		ctx,
 		userPolicy,
@@ -819,35 +718,24 @@ func (h *AttendanceHandler) AssignUserAttendancePolicy(
 			util.String("policy_id", req.PolicyID.String()),
 			util.ErrorField(err),
 		)
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") ||
 			strings.Contains(err.Error(), "not active") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
 
-	// ------------------------------------------------------------
-	// Success response
-	// ------------------------------------------------------------
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Attendance policy assigned to user successfully",
 	})
 }
 
-// ============================================================================
-// ATTENDANCE RULES
-// ============================================================================
-
-// GetCompanyAttendanceRules handles GET /api/attendance/companies/{companyID}/rules
 func (h *AttendanceHandler) GetCompanyAttendanceRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -855,7 +743,6 @@ func (h *AttendanceHandler) GetCompanyAttendanceRules(w http.ResponseWriter, r *
 		return
 	}
 
-	// Get company attendance rules
 	rules, err := h.attendanceService.GetCompanyAttendanceRules(ctx, companyID)
 	if err != nil {
 		h.logger.Error("Failed to get company attendance rules",
@@ -871,21 +758,17 @@ func (h *AttendanceHandler) GetCompanyAttendanceRules(w http.ResponseWriter, r *
 	})
 }
 
-// UpdateCompanyAttendanceRules handles PUT /api/attendance/companies/{companyID}/rules
 func (h *AttendanceHandler) UpdateCompanyAttendanceRules(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	ctx := r.Context()
-
-	// ✅ Admin-only guard
-	adminID, err := RequireAdmin(ctx)
+	_, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Admin access required")
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse company ID
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -893,20 +776,17 @@ func (h *AttendanceHandler) UpdateCompanyAttendanceRules(
 		return
 	}
 
-	// Parse request body
 	var rules attendance.CompanyAttendanceRules
 	rules.CompanyID = companyID
-
 	if err := json.NewDecoder(r.Body).Decode(&rules); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Update rules
 	if err := h.attendanceService.UpdateCompanyAttendanceRules(
 		ctx,
 		&rules,
-		adminID, // ✅ explicit admin actor
+		actorID,
 	); err != nil {
 		h.logger.Error(
 			"Failed to update company attendance rules",
@@ -923,11 +803,9 @@ func (h *AttendanceHandler) UpdateCompanyAttendanceRules(
 	})
 }
 
-// GetDepartmentAttendanceRules handles GET /api/attendance/departments/{departmentID}/rules
 func (h *AttendanceHandler) GetDepartmentAttendanceRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -935,7 +813,6 @@ func (h *AttendanceHandler) GetDepartmentAttendanceRules(w http.ResponseWriter, 
 		return
 	}
 
-	// Parse department ID from URL
 	departmentIDStr := chi.URLParam(r, "departmentID")
 	departmentID, err := uuid.Parse(departmentIDStr)
 	if err != nil {
@@ -943,7 +820,6 @@ func (h *AttendanceHandler) GetDepartmentAttendanceRules(w http.ResponseWriter, 
 		return
 	}
 
-	// Get department attendance rules
 	rules, err := h.attendanceService.GetDepartmentAttendanceRules(ctx, companyID, departmentID)
 	if err != nil {
 		h.logger.Error("Failed to get department attendance rules",
@@ -960,11 +836,9 @@ func (h *AttendanceHandler) GetDepartmentAttendanceRules(w http.ResponseWriter, 
 	})
 }
 
-// UpdateDepartmentAttendanceRules handles PUT /api/attendance/departments/{departmentID}/rules
 func (h *AttendanceHandler) UpdateDepartmentAttendanceRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -972,7 +846,6 @@ func (h *AttendanceHandler) UpdateDepartmentAttendanceRules(w http.ResponseWrite
 		return
 	}
 
-	// Parse department ID from URL
 	departmentIDStr := chi.URLParam(r, "departmentID")
 	departmentID, err := uuid.Parse(departmentIDStr)
 	if err != nil {
@@ -980,17 +853,14 @@ func (h *AttendanceHandler) UpdateDepartmentAttendanceRules(w http.ResponseWrite
 		return
 	}
 
-	// Parse request body
 	var rules attendance.DepartmentAttendanceRules
 	rules.CompanyID = companyID
 	rules.DepartmentID = departmentID
-
 	if err := json.NewDecoder(r.Body).Decode(&rules); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Update department attendance rules
 	err = h.attendanceService.UpsertDepartmentAttendanceRules(ctx, &rules)
 	if err != nil {
 		h.logger.Error("Failed to update department attendance rules",
@@ -1007,11 +877,9 @@ func (h *AttendanceHandler) UpdateDepartmentAttendanceRules(w http.ResponseWrite
 	})
 }
 
-// GetUserAttendanceProfile handles GET /api/attendance/users/{userID}/profile
 func (h *AttendanceHandler) GetUserAttendanceProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -1019,7 +887,6 @@ func (h *AttendanceHandler) GetUserAttendanceProfile(w http.ResponseWriter, r *h
 		return
 	}
 
-	// Get user attendance profile
 	profile, err := h.attendanceService.GetUserAttendanceProfile(ctx, userID)
 	if err != nil {
 		h.logger.Error("Failed to get user attendance profile",
@@ -1035,11 +902,9 @@ func (h *AttendanceHandler) GetUserAttendanceProfile(w http.ResponseWriter, r *h
 	})
 }
 
-// UpdateUserAttendanceProfile handles PUT /api/attendance/users/{userID}/profile
 func (h *AttendanceHandler) UpdateUserAttendanceProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -1047,19 +912,15 @@ func (h *AttendanceHandler) UpdateUserAttendanceProfile(w http.ResponseWriter, r
 		return
 	}
 
-	// Parse request body
 	var profile attendance.UserAttendanceProfile
 	profile.UserID = userID
-
 	if err := json.NewDecoder(r.Body).Decode(&profile); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Get company ID from context or request
 	companyID, err := h.getCompanyIDFromContext(ctx)
 	if err != nil {
-		// Try to get from request body
 		if profile.CompanyID == uuid.Nil {
 			h.respondWithError(w, http.StatusBadRequest, "Company ID is required")
 			return
@@ -1068,7 +929,6 @@ func (h *AttendanceHandler) UpdateUserAttendanceProfile(w http.ResponseWriter, r
 		profile.CompanyID = companyID
 	}
 
-	// Update user attendance profile
 	err = h.attendanceService.UpsertUserAttendanceProfile(ctx, &profile)
 	if err != nil {
 		h.logger.Error("Failed to update user attendance profile",
@@ -1084,27 +944,21 @@ func (h *AttendanceHandler) UpdateUserAttendanceProfile(w http.ResponseWriter, r
 	})
 }
 
-// ResolveAttendanceRules handles GET /api/attendance/rules/resolve
 func (h *AttendanceHandler) ResolveAttendanceRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Parse query parameters
 	query := r.URL.Query()
 
-	// Parse company ID
 	companyIDStr := query.Get("company_id")
 	if companyIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
 		return
 	}
-
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
 		return
 	}
 
-	// Parse user ID (optional)
 	var userID uuid.UUID
 	if userIDStr := query.Get("user_id"); userIDStr != "" {
 		userID, err = uuid.Parse(userIDStr)
@@ -1114,7 +968,6 @@ func (h *AttendanceHandler) ResolveAttendanceRules(w http.ResponseWriter, r *htt
 		}
 	}
 
-	// Parse department ID (optional)
 	var departmentID uuid.UUID
 	if deptIDStr := query.Get("department_id"); deptIDStr != "" {
 		departmentID, err = uuid.Parse(deptIDStr)
@@ -1124,7 +977,6 @@ func (h *AttendanceHandler) ResolveAttendanceRules(w http.ResponseWriter, r *htt
 		}
 	}
 
-	// Resolve attendance rules
 	rules, err := h.attendanceService.ResolveAttendanceRules(ctx, userID, companyID, departmentID)
 	if err != nil {
 		h.logger.Error("Failed to resolve attendance rules",
@@ -1140,15 +992,9 @@ func (h *AttendanceHandler) ResolveAttendanceRules(w http.ResponseWriter, r *htt
 	})
 }
 
-// ============================================================================
-// DAILY SUMMARIES
-// ============================================================================
-
-// GetAttendanceDailySummary handles GET /api/attendance/users/{userID}/summary
 func (h *AttendanceHandler) GetAttendanceDailySummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -1156,13 +1002,10 @@ func (h *AttendanceHandler) GetAttendanceDailySummary(w http.ResponseWriter, r *
 		return
 	}
 
-	// Parse date from query parameters
 	query := r.URL.Query()
 	dateStr := query.Get("date")
-
 	var date time.Time
 	if dateStr == "" {
-		// Default to today
 		date = time.Now().UTC()
 	} else {
 		date, err = time.Parse("2006-01-02", dateStr)
@@ -1172,7 +1015,6 @@ func (h *AttendanceHandler) GetAttendanceDailySummary(w http.ResponseWriter, r *
 		}
 	}
 
-	// Get attendance daily summary
 	summary, err := h.queryService.GetAttendanceDailySummaryByUserDate(ctx, userID, date)
 	if err != nil {
 		h.logger.Error("Failed to get attendance daily summary",
@@ -1189,11 +1031,9 @@ func (h *AttendanceHandler) GetAttendanceDailySummary(w http.ResponseWriter, r *
 	})
 }
 
-// GetAttendanceDailySummaries handles GET /api/attendance/users/{userID}/summaries
 func (h *AttendanceHandler) GetAttendanceDailySummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -1201,16 +1041,12 @@ func (h *AttendanceHandler) GetAttendanceDailySummaries(w http.ResponseWriter, r
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
-
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
 	if startDateStr == "" || endDateStr == "" {
-		// Default to current month
 		now := time.Now().UTC()
 		startDate = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 		endDate = startDate.AddDate(0, 1, -1)
@@ -1220,7 +1056,6 @@ func (h *AttendanceHandler) GetAttendanceDailySummaries(w http.ResponseWriter, r
 			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
 			return
 		}
-
 		endDate, err = time.Parse("2006-01-02", endDateStr)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
@@ -1228,7 +1063,6 @@ func (h *AttendanceHandler) GetAttendanceDailySummaries(w http.ResponseWriter, r
 		}
 	}
 
-	// Get attendance daily summaries
 	summaries, err := h.queryService.GetAttendanceDailySummariesByUser(ctx, userID, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to get attendance daily summaries",
@@ -1251,11 +1085,9 @@ func (h *AttendanceHandler) GetAttendanceDailySummaries(w http.ResponseWriter, r
 	})
 }
 
-// GenerateDailySummary handles POST /api/attendance/summaries/generate
 func (h *AttendanceHandler) GenerateDailySummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse request body
 	var req struct {
 		CompanyID uuid.UUID `json:"company_id" validate:"required"`
 		UserID    uuid.UUID `json:"user_id" validate:"required"`
@@ -1272,7 +1104,6 @@ func (h *AttendanceHandler) GenerateDailySummary(w http.ResponseWriter, r *http.
 		req.Timezone = "UTC"
 	}
 
-	// Generate daily summary
 	summary, err := h.attendanceService.GenerateDailySummary(ctx, req.CompanyID, req.UserID, req.Date, req.Timezone)
 	if err != nil {
 		h.logger.Error("Failed to generate daily summary",
@@ -1290,11 +1121,9 @@ func (h *AttendanceHandler) GenerateDailySummary(w http.ResponseWriter, r *http.
 	})
 }
 
-// GenerateBulkDailySummaries handles POST /api/attendance/summaries/bulk-generate
 func (h *AttendanceHandler) GenerateBulkDailySummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse request body
 	var req struct {
 		CompanyID uuid.UUID `json:"company_id" validate:"required"`
 		Timezone  string    `json:"timezone"`
@@ -1311,7 +1140,6 @@ func (h *AttendanceHandler) GenerateBulkDailySummaries(w http.ResponseWriter, r 
 		req.Timezone = "UTC"
 	}
 
-	// Generate bulk daily summaries
 	summaries, err := h.attendanceService.GenerateBulkDailySummaries(ctx, req.CompanyID, req.Timezone, req.StartDate, req.EndDate)
 	if err != nil {
 		h.logger.Error("Failed to generate bulk daily summaries",
@@ -1336,22 +1164,14 @@ func (h *AttendanceHandler) GenerateBulkDailySummaries(w http.ResponseWriter, r 
 	})
 }
 
-// ============================================================================
-// RFID MANAGEMENT
-// ============================================================================
-
-// AssignRFIDToEmployee handles POST /api/attendance/rfid/assign
 func (h *AttendanceHandler) AssignRFIDToEmployee(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Get actor information from context
 	_, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse request body
 	var req struct {
 		CompanyID uuid.UUID `json:"company_id" validate:"required"`
 		UserID    uuid.UUID `json:"user_id" validate:"required"`
@@ -1363,7 +1183,6 @@ func (h *AttendanceHandler) AssignRFIDToEmployee(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Assign RFID to employee
 	err = h.attendanceService.AssignRFIDToEmployee(ctx, req.CompanyID, req.UserID, req.RFIDTag, actorID)
 	if err != nil {
 		h.logger.Error("Failed to assign RFID to employee",
@@ -1371,14 +1190,12 @@ func (h *AttendanceHandler) AssignRFIDToEmployee(w http.ResponseWriter, r *http.
 			util.String("user_id", req.UserID.String()),
 			util.String("rfid_tag", req.RFIDTag),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "already assigned") {
 			status = http.StatusConflict
 		} else if strings.Contains(err.Error(), "required") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -1389,18 +1206,15 @@ func (h *AttendanceHandler) AssignRFIDToEmployee(w http.ResponseWriter, r *http.
 	})
 }
 
-// GetEmployeeByRFID handles GET /api/attendance/rfid/{rfidTag}
 func (h *AttendanceHandler) GetEmployeeByRFID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse RFID tag from URL
 	rfidTag := chi.URLParam(r, "rfidTag")
 	if rfidTag == "" {
 		h.respondWithError(w, http.StatusBadRequest, "RFID tag is required")
 		return
 	}
 
-	// Parse company ID from query parameters
 	query := r.URL.Query()
 	companyIDStr := query.Get("company_id")
 	if companyIDStr == "" {
@@ -1414,7 +1228,6 @@ func (h *AttendanceHandler) GetEmployeeByRFID(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Get employee by RFID
 	mapping, err := h.attendanceService.GetEmployeeByRFID(ctx, rfidTag, companyID)
 	if err != nil {
 		h.logger.Error("Failed to get employee by RFID",
@@ -1436,18 +1249,14 @@ func (h *AttendanceHandler) GetEmployeeByRFID(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// UnassignRFID handles POST /api/attendance/rfid/{rfidID}/unassign
 func (h *AttendanceHandler) UnassignRFID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Get actor information from context
 	_, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
-	// Parse RFID ID from URL
 	rfidIDStr := chi.URLParam(r, "rfidID")
 	rfidID, err := uuid.Parse(rfidIDStr)
 	if err != nil {
@@ -1455,18 +1264,15 @@ func (h *AttendanceHandler) UnassignRFID(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Unassign RFID
 	err = h.attendanceService.UnassignRFID(ctx, rfidID, actorID)
 	if err != nil {
 		h.logger.Error("Failed to unassign RFID",
 			util.String("rfid_id", rfidID.String()),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -1477,105 +1283,9 @@ func (h *AttendanceHandler) UnassignRFID(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// ============================================================================
-// WORK CENTER MANAGEMENT
-// ============================================================================
-
-// MapWorkCenterToShift handles POST /api/attendance/work-centers/map
-func (h *AttendanceHandler) MapWorkCenterToShift(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Get actor information from context
-	_, actorID, err := h.getActorFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-		return
-	}
-
-	// Parse request body
-	var req struct {
-		CompanyID      uuid.UUID  `json:"company_id" validate:"required"`
-		WorkCenterCode string     `json:"work_center_code" validate:"required"`
-		ShiftID        uuid.UUID  `json:"shift_id" validate:"required"`
-		EffectiveFrom  time.Time  `json:"effective_from"`
-		EffectiveTo    *time.Time `json:"effective_to"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-
-	// Map work center to shift
-	err = h.attendanceService.MapWorkCenterToShift(
-		ctx, req.CompanyID, req.WorkCenterCode, req.ShiftID, req.EffectiveFrom, req.EffectiveTo, actorID)
-	if err != nil {
-		h.logger.Error("Failed to map work center to shift",
-			util.String("company_id", req.CompanyID.String()),
-			util.String("work_center_code", req.WorkCenterCode),
-			util.String("shift_id", req.ShiftID.String()),
-			util.ErrorField(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to map work center to shift")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Work center mapped to shift successfully",
-	})
-}
-
-// GetShiftForWorkCenter handles GET /api/attendance/work-centers/{workCenterCode}/shift
-func (h *AttendanceHandler) GetShiftForWorkCenter(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Parse work center code from URL
-	workCenterCode := chi.URLParam(r, "workCenterCode")
-	if workCenterCode == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Work center code is required")
-		return
-	}
-
-	// Parse company ID from query parameters
-	query := r.URL.Query()
-	companyIDStr := query.Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
-		return
-	}
-
-	// Get shift for work center
-	mapping, err := h.attendanceService.GetShiftForWorkCenter(ctx, workCenterCode, companyID)
-	if err != nil {
-		h.logger.Error("Failed to get shift for work center",
-			util.String("work_center_code", workCenterCode),
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
-		h.respondWithError(w, http.StatusInternalServerError, "Failed to get shift for work center")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    mapping,
-	})
-}
-
-// ============================================================================
-// ATTENDANCE ANALYTICS
-// ============================================================================
-
-// GetAttendanceStats handles GET /api/attendance/companies/{companyID}/stats
 func (h *AttendanceHandler) GetAttendanceStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1583,16 +1293,12 @@ func (h *AttendanceHandler) GetAttendanceStats(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
-
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
 	if startDateStr == "" || endDateStr == "" {
-		// Default to current month
 		now := time.Now().UTC()
 		startDate = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 		endDate = startDate.AddDate(0, 1, -1)
@@ -1602,7 +1308,6 @@ func (h *AttendanceHandler) GetAttendanceStats(w http.ResponseWriter, r *http.Re
 			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
 			return
 		}
-
 		endDate, err = time.Parse("2006-01-02", endDateStr)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
@@ -1610,8 +1315,7 @@ func (h *AttendanceHandler) GetAttendanceStats(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// Get attendance stats
-	stats, err := h.queryService.GetAttendanceSummaryStats(ctx, companyID, startDate, endDate)
+	stats, err := h.attendanceService.GetAttendanceStats(ctx, companyID, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to get attendance stats",
 			util.String("company_id", companyID.String()),
@@ -1626,11 +1330,9 @@ func (h *AttendanceHandler) GetAttendanceStats(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// GetUserAttendanceStats handles GET /api/attendance/users/{userID}/stats
 func (h *AttendanceHandler) GetUserAttendanceStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse user ID from URL
 	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
@@ -1638,16 +1340,12 @@ func (h *AttendanceHandler) GetUserAttendanceStats(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
-
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
 
 	var startDate, endDate time.Time
 	if startDateStr == "" || endDateStr == "" {
-		// Default to current month
 		now := time.Now().UTC()
 		startDate = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 		endDate = startDate.AddDate(0, 1, -1)
@@ -1657,7 +1355,6 @@ func (h *AttendanceHandler) GetUserAttendanceStats(w http.ResponseWriter, r *htt
 			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
 			return
 		}
-
 		endDate, err = time.Parse("2006-01-02", endDateStr)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
@@ -1665,7 +1362,6 @@ func (h *AttendanceHandler) GetUserAttendanceStats(w http.ResponseWriter, r *htt
 		}
 	}
 
-	// Get user attendance stats
 	stats, err := h.attendanceService.GetUserAttendanceStats(ctx, userID, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to get user attendance stats",
@@ -1681,19 +1377,11 @@ func (h *AttendanceHandler) GetUserAttendanceStats(w http.ResponseWriter, r *htt
 	})
 }
 
-// ============================================================================
-// EVENT & SOURCE TYPES
-// ============================================================================
-
-// GetAttendanceEventTypes handles GET /api/attendance/event-types
 func (h *AttendanceHandler) GetAttendanceEventTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Parse query parameters
 	query := r.URL.Query()
 	activeOnly := query.Get("active_only") == "true"
 
-	// Get attendance event types
 	eventTypes, err := h.queryService.ListAttendanceEventTypes(ctx, activeOnly)
 	if err != nil {
 		h.logger.Error("Failed to get attendance event types",
@@ -1711,11 +1399,9 @@ func (h *AttendanceHandler) GetAttendanceEventTypes(w http.ResponseWriter, r *ht
 	})
 }
 
-// GetAttendanceSourceTypes handles GET /api/attendance/source-types
 func (h *AttendanceHandler) GetAttendanceSourceTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Get attendance source types
 	sourceTypes, err := h.queryService.ListAttendanceSourceTypes(ctx)
 	if err != nil {
 		h.logger.Error("Failed to get attendance source types",
@@ -1733,49 +1419,32 @@ func (h *AttendanceHandler) GetAttendanceSourceTypes(w http.ResponseWriter, r *h
 	})
 }
 
-// ============================================================================
-// SAP BUSINESS RULES
-// ============================================================================
-
-// ============================================================================
-// REPORTS
-// ============================================================================
-
-// GenerateAttendanceReport handles GET /api/attendance/reports
 func (h *AttendanceHandler) GenerateAttendanceReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// Parse query parameters
 	query := r.URL.Query()
 
-	// Parse company ID
 	companyIDStr := query.Get("company_id")
 	if companyIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
 		return
 	}
-
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
 		return
 	}
 
-	// Parse report type
 	reportType := strings.ToLower(query.Get("type"))
 	if reportType == "" {
 		reportType = "csv"
 	}
-
 	if reportType != "csv" && reportType != "json" {
 		h.respondWithError(w, http.StatusBadRequest, "Unsupported report type. Use 'csv' or 'json'")
 		return
 	}
 
-	// Parse dates
 	startDateStr := query.Get("start_date")
 	endDateStr := query.Get("end_date")
-
 	if startDateStr == "" || endDateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
 		return
@@ -1786,21 +1455,18 @@ func (h *AttendanceHandler) GenerateAttendanceReport(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
 		return
 	}
-
 	endDate, err := time.Parse("2006-01-02", endDateStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
 		return
 	}
 
-	// Generate attendance report
 	data, contentType, err := h.queryService.GenerateAttendanceReport(ctx, companyID, reportType, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to generate attendance report",
 			util.String("company_id", companyID.String()),
 			util.String("report_type", reportType),
 			util.ErrorField(err))
-
 		if strings.Contains(err.Error(), "date range cannot exceed") {
 			h.respondWithError(w, http.StatusBadRequest, err.Error())
 		} else {
@@ -1809,7 +1475,6 @@ func (h *AttendanceHandler) GenerateAttendanceReport(w http.ResponseWriter, r *h
 		return
 	}
 
-	// Generate filename
 	filename := fmt.Sprintf("attendance-report_%s_%s_%s.%s",
 		companyID.String(),
 		startDate.Format("2006-01-02"),
@@ -1817,12 +1482,9 @@ func (h *AttendanceHandler) GenerateAttendanceReport(w http.ResponseWriter, r *h
 		reportType,
 	)
 
-	// Set response headers
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-
-	// Write data
 	if _, err := w.Write(data); err != nil {
 		h.logger.Error("Failed to write report data",
 			util.String("company_id", companyID.String()),
@@ -1830,11 +1492,6 @@ func (h *AttendanceHandler) GenerateAttendanceReport(w http.ResponseWriter, r *h
 	}
 }
 
-// ============================================================================
-// HEALTH CHECK
-// ============================================================================
-
-// HealthCheck handles GET /api/attendance/health
 func (h *AttendanceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1859,392 +1516,277 @@ func (h *AttendanceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// ============================================================================
-// HELPER METHODS
-// ============================================================================
+func (h *AttendanceHandler) CheckDateAvailability(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-func (h *AttendanceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("Failed to encode JSON response", util.ErrorField(err))
-	}
-}
-
-func (h *AttendanceHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-		"message": message,
-		"code":    status,
-	})
-}
-func (h *AttendanceHandler) getActorFromContext(
-	ctx context.Context,
-) (string, uuid.UUID, error) {
-
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return "", uuid.Nil, fmt.Errorf("user not authenticated")
-	}
-
+	userIDStr := chi.URLParam(r, "userID")
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		return "", uuid.Nil, fmt.Errorf("invalid user_id in context")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID format")
+		return
 	}
 
-	userType, ok := ctx.Value("user_type").(string)
-	if !ok || userType == "" {
-		userType = "user"
+	query := r.URL.Query()
+	dateStr := query.Get("date")
+	if dateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "date parameter is required")
+		return
 	}
 
-	return userType, userID, nil
-}
-func (h *AttendanceHandler) getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	v := ctx.Value("company_id")
-	if v == nil {
-		return uuid.Nil, fmt.Errorf("company ID not found in context")
-	}
-
-	switch id := v.(type) {
-	case uuid.UUID:
-		return id, nil
-	case string:
-		if id == "" {
-			return uuid.Nil, fmt.Errorf("company ID empty in context")
-		}
-		return uuid.Parse(id)
-	default:
-		return uuid.Nil, fmt.Errorf("invalid company ID type in context")
-	}
-}
-
-func (h *AttendanceHandler) getPointerValue(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-// func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-
-// 	// Get user and company from context (set by middleware)
-// 	actorType, actorID, err := h.getActorFromContext(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-// 		return
-// 	}
-
-// 	companyID, err := h.getCompanyIDFromContext(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Company context required")
-// 		return
-// 	}
-
-// 	var req struct {
-// 		EventType  string                   `json:"event_type" validate:"required"`
-// 		SourceType string                   `json:"source_type" validate:"required"`
-// 		Metadata   attendance.EventMetadata `json:"metadata,omitempty"`
-// 	}
-
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Auto-derive all data - client cannot send these
-// 	now := time.Now().UTC()
-// 	clientIP := h.getClientIP(r)
-// 	deviceID := r.Header.Get("X-Device-ID")
-// 	userID := actorID // User punches for themselves
-
-// 	event := &attendance.AttendanceEvent{
-// 		AttendanceEventID: uuid.New(),
-// 		CompanyID:         companyID,
-// 		UserID:            userID,
-// 		EventType:         req.EventType,
-// 		EventTime:         now, // Server time, not client time
-// 		SourceType:        req.SourceType,
-// 		DeviceID:          &deviceID,
-// 		IPAddress:         &clientIP,
-// 		Metadata:          req.Metadata,
-// 		CreatedAt:         now,
-// 		CreatedBy:         &actorID,
-// 	}
-
-// 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
-// 		ctx, event, actorType, actorID, map[string]interface{}{
-// 			"auto_derived": true,
-// 			"source":       "real_time_punch",
-// 		})
-
-// 	if err != nil {
-// 		h.logger.Error("Failed to create punch attendance event",
-// 			util.String("user_id", userID.String()),
-// 			util.String("event_type", req.EventType),
-// 			util.ErrorField(err))
-
-// 		status := http.StatusInternalServerError
-// 		if strings.Contains(err.Error(), "invalid") ||
-// 			strings.Contains(err.Error(), "required") ||
-// 			strings.Contains(err.Error(), "not allowed") {
-// 			status = http.StatusBadRequest
-// 		}
-// 		h.respondWithError(w, status, err.Error())
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-// 		"success": true,
-// 		"data":    createdEvent,
-// 		"auto_derived": map[string]interface{}{
-// 			"event_time": now,
-// 			"ip_address": clientIP,
-// 			"device_id":  deviceID,
-// 		},
-// 	})
-// }
-
-// func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-
-// 	// Get actor info
-// 	actorType, actorID, err := h.getActorFromContext(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-// 		return
-// 	}
-
-// 	companyID, err := h.getCompanyIDFromContext(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Company context required")
-// 		return
-// 	}
-
-// 	var req struct {
-// 		UserID     uuid.UUID                `json:"user_id" validate:"required"`
-// 		EventType  string                   `json:"event_type" validate:"required"`
-// 		EventTime  time.Time                `json:"event_time" validate:"required"`
-// 		SourceType string                   `json:"source_type"`
-// 		Reason     string                   `json:"reason" validate:"required"`
-// 		DeviceID   *string                  `json:"device_id,omitempty"`
-// 		IPAddress  *string                  `json:"ip_address,omitempty"`
-// 		Metadata   attendance.EventMetadata `json:"metadata,omitempty"`
-// 	}
-
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-// 		return
-// 	}
-
-// 	// Validate required fields
-// 	if req.Reason == "" {
-// 		h.respondWithError(w, http.StatusBadRequest, "Reason is required for correction")
-// 		return
-// 	}
-
-// 	if req.EventTime.After(time.Now().UTC()) {
-// 		h.respondWithError(w, http.StatusBadRequest, "Cannot correct future events")
-// 		return
-// 	}
-
-// 	// Use provided source type or default
-// 	sourceType := req.SourceType
-// 	if sourceType == "" {
-// 		sourceType = "correction"
-// 	}
-
-// 	now := time.Now().UTC()
-// 	event := &attendance.AttendanceEvent{
-// 		AttendanceEventID: uuid.New(),
-// 		CompanyID:         companyID,
-// 		UserID:            req.UserID,
-// 		EventType:         req.EventType,
-// 		EventTime:         req.EventTime,
-// 		SourceType:        sourceType,
-// 		DeviceID:          req.DeviceID,
-// 		IPAddress:         req.IPAddress,
-// 		Metadata:          req.Metadata,
-// 		CreatedAt:         now,
-// 		CreatedBy:         &actorID,
-// 	}
-
-// 	// Add reason to metadata if not already present
-// 	if event.Metadata.Reason == nil {
-// 		event.Metadata.Reason = &req.Reason
-// 	}
-
-// 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
-// 		ctx, event, actorType, actorID, map[string]interface{}{
-// 			"correction":   true,
-// 			"reason":       req.Reason,
-// 			"corrected_by": actorID.String(),
-// 			"corrected_at": now,
-// 		})
-
-// 	if err != nil {
-// 		h.logger.Error("Failed to create correction attendance event",
-// 			util.String("user_id", req.UserID.String()),
-// 			util.String("event_type", req.EventType),
-// 			util.String("reason", req.Reason),
-// 			util.ErrorField(err))
-
-// 		status := http.StatusInternalServerError
-// 		if strings.Contains(err.Error(), "invalid") ||
-// 			strings.Contains(err.Error(), "required") ||
-// 			strings.Contains(err.Error(), "not allowed") {
-// 			status = http.StatusBadRequest
-// 		}
-// 		h.respondWithError(w, status, err.Error())
-// 		return
-// 	}
-
-// 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-// 		"success": true,
-// 		"data":    createdEvent,
-// 		"correction_info": map[string]interface{}{
-// 			"reason":       req.Reason,
-// 			"corrected_by": actorID.String(),
-// 			"corrected_at": now,
-// 		},
-// 	})
-// }
-
-// ====================================
-// HELPER FUNCTIONS
-// ====================================
-
-// getClientIP extracts client IP address from request
-func (h *AttendanceHandler) getClientIP(r *http.Request) string {
-	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
-			ip := strings.TrimSpace(ips[0])
-			if parsedIP := net.ParseIP(ip); parsedIP != nil {
-				return ip
-			}
-		}
-	}
-
-	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
-			return realIP
-		}
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	date, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
-		return r.RemoteAddr
+		h.respondWithError(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD")
+		return
 	}
-	return host
+
+	result, err := h.attendanceService.CheckDateAvailability(ctx, userID, date)
+	if err != nil {
+		h.logger.Error("Failed to check date availability",
+			util.String("user_id", userID.String()),
+			util.String("date", date.Format("2006-01-02")),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to check date availability")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    result,
+	})
 }
 
-// func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
+func (h *AttendanceHandler) GetAttendanceDailySummariesByCompany(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-// 	actorType, actorID, err := h.getActorFromContext(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
-// 		return
-// 	}
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		return
+	}
 
-// 	companyID, err := h.getCompanyIDFromContext(ctx)
-// 	if err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Company context required")
-// 		return
-// 	}
+	query := r.URL.Query()
+	startDateStr := query.Get("start_date")
+	endDateStr := query.Get("end_date")
 
-// 	var req struct {
-// 		UserID    uuid.UUID                `json:"user_id" validate:"required"`
-// 		EventType string                   `json:"event_type" validate:"required"`
-// 		EventTime time.Time                `json:"event_time" validate:"required"`
-// 		Reason    string                   `json:"reason" validate:"required"`
-// 		Metadata  attendance.EventMetadata `json:"metadata,omitempty"`
-// 	}
+	var startDate, endDate time.Time
+	if startDateStr == "" || endDateStr == "" {
+		now := time.Now().UTC()
+		startDate = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+		endDate = startDate.AddDate(0, 1, -1)
+	} else {
+		startDate, err = time.Parse("2006-01-02", startDateStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
+			return
+		}
+		endDate, err = time.Parse("2006-01-02", endDateStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
+			return
+		}
+	}
 
-// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-// 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
-// 		return
-// 	}
+	page, _ := strconv.Atoi(query.Get("page"))
+	if page < 1 {
+		page = 1
+	}
 
-// 	if req.Reason == "" {
-// 		h.respondWithError(w, http.StatusBadRequest, "Reason is required for correction")
-// 		return
-// 	}
+	pageSize, _ := strconv.Atoi(query.Get("page_size"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
 
-// 	if req.EventTime.After(time.Now().UTC()) {
-// 		h.respondWithError(w, http.StatusBadRequest, "Cannot correct future events")
-// 		return
-// 	}
+	summaries, total, err := h.attendanceService.GetAttendanceDailySummariesByCompany(
+		ctx, companyID, startDate, endDate, page, pageSize)
+	if err != nil {
+		h.logger.Error("Failed to get attendance daily summaries by company",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to get attendance daily summaries")
+		return
+	}
 
-// 	now := time.Now().UTC()
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"summaries": summaries,
+			"total":     total,
+			"page":      page,
+			"page_size": pageSize,
+			"period": map[string]interface{}{
+				"start_date": startDate.Format("2006-01-02"),
+				"end_date":   endDate.Format("2006-01-02"),
+			},
+		},
+	})
+}
 
-// 	// 🔒 FORCE correction source type (client never sends it)
-// 	event := &attendance.AttendanceEvent{
-// 		AttendanceEventID: uuid.New(),
-// 		CompanyID:         companyID,
-// 		UserID:            req.UserID,
-// 		EventType:         req.EventType,
-// 		EventTime:         req.EventTime,
-// 		SourceType:        "correction", // ✅ HARD-SET
-// 		Metadata:          req.Metadata,
-// 		CreatedAt:         now,
-// 		CreatedBy:         &actorID,
-// 	}
+func (h *AttendanceHandler) CompleteSAPAttendanceFlow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-// 	// Always store reason in metadata
-// 	if event.Metadata.Reason == nil {
-// 		event.Metadata.Reason = &req.Reason
-// 	}
+	var req struct {
+		SapEvent  service.SAPAttendanceEvent `json:"sap_event" validate:"required"`
+		CompanyID uuid.UUID                  `json:"company_id" validate:"required"`
+	}
 
-// 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
-// 		ctx,
-// 		event,
-// 		actorType,
-// 		actorID,
-// 		map[string]interface{}{
-// 			"correction":   true,
-// 			"reason":       req.Reason,
-// 			"corrected_by": actorID.String(),
-// 			"corrected_at": now,
-// 		},
-// 	)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
 
-// 	if err != nil {
-// 		h.logger.Error(
-// 			"Failed to create correction attendance event",
-// 			util.String("user_id", req.UserID.String()),
-// 			util.String("event_type", req.EventType),
-// 			util.String("reason", req.Reason),
-// 			util.ErrorField(err),
-// 		)
+	err := h.attendanceService.CompleteSAPAttendanceFlow(ctx, &req.SapEvent, req.CompanyID)
+	if err != nil {
+		h.logger.Error("Failed to complete SAP attendance flow",
+			util.String("company_id", req.CompanyID.String()),
+			util.String("employee_id", req.SapEvent.EmployeeID),
+			util.ErrorField(err))
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "invalid") ||
+			strings.Contains(err.Error(), "required") ||
+			strings.Contains(err.Error(), "not found") {
+			status = http.StatusBadRequest
+		}
+		h.respondWithError(w, status, err.Error())
+		return
+	}
 
-// 		status := http.StatusInternalServerError
-// 		if strings.Contains(err.Error(), "invalid") ||
-// 			strings.Contains(err.Error(), "required") ||
-// 			strings.Contains(err.Error(), "not allowed") {
-// 			status = http.StatusBadRequest
-// 		}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "SAP attendance flow completed successfully",
+	})
+}
 
-// 		h.respondWithError(w, status, err.Error())
-// 		return
-// 	}
+func (h *AttendanceHandler) GetUserCurrentAttendancePolicy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-// 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-// 		"success": true,
-// 		"data":    createdEvent,
-// 		"correction_info": map[string]interface{}{
-// 			"reason":       req.Reason,
-// 			"corrected_by": actorID.String(),
-// 			"corrected_at": now,
-// 		},
-// 	})
-// }
+	userIDStr := chi.URLParam(r, "userID")
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID format")
+		return
+	}
+
+	query := r.URL.Query()
+	dateStr := query.Get("date")
+	var date time.Time
+	if dateStr == "" {
+		date = time.Now().UTC()
+	} else {
+		date, err = time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid date format. Use YYYY-MM-DD")
+			return
+		}
+	}
+
+	policy, err := h.queryService.GetUserCurrentAttendancePolicy(ctx, userID, date)
+	if err != nil {
+		h.logger.Error("Failed to get user current attendance policy",
+			util.String("user_id", userID.String()),
+			util.String("date", date.Format("2006-01-02")),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to get user attendance policy")
+		return
+	}
+
+	if policy == nil {
+		h.respondWithError(w, http.StatusNotFound, "No active attendance policy found for user")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    policy,
+	})
+}
+
+func (h *AttendanceHandler) StreamAttendanceEvents(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	query := r.URL.Query()
+
+	companyIDStr := query.Get("company_id")
+	if companyIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
+		return
+	}
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		return
+	}
+
+	format := strings.ToLower(query.Get("format"))
+	if format == "" {
+		format = "csv"
+	}
+	if format != "csv" && format != "jsonl" {
+		h.respondWithError(w, http.StatusBadRequest, "Unsupported format. Use 'csv' or 'jsonl'")
+		return
+	}
+
+	startDateStr := query.Get("start_date")
+	endDateStr := query.Get("end_date")
+	if startDateStr == "" || endDateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
+		return
+	}
+
+	startDate, err := time.Parse("2006-01-02", startDateStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use YYYY-MM-DD")
+		return
+	}
+	endDate, err := time.Parse("2006-01-02", endDateStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use YYYY-MM-DD")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	err = h.queryService.StreamAttendanceEvents(ctx, companyID, startDate, endDate, w, format)
+	if err != nil {
+		h.logger.Error("Failed to stream attendance events",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to stream attendance events")
+		return
+	}
+}
+
+func (h *AttendanceHandler) ValidateEventAgainstRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var req struct {
+		Event *attendance.AttendanceEvent         `json:"event" validate:"required"`
+		Rules *attendance.ResolvedAttendanceRules `json:"rules" validate:"required"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	err := h.attendanceService.ValidateEventAgainstRules(ctx, req.Event, req.Rules)
+	if err != nil {
+		h.logger.Error("Event validation against rules failed",
+			util.String("user_id", req.Event.UserID.String()),
+			util.String("event_type", req.Event.EventType),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Event is valid against the rules",
+	})
+}
 
 func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -2270,7 +1812,6 @@ func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Validate required fields
 	if req.Reason == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Reason is required for correction")
 		return
@@ -2281,13 +1822,11 @@ func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Check if correction is too old (e.g., more than 30 days)
 	if time.Since(req.EventTime) > 30*24*time.Hour {
 		h.respondWithError(w, http.StatusBadRequest, "Cannot correct events older than 30 days")
 		return
 	}
 
-	// Create correction event
 	now := time.Now().UTC()
 	event := &attendance.AttendanceEvent{
 		AttendanceEventID: uuid.New(),
@@ -2301,12 +1840,10 @@ func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Req
 		CreatedBy:         &actorID,
 	}
 
-	// Set correction reason in metadata
 	if event.Metadata.Reason == nil {
 		event.Metadata.Reason = &req.Reason
 	}
 
-	// Create the correction event
 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
 		ctx,
 		event,
@@ -2328,7 +1865,6 @@ func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Req
 			util.String("reason", req.Reason),
 			util.ErrorField(err),
 		)
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "duplicate") {
 			status = http.StatusConflict
@@ -2339,7 +1875,6 @@ func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Req
 			strings.Contains(err.Error(), "not allowed") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -2358,7 +1893,6 @@ func (h *AttendanceHandler) CorrectAttendance(w http.ResponseWriter, r *http.Req
 
 func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
 	actorType, actorID, err := h.getActorFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
@@ -2382,13 +1916,11 @@ func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Get current time
 	now := time.Now().UTC()
 	clientIP := h.getClientIP(r)
 	deviceID := r.Header.Get("X-Device-ID")
 	userID := actorID
 
-	// Create punch event
 	event := &attendance.AttendanceEvent{
 		AttendanceEventID: uuid.New(),
 		CompanyID:         companyID,
@@ -2403,7 +1935,6 @@ func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Reque
 		CreatedBy:         &actorID,
 	}
 
-	// Create the attendance event with duplicate protection
 	createdEvent, err := h.attendanceService.CreateAttendanceEvent(
 		ctx, event, actorType, actorID, map[string]interface{}{
 			"auto_derived": true,
@@ -2417,7 +1948,6 @@ func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Reque
 			util.String("user_id", userID.String()),
 			util.String("event_type", req.EventType),
 			util.ErrorField(err))
-
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "duplicate") {
 			status = http.StatusConflict
@@ -2428,7 +1958,6 @@ func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Reque
 			strings.Contains(err.Error(), "not allowed") {
 			status = http.StatusBadRequest
 		}
-
 		h.respondWithError(w, status, err.Error())
 		return
 	}
@@ -2443,7 +1972,6 @@ func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Reque
 		},
 	}
 
-	// Add duplicate warning if event was actually a duplicate
 	if createdEvent.AttendanceEventID != event.AttendanceEventID {
 		response["warning"] = "Duplicate punch prevented - returned existing record"
 		response["is_duplicate"] = true
@@ -2451,4 +1979,105 @@ func (h *AttendanceHandler) PunchAttendance(w http.ResponseWriter, r *http.Reque
 	}
 
 	h.respondWithJSON(w, http.StatusCreated, response)
+}
+
+func (h *AttendanceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("Failed to encode JSON response", util.ErrorField(err))
+	}
+}
+
+func (h *AttendanceHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+		"message": message,
+		"code":    status,
+	})
+}
+
+func (h *AttendanceHandler) getActorFromContext(
+	ctx context.Context,
+) (string, uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok || userIDStr == "" {
+		return "", uuid.Nil, fmt.Errorf("user not authenticated")
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return "", uuid.Nil, fmt.Errorf("invalid user_id in context")
+	}
+	userType, ok := ctx.Value("user_type").(string)
+	if !ok || userType == "" {
+		userType = "user"
+	}
+	return userType, userID, nil
+}
+
+func (h *AttendanceHandler) getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	v := ctx.Value("company_id")
+	if v == nil {
+		return uuid.Nil, fmt.Errorf("company ID not found in context")
+	}
+	switch id := v.(type) {
+	case uuid.UUID:
+		return id, nil
+	case string:
+		if id == "" {
+			return uuid.Nil, fmt.Errorf("company ID empty in context")
+		}
+		return uuid.Parse(id)
+	default:
+		return uuid.Nil, fmt.Errorf("invalid company ID type in context")
+	}
+}
+
+func (h *AttendanceHandler) getPointerValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func (h *AttendanceHandler) getClientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if ips := strings.Split(forwarded, ","); len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if parsedIP := net.ParseIP(ip); parsedIP != nil {
+				return ip
+			}
+		}
+	}
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		if parsedIP := net.ParseIP(realIP); parsedIP != nil {
+			return realIP
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// Helper function for admin access (you need to implement this based on your auth system)
+func RequireAdmin(ctx context.Context) (uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok || userIDStr == "" {
+		return uuid.Nil, fmt.Errorf("user not authenticated")
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid user_id in context")
+	}
+
+	// Check if user has admin role (implement based on your auth system)
+	userRole, ok := ctx.Value("user_role").(string)
+	if !ok || userRole != "admin" {
+		return uuid.Nil, fmt.Errorf("admin access required")
+	}
+
+	return userID, nil
 }

@@ -242,32 +242,32 @@ type AttendanceRepository interface {
 		rfidID uuid.UUID,
 	) error
 
-	CreateWorkCenterShift(
-		ctx context.Context,
-		mapping *attendance.WorkCenterShift,
-	) error
+	// CreateWorkCenterShift(
+	// 	ctx context.Context,
+	// 	mapping *attendance.WorkCenterShift,
+	// ) error
 
-	GetWorkCenterShiftByCode(
-		ctx context.Context,
-		companyID uuid.UUID,
-		workCenterCode string,
-	) (*attendance.WorkCenterShift, error)
+	// GetWorkCenterShiftByCode(
+	// 	ctx context.Context,
+	// 	companyID uuid.UUID,
+	// 	workCenterCode string,
+	// ) (*attendance.WorkCenterShift, error)
 
-	GetWorkCenterShiftsByCompany(
-		ctx context.Context,
-		companyID uuid.UUID,
-		activeOnly bool,
-	) ([]*attendance.WorkCenterShift, error)
+	// GetWorkCenterShiftsByCompany(
+	// 	ctx context.Context,
+	// 	companyID uuid.UUID,
+	// 	activeOnly bool,
+	// ) ([]*attendance.WorkCenterShift, error)
 
-	UpdateWorkCenterShift(
-		ctx context.Context,
-		mapping *attendance.WorkCenterShift,
-	) error
+	// UpdateWorkCenterShift(
+	// 	ctx context.Context,
+	// 	mapping *attendance.WorkCenterShift,
+	// ) error
 
-	DeactivateWorkCenterShift(
-		ctx context.Context,
-		mappingID uuid.UUID,
-	) error
+	// DeactivateWorkCenterShift(
+	// 	ctx context.Context,
+	// 	mappingID uuid.UUID,
+	// ) error
 
 	// ============================================================
 	// ANALYTICS

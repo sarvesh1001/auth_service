@@ -3352,285 +3352,285 @@ func (r *CompanyRepositoryImpl) GetUserPermissions(ctx context.Context, companyI
 //
 // CreateCompany creates a new company with full RBAC setup
 
-func (r *CompanyRepositoryImpl) CreateCompany(
-	ctx context.Context,
-	company *models.Company,
-	additionalDepartments []string,
-	ownerPositionTitle string,
-) error {
+// func (r *CompanyRepositoryImpl) CreateCompany(
+// 	ctx context.Context,
+// 	company *models.Company,
+// 	additionalDepartments []string,
+// 	ownerPositionTitle string,
+// ) error {
 
-	tx, err := r.client.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
+// 	tx, err := r.client.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to begin transaction: %w", err)
+// 	}
+// 	defer tx.Rollback()
 
-	// ------------------------------------------------------------------
-	// 1. Insert company (WITH max_departments)
-	// ------------------------------------------------------------------
-	companyQuery := `
-		INSERT INTO companies (
-			company_id,
-			company_name,
-			owner_user_id,
-			subscription_tier,
-			subscription_status,
-			max_employees,
-			max_departments,
-			data_region,
-			is_active,
-			created_at,
-			updated_at,
-			subscription_start_date,
-			subscription_end_date
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-	`
+// 	// ------------------------------------------------------------------
+// 	// 1. Insert company (WITH max_departments)
+// 	// ------------------------------------------------------------------
+// 	companyQuery := `
+// 		INSERT INTO companies (
+// 			company_id,
+// 			company_name,
+// 			owner_user_id,
+// 			subscription_tier,
+// 			subscription_status,
+// 			max_employees,
+// 			max_departments,
+// 			data_region,
+// 			is_active,
+// 			created_at,
+// 			updated_at,
+// 			subscription_start_date,
+// 			subscription_end_date
+// 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+// 	`
 
-	_, err = tx.ExecContext(ctx, companyQuery,
-		company.CompanyID,
-		company.CompanyName,
-		company.OwnerUserID,
-		company.SubscriptionTier,
-		company.SubscriptionStatus,
-		company.MaxEmployees,
-		company.MaxDepartments,
-		company.DataRegion,
-		company.IsActive,
-		company.CreatedAt,
-		company.UpdatedAt,
-		company.SubscriptionStartDate,
-		company.SubscriptionEndDate,
-	)
-	if err != nil {
-		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
-			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
-		}
-		return fmt.Errorf("failed to create company: %w", err)
-	}
+// 	_, err = tx.ExecContext(ctx, companyQuery,
+// 		company.CompanyID,
+// 		company.CompanyName,
+// 		company.OwnerUserID,
+// 		company.SubscriptionTier,
+// 		company.SubscriptionStatus,
+// 		company.MaxEmployees,
+// 		company.MaxDepartments,
+// 		company.DataRegion,
+// 		company.IsActive,
+// 		company.CreatedAt,
+// 		company.UpdatedAt,
+// 		company.SubscriptionStartDate,
+// 		company.SubscriptionEndDate,
+// 	)
+// 	if err != nil {
+// 		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
+// 			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
+// 		}
+// 		return fmt.Errorf("failed to create company: %w", err)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 2. Create OWNER role
-	// ------------------------------------------------------------------
-	ownerRoleID := uuid.New()
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO roles (
-			role_id, role_name, role_level, company_id,
-			is_system_role, description, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-	`,
-		ownerRoleID,
-		"Owner",
-		1000,
-		company.CompanyID,
-		true,
-		"Company owner with full permissions",
-		company.CreatedAt,
-		company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create owner role: %w", err)
-	}
+// 	// ------------------------------------------------------------------
+// 	// 2. Create OWNER role
+// 	// ------------------------------------------------------------------
+// 	ownerRoleID := uuid.New()
+// 	_, err = tx.ExecContext(ctx, `
+// 		INSERT INTO roles (
+// 			role_id, role_name, role_level, company_id,
+// 			is_system_role, description, created_at, updated_at
+// 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+// 	`,
+// 		ownerRoleID,
+// 		"Owner",
+// 		1000,
+// 		company.CompanyID,
+// 		true,
+// 		"Company owner with full permissions",
+// 		company.CreatedAt,
+// 		company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create owner role: %w", err)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 3. Load system departments
-	// ------------------------------------------------------------------
-	systemDepts, err := r.GetSystemDepartments(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get system departments: %w", err)
-	}
+// 	// ------------------------------------------------------------------
+// 	// 3. Load system departments
+// 	// ------------------------------------------------------------------
+// 	systemDepts, err := r.GetSystemDepartments(ctx)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to get system departments: %w", err)
+// 	}
 
-	systemDeptMap := make(map[string]uuid.UUID)
-	for _, d := range systemDepts {
-		systemDeptMap[strings.ToLower(d.ModuleCode)] = d.SystemDepartmentID
-	}
+// 	systemDeptMap := make(map[string]uuid.UUID)
+// 	for _, d := range systemDepts {
+// 		systemDeptMap[strings.ToLower(d.ModuleCode)] = d.SystemDepartmentID
+// 	}
 
-	// ------------------------------------------------------------------
-	// 4. Create ADMINISTRATION department (always 1)
-	// ------------------------------------------------------------------
-	adminSystemDeptID, ok := systemDeptMap["administration"]
-	if !ok {
-		return fmt.Errorf("administration system department not found")
-	}
+// 	// ------------------------------------------------------------------
+// 	// 4. Create ADMINISTRATION department (always 1)
+// 	// ------------------------------------------------------------------
+// 	adminSystemDeptID, ok := systemDeptMap["administration"]
+// 	if !ok {
+// 		return fmt.Errorf("administration system department not found")
+// 	}
 
-	adminDeptID := uuid.New()
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO departments (
-			department_id, company_id, department_name,
-			system_department_id, is_active, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7)
-	`,
-		adminDeptID,
-		company.CompanyID,
-		"Administration",
-		adminSystemDeptID,
-		true,
-		company.CreatedAt,
-		company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create administration department: %w", err)
-	}
+// 	adminDeptID := uuid.New()
+// 	_, err = tx.ExecContext(ctx, `
+// 		INSERT INTO departments (
+// 			department_id, company_id, department_name,
+// 			system_department_id, is_active, created_at, updated_at
+// 		) VALUES ($1,$2,$3,$4,$5,$6,$7)
+// 	`,
+// 		adminDeptID,
+// 		company.CompanyID,
+// 		"Administration",
+// 		adminSystemDeptID,
+// 		true,
+// 		company.CreatedAt,
+// 		company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create administration department: %w", err)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 5. Create OWNER position (Administration)
-	// ------------------------------------------------------------------
-	adminPositionID := uuid.New()
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO positions (
-			position_id, company_id, department_id,
-			title, is_open, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7)
-	`,
-		adminPositionID,
-		company.CompanyID,
-		adminDeptID,
-		ownerPositionTitle,
-		false,
-		company.CreatedAt,
-		company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create owner position: %w", err)
-	}
+// 	// ------------------------------------------------------------------
+// 	// 5. Create OWNER position (Administration)
+// 	// ------------------------------------------------------------------
+// 	adminPositionID := uuid.New()
+// 	_, err = tx.ExecContext(ctx, `
+// 		INSERT INTO positions (
+// 			position_id, company_id, department_id,
+// 			title, is_open, created_at, updated_at
+// 		) VALUES ($1,$2,$3,$4,$5,$6,$7)
+// 	`,
+// 		adminPositionID,
+// 		company.CompanyID,
+// 		adminDeptID,
+// 		ownerPositionTitle,
+// 		false,
+// 		company.CreatedAt,
+// 		company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create owner position: %w", err)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 6. Create additional departments (LIMITED by max_departments)
-	// ------------------------------------------------------------------
-	remainingSlots := company.MaxDepartments - 1 // 1 = Administration
-	if remainingSlots < 0 {
-		remainingSlots = 0
-	}
+// 	// ------------------------------------------------------------------
+// 	// 6. Create additional departments (LIMITED by max_departments)
+// 	// ------------------------------------------------------------------
+// 	remainingSlots := company.MaxDepartments - 1 // 1 = Administration
+// 	if remainingSlots < 0 {
+// 		remainingSlots = 0
+// 	}
 
-	if len(additionalDepartments) > remainingSlots {
-		additionalDepartments = additionalDepartments[:remainingSlots]
-	}
+// 	if len(additionalDepartments) > remainingSlots {
+// 		additionalDepartments = additionalDepartments[:remainingSlots]
+// 	}
 
-	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}
-	ownerAccessModules := []string{"administration"}
-	positionsByDept := map[uuid.UUID]uuid.UUID{
-		adminDeptID: adminPositionID,
-	}
+// 	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}
+// 	ownerAccessModules := []string{"administration"}
+// 	positionsByDept := map[uuid.UUID]uuid.UUID{
+// 		adminDeptID: adminPositionID,
+// 	}
 
-	for _, deptName := range additionalDepartments {
-		deptID := uuid.New()
+// 	for _, deptName := range additionalDepartments {
+// 		deptID := uuid.New()
 
-		module := strings.ToLower(strings.TrimSpace(deptName))
-		systemDeptID, ok := systemDeptMap[module]
-		if !ok {
-			systemDeptID = systemDeptMap["operations"]
-			module = "operations"
-		}
+// 		module := strings.ToLower(strings.TrimSpace(deptName))
+// 		systemDeptID, ok := systemDeptMap[module]
+// 		if !ok {
+// 			systemDeptID = systemDeptMap["operations"]
+// 			module = "operations"
+// 		}
 
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO departments (
-				department_id, company_id, department_name,
-				system_department_id, is_active, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7)
-		`,
-			deptID,
-			company.CompanyID,
-			deptName,
-			systemDeptID,
-			true,
-			company.CreatedAt,
-			company.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("department creation failed",
-				util.String("department", deptName),
-				util.ErrorField(err))
-			continue
-		}
+// 		_, err = tx.ExecContext(ctx, `
+// 			INSERT INTO departments (
+// 				department_id, company_id, department_name,
+// 				system_department_id, is_active, created_at, updated_at
+// 			) VALUES ($1,$2,$3,$4,$5,$6,$7)
+// 		`,
+// 			deptID,
+// 			company.CompanyID,
+// 			deptName,
+// 			systemDeptID,
+// 			true,
+// 			company.CreatedAt,
+// 			company.UpdatedAt,
+// 		)
+// 		if err != nil {
+// 			r.logger.Warn("department creation failed",
+// 				util.String("department", deptName),
+// 				util.ErrorField(err))
+// 			continue
+// 		}
 
-		positionID := uuid.New()
-		_, _ = tx.ExecContext(ctx, `
-			INSERT INTO positions (
-				position_id, company_id, department_id,
-				title, is_open, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7)
-		`,
-			positionID,
-			company.CompanyID,
-			deptID,
-			fmt.Sprintf("%s Head", deptName),
-			true,
-			company.CreatedAt,
-			company.UpdatedAt,
-		)
+// 		positionID := uuid.New()
+// 		_, _ = tx.ExecContext(ctx, `
+// 			INSERT INTO positions (
+// 				position_id, company_id, department_id,
+// 				title, is_open, created_at, updated_at
+// 			) VALUES ($1,$2,$3,$4,$5,$6,$7)
+// 		`,
+// 			positionID,
+// 			company.CompanyID,
+// 			deptID,
+// 			fmt.Sprintf("%s Head", deptName),
+// 			true,
+// 			company.CreatedAt,
+// 			company.UpdatedAt,
+// 		)
 
-		positionsByDept[deptID] = positionID
-		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
-		ownerAccessModules = append(ownerAccessModules, module)
-	}
+// 		positionsByDept[deptID] = positionID
+// 		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
+// 		ownerAccessModules = append(ownerAccessModules, module)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 7. Assign departments to OWNER role
-	// ------------------------------------------------------------------
-	for _, deptID := range ownerAccessDeptIDs {
-		_, _ = tx.ExecContext(ctx,
-			`INSERT INTO role_departments (role_id, department_id) VALUES ($1,$2)`,
-			ownerRoleID,
-			deptID,
-		)
-	}
+// 	// ------------------------------------------------------------------
+// 	// 7. Assign departments to OWNER role
+// 	// ------------------------------------------------------------------
+// 	for _, deptID := range ownerAccessDeptIDs {
+// 		_, _ = tx.ExecContext(ctx,
+// 			`INSERT INTO role_departments (role_id, department_id) VALUES ($1,$2)`,
+// 			ownerRoleID,
+// 			deptID,
+// 		)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 8. Grant permissions ONLY for allowed modules
-	// ------------------------------------------------------------------
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
-		SELECT $1, p.permission_id, $2, $3
-		FROM permissions p
-		WHERE p.module = ANY($4)
-	`,
-		ownerRoleID,
-		company.OwnerUserID,
-		company.CreatedAt,
-		pq.Array(ownerAccessModules),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to grant permissions: %w", err)
-	}
+// 	// ------------------------------------------------------------------
+// 	// 8. Grant permissions ONLY for allowed modules
+// 	// ------------------------------------------------------------------
+// 	_, err = tx.ExecContext(ctx, `
+// 		INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
+// 		SELECT $1, p.permission_id, $2, $3
+// 		FROM permissions p
+// 		WHERE p.module = ANY($4)
+// 	`,
+// 		ownerRoleID,
+// 		company.OwnerUserID,
+// 		company.CreatedAt,
+// 		pq.Array(ownerAccessModules),
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to grant permissions: %w", err)
+// 	}
 
-	// ------------------------------------------------------------------
-	// 9. Insert OWNER as employee
-	// ------------------------------------------------------------------
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO company_employees (
-			company_id, user_id, employee_id,
-			role_id, position_id,
-			hire_date, is_active, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-	`,
-		company.CompanyID,
-		company.OwnerUserID,
-		"OWNER-"+company.CompanyID.String()[:8],
-		ownerRoleID,
-		adminPositionID,
-		company.CreatedAt,
-		true,
-		company.CreatedAt,
-		company.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to insert owner employee: %w", err)
-	}
+// 	// ------------------------------------------------------------------
+// 	// 9. Insert OWNER as employee
+// 	// ------------------------------------------------------------------
+// 	_, err = tx.ExecContext(ctx, `
+// 		INSERT INTO company_employees (
+// 			company_id, user_id, employee_id,
+// 			role_id, position_id,
+// 			hire_date, is_active, created_at, updated_at
+// 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+// 	`,
+// 		company.CompanyID,
+// 		company.OwnerUserID,
+// 		"OWNER-"+company.CompanyID.String()[:8],
+// 		ownerRoleID,
+// 		adminPositionID,
+// 		company.CreatedAt,
+// 		true,
+// 		company.CreatedAt,
+// 		company.UpdatedAt,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to insert owner employee: %w", err)
+// 	}
 
-	// ------------------------------------------------------------------
-	// COMMIT
-	// ------------------------------------------------------------------
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
+// 	// ------------------------------------------------------------------
+// 	// COMMIT
+// 	// ------------------------------------------------------------------
+// 	if err := tx.Commit(); err != nil {
+// 		return fmt.Errorf("failed to commit transaction: %w", err)
+// 	}
 
-	r.logger.Info("Company created successfully",
-		util.String("company_id", company.CompanyID.String()),
-		util.Int("max_departments", company.MaxDepartments),
-		util.Int("departments_created", len(ownerAccessDeptIDs)),
-	)
+// 	r.logger.Info("Company created successfully",
+// 		util.String("company_id", company.CompanyID.String()),
+// 		util.Int("max_departments", company.MaxDepartments),
+// 		util.Int("departments_created", len(ownerAccessDeptIDs)),
+// 	)
 
-	return nil
-}
+// 	return nil
+// }
 
 // GetUserPermissionBitmask retrieves the complete permission bitmask for a user
 func (r *CompanyRepositoryImpl) GetUserPermissionBitmask(ctx context.Context, companyID, userID uuid.UUID) ([]uint64, error) {
@@ -5522,227 +5522,14 @@ func (r *CompanyRepositoryImpl) GetEmployeeDepartments(ctx context.Context, comp
 }
 
 // CreatePosition creates a new position in the database
-func (r *CompanyRepositoryImpl) CreatePosition(ctx context.Context, position *models.Position) error {
-	query := `
-		INSERT INTO positions (
-			position_id, company_id, department_id, title,
-			is_open, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)`
-
-	_, err := r.client.Exec(ctx, query,
-		position.PositionID,
-		position.CompanyID,
-		position.DepartmentID,
-		position.Title,
-		position.IsOpen,
-		position.CreatedAt,
-		position.UpdatedAt,
-	)
-
-	if err != nil {
-		r.recordError()
-
-		// Handle duplicate title
-		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
-			return fmt.Errorf("position with same title already exists in this department")
-		}
-
-		return fmt.Errorf("failed to create position: %w", err)
-	}
-
-	r.recordQuery()
-	return nil
-}
 
 // GetPosition retrieves a position by ID
-func (r *CompanyRepositoryImpl) GetPosition(ctx context.Context, positionID uuid.UUID) (*models.Position, error) {
-	query := `
-        SELECT position_id, company_id, department_id, title,
-               is_open, created_at, updated_at
-        FROM positions
-        WHERE position_id = $1`
-
-	var position models.Position
-	err := r.client.QueryRow(ctx, query, positionID).Scan(
-		&position.PositionID, &position.CompanyID, &position.DepartmentID,
-		&position.Title, &position.IsOpen, &position.CreatedAt, &position.UpdatedAt,
-	)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("position not found: %s", positionID)
-		}
-		r.recordError()
-		return nil, fmt.Errorf("failed to get position: %w", err)
-	}
-
-	r.recordQuery()
-	return &position, nil
-}
 
 // GetPositionsByCompany retrieves all positions for a company
-func (r *CompanyRepositoryImpl) GetPositionsByCompany(
-	ctx context.Context,
-	companyID uuid.UUID,
-	limit, offset int,
-	onlyOpen bool,
-) ([]*models.Position, int, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM positions WHERE company_id = $1`
-	if onlyOpen {
-		countQuery += ` AND is_open = true`
-	}
-
-	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
-	}
-
-	query := `
-        SELECT position_id, department_id, title, is_open, created_at, updated_at
-        FROM positions
-        WHERE company_id = $1`
-
-	if onlyOpen {
-		query += ` AND is_open = true`
-	}
-
-	query += ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`
-
-	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to query positions: %w", err)
-	}
-	defer rows.Close()
-
-	positions := make([]*models.Position, 0, limit)
-	for rows.Next() {
-		var position models.Position
-		err := rows.Scan(
-			&position.PositionID, &position.DepartmentID, &position.Title,
-			&position.IsOpen, &position.CreatedAt, &position.UpdatedAt,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
-			continue
-		}
-		position.CompanyID = companyID
-		positions = append(positions, &position)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
-	}
-
-	r.recordQuery()
-	return positions, totalCount, nil
-}
 
 // GetPositionsByDepartment retrieves all positions for a department
-func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
-	ctx context.Context,
-	departmentID uuid.UUID,
-	limit, offset int,
-	onlyOpen bool,
-) ([]*models.Position, int, error) {
-	if limit <= 0 || limit > DefaultCompanyPageSize {
-		limit = DefaultCompanyPageSize
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM positions WHERE department_id = $1`
-	if onlyOpen {
-		countQuery += ` AND is_open = true`
-	}
-
-	err := r.client.QueryRow(ctx, countQuery, departmentID).Scan(&totalCount)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to count department positions: %w", err)
-	}
-
-	query := `
-        SELECT p.position_id, p.company_id, p.title, p.is_open,
-               p.created_at, p.updated_at, d.department_name
-        FROM positions p
-        INNER JOIN departments d ON p.department_id = d.department_id
-        WHERE p.department_id = $1`
-
-	if onlyOpen {
-		query += ` AND p.is_open = true`
-	}
-
-	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
-
-	rows, err := r.client.Query(ctx, query, departmentID, limit, offset)
-	if err != nil {
-		r.recordError()
-		return nil, 0, fmt.Errorf("failed to query department positions: %w", err)
-	}
-	defer rows.Close()
-
-	positions := make([]*models.Position, 0, limit)
-	for rows.Next() {
-		var position models.Position
-		var departmentName string
-		err := rows.Scan(
-			&position.PositionID, &position.CompanyID, &position.Title,
-			&position.IsOpen, &position.CreatedAt, &position.UpdatedAt,
-			&departmentName,
-		)
-		if err != nil {
-			r.logger.Warn("Failed to scan department position row", util.ErrorField(err))
-			continue
-		}
-		position.DepartmentID = departmentID
-		position.DepartmentName = departmentName
-		positions = append(positions, &position)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("error iterating department position rows: %w", err)
-	}
-
-	r.recordQuery()
-	return positions, totalCount, nil
-}
 
 // UpdatePosition updates position details
-func (r *CompanyRepositoryImpl) UpdatePosition(ctx context.Context, position *models.Position) error {
-	position.UpdatedAt = time.Now().UTC()
-	query := `
-        UPDATE positions SET
-            title = $1, department_id = $2, is_open = $3, updated_at = $4
-        WHERE position_id = $5`
-
-	result, err := r.client.Exec(ctx, query,
-		position.Title, position.DepartmentID, position.IsOpen,
-		position.UpdatedAt, position.PositionID,
-	)
-	if err != nil {
-		r.recordError()
-		return fmt.Errorf("failed to update position: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("position not found: %s", position.PositionID)
-	}
-
-	r.recordQuery()
-	return nil
-}
 
 // DeletePosition deletes a position
 func (r *CompanyRepositoryImpl) DeletePosition(ctx context.Context, positionID uuid.UUID) error {
@@ -6670,24 +6457,6 @@ func (r *CompanyRepositoryImpl) GetDepartmentByID(
 	return &dept, nil
 }
 
-func (r *CompanyRepositoryImpl) PositionExists(
-	ctx context.Context,
-	companyID, departmentID uuid.UUID,
-	title string,
-) (bool, error) {
-	query := `
-		SELECT EXISTS (
-			SELECT 1 FROM positions
-			WHERE company_id = $1
-			  AND department_id = $2
-			  AND LOWER(title) = LOWER($3)
-		)`
-
-	var exists bool
-	err := r.client.QueryRow(ctx, query, companyID, departmentID, title).Scan(&exists)
-	return exists, err
-}
-
 // Add this to your CompanyRepository interface (postgres/company_repository.go)
 func (r *CompanyRepositoryImpl) SearchDepartments(
 	ctx context.Context,
@@ -7154,9 +6923,332 @@ func (r *CompanyRepositoryImpl) GetEmployeeWithPosition(ctx context.Context, com
 
 	return &emp, position, nil
 }
+
+// Updated PositionExists function
+func (r *CompanyRepositoryImpl) PositionExists(
+	ctx context.Context,
+	companyID, departmentID uuid.UUID,
+	title string,
+) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM positions
+			WHERE company_id = $1
+			  AND department_id = $2
+			  AND LOWER(title) = LOWER($3)
+		)`
+	var exists bool
+	err := r.client.QueryRow(ctx, query, companyID, departmentID, title).Scan(&exists)
+	return exists, err
+}
+
+// Updated CreatePosition function
+func (r *CompanyRepositoryImpl) CreatePosition(ctx context.Context, position *models.Position) error {
+	query := `
+		INSERT INTO positions (
+			position_id, company_id, department_id, title,
+			is_open, is_schedulable, attendance_required,
+			overtime_allowed, work_center_code,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+
+	_, err := r.client.Exec(ctx, query,
+		position.PositionID,
+		position.CompanyID,
+		position.DepartmentID,
+		position.Title,
+		position.IsOpen,
+		position.IsSchedulable,
+		position.AttendanceRequired,
+		position.OvertimeAllowed,
+		position.WorkCenterCode,
+		position.CreatedAt,
+		position.UpdatedAt,
+	)
+
+	if err != nil {
+		r.recordError()
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			return fmt.Errorf("position with same title already exists in this department")
+		}
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23503" {
+			if pgErr.Constraint == "fk_positions_work_center" {
+				return fmt.Errorf("work center does not exist")
+			}
+		}
+		return fmt.Errorf("failed to create position: %w", err)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// Updated GetPosition function
+func (r *CompanyRepositoryImpl) GetPosition(ctx context.Context, positionID uuid.UUID) (*models.Position, error) {
+	query := `
+        SELECT 
+            p.position_id, p.company_id, p.department_id, p.title,
+            p.is_open, p.is_schedulable, p.attendance_required,
+            p.overtime_allowed, p.work_center_code, wc.name as work_center_name,
+            p.created_at, p.updated_at
+        FROM positions p
+        LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+        WHERE p.position_id = $1`
+
+	var position models.Position
+	var workCenterCode sql.NullString
+	var workCenterName sql.NullString
+
+	err := r.client.QueryRow(ctx, query, positionID).Scan(
+		&position.PositionID, &position.CompanyID, &position.DepartmentID,
+		&position.Title, &position.IsOpen, &position.IsSchedulable,
+		&position.AttendanceRequired, &position.OvertimeAllowed,
+		&workCenterCode, &workCenterName,
+		&position.CreatedAt, &position.UpdatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("position not found: %s", positionID)
+		}
+		r.recordError()
+		return nil, fmt.Errorf("failed to get position: %w", err)
+	}
+
+	if workCenterCode.Valid {
+		position.WorkCenterCode = &workCenterCode.String
+	}
+	if workCenterName.Valid {
+		position.WorkCenterName = &workCenterName.String
+	}
+
+	r.recordQuery()
+	return &position, nil
+}
+
+// Updated UpdatePosition function
+func (r *CompanyRepositoryImpl) UpdatePosition(ctx context.Context, position *models.Position) error {
+	position.UpdatedAt = time.Now().UTC()
+
+	query := `
+        UPDATE positions SET
+            title = $1, 
+            department_id = $2, 
+            is_open = $3, 
+            is_schedulable = $4,
+            attendance_required = $5,
+            overtime_allowed = $6,
+            work_center_code = $7,
+            updated_at = $8
+        WHERE position_id = $9`
+
+	result, err := r.client.Exec(ctx, query,
+		position.Title,
+		position.DepartmentID,
+		position.IsOpen,
+		position.IsSchedulable,
+		position.AttendanceRequired,
+		position.OvertimeAllowed,
+		position.WorkCenterCode,
+		position.UpdatedAt,
+		position.PositionID,
+	)
+
+	if err != nil {
+		r.recordError()
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23503" {
+			if pgErr.Constraint == "fk_positions_work_center" {
+				return fmt.Errorf("work center does not exist")
+			}
+		}
+		return fmt.Errorf("failed to update position: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("position not found: %s", position.PositionID)
+	}
+
+	r.recordQuery()
+	return nil
+}
+
+// Updated GetPositionsByDepartment function
+func (r *CompanyRepositoryImpl) GetPositionsByDepartment(
+	ctx context.Context,
+	departmentID uuid.UUID,
+	limit, offset int,
+	onlyOpen bool,
+) ([]*models.Position, int, error) {
+	if limit <= 0 || limit > DefaultCompanyPageSize {
+		limit = DefaultCompanyPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var totalCount int
+	countQuery := `SELECT COUNT(*) FROM positions WHERE department_id = $1`
+	if onlyOpen {
+		countQuery += ` AND is_open = true`
+	}
+
+	err := r.client.QueryRow(ctx, countQuery, departmentID).Scan(&totalCount)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to count department positions: %w", err)
+	}
+
+	query := `
+        SELECT 
+            p.position_id, p.company_id, p.title, p.is_open,
+            p.is_schedulable, p.attendance_required, p.overtime_allowed,
+            p.work_center_code, wc.name as work_center_name,
+            p.created_at, p.updated_at, d.department_name
+        FROM positions p
+        INNER JOIN departments d ON p.department_id = d.department_id
+        LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+        WHERE p.department_id = $1`
+
+	if onlyOpen {
+		query += ` AND p.is_open = true`
+	}
+
+	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
+
+	rows, err := r.client.Query(ctx, query, departmentID, limit, offset)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to query department positions: %w", err)
+	}
+	defer rows.Close()
+
+	positions := make([]*models.Position, 0, limit)
+	for rows.Next() {
+		var position models.Position
+		var departmentName string
+		var workCenterCode sql.NullString
+		var workCenterName sql.NullString
+
+		err := rows.Scan(
+			&position.PositionID, &position.CompanyID, &position.Title,
+			&position.IsOpen, &position.IsSchedulable, &position.AttendanceRequired,
+			&position.OvertimeAllowed, &workCenterCode, &workCenterName,
+			&position.CreatedAt, &position.UpdatedAt, &departmentName,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan department position row", util.ErrorField(err))
+			continue
+		}
+
+		position.DepartmentID = departmentID
+		position.DepartmentName = departmentName
+		if workCenterCode.Valid {
+			position.WorkCenterCode = &workCenterCode.String
+		}
+		if workCenterName.Valid {
+			position.WorkCenterName = &workCenterName.String
+		}
+
+		positions = append(positions, &position)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating department position rows: %w", err)
+	}
+
+	r.recordQuery()
+	return positions, totalCount, nil
+}
+
+// Updated GetPositionsByCompany function
+func (r *CompanyRepositoryImpl) GetPositionsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	limit, offset int,
+	onlyOpen bool,
+) ([]*models.Position, int, error) {
+	if limit <= 0 || limit > DefaultCompanyPageSize {
+		limit = DefaultCompanyPageSize
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var totalCount int
+	countQuery := `SELECT COUNT(*) FROM positions WHERE company_id = $1`
+	if onlyOpen {
+		countQuery += ` AND is_open = true`
+	}
+
+	err := r.client.QueryRow(ctx, countQuery, companyID).Scan(&totalCount)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
+	}
+
+	query := `
+        SELECT 
+            p.position_id, p.department_id, p.title, p.is_open,
+            p.is_schedulable, p.attendance_required, p.overtime_allowed,
+            p.work_center_code, wc.name as work_center_name,
+            p.created_at, p.updated_at
+        FROM positions p
+        LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
+        WHERE p.company_id = $1`
+
+	if onlyOpen {
+		query += ` AND p.is_open = true`
+	}
+
+	query += ` ORDER BY p.created_at DESC LIMIT $2 OFFSET $3`
+
+	rows, err := r.client.Query(ctx, query, companyID, limit, offset)
+	if err != nil {
+		r.recordError()
+		return nil, 0, fmt.Errorf("failed to query positions: %w", err)
+	}
+	defer rows.Close()
+
+	positions := make([]*models.Position, 0, limit)
+	for rows.Next() {
+		var position models.Position
+		var workCenterCode sql.NullString
+		var workCenterName sql.NullString
+
+		err := rows.Scan(
+			&position.PositionID, &position.DepartmentID, &position.Title,
+			&position.IsOpen, &position.IsSchedulable, &position.AttendanceRequired,
+			&position.OvertimeAllowed, &workCenterCode, &workCenterName,
+			&position.CreatedAt, &position.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
+			continue
+		}
+
+		position.CompanyID = companyID
+		if workCenterCode.Valid {
+			position.WorkCenterCode = &workCenterCode.String
+		}
+		if workCenterName.Valid {
+			position.WorkCenterName = &workCenterName.String
+		}
+
+		positions = append(positions, &position)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating position rows: %w", err)
+	}
+
+	r.recordQuery()
+	return positions, totalCount, nil
+}
+
+// Updated GetOpenPositions function
 func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error) {
 	start := time.Now()
-
 	if limit <= 0 {
 		limit = DefaultCompanyPageSize
 	}
@@ -7164,7 +7256,6 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 		offset = 0
 	}
 
-	// Count total
 	var countQuery string
 	var countArgs []interface{}
 	countArgs = append(countArgs, companyID)
@@ -7183,18 +7274,23 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 		return nil, 0, fmt.Errorf("failed to count positions: %w", err)
 	}
 
-	// Query positions
 	query := `
-		SELECT 
-			p.position_id, 
-			p.company_id, 
-			p.department_id, 
-			p.title, 
-			p.is_open, 
-			p.created_at, 
+		SELECT
+			p.position_id,
+			p.company_id,
+			p.department_id,
+			p.title,
+			p.is_open,
+			p.is_schedulable,
+			p.attendance_required,
+			p.overtime_allowed,
+			p.work_center_code,
+			wc.name as work_center_name,
+			p.created_at,
 			p.updated_at
 		FROM positions p
 		INNER JOIN departments d ON p.department_id = d.department_id
+		LEFT JOIN work_centers wc ON p.company_id = wc.company_id AND p.work_center_code = wc.work_center_code
 		WHERE p.company_id = $1 AND d.is_active = true
 	`
 
@@ -7221,12 +7317,20 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 	var positions []*models.Position
 	for rows.Next() {
 		var position models.Position
+		var workCenterCode sql.NullString
+		var workCenterName sql.NullString
+
 		err := rows.Scan(
 			&position.PositionID,
 			&position.CompanyID,
 			&position.DepartmentID,
 			&position.Title,
 			&position.IsOpen,
+			&position.IsSchedulable,
+			&position.AttendanceRequired,
+			&position.OvertimeAllowed,
+			&workCenterCode,
+			&workCenterName,
 			&position.CreatedAt,
 			&position.UpdatedAt,
 		)
@@ -7234,6 +7338,14 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 			r.logger.Warn("Failed to scan position row", util.ErrorField(err))
 			continue
 		}
+
+		if workCenterCode.Valid {
+			position.WorkCenterCode = &workCenterCode.String
+		}
+		if workCenterName.Valid {
+			position.WorkCenterName = &workCenterName.String
+		}
+
 		positions = append(positions, &position)
 	}
 
@@ -7250,4 +7362,274 @@ func (r *CompanyRepositoryImpl) GetOpenPositions(ctx context.Context, companyID 
 	)
 
 	return positions, totalCount, nil
+}
+
+// New: Check if work center exists
+func (r *CompanyRepositoryImpl) WorkCenterExists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM work_centers WHERE company_id = $1 AND work_center_code = $2)`
+	var exists bool
+	err := r.client.QueryRow(ctx, query, companyID, workCenterCode).Scan(&exists)
+	if err != nil {
+		r.recordError()
+		return false, fmt.Errorf("failed to check work center existence: %w", err)
+	}
+	return exists, nil
+}
+func (r *CompanyRepositoryImpl) CreateCompany(
+	ctx context.Context,
+	company *models.Company,
+	additionalDepartments []string,
+	ownerPositionTitle string,
+	positionDetails *models.Position,
+	workCenterDetails *models.WorkCenter,
+) error {
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Create the company
+	companyQuery := `
+        INSERT INTO companies (
+            company_id, company_name, owner_user_id, subscription_tier,
+            subscription_status, max_employees, max_departments, data_region,
+            is_active, created_at, updated_at, subscription_start_date, subscription_end_date
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    `
+	_, err = tx.ExecContext(ctx, companyQuery,
+		company.CompanyID, company.CompanyName, company.OwnerUserID,
+		company.SubscriptionTier, company.SubscriptionStatus,
+		company.MaxEmployees, company.MaxDepartments, company.DataRegion,
+		company.IsActive, company.CreatedAt, company.UpdatedAt,
+		company.SubscriptionStartDate, company.SubscriptionEndDate,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
+			return fmt.Errorf("company with name '%s' already exists for this owner", company.CompanyName)
+		}
+		return fmt.Errorf("failed to create company: %w", err)
+	}
+
+	// 2. Create work center if provided
+	if workCenterDetails != nil && workCenterDetails.WorkCenterCode != "" {
+		workCenterQuery := `
+            INSERT INTO work_centers (
+                work_center_code, company_id, name, 
+                description, timezone, is_active, 
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (company_id, work_center_code) DO NOTHING
+        `
+		_, err = tx.ExecContext(ctx, workCenterQuery,
+			workCenterDetails.WorkCenterCode, company.CompanyID,
+			workCenterDetails.Name, workCenterDetails.Description,
+			workCenterDetails.Timezone, workCenterDetails.IsActive,
+			company.CreatedAt, company.UpdatedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create work center: %w", err)
+		}
+	}
+
+	// 3. Create owner role (system role)
+	ownerRoleID := uuid.New()
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO roles (
+            role_id, role_name, role_level, company_id,
+            is_system_role, description, created_at, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `,
+		ownerRoleID,
+		"Owner",
+		1000,
+		company.CompanyID,
+		true,
+		"Company owner with full permissions",
+		company.CreatedAt,
+		company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create owner role: %w", err)
+	}
+
+	// 4. Get system department ID for Administration
+	var adminSystemDeptID uuid.UUID
+	err = tx.QueryRowContext(ctx, `
+        SELECT system_department_id 
+        FROM system_departments 
+        WHERE module_code = 'administration' 
+        LIMIT 1
+    `).Scan(&adminSystemDeptID)
+	if err != nil {
+		return fmt.Errorf("failed to get administration system department: %w", err)
+	}
+
+	// 5. Create Administration department (main department for owner)
+	adminDeptID := uuid.New()
+	departmentName := "Administration" // Always use "Administration" for owner's department
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO departments (
+            department_id, company_id, department_name,
+            system_department_id, is_active, created_at, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `,
+		adminDeptID,
+		company.CompanyID,
+		departmentName,
+		adminSystemDeptID,
+		true,
+		company.CreatedAt,
+		company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create administration department: %w", err)
+	}
+
+	// 6. Create owner position in Administration department
+	ownerPositionID := uuid.New()
+	positionQuery := `
+        INSERT INTO positions (
+            position_id, company_id, department_id, title,
+            is_open, is_schedulable, attendance_required,
+            overtime_allowed, work_center_code,
+            created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `
+
+	// Use the provided position details, but with Administration department ID
+	_, err = tx.ExecContext(ctx, positionQuery,
+		ownerPositionID,
+		company.CompanyID,
+		adminDeptID,        // ← This is the key: position gets Administration department ID
+		ownerPositionTitle, // Use the provided owner position title
+		positionDetails.IsOpen,
+		positionDetails.IsSchedulable,
+		positionDetails.AttendanceRequired,
+		positionDetails.OvertimeAllowed,
+		positionDetails.WorkCenterCode, // Can be NULL or work center code
+		company.CreatedAt,
+		company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create owner position: %w", err)
+	}
+
+	// 7. Create additional departments if any
+	remainingSlots := company.MaxDepartments - 1
+	if remainingSlots < 0 {
+		remainingSlots = 0
+	}
+
+	if len(additionalDepartments) > remainingSlots {
+		additionalDepartments = additionalDepartments[:remainingSlots]
+	}
+
+	ownerAccessDeptIDs := []uuid.UUID{adminDeptID}
+	ownerAccessModules := []string{"administration"}
+
+	for _, deptName := range additionalDepartments {
+		deptID := uuid.New()
+		// Get system department ID for this department
+		var systemDeptID uuid.UUID
+		err = tx.QueryRowContext(ctx, `
+            SELECT system_department_id 
+            FROM system_departments 
+            WHERE module_code = $1 
+            LIMIT 1
+        `, strings.ToLower(strings.TrimSpace(deptName))).Scan(&systemDeptID)
+		if err != nil {
+			// Default to operations if not found
+			systemDeptID = adminSystemDeptID
+		}
+
+		_, err = tx.ExecContext(ctx, `
+            INSERT INTO departments (
+                department_id, company_id, department_name,
+                system_department_id, is_active, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `,
+			deptID,
+			company.CompanyID,
+			deptName,
+			systemDeptID,
+			true,
+			company.CreatedAt,
+			company.UpdatedAt,
+		)
+		if err != nil {
+			r.logger.Warn("department creation failed",
+				util.String("department", deptName),
+				util.ErrorField(err))
+			continue
+		}
+
+		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
+		// Add module based on system department
+		if systemDeptID == adminSystemDeptID {
+			ownerAccessModules = append(ownerAccessModules, "administration")
+		} else {
+			ownerAccessModules = append(ownerAccessModules, strings.ToLower(deptName))
+		}
+	}
+
+	// 8. Link owner role to all departments
+	for _, deptID := range ownerAccessDeptIDs {
+		_, _ = tx.ExecContext(ctx,
+			`INSERT INTO role_departments (role_id, department_id) VALUES ($1,$2)`,
+			ownerRoleID,
+			deptID,
+		)
+	}
+
+	// 9. Grant all permissions for the modules the owner has access to
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO role_permissions (role_id, permission_id, granted_by, granted_at)
+        SELECT $1, p.permission_id, $2, $3
+        FROM permissions p
+        WHERE p.module = ANY($4)
+    `,
+		ownerRoleID,
+		company.OwnerUserID,
+		company.CreatedAt,
+		pq.Array(ownerAccessModules),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to grant permissions: %w", err)
+	}
+
+	// 10. Create owner employee record
+	_, err = tx.ExecContext(ctx, `
+        INSERT INTO company_employees (
+            company_id, user_id, employee_id,
+            role_id, position_id,
+            hire_date, is_active, created_at, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    `,
+		company.CompanyID,
+		company.OwnerUserID,
+		"OWNER-"+company.CompanyID.String()[:8],
+		ownerRoleID,
+		ownerPositionID,
+		company.CreatedAt,
+		true,
+		company.CreatedAt,
+		company.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert owner employee: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	r.logger.Info("Company created successfully",
+		util.String("company_id", company.CompanyID.String()),
+		util.Int("max_departments", company.MaxDepartments),
+		util.Int("departments_created", len(ownerAccessDeptIDs)),
+		util.String("owner_department_id", adminDeptID.String()),
+		util.String("owner_position_id", ownerPositionID.String()),
+	)
+	return nil
 }

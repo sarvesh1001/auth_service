@@ -1958,96 +1958,96 @@ func (h *AdminHandler) respondWithError(w http.ResponseWriter, statusCode int, e
 }
 
 // ==================== Company Management Methods (Maintained from original) ====================
-type CreateCompanyRequest struct {
-	CompanyName        string `json:"company_name" validate:"required"`
-	OwnerPhone         string `json:"owner_phone" validate:"required"`
-	OwnerUsername      string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
-	OwnerFullName      string `json:"owner_full_name" validate:"required,max=255"`
-	OwnerPositionTitle string `json:"owner_position_title" validate:"required,max=255"`
-	SubscriptionTier   string `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
-	MaxEmployees       int    `json:"max_employees" validate:"required,min=1,max=2000"`
+// type CreateCompanyRequest struct {
+// 	CompanyName        string `json:"company_name" validate:"required"`
+// 	OwnerPhone         string `json:"owner_phone" validate:"required"`
+// 	OwnerUsername      string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
+// 	OwnerFullName      string `json:"owner_full_name" validate:"required,max=255"`
+// 	OwnerPositionTitle string `json:"owner_position_title" validate:"required,max=255"`
+// 	SubscriptionTier   string `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
+// 	MaxEmployees       int    `json:"max_employees" validate:"required,min=1,max=2000"`
 
-	// ✅ NEW (matches service + repo)
-	MaxDepartments int `json:"max_departments" validate:"required,min=1,max=100"`
+// 	// ✅ NEW (matches service + repo)
+// 	MaxDepartments int `json:"max_departments" validate:"required,min=1,max=100"`
 
-	DataRegion         string   `json:"data_region" validate:"required"`
-	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
-	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
-	Departments        []string `json:"departments"`
-}
+// 	DataRegion         string   `json:"data_region" validate:"required"`
+// 	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
+// 	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
+// 	Departments        []string `json:"departments"`
+// }
 
-func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
+// func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+// 	startTime := time.Now()
 
-	adminID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
-		return
-	}
+// 	adminID, err := h.getRequesterAdminID(r)
+// 	if err != nil {
+// 		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+// 		return
+// 	}
 
-	var req CreateCompanyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
+// 	var req CreateCompanyRequest
+// 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+// 		return
+// 	}
 
-	// Manual validation
-	if err := validateCreateCompanyRequest(req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
-		return
-	}
+// 	// Manual validation
+// 	if err := validateCreateCompanyRequest(req); err != nil {
+// 		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
+// 		return
+// 	}
 
-	companyReq := service.CreateCompanyRequest{
-		CompanyName:        req.CompanyName,
-		OwnerPhone:         req.OwnerPhone,
-		OwnerUsername:      req.OwnerUsername,
-		OwnerFullName:      req.OwnerFullName,
-		OwnerPositionTitle: req.OwnerPositionTitle,
-		SubscriptionTier:   req.SubscriptionTier,
-		MaxEmployees:       req.MaxEmployees,
-		MaxDepartments:     req.MaxDepartments, // ✅ NEW
-		DataRegion:         req.DataRegion,
-		SubscriptionMonths: req.SubscriptionMonths,
-		SubscriptionDays:   req.SubscriptionDays,
-		Departments:        req.Departments,
-	}
+// 	companyReq := service.CreateCompanyRequest{
+// 		CompanyName:        req.CompanyName,
+// 		OwnerPhone:         req.OwnerPhone,
+// 		OwnerUsername:      req.OwnerUsername,
+// 		OwnerFullName:      req.OwnerFullName,
+// 		OwnerPositionTitle: req.OwnerPositionTitle,
+// 		SubscriptionTier:   req.SubscriptionTier,
+// 		MaxEmployees:       req.MaxEmployees,
+// 		MaxDepartments:     req.MaxDepartments, // ✅ NEW
+// 		DataRegion:         req.DataRegion,
+// 		SubscriptionMonths: req.SubscriptionMonths,
+// 		SubscriptionDays:   req.SubscriptionDays,
+// 		Departments:        req.Departments,
+// 	}
 
-	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
-	if err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			h.respondWithError(w, http.StatusConflict, err, "Company already exists for this owner")
-			return
-		}
-		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create company")
-		return
-	}
+// 	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
+// 	if err != nil {
+// 		if strings.Contains(err.Error(), "already exists") {
+// 			h.respondWithError(w, http.StatusConflict, err, "Company already exists for this owner")
+// 			return
+// 		}
+// 		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create company")
+// 		return
+// 	}
 
-	response := map[string]interface{}{
-		"success": true,
-		"message": "Company created successfully with RBAC setup",
-		"data": map[string]interface{}{
-			"company_id":        company.CompanyID.String(),
-			"company_name":      company.CompanyName,
-			"owner_phone":       req.OwnerPhone,
-			"owner_user_id":     company.OwnerUserID.String(),
-			"subscription_tier": company.SubscriptionTier,
-			"max_departments":   company.MaxDepartments,
-			"departments":       len(req.Departments) + 1, // incl. Administration
-			"created_at":        company.CreatedAt,
-		},
-	}
+// 	response := map[string]interface{}{
+// 		"success": true,
+// 		"message": "Company created successfully with RBAC setup",
+// 		"data": map[string]interface{}{
+// 			"company_id":        company.CompanyID.String(),
+// 			"company_name":      company.CompanyName,
+// 			"owner_phone":       req.OwnerPhone,
+// 			"owner_user_id":     company.OwnerUserID.String(),
+// 			"subscription_tier": company.SubscriptionTier,
+// 			"max_departments":   company.MaxDepartments,
+// 			"departments":       len(req.Departments) + 1, // incl. Administration
+// 			"created_at":        company.CreatedAt,
+// 		},
+// 	}
 
-	h.respondWithJSON(w, http.StatusCreated, response)
+// 	h.respondWithJSON(w, http.StatusCreated, response)
 
-	h.logger.Info("Company created by admin",
-		util.String("company_id", company.CompanyID.String()),
-		util.String("company_name", company.CompanyName),
-		util.Int("max_departments", req.MaxDepartments),
-		util.String("created_by", adminID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
+// 	h.logger.Info("Company created by admin",
+// 		util.String("company_id", company.CompanyID.String()),
+// 		util.String("company_name", company.CompanyName),
+// 		util.Int("max_departments", req.MaxDepartments),
+// 		util.String("created_by", adminID.String()),
+// 		util.Duration("duration", time.Since(startTime)),
+// 	)
+// }
 
 // Helper function for manual validation
 func validateCreateCompanyRequest(req CreateCompanyRequest) error {
@@ -6903,47 +6903,6 @@ func (h *AdminHandler) UpdateAdminUserRole(w http.ResponseWriter, r *http.Reques
 // ==================== Position Management Handlers ====================
 
 // CreatePosition creates a new position in a company
-func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	var req service.CreatePositionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Set company ID from URL path
-	req.CompanyID = companyID
-
-	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to create position")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, successResponse(position, "Position created successfully"))
-	h.logger.Info("Position created",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", position.PositionID.String()),
-		util.String("created_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
 
 // GetPosition retrieves a position by ID
 func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
@@ -7019,87 +6978,6 @@ func (h *AdminHandler) GetPosition(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListPositions lists positions with filtering
-func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	// Parse query parameters
-	limit := h.getIntQueryParam(r, "limit", 50)
-	offset := h.getIntQueryParam(r, "offset", 0)
-	onlyOpen := h.getBoolQueryParam(r, "only_open", false)
-
-	var departmentID *uuid.UUID
-	if deptIDStr := r.URL.Query().Get("department_id"); deptIDStr != "" {
-		deptID, err := uuid.Parse(deptIDStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
-			return
-		}
-		departmentID = &deptID
-	}
-
-	h.logger.Debug(
-		"ListPositions request received",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.Bool("only_open", onlyOpen),
-		util.Int("limit", limit),
-		util.Int("offset", offset),
-		func() zap.Field {
-			if departmentID != nil {
-				return util.String("department_id", departmentID.String())
-			}
-			return util.String("department_id", "all")
-		}(),
-	)
-
-	positions, total, err := h.companyService.ListPositions(
-		ctx, companyID, departmentID, onlyOpen, limit, offset,
-	)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to list positions")
-		return
-	}
-
-	response := map[string]interface{}{
-		"positions": positions,
-		"meta": map[string]interface{}{
-			"total":  total,
-			"limit":  limit,
-			"offset": offset,
-			"count":  len(positions),
-		},
-	}
-
-	h.respondWithJSON(
-		w,
-		http.StatusOK,
-		successResponse(response, "Positions listed successfully"),
-	)
-
-	h.logger.Info(
-		"Positions listed successfully",
-		util.String("requested_by", requesterID.String()),
-		util.String("company_id", companyID.String()),
-		util.Int("total", total),
-		util.Int("returned_count", len(positions)),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
 
 // DeletePosition deletes a position
 func (h *AdminHandler) DeletePosition(w http.ResponseWriter, r *http.Request) {
@@ -7157,69 +7035,6 @@ func (h *AdminHandler) DeletePosition(w http.ResponseWriter, r *http.Request) {
 }
 
 // UpdatePositionStatus updates the open/closed status of a position
-func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	startTime := time.Now()
-
-	requesterID, err := h.getRequesterAdminID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
-		return
-	}
-
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
-		return
-	}
-
-	positionIDStr := chi.URLParam(r, "positionID")
-	positionID, err := uuid.Parse(positionIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
-		return
-	}
-
-	var req struct {
-		IsOpen bool `json:"is_open"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
-		return
-	}
-
-	// Get existing position to verify company
-	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
-	if err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Position not found")
-		return
-	}
-
-	if existingPosition.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden,
-			errors.New("position does not belong to company"),
-			"Cannot update position in another company")
-		return
-	}
-
-	if err := h.companyService.UpdatePositionStatus(ctx, positionID, req.IsOpen, requesterID); err != nil {
-		statusCode := h.getStatusCode(err)
-		h.respondWithError(w, statusCode, err, "Failed to update position status")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position status updated successfully"))
-	h.logger.Info("Position status updated",
-		util.String("company_id", companyID.String()),
-		util.String("position_id", positionID.String()),
-		util.Bool("is_open", req.IsOpen),
-		util.String("updated_by", requesterID.String()),
-		util.Duration("duration", time.Since(startTime)),
-	)
-}
 
 // ==================== Department Hierarchy Handlers ====================
 
@@ -8185,11 +8000,344 @@ func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.R
 // handler/admin_handler.go
 // Add these methods to the AdminHandler struct
 
+// Updated CreatePosition handler
+func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	var req service.CreatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.CompanyID = companyID
+
+	// Set default values if not provided
+	if req.IsSchedulable == false && !r.Body.(*util.RequestBodyTracker).FieldExists("is_schedulable") {
+		req.IsSchedulable = true
+	}
+	if req.AttendanceRequired == false && !r.Body.(*util.RequestBodyTracker).FieldExists("attendance_required") {
+		req.AttendanceRequired = true
+	}
+	if req.OvertimeAllowed == true && !r.Body.(*util.RequestBodyTracker).FieldExists("overtime_allowed") {
+		req.OvertimeAllowed = false
+	}
+
+	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to create position")
+		return
+	}
+
+	response := map[string]interface{}{
+		"position_id":         position.PositionID.String(),
+		"title":               position.Title,
+		"department_id":       position.DepartmentID.String(),
+		"company_id":          position.CompanyID.String(),
+		"is_open":             position.IsOpen,
+		"is_schedulable":      position.IsSchedulable,
+		"attendance_required": position.AttendanceRequired,
+		"overtime_allowed":    position.OvertimeAllowed,
+		"work_center_code":    position.WorkCenterCode,
+		"created_at":          position.CreatedAt,
+		"updated_at":          position.UpdatedAt,
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, successResponse(response, "Position created successfully"))
+
+	h.logger.Info("Position created",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", position.PositionID.String()),
+		util.String("created_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// Updated GetPosition handler remains the same (just returns additional fields)
+
+// Updated ListPositions handler response
+func (h *AdminHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	limit := h.getIntQueryParam(r, "limit", 50)
+	offset := h.getIntQueryParam(r, "offset", 0)
+	onlyOpen := h.getBoolQueryParam(r, "only_open", false)
+
+	var departmentID *uuid.UUID
+	if deptIDStr := r.URL.Query().Get("department_id"); deptIDStr != "" {
+		deptID, err := uuid.Parse(deptIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid department ID")
+			return
+		}
+		departmentID = &deptID
+	}
+
+	h.logger.Debug(
+		"ListPositions request received",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.Bool("only_open", onlyOpen),
+		util.Int("limit", limit),
+		util.Int("offset", offset),
+		func() zap.Field {
+			if departmentID != nil {
+				return util.String("department_id", departmentID.String())
+			}
+			return util.String("department_id", "all")
+		}(),
+	)
+
+	positions, total, err := h.companyService.ListPositions(
+		ctx, companyID, departmentID, onlyOpen, limit, offset,
+	)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to list positions")
+		return
+	}
+
+	positionResponses := make([]map[string]interface{}, len(positions))
+	for i, pos := range positions {
+		positionResponses[i] = map[string]interface{}{
+			"position_id":         pos.PositionID.String(),
+			"title":               pos.Title,
+			"department_id":       pos.DepartmentID.String(),
+			"department_name":     pos.DepartmentName,
+			"company_id":          pos.CompanyID.String(),
+			"is_open":             pos.IsOpen,
+			"is_schedulable":      pos.IsSchedulable,
+			"attendance_required": pos.AttendanceRequired,
+			"overtime_allowed":    pos.OvertimeAllowed,
+			"work_center_code":    pos.WorkCenterCode,
+			"work_center_name":    pos.WorkCenterName,
+			"created_at":          pos.CreatedAt,
+			"updated_at":          pos.UpdatedAt,
+		}
+	}
+
+	response := map[string]interface{}{
+		"positions": positionResponses,
+		"meta": map[string]interface{}{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+			"count":  len(positions),
+		},
+	}
+
+	h.respondWithJSON(
+		w,
+		http.StatusOK,
+		successResponse(response, "Positions listed successfully"),
+	)
+
+	h.logger.Info(
+		"Positions listed successfully",
+		util.String("requested_by", requesterID.String()),
+		util.String("company_id", companyID.String()),
+		util.Int("total", total),
+		util.Int("returned_count", len(positions)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// New UpdatePosition handler (for full updates)
+func (h *AdminHandler) UpdatePosition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	var req service.UpdatePositionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	req.PositionID = positionID
+
+	// Validate position belongs to company
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Position not found")
+		return
+	}
+
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("position does not belong to company"),
+			"Cannot update position in another company")
+		return
+	}
+
+	if err := h.companyService.UpdatePosition(ctx, &req, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update position")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position updated successfully"))
+
+	h.logger.Info("Position updated",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+		util.String("updated_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// Updated UpdatePositionStatus handler (now handles partial updates)
+func (h *AdminHandler) UpdatePositionStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	requesterID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Unauthorized")
+		return
+	}
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+		return
+	}
+
+	positionIDStr := chi.URLParam(r, "positionID")
+	positionID, err := uuid.Parse(positionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid position ID")
+		return
+	}
+
+	var req struct {
+		IsOpen             *bool   `json:"is_open,omitempty"`
+		IsSchedulable      *bool   `json:"is_schedulable,omitempty"`
+		AttendanceRequired *bool   `json:"attendance_required,omitempty"`
+		OvertimeAllowed    *bool   `json:"overtime_allowed,omitempty"`
+		WorkCenterCode     *string `json:"work_center_code,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Validate position belongs to company
+	existingPosition, err := h.companyService.GetPosition(ctx, positionID)
+	if err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Position not found")
+		return
+	}
+
+	if existingPosition.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden,
+			errors.New("position does not belong to company"),
+			"Cannot update position in another company")
+		return
+	}
+
+	// Create update request
+	updateReq := &service.UpdatePositionRequest{
+		PositionID:         positionID,
+		Title:              existingPosition.Title,
+		DepartmentID:       existingPosition.DepartmentID,
+		IsOpen:             existingPosition.IsOpen,
+		IsSchedulable:      &existingPosition.IsSchedulable,
+		AttendanceRequired: &existingPosition.AttendanceRequired,
+		OvertimeAllowed:    &existingPosition.OvertimeAllowed,
+		WorkCenterCode:     existingPosition.WorkCenterCode,
+	}
+
+	// Update only provided fields
+	if req.IsOpen != nil {
+		updateReq.IsOpen = *req.IsOpen
+	}
+	if req.IsSchedulable != nil {
+		updateReq.IsSchedulable = req.IsSchedulable
+	}
+	if req.AttendanceRequired != nil {
+		updateReq.AttendanceRequired = req.AttendanceRequired
+	}
+	if req.OvertimeAllowed != nil {
+		updateReq.OvertimeAllowed = req.OvertimeAllowed
+	}
+	if req.WorkCenterCode != nil {
+		updateReq.WorkCenterCode = req.WorkCenterCode
+	}
+
+	if err := h.companyService.UpdatePosition(ctx, updateReq, requesterID); err != nil {
+		statusCode := h.getStatusCode(err)
+		h.respondWithError(w, statusCode, err, "Failed to update position status")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, successResponse(nil, "Position status updated successfully"))
+
+	h.logger.Info("Position status updated",
+		util.String("company_id", companyID.String()),
+		util.String("position_id", positionID.String()),
+		util.String("updated_by", requesterID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+// Updated GetOpenPositions handler
 func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
 
-	// Get company ID from context or query
 	companyIDStr := r.URL.Query().Get("company_id")
 	if companyIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest,
@@ -8204,7 +8352,6 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse optional parameters
 	var isOpen *bool
 	if isOpenStr := r.URL.Query().Get("is_open"); isOpenStr != "" {
 		openVal, err := strconv.ParseBool(isOpenStr)
@@ -8216,7 +8363,6 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 	limit := h.getIntQueryParam(r, "limit", 50)
 	offset := h.getIntQueryParam(r, "offset", 0)
 
-	// Get open positions
 	positions, total, err := h.companyService.GetOpenPositions(ctx, companyID, isOpen, limit, offset)
 	if err != nil {
 		statusCode := h.getStatusCode(err)
@@ -8224,17 +8370,21 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Format response
 	positionResponses := make([]map[string]interface{}, len(positions))
 	for i, pos := range positions {
 		positionResponses[i] = map[string]interface{}{
-			"position_id":   pos.PositionID.String(),
-			"title":         pos.Title,
-			"is_open":       pos.IsOpen,
-			"department_id": pos.DepartmentID.String(),
-			"company_id":    pos.CompanyID.String(),
-			"created_at":    pos.CreatedAt,
-			"updated_at":    pos.UpdatedAt,
+			"position_id":         pos.PositionID.String(),
+			"title":               pos.Title,
+			"is_open":             pos.IsOpen,
+			"is_schedulable":      pos.IsSchedulable,
+			"attendance_required": pos.AttendanceRequired,
+			"overtime_allowed":    pos.OvertimeAllowed,
+			"work_center_code":    pos.WorkCenterCode,
+			"work_center_name":    pos.WorkCenterName,
+			"department_id":       pos.DepartmentID.String(),
+			"company_id":          pos.CompanyID.String(),
+			"created_at":          pos.CreatedAt,
+			"updated_at":          pos.UpdatedAt,
 		}
 	}
 
@@ -8253,6 +8403,112 @@ func (h *AdminHandler) GetOpenPositions(w http.ResponseWriter, r *http.Request) 
 	h.logger.Info("Open positions retrieved",
 		util.String("company_id", companyID.String()),
 		util.Int("count", len(positions)),
+		util.Duration("duration", time.Since(startTime)),
+	)
+}
+
+type CreateCompanyRequest struct {
+	CompanyName        string `json:"company_name" validate:"required,max=255"`
+	OwnerPhone         string `json:"owner_phone" validate:"required"`
+	OwnerUsername      string `json:"owner_username" validate:"required,min=3,max=100,alphanum"`
+	OwnerFullName      string `json:"owner_full_name" validate:"required,max=255"`
+	OwnerPositionTitle string `json:"owner_position_title" validate:"required,max=255"`
+
+	SubscriptionTier string `json:"subscription_tier" validate:"required,oneof=basic premium enterprise"`
+	MaxEmployees     int    `json:"max_employees" validate:"required,min=1,max=2000"`
+	MaxDepartments   int    `json:"max_departments" validate:"required,min=1,max=100"`
+
+	DataRegion         string   `json:"data_region" validate:"required"`
+	SubscriptionMonths int      `json:"subscription_months" validate:"required,min=1,max=36"`
+	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
+	Departments        []string `json:"departments"`
+
+	// 🏭 Work Center (mandatory now)
+	WorkCenterCode   string  `json:"work_center_code" validate:"required,max=100"`
+	WorkCenterName   string  `json:"work_center_name" validate:"required,max=255"`
+	WorkCenterDesc   *string `json:"work_center_description,omitempty"`
+	WorkCenterTZ     string  `json:"work_center_timezone" validate:"required"`
+	WorkCenterActive bool    `json:"work_center_is_active"`
+
+	// 👤 Owner position overrides (optional)
+	PositionWorkCenterCode *string `json:"position_work_center_code,omitempty"`
+}
+
+func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	startTime := time.Now()
+
+	adminID, err := h.getRequesterAdminID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err, "Admin authentication required")
+		return
+	}
+
+	var req CreateCompanyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Invalid request body")
+		return
+	}
+
+	// Validation
+	if err := validateCreateCompanyRequest(req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err, "Validation failed")
+		return
+	}
+
+	companyReq := service.CreateCompanyRequest{
+		CompanyName:        req.CompanyName,
+		OwnerPhone:         req.OwnerPhone,
+		OwnerUsername:      req.OwnerUsername,
+		OwnerFullName:      req.OwnerFullName,
+		OwnerPositionTitle: req.OwnerPositionTitle,
+		SubscriptionTier:   req.SubscriptionTier,
+		MaxEmployees:       req.MaxEmployees,
+		MaxDepartments:     req.MaxDepartments,
+		DataRegion:         req.DataRegion,
+		SubscriptionMonths: req.SubscriptionMonths,
+		SubscriptionDays:   req.SubscriptionDays,
+		Departments:        req.Departments,
+
+		// Work center
+		WorkCenterCode:   req.WorkCenterCode,
+		WorkCenterName:   req.WorkCenterName,
+		WorkCenterDesc:   req.WorkCenterDesc,
+		WorkCenterTZ:     req.WorkCenterTZ,
+		WorkCenterActive: req.WorkCenterActive,
+
+		// Owner position
+		PositionWorkCenterCode: req.PositionWorkCenterCode,
+	}
+
+	company, err := h.companyService.CreateCompany(ctx, &companyReq, adminID)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			h.respondWithError(w, http.StatusConflict, err, "Company already exists for this owner")
+			return
+		}
+		h.respondWithError(w, h.getStatusCode(err), err, "Failed to create company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": "Company created successfully",
+		"data": map[string]interface{}{
+			"company_id":        company.CompanyID.String(),
+			"company_name":      company.CompanyName,
+			"owner_user_id":     company.OwnerUserID.String(),
+			"subscription_tier": company.SubscriptionTier,
+			"max_departments":   company.MaxDepartments,
+			"departments":       len(req.Departments) + 1, // incl Administration
+			"created_at":        company.CreatedAt,
+		},
+	})
+
+	h.logger.Info("Company created by admin",
+		util.String("company_id", company.CompanyID.String()),
+		util.String("company_name", company.CompanyName),
+		util.String("created_by", adminID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)
 }

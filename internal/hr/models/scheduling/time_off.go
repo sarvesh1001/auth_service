@@ -93,3 +93,28 @@ type ScheduleOverrideUpdate struct {
 	OverrideType *string `json:"override_type,omitempty"`
 	Reason       *string `json:"reason,omitempty"`
 }
+
+type UserWorkCenterAssignment struct {
+	AssignmentID   uuid.UUID  `db:"assignment_id" json:"assignment_id"`
+	CompanyID      uuid.UUID  `db:"company_id" json:"company_id"`
+	UserID         uuid.UUID  `db:"user_id" json:"user_id"`
+	WorkCenterCode string     `db:"work_center_code" json:"work_center_code"`
+	EffectiveFrom  time.Time  `db:"effective_from" json:"effective_from"`
+	EffectiveTo    *time.Time `db:"effective_to" json:"effective_to,omitempty"`
+	IsActive       bool       `db:"is_active" json:"is_active"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+}
+type WorkCenterShiftMapping struct {
+	MappingID      uuid.UUID  `db:"mapping_id" json:"mapping_id"`
+	CompanyID      uuid.UUID  `db:"company_id" json:"company_id"`
+	WorkCenterCode string     `db:"work_center_code" json:"work_center_code"`
+	ShiftID        uuid.UUID  `db:"shift_id" json:"shift_id"`
+	EffectiveFrom  time.Time  `db:"effective_from" json:"effective_from"`
+	EffectiveTo    *time.Time `db:"effective_to" json:"effective_to,omitempty"`
+	IsActive       bool       `db:"is_active" json:"is_active"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+}
+type WorkCenterShiftMappingUpdate struct {
+	ShiftID     *uuid.UUID `json:"shift_id,omitempty"`
+	EffectiveTo *time.Time `json:"effective_to,omitempty"`
+}

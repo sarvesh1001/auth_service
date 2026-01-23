@@ -74,115 +74,115 @@ func (s *CompanyService) GetPermissionsFromContext(ctx context.Context) ([]strin
 	return rbac.GetPermissionsFromMask(permissionMask), nil
 }
 
-type CreateCompanyRequest struct {
-	CompanyName        string   `json:"company_name"`
-	OwnerPhone         string   `json:"owner_phone"`
-	OwnerUsername      string   `json:"owner_username"`
-	OwnerFullName      string   `json:"owner_full_name"`
-	OwnerPositionTitle string   `json:"owner_position_title"`
-	SubscriptionTier   string   `json:"subscription_tier"`
-	MaxEmployees       int      `json:"max_employees"`
-	MaxDepartments     int      `json:"max_departments"`
-	DataRegion         string   `json:"data_region"`
-	SubscriptionMonths int      `json:"subscription_months"`
-	SubscriptionDays   int      `json:"subscription_days"`
-	Departments        []string `json:"departments"`
-}
+// type CreateCompanyRequest struct {
+// 	CompanyName        string   `json:"company_name"`
+// 	OwnerPhone         string   `json:"owner_phone"`
+// 	OwnerUsername      string   `json:"owner_username"`
+// 	OwnerFullName      string   `json:"owner_full_name"`
+// 	OwnerPositionTitle string   `json:"owner_position_title"`
+// 	SubscriptionTier   string   `json:"subscription_tier"`
+// 	MaxEmployees       int      `json:"max_employees"`
+// 	MaxDepartments     int      `json:"max_departments"`
+// 	DataRegion         string   `json:"data_region"`
+// 	SubscriptionMonths int      `json:"subscription_months"`
+// 	SubscriptionDays   int      `json:"subscription_days"`
+// 	Departments        []string `json:"departments"`
+// }
 
-func (s *CompanyService) CreateCompany(
-	ctx context.Context,
-	req *CreateCompanyRequest,
-	createdBy uuid.UUID,
-) (*models.Company, error) {
-	start := time.Now()
+// func (s *CompanyService) CreateCompany(
+// 	ctx context.Context,
+// 	req *CreateCompanyRequest,
+// 	createdBy uuid.UUID,
+// ) (*models.Company, error) {
+// 	start := time.Now()
 
-	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
-		return nil, fmt.Errorf("max_departments must be between 1 and 100")
-	}
+// 	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
+// 		return nil, fmt.Errorf("max_departments must be between 1 and 100")
+// 	}
 
-	totalDepartments := len(req.Departments) + 1
-	if totalDepartments > req.MaxDepartments {
-		return nil, fmt.Errorf(
-			"cannot create company: requested %d departments exceeds max_departments limit of %d",
-			totalDepartments,
-			req.MaxDepartments,
-		)
-	}
+// 	totalDepartments := len(req.Departments) + 1
+// 	if totalDepartments > req.MaxDepartments {
+// 		return nil, fmt.Errorf(
+// 			"cannot create company: requested %d departments exceeds max_departments limit of %d",
+// 			totalDepartments,
+// 			req.MaxDepartments,
+// 		)
+// 	}
 
-	var ownerUser *models.User
-	existingUser, err := s.userService.GetUserByPhone(ctx, req.OwnerPhone)
-	if err != nil {
-		ownerUser, err = s.createOrFindUserForCompanyOwner(ctx, req)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create user for company owner: %w", err)
-		}
-	} else {
-		ownerUser = existingUser
-		s.logger.Info("Using existing user for company creation",
-			util.String("phone", req.OwnerPhone),
-			util.String("existing_username", ownerUser.Username),
-			util.String("provided_username", req.OwnerUsername),
-			util.String("existing_full_name", ownerUser.FullName),
-			util.String("provided_full_name", req.OwnerFullName),
-		)
-	}
+// 	var ownerUser *models.User
+// 	existingUser, err := s.userService.GetUserByPhone(ctx, req.OwnerPhone)
+// 	if err != nil {
+// 		ownerUser, err = s.createOrFindUserForCompanyOwner(ctx, req)
+// 		if err != nil {
+// 			return nil, fmt.Errorf("failed to create user for company owner: %w", err)
+// 		}
+// 	} else {
+// 		ownerUser = existingUser
+// 		s.logger.Info("Using existing user for company creation",
+// 			util.String("phone", req.OwnerPhone),
+// 			util.String("existing_username", ownerUser.Username),
+// 			util.String("provided_username", req.OwnerUsername),
+// 			util.String("existing_full_name", ownerUser.FullName),
+// 			util.String("provided_full_name", req.OwnerFullName),
+// 		)
+// 	}
 
-	exists, err := s.companyRepo.CheckCompanyExists(ctx, req.CompanyName, ownerUser.UserID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate company: %w", err)
-	}
-	if exists {
-		return nil, fmt.Errorf(
-			"company with name '%s' already exists for this owner",
-			req.CompanyName,
-		)
-	}
+// 	exists, err := s.companyRepo.CheckCompanyExists(ctx, req.CompanyName, ownerUser.UserID)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to validate company: %w", err)
+// 	}
+// 	if exists {
+// 		return nil, fmt.Errorf(
+// 			"company with name '%s' already exists for this owner",
+// 			req.CompanyName,
+// 		)
+// 	}
 
-	companyID := uuid.New()
-	now := time.Now().UTC()
-	subscriptionEnd := now.AddDate(0, req.SubscriptionMonths, req.SubscriptionDays)
+// 	companyID := uuid.New()
+// 	now := time.Now().UTC()
+// 	subscriptionEnd := now.AddDate(0, req.SubscriptionMonths, req.SubscriptionDays)
 
-	company := &models.Company{
-		CompanyID:             companyID,
-		CompanyName:           req.CompanyName,
-		OwnerUserID:           ownerUser.UserID,
-		SubscriptionTier:      req.SubscriptionTier,
-		SubscriptionStatus:    models.SubscriptionStatusActive,
-		MaxEmployees:          req.MaxEmployees,
-		MaxDepartments:        req.MaxDepartments,
-		DataRegion:            req.DataRegion,
-		IsActive:              true,
-		CreatedAt:             now,
-		UpdatedAt:             now,
-		SubscriptionStartDate: &now,
-		SubscriptionEndDate:   &subscriptionEnd,
-	}
+// 	company := &models.Company{
+// 		CompanyID:             companyID,
+// 		CompanyName:           req.CompanyName,
+// 		OwnerUserID:           ownerUser.UserID,
+// 		SubscriptionTier:      req.SubscriptionTier,
+// 		SubscriptionStatus:    models.SubscriptionStatusActive,
+// 		MaxEmployees:          req.MaxEmployees,
+// 		MaxDepartments:        req.MaxDepartments,
+// 		DataRegion:            req.DataRegion,
+// 		IsActive:              true,
+// 		CreatedAt:             now,
+// 		UpdatedAt:             now,
+// 		SubscriptionStartDate: &now,
+// 		SubscriptionEndDate:   &subscriptionEnd,
+// 	}
 
-	if err := s.companyRepo.CreateCompany(
-		ctx,
-		company,
-		req.Departments,
-		req.OwnerPositionTitle,
-	); err != nil {
-		return nil, fmt.Errorf("failed to create company: %w", err)
-	}
+// 	if err := s.companyRepo.CreateCompany(
+// 		ctx,
+// 		company,
+// 		req.Departments,
+// 		req.OwnerPositionTitle,
+// 	); err != nil {
+// 		return nil, fmt.Errorf("failed to create company: %w", err)
+// 	}
 
-	s.logger.Info("Company created successfully by admin",
-		util.String("company_id", companyID.String()),
-		util.String("company_name", req.CompanyName),
-		util.String("owner_user_id", ownerUser.UserID.String()),
-		util.String("owner_username", ownerUser.Username),
-		util.String("owner_phone", req.OwnerPhone),
-		util.String("owner_position_title", req.OwnerPositionTitle),
-		util.String("created_by", createdBy.String()),
-		util.String("subscription_tier", req.SubscriptionTier),
-		util.Int("max_departments", req.MaxDepartments),
-		util.Int("initial_departments", totalDepartments),
-		util.Duration("duration", time.Since(start)),
-	)
+// 	s.logger.Info("Company created successfully by admin",
+// 		util.String("company_id", companyID.String()),
+// 		util.String("company_name", req.CompanyName),
+// 		util.String("owner_user_id", ownerUser.UserID.String()),
+// 		util.String("owner_username", ownerUser.Username),
+// 		util.String("owner_phone", req.OwnerPhone),
+// 		util.String("owner_position_title", req.OwnerPositionTitle),
+// 		util.String("created_by", createdBy.String()),
+// 		util.String("subscription_tier", req.SubscriptionTier),
+// 		util.Int("max_departments", req.MaxDepartments),
+// 		util.Int("initial_departments", totalDepartments),
+// 		util.Duration("duration", time.Since(start)),
+// 	)
 
-	return company, nil
-}
+// 	return company, nil
+// }
 
 func (s *CompanyService) createOrFindUserForCompanyOwner(ctx context.Context, req *CreateCompanyRequest) (*models.User, error) {
 	user, err := s.userService.CreateUser(ctx, &UserCreateRequest{
@@ -2993,98 +2993,6 @@ func (s *CompanyService) validateDepartmentHead(ctx context.Context, companyID u
 	return nil
 }
 
-type CreatePositionRequest struct {
-	CompanyID    uuid.UUID `json:"company_id" validate:"required"`
-	DepartmentID uuid.UUID `json:"department_id" validate:"required"`
-	Title        string    `json:"title" validate:"required,min=1,max=255"`
-	IsOpen       bool      `json:"is_open" default:"true"`
-}
-
-type UpdatePositionRequest struct {
-	PositionID   uuid.UUID `json:"position_id" validate:"required"`
-	Title        string    `json:"title" validate:"required,min=1,max=255"`
-	DepartmentID uuid.UUID `json:"department_id" validate:"required"`
-	IsOpen       bool      `json:"is_open"`
-}
-
-func (s *CompanyService) CreatePosition(
-	ctx context.Context,
-	req *CreatePositionRequest,
-	createdBy uuid.UUID,
-) (*models.Position, error) {
-	department, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
-	if err != nil {
-		return nil, fmt.Errorf("department not found: %w", err)
-	}
-
-	if department.CompanyID != req.CompanyID {
-		return nil, fmt.Errorf("department does not belong to company")
-	}
-
-	userID, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return nil, fmt.Errorf("user ID not found in context")
-	}
-
-	parsedUserID, err := uuid.Parse(userID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid user ID in context")
-	}
-
-	hasAccess, err := s.ValidateUserAccessToDepartment(
-		ctx,
-		req.CompanyID,
-		parsedUserID,
-		req.DepartmentID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate department access: %w", err)
-	}
-
-	if !hasAccess {
-		return nil, fmt.Errorf("user lacks access to this department")
-	}
-
-	exists, err := s.companyRepo.PositionExists(
-		ctx,
-		req.CompanyID,
-		req.DepartmentID,
-		req.Title,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check position uniqueness: %w", err)
-	}
-
-	if exists {
-		return nil, fmt.Errorf("position with this title already exists in the department")
-	}
-
-	now := time.Now().UTC()
-	position := &models.Position{
-		PositionID:   uuid.New(),
-		CompanyID:    req.CompanyID,
-		DepartmentID: req.DepartmentID,
-		Title:        req.Title,
-		IsOpen:       req.IsOpen,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-
-	if err := s.companyRepo.CreatePosition(ctx, position); err != nil {
-		return nil, fmt.Errorf("failed to create position: %w", err)
-	}
-
-	s.logger.Info("Position created successfully",
-		util.String("company_id", req.CompanyID.String()),
-		util.String("department_id", req.DepartmentID.String()),
-		util.String("position_id", position.PositionID.String()),
-		util.String("title", req.Title),
-		util.String("created_by", createdBy.String()),
-	)
-
-	return position, nil
-}
-
 func (s *CompanyService) GetPosition(ctx context.Context, positionID uuid.UUID) (*models.Position, error) {
 	position, err := s.companyRepo.GetPosition(ctx, positionID)
 	if err != nil {
@@ -3107,54 +3015,6 @@ func (s *CompanyService) GetPosition(ctx context.Context, positionID uuid.UUID) 
 	}
 
 	return position, nil
-}
-
-func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePositionRequest, updatedBy uuid.UUID) error {
-	existingPosition, err := s.companyRepo.GetPosition(ctx, req.PositionID)
-	if err != nil {
-		return fmt.Errorf("position not found: %w", err)
-	}
-
-	if req.DepartmentID != existingPosition.DepartmentID {
-		newDepartment, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
-		if err != nil {
-			return fmt.Errorf("new department not found: %w", err)
-		}
-		if newDepartment.CompanyID != existingPosition.CompanyID {
-			return fmt.Errorf("new department does not belong to same company")
-		}
-
-		userID, ok := ctx.Value("user_id").(string)
-		if !ok {
-			return fmt.Errorf("user ID not found in context")
-		}
-
-		parsedUserID, err := uuid.Parse(userID)
-		if err != nil {
-			return fmt.Errorf("invalid user ID in context")
-		}
-
-		hasAccess, err := s.ValidateUserAccessToDepartment(ctx, existingPosition.CompanyID, parsedUserID, req.DepartmentID)
-		if err != nil || !hasAccess {
-			return fmt.Errorf("user lacks access to the new department")
-		}
-	}
-
-	existingPosition.Title = req.Title
-	existingPosition.DepartmentID = req.DepartmentID
-	existingPosition.IsOpen = req.IsOpen
-	existingPosition.UpdatedAt = time.Now().UTC()
-
-	if err := s.companyRepo.UpdatePosition(ctx, existingPosition); err != nil {
-		return fmt.Errorf("failed to update position: %w", err)
-	}
-
-	s.logger.Info("Position updated successfully",
-		util.String("position_id", req.PositionID.String()),
-		util.String("title", req.Title),
-		util.String("updated_by", updatedBy.String()))
-
-	return nil
 }
 
 func (s *CompanyService) ListPositions(
@@ -3219,8 +3079,225 @@ func (s *CompanyService) GetDepartment(
 	return department, nil
 }
 
+// Updated CreatePositionRequest struct
+type CreatePositionRequest struct {
+	CompanyID          uuid.UUID `json:"company_id" validate:"required"`
+	DepartmentID       uuid.UUID `json:"department_id" validate:"required"`
+	Title              string    `json:"title" validate:"required,min=1,max=255"`
+	IsOpen             bool      `json:"is_open" default:"true"`
+	IsSchedulable      bool      `json:"is_schedulable" default:"true"`
+	AttendanceRequired bool      `json:"attendance_required" default:"true"`
+	OvertimeAllowed    bool      `json:"overtime_allowed" default:"false"`
+	WorkCenterCode     *string   `json:"work_center_code,omitempty" validate:"omitempty,max=100"`
+}
+
+// Updated UpdatePositionRequest struct
+type UpdatePositionRequest struct {
+	PositionID         uuid.UUID `json:"position_id" validate:"required"`
+	Title              string    `json:"title" validate:"required,min=1,max=255"`
+	DepartmentID       uuid.UUID `json:"department_id" validate:"required"`
+	IsOpen             bool      `json:"is_open"`
+	IsSchedulable      *bool     `json:"is_schedulable,omitempty"`
+	AttendanceRequired *bool     `json:"attendance_required,omitempty"`
+	OvertimeAllowed    *bool     `json:"overtime_allowed,omitempty"`
+	WorkCenterCode     *string   `json:"work_center_code,omitempty" validate:"omitempty,max=100"`
+}
+
+// Updated CreatePosition function
+func (s *CompanyService) CreatePosition(
+	ctx context.Context,
+	req *CreatePositionRequest,
+	createdBy uuid.UUID,
+) (*models.Position, error) {
+	// Validate department
+	department, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
+	if err != nil {
+		return nil, fmt.Errorf("department not found: %w", err)
+	}
+	if department.CompanyID != req.CompanyID {
+		return nil, fmt.Errorf("department does not belong to company")
+	}
+
+	// Validate user access
+	userID, ok := ctx.Value("user_id").(string)
+	if !ok {
+		return nil, fmt.Errorf("user ID not found in context")
+	}
+	parsedUserID, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user ID in context")
+	}
+
+	hasAccess, err := s.ValidateUserAccessToDepartment(
+		ctx,
+		req.CompanyID,
+		parsedUserID,
+		req.DepartmentID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate department access: %w", err)
+	}
+	if !hasAccess {
+		return nil, fmt.Errorf("user lacks access to this department")
+	}
+
+	// Check if work center exists (if provided)
+	if req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
+		exists, err := s.companyRepo.WorkCenterExists(ctx, req.CompanyID, *req.WorkCenterCode)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate work center: %w", err)
+		}
+		if !exists {
+			return nil, fmt.Errorf("work center does not exist")
+		}
+	}
+
+	// Check position uniqueness
+	exists, err := s.companyRepo.PositionExists(
+		ctx,
+		req.CompanyID,
+		req.DepartmentID,
+		req.Title,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check position uniqueness: %w", err)
+	}
+	if exists {
+		return nil, fmt.Errorf("position with this title already exists in the department")
+	}
+
+	now := time.Now().UTC()
+	position := &models.Position{
+		PositionID:         uuid.New(),
+		CompanyID:          req.CompanyID,
+		DepartmentID:       req.DepartmentID,
+		Title:              req.Title,
+		IsOpen:             req.IsOpen,
+		IsSchedulable:      req.IsSchedulable,
+		AttendanceRequired: req.AttendanceRequired,
+		OvertimeAllowed:    req.OvertimeAllowed,
+		WorkCenterCode:     req.WorkCenterCode,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+
+	if err := s.companyRepo.CreatePosition(ctx, position); err != nil {
+		return nil, fmt.Errorf("failed to create position: %w", err)
+	}
+
+	s.logger.Info("Position created successfully",
+		util.String("company_id", req.CompanyID.String()),
+		util.String("department_id", req.DepartmentID.String()),
+		util.String("position_id", position.PositionID.String()),
+		util.String("title", req.Title),
+		util.Bool("is_schedulable", req.IsSchedulable),
+		util.Bool("attendance_required", req.AttendanceRequired),
+		util.Bool("overtime_allowed", req.OvertimeAllowed),
+		util.String("work_center_code", func() string {
+			if req.WorkCenterCode != nil {
+				return *req.WorkCenterCode
+			}
+			return "none"
+		}()),
+		util.String("created_by", createdBy.String()),
+	)
+
+	return position, nil
+}
+
+// Updated UpdatePosition function
+func (s *CompanyService) UpdatePosition(ctx context.Context, req *UpdatePositionRequest, updatedBy uuid.UUID) error {
+	// Get existing position
+	existingPosition, err := s.companyRepo.GetPosition(ctx, req.PositionID)
+	if err != nil {
+		return fmt.Errorf("position not found: %w", err)
+	}
+
+	// Check if department changed
+	if req.DepartmentID != existingPosition.DepartmentID {
+		newDepartment, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
+		if err != nil {
+			return fmt.Errorf("new department not found: %w", err)
+		}
+		if newDepartment.CompanyID != existingPosition.CompanyID {
+			return fmt.Errorf("new department does not belong to same company")
+		}
+
+		// Validate user access to new department
+		userID, ok := ctx.Value("user_id").(string)
+		if !ok {
+			return fmt.Errorf("user ID not found in context")
+		}
+		parsedUserID, err := uuid.Parse(userID)
+		if err != nil {
+			return fmt.Errorf("invalid user ID in context")
+		}
+
+		hasAccess, err := s.ValidateUserAccessToDepartment(ctx, existingPosition.CompanyID, parsedUserID, req.DepartmentID)
+		if err != nil || !hasAccess {
+			return fmt.Errorf("user lacks access to the new department")
+		}
+	}
+
+	// Check if work center exists (if provided and changed)
+	if req.WorkCenterCode != nil {
+		if existingPosition.WorkCenterCode == nil ||
+			*existingPosition.WorkCenterCode != *req.WorkCenterCode {
+
+			if *req.WorkCenterCode != "" {
+				exists, err := s.companyRepo.WorkCenterExists(ctx, existingPosition.CompanyID, *req.WorkCenterCode)
+				if err != nil {
+					return fmt.Errorf("failed to validate work center: %w", err)
+				}
+				if !exists {
+					return fmt.Errorf("work center does not exist")
+				}
+			}
+			existingPosition.WorkCenterCode = req.WorkCenterCode
+		}
+	}
+
+	// Update fields
+	existingPosition.Title = req.Title
+	existingPosition.DepartmentID = req.DepartmentID
+	existingPosition.IsOpen = req.IsOpen
+
+	// Update optional fields if provided
+	if req.IsSchedulable != nil {
+		existingPosition.IsSchedulable = *req.IsSchedulable
+	}
+	if req.AttendanceRequired != nil {
+		existingPosition.AttendanceRequired = *req.AttendanceRequired
+	}
+	if req.OvertimeAllowed != nil {
+		existingPosition.OvertimeAllowed = *req.OvertimeAllowed
+	}
+
+	existingPosition.UpdatedAt = time.Now().UTC()
+
+	if err := s.companyRepo.UpdatePosition(ctx, existingPosition); err != nil {
+		return fmt.Errorf("failed to update position: %w", err)
+	}
+
+	s.logger.Info("Position updated successfully",
+		util.String("position_id", req.PositionID.String()),
+		util.String("title", req.Title),
+		util.String("updated_by", updatedBy.String()))
+
+	return nil
+}
+
+// Updated UpdatePositionStatus function
 func (s *CompanyService) UpdatePositionStatus(ctx context.Context, positionID uuid.UUID, isOpen bool, updatedBy uuid.UUID) error {
-	if err := s.companyRepo.UpdatePositionStatus(ctx, positionID, isOpen); err != nil {
+	position, err := s.companyRepo.GetPosition(ctx, positionID)
+	if err != nil {
+		return fmt.Errorf("position not found: %w", err)
+	}
+
+	position.IsOpen = isOpen
+	position.UpdatedAt = time.Now().UTC()
+
+	if err := s.companyRepo.UpdatePosition(ctx, position); err != nil {
 		return fmt.Errorf("failed to update position status: %w", err)
 	}
 
@@ -3228,6 +3305,7 @@ func (s *CompanyService) UpdatePositionStatus(ctx context.Context, positionID uu
 		util.String("position_id", positionID.String()),
 		util.Bool("is_open", isOpen),
 		util.String("updated_by", updatedBy.String()))
+
 	return nil
 }
 
@@ -3786,4 +3864,174 @@ func (s *CompanyService) GetEmployeeWithPosition(
 	)
 
 	return result, nil
+}
+
+type CreateCompanyRequest struct {
+	CompanyName        string   `json:"company_name" validate:"required,max=255"`
+	OwnerPhone         string   `json:"owner_phone" validate:"required"`
+	OwnerUsername      string   `json:"owner_username" validate:"required"`
+	OwnerFullName      string   `json:"owner_full_name" validate:"required"`
+	OwnerPositionTitle string   `json:"owner_position_title" validate:"required"`
+	SubscriptionTier   string   `json:"subscription_tier" validate:"required"`
+	MaxEmployees       int      `json:"max_employees"`
+	MaxDepartments     int      `json:"max_departments"`
+	DataRegion         string   `json:"data_region" validate:"required"`
+	SubscriptionMonths int      `json:"subscription_months,omitempty"`
+	SubscriptionDays   int      `json:"subscription_days,omitempty"`
+	Departments        []string `json:"departments"`
+
+	// Work Center fields
+	WorkCenterCode   string  `json:"work_center_code" validate:"required,max=100"`
+	WorkCenterName   string  `json:"work_center_name" validate:"required,max=255"`
+	WorkCenterDesc   *string `json:"work_center_description,omitempty"`
+	WorkCenterTZ     string  `json:"work_center_timezone" validate:"required"`
+	WorkCenterActive bool    `json:"work_center_is_active"`
+
+	// Position fields (for owner's position)
+	PositionIsOpen         bool    `json:"position_is_open"`
+	IsSchedulable          bool    `json:"is_schedulable"`
+	AttendanceRequired     bool    `json:"attendance_required"`
+	OvertimeAllowed        bool    `json:"overtime_allowed"`
+	PositionWorkCenterCode *string `json:"position_work_center_code,omitempty"`
+}
+
+func (s *CompanyService) CreateCompany(
+	ctx context.Context,
+	req *CreateCompanyRequest,
+	createdBy uuid.UUID,
+) (*models.Company, error) {
+	start := time.Now()
+
+	// Validate max departments
+	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
+		return nil, fmt.Errorf("max_departments must be between 1 and 100")
+	}
+
+	// Validate total departments don't exceed max
+	totalDepartments := len(req.Departments) + 1 // +1 for Administration
+	if totalDepartments > req.MaxDepartments {
+		return nil, fmt.Errorf(
+			"cannot create company: requested %d departments exceeds max_departments limit of %d",
+			totalDepartments,
+			req.MaxDepartments,
+		)
+	}
+
+	// Find or create owner user
+	var ownerUser *models.User
+	existingUser, err := s.userService.GetUserByPhone(ctx, req.OwnerPhone)
+	if err != nil {
+		ownerUser, err = s.createOrFindUserForCompanyOwner(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create user for company owner: %w", err)
+		}
+	} else {
+		ownerUser = existingUser
+		s.logger.Info("Using existing user for company creation",
+			util.String("phone", req.OwnerPhone),
+			util.String("existing_username", ownerUser.Username),
+			util.String("provided_username", req.OwnerUsername),
+			util.String("existing_full_name", ownerUser.FullName),
+			util.String("provided_full_name", req.OwnerFullName),
+		)
+	}
+
+	// Check if company already exists for this owner
+	exists, err := s.companyRepo.CheckCompanyExists(ctx, req.CompanyName, ownerUser.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate company: %w", err)
+	}
+	if exists {
+		return nil, fmt.Errorf(
+			"company with name '%s' already exists for this owner",
+			req.CompanyName,
+		)
+	}
+
+	// Generate IDs and timestamps
+	companyID := uuid.New()
+	now := time.Now().UTC()
+	subscriptionEnd := now.AddDate(0, req.SubscriptionMonths, req.SubscriptionDays)
+
+	// ------------------------------------------------------------------
+	// ✅ FIX: Default owner position work center
+	// ------------------------------------------------------------------
+	positionWorkCenter := req.PositionWorkCenterCode
+	if positionWorkCenter == nil {
+		positionWorkCenter = &req.WorkCenterCode
+	}
+
+	// Create work center model
+	workCenter := &models.WorkCenter{
+		WorkCenterCode: req.WorkCenterCode,
+		CompanyID:      companyID,
+		Name:           req.WorkCenterName,
+		Description:    req.WorkCenterDesc,
+		Timezone:       req.WorkCenterTZ,
+		IsActive:       req.WorkCenterActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	// Create position model for owner
+	position := &models.Position{
+		PositionID:         uuid.New(),
+		CompanyID:          companyID,
+		DepartmentID:       uuid.Nil,         // Set by repository
+		DepartmentName:     "Administration", // Always Administration
+		Title:              req.OwnerPositionTitle,
+		IsOpen:             false, // Owner position is never open
+		IsSchedulable:      true,
+		AttendanceRequired: true,
+		OvertimeAllowed:    true,
+		WorkCenterCode:     positionWorkCenter, // ✅ ALWAYS SET
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+
+	// Create company model
+	company := &models.Company{
+		CompanyID:             companyID,
+		CompanyName:           req.CompanyName,
+		OwnerUserID:           ownerUser.UserID,
+		SubscriptionTier:      req.SubscriptionTier,
+		SubscriptionStatus:    models.SubscriptionStatusActive,
+		MaxEmployees:          req.MaxEmployees,
+		MaxDepartments:        req.MaxDepartments,
+		DataRegion:            req.DataRegion,
+		IsActive:              true,
+		CreatedAt:             now,
+		UpdatedAt:             now,
+		SubscriptionStartDate: &now,
+		SubscriptionEndDate:   &subscriptionEnd,
+	}
+
+	// Persist everything in one transaction
+	if err := s.companyRepo.CreateCompany(
+		ctx,
+		company,
+		req.Departments,
+		req.OwnerPositionTitle,
+		position,
+		workCenter,
+	); err != nil {
+		return nil, fmt.Errorf("failed to create company: %w", err)
+	}
+
+	s.logger.Info("Company created successfully by admin",
+		util.String("company_id", companyID.String()),
+		util.String("company_name", req.CompanyName),
+		util.String("owner_user_id", ownerUser.UserID.String()),
+		util.String("owner_username", ownerUser.Username),
+		util.String("owner_phone", req.OwnerPhone),
+		util.String("owner_position_title", req.OwnerPositionTitle),
+		util.String("work_center_code", *positionWorkCenter),
+		util.String("created_by", createdBy.String()),
+		util.String("subscription_tier", req.SubscriptionTier),
+		util.Int("max_departments", req.MaxDepartments),
+		util.Int("initial_departments", totalDepartments),
+		util.Duration("duration", time.Since(start)),
+	)
+
+	return company, nil
 }

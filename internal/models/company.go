@@ -535,15 +535,21 @@ type CompanyEmployeeSearchResult struct {
 }
 
 // In models package
+
 type Position struct {
-	PositionID     uuid.UUID `json:"position_id" db:"position_id"`
-	CompanyID      uuid.UUID `json:"company_id" db:"company_id"`
-	DepartmentID   uuid.UUID `json:"department_id" db:"department_id"`
-	DepartmentName string    `json:"department_name,omitempty" db:"-"`
-	Title          string    `json:"title" db:"title"`
-	IsOpen         bool      `json:"is_open" db:"is_open"`
-	CreatedAt      time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+	PositionID         uuid.UUID `json:"position_id" db:"position_id"`
+	CompanyID          uuid.UUID `json:"company_id" db:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id" db:"department_id"`
+	DepartmentName     string    `json:"department_name,omitempty" db:"-"`
+	Title              string    `json:"title" db:"title"`
+	IsOpen             bool      `json:"is_open" db:"is_open"`
+	IsSchedulable      bool      `json:"is_schedulable" db:"is_schedulable"`
+	AttendanceRequired bool      `json:"attendance_required" db:"attendance_required"`
+	OvertimeAllowed    bool      `json:"overtime_allowed" db:"overtime_allowed"`
+	WorkCenterCode     *string   `json:"work_center_code,omitempty" db:"work_center_code"`
+	WorkCenterName     *string   `json:"work_center_name,omitempty" db:"-"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 }
 
 type DepartmentTree struct {
@@ -615,4 +621,15 @@ type PositionsByDepartmentRequest struct {
 	IsOpen       *bool     `json:"is_open,omitempty"`
 	Limit        *int      `json:"limit,omitempty"`
 	Offset       *int      `json:"offset,omitempty"`
+}
+
+type WorkCenter struct {
+	WorkCenterCode string    `json:"work_center_code" db:"work_center_code"`
+	CompanyID      uuid.UUID `json:"company_id" db:"company_id"`
+	Name           string    `json:"name" db:"name"`
+	Description    *string   `json:"description" db:"description"`
+	Timezone       string    `json:"timezone" db:"timezone"`
+	IsActive       bool      `json:"is_active" db:"is_active"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
 }
