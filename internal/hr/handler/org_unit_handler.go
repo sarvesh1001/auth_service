@@ -770,7 +770,12 @@ func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	onlyActive := r.URL.Query().Get("active") != "false"
+	// ✅ FIX: default = false (return ALL members)
+	onlyActive := false
+
+	if v := r.URL.Query().Get("active"); v != "" {
+		onlyActive = v == "true"
+	}
 
 	members, err := h.orgUnitQueryService.GetOrgUnitMembers(ctx, orgUnitID, onlyActive)
 	if err != nil {
@@ -779,6 +784,11 @@ func (h *OrgUnitHandler) GetOrgUnitMembers(w http.ResponseWriter, r *http.Reques
 			util.ErrorField(err))
 		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve members")
 		return
+	}
+
+	// ✅ NEVER return null arrays
+	if members == nil {
+		members = []*orgunit.OrgUnitMember{}
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -932,5 +942,71 @@ func (h *OrgUnitHandler) respondWithError(w http.ResponseWriter, statusCode int,
 		"success": false,
 		"error":   message,
 		"code":    statusCode,
+	})
+}
+func (h *OrgUnitHandler) UpdateMember(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	ctx := r.Context()
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		return
+	}
+
+	orgUnitID, err := uuid.Parse(chi.URLParam(r, "orgUnitID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid org unit ID")
+		return
+	}
+
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
+		return
+	}
+
+	var req orgunit.UpdateMemberRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	actorType, actorID, err := h.getActorInfo(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
+		return
+	}
+
+	metadata := map[string]interface{}{
+		"ip_address": r.RemoteAddr,
+		"user_agent": r.UserAgent(),
+	}
+
+	err = h.orgUnitService.UpdateMember(
+		ctx,
+		companyID,
+		orgUnitID,
+		userID,
+		&req,
+		actorType,
+		actorID,
+		metadata,
+	)
+	if err != nil {
+		h.logger.Error("Failed to update membership",
+			util.String("org_unit_id", orgUnitID.String()),
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Membership updated successfully",
+		"meta": map[string]interface{}{
+			"duration": time.Since(startTime).String(),
+		},
 	})
 }

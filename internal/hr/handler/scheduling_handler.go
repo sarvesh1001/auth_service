@@ -364,18 +364,22 @@ func (h *SchedulingHandler) ListScheduleTemplates(w http.ResponseWriter, r *http
 }
 
 // Schedule Instance Handlers
+// CreateScheduleInstanceRequest
+// Used ONLY for manual schedule creation
 type CreateScheduleInstanceRequest struct {
 	UserID             uuid.UUID                    `json:"user_id"`
-	ScheduleDate       string                       `json:"schedule_date"`
-	ExpectedStart      *time.Time                   `json:"expected_start,omitempty"`
-	ExpectedEnd        *time.Time                   `json:"expected_end,omitempty"`
+	ScheduleDate       string                       `json:"schedule_date"` // YYYY-MM-DD
+	ScheduleTemplateID uuid.UUID                    `json:"schedule_template_id"`
 	Timezone           string                       `json:"timezone,omitempty"`
-	ScheduleTemplateID *uuid.UUID                   `json:"schedule_template_id,omitempty"`
 	Metadata           *scheduling.InstanceMetadata `json:"metadata,omitempty"`
 }
 
-func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) CreateScheduleInstance(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -392,40 +396,53 @@ func (h *SchedulingHandler) CreateScheduleInstance(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Determine timezone
+	// 🔒 Enforce template requirement (manual means explicit)
+	if req.ScheduleTemplateID == uuid.Nil {
+		h.respondWithError(
+			w,
+			http.StatusBadRequest,
+			"schedule_template_id is required for manual schedule creation",
+		)
+		return
+	}
+
+	// Resolve timezone
 	timezone := req.Timezone
 	if timezone == "" {
 		timezone = h.getUserTimezone(ctx, req.UserID)
 	}
 
-	// Parse schedule date
-	businessDate, err := normalizeBusinessDateFromString(req.ScheduleDate, timezone)
+	// Normalize business date
+	businessDate, err := normalizeBusinessDateFromString(
+		req.ScheduleDate,
+		timezone,
+	)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid schedule date format")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid schedule_date")
 		return
 	}
 
-	// Create instance
+	// Build instance (times resolved in service from template)
 	instance := &scheduling.ScheduleInstance{
 		CompanyID:          companyID,
 		UserID:             req.UserID,
 		ScheduleDate:       businessDate,
-		ExpectedStart:      req.ExpectedStart,
-		ExpectedEnd:        req.ExpectedEnd,
+		ScheduleTemplateID: req.ScheduleTemplateID,
 		Timezone:           timezone,
-		ScheduleTemplateID: uuid.Nil, // Will be filled by service if needed
 		Metadata:           scheduling.InstanceMetadata{},
-	}
-
-	if req.ScheduleTemplateID != nil {
-		instance.ScheduleTemplateID = *req.ScheduleTemplateID
 	}
 
 	if req.Metadata != nil {
 		instance.Metadata = *req.Metadata
 	}
 
-	result, err := h.schedulingService.CreateScheduleInstance(ctx, instance, actorType, actorID, nil)
+	result, err := h.schedulingService.CreateScheduleInstance(
+		ctx,
+		instance,
+		actorType,
+		actorID,
+		nil,
+	)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1356,6 +1373,8 @@ func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, 
 
 func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// 1️⃣ Company ID (path param)
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1363,31 +1382,50 @@ func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	workCenterCode := chi.URLParam(r, "workCenterCode")
+	// 2️⃣ Work center code (QUERY param — IMPORTANT FIX)
+	workCenterCode := r.URL.Query().Get("work_center_code")
+	if workCenterCode == "" {
+		h.respondWithError(w, http.StatusBadRequest, "work_center_code is required")
+		return
+	}
+
+	// 3️⃣ Date (optional query param)
 	dateStr := r.URL.Query().Get("date")
 
 	var date time.Time
+
 	if dateStr != "" {
-		workCenter, err := h.schedulingQueryService.GetWorkCenterByCode(ctx, companyID, workCenterCode)
-		if err != nil {
+		// 4️⃣ Fetch work center to get timezone
+		workCenter, err := h.schedulingQueryService.
+			GetWorkCenterByCode(ctx, companyID, workCenterCode)
+		if err != nil || workCenter == nil {
 			h.respondWithError(w, http.StatusBadRequest, "Work center not found")
 			return
 		}
-		date, err = normalizeBusinessDateFromString(dateStr, workCenter.Timezone)
+
+		// 5️⃣ Normalize business date using WC timezone
+		date, err = normalizeBusinessDateFromString(
+			dateStr,
+			workCenter.Timezone,
+		)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid date format (expected YYYY-MM-DD)")
 			return
 		}
 	} else {
+		// Default to today (UTC-safe fallback)
 		date = time.Now()
 	}
 
-	result, err := h.schedulingQueryService.GetWorkCenterShifts(ctx, companyID, workCenterCode, date)
+	// 6️⃣ Fetch shifts
+	result, err := h.schedulingQueryService.
+		GetWorkCenterShifts(ctx, companyID, workCenterCode, date)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	// 7️⃣ Respond
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 

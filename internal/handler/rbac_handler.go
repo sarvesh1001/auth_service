@@ -226,10 +226,10 @@ func (h *RBACHandler) GetRole(w http.ResponseWriter, r *http.Request) {
 	h.respondWithJSON(w, http.StatusOK, successResponse(role, "Role retrieved successfully"))
 }
 
-// UpdateRole updates a role
 func (h *RBACHandler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// --- role_id from URL ---
 	roleIDStr := chi.URLParam(r, "roleID")
 	roleID, err := uuid.Parse(roleIDStr)
 	if err != nil {
@@ -237,24 +237,63 @@ func (h *RBACHandler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get admin ID from context
-	adminID := r.Context().Value("user_id")
-	if adminID == nil {
+	// --- company_id from context (SAFE) ---
+	rawCompanyID := ctx.Value("company_id")
+	if rawCompanyID == nil {
+		h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("UNAUTHORIZED"), "Company ID required")
+		return
+	}
+
+	var companyID uuid.UUID
+	switch v := rawCompanyID.(type) {
+	case uuid.UUID:
+		companyID = v
+	case string:
+		companyID, err = uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid company ID")
+			return
+		}
+	default:
+		h.respondWithError(w, http.StatusInternalServerError,
+			fmt.Errorf("INVALID_COMPANY_CONTEXT"),
+			"Invalid company ID type in context")
+		return
+	}
+
+	// --- user_id from context (SAFE) ---
+	rawUserID := ctx.Value("user_id")
+	if rawUserID == nil {
 		h.respondWithError(w, http.StatusUnauthorized, fmt.Errorf("UNAUTHORIZED"), "Authentication required")
 		return
 	}
 
-	adminIDParsed, err := uuid.Parse(adminID.(string))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err, "Invalid admin ID")
+	var updatedBy uuid.UUID
+	switch v := rawUserID.(type) {
+	case uuid.UUID:
+		updatedBy = v
+	case string:
+		updatedBy, err = uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err, "Invalid user ID")
+			return
+		}
+	default:
+		h.respondWithError(w, http.StatusInternalServerError,
+			fmt.Errorf("INVALID_USER_CONTEXT"),
+			"Invalid user ID type in context")
 		return
 	}
 
+	// --- request body ---
 	var req struct {
-		RoleName    string `json:"role_name" validate:"required"`
-		RoleLevel   int    `json:"role_level" validate:"required"`
-		Description string `json:"description"`
-		IsActive    *bool  `json:"is_active"`
+		RoleName           string   `json:"role_name" validate:"required"`
+		Description        string   `json:"description"`
+		AddDepartments     []string `json:"add_departments"`
+		RemoveDepartments  []string `json:"remove_departments"`
+		AddPermissions     []string `json:"add_permissions"`
+		RemovePermissions  []string `json:"remove_permissions"`
+		ReplacePermissions []string `json:"replace_permissions"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -262,8 +301,41 @@ func (h *RBACHandler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.companyService.UpdateRole(ctx, roleID, req.RoleName, req.RoleLevel, adminIDParsed, req.Description); err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to update role")
+	if strings.TrimSpace(req.RoleName) == "" {
+		h.respondWithError(w, http.StatusBadRequest,
+			fmt.Errorf("ROLE_NAME_REQUIRED"),
+			"Role name is required")
+		return
+	}
+
+	// --- service DTO ---
+	updateReq := service.UpdateRoleRequest{
+		CompanyID:          companyID,
+		RoleID:             roleID,
+		RoleName:           req.RoleName,
+		Description:        req.Description,
+		AddDepartments:     req.AddDepartments,
+		RemoveDepartments:  req.RemoveDepartments,
+		AddPermissions:     req.AddPermissions,
+		RemovePermissions:  req.RemovePermissions,
+		ReplacePermissions: req.ReplacePermissions,
+		UpdatedBy:          updatedBy,
+	}
+
+	// --- call service ---
+	if err := h.companyService.UpdateRole(ctx, updateReq); err != nil {
+		switch {
+		case strings.Contains(err.Error(), "not found"):
+			h.respondWithError(w, http.StatusNotFound, err, err.Error())
+		case strings.Contains(err.Error(), "cannot update system roles"):
+			h.respondWithError(w, http.StatusForbidden, err, err.Error())
+		case strings.Contains(err.Error(), "permission not found"):
+			h.respondWithError(w, http.StatusBadRequest, err, err.Error())
+		case strings.Contains(err.Error(), "department not found"):
+			h.respondWithError(w, http.StatusBadRequest, err, err.Error())
+		default:
+			h.respondWithError(w, http.StatusInternalServerError, err, "Failed to update role")
+		}
 		return
 	}
 

@@ -31,67 +31,16 @@ func NewAttendanceRepository(
 		logger: logger,
 	}
 }
-func scanAttendanceEvent(row *sql.Rows, event *attendance.AttendanceEvent) error {
-	var metadataJSON []byte
-	err := row.Scan(
-		&event.AttendanceEventID,
-		&event.CompanyID,
-		&event.UserID,
-		&event.EventType,
-		&event.EventTime,
-		&event.SourceType,
-		&event.SourceID,
-		&event.DeviceID,
-		&event.IPAddress,
-		&metadataJSON,
-		&event.CreatedAt,
-		&event.CreatedBy,
-	)
-	if err != nil {
-		return err
-	}
-	if len(metadataJSON) > 0 {
-		err = json.Unmarshal(metadataJSON, &event.Metadata)
-		if err != nil {
-			return fmt.Errorf("failed to unmarshal metadata: %w", err)
-		}
-	}
-	return nil
-}
-func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDailySummary) error {
-	var metadataJSON []byte
-	err := row.Scan(
-		&summary.AttendanceSummaryID,
-		&summary.CompanyID,
-		&summary.UserID,
-		&summary.AttendanceDate,
-		&summary.Status,
-		&summary.WorkedMinutes,
-		&summary.OvertimeMinutes,
-		&summary.LateMinutes,
-		&metadataJSON,
-		&summary.GeneratedAt,
-		&summary.GeneratedBy,
-	)
-	if err != nil {
-		return err
-	}
-	if len(metadataJSON) > 0 {
-		err = json.Unmarshal(metadataJSON, &summary.Metadata)
-		if err != nil {
-			return fmt.Errorf("failed to unmarshal metadata: %w", err)
-		}
-	}
-	return nil
-}
+
 func buildNamedQueryArgs(event *attendance.AttendanceEvent) (string, []interface{}) {
 	query := `
         INSERT INTO attendance_events (
             attendance_event_id, company_id, user_id, event_type, event_time,
-            source_type, source_id, device_id, ip_address, metadata,
-            created_at, created_by
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            source_type, source_id, device_id, ip_address, context,
+            metadata, created_at, created_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     `
+	contextJSON, _ := json.Marshal(event.Context)
 	metadataJSON, _ := json.Marshal(event.Metadata)
 	args := []interface{}{
 		event.AttendanceEventID,
@@ -103,33 +52,113 @@ func buildNamedQueryArgs(event *attendance.AttendanceEvent) (string, []interface
 		event.SourceID,
 		event.DeviceID,
 		event.IPAddress,
+		contextJSON,
 		metadataJSON,
 		event.CreatedAt,
 		event.CreatedBy,
 	}
 	return query, args
 }
+
 func (r *attendanceRepository) CreateAttendanceEvent(
 	ctx context.Context,
 	event *attendance.AttendanceEvent,
 ) error {
+
+	// Ensure ID & timestamps
 	if event.AttendanceEventID == uuid.Nil {
 		event.AttendanceEventID = uuid.New()
 	}
 	if event.CreatedAt.IsZero() {
 		event.CreatedAt = time.Now().UTC()
 	}
-	query, args := buildNamedQueryArgs(event)
-	_, err := r.client.Exec(ctx, query, args...)
+
+	// Use transaction for atomicity
+	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
-		r.logger.Error("Failed to create attendance event",
-			util.String("event_id", event.AttendanceEventID.String()),
-			util.String("user_id", event.UserID.String()),
-			util.ErrorField(err))
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 1️⃣ Insert attendance event
+	query := `
+		INSERT INTO attendance_events (
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
+		) VALUES (
+			$1,$2,$3,$4,$5,
+			$6,$7,$8,$9,
+			$10,$11,$12,$13
+		)
+	`
+
+	contextJSON, _ := json.Marshal(event.Context)
+	metadataJSON, _ := json.Marshal(event.Metadata)
+
+	_, err = tx.ExecContext(ctx, query,
+		event.AttendanceEventID,
+		event.CompanyID,
+		event.UserID,
+		event.EventType,
+		event.EventTime,
+		event.SourceType,
+		event.SourceID,
+		event.DeviceID,
+		event.IPAddress,
+		contextJSON,
+		metadataJSON,
+		event.CreatedAt,
+		event.CreatedBy,
+	)
+	if err != nil {
 		return fmt.Errorf("failed to create attendance event: %w", err)
 	}
+
+	// 2️⃣ 🔥 FIXED: Insert into outbox (NO mixed uuid/text params)
+	outboxPayload := map[string]interface{}{
+		"event_id":      event.AttendanceEventID.String(),
+		"company_id":    event.CompanyID.String(),
+		"user_id":       event.UserID.String(),
+		"event_type":    event.EventType,
+		"event_time":    event.EventTime,
+		"source_type":   event.SourceType,
+		"is_correction": event.Metadata.IsCorrection,
+	}
+
+	err = r.InsertAttendanceOutboxEvent(
+		ctx,
+		"attendance.event.created",
+		event.AttendanceEventID,
+		outboxPayload,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert into attendance outbox: %w", err)
+	}
+
+	// 3️⃣ Commit transaction
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
 	return nil
 }
+
 func (r *attendanceRepository) CreateBulkAttendanceEvents(
 	ctx context.Context,
 	events []*attendance.AttendanceEvent,
@@ -143,18 +172,35 @@ func (r *attendanceRepository) CreateBulkAttendanceEvents(
 			tx.Rollback()
 		}
 	}()
+
 	query := `
-        INSERT INTO attendance_events (
-            attendance_event_id, company_id, user_id, event_type, event_time,
-            source_type, source_id, device_id, ip_address, metadata,
-            created_at, created_by
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-    `
+		INSERT INTO attendance_events (
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
+		) VALUES (
+			$1,$2,$3,$4,$5,
+			$6,$7,$8,$9,
+			$10,$11,$12,$13
+		)
+	`
+
 	stmt, err := tx.Prepare(query)
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
 	}
 	defer stmt.Close()
+
 	for _, event := range events {
 		if event.AttendanceEventID == uuid.Nil {
 			event.AttendanceEventID = uuid.New()
@@ -162,7 +208,10 @@ func (r *attendanceRepository) CreateBulkAttendanceEvents(
 		if event.CreatedAt.IsZero() {
 			event.CreatedAt = time.Now().UTC()
 		}
+
+		contextJSON, _ := json.Marshal(event.Context)
 		metadataJSON, _ := json.Marshal(event.Metadata)
+
 		_, err := stmt.ExecContext(ctx,
 			event.AttendanceEventID,
 			event.CompanyID,
@@ -173,6 +222,7 @@ func (r *attendanceRepository) CreateBulkAttendanceEvents(
 			event.SourceID,
 			event.DeviceID,
 			event.IPAddress,
+			contextJSON,
 			metadataJSON,
 			event.CreatedAt,
 			event.CreatedBy,
@@ -181,92 +231,13 @@ func (r *attendanceRepository) CreateBulkAttendanceEvents(
 			return fmt.Errorf("failed to insert event %s: %w", event.AttendanceEventID, err)
 		}
 	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	return nil
 }
-func (r *attendanceRepository) GetAttendanceEventByID(
-	ctx context.Context,
-	eventID uuid.UUID,
-) (*attendance.AttendanceEvent, error) {
-	query := `
-        SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-               source_type, source_id, device_id, ip_address, metadata,
-               created_at, created_by
-        FROM attendance_events
-        WHERE attendance_event_id = $1
-    `
-	row := r.client.QueryRow(ctx, query, eventID)
-	var event attendance.AttendanceEvent
-	var metadataJSON []byte
-	err := row.Scan(
-		&event.AttendanceEventID,
-		&event.CompanyID,
-		&event.UserID,
-		&event.EventType,
-		&event.EventTime,
-		&event.SourceType,
-		&event.SourceID,
-		&event.DeviceID,
-		&event.IPAddress,
-		&metadataJSON,
-		&event.CreatedAt,
-		&event.CreatedBy,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		r.logger.Error("Failed to get attendance event",
-			util.String("event_id", eventID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get attendance event: %w", err)
-	}
-	if len(metadataJSON) > 0 {
-		err = json.Unmarshal(metadataJSON, &event.Metadata)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
-		}
-	}
-	return &event, nil
-}
-func (r *attendanceRepository) GetAttendanceEventsByUser(
-	ctx context.Context,
-	userID uuid.UUID,
-	startDate, endDate time.Time,
-	limit int,
-) ([]*attendance.AttendanceEvent, error) {
-	query := `
-        SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-               source_type, source_id, device_id, ip_address, metadata,
-               created_at, created_by
-        FROM attendance_events
-        WHERE user_id = $1
-          AND event_time BETWEEN $2 AND $3
-        ORDER BY event_time ASC
-    `
-	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
-	if err != nil {
-		r.logger.Error("Failed to get attendance events by user",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get attendance events: %w", err)
-	}
-	defer rows.Close()
-	var events []*attendance.AttendanceEvent
-	for rows.Next() {
-		var event attendance.AttendanceEvent
-		if err := scanAttendanceEvent(rows, &event); err != nil {
-			return nil, fmt.Errorf("failed to scan event: %w", err)
-		}
-		events = append(events, &event)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-	return events, nil
-}
+
 func (r *attendanceRepository) GetAttendanceEventsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -274,6 +245,7 @@ func (r *attendanceRepository) GetAttendanceEventsByCompany(
 	page, pageSize int,
 ) ([]*attendance.AttendanceEvent, int64, error) {
 	offset := (page - 1) * pageSize
+
 	countQuery := `
         SELECT COUNT(*) FROM attendance_events
         WHERE company_id = $1
@@ -285,16 +257,29 @@ func (r *attendanceRepository) GetAttendanceEventsByCompany(
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count attendance events: %w", err)
 	}
+
 	query := `
-        SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-               source_type, source_id, device_id, ip_address, metadata,
-               created_at, created_by
+        SELECT 
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
         FROM attendance_events
         WHERE company_id = $1
         AND event_time BETWEEN $2 AND $3
         ORDER BY event_time DESC
         LIMIT $4 OFFSET $5
     `
+
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate, pageSize, offset)
 	if err != nil {
 		r.logger.Error("Failed to get attendance events by company",
@@ -303,6 +288,7 @@ func (r *attendanceRepository) GetAttendanceEventsByCompany(
 		return nil, 0, fmt.Errorf("failed to get attendance events: %w", err)
 	}
 	defer rows.Close()
+
 	var events []*attendance.AttendanceEvent
 	for rows.Next() {
 		var event attendance.AttendanceEvent
@@ -311,11 +297,13 @@ func (r *attendanceRepository) GetAttendanceEventsByCompany(
 		}
 		events = append(events, &event)
 	}
+
 	if err = rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("rows iteration error: %w", err)
 	}
 	return events, total, nil
 }
+
 func (r *attendanceRepository) SearchAttendanceEvents(
 	ctx context.Context,
 	filter AttendanceEventFilter,
@@ -323,57 +311,80 @@ func (r *attendanceRepository) SearchAttendanceEvents(
 	var conditions []string
 	var args []interface{}
 	argIdx := 1
+
 	conditions = append(conditions, fmt.Sprintf("company_id = $%d", argIdx))
 	args = append(args, filter.CompanyID)
 	argIdx++
+
 	conditions = append(conditions, fmt.Sprintf("event_time BETWEEN $%d AND $%d", argIdx, argIdx+1))
 	args = append(args, filter.StartDate, filter.EndDate)
 	argIdx += 2
+
 	if filter.UserID != nil {
 		conditions = append(conditions, fmt.Sprintf("user_id = $%d", argIdx))
 		args = append(args, *filter.UserID)
 		argIdx++
 	}
+
 	if filter.EventType != nil {
 		conditions = append(conditions, fmt.Sprintf("event_type = $%d", argIdx))
 		args = append(args, *filter.EventType)
 		argIdx++
 	}
+
 	if filter.SourceType != nil {
 		conditions = append(conditions, fmt.Sprintf("source_type = $%d", argIdx))
 		args = append(args, *filter.SourceType)
 		argIdx++
 	}
+
 	whereClause := ""
 	if len(conditions) > 0 {
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
+
 	countQuery := fmt.Sprintf(`
         SELECT COUNT(*) FROM attendance_events
         %s
     `, whereClause)
+
 	row := r.client.QueryRow(ctx, countQuery, args...)
 	var total int64
 	err := row.Scan(&total)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to count attendance events: %w", err)
 	}
+
 	offset := (filter.Page - 1) * filter.PageSize
 	query := fmt.Sprintf(`
-        SELECT attendance_event_id, company_id, user_id, event_type, event_time,
-               source_type, source_id, device_id, ip_address, metadata,
-               created_at, created_by
+        SELECT 
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
         FROM attendance_events
         %s
         ORDER BY event_time DESC
         LIMIT $%d OFFSET $%d
     `, whereClause, argIdx, argIdx+1)
+
 	args = append(args, filter.PageSize, offset)
+
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to search attendance events: %w", err)
 	}
 	defer rows.Close()
+
 	var events []*attendance.AttendanceEvent
 	for rows.Next() {
 		var event attendance.AttendanceEvent
@@ -382,133 +393,330 @@ func (r *attendanceRepository) SearchAttendanceEvents(
 		}
 		events = append(events, &event)
 	}
+
 	if err = rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("rows iteration error: %w", err)
 	}
 	return events, total, nil
 }
-func (r *attendanceRepository) CreateAttendanceDailySummary(
-	ctx context.Context,
-	summary *attendance.AttendanceDailySummary,
-) error {
-	query := `
-        INSERT INTO attendance_daily_summary (
-            attendance_summary_id, company_id, user_id, attendance_date,
-            status, worked_minutes, overtime_minutes, late_minutes,
-            metadata, generated_at, generated_by
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    `
-	if summary.AttendanceSummaryID == uuid.Nil {
-		summary.AttendanceSummaryID = uuid.New()
-	}
-	if summary.GeneratedAt.IsZero() {
-		summary.GeneratedAt = time.Now().UTC()
-	}
-	metadataJSON, _ := json.Marshal(summary.Metadata)
-	_, err := r.client.Exec(ctx, query,
-		summary.AttendanceSummaryID,
-		summary.CompanyID,
-		summary.UserID,
-		summary.AttendanceDate,
-		summary.Status,
-		summary.WorkedMinutes,
-		summary.OvertimeMinutes,
-		summary.LateMinutes,
-		metadataJSON,
-		summary.GeneratedAt,
-		summary.GeneratedBy,
-	)
-	if err != nil {
-		r.logger.Error("Failed to create attendance daily summary",
-			util.String("summary_id", summary.AttendanceSummaryID.String()),
-			util.String("user_id", summary.UserID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to create attendance daily summary: %w", err)
-	}
-	return nil
-}
-func (r *attendanceRepository) UpdateAttendanceDailySummary(
-	ctx context.Context,
-	summary *attendance.AttendanceDailySummary,
-) error {
-	query := `
-        UPDATE attendance_daily_summary SET
-            status = $1,
-            worked_minutes = $2,
-            overtime_minutes = $3,
-            late_minutes = $4,
-            metadata = $5,
-            generated_at = $6,
-            generated_by = $7
-        WHERE attendance_summary_id = $8
-    `
-	metadataJSON, _ := json.Marshal(summary.Metadata)
-	result, err := r.client.Exec(ctx, query,
-		summary.Status,
-		summary.WorkedMinutes,
-		summary.OvertimeMinutes,
-		summary.LateMinutes,
-		metadataJSON,
-		summary.GeneratedAt,
-		summary.GeneratedBy,
-		summary.AttendanceSummaryID,
-	)
-	if err != nil {
-		r.logger.Error("Failed to update attendance daily summary",
-			util.String("summary_id", summary.AttendanceSummaryID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to update attendance daily summary: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("attendance daily summary not found")
-	}
-	return nil
-}
-func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
+
+func (r *attendanceRepository) GetAttendanceEventsByUser(
 	ctx context.Context,
 	userID uuid.UUID,
-	date time.Time,
-) (*attendance.AttendanceDailySummary, error) {
+	startDate, endDate time.Time,
+	limit int,
+) ([]*attendance.AttendanceEvent, error) {
 	query := `
-        SELECT * FROM attendance_daily_summary
+        SELECT 
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
+        FROM attendance_events
         WHERE user_id = $1
-        AND attendance_date = $2
+          AND event_time BETWEEN $2 AND $3
+        ORDER BY event_time ASC
     `
-	row := r.client.QueryRow(ctx, query, userID, date)
-	var summary attendance.AttendanceDailySummary
+
+	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
+	if err != nil {
+		r.logger.Error("Failed to get attendance events by user",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*attendance.AttendanceEvent
+	for rows.Next() {
+		var event attendance.AttendanceEvent
+		if err := scanAttendanceEvent(rows, &event); err != nil {
+			return nil, fmt.Errorf("failed to scan event: %w", err)
+		}
+		events = append(events, &event)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return events, nil
+}
+
+func (r *attendanceRepository) GetAttendanceEventByID(
+	ctx context.Context,
+	eventID uuid.UUID,
+) (*attendance.AttendanceEvent, error) {
+	query := `
+        SELECT 
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
+        FROM attendance_events
+        WHERE attendance_event_id = $1
+    `
+
+	row := r.client.QueryRow(ctx, query, eventID)
+	var event attendance.AttendanceEvent
+	var contextJSON []byte
 	var metadataJSON []byte
+
 	err := row.Scan(
-		&summary.AttendanceSummaryID,
-		&summary.CompanyID,
-		&summary.UserID,
-		&summary.AttendanceDate,
-		&summary.Status,
-		&summary.WorkedMinutes,
-		&summary.OvertimeMinutes,
-		&summary.LateMinutes,
+		&event.AttendanceEventID,
+		&event.CompanyID,
+		&event.UserID,
+		&event.EventType,
+		&event.EventTime,
+		&event.SourceType,
+		&event.SourceID,
+		&event.DeviceID,
+		&event.IPAddress,
+		&contextJSON,
 		&metadataJSON,
-		&summary.GeneratedAt,
-		&summary.GeneratedBy,
+		&event.CreatedAt,
+		&event.CreatedBy,
 	)
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
-		r.logger.Error("Failed to get attendance daily summary",
-			util.String("user_id", userID.String()),
-			util.String("date", date.Format("2006-01-02")),
+		r.logger.Error("Failed to get attendance event",
+			util.String("event_id", eventID.String()),
 			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get attendance daily summary: %w", err)
+		return nil, fmt.Errorf("failed to get attendance event: %w", err)
 	}
+
+	if len(contextJSON) > 0 {
+		err = json.Unmarshal(contextJSON, &event.Context)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal context: %w", err)
+		}
+	}
+
 	if len(metadataJSON) > 0 {
-		err = json.Unmarshal(metadataJSON, &summary.Metadata)
+		err = json.Unmarshal(metadataJSON, &event.Metadata)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 		}
 	}
-	return &summary, nil
+
+	return &event, nil
 }
+
+func (r *attendanceRepository) FindExistingCorrection(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	eventType string,
+	eventTime time.Time,
+) (*attendance.AttendanceEvent, error) {
+	query := `
+		SELECT
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
+		FROM attendance_events
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND event_type = $3
+		  AND event_time = $4
+		  AND source_type = 'correction'
+		LIMIT 1
+	`
+
+	row := r.client.QueryRow(ctx, query, companyID, userID, eventType, eventTime)
+	var event attendance.AttendanceEvent
+	var contextJSON []byte
+	var metadataJSON []byte
+
+	err := row.Scan(
+		&event.AttendanceEventID,
+		&event.CompanyID,
+		&event.UserID,
+		&event.EventType,
+		&event.EventTime,
+		&event.SourceType,
+		&event.SourceID,
+		&event.DeviceID,
+		&event.IPAddress,
+		&contextJSON,
+		&metadataJSON,
+		&event.CreatedAt,
+		&event.CreatedBy,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error(
+			"Failed to find existing correction",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", userID.String()),
+			util.String("event_type", eventType),
+			util.Time("event_time", eventTime),
+			util.ErrorField(err),
+		)
+		return nil, fmt.Errorf("failed to find existing correction: %w", err)
+	}
+
+	if len(contextJSON) > 0 {
+		if err := json.Unmarshal(contextJSON, &event.Context); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal context: %w", err)
+		}
+	}
+
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &event.Metadata); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+	}
+
+	return &event, nil
+}
+
+func (r *attendanceRepository) GetLastAttendanceEvent(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	eventType string,
+	since time.Time,
+) (*attendance.AttendanceEvent, error) {
+	query := `
+		SELECT
+			attendance_event_id,
+			company_id,
+			user_id,
+			event_type,
+			event_time,
+			source_type,
+			source_id,
+			device_id,
+			ip_address,
+			context,
+			metadata,
+			created_at,
+			created_by
+		FROM attendance_events
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND event_type = $3
+		  AND event_time >= $4
+		  AND source_type != 'correction'
+		ORDER BY event_time DESC
+		LIMIT 1
+	`
+
+	row := r.client.QueryRow(ctx, query, companyID, userID, eventType, since)
+	var event attendance.AttendanceEvent
+	var contextJSON []byte
+	var metadataJSON []byte
+
+	err := row.Scan(
+		&event.AttendanceEventID,
+		&event.CompanyID,
+		&event.UserID,
+		&event.EventType,
+		&event.EventTime,
+		&event.SourceType,
+		&event.SourceID,
+		&event.DeviceID,
+		&event.IPAddress,
+		&contextJSON,
+		&metadataJSON,
+		&event.CreatedAt,
+		&event.CreatedBy,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error(
+			"Failed to get last attendance event",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", userID.String()),
+			util.String("event_type", eventType),
+			util.Time("since", since),
+			util.ErrorField(err),
+		)
+		return nil, fmt.Errorf("failed to get last attendance event: %w", err)
+	}
+
+	if len(contextJSON) > 0 {
+		if err := json.Unmarshal(contextJSON, &event.Context); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal context: %w", err)
+		}
+	}
+
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &event.Metadata); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+	}
+
+	return &event, nil
+}
+
+func scanAttendanceEvent(row *sql.Rows, event *attendance.AttendanceEvent) error {
+	var contextJSON []byte
+	var metadataJSON []byte
+
+	err := row.Scan(
+		&event.AttendanceEventID,
+		&event.CompanyID,
+		&event.UserID,
+		&event.EventType,
+		&event.EventTime,
+		&event.SourceType,
+		&event.SourceID,
+		&event.DeviceID,
+		&event.IPAddress,
+		&contextJSON,
+		&metadataJSON,
+		&event.CreatedAt,
+		&event.CreatedBy,
+	)
+	if err != nil {
+		return err
+	}
+
+	if len(contextJSON) > 0 {
+		_ = json.Unmarshal(contextJSON, &event.Context)
+	}
+	if len(metadataJSON) > 0 {
+		_ = json.Unmarshal(metadataJSON, &event.Metadata)
+	}
+	return nil
+}
+
 func (r *attendanceRepository) GetAttendanceDailySummariesByUser(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -541,6 +749,7 @@ func (r *attendanceRepository) GetAttendanceDailySummariesByUser(
 	}
 	return summaries, nil
 }
+
 func (r *attendanceRepository) GetAttendanceDailySummariesByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -587,6 +796,7 @@ func (r *attendanceRepository) GetAttendanceDailySummariesByCompany(
 	}
 	return summaries, total, nil
 }
+
 func (r *attendanceRepository) DeleteAttendanceDailySummary(
 	ctx context.Context,
 	summaryID uuid.UUID,
@@ -608,6 +818,7 @@ func (r *attendanceRepository) DeleteAttendanceDailySummary(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetAttendanceEventTypes(
 	ctx context.Context,
 ) ([]*attendance.AttendanceEventType, error) {
@@ -645,36 +856,47 @@ func (r *attendanceRepository) GetAttendanceEventTypes(
 	}
 	return eventTypes, nil
 }
+
 func (r *attendanceRepository) GetAttendanceSourceTypes(
 	ctx context.Context,
 ) ([]*attendance.AttendanceSourceType, error) {
+
 	query := `
         SELECT
             source_type,
             description,
-            requires_reference
+            requires_device
         FROM attendance_source_types
         ORDER BY source_type
     `
+
 	rows, err := r.client.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get attendance source types: %w", err)
 	}
 	defer rows.Close()
+
 	var sourceTypes []*attendance.AttendanceSourceType
+
 	for rows.Next() {
 		var st attendance.AttendanceSourceType
 		if err := rows.Scan(
 			&st.SourceType,
 			&st.Description,
-			&st.RequiresReference,
+			&st.RequiresDevice,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan source type: %w", err)
 		}
 		sourceTypes = append(sourceTypes, &st)
 	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
 	return sourceTypes, nil
 }
+
 func (r *attendanceRepository) GetCompanyAttendanceRules(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -719,6 +941,7 @@ func (r *attendanceRepository) GetCompanyAttendanceRules(
 	rules.AllowedSourceTypes = allowedSources
 	return &rules, nil
 }
+
 func (r *attendanceRepository) UpsertCompanyAttendanceRules(
 	ctx context.Context,
 	rules *attendance.CompanyAttendanceRules,
@@ -750,6 +973,7 @@ func (r *attendanceRepository) UpsertCompanyAttendanceRules(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetDepartmentAttendanceRules(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -796,6 +1020,7 @@ func (r *attendanceRepository) GetDepartmentAttendanceRules(
 	rules.AllowedEventTypes = allowedEvents
 	return &rules, nil
 }
+
 func (r *attendanceRepository) UpsertDepartmentAttendanceRules(
 	ctx context.Context,
 	rules *attendance.DepartmentAttendanceRules,
@@ -844,6 +1069,7 @@ func (r *attendanceRepository) UpsertDepartmentAttendanceRules(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetUserAttendanceProfile(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -884,6 +1110,7 @@ func (r *attendanceRepository) GetUserAttendanceProfile(
 	profile.OverrideEventTypes = overrideEvents
 	return &profile, nil
 }
+
 func (r *attendanceRepository) UpsertUserAttendanceProfile(
 	ctx context.Context,
 	profile *attendance.UserAttendanceProfile,
@@ -920,300 +1147,7 @@ func (r *attendanceRepository) UpsertUserAttendanceProfile(
 	}
 	return nil
 }
-func (r *attendanceRepository) CreateAttendancePolicy(
-	ctx context.Context,
-	policy *attendance.AttendancePolicy,
-) error {
-	query := `
-        INSERT INTO attendance_policies (
-            policy_id, company_id, department_id, policy_code,
-            policy_type, rules, is_active, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    `
-	if policy.PolicyID == uuid.Nil {
-		policy.PolicyID = uuid.New()
-	}
-	if policy.CreatedAt.IsZero() {
-		now := time.Now().UTC()
-		policy.CreatedAt = now
-		policy.UpdatedAt = now
-	}
-	rulesJSON, _ := json.Marshal(policy.Rules)
-	_, err := r.client.Exec(ctx, query,
-		policy.PolicyID,
-		policy.CompanyID,
-		policy.DepartmentID,
-		policy.PolicyCode,
-		policy.PolicyType,
-		rulesJSON,
-		policy.IsActive,
-		policy.CreatedAt,
-		policy.UpdatedAt,
-	)
-	if err != nil {
-		r.logger.Error("Failed to create attendance policy",
-			util.String("policy_id", policy.PolicyID.String()),
-			util.String("policy_code", policy.PolicyCode),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to create attendance policy: %w", err)
-	}
-	return nil
-}
-func (r *attendanceRepository) GetAttendancePolicyByID(
-	ctx context.Context,
-	policyID uuid.UUID,
-) (*attendance.AttendancePolicy, error) {
-	query := `
-        SELECT * FROM attendance_policies
-        WHERE policy_id = $1
-    `
-	row := r.client.QueryRow(ctx, query, policyID)
-	var policy attendance.AttendancePolicy
-	var rulesJSON []byte
-	err := row.Scan(
-		&policy.PolicyID,
-		&policy.CompanyID,
-		&policy.DepartmentID,
-		&policy.PolicyCode,
-		&policy.PolicyType,
-		&rulesJSON,
-		&policy.IsActive,
-		&policy.CreatedAt,
-		&policy.UpdatedAt,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		r.logger.Error("Failed to get attendance policy",
-			util.String("policy_id", policyID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get attendance policy: %w", err)
-	}
-	if len(rulesJSON) > 0 {
-		err = json.Unmarshal(rulesJSON, &policy.Rules)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
-		}
-	}
-	return &policy, nil
-}
-func (r *attendanceRepository) GetAttendancePoliciesByCompany(
-	ctx context.Context,
-	companyID uuid.UUID,
-	activeOnly bool,
-) ([]*attendance.AttendancePolicy, error) {
-	query := `
-        SELECT * FROM attendance_policies
-        WHERE company_id = $1
-        ORDER BY policy_code
-    `
-	if activeOnly {
-		query = `
-            SELECT * FROM attendance_policies
-            WHERE company_id = $1 AND is_active = true
-            ORDER BY policy_code
-        `
-	}
-	rows, err := r.client.Query(ctx, query, companyID)
-	if err != nil {
-		r.logger.Error("Failed to get attendance policies",
-			util.String("company_id", companyID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get attendance policies: %w", err)
-	}
-	defer rows.Close()
-	var policies []*attendance.AttendancePolicy
-	for rows.Next() {
-		var policy attendance.AttendancePolicy
-		var rulesJSON []byte
-		err := rows.Scan(
-			&policy.PolicyID,
-			&policy.CompanyID,
-			&policy.DepartmentID,
-			&policy.PolicyCode,
-			&policy.PolicyType,
-			&rulesJSON,
-			&policy.IsActive,
-			&policy.CreatedAt,
-			&policy.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan policy: %w", err)
-		}
-		if len(rulesJSON) > 0 {
-			err = json.Unmarshal(rulesJSON, &policy.Rules)
-			if err != nil {
-				return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
-			}
-		}
-		policies = append(policies, &policy)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration error: %w", err)
-	}
-	return policies, nil
-}
-func (r *attendanceRepository) UpdateAttendancePolicy(
-	ctx context.Context,
-	policy *attendance.AttendancePolicy,
-) error {
-	policy.UpdatedAt = time.Now().UTC()
-	query := `
-        UPDATE attendance_policies SET
-            department_id = $1,
-            policy_code = $2,
-            policy_type = $3,
-            rules = $4,
-            is_active = $5,
-            updated_at = $6
-        WHERE policy_id = $7
-    `
-	rulesJSON, _ := json.Marshal(policy.Rules)
-	result, err := r.client.Exec(ctx, query,
-		policy.DepartmentID,
-		policy.PolicyCode,
-		policy.PolicyType,
-		rulesJSON,
-		policy.IsActive,
-		policy.UpdatedAt,
-		policy.PolicyID,
-	)
-	if err != nil {
-		r.logger.Error("Failed to update attendance policy",
-			util.String("policy_id", policy.PolicyID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to update attendance policy: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("attendance policy not found")
-	}
-	return nil
-}
-func (r *attendanceRepository) DeleteAttendancePolicy(
-	ctx context.Context,
-	policyID uuid.UUID,
-) error {
-	query := `
-        DELETE FROM attendance_policies
-        WHERE policy_id = $1
-    `
-	result, err := r.client.Exec(ctx, query, policyID)
-	if err != nil {
-		r.logger.Error("Failed to delete attendance policy",
-			util.String("policy_id", policyID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to delete attendance policy: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("attendance policy not found")
-	}
-	return nil
-}
-func (r *attendanceRepository) AssignUserAttendancePolicy(
-	ctx context.Context,
-	assignment *attendance.UserAttendancePolicy,
-) error {
-	query := `
-        INSERT INTO user_attendance_policies (
-            user_id, policy_id, effective_from, effective_to,
-            assigned_by, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-    `
-	if assignment.CreatedAt.IsZero() {
-		assignment.CreatedAt = time.Now().UTC()
-	}
-	_, err := r.client.Exec(ctx, query,
-		assignment.UserID,
-		assignment.PolicyID,
-		assignment.EffectiveFrom,
-		assignment.EffectiveTo,
-		assignment.AssignedBy,
-		assignment.CreatedAt,
-	)
-	if err != nil {
-		r.logger.Error("Failed to assign user attendance policy",
-			util.String("user_id", assignment.UserID.String()),
-			util.String("policy_id", assignment.PolicyID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to assign user attendance policy: %w", err)
-	}
-	return nil
-}
-func (r *attendanceRepository) GetUserActiveAttendancePolicy(
-	ctx context.Context,
-	userID uuid.UUID,
-	at time.Time,
-) (*attendance.AttendancePolicy, error) {
-	query := `
-        SELECT ap.*
-        FROM user_attendance_policies uap
-        JOIN attendance_policies ap ON uap.policy_id = ap.policy_id
-        WHERE uap.user_id = $1
-        AND uap.effective_from <= $2
-        AND (uap.effective_to IS NULL OR uap.effective_to >= $2)
-        AND ap.is_active = true
-        ORDER BY uap.effective_from DESC
-        LIMIT 1
-    `
-	row := r.client.QueryRow(ctx, query, userID, at)
-	var policy attendance.AttendancePolicy
-	var rulesJSON []byte
-	err := row.Scan(
-		&policy.PolicyID,
-		&policy.CompanyID,
-		&policy.DepartmentID,
-		&policy.PolicyCode,
-		&policy.PolicyType,
-		&rulesJSON,
-		&policy.IsActive,
-		&policy.CreatedAt,
-		&policy.UpdatedAt,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		r.logger.Error("Failed to get user active attendance policy",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get user active attendance policy: %w", err)
-	}
-	if len(rulesJSON) > 0 {
-		err = json.Unmarshal(rulesJSON, &policy.Rules)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
-		}
-	}
-	return &policy, nil
-}
-func (r *attendanceRepository) EndUserAttendancePolicy(
-	ctx context.Context,
-	userID, policyID uuid.UUID,
-	endDate time.Time,
-) error {
-	query := `
-        UPDATE user_attendance_policies
-        SET effective_to = $1
-        WHERE user_id = $2 AND policy_id = $3
-        AND effective_to IS NULL
-    `
-	result, err := r.client.Exec(ctx, query, endDate, userID, policyID)
-	if err != nil {
-		r.logger.Error("Failed to end user attendance policy",
-			util.String("user_id", userID.String()),
-			util.String("policy_id", policyID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to end user attendance policy: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("active user attendance policy not found")
-	}
-	return nil
-}
+
 func (r *attendanceRepository) CreateAttendanceSource(
 	ctx context.Context,
 	source *attendance.AttendanceSource,
@@ -1251,6 +1185,7 @@ func (r *attendanceRepository) CreateAttendanceSource(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetAttendanceSourceByID(
 	ctx context.Context,
 	sourceID uuid.UUID,
@@ -1283,6 +1218,7 @@ func (r *attendanceRepository) GetAttendanceSourceByID(
 	}
 	return &source, nil
 }
+
 func (r *attendanceRepository) GetAttendanceSourcesByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1332,6 +1268,7 @@ func (r *attendanceRepository) GetAttendanceSourcesByCompany(
 	}
 	return sources, nil
 }
+
 func (r *attendanceRepository) UpdateAttendanceSource(
 	ctx context.Context,
 	source *attendance.AttendanceSource,
@@ -1365,6 +1302,7 @@ func (r *attendanceRepository) UpdateAttendanceSource(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) CreateAttendanceLocation(
 	ctx context.Context,
 	location *attendance.AttendanceLocation,
@@ -1397,6 +1335,7 @@ func (r *attendanceRepository) CreateAttendanceLocation(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetAttendanceLocationByID(
 	ctx context.Context,
 	locationID uuid.UUID,
@@ -1429,6 +1368,7 @@ func (r *attendanceRepository) GetAttendanceLocationByID(
 	}
 	return &location, nil
 }
+
 func (r *attendanceRepository) GetAttendanceLocationsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1478,6 +1418,7 @@ func (r *attendanceRepository) GetAttendanceLocationsByCompany(
 	}
 	return locations, nil
 }
+
 func (r *attendanceRepository) CreateEmployeeRFIDMapping(
 	ctx context.Context,
 	mapping *attendance.EmployeeRFIDMapping,
@@ -1518,6 +1459,7 @@ func (r *attendanceRepository) CreateEmployeeRFIDMapping(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetEmployeeRFIDMappingByUser(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -1554,6 +1496,7 @@ func (r *attendanceRepository) GetEmployeeRFIDMappingByUser(
 	}
 	return &mapping, nil
 }
+
 func (r *attendanceRepository) GetEmployeeRFIDMapping(
 	ctx context.Context,
 	rfidTag string,
@@ -1590,6 +1533,7 @@ func (r *attendanceRepository) GetEmployeeRFIDMapping(
 	}
 	return &mapping, nil
 }
+
 func (r *attendanceRepository) UpdateEmployeeRFIDMapping(
 	ctx context.Context,
 	mapping *attendance.EmployeeRFIDMapping,
@@ -1628,6 +1572,7 @@ func (r *attendanceRepository) UpdateEmployeeRFIDMapping(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) DeactivateEmployeeRFIDMapping(
 	ctx context.Context,
 	rfidID uuid.UUID,
@@ -1650,6 +1595,7 @@ func (r *attendanceRepository) DeactivateEmployeeRFIDMapping(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) UpsertAttendanceDailySummary(
 	ctx context.Context,
 	summary *attendance.AttendanceDailySummary,
@@ -1714,6 +1660,7 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 	}
 	return nil
 }
+
 func (r *attendanceRepository) GetDistinctUsersWithEvents(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1748,6 +1695,7 @@ func (r *attendanceRepository) GetDistinctUsersWithEvents(
 	}
 	return userIDs, nil
 }
+
 func (r *attendanceRepository) GetAttendanceStats(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1795,6 +1743,7 @@ func (r *attendanceRepository) GetAttendanceStats(
 	}
 	return &stats, nil
 }
+
 func (r *attendanceRepository) GetUserAttendanceStats(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -1860,6 +1809,7 @@ func (r *attendanceRepository) GetUserAttendanceStats(
 	}
 	return &stats, nil
 }
+
 func (r *attendanceRepository) HealthCheck(ctx context.Context) error {
 	query := `SELECT 1`
 	var result int
@@ -1872,136 +1822,790 @@ func (r *attendanceRepository) HealthCheck(ctx context.Context) error {
 	}
 	return nil
 }
-func (r *attendanceRepository) FindExistingCorrection(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	eventType string,
-	eventTime time.Time,
-) (*attendance.AttendanceEvent, error) {
-	query := `
-		SELECT
-			attendance_event_id,
-			company_id,
-			user_id,
-			event_type,
-			event_time,
-			source_type,
-			source_id,
-			device_id,
-			ip_address,
-			metadata,
-			created_at,
-			created_by
-		FROM attendance_events
-		WHERE company_id = $1
-		  AND user_id = $2
-		  AND event_type = $3
-		  AND event_time = $4
-		  AND source_type = 'correction'
-		LIMIT 1
-	`
-	row := r.client.QueryRow(ctx, query, companyID, userID, eventType, eventTime)
-	var event attendance.AttendanceEvent
+
+func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDailySummary) error {
 	var metadataJSON []byte
 	err := row.Scan(
-		&event.AttendanceEventID,
-		&event.CompanyID,
-		&event.UserID,
-		&event.EventType,
-		&event.EventTime,
-		&event.SourceType,
-		&event.SourceID,
-		&event.DeviceID,
-		&event.IPAddress,
+		&summary.AttendanceSummaryID,
+		&summary.CompanyID,
+		&summary.UserID,
+		&summary.AttendanceDate,
+		&summary.Status,
+		&summary.WorkedMinutes,
+		&summary.OvertimeMinutes,
+		&summary.LateMinutes,
 		&metadataJSON,
-		&event.CreatedAt,
-		&event.CreatedBy,
+		&summary.GeneratedAt,
+		&summary.GeneratedBy,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		r.logger.Error(
-			"Failed to find existing correction",
-			util.String("company_id", companyID.String()),
-			util.String("user_id", userID.String()),
-			util.String("event_type", eventType),
-			util.Time("event_time", eventTime),
-			util.ErrorField(err),
-		)
-		return nil, fmt.Errorf("failed to find existing correction: %w", err)
+		return err
 	}
 	if len(metadataJSON) > 0 {
-		if err := json.Unmarshal(metadataJSON, &event.Metadata); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		err = json.Unmarshal(metadataJSON, &summary.Metadata)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal metadata: %w", err)
 		}
 	}
-	return &event, nil
+	return nil
 }
-func (r *attendanceRepository) GetLastAttendanceEvent(
+
+// ============================================================
+// POLICY-BASED METHODS WITH WORK CENTER UPDATES
+// ============================================================
+
+func (r *attendanceRepository) CreateAttendancePolicy(
 	ctx context.Context,
-	companyID, userID uuid.UUID,
-	eventType string,
-	since time.Time,
-) (*attendance.AttendanceEvent, error) {
+	policy *attendance.AttendancePolicy,
+) error {
 	query := `
-		SELECT
-			attendance_event_id,
-			company_id,
-			user_id,
-			event_type,
-			event_time,
-			source_type,
-			source_id,
-			device_id,
-			ip_address,
-			metadata,
-			created_at,
-			created_by
-		FROM attendance_events
+        INSERT INTO attendance_policies (
+            policy_id,
+            company_id,
+            work_center_code,
+            position_id,
+            policy_code,
+            policy_type,
+            rules,
+            is_active,
+            created_at,
+            updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `
+	if policy.PolicyID == uuid.Nil {
+		policy.PolicyID = uuid.New()
+	}
+	if policy.CreatedAt.IsZero() {
+		now := time.Now().UTC()
+		policy.CreatedAt = now
+		policy.UpdatedAt = now
+	}
+	rulesJSON, _ := json.Marshal(policy.Rules)
+	_, err := r.client.Exec(ctx, query,
+		policy.PolicyID,
+		policy.CompanyID,
+		policy.WorkCenterCode, // 🔥 NEW
+		policy.PositionID,
+		policy.PolicyCode,
+		policy.PolicyType,
+		rulesJSON,
+		policy.IsActive,
+		policy.CreatedAt,
+		policy.UpdatedAt,
+	)
+	if err != nil {
+		r.logger.Error("Failed to create attendance policy",
+			util.String("policy_id", policy.PolicyID.String()),
+			util.String("policy_code", policy.PolicyCode),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to create attendance policy: %w", err)
+	}
+	return nil
+}
+
+func (r *attendanceRepository) GetAttendancePolicyByID(
+	ctx context.Context,
+	policyID uuid.UUID,
+) (*attendance.AttendancePolicy, error) {
+	query := `
+        SELECT * FROM attendance_policies
+        WHERE policy_id = $1
+    `
+	row := r.client.QueryRow(ctx, query, policyID)
+	var policy attendance.AttendancePolicy
+	var rulesJSON []byte
+	err := row.Scan(
+		&policy.PolicyID,
+		&policy.CompanyID,
+		&policy.WorkCenterCode, // 🔥 NEW
+		&policy.PositionID,
+		&policy.PolicyCode,
+		&policy.PolicyType,
+		&rulesJSON,
+		&policy.IsActive,
+		&policy.CreatedAt,
+		&policy.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("Failed to get attendance policy",
+			util.String("policy_id", policyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance policy: %w", err)
+	}
+	if len(rulesJSON) > 0 {
+		err = json.Unmarshal(rulesJSON, &policy.Rules)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
+		}
+	}
+	return &policy, nil
+}
+
+func (r *attendanceRepository) GetAttendancePoliciesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	activeOnly bool,
+) ([]*attendance.AttendancePolicy, error) {
+	query := `
+        SELECT * FROM attendance_policies
+        WHERE company_id = $1
+        ORDER BY policy_code
+    `
+	if activeOnly {
+		query = `
+            SELECT * FROM attendance_policies
+            WHERE company_id = $1 AND is_active = true
+            ORDER BY policy_code
+        `
+	}
+	rows, err := r.client.Query(ctx, query, companyID)
+	if err != nil {
+		r.logger.Error("Failed to get attendance policies",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance policies: %w", err)
+	}
+	defer rows.Close()
+	var policies []*attendance.AttendancePolicy
+	for rows.Next() {
+		var policy attendance.AttendancePolicy
+		var rulesJSON []byte
+		err := rows.Scan(
+			&policy.PolicyID,
+			&policy.CompanyID,
+			&policy.WorkCenterCode, // 🔥 NEW
+			&policy.PositionID,
+			&policy.PolicyCode,
+			&policy.PolicyType,
+			&rulesJSON,
+			&policy.IsActive,
+			&policy.CreatedAt,
+			&policy.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan policy: %w", err)
+		}
+		if len(rulesJSON) > 0 {
+			err = json.Unmarshal(rulesJSON, &policy.Rules)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
+			}
+		}
+		policies = append(policies, &policy)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return policies, nil
+}
+
+func (r *attendanceRepository) UpdateAttendancePolicy(
+	ctx context.Context,
+	policy *attendance.AttendancePolicy,
+) error {
+	policy.UpdatedAt = time.Now().UTC()
+	query := `
+        UPDATE attendance_policies SET
+            work_center_code = $1,
+            position_id = $2,
+            policy_code = $3,
+            policy_type = $4,
+            rules = $5,
+            is_active = $6,
+            updated_at = $7
+        WHERE policy_id = $8
+    `
+	rulesJSON, _ := json.Marshal(policy.Rules)
+	result, err := r.client.Exec(ctx, query,
+		policy.WorkCenterCode, // 🔥 NEW
+		policy.PositionID,
+		policy.PolicyCode,
+		policy.PolicyType,
+		rulesJSON,
+		policy.IsActive,
+		policy.UpdatedAt,
+		policy.PolicyID,
+	)
+	if err != nil {
+		r.logger.Error("Failed to update attendance policy",
+			util.String("policy_id", policy.PolicyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to update attendance policy: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("attendance policy not found")
+	}
+	return nil
+}
+
+func (r *attendanceRepository) DeleteAttendancePolicy(
+	ctx context.Context,
+	policyID uuid.UUID,
+) error {
+	query := `
+        DELETE FROM attendance_policies
+        WHERE policy_id = $1
+    `
+	result, err := r.client.Exec(ctx, query, policyID)
+	if err != nil {
+		r.logger.Error("Failed to delete attendance policy",
+			util.String("policy_id", policyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to delete attendance policy: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("attendance policy not found")
+	}
+	return nil
+}
+
+func (r *attendanceRepository) AssignUserAttendancePolicy(
+	ctx context.Context,
+	assignment *attendance.UserAttendancePolicy,
+) error {
+	query := `
+        INSERT INTO user_attendance_policies (
+            user_id, policy_id, effective_from, effective_to,
+            assigned_by, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+    `
+	if assignment.CreatedAt.IsZero() {
+		assignment.CreatedAt = time.Now().UTC()
+	}
+	_, err := r.client.Exec(ctx, query,
+		assignment.UserID,
+		assignment.PolicyID,
+		assignment.EffectiveFrom,
+		assignment.EffectiveTo,
+		assignment.AssignedBy,
+		assignment.CreatedAt,
+	)
+	if err != nil {
+		r.logger.Error("Failed to assign user attendance policy",
+			util.String("user_id", assignment.UserID.String()),
+			util.String("policy_id", assignment.PolicyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to assign user attendance policy: %w", err)
+	}
+	return nil
+}
+
+func (r *attendanceRepository) GetUserActiveAttendancePolicy(
+	ctx context.Context,
+	userID uuid.UUID,
+	at time.Time,
+) (*attendance.AttendancePolicy, error) {
+	query := `
+        SELECT ap.*
+        FROM user_attendance_policies uap
+        JOIN attendance_policies ap ON uap.policy_id = ap.policy_id
+        WHERE uap.user_id = $1
+        AND uap.effective_from <= $2
+        AND (uap.effective_to IS NULL OR uap.effective_to >= $2)
+        AND ap.is_active = true
+        ORDER BY uap.effective_from DESC
+        LIMIT 1
+    `
+	row := r.client.QueryRow(ctx, query, userID, at)
+	var policy attendance.AttendancePolicy
+	var rulesJSON []byte
+	err := row.Scan(
+		&policy.PolicyID,
+		&policy.CompanyID,
+		&policy.WorkCenterCode, // 🔥 NEW (must be included in SELECT ap.*)
+		&policy.PositionID,
+		&policy.PolicyCode,
+		&policy.PolicyType,
+		&rulesJSON,
+		&policy.IsActive,
+		&policy.CreatedAt,
+		&policy.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("Failed to get user active attendance policy",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get user active attendance policy: %w", err)
+	}
+	if len(rulesJSON) > 0 {
+		err = json.Unmarshal(rulesJSON, &policy.Rules)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
+		}
+	}
+	return &policy, nil
+}
+
+func (r *attendanceRepository) EndUserAttendancePolicy(
+	ctx context.Context,
+	userID, policyID uuid.UUID,
+	endDate time.Time,
+) error {
+	query := `
+        UPDATE user_attendance_policies
+        SET effective_to = $1
+        WHERE user_id = $2 AND policy_id = $3
+        AND effective_to IS NULL
+    `
+	result, err := r.client.Exec(ctx, query, endDate, userID, policyID)
+	if err != nil {
+		r.logger.Error("Failed to end user attendance policy",
+			util.String("user_id", userID.String()),
+			util.String("policy_id", policyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to end user attendance policy: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("active user attendance policy not found")
+	}
+	return nil
+}
+
+func (r *attendanceRepository) GetPositionAttendancePolicy(
+	ctx context.Context,
+	positionID uuid.UUID,
+) (*attendance.AttendancePolicy, error) {
+	query := `
+        SELECT * FROM attendance_policies
+        WHERE position_id = $1
+        AND is_active = true
+        ORDER BY created_at DESC
+        LIMIT 1
+    `
+	row := r.client.QueryRow(ctx, query, positionID)
+	var policy attendance.AttendancePolicy
+	var rulesJSON []byte
+	err := row.Scan(
+		&policy.PolicyID,
+		&policy.CompanyID,
+		&policy.WorkCenterCode, // 🔥 NEW
+		&policy.PositionID,
+		&policy.PolicyCode,
+		&policy.PolicyType,
+		&rulesJSON,
+		&policy.IsActive,
+		&policy.CreatedAt,
+		&policy.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("Failed to get position attendance policy",
+			util.String("position_id", positionID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get position attendance policy: %w", err)
+	}
+	if len(rulesJSON) > 0 {
+		err = json.Unmarshal(rulesJSON, &policy.Rules)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal rules: %w", err)
+		}
+	}
+	return &policy, nil
+}
+
+// 🔥 6️⃣ ADD NEW METHOD: Work Center Policy Lookup
+func (r *attendanceRepository) GetWorkCenterAttendancePolicy(
+	ctx context.Context,
+	companyID uuid.UUID,
+	workCenterCode string,
+) (*attendance.AttendancePolicy, error) {
+
+	query := `
+		SELECT *
+		FROM attendance_policies
 		WHERE company_id = $1
-		  AND user_id = $2
-		  AND event_type = $3
-		  AND event_time >= $4
-		  AND source_type != 'correction'
-		ORDER BY event_time DESC
+		  AND work_center_code = $2
+		  AND is_active = true
+		ORDER BY created_at DESC
 		LIMIT 1
 	`
-	row := r.client.QueryRow(ctx, query, companyID, userID, eventType, since)
-	var event attendance.AttendanceEvent
+
+	row := r.client.QueryRow(ctx, query, companyID, workCenterCode)
+
+	var policy attendance.AttendancePolicy
+	var rulesJSON []byte
+
+	err := row.Scan(
+		&policy.PolicyID,
+		&policy.CompanyID,
+		&policy.WorkCenterCode,
+		&policy.PositionID,
+		&policy.PolicyCode,
+		&policy.PolicyType,
+		&rulesJSON,
+		&policy.IsActive,
+		&policy.CreatedAt,
+		&policy.UpdatedAt,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get work center attendance policy: %w", err)
+	}
+
+	if len(rulesJSON) > 0 {
+		_ = json.Unmarshal(rulesJSON, &policy.Rules)
+	}
+
+	return &policy, nil
+}
+
+func (r *attendanceRepository) GetUsersByAttendancePolicy(
+	ctx context.Context,
+	policyID uuid.UUID,
+	effectiveDate time.Time,
+) ([]uuid.UUID, error) {
+	query := `
+        SELECT uap.user_id
+        FROM user_attendance_policies uap
+        WHERE uap.policy_id = $1
+        AND uap.effective_from <= $2
+        AND (uap.effective_to IS NULL OR uap.effective_to >= $2)
+        ORDER BY uap.user_id
+    `
+	rows, err := r.client.Query(ctx, query, policyID, effectiveDate)
+	if err != nil {
+		r.logger.Error("Failed to get users by attendance policy",
+			util.String("policy_id", policyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get users by attendance policy: %w", err)
+	}
+	defer rows.Close()
+
+	var userIDs []uuid.UUID
+	for rows.Next() {
+		var userID uuid.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("failed to scan user_id: %w", err)
+		}
+		userIDs = append(userIDs, userID)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return userIDs, nil
+}
+
+func (r *attendanceRepository) CreateAttendanceDailySummary(
+	ctx context.Context,
+	summary *attendance.AttendanceDailySummary,
+) error {
+	query := `
+        INSERT INTO attendance_daily_summary (
+            attendance_summary_id, company_id, user_id, attendance_date,
+            status, worked_minutes, overtime_minutes, late_minutes,
+            metadata, generated_at, generated_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `
+	if summary.AttendanceSummaryID == uuid.Nil {
+		summary.AttendanceSummaryID = uuid.New()
+	}
+	if summary.GeneratedAt.IsZero() {
+		summary.GeneratedAt = time.Now().UTC()
+	}
+	metadataJSON, _ := json.Marshal(summary.Metadata)
+	_, err := r.client.Exec(ctx, query,
+		summary.AttendanceSummaryID,
+		summary.CompanyID,
+		summary.UserID,
+		summary.AttendanceDate,
+		summary.Status,
+		summary.WorkedMinutes,
+		summary.OvertimeMinutes,
+		summary.LateMinutes,
+		metadataJSON,
+		summary.GeneratedAt,
+		summary.GeneratedBy,
+	)
+	if err != nil {
+		r.logger.Error("Failed to create attendance daily summary",
+			util.String("summary_id", summary.AttendanceSummaryID.String()),
+			util.String("user_id", summary.UserID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to create attendance daily summary: %w", err)
+	}
+	return nil
+}
+
+func (r *attendanceRepository) UpdateAttendanceDailySummary(
+	ctx context.Context,
+	summary *attendance.AttendanceDailySummary,
+) error {
+	query := `
+        UPDATE attendance_daily_summary SET
+            status = $1,
+            worked_minutes = $2,
+            overtime_minutes = $3,
+            late_minutes = $4,
+            metadata = $5,
+            generated_at = $6,
+            generated_by = $7
+        WHERE attendance_summary_id = $8
+    `
+	metadataJSON, _ := json.Marshal(summary.Metadata)
+	result, err := r.client.Exec(ctx, query,
+		summary.Status,
+		summary.WorkedMinutes,
+		summary.OvertimeMinutes,
+		summary.LateMinutes,
+		metadataJSON,
+		summary.GeneratedAt,
+		summary.GeneratedBy,
+		summary.AttendanceSummaryID,
+	)
+	if err != nil {
+		r.logger.Error("Failed to update attendance daily summary",
+			util.String("summary_id", summary.AttendanceSummaryID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to update attendance daily summary: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("attendance daily summary not found")
+	}
+	return nil
+}
+
+func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+) (*attendance.AttendanceDailySummary, error) {
+	query := `
+        SELECT * FROM attendance_daily_summary
+        WHERE user_id = $1
+        AND attendance_date = $2
+    `
+	row := r.client.QueryRow(ctx, query, userID, date)
+	var summary attendance.AttendanceDailySummary
 	var metadataJSON []byte
 	err := row.Scan(
-		&event.AttendanceEventID,
-		&event.CompanyID,
-		&event.UserID,
-		&event.EventType,
-		&event.EventTime,
-		&event.SourceType,
-		&event.SourceID,
-		&event.DeviceID,
-		&event.IPAddress,
+		&summary.AttendanceSummaryID,
+		&summary.CompanyID,
+		&summary.UserID,
+		&summary.AttendanceDate,
+		&summary.Status,
+		&summary.WorkedMinutes,
+		&summary.OvertimeMinutes,
+		&summary.LateMinutes,
 		&metadataJSON,
-		&event.CreatedAt,
-		&event.CreatedBy,
+		&summary.GeneratedAt,
+		&summary.GeneratedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("Failed to get attendance daily summary",
+			util.String("user_id", userID.String()),
+			util.String("date", date.Format("2006-01-02")),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance daily summary: %w", err)
+	}
+	if len(metadataJSON) > 0 {
+		err = json.Unmarshal(metadataJSON, &summary.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+	}
+	return &summary, nil
+}
+
+func (r *attendanceRepository) InsertAttendanceOutboxEvent(
+	ctx context.Context,
+	eventType string,
+	aggregateID uuid.UUID,
+	payload map[string]interface{},
+) error {
+	query := `
+        INSERT INTO attendance.attendance_events_outbox
+        (event_type, aggregate_id, payload)
+        VALUES ($1, $2, $3)
+    `
+	payloadJSON, _ := json.Marshal(payload)
+	_, err := r.client.Exec(ctx, query,
+		eventType,
+		aggregateID,
+		payloadJSON,
+	)
+	return err
+}
+
+type CompanyEmployee struct {
+	CompanyID  uuid.UUID
+	UserID     uuid.UUID
+	PositionID *uuid.UUID
+}
+
+type Position struct {
+	PositionID     uuid.UUID
+	Title          string
+	DepartmentID   uuid.UUID
+	WorkCenterCode *string
+}
+
+type EmployeeDepartment struct {
+	DepartmentID uuid.UUID
+}
+
+type Department struct {
+	DepartmentID   uuid.UUID
+	DepartmentName string
+}
+
+func (r *attendanceRepository) GetCompanyEmployee(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+) (*CompanyEmployee, error) {
+	query := `
+		SELECT
+			company_id,
+			user_id,
+			position_id
+		FROM company_employees
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND is_active = true
+		LIMIT 1
+	`
+
+	var ce CompanyEmployee
+	err := r.client.QueryRow(ctx, query, companyID, userID).Scan(
+		&ce.CompanyID,
+		&ce.UserID,
+		&ce.PositionID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		r.logger.Error(
-			"Failed to get last attendance event",
+			"Failed to get company employee",
 			util.String("company_id", companyID.String()),
 			util.String("user_id", userID.String()),
-			util.String("event_type", eventType),
-			util.Time("since", since),
 			util.ErrorField(err),
 		)
-		return nil, fmt.Errorf("failed to get last attendance event: %w", err)
+		return nil, err
 	}
-	if len(metadataJSON) > 0 {
-		if err := json.Unmarshal(metadataJSON, &event.Metadata); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+
+	return &ce, nil
+}
+
+func (r *attendanceRepository) GetPosition(
+	ctx context.Context,
+	positionID uuid.UUID,
+) (*Position, error) {
+	query := `
+		SELECT
+			position_id,
+			title,
+			department_id,
+			work_center_code
+		FROM positions
+		WHERE position_id = $1
+		  AND is_active = true
+	`
+
+	var p Position
+	err := r.client.QueryRow(ctx, query, positionID).Scan(
+		&p.PositionID,
+		&p.Title,
+		&p.DepartmentID,
+		&p.WorkCenterCode,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
 		}
+		r.logger.Error(
+			"Failed to get position",
+			util.String("position_id", positionID.String()),
+			util.ErrorField(err),
+		)
+		return nil, err
 	}
-	return &event, nil
+
+	return &p, nil
+}
+
+func (r *attendanceRepository) GetEmployeeActiveDepartment(
+	ctx context.Context,
+	userID uuid.UUID,
+) (*EmployeeDepartment, error) {
+	query := `
+		SELECT
+			department_id
+		FROM employee_department_history
+		WHERE user_id = $1
+		  AND effective_from <= now()
+		  AND (effective_to IS NULL OR effective_to >= now())
+		ORDER BY effective_from DESC
+		LIMIT 1
+	`
+
+	var ed EmployeeDepartment
+	err := r.client.QueryRow(ctx, query, userID).Scan(
+		&ed.DepartmentID,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error(
+			"Failed to get employee active department",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err),
+		)
+		return nil, err
+	}
+
+	return &ed, nil
+}
+
+func (r *attendanceRepository) GetDepartment(
+	ctx context.Context,
+	departmentID uuid.UUID,
+) (*Department, error) {
+	query := `
+		SELECT
+			department_id,
+			department_name
+		FROM departments
+		WHERE department_id = $1
+		  AND is_active = true
+	`
+
+	var d Department
+	err := r.client.QueryRow(ctx, query, departmentID).Scan(
+		&d.DepartmentID,
+		&d.DepartmentName,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error(
+			"Failed to get department",
+			util.String("department_id", departmentID.String()),
+			util.ErrorField(err),
+		)
+		return nil, err
+	}
+
+	return &d, nil
 }

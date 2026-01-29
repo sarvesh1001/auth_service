@@ -22,12 +22,12 @@ func NewRouter(
 	adminHandler *AdminHandler,
 	authHandler *AuthHandler,
 	rbacHandler *RBACHandler,
-	attendanceHandler *hrHandler.AttendanceHandler,
 	auditHandler *hrHandler.AuditHandler,
 	compensationHandler *hrHandler.CompensationHandler,
 	employeeHandler *hrHandler.EmployeeHandler,
 	leaveHandler *hrHandler.LeaveHandler,
 	schedulingHandler *hrHandler.SchedulingHandler,
+	attendanceIngestHandler *hrHandler.AttendanceIngestHandler,
 	pairingHandler *PairingHandler,
 	workCenterHandler *hrHandler.WorkCenterHandler,
 	wsHandler *WebSocketHandler,
@@ -35,6 +35,12 @@ func NewRouter(
 	jwtService *service.JWTService,
 	logger *zap.Logger,
 	orgUnitHandler *hrHandler.OrgUnitHandler,
+	// New attendance handlers
+	deviceHandler *hrHandler.DeviceHandler,
+	attendanceAdminHandler *hrHandler.AttendanceAdminHandler,
+	attendanceQueryHandler *hrHandler.AttendanceQueryHandler,
+	attendanceResolutionHandler *hrHandler.AttendanceResolutionHandler,
+	attendanceCorrectionHandler *hrHandler.AttendanceCorrectionHandler,
 
 ) chi.Router {
 	router := chi.NewRouter()
@@ -226,7 +232,7 @@ func NewRouter(
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update", logger)).
 						Post("/{parentDepartmentID}/sub-departments", adminHandler.CreateSubDepartment)
 				})
-				r.Route("/companies/{companyID}/org-units", func(r chi.Router) {
+				r.Route("/org-units", func(r chi.Router) {
 					r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
 
 					// Org Units
@@ -262,11 +268,20 @@ func NewRouter(
 							Get("/roles", orgUnitHandler.GetOrgUnitRoles)
 
 						r.Route("/members/{userID}", func(r chi.Router) {
+
+							// ✅ UPDATE membership (end + insert)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+								Put("/", orgUnitHandler.UpdateMember)
+
+							// Remove member (end membership)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
 								Delete("/", orgUnitHandler.RemoveMember)
+
+							// Remove role from member
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
 								Delete("/roles/{role}", orgUnitHandler.RemoveRole)
 						})
+
 					})
 
 					// User memberships
@@ -275,152 +290,133 @@ func NewRouter(
 				})
 
 				// ============================================
-				// ATTENDANCE MANAGEMENT ROUTES (UPDATED)
+				// UPDATED ATTENDANCE MANAGEMENT ROUTES
 				// ============================================
 				r.Route("/attendance", func(r chi.Router) {
-					// Health Check
-					r.Get("/health", attendanceHandler.HealthCheck)
+					// Device Management
+					r.Route("/devices", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+							Post("/", deviceHandler.CreateDevice)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+							Get("/", deviceHandler.ListDevices)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("it.system.config.view", logger)).
+							Get("/health", deviceHandler.HealthCheck)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+							Get("/stats", deviceHandler.GetDeviceStatistics)
 
-					// Attendance Events
+						r.Route("/{deviceID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+								Get("/", deviceHandler.GetDevice)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Put("/", deviceHandler.UpdateDevice)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Delete("/", deviceHandler.DeleteDevice)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Post("/activate", deviceHandler.ActivateDevice)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Post("/deactivate", deviceHandler.DeactivateDevice)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Post("/trust", deviceHandler.MarkAsTrusted)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Post("/revoke-trust", deviceHandler.RevokeTrust)
+						})
+					})
+
+					// Attendance Admin (Policies, Rules, RFID)
+					r.Route("/admin", func(r chi.Router) {
+						r.Route("/policies", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Post("/", attendanceAdminHandler.CreatePolicy)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+								Get("/", attendanceAdminHandler.ListPolicies)
+
+							r.Route("/{policyID}", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+									Get("/", attendanceAdminHandler.GetPolicy)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+									Put("/", attendanceAdminHandler.UpdatePolicy)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+									Delete("/", attendanceAdminHandler.DeletePolicy)
+							})
+						})
+
+						r.Route("/rules", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+								Get("/company", attendanceAdminHandler.GetCompanyRules)
+							// r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+							// 	Put("/company", attendanceAdminHandler.UpdateCompanyRules)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+								Get("/resolve", attendanceAdminHandler.GetResolvedRules)
+						})
+
+						r.Route("/rfid", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+								Post("/assign", attendanceAdminHandler.AssignRFID)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+								Get("/assignment", attendanceAdminHandler.GetRFIDAssignment)
+						})
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
+							Post("/assign-policy", attendanceAdminHandler.AssignPolicyToUser)
+					})
+
+					// Attendance Events (Ingest)
 					r.Route("/events", func(r chi.Router) {
+
+						// Punch
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.self.punch", logger)).
-							Post("/punch", attendanceHandler.PunchAttendance)
+							Post("/punch", attendanceIngestHandler.PunchAttendance)
+
+						// ✅ CORRECTION (ADMIN / MANAGER)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
-							Post("/correct", attendanceHandler.CorrectAttendance)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/", attendanceHandler.CreateAttendanceEvent)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/bulk", attendanceHandler.CreateBulkAttendanceEvents)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/{eventID}", attendanceHandler.GetAttendanceEvent)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/search", attendanceHandler.SearchAttendanceEvents)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/", attendanceHandler.GetAttendanceEventsByCompany)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/stream", attendanceHandler.StreamAttendanceEvents)
+							Post("/correction", attendanceCorrectionHandler.CreateCorrection)
 
-						r.Route("/user/{userID}", func(r chi.Router) {
+						r.Route("/{eventID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/", attendanceHandler.GetAttendanceEventsByUser)
+								Get("/", attendanceQueryHandler.GetEvent)
 						})
+
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
+							Get("/search", attendanceQueryHandler.SearchEvents)
 					})
 
-					// Attendance Policies
-					r.Route("/policies", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/", attendanceHandler.CreateAttendancePolicy)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/", attendanceHandler.GetAttendancePoliciesByCompany)
-
-						r.Route("/{policyID}", func(r chi.Router) {
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/", attendanceHandler.GetAttendancePolicy)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-								Put("/", attendanceHandler.UpdateAttendancePolicy)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.delete", logger)).
-								Delete("/", attendanceHandler.DeleteAttendancePolicy)
-						})
-
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/assign", attendanceHandler.AssignUserAttendancePolicy)
-
-						r.Route("/user/{userID}", func(r chi.Router) {
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/current", attendanceHandler.GetUserCurrentAttendancePolicy)
-						})
-					})
-
-					// Attendance Rules
-					r.Route("/rules", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/company", attendanceHandler.GetCompanyAttendanceRules)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Put("/company", attendanceHandler.UpdateCompanyAttendanceRules)
-
-						r.Route("/departments/{departmentID}", func(r chi.Router) {
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/", attendanceHandler.GetDepartmentAttendanceRules)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-								Put("/", attendanceHandler.UpdateDepartmentAttendanceRules)
-						})
-
-						r.Route("/users/{userID}", func(r chi.Router) {
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/profile", attendanceHandler.GetUserAttendanceProfile)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-								Put("/profile", attendanceHandler.UpdateUserAttendanceProfile)
-						})
-
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/resolve", attendanceHandler.ResolveAttendanceRules)
-					})
-
-					// Daily Summaries
+					// Attendance Query (Views & Reports)
 					r.Route("/summary", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/generate", attendanceHandler.GenerateDailySummary)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/generate/bulk", attendanceHandler.GenerateBulkDailySummaries)
-
 						r.Route("/user/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/daily", attendanceHandler.GetAttendanceDailySummary)
+								Get("/daily/{date}", attendanceQueryHandler.GetDailySummary)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-								Get("/range", attendanceHandler.GetAttendanceDailySummaries)
+								Get("/range", attendanceQueryHandler.GetUserSummaries)
 						})
 					})
-
-					// Company-wide Summaries
-					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Get("/summaries", attendanceHandler.GetAttendanceDailySummariesByCompany)
 
 					// Statistics
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Get("/stats", attendanceHandler.GetAttendanceStats)
-
-					r.Route("/stats/user/{userID}", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/", attendanceHandler.GetUserAttendanceStats)
-					})
-
-					// Integration Endpoints
-					r.Route("/integration", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/sap", attendanceHandler.ProcessSAPAttendanceEvent)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/factory", attendanceHandler.SyncFactoryAttendance)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/sap/complete", attendanceHandler.CompleteSAPAttendanceFlow)
-					})
-
-					// RFID Management
-					r.Route("/rfid", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Post("/assign", attendanceHandler.AssignRFIDToEmployee)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-							Get("/employee/{rfidTag}", attendanceHandler.GetEmployeeByRFID)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.update", logger)).
-							Delete("/{rfidID}", attendanceHandler.UnassignRFID)
-					})
-
-					// Availability Check
+						Get("/stats", attendanceQueryHandler.GetCompanyStats)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Get("/availability/check", attendanceHandler.CheckDateAvailability)
+						Get("/stats/user/{userID}", attendanceQueryHandler.GetUserStats)
 
 					// Reports
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Get("/report", attendanceHandler.GenerateAttendanceReport)
+						Get("/reports", attendanceQueryHandler.GenerateReport)
 
-					// Event and Source Types
+					// Metadata
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Get("/event-types", attendanceHandler.GetAttendanceEventTypes)
+						Get("/event-types", attendanceQueryHandler.ListEventTypes)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Get("/source-types", attendanceHandler.GetAttendanceSourceTypes)
+						Get("/source-types", attendanceQueryHandler.ListSourceTypes)
 
-					// Validation
-					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
-						Post("/validate", attendanceHandler.ValidateEventAgainstRules)
+					// Resolution
+					r.Route("/resolve", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
+							Post("/event", attendanceResolutionHandler.ResolveEvent)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
+							Post("/day", attendanceResolutionHandler.ResolveDay)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
+							Post("/batch", attendanceResolutionHandler.BatchResolve)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
+							Post("/day/{userID}/{date}", attendanceResolutionHandler.ResolveDayByPath)
+					})
 				})
 
 				// ============================================
@@ -488,17 +484,13 @@ func NewRouter(
 					})
 
 					// Position-Based Scheduling
-					// Position-Based Scheduling
 					r.Route("/position-based", func(r chi.Router) {
-
 						r.Route("/users/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 								Get("/resolve", schedulingHandler.ResolveUserDay)
-
 							r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 								Get("/position", schedulingHandler.GetUserScheduledPosition)
 						})
-
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.create", logger)).
 							Post("/instances", schedulingHandler.CreateScheduleInstanceFromPosition)
 					})
@@ -881,7 +873,16 @@ func NewRouter(
 
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(AdminSessionMiddleware(logger))
+				r.Route("/companies/{companyID}/attendance", func(r chi.Router) {
 
+					r.With(
+						authMiddleware.BitmaskPermissionMiddleware(
+							"attendance.configure",
+							logger,
+						),
+					).Put("/rules", attendanceAdminHandler.UpdateCompanyRules)
+
+				})
 				r.Route("/system/hr", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config", logger)).
 						Post("/enforce-exits", employeeHandler.EnforceEmployeeExits)

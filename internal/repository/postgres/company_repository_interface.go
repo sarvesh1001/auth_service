@@ -392,4 +392,44 @@ type CompanyRepository interface {
 	) (*models.CompanyEmployee, *models.Position, error)
 	WorkCenterExists(ctx context.Context, companyID uuid.UUID, workCenterCode string) (bool, error)
 	GetOpenPositions(ctx context.Context, companyID uuid.UUID, isOpen *bool, limit, offset int) ([]*models.Position, int, error)
+	AddRoleDepartments(
+		ctx context.Context,
+		roleID uuid.UUID,
+		departmentIDs []uuid.UUID,
+	) error
+
+	RemoveRoleDepartments(
+		ctx context.Context,
+		roleID uuid.UUID,
+		departmentIDs []uuid.UUID,
+	) error
+
+	// Role ↔ Permission mapping
+	ClearRolePermissions(
+		ctx context.Context,
+		roleID uuid.UUID,
+	) error
+
+	AddRolePermissions(
+		ctx context.Context,
+		roleID uuid.UUID,
+		permissionIDs []uuid.UUID,
+		grantedBy uuid.UUID,
+	) error
+
+	RemoveRolePermissions(
+		ctx context.Context,
+		roleID uuid.UUID,
+		permissionIDs []uuid.UUID,
+	) error
+
+	// Lookups
+
+	GetDepartmentByName(
+		ctx context.Context,
+		companyID uuid.UUID,
+		departmentName string,
+	) (*models.Department, error)
+
+	// Queries
 }

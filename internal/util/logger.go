@@ -305,3 +305,6 @@ func SafeString(s *string) string {
 	}
 	return *s
 }
+func BoolPtr(v bool) *bool {
+	return &v
+}

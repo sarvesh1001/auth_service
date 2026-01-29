@@ -1,925 +1,1143 @@
 package service
 
-// package service
-
-// import (
-// 	"auth-service/internal/hr/models/attendance"
-// 	"auth-service/internal/hr/repository"
-// 	"auth-service/internal/util"
-// 	"context"
-// 	"encoding/csv"
-// 	"encoding/json"
-// 	"fmt"
-// 	"io"
-// 	"strings"
-// 	"sync"
-// 	"time"
-
-// 	"github.com/google/uuid"
-// 	"go.uber.org/zap"
-// )
-
-// // ============================================================================
-// // QUERY SERVICE TYPES
-// // ============================================================================
-
-// // AttendanceSearchFilters provides type-safe filtering
-// type AttendanceSearchFilters struct {
-// 	UserID           *uuid.UUID
-// 	UserIDs          []uuid.UUID
-// 	EventType        *string
-// 	EventTypes       []string
-// 	SourceType       *string
-// 	SourceTypes      []string
-// 	StartDate        *time.Time
-// 	EndDate          *time.Time
-// 	DeviceID         *string
-// 	MinWorkedMinutes *int
-// 	MaxWorkedMinutes *int
-// 	Status           *string
-// 	Statuses         []string
-// }
-
-// // AttendanceSummaryStats provides typed statistics
-// type AttendanceSummaryStats struct {
-// 	TotalRecords         int64            `json:"total_records"`
-// 	PresentDays          int64            `json:"present_days"`
-// 	AbsentDays           int64            `json:"absent_days"`
-// 	HalfDays             int64            `json:"half_days"`
-// 	LeaveDays            int64            `json:"leave_days"`
-// 	LateCount            int64            `json:"late_count"`
-// 	TotalLateMinutes     int64            `json:"total_late_minutes"`
-// 	TotalWorkedMinutes   int64            `json:"total_worked_minutes"`
-// 	TotalOvertimeMinutes int64            `json:"total_overtime_minutes"`
-// 	AvgWorkedMinutes     float64          `json:"avg_worked_minutes"`
-// 	AttendanceRate       float64          `json:"attendance_rate"`
-// 	ByDepartment         map[string]int64 `json:"by_department"`
-// 	ByStatus             map[string]int64 `json:"by_status"`
-// 	ByDate               map[string]int64 `json:"by_date"` // date -> count
-// }
-
-// // AttendanceReport represents a generated report
-// type AttendanceReport struct {
-// 	ReportID    uuid.UUID `json:"report_id"`
-// 	ReportType  string    `json:"report_type"`
-// 	CompanyID   uuid.UUID `json:"company_id"`
-// 	GeneratedAt time.Time `json:"generated_at"`
-// 	GeneratedBy string    `json:"generated_by"`
-// 	PeriodStart time.Time `json:"period_start"`
-// 	PeriodEnd   time.Time `json:"period_end"`
-// 	Format      string    `json:"format"` // json, csv, pdf
-// 	Status      string    `json:"status"` // pending, generating, completed, failed
-// 	DownloadURL *string   `json:"download_url,omitempty"`
-// 	FileSize    *int64    `json:"file_size,omitempty"`
-// 	Error       *string   `json:"error,omitempty"`
-// }
-
-// // ============================================================================
-// // QUERY SERVICE INTERFACE
-// // ============================================================================
-
-// // AttendanceQueryService defines read-only attendance operations
-// type AttendanceQueryService interface {
-// 	// Event Queries
-// 	GetAttendanceEventByID(ctx context.Context, eventID uuid.UUID) (*attendance.AttendanceEvent, error)
-// 	GetAttendanceEventsByUser(
-// 		ctx context.Context,
-// 		userID uuid.UUID,
-// 		startDate, endDate time.Time,
-// 		limit int,
-// 	) ([]*attendance.AttendanceEvent, error)
-
-// 	GetAttendanceEventsByCompany(
-// 		ctx context.Context,
-// 		companyID uuid.UUID,
-// 		startDate, endDate time.Time,
-// 		page, pageSize int,
-// 	) ([]*attendance.AttendanceEvent, int, error)
-
-// 	SearchAttendanceEvents(
-// 		ctx context.Context,
-// 		companyID uuid.UUID,
-// 		filters map[string]interface{},
-// 		page, pageSize int,
-// 	) ([]*attendance.AttendanceEvent, int, error)
-
-// 	SearchAttendanceEventsTyped(
-// 		ctx context.Context,
-// 		companyID uuid.UUID,
-// 		filters AttendanceSearchFilters,
-// 		page, pageSize int,
-// 	) ([]*attendance.AttendanceEvent, int, error)
-
-// 	// Policy Queries
-// 	GetAttendancePolicyByID(ctx context.Context, policyID uuid.UUID) (*attendance.AttendancePolicy, error)
-// 	GetAttendancePoliciesByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*attendance.AttendancePolicy, error)
-// 	GetUserCurrentAttendancePolicy(ctx context.Context, userID uuid.UUID, date time.Time) (*attendance.AttendancePolicy, error)
-
-// 	// Summary Queries
-// 	GetAttendanceDailySummaryByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*attendance.AttendanceDailySummary, error)
-// 	GetAttendanceDailySummariesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*attendance.AttendanceDailySummary, error)
-// 	GetAttendanceSummaryStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*AttendanceSummaryStats, error)
-
-// 	// Reports
-// 	GenerateAttendanceReport(
-// 		ctx context.Context,
-// 		companyID uuid.UUID,
-// 		reportType string,
-// 		startDate, endDate time.Time,
-// 	) ([]byte, string, error)
-
-// 	StreamAttendanceEvents(
-// 		ctx context.Context,
-// 		companyID uuid.UUID,
-// 		startDate, endDate time.Time,
-// 		writer io.Writer,
-// 		format string,
-// 	) error
-
-// 	// Health
-// 	HealthCheck(ctx context.Context) error
-// }
-
-// // ============================================================================
-// // QUERY SERVICE IMPLEMENTATION
-// // ============================================================================
-
-// type attendanceQueryServiceImpl struct {
-// 	attendanceRepo repository.AttendanceRepository
-// 	logger         *zap.Logger
-// 	mu             sync.RWMutex
-// 	reportCache    map[uuid.UUID]*AttendanceReport
-// }
-
-// // NewAttendanceQueryService creates a new attendance query service
-// func NewAttendanceQueryService(
-// 	attendanceRepo repository.AttendanceRepository,
-// 	logger *zap.Logger,
-// ) AttendanceQueryService {
-// 	return &attendanceQueryServiceImpl{
-// 		attendanceRepo: attendanceRepo,
-// 		logger:         logger,
-// 		reportCache:    make(map[uuid.UUID]*AttendanceReport),
-// 	}
-// }
-
-// // ============================================================================
-// // EVENT QUERIES
-// // ============================================================================
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceEventByID(
-// 	ctx context.Context,
-// 	eventID uuid.UUID,
-// ) (*attendance.AttendanceEvent, error) {
-// 	startTime := time.Now()
-
-// 	event, err := qs.attendanceRepo.GetAttendanceEventByID(ctx, eventID)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance event: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance event retrieved by ID",
-// 		util.String("event_id", eventID.String()),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return event, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceEventsByUser(
-// 	ctx context.Context,
-// 	userID uuid.UUID,
-// 	startDate, endDate time.Time,
-// 	limit int,
-// ) ([]*attendance.AttendanceEvent, error) {
-// 	startTime := time.Now()
-
-// 	// Validate parameters
-// 	if limit <= 0 || limit > 1000 {
-// 		limit = 100
-// 	}
-
-// 	// Normalize dates to UTC for query
-// 	startUTC := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
-// 	endUTC := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, time.UTC)
-
-// 	// Validate date range (calendar days)
-// 	calendarDays := int(endUTC.Sub(startUTC).Hours()/24) + 1
-// 	if calendarDays > 90 {
-// 		return nil, fmt.Errorf("date range cannot exceed 90 days, got %d days", calendarDays)
-// 	}
-
-// 	events, err := qs.attendanceRepo.GetAttendanceEventsByUser(ctx, userID, startUTC, endUTC, limit)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance events by user: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance events retrieved by user",
-// 		util.String("user_id", userID.String()),
-// 		util.Time("start_date", startUTC),
-// 		util.Time("end_date", endUTC),
-// 		util.Int("calendar_days", calendarDays),
-// 		util.Int("limit", limit),
-// 		util.Int("event_count", len(events)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return events, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceEventsByCompany(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// 	page, pageSize int,
-// ) ([]*attendance.AttendanceEvent, int, error) {
-// 	startTime := time.Now()
-
-// 	// Validate pagination parameters
-// 	if page < 1 {
-// 		page = 1
-// 	}
-// 	if pageSize < 1 || pageSize > 1000 {
-// 		pageSize = 100
-// 	}
-
-// 	// Normalize dates
-// 	startUTC := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
-// 	endUTC := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, time.UTC)
-
-// 	// Validate date range
-// 	calendarDays := int(endUTC.Sub(startUTC).Hours()/24) + 1
-// 	if calendarDays > 31 {
-// 		return nil, 0, fmt.Errorf("date range cannot exceed 31 days for company queries, got %d days", calendarDays)
-// 	}
-
-// 	offset := (page - 1) * pageSize
-
-// 	events, totalCount, err := qs.attendanceRepo.GetAttendanceEventsByCompany(ctx, companyID, startUTC, endUTC, pageSize, offset)
-// 	if err != nil {
-// 		return nil, 0, fmt.Errorf("failed to get attendance events by company: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance events retrieved by company",
-// 		util.String("company_id", companyID.String()),
-// 		util.Time("start_date", startUTC),
-// 		util.Time("end_date", endUTC),
-// 		util.Int("calendar_days", calendarDays),
-// 		util.Int("page", page),
-// 		util.Int("page_size", pageSize),
-// 		util.Int("total_count", totalCount),
-// 		util.Int("returned_count", len(events)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return events, totalCount, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) SearchAttendanceEvents(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	filters map[string]interface{},
-// 	page, pageSize int,
-// ) ([]*attendance.AttendanceEvent, int, error) {
-// 	startTime := time.Now()
-
-// 	// Validate pagination parameters
-// 	if page < 1 {
-// 		page = 1
-// 	}
-// 	if pageSize < 1 || pageSize > 1000 {
-// 		pageSize = 100
-// 	}
-
-// 	offset := (page - 1) * pageSize
-
-// 	events, totalCount, err := qs.attendanceRepo.SearchAttendanceEvents(ctx, companyID, filters, pageSize, offset)
-// 	if err != nil {
-// 		return nil, 0, fmt.Errorf("failed to search attendance events: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance events searched",
-// 		util.String("company_id", companyID.String()),
-// 		util.Int("filter_count", len(filters)),
-// 		util.Int("page", page),
-// 		util.Int("pageSize", pageSize),
-// 		util.Int("total_count", totalCount),
-// 		util.Int("returned_count", len(events)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return events, totalCount, nil
-// }
-
-// // SearchAttendanceEventsTyped provides type-safe searching
-// func (qs *attendanceQueryServiceImpl) SearchAttendanceEventsTyped(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	filters AttendanceSearchFilters,
-// 	page, pageSize int,
-// ) ([]*attendance.AttendanceEvent, int, error) {
-// 	// Convert typed filters to generic map for repository
-// 	genericFilters := make(map[string]interface{})
-
-// 	if filters.UserID != nil {
-// 		genericFilters["user_id"] = *filters.UserID
-// 	}
-
-// 	if len(filters.UserIDs) > 0 {
-// 		genericFilters["user_ids"] = filters.UserIDs
-// 	}
-
-// 	if filters.EventType != nil {
-// 		genericFilters["event_type"] = *filters.EventType
-// 	}
-
-// 	if len(filters.EventTypes) > 0 {
-// 		genericFilters["event_types"] = filters.EventTypes
-// 	}
-
-// 	if filters.StartDate != nil {
-// 		genericFilters["start_date"] = *filters.StartDate
-// 	}
-
-// 	if filters.EndDate != nil {
-// 		genericFilters["end_date"] = *filters.EndDate
-// 	}
-
-// 	if filters.DeviceID != nil {
-// 		genericFilters["device_id"] = *filters.DeviceID
-// 	}
-
-// 	if filters.Status != nil {
-// 		genericFilters["status"] = *filters.Status
-// 	}
-
-// 	if len(filters.Statuses) > 0 {
-// 		genericFilters["statuses"] = filters.Statuses
-// 	}
-
-// 	return qs.SearchAttendanceEvents(ctx, companyID, genericFilters, page, pageSize)
-// }
-
-// // ============================================================================
-// // POLICY QUERIES
-// // ============================================================================
-
-// func (qs *attendanceQueryServiceImpl) GetAttendancePolicyByID(
-// 	ctx context.Context,
-// 	policyID uuid.UUID,
-// ) (*attendance.AttendancePolicy, error) {
-// 	startTime := time.Now()
-
-// 	policy, err := qs.attendanceRepo.GetAttendancePolicyByID(ctx, policyID)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance policy: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance policy retrieved by ID",
-// 		util.String("policy_id", policyID.String()),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return policy, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetAttendancePoliciesByCompany(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	activeOnly bool,
-// ) ([]*attendance.AttendancePolicy, error) {
-// 	startTime := time.Now()
-
-// 	policies, err := qs.attendanceRepo.GetAttendancePoliciesByCompany(ctx, companyID, activeOnly)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance policies by company: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance policies retrieved by company",
-// 		util.String("company_id", companyID.String()),
-// 		util.Bool("active_only", activeOnly),
-// 		util.Int("policy_count", len(policies)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return policies, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
-// 	ctx context.Context,
-// 	userID uuid.UUID,
-// 	date time.Time,
-// ) (*attendance.AttendancePolicy, error) {
-// 	startTime := time.Now()
-
-// 	if date.IsZero() {
-// 		date = time.Now().UTC()
-// 	}
-
-// 	policy, err := qs.attendanceRepo.GetUserCurrentAttendancePolicy(ctx, userID, date)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get user current attendance policy: %w", err)
-// 	}
-
-// 	qs.logger.Debug("User current attendance policy retrieved",
-// 		util.String("user_id", userID.String()),
-// 		util.Time("date", date),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return policy, nil
-// }
-
-// // ============================================================================
-// // SUMMARY QUERIES
-// // ============================================================================
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceDailySummaryByUserDate(
-// 	ctx context.Context,
-// 	userID uuid.UUID,
-// 	date time.Time,
-// ) (*attendance.AttendanceDailySummary, error) {
-// 	startTime := time.Now()
-
-// 	// Normalize date to UTC
-// 	dateUTC := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.UTC)
-
-// 	summary, err := qs.attendanceRepo.GetAttendanceDailySummaryByUserDate(ctx, userID, dateUTC)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance daily summary: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance daily summary retrieved by user and date",
-// 		util.String("user_id", userID.String()),
-// 		util.String("date", dateUTC.Format("2006-01-02")),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return summary, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceDailySummariesByUser(
-// 	ctx context.Context,
-// 	userID uuid.UUID,
-// 	startDate, endDate time.Time,
-// ) ([]*attendance.AttendanceDailySummary, error) {
-// 	startTime := time.Now()
-
-// 	// Normalize dates
-// 	startUTC := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
-// 	endUTC := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, time.UTC)
-
-// 	// Validate date range using calendar days
-// 	calendarDays := int(endUTC.Sub(startUTC).Hours()/24) + 1
-// 	if calendarDays > 90 {
-// 		return nil, fmt.Errorf("date range cannot exceed 90 days, got %d days", calendarDays)
-// 	}
-
-// 	summaries, err := qs.attendanceRepo.GetAttendanceDailySummariesByUser(ctx, userID, startUTC, endUTC)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance daily summaries by user: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance daily summaries retrieved by user",
-// 		util.String("user_id", userID.String()),
-// 		util.Time("start_date", startUTC),
-// 		util.Time("end_date", endUTC),
-// 		util.Int("calendar_days", calendarDays),
-// 		util.Int("summary_count", len(summaries)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return summaries, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceSummaryStats(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// ) (*AttendanceSummaryStats, error) {
-// 	startTime := time.Now()
-
-// 	// Normalize dates
-// 	startUTC := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
-// 	endUTC := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, time.UTC)
-
-// 	// Validate date range
-// 	calendarDays := int(endUTC.Sub(startUTC).Hours()/24) + 1
-// 	if calendarDays > 365 {
-// 		return nil, fmt.Errorf("date range cannot exceed 365 days for statistics, got %d days", calendarDays)
-// 	}
-
-// 	// Get raw stats from repository
-// 	rawStats, err := qs.attendanceRepo.GetAttendanceSummaryStats(ctx, companyID, startUTC, endUTC)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance summary stats: %w", err)
-// 	}
-
-// 	// Convert to typed stats
-// 	stats := qs.convertToTypedStats(rawStats, calendarDays)
-
-// 	qs.logger.Debug("Attendance summary stats retrieved",
-// 		util.String("company_id", companyID.String()),
-// 		util.Time("start_date", startUTC),
-// 		util.Time("end_date", endUTC),
-// 		util.Int("calendar_days", calendarDays),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return stats, nil
-// }
-
-// // ============================================================================
-// // REPORT GENERATION
-// // ============================================================================
-
-// func (qs *attendanceQueryServiceImpl) GenerateAttendanceReport(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	reportType string,
-// 	startDate, endDate time.Time,
-// ) ([]byte, string, error) {
-// 	startTime := time.Now()
-
-// 	// Normalize dates
-// 	startUTC := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
-// 	endUTC := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, time.UTC)
-
-// 	// Validate date range
-// 	calendarDays := int(endUTC.Sub(startUTC).Hours()/24) + 1
-// 	if calendarDays > 31 {
-// 		return nil, "", fmt.Errorf("report period cannot exceed 31 days, got %d days", calendarDays)
-// 	}
-
-// 	var data []byte
-// 	var contentType string
-// 	var err error
-
-// 	switch strings.ToLower(reportType) {
-// 	case "department_summary":
-// 		report, err := qs.GetAttendanceReportByDepartment(ctx, companyID, startUTC, endUTC)
-// 		if err != nil {
-// 			return nil, "", err
-// 		}
-// 		data, err = json.Marshal(report)
-// 		contentType = "application/json"
-
-// 	case "late_arrivals":
-// 		report, err := qs.GetLateArrivalsReport(ctx, companyID, startUTC, endUTC)
-// 		if err != nil {
-// 			return nil, "", err
-// 		}
-// 		data, err = json.Marshal(report)
-// 		contentType = "application/json"
-
-// 	case "overtime":
-// 		report, err := qs.GetOvertimeReport(ctx, companyID, startUTC, endUTC)
-// 		if err != nil {
-// 			return nil, "", err
-// 		}
-// 		data, err = json.Marshal(report)
-// 		contentType = "application/json"
-
-// 	case "csv":
-// 		// Stream events with pagination to avoid memory issues
-// 		data, err = qs.generateCSVReport(ctx, companyID, startUTC, endUTC)
-// 		if err != nil {
-// 			return nil, "", err
-// 		}
-// 		contentType = "text/csv"
-
-// 	default:
-// 		return nil, "", fmt.Errorf("unsupported report type: %s", reportType)
-// 	}
-
-// 	if err != nil {
-// 		return nil, "", fmt.Errorf("failed to generate %s report: %w", reportType, err)
-// 	}
-
-// 	qs.logger.Info("Attendance report generated",
-// 		util.String("company_id", companyID.String()),
-// 		util.String("report_type", reportType),
-// 		util.Time("start_date", startUTC),
-// 		util.Time("end_date", endUTC),
-// 		util.Int("calendar_days", calendarDays),
-// 		util.Int("data_size", len(data)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return data, contentType, nil
-// }
-
-// // generateCSVReport generates CSV with streaming/pagination
-// func (qs *attendanceQueryServiceImpl) generateCSVReport(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// ) ([]byte, error) {
-// 	var buf strings.Builder
-// 	writer := csv.NewWriter(&buf)
-
-// 	// Write header
-// 	header := []string{
-// 		"Event ID",
-// 		"User ID",
-// 		"Event Type",
-// 		"Event Time (UTC)",
-// 		"Source Type",
-// 		"Device ID",
-// 		"IP Address",
-// 		"Company ID",
-// 	}
-
-// 	if err := writer.Write(header); err != nil {
-// 		return nil, fmt.Errorf("failed to write CSV header: %w", err)
-// 	}
-
-// 	// Stream events with pagination
-// 	page := 1
-// 	pageSize := 1000
-
-// 	for {
-// 		events, totalCount, err := qs.GetAttendanceEventsByCompany(ctx, companyID, startDate, endDate, page, pageSize)
-// 		if err != nil {
-// 			return nil, fmt.Errorf("failed to fetch events for CSV: %w", err)
-// 		}
-
-// 		if len(events) == 0 {
-// 			break
-// 		}
-
-// 		// Write events
-// 		for _, event := range events {
-// 			deviceID := ""
-// 			if event.DeviceID != nil {
-// 				deviceID = *event.DeviceID
-// 			}
-
-// 			ipAddress := ""
-// 			if event.IPAddress != nil {
-// 				ipAddress = *event.IPAddress
-// 			}
-
-// 			row := []string{
-// 				event.AttendanceEventID.String(),
-// 				event.UserID.String(),
-// 				event.EventType,
-// 				event.EventTime.Format(time.RFC3339),
-// 				event.SourceType,
-// 				deviceID,
-// 				ipAddress,
-// 				event.CompanyID.String(),
-// 			}
-
-// 			if err := writer.Write(row); err != nil {
-// 				return nil, fmt.Errorf("failed to write CSV row: %w", err)
-// 			}
-// 		}
-
-// 		qs.logger.Debug("CSV report batch processed",
-// 			util.String("company_id", companyID.String()),
-// 			util.Int("page", page),
-// 			util.Int("batch_size", len(events)))
-
-// 		// Check if we've processed all events
-// 		if page*pageSize >= totalCount {
-// 			break
-// 		}
-
-// 		page++
-// 	}
-
-// 	writer.Flush()
-// 	if err := writer.Error(); err != nil {
-// 		return nil, fmt.Errorf("CSV flush error: %w", err)
-// 	}
-
-// 	return []byte(buf.String()), nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetAttendanceReportByDepartment(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// ) (map[string]interface{}, error) {
-// 	startTime := time.Now()
-
-// 	report, err := qs.attendanceRepo.GetAttendanceReportByDepartment(ctx, companyID, startDate, endDate)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get attendance report by department: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Attendance report by department retrieved",
-// 		util.String("company_id", companyID.String()),
-// 		util.Time("start_date", startDate),
-// 		util.Time("end_date", endDate),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return report, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetLateArrivalsReport(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// ) ([]map[string]interface{}, error) {
-// 	startTime := time.Now()
-
-// 	report, err := qs.attendanceRepo.GetLateArrivalsReport(ctx, companyID, startDate, endDate)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get late arrivals report: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Late arrivals report retrieved",
-// 		util.String("company_id", companyID.String()),
-// 		util.Time("start_date", startDate),
-// 		util.Time("end_date", endDate),
-// 		util.Int("record_count", len(report)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return report, nil
-// }
-
-// func (qs *attendanceQueryServiceImpl) GetOvertimeReport(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// ) ([]map[string]interface{}, error) {
-// 	startTime := time.Now()
-
-// 	report, err := qs.attendanceRepo.GetOvertimeReport(ctx, companyID, startDate, endDate)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to get overtime report: %w", err)
-// 	}
-
-// 	qs.logger.Debug("Overtime report retrieved",
-// 		util.String("company_id", companyID.String()),
-// 		util.Time("start_date", startDate),
-// 		util.Time("end_date", endDate),
-// 		util.Int("record_count", len(report)),
-// 		util.Duration("duration", time.Since(startTime)))
-
-// 	return report, nil
-// }
-
-// // StreamAttendanceEvents streams events directly to writer for large datasets
-// func (qs *attendanceQueryServiceImpl) StreamAttendanceEvents(
-// 	ctx context.Context,
-// 	companyID uuid.UUID,
-// 	startDate, endDate time.Time,
-// 	writer io.Writer,
-// 	format string,
-// ) error {
-// 	if format != "csv" && format != "jsonl" {
-// 		return fmt.Errorf("unsupported format: %s", format)
-// 	}
-
-// 	// Normalize dates
-// 	startUTC := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, time.UTC)
-// 	endUTC := time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 0, time.UTC)
-
-// 	// Validate date range
-// 	calendarDays := int(endUTC.Sub(startUTC).Hours()/24) + 1
-// 	if calendarDays > 31 {
-// 		return fmt.Errorf("streaming period cannot exceed 31 days, got %d days", calendarDays)
-// 	}
-
-// 	if format == "csv" {
-// 		csvWriter := csv.NewWriter(writer)
-// 		defer csvWriter.Flush()
-
-// 		header := []string{"Event ID", "User ID", "Event Type", "Event Time", "Source Type"}
-// 		if err := csvWriter.Write(header); err != nil {
-// 			return err
-// 		}
-
-// 		// Stream with pagination
-// 		page := 1
-// 		pageSize := 1000
-
-// 		for {
-// 			events, totalCount, err := qs.GetAttendanceEventsByCompany(ctx, companyID, startUTC, endUTC, page, pageSize)
-// 			if err != nil {
-// 				return err
-// 			}
-
-// 			if len(events) == 0 {
-// 				break
-// 			}
-
-// 			for _, event := range events {
-// 				row := []string{
-// 					event.AttendanceEventID.String(),
-// 					event.UserID.String(),
-// 					event.EventType,
-// 					event.EventTime.Format(time.RFC3339),
-// 					event.SourceType,
-// 				}
-// 				if err := csvWriter.Write(row); err != nil {
-// 					return err
-// 				}
-// 			}
-
-// 			if page*pageSize >= totalCount {
-// 				break
-// 			}
-// 			page++
-// 		}
-
-// 		return csvWriter.Error()
-// 	}
-
-// 	// JSON Lines format
-// 	page := 1
-// 	pageSize := 1000
-
-// 	for {
-// 		events, totalCount, err := qs.GetAttendanceEventsByCompany(ctx, companyID, startUTC, endUTC, page, pageSize)
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 		if len(events) == 0 {
-// 			break
-// 		}
-
-// 		for _, event := range events {
-// 			jsonData, err := json.Marshal(event)
-// 			if err != nil {
-// 				return err
-// 			}
-
-// 			if _, err := writer.Write(jsonData); err != nil {
-// 				return err
-// 			}
-// 			if _, err := writer.Write([]byte("\n")); err != nil {
-// 				return err
-// 			}
-// 		}
-
-// 		if page*pageSize >= totalCount {
-// 			break
-// 		}
-// 		page++
-// 	}
-
-// 	return nil
-// }
-
-// // ============================================================================
-// // HELPER METHODS
-// // ============================================================================
-
-// func (qs *attendanceQueryServiceImpl) convertToTypedStats(rawStats map[string]interface{}, calendarDays int) *AttendanceSummaryStats {
-// 	stats := &AttendanceSummaryStats{
-// 		ByDepartment: make(map[string]int64),
-// 		ByStatus:     make(map[string]int64),
-// 		ByDate:       make(map[string]int64),
-// 	}
-
-// 	// Extract values from raw stats
-// 	if val, ok := rawStats["total_records"].(int); ok {
-// 		stats.TotalRecords = int64(val)
-// 	}
-
-// 	if val, ok := rawStats["present_days"].(int); ok {
-// 		stats.PresentDays = int64(val)
-// 	}
-
-// 	if val, ok := rawStats["absent_days"].(int); ok {
-// 		stats.AbsentDays = int64(val)
-// 	}
-
-// 	if val, ok := rawStats["late_arrivals"].(int); ok {
-// 		stats.LateCount = int64(val)
-// 	}
-
-// 	if val, ok := rawStats["total_overtime_minutes"].(int); ok {
-// 		stats.TotalOvertimeMinutes = int64(val)
-// 	}
-
-// 	if val, ok := rawStats["avg_worked_minutes"].(float64); ok {
-// 		stats.AvgWorkedMinutes = val
-// 	}
-
-// 	// Calculate attendance rate
-// 	if stats.TotalRecords > 0 {
-// 		stats.AttendanceRate = float64(stats.PresentDays+stats.HalfDays) / float64(stats.TotalRecords) * 100.0
-// 	}
-
-// 	// Extract status distribution
-// 	if statusDist, ok := rawStats["status_distribution"].(map[string]int); ok {
-// 		for status, count := range statusDist {
-// 			stats.ByStatus[status] = int64(count)
-// 		}
-// 	}
-
-// 	// Extract daily activity
-// 	if dailyActivity, ok := rawStats["daily_activity"].(map[string]int); ok {
-// 		for date, count := range dailyActivity {
-// 			stats.ByDate[date] = int64(count)
-// 		}
-// 	}
-
-// 	return stats
-// }
-
-// // ============================================================================
-// // HEALTH CHECK
-// // ============================================================================
-
-// func (qs *attendanceQueryServiceImpl) HealthCheck(ctx context.Context) error {
-// 	if err := qs.attendanceRepo.HealthCheck(ctx); err != nil {
-// 		return fmt.Errorf("attendance repository health check failed: %w", err)
-// 	}
-// 	return nil
-// }
+import (
+	"auth-service/internal/hr/models/attendance"
+	"auth-service/internal/hr/repository"
+	"auth-service/internal/util"
+	"bytes"
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+type AttendanceQueryService interface {
+	GetAttendanceEventByID(
+		ctx context.Context,
+		eventID uuid.UUID,
+	) (*attendance.AttendanceEvent, error)
+	GetAttendanceStats(
+		ctx context.Context,
+		companyID uuid.UUID,
+		startDate, endDate time.Time,
+	) (*attendance.AttendanceStats, error)
+
+	GetAttendanceEventsByUser(
+		ctx context.Context,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+		limit int,
+	) ([]*attendance.AttendanceEvent, error)
+	GetAttendanceEventsByCompany(
+		ctx context.Context,
+		companyID uuid.UUID,
+		startDate, endDate time.Time,
+		page, pageSize int,
+	) ([]*attendance.AttendanceEvent, int, error)
+	SearchAttendanceEventsTyped(
+		ctx context.Context,
+		companyID uuid.UUID,
+		filters AttendanceSearchFilters,
+		page, pageSize int,
+	) ([]*attendance.AttendanceEvent, int, error)
+	GetUserAttendanceStats(
+		ctx context.Context,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+	) (*attendance.UserAttendanceStats, error)
+
+	GetAttendancePolicyByID(
+		ctx context.Context,
+		policyID uuid.UUID,
+	) (*attendance.AttendancePolicy, error)
+	GetAttendancePoliciesByCompany(
+		ctx context.Context,
+		companyID uuid.UUID,
+		activeOnly bool,
+	) ([]*attendance.AttendancePolicy, error)
+	GetUserCurrentAttendancePolicy(
+		ctx context.Context,
+		userID uuid.UUID,
+		date time.Time,
+	) (*attendance.AttendancePolicy, error)
+	GetAttendanceDailySummaryByUserDate(
+		ctx context.Context,
+		userID uuid.UUID,
+		date time.Time,
+	) (*attendance.AttendanceDailySummary, error)
+	GetAttendanceDailySummariesByUser(
+		ctx context.Context,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+	) ([]*attendance.AttendanceDailySummary, error)
+	GetAttendanceSummaryStats(
+		ctx context.Context,
+		companyID uuid.UUID,
+		startDate, endDate time.Time,
+	) (*AttendanceSummaryStats, error)
+	GenerateAttendanceReport(
+		ctx context.Context,
+		companyID uuid.UUID,
+		reportType string,
+		startDate, endDate time.Time,
+	) ([]byte, string, error)
+	StreamAttendanceEvents(
+		ctx context.Context,
+		companyID uuid.UUID,
+		startDate, endDate time.Time,
+		writer io.Writer,
+		format string,
+	) error
+	ListAttendanceEventTypes(
+		ctx context.Context,
+		activeOnly bool,
+	) ([]*attendance.AttendanceEventType, error)
+	ListAttendanceSourceTypes(
+		ctx context.Context,
+	) ([]*attendance.AttendanceSourceType, error)
+	HealthCheck(ctx context.Context) error
+}
+
+type AttendanceSearchFilters struct {
+	CompanyID    uuid.UUID
+	UserID       *uuid.UUID
+	StartDate    time.Time
+	EndDate      time.Time
+	EventType    *string
+	SourceType   *string
+	DepartmentID *uuid.UUID
+	ShiftID      *uuid.UUID
+}
+
+type AttendanceSummaryStats struct {
+	CompanyID           uuid.UUID                  `json:"company_id"`
+	StartDate           time.Time                  `json:"start_date"`
+	EndDate             time.Time                  `json:"end_date"`
+	TotalEmployees      int                        `json:"total_employees"`
+	SummaryByStatus     map[string]int             `json:"summary_by_status"`
+	AverageHours        float64                    `json:"average_hours"`
+	OvertimeHours       float64                    `json:"overtime_hours"`
+	LateArrivals        int                        `json:"late_arrivals"`
+	TopLateEmployees    []LateEmployeeSummary      `json:"top_late_employees"`
+	DepartmentBreakdown map[string]DepartmentStats `json:"department_breakdown"`
+}
+
+type LateEmployeeSummary struct {
+	UserID             uuid.UUID `json:"user_id"`
+	Username           string    `json:"username"`
+	FullName           string    `json:"full_name"`
+	LateCount          int       `json:"late_count"`
+	AverageLateMinutes int       `json:"average_late_minutes"`
+}
+
+type DepartmentStats struct {
+	DepartmentID   uuid.UUID `json:"department_id"`
+	DepartmentName string    `json:"department_name"`
+	PresentCount   int       `json:"present_count"`
+	AbsentCount    int       `json:"absent_count"`
+	LateCount      int       `json:"late_count"`
+	AverageHours   float64   `json:"average_hours"`
+}
+
+type attendanceQueryServiceImpl struct {
+	attendanceRepo repository.AttendanceRepository
+	logger         *zap.Logger
+}
+
+func NewAttendanceQueryService(
+	attendanceRepo repository.AttendanceRepository,
+	logger *zap.Logger,
+) AttendanceQueryService {
+	return &attendanceQueryServiceImpl{
+		attendanceRepo: attendanceRepo,
+		logger:         logger,
+	}
+}
+
+func (qs *attendanceQueryServiceImpl) GetAttendanceEventByID(
+	ctx context.Context,
+	eventID uuid.UUID,
+) (*attendance.AttendanceEvent, error) {
+	startTime := time.Now()
+	if eventID == uuid.Nil {
+		return nil, fmt.Errorf("event ID is required")
+	}
+
+	event, err := qs.attendanceRepo.GetAttendanceEventByID(ctx, eventID)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance event by ID",
+			util.String("event_id", eventID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance event: %w", err)
+	}
+
+	qs.logger.Debug("Attendance event retrieved by ID",
+		util.String("event_id", eventID.String()),
+		util.Duration("duration", time.Since(startTime)))
+	return event, nil
+}
+
+func (qs *attendanceQueryServiceImpl) GetAttendanceEventsByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+	limit int,
+) ([]*attendance.AttendanceEvent, error) {
+	startTime := time.Now()
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("user ID is required")
+	}
+	if startDate.After(endDate) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+
+	// Validate date range
+	maxDays := 90
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	// Set default limit if not provided
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	events, err := qs.attendanceRepo.GetAttendanceEventsByUser(ctx, userID, startDate, endDate, limit)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance events by user",
+			util.String("user_id", userID.String()),
+			util.Time("start_date", startDate),
+			util.Time("end_date", endDate),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance events by user: %w", err)
+	}
+
+	qs.logger.Debug("Attendance events retrieved by user",
+		util.String("user_id", userID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("limit", limit),
+		util.Int("event_count", len(events)),
+		util.Duration("duration", time.Since(startTime)))
+	return events, nil
+}
+
+func (qs *attendanceQueryServiceImpl) SearchAttendanceEvents(
+	ctx context.Context,
+	companyID uuid.UUID,
+	filters AttendanceSearchFilters,
+	page, pageSize int,
+) ([]*attendance.AttendanceEvent, int, error) {
+	startTime := time.Now()
+	if companyID == uuid.Nil {
+		return nil, 0, fmt.Errorf("company ID is required")
+	}
+
+	// Validate pagination parameters
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 1000 {
+		pageSize = 100
+	}
+
+	// Set default date range if not provided
+	if filters.StartDate.IsZero() {
+		filters.StartDate = time.Now().AddDate(0, 0, -30)
+	}
+	if filters.EndDate.IsZero() {
+		filters.EndDate = time.Now()
+	}
+
+	if filters.StartDate.After(filters.EndDate) {
+		return nil, 0, fmt.Errorf("start date cannot be after end date")
+	}
+
+	// Validate date range
+	maxDays := 90
+	if filters.EndDate.Sub(filters.StartDate).Hours()/24 > float64(maxDays) {
+		return nil, 0, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	repoFilter := repository.AttendanceEventFilter{
+		CompanyID:  companyID,
+		UserID:     filters.UserID,
+		StartDate:  filters.StartDate,
+		EndDate:    filters.EndDate,
+		EventType:  filters.EventType,
+		SourceType: filters.SourceType,
+		Page:       page,
+		PageSize:   pageSize,
+	}
+
+	events, total, err := qs.attendanceRepo.SearchAttendanceEvents(ctx, repoFilter)
+	if err != nil {
+		qs.logger.Error("Failed to search attendance events",
+			util.String("company_id", companyID.String()),
+			util.Time("start_date", filters.StartDate),
+			util.Time("end_date", filters.EndDate),
+			util.ErrorField(err))
+		return nil, 0, fmt.Errorf("failed to search attendance events: %w", err)
+	}
+
+	totalPages := (int(total) + pageSize - 1) / pageSize
+	qs.logger.Debug("Attendance events searched",
+		util.String("company_id", companyID.String()),
+		util.Time("start_date", filters.StartDate),
+		util.Time("end_date", filters.EndDate),
+		util.Int("page", page),
+		util.Int("page_size", pageSize),
+		util.Int("total_events", int(total)),
+		util.Int("total_pages", totalPages),
+		util.Int("returned_events", len(events)),
+		util.Duration("duration", time.Since(startTime)))
+	return events, int(total), nil
+}
+
+func (qs *attendanceQueryServiceImpl) GetAttendanceDailySummaryByUserDate(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+) (*attendance.AttendanceDailySummary, error) {
+	startTime := time.Now()
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("user ID is required")
+	}
+	if date.IsZero() {
+		date = time.Now()
+	}
+
+	summary, err := qs.attendanceRepo.GetAttendanceDailySummaryByUserDate(ctx, userID, date)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance daily summary",
+			util.String("user_id", userID.String()),
+			util.String("date", date.Format("2006-01-02")),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance daily summary: %w", err)
+	}
+
+	qs.logger.Debug("Attendance daily summary retrieved",
+		util.String("user_id", userID.String()),
+		util.String("date", date.Format("2006-01-02")),
+		util.Duration("duration", time.Since(startTime)))
+	return summary, nil
+}
+
+func (qs *attendanceQueryServiceImpl) GetAttendanceDailySummariesByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*attendance.AttendanceDailySummary, error) {
+	startTime := time.Now()
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("user ID is required")
+	}
+	if startDate.After(endDate) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+
+	// Validate date range
+	maxDays := 365
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	summaries, err := qs.attendanceRepo.GetAttendanceDailySummariesByUser(ctx, userID, startDate, endDate)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance daily summaries",
+			util.String("user_id", userID.String()),
+			util.Time("start_date", startDate),
+			util.Time("end_date", endDate),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance daily summaries: %w", err)
+	}
+
+	qs.logger.Debug("Attendance daily summaries retrieved",
+		util.String("user_id", userID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("summary_count", len(summaries)),
+		util.Duration("duration", time.Since(startTime)))
+	return summaries, nil
+}
+
+func (qs *attendanceQueryServiceImpl) GetAttendanceStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+) (*attendance.AttendanceStats, error) {
+	startTime := time.Now()
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID is required")
+	}
+	if startDate.IsZero() || endDate.IsZero() {
+		return nil, fmt.Errorf("start date and end date are required")
+	}
+	if startDate.After(endDate) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+
+	// Validate date range
+	maxDays := 31
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	stats, err := qs.attendanceRepo.GetAttendanceStats(ctx, companyID, startDate, endDate)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance stats",
+			util.String("company_id", companyID.String()),
+			util.Time("start_date", startDate),
+			util.Time("end_date", endDate),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance stats: %w", err)
+	}
+
+	if stats == nil {
+		stats = &attendance.AttendanceStats{
+			CompanyID:          companyID,
+			StartDate:          startDate,
+			EndDate:            endDate,
+			TotalEmployees:     0,
+			PresentCount:       0,
+			AbsentCount:        0,
+			LateCount:          0,
+			HalfDayCount:       0,
+			LeaveCount:         0,
+			HolidayCount:       0,
+			TotalWorkedHours:   0,
+			TotalOvertimeHours: 0,
+			AverageAttendance:  0,
+		}
+	}
+
+	qs.logger.Debug("Attendance stats retrieved",
+		util.String("company_id", companyID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("total_employees", stats.TotalEmployees),
+		util.Int("present_count", stats.PresentCount),
+		util.Int("late_count", stats.LateCount),
+		util.Float64("average_attendance", stats.AverageAttendance),
+		util.Duration("duration", time.Since(startTime)))
+	return stats, nil
+}
+
+func (qs *attendanceQueryServiceImpl) GetUserAttendanceStats(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) (*attendance.UserAttendanceStats, error) {
+	startTime := time.Now()
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("user ID is required")
+	}
+	if startDate.IsZero() || endDate.IsZero() {
+		return nil, fmt.Errorf("start date and end date are required")
+	}
+	if startDate.After(endDate) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+
+	// Validate date range
+	maxDays := 365
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	// Check if user exists and has attendance profile
+	_, err := qs.attendanceRepo.GetUserAttendanceProfile(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user attendance profile: %w", err)
+	}
+
+	stats, err := qs.attendanceRepo.GetUserAttendanceStats(ctx, userID, startDate, endDate)
+	if err != nil {
+		qs.logger.Error("Failed to get user attendance stats",
+			util.String("user_id", userID.String()),
+			util.Time("start_date", startDate),
+			util.Time("end_date", endDate),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get user attendance stats: %w", err)
+	}
+
+	if stats == nil {
+		stats = &attendance.UserAttendanceStats{
+			UserID:             userID,
+			StartDate:          startDate,
+			EndDate:            endDate,
+			PresentDays:        0,
+			AbsentDays:         0,
+			LateDays:           0,
+			HalfDays:           0,
+			LeaveDays:          0,
+			TotalWorkedHours:   0,
+			TotalOvertimeHours: 0,
+			AverageInTime:      "",
+			AverageOutTime:     "",
+			AttendancePercent:  0,
+		}
+	}
+
+	qs.logger.Debug("User attendance stats retrieved",
+		util.String("user_id", userID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("present_days", stats.PresentDays),
+		util.Int("absent_days", stats.AbsentDays),
+		util.Int("late_days", stats.LateDays),
+		util.Float64("attendance_percent", stats.AttendancePercent),
+		util.Duration("duration", time.Since(startTime)))
+	return stats, nil
+}
+
+func (qs *attendanceQueryServiceImpl) GenerateAttendanceReport(
+	ctx context.Context,
+	companyID uuid.UUID,
+	reportType string,
+	startDate, endDate time.Time,
+) ([]byte, string, error) {
+	startTime := time.Now()
+
+	// Validate report type
+	if reportType != "csv" && reportType != "json" {
+		return nil, "", fmt.Errorf("unsupported report type: %s. Supported types: csv, json", reportType)
+	}
+
+	// Validate date range
+	maxDays := 31
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, "", fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	// Get attendance summaries for the date range
+	summaries, _, err := qs.attendanceRepo.GetAttendanceDailySummariesByCompany(ctx, companyID, startDate, endDate, 1, 10000)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance summaries for report",
+			util.String("company_id", companyID.String()),
+			util.Time("start_date", startDate),
+			util.Time("end_date", endDate),
+			util.ErrorField(err))
+		return nil, "", fmt.Errorf("failed to get attendance summaries: %w", err)
+	}
+
+	// Generate report based on type
+	var reportData []byte
+	var contentType string
+
+	switch reportType {
+	case "csv":
+		reportData, err = qs.generateCSVReport(summaries)
+		contentType = "text/csv"
+	case "json":
+		reportData, err = qs.generateJSONReport(summaries)
+		contentType = "application/json"
+	}
+
+	if err != nil {
+		qs.logger.Error("Failed to generate attendance report",
+			util.String("company_id", companyID.String()),
+			util.String("report_type", reportType),
+			util.ErrorField(err))
+		return nil, "", fmt.Errorf("failed to generate %s report: %w", reportType, err)
+	}
+
+	qs.logger.Info("Attendance report generated",
+		util.String("company_id", companyID.String()),
+		util.String("report_type", reportType),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("record_count", len(summaries)),
+		util.Duration("duration", time.Since(startTime)))
+	return reportData, contentType, nil
+}
+
+func (qs *attendanceQueryServiceImpl) StreamAttendanceEvents(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+	writer io.Writer,
+	format string,
+) error {
+	startTime := time.Now()
+
+	// Validate format
+	if format != "csv" && format != "jsonl" {
+		return fmt.Errorf("unsupported stream format: %s. Supported formats: csv, jsonl", format)
+	}
+
+	// Validate date range for streaming
+	maxDays := 7
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return fmt.Errorf("date range cannot exceed %d days for streaming", maxDays)
+	}
+
+	page := 1
+	pageSize := 1000
+	totalEvents := 0
+
+	for {
+		// Get events in batches
+		events, total, err := qs.attendanceRepo.GetAttendanceEventsByCompany(ctx, companyID, startDate, endDate, page, pageSize)
+		if err != nil {
+			qs.logger.Error("Failed to get attendance events for streaming",
+				util.String("company_id", companyID.String()),
+				util.Int("page", page),
+				util.ErrorField(err))
+			return fmt.Errorf("failed to get attendance events: %w", err)
+		}
+
+		if len(events) == 0 {
+			break
+		}
+
+		// Stream events in the requested format
+		switch format {
+		case "csv":
+			if err := qs.streamEventsAsCSV(events, writer, page == 1); err != nil {
+				qs.logger.Error("Failed to stream events as CSV",
+					util.String("company_id", companyID.String()),
+					util.ErrorField(err))
+				return err
+			}
+		case "jsonl":
+			if err := qs.streamEventsAsJSONL(events, writer); err != nil {
+				qs.logger.Error("Failed to stream events as JSONL",
+					util.String("company_id", companyID.String()),
+					util.ErrorField(err))
+				return err
+			}
+		}
+
+		totalEvents += len(events)
+
+		// Check if we've processed all events
+		if page*pageSize >= int(total) {
+			break
+		}
+
+		page++
+
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+
+	qs.logger.Info("Attendance events streamed",
+		util.String("company_id", companyID.String()),
+		util.String("format", format),
+		util.Int("total_events", totalEvents),
+		util.Duration("duration", time.Since(startTime)))
+	return nil
+}
+
+func (qs *attendanceQueryServiceImpl) ListAttendanceEventTypes(
+	ctx context.Context,
+	activeOnly bool,
+) ([]*attendance.AttendanceEventType, error) {
+	startTime := time.Now()
+
+	eventTypes, err := qs.attendanceRepo.GetAttendanceEventTypes(ctx)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance event types",
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance event types: %w", err)
+	}
+
+	// Filter active types if requested
+	if activeOnly {
+		var activeTypes []*attendance.AttendanceEventType
+		for _, et := range eventTypes {
+			if et.IsActive {
+				activeTypes = append(activeTypes, et)
+			}
+		}
+		qs.logger.Debug("Active attendance event types retrieved",
+			util.Int("count", len(activeTypes)),
+			util.Duration("duration", time.Since(startTime)))
+		return activeTypes, nil
+	}
+
+	qs.logger.Debug("All attendance event types retrieved",
+		util.Int("count", len(eventTypes)),
+		util.Duration("duration", time.Since(startTime)))
+	return eventTypes, nil
+}
+
+func (qs *attendanceQueryServiceImpl) ListAttendanceSourceTypes(
+	ctx context.Context,
+) ([]*attendance.AttendanceSourceType, error) {
+	startTime := time.Now()
+
+	sourceTypes, err := qs.attendanceRepo.GetAttendanceSourceTypes(ctx)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance source types",
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance source types: %w", err)
+	}
+
+	qs.logger.Debug("Attendance source types retrieved",
+		util.Int("count", len(sourceTypes)),
+		util.Duration("duration", time.Since(startTime)))
+	return sourceTypes, nil
+}
+
+func (qs *attendanceQueryServiceImpl) HealthCheck(ctx context.Context) error {
+	if err := qs.attendanceRepo.HealthCheck(ctx); err != nil {
+		qs.logger.Error("Attendance repository health check failed",
+			util.ErrorField(err))
+		return fmt.Errorf("attendance repository health check failed: %w", err)
+	}
+	return nil
+}
+
+func (qs *attendanceQueryServiceImpl) generateCSVReport(summaries []*attendance.AttendanceDailySummary) ([]byte, error) {
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+
+	// Write header
+	header := []string{
+		"Date", "User ID", "Status", "Worked Hours", "Overtime Hours",
+		"Late Minutes", "Generated At",
+	}
+	if err := writer.Write(header); err != nil {
+		return nil, err
+	}
+
+	// Write data rows
+	for _, summary := range summaries {
+		var workedHours, overtimeHours, lateMinutes string
+
+		if summary.WorkedMinutes != nil {
+			workedHours = fmt.Sprintf("%.2f", float64(*summary.WorkedMinutes)/60.0)
+		}
+
+		if summary.OvertimeMinutes != nil {
+			overtimeHours = fmt.Sprintf("%.2f", float64(*summary.OvertimeMinutes)/60.0)
+		}
+
+		if summary.LateMinutes != nil {
+			lateMinutes = fmt.Sprintf("%d", *summary.LateMinutes)
+		}
+
+		row := []string{
+			summary.AttendanceDate.Format("2006-01-02"),
+			summary.UserID.String(),
+			summary.Status,
+			workedHours,
+			overtimeHours,
+			lateMinutes,
+			summary.GeneratedAt.Format("2006-01-02 15:04:05"),
+		}
+
+		if err := writer.Write(row); err != nil {
+			return nil, err
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (qs *attendanceQueryServiceImpl) generateJSONReport(summaries []*attendance.AttendanceDailySummary) ([]byte, error) {
+	report := map[string]interface{}{
+		"summaries":    summaries,
+		"generated_at": time.Now().UTC(),
+		"total_count":  len(summaries),
+	}
+	return json.MarshalIndent(report, "", "  ")
+}
+
+func (qs *attendanceQueryServiceImpl) streamEventsAsCSV(events []*attendance.AttendanceEvent, writer io.Writer, writeHeader bool) error {
+	csvWriter := csv.NewWriter(writer)
+
+	// Write header if this is the first batch
+	if writeHeader {
+		header := []string{
+			"Event ID", "User ID", "Event Type", "Event Time", "Source Type",
+			"Device ID", "IP Address", "Created At", "Work Center Code", "Location ID",
+		}
+		if err := csvWriter.Write(header); err != nil {
+			return err
+		}
+	}
+
+	// Write event rows
+	for _, event := range events {
+		var deviceID, ipAddress, workCenterCode, locationID string
+
+		if event.DeviceID != nil {
+			deviceID = *event.DeviceID
+		}
+
+		if event.IPAddress != nil {
+			ipAddress = *event.IPAddress
+		}
+
+		if event.Context.WorkCenterCode != nil {
+			workCenterCode = *event.Context.WorkCenterCode
+		}
+
+		if event.Context.LocationID != nil {
+			locationID = event.Context.LocationID.String()
+		}
+
+		row := []string{
+			event.AttendanceEventID.String(),
+			event.UserID.String(),
+			event.EventType,
+			event.EventTime.Format("2006-01-02 15:04:05"),
+			event.SourceType,
+			deviceID,
+			ipAddress,
+			event.CreatedAt.Format("2006-01-02 15:04:05"),
+			workCenterCode,
+			locationID,
+		}
+
+		if err := csvWriter.Write(row); err != nil {
+			return err
+		}
+	}
+
+	csvWriter.Flush()
+	return csvWriter.Error()
+}
+
+func (qs *attendanceQueryServiceImpl) streamEventsAsJSONL(events []*attendance.AttendanceEvent, writer io.Writer) error {
+	for _, event := range events {
+		data, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+
+		if _, err := writer.Write(data); err != nil {
+			return err
+		}
+
+		if _, err := writer.Write([]byte("\n")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Helper method for backward compatibility (renamed from SearchAttendanceEventsTyped)
+func (qs *attendanceQueryServiceImpl) SearchAttendanceEventsTyped(
+	ctx context.Context,
+	companyID uuid.UUID,
+	filters AttendanceSearchFilters,
+	page, pageSize int,
+) ([]*attendance.AttendanceEvent, int, error) {
+	return qs.SearchAttendanceEvents(ctx, companyID, filters, page, pageSize)
+}
+
+// Add this method to attendanceQueryServiceImpl in attendanceQueryService.go
+func (qs *attendanceQueryServiceImpl) GetAttendanceEventsByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+	page, pageSize int,
+) ([]*attendance.AttendanceEvent, int, error) {
+	startTime := time.Now()
+
+	if companyID == uuid.Nil {
+		return nil, 0, fmt.Errorf("company ID is required")
+	}
+	if startDate.IsZero() || endDate.IsZero() {
+		return nil, 0, fmt.Errorf("start date and end date are required")
+	}
+	if startDate.After(endDate) {
+		return nil, 0, fmt.Errorf("start date cannot be after end date")
+	}
+
+	// Validate pagination parameters
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 1000 {
+		pageSize = 100
+	}
+
+	// Validate date range
+	maxDays := 31
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, 0, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	// Use repository method
+	events, total, err := qs.attendanceRepo.GetAttendanceEventsByCompany(
+		ctx, companyID, startDate, endDate, page, pageSize)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance events by company",
+			util.String("company_id", companyID.String()),
+			util.Time("start_date", startDate),
+			util.Time("end_date", endDate),
+			util.ErrorField(err))
+		return nil, 0, fmt.Errorf("failed to get attendance events by company: %w", err)
+	}
+
+	totalPages := (int(total) + pageSize - 1) / pageSize
+	qs.logger.Debug("Attendance events retrieved by company",
+		util.String("company_id", companyID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("page", page),
+		util.Int("page_size", pageSize),
+		util.Int("total_events", int(total)),
+		util.Int("total_pages", totalPages),
+		util.Int("returned_events", len(events)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return events, int(total), nil
+}
+
+// Add this method to attendanceQueryServiceImpl in attendanceQueryService.go
+func (qs *attendanceQueryServiceImpl) GetAttendancePoliciesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	activeOnly bool,
+) ([]*attendance.AttendancePolicy, error) {
+	startTime := time.Now()
+
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID is required")
+	}
+
+	policies, err := qs.attendanceRepo.GetAttendancePoliciesByCompany(ctx, companyID, activeOnly)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance policies by company",
+			util.String("company_id", companyID.String()),
+			util.Bool("active_only", activeOnly),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance policies by company: %w", err)
+	}
+
+	qs.logger.Debug("Attendance policies retrieved by company",
+		util.String("company_id", companyID.String()),
+		util.Bool("active_only", activeOnly),
+		util.Int("policy_count", len(policies)),
+		util.Duration("duration", time.Since(startTime)))
+
+	return policies, nil
+}
+
+// ============================================
+// POLICY QUERIES
+// ============================================
+
+func (qs *attendanceQueryServiceImpl) GetAttendancePolicyByID(
+	ctx context.Context,
+	policyID uuid.UUID,
+) (*attendance.AttendancePolicy, error) {
+	startTime := time.Now()
+	if policyID == uuid.Nil {
+		return nil, fmt.Errorf("policy ID is required")
+	}
+
+	policy, err := qs.attendanceRepo.GetAttendancePolicyByID(ctx, policyID)
+	if err != nil {
+		qs.logger.Error("Failed to get attendance policy by ID",
+			util.String("policy_id", policyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance policy: %w", err)
+	}
+
+	qs.logger.Debug("Attendance policy retrieved by ID",
+		util.String("policy_id", policyID.String()),
+		util.Duration("duration", time.Since(startTime)))
+	return policy, nil
+}
+
+func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+) (*attendance.AttendancePolicy, error) {
+
+	startTime := time.Now()
+
+	if userID == uuid.Nil {
+		return nil, fmt.Errorf("user ID is required")
+	}
+	if date.IsZero() {
+		date = time.Now()
+	}
+
+	// ------------------------------------------------------------
+	// 1️⃣ USER-LEVEL POLICY (explicit assignment)
+	// ------------------------------------------------------------
+	userPolicy, err := qs.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, date)
+	if err != nil {
+		qs.logger.Error(
+			"Failed to get user attendance policy",
+			util.String("user_id", userID.String()),
+			util.ErrorField(err),
+		)
+		return nil, fmt.Errorf("failed to get user attendance policy: %w", err)
+	}
+	if userPolicy != nil {
+		qs.logger.Debug(
+			"Resolved attendance policy at USER level",
+			util.String("user_id", userID.String()),
+			util.String("policy_code", userPolicy.PolicyCode),
+			util.Duration("duration", time.Since(startTime)),
+		)
+		return userPolicy, nil
+	}
+
+	// ------------------------------------------------------------
+	// 2️⃣ POSITION-LEVEL POLICY
+	// ------------------------------------------------------------
+	companyEmployee, err := qs.attendanceRepo.GetCompanyEmployee(ctx, uuid.Nil, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get company employee: %w", err)
+	}
+
+	if companyEmployee != nil && companyEmployee.PositionID != nil {
+
+		positionPolicy, err := qs.attendanceRepo.GetPositionAttendancePolicy(
+			ctx,
+			*companyEmployee.PositionID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get position attendance policy: %w", err)
+		}
+		if positionPolicy != nil {
+			qs.logger.Debug(
+				"Resolved attendance policy at POSITION level",
+				util.String("user_id", userID.String()),
+				util.String("policy_code", positionPolicy.PolicyCode),
+				util.Duration("duration", time.Since(startTime)),
+			)
+			return positionPolicy, nil
+		}
+
+		// --------------------------------------------------------
+		// 3️⃣ WORK-CENTER POLICY (via position)
+		// --------------------------------------------------------
+		position, err := qs.attendanceRepo.GetPosition(ctx, *companyEmployee.PositionID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get position: %w", err)
+		}
+
+		if position != nil && position.WorkCenterCode != nil {
+			wcPolicy, err := qs.attendanceRepo.GetWorkCenterAttendancePolicy(
+				ctx,
+				companyEmployee.CompanyID,
+				*position.WorkCenterCode,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get work center attendance policy: %w", err)
+			}
+			if wcPolicy != nil {
+				qs.logger.Debug(
+					"Resolved attendance policy at WORK CENTER level",
+					util.String("user_id", userID.String()),
+					util.String("work_center_code", *position.WorkCenterCode),
+					util.String("policy_code", wcPolicy.PolicyCode),
+					util.Duration("duration", time.Since(startTime)),
+				)
+				return wcPolicy, nil
+			}
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 4️⃣ COMPANY DEFAULT POLICY (SAFE FALLBACK)
+	// ------------------------------------------------------------
+	defaultPolicy := &attendance.AttendancePolicy{
+		PolicyID:   uuid.New(),
+		PolicyCode: "DEFAULT",
+		PolicyType: "company_default",
+		Rules: attendance.PolicyRules{
+			GracePeriod:         intPtr(15),
+			MaxLateAllowed:      intPtr(60),
+			HalfDayAfter:        intPtr(240),
+			AutoCheckout:        boolPtr(false),
+			OvertimeThreshold:   intPtr(15),
+			AutoApproveOvertime: boolPtr(false),
+			AllowShiftOverlap:   boolPtr(false),
+		},
+		IsActive: true,
+	}
+
+	qs.logger.Warn(
+		"Falling back to DEFAULT attendance policy",
+		util.String("user_id", userID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+
+	return defaultPolicy, nil
+}
+
+// ============================================
+// DAILY SUMMARY QUERIES
+// ============================================
+
+// ============================================
+// STATISTICS AND REPORTS
+// ============================================
+
+func (qs *attendanceQueryServiceImpl) GetAttendanceSummaryStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+) (*AttendanceSummaryStats, error) {
+	startTime := time.Now()
+	if startDate.After(endDate) {
+		return nil, fmt.Errorf("start date cannot be after end date")
+	}
+	maxDays := 31
+	if endDate.Sub(startDate).Hours()/24 > float64(maxDays) {
+		return nil, fmt.Errorf("date range cannot exceed %d days", maxDays)
+	}
+
+	stats, err := qs.attendanceRepo.GetAttendanceStats(ctx, companyID, startDate, endDate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attendance stats: %w", err)
+	}
+
+	summaryStats := &AttendanceSummaryStats{
+		CompanyID:      companyID,
+		StartDate:      startDate,
+		EndDate:        endDate,
+		TotalEmployees: stats.TotalEmployees,
+		SummaryByStatus: map[string]int{
+			"present":  stats.PresentCount,
+			"absent":   stats.AbsentCount,
+			"late":     stats.LateCount,
+			"half_day": stats.HalfDayCount,
+			"leave":    stats.LeaveCount,
+			"holiday":  stats.HolidayCount,
+		},
+		AverageHours:        stats.TotalWorkedHours,
+		OvertimeHours:       stats.TotalOvertimeHours,
+		LateArrivals:        stats.LateCount,
+		TopLateEmployees:    []LateEmployeeSummary{},
+		DepartmentBreakdown: map[string]DepartmentStats{},
+	}
+
+	qs.logger.Debug("Attendance summary stats retrieved",
+		util.String("company_id", companyID.String()),
+		util.Time("start_date", startDate),
+		util.Time("end_date", endDate),
+		util.Int("total_employees", stats.TotalEmployees),
+		util.Int("present_count", stats.PresentCount),
+		util.Int("late_count", stats.LateCount),
+		util.Float64("average_attendance", stats.AverageAttendance),
+		util.Duration("duration", time.Since(startTime)))
+	return summaryStats, nil
+}

@@ -35,7 +35,17 @@ type OrgUnitRepository interface {
 	GetRole(ctx context.Context, orgUnitID, userID uuid.UUID, role string) (*orgunit.OrgUnitRole, error)
 	GetUserRoles(ctx context.Context, userID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitRole, error)
 	GetOrgUnitRoles(ctx context.Context, orgUnitID uuid.UUID, onlyActive bool) ([]*orgunit.OrgUnitRole, error)
-
+	MemberExists(
+		ctx context.Context,
+		orgUnitID uuid.UUID,
+		userID uuid.UUID,
+		effectiveFrom time.Time,
+	) (bool, error)
+	EndActiveMembership(
+		ctx context.Context,
+		orgUnitID, userID uuid.UUID,
+		effectiveTo time.Time,
+	) error
 	// Health
 	HealthCheck(ctx context.Context) error
 }

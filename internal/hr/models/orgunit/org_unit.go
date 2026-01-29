@@ -87,3 +87,8 @@ type UserOrgUnitMembership struct {
 	Role        *string    `json:"role,omitempty"`
 	PositionID  *uuid.UUID `json:"position_id,omitempty"`
 }
+
+type UpdateMemberRequest struct {
+	EffectiveFrom string  `json:"effective_from"`
+	EffectiveTo   *string `json:"effective_to,omitempty"`
+}

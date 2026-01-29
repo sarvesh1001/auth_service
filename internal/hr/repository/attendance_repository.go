@@ -1,4 +1,3 @@
-// internal/hr/repository/attendance/interface.go
 package repository
 
 import (
@@ -177,6 +176,13 @@ type AttendanceRepository interface {
 		endDate time.Time,
 	) error
 
+	// 🔥 NEW METHOD: Get Work Center Policy
+	GetWorkCenterAttendancePolicy(
+		ctx context.Context,
+		companyID uuid.UUID,
+		workCenterCode string,
+	) (*attendance.AttendancePolicy, error)
+
 	// ============================================================
 	// INFRASTRUCTURE (RFID, SOURCES, WORK CENTERS)
 	// ============================================================
@@ -242,33 +248,6 @@ type AttendanceRepository interface {
 		rfidID uuid.UUID,
 	) error
 
-	// CreateWorkCenterShift(
-	// 	ctx context.Context,
-	// 	mapping *attendance.WorkCenterShift,
-	// ) error
-
-	// GetWorkCenterShiftByCode(
-	// 	ctx context.Context,
-	// 	companyID uuid.UUID,
-	// 	workCenterCode string,
-	// ) (*attendance.WorkCenterShift, error)
-
-	// GetWorkCenterShiftsByCompany(
-	// 	ctx context.Context,
-	// 	companyID uuid.UUID,
-	// 	activeOnly bool,
-	// ) ([]*attendance.WorkCenterShift, error)
-
-	// UpdateWorkCenterShift(
-	// 	ctx context.Context,
-	// 	mapping *attendance.WorkCenterShift,
-	// ) error
-
-	// DeactivateWorkCenterShift(
-	// 	ctx context.Context,
-	// 	mappingID uuid.UUID,
-	// ) error
-
 	// ============================================================
 	// ANALYTICS
 	// ============================================================
@@ -306,6 +285,48 @@ type AttendanceRepository interface {
 		startDate, endDate time.Time,
 	) ([]uuid.UUID, error)
 
+	GetPositionAttendancePolicy(
+		ctx context.Context,
+		positionID uuid.UUID,
+	) (*attendance.AttendancePolicy, error)
+
+	GetUsersByAttendancePolicy(
+		ctx context.Context,
+		policyID uuid.UUID,
+		effectiveDate time.Time,
+	) ([]uuid.UUID, error)
+
+	// New outbox method
+	InsertAttendanceOutboxEvent(
+		ctx context.Context,
+		eventType string,
+		aggregateID uuid.UUID,
+		payload map[string]interface{},
+	) error
+
+	// Company employee lookup
+	GetCompanyEmployee(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+	) (*CompanyEmployee, error)
+
+	// Position lookup
+	GetPosition(
+		ctx context.Context,
+		positionID uuid.UUID,
+	) (*Position, error)
+
+	// Active department for employee
+	GetEmployeeActiveDepartment(
+		ctx context.Context,
+		userID uuid.UUID,
+	) (*EmployeeDepartment, error)
+	// Department lookup
+	GetDepartment(
+		ctx context.Context,
+		departmentID uuid.UUID,
+	) (*Department, error)
 	GetLastAttendanceEvent(
 		ctx context.Context,
 		companyID, userID uuid.UUID,

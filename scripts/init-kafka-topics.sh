@@ -108,7 +108,7 @@ declare -A TOPIC_CONFIGS=(
     ["device-events"]="3 1 2592000000 gzip"
     ["mpin-events"]="3 1 2592000000 gzip"
     ["otp-events"]="3 1 604800000 gzip"
-
+    ["attendance.events"]="3 1 2592000000 gzip"  # 30 days retention
     ["security-events"]="3 1 7776000000 gzip"
 )
 

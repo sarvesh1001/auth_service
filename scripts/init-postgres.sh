@@ -14,31 +14,33 @@ echo "🏗️ Creating database schema..."
 
 # Execute the SQL schema
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'EOSQL'
-    -- Enable extensions
+    -- ==============================================
+    -- ENABLE EXTENSIONS
+    -- ==============================================
     CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
     CREATE EXTENSION IF NOT EXISTS "pg_trgm";
     CREATE EXTENSION IF NOT EXISTS "pgcrypto";
     CREATE EXTENSION IF NOT EXISTS "btree_gist";
 
     -- ==============================================
-    -- SINGLE PERMISSIONS TABLE (For both Users and Admins)
+    -- CORE TABLES
     -- ==============================================
-    CREATE TABLE permissions (
+
+    -- SINGLE PERMISSIONS TABLE (For both Users and Admins)
+    CREATE TABLE IF NOT EXISTS permissions (
         permission_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         permission_name VARCHAR(100) NOT NULL UNIQUE,
         description TEXT,
         category VARCHAR(50) NOT NULL,
         module VARCHAR(50) NOT NULL,
-        scope VARCHAR(20) NOT NULL DEFAULT 'user', -- 'user' or 'admin' or 'both'
+        scope VARCHAR(20) NOT NULL DEFAULT 'user',
         requires_tier VARCHAR(20) DEFAULT 'basic',
         bit_index INTEGER UNIQUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    -- ==============================================
     -- SINGLE SYSTEM DEPARTMENTS TABLE (For both Users and Admins)
-    -- ==============================================
-    CREATE TABLE system_departments (
+    CREATE TABLE IF NOT EXISTS system_departments (
         system_department_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         name VARCHAR(255) UNIQUE NOT NULL,
         module_code VARCHAR(100) NOT NULL,
@@ -47,27 +49,26 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     );
 
     -- ==============================================
-    -- ADMIN ROLES TABLE
+    -- ADMIN TABLES
     -- ==============================================
-    CREATE TABLE admin_roles (
+
+    -- ADMIN ROLES TABLE
+    CREATE TABLE IF NOT EXISTS admin_roles (
         admin_role_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         role_name VARCHAR(100) NOT NULL,
         role_level INTEGER NOT NULL DEFAULT 1000,
-        role_type INTEGER NOT NULL DEFAULT 1, -- 1=Employee, 2=Manager, 4=Super Admin
+        role_type INTEGER NOT NULL DEFAULT 1,
         is_system_role BOOLEAN NOT NULL DEFAULT false,
         description TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(role_name),
         CONSTRAINT check_role_type CHECK (role_type IN (1, 2, 4)),
-        -- New constraint: Only one Super Admin role (role_type = 4)
         CONSTRAINT unique_super_admin_role EXCLUDE USING btree (role_type WITH =) WHERE (role_type = 4)
     );
 
-    -- ==============================================
     -- ADMIN ROLE PERMISSIONS TABLE
-    -- ==============================================
-    CREATE TABLE admin_role_permissions (
+    CREATE TABLE IF NOT EXISTS admin_role_permissions (
         admin_role_id UUID NOT NULL,
         permission_id UUID NOT NULL,
         granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -77,10 +78,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_admin_role_perms_permission FOREIGN KEY (permission_id) REFERENCES permissions(permission_id) ON DELETE CASCADE
     );
 
-    -- ==============================================
     -- ADMIN ROLE DEPARTMENTS TABLE
-    -- ==============================================
-    CREATE TABLE admin_role_departments (
+    CREATE TABLE IF NOT EXISTS admin_role_departments (
         admin_role_id UUID NOT NULL,
         system_department_id UUID NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -89,17 +88,15 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_admin_role_departments_department FOREIGN KEY (system_department_id) REFERENCES system_departments(system_department_id) ON DELETE CASCADE
     );
 
-    -- ==============================================
     -- ADMIN USERS TABLE (Updated Structure)
-    -- ==============================================
-    CREATE TABLE admin_users (
+    CREATE TABLE IF NOT EXISTS admin_users (
         admin_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         phone_hash VARCHAR(128) NOT NULL,
         phone_encrypted BYTEA NOT NULL,
         phone_key_id UUID NOT NULL,
         phone_encrypted_dek TEXT NOT NULL,
         admin_role_id UUID NOT NULL,
-        role_type INTEGER NOT NULL DEFAULT 1, -- 1=Employee, 2=Manager, 4=Super Admin
+        role_type INTEGER NOT NULL DEFAULT 1,
         reports_to UUID REFERENCES admin_users(admin_id),
         admin_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         admin_created_by UUID,
@@ -109,30 +106,30 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         ip_whitelist TEXT[],
         failed_login_attempts INTEGER DEFAULT 0,
         last_login TIMESTAMPTZ,
-        -- New fields for search functionality
         username VARCHAR(100) NOT NULL UNIQUE,
         full_name VARCHAR(255),
         user_search_tsv TSVECTOR GENERATED ALWAYS AS (
             to_tsvector('simple', COALESCE(username, '')) ||
             to_tsvector('simple', COALESCE(full_name, ''))
         ) STORED,
-        -- Foreign key constraint for admin role
         CONSTRAINT fk_admin_users_role FOREIGN KEY (admin_role_id) REFERENCES admin_roles(admin_role_id),
         CONSTRAINT check_admin_role_type CHECK (role_type IN (1, 2, 4)),
-        -- New constraint: Only one Super Admin user (role_type = 4)
         CONSTRAINT unique_super_admin_user EXCLUDE USING btree (role_type WITH =) WHERE (role_type = 4)
     );
 
-    CREATE TABLE users (
+    -- ==============================================
+    -- USER TABLES
+    -- ==============================================
+
+    -- USERS TABLE (Partitioned)
+    CREATE TABLE IF NOT EXISTS users (
         user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        -- New fields for user search
         username VARCHAR(100) NOT NULL,
         full_name VARCHAR(255),
         user_search_tsv TSVECTOR GENERATED ALWAYS AS (
             to_tsvector('simple', COALESCE(username, '')) ||
             to_tsvector('simple', COALESCE(full_name, ''))
         ) STORED,
-        -- Existing fields from old schema
         phone_hash VARCHAR(128) NOT NULL,
         phone_encrypted BYTEA NOT NULL,
         phone_encrypted_dek TEXT NOT NULL,
@@ -148,21 +145,25 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         last_login TIMESTAMPTZ,
-        -- Unique constraint that includes the partition key (required for partitioned tables)
         CONSTRAINT unique_username UNIQUE (user_id, username)
     ) PARTITION BY HASH (user_id);
 
-    -- Create 8 partitions for users (as in old schema)
-    CREATE TABLE users_p0 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 0);
-    CREATE TABLE users_p1 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 1);
-    CREATE TABLE users_p2 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 2);
-    CREATE TABLE users_p3 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 3);
-    CREATE TABLE users_p4 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 4);
-    CREATE TABLE users_p5 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 5);
-    CREATE TABLE users_p6 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 6);
-    CREATE TABLE users_p7 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 7);
+    -- Create 8 partitions for users
+    CREATE TABLE IF NOT EXISTS users_p0 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 0);
+    CREATE TABLE IF NOT EXISTS users_p1 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 1);
+    CREATE TABLE IF NOT EXISTS users_p2 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 2);
+    CREATE TABLE IF NOT EXISTS users_p3 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 3);
+    CREATE TABLE IF NOT EXISTS users_p4 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 4);
+    CREATE TABLE IF NOT EXISTS users_p5 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 5);
+    CREATE TABLE IF NOT EXISTS users_p6 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 6);
+    CREATE TABLE IF NOT EXISTS users_p7 PARTITION OF users FOR VALUES WITH (MODULUS 8, REMAINDER 7);
 
-    CREATE TABLE companies (
+    -- ==============================================
+    -- COMPANY TABLES
+    -- ==============================================
+
+    -- COMPANIES TABLE
+    CREATE TABLE IF NOT EXISTS companies (
         company_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_name VARCHAR(255) NOT NULL,
         company_name_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', company_name)) STORED,
@@ -177,14 +178,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         subscription_start_date TIMESTAMPTZ,
         subscription_end_date TIMESTAMPTZ,
-        -- Keep unique constraint from old schema
         UNIQUE(company_name, owner_user_id),
-        -- Foreign key constraint
         CONSTRAINT fk_companies_owner FOREIGN KEY (owner_user_id) REFERENCES users(user_id),
         CONSTRAINT check_max_departments CHECK (max_departments > 0 AND max_departments <= 1000)
     );
 
-    CREATE TABLE roles (
+    -- ROLES TABLE
+    CREATE TABLE IF NOT EXISTS roles (
         role_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         role_name VARCHAR(100) NOT NULL,
         role_level INTEGER NOT NULL DEFAULT 1000,
@@ -197,7 +197,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_roles_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
     );
 
-    CREATE TABLE role_permissions (
+    -- ROLE PERMISSIONS TABLE
+    CREATE TABLE IF NOT EXISTS role_permissions (
         role_id UUID NOT NULL,
         permission_id UUID NOT NULL,
         granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -207,7 +208,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_role_perms_permission FOREIGN KEY (permission_id) REFERENCES permissions(permission_id) ON DELETE CASCADE
     );
 
-    CREATE TABLE departments (
+    -- DEPARTMENTS TABLE
+    CREATE TABLE IF NOT EXISTS departments (
         department_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         department_name VARCHAR(255) NOT NULL,
@@ -220,173 +222,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_departments_system FOREIGN KEY (system_department_id) REFERENCES system_departments(system_department_id),
         CONSTRAINT fk_departments_parent FOREIGN KEY (parent_department_id) REFERENCES departments(department_id)
     );
-    CREATE INDEX idx_departments_company_active
-    ON departments (company_id)
-    WHERE is_active = true;
 
-    -- Unique constraint for active departments only
-    CREATE UNIQUE INDEX uq_departments_company_name_active
-    ON departments (company_id, department_name)
-    WHERE is_active = true;
-
-    -- ==============================================
-    -- FUNCTION: ENFORCE MAX DEPARTMENTS PER COMPANY
-    -- ==============================================
-    CREATE OR REPLACE FUNCTION enforce_department_limit()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        current_dept_count INTEGER;
-        max_dept_allowed INTEGER;
-    BEGIN
-        -- 🔒 Lock company row to prevent race conditions
-        PERFORM 1
-        FROM companies
-        WHERE company_id = NEW.company_id
-        FOR UPDATE;
-
-        -- Count active departments
-        SELECT COUNT(*)
-        INTO current_dept_count
-        FROM departments
-        WHERE company_id = NEW.company_id
-        AND is_active = true;
-
-        -- Fetch allowed limit
-        SELECT max_departments
-        INTO max_dept_allowed
-        FROM companies
-        WHERE company_id = NEW.company_id;
-
-        -- Absolute safety cap
-        IF max_dept_allowed > 1000 THEN
-            max_dept_allowed := 1000;
-        END IF;
-
-        -- INSERT case
-        IF TG_OP = 'INSERT' THEN
-            IF current_dept_count >= max_dept_allowed THEN
-                RAISE EXCEPTION
-                    'Department limit exceeded (% allowed)',
-                    max_dept_allowed
-                    USING ERRCODE = '23514';
-            END IF;
-        END IF;
-
-        -- UPDATE case (inactive → active)
-        IF TG_OP = 'UPDATE' THEN
-            IF OLD.is_active = false AND NEW.is_active = true THEN
-                IF current_dept_count >= max_dept_allowed THEN
-                    RAISE EXCEPTION
-                        'Department limit exceeded (% allowed)',
-                        max_dept_allowed
-                        USING ERRCODE = '23514';
-                END IF;
-            END IF;
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to cascade department deactivation to child departments
-    CREATE OR REPLACE FUNCTION deactivate_child_departments(p_dept_id UUID)
-    RETURNS VOID AS $$
-    DECLARE
-        child_id UUID;
-    BEGIN
-        FOR child_id IN
-            SELECT department_id
-            FROM departments
-            WHERE parent_department_id = p_dept_id
-            AND is_active = true
-        LOOP
-            UPDATE departments
-            SET is_active = false
-            WHERE department_id = child_id;
-
-            PERFORM deactivate_child_departments(child_id);
-        END LOOP;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to cascade department soft delete
-    CREATE OR REPLACE FUNCTION cascade_department_soft_delete()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF OLD.is_active = true AND NEW.is_active = false THEN
-            PERFORM deactivate_child_departments(OLD.department_id);
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to prevent creating/activating department under inactive parent
-    CREATE OR REPLACE FUNCTION prevent_child_on_inactive_parent()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        parent_active BOOLEAN;
-    BEGIN
-        IF NEW.parent_department_id IS NOT NULL THEN
-            SELECT is_active
-            INTO parent_active
-            FROM departments
-            WHERE department_id = NEW.parent_department_id;
-
-            -- Parent missing OR inactive
-            IF parent_active IS DISTINCT FROM true THEN
-                RAISE EXCEPTION 'Cannot create or activate department under inactive or missing parent';
-            END IF;
-        END IF;
-
-        -- Prevent re-activating child under inactive parent
-        IF TG_OP = 'UPDATE'
-        AND OLD.is_active = false
-        AND NEW.is_active = true
-        AND NEW.parent_department_id IS NOT NULL THEN
-
-            SELECT is_active
-            INTO parent_active
-            FROM departments
-            WHERE department_id = NEW.parent_department_id;
-
-            IF parent_active IS DISTINCT FROM true THEN
-                RAISE EXCEPTION 'Cannot activate department under inactive parent';
-            END IF;
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to enforce unique active department name
-    CREATE OR REPLACE FUNCTION enforce_unique_active_department_name()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF NEW.is_active = true THEN
-            IF EXISTS (
-                SELECT 1
-                FROM departments
-                WHERE company_id = NEW.company_id
-                AND department_name = NEW.department_name
-                AND is_active = true
-                AND department_id <> NEW.department_id
-            ) THEN
-                RAISE EXCEPTION 'Active department name already exists';
-            END IF;
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to prevent hard delete of departments
-    CREATE OR REPLACE FUNCTION prevent_department_delete()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        RAISE EXCEPTION 'Hard delete of departments is not allowed';
-    END;
-    $$ LANGUAGE plpgsql;
-
-    CREATE TABLE role_departments (
+    -- ROLE DEPARTMENTS TABLE
+    CREATE TABLE IF NOT EXISTS role_departments (
         role_id UUID NOT NULL,
         department_id UUID NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -397,7 +235,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
             REFERENCES departments(department_id)
     );
 
-    CREATE TABLE company_employees (
+    -- COMPANY EMPLOYEES TABLE
+    CREATE TABLE IF NOT EXISTS company_employees (
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
         employee_id VARCHAR(100) NOT NULL,
@@ -414,58 +253,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_employees_role FOREIGN KEY (role_id) REFERENCES roles(role_id)
     );
 
-    -- Function to enforce employee limit per company
-    CREATE OR REPLACE FUNCTION enforce_employee_limit()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        active_count INTEGER;
-        max_allowed INTEGER;
-    BEGIN
-        -- Only check when activating or inserting active employee
-        IF (TG_OP = 'INSERT' AND NEW.is_active = true)
-        OR (TG_OP = 'UPDATE' AND OLD.is_active = false AND NEW.is_active = true) THEN
+    -- ==============================================
+    -- DEVICE & SECURITY TABLES
+    -- ==============================================
 
-            SELECT max_employees
-            INTO max_allowed
-            FROM companies
-            WHERE company_id = NEW.company_id
-            FOR UPDATE;
-
-            SELECT COUNT(*)
-            INTO active_count
-            FROM company_employees
-            WHERE company_id = NEW.company_id
-            AND is_active = true;
-
-            IF active_count + 1 > max_allowed THEN
-                RAISE EXCEPTION
-                    'Employee limit exceeded (%/%). Deactivate another employee.',
-                    active_count + 1,
-                    max_allowed;
-            END IF;
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to get active employee count
-    CREATE OR REPLACE FUNCTION get_active_employee_count(p_company_id UUID)
-    RETURNS INTEGER AS $$
-    DECLARE
-        total INTEGER;
-    BEGIN
-        SELECT COUNT(*)
-        INTO total
-        FROM company_employees
-        WHERE company_id = p_company_id
-        AND is_active = true;
-
-        RETURN total;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    CREATE TABLE user_devices (
+    -- USER DEVICES TABLE
+    CREATE TABLE IF NOT EXISTS user_devices (
         device_id VARCHAR(256) PRIMARY KEY,
         user_id UUID NOT NULL,
         device_type VARCHAR(50),
@@ -479,7 +272,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         CONSTRAINT fk_user_devices_user FOREIGN KEY (user_id) REFERENCES users(user_id)
     );
 
-    CREATE TABLE login_attempts (
+    -- LOGIN ATTEMPTS TABLE
+    CREATE TABLE IF NOT EXISTS login_attempts (
         attempt_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         success BOOLEAN NOT NULL,
@@ -496,36 +290,26 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     -- HR MODULE TABLES
     -- ==============================================
 
-    -- Employee Profiles
-    CREATE TABLE employee_profiles (
+    -- EMPLOYEE PROFILES TABLE
+    CREATE TABLE IF NOT EXISTS employee_profiles (
         employee_profile_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         company_id UUID NOT NULL,
-
-        -- Personal
         date_of_birth DATE,
         gender VARCHAR(20),
         marital_status VARCHAR(20),
         nationality VARCHAR(50),
-
-        -- Employment
-        employment_type VARCHAR(30), -- full_time, contract, intern
-        employment_status VARCHAR(30) NOT NULL DEFAULT 'active', -- active, notice, terminated, on_hold
+        employment_type VARCHAR(30),
+        employment_status VARCHAR(30) NOT NULL DEFAULT 'active',
         probation_end_date DATE,
         confirmation_date DATE,
-
-        -- Job
         job_title VARCHAR(255),
         grade VARCHAR(50),
         cost_center VARCHAR(50),
-
-        -- Legal
         tax_id VARCHAR(50),
         social_security_id VARCHAR(50),
-
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
-
         UNIQUE (company_id, user_id),
         CONSTRAINT chk_employment_status CHECK (employment_status IN ('active','notice','terminated','on_hold')),
         CONSTRAINT fk_employee_profile_membership FOREIGN KEY (company_id, user_id) 
@@ -534,8 +318,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- Employee Department History
-    CREATE TABLE employee_department_history (
+    -- EMPLOYEE DEPARTMENT HISTORY TABLE
+    CREATE TABLE IF NOT EXISTS employee_department_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         company_id UUID NOT NULL,
@@ -544,36 +328,28 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         end_date DATE,
         change_reason TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         FOREIGN KEY (user_id) REFERENCES users(user_id),
         FOREIGN KEY (department_id) REFERENCES departments(department_id)
     );
 
-    CREATE UNIQUE INDEX uq_employee_active_department 
-    ON employee_department_history (user_id) 
-    WHERE end_date IS NULL;
-
-    -- Employee Documents
-    CREATE TABLE employee_documents (
+    -- EMPLOYEE DOCUMENTS TABLE
+    CREATE TABLE IF NOT EXISTS employee_documents (
         document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         company_id UUID NOT NULL,
-
-        document_type VARCHAR(50), -- offer_letter, id_proof, resume
+        document_type VARCHAR(50),
         document_name VARCHAR(255),
         document_object_key TEXT NOT NULL,
         mime_type VARCHAR(50),
-
         is_confidential BOOLEAN DEFAULT false,
         uploaded_by UUID,
         uploaded_at TIMESTAMPTZ DEFAULT NOW(),
-
         FOREIGN KEY (user_id) REFERENCES users(user_id),
         FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- Positions
-    CREATE TABLE positions (
+    -- POSITIONS TABLE
+    CREATE TABLE IF NOT EXISTS positions (
         position_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         department_id UUID NOT NULL,
@@ -581,112 +357,70 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         is_open BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
-        -- Add new scheduling columns
         is_schedulable BOOLEAN NOT NULL DEFAULT true,
         attendance_required BOOLEAN NOT NULL DEFAULT true,
         overtime_allowed BOOLEAN NOT NULL DEFAULT false,
         work_center_code VARCHAR(100),
-        
         CONSTRAINT uniq_position_title_per_dept
             UNIQUE (company_id, department_id, title),
         FOREIGN KEY (department_id) REFERENCES departments(department_id)
     );
 
-    -- Function to prevent assigning position to inactive department
-    CREATE OR REPLACE FUNCTION prevent_position_in_inactive_department()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        dept_active BOOLEAN;
-    BEGIN
-        SELECT is_active
-        INTO dept_active
-        FROM departments
-        WHERE department_id = NEW.department_id;
-
-        IF dept_active = false THEN
-            RAISE EXCEPTION 'Cannot assign position to inactive department';
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Employee Role History
-    CREATE TABLE employee_role_history (
+    -- EMPLOYEE ROLE HISTORY TABLE
+    CREATE TABLE IF NOT EXISTS employee_role_history (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         role_id UUID NOT NULL,
         start_date DATE,
         end_date DATE,
         reason TEXT,
-        
         FOREIGN KEY (user_id) REFERENCES users(user_id),
         FOREIGN KEY (role_id) REFERENCES roles(role_id)
     );
 
-    CREATE UNIQUE INDEX uq_employee_role_active
-    ON employee_role_history (user_id)
-    WHERE end_date IS NULL;
-
-    -- Employee Exit (Offboarding & Termination)
-    CREATE TABLE employee_exit (
-    exit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL,
-    company_id UUID NOT NULL,
-
-    exit_date DATE NOT NULL,
-    exit_reason TEXT,
-    eligible_for_rehire BOOLEAN DEFAULT false,
-
-    exit_state VARCHAR(20) NOT NULL DEFAULT 'scheduled',
-    -- scheduled | effective | cancelled | rehired
-
-    enforced_at TIMESTAMPTZ,
-    enforced_by UUID,
-
-    created_at TIMestAMPTZ DEFAULT NOW(),
-
-    CONSTRAINT chk_exit_state CHECK (
-        exit_state IN ('scheduled','effective','cancelled','rehired')
-    ),
-
-    FOREIGN KEY (user_id) REFERENCES users(user_id),
-    FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    -- EMPLOYEE EXIT TABLE
+    CREATE TABLE IF NOT EXISTS employee_exit (
+        exit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL,
+        company_id UUID NOT NULL,
+        exit_date DATE NOT NULL,
+        exit_reason TEXT,
+        eligible_for_rehire BOOLEAN DEFAULT false,
+        exit_state VARCHAR(20) NOT NULL DEFAULT 'scheduled',
+        enforced_at TIMESTAMPTZ,
+        enforced_by UUID,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        CONSTRAINT chk_exit_state CHECK (
+            exit_state IN ('scheduled','effective','cancelled','rehired')
+        ),
+        FOREIGN KEY (user_id) REFERENCES users(user_id),
+        FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- Function to deactivate employee on exit
-    
     -- ==============================================
     -- SCHEDULING MODULE TABLES
     -- ==============================================
 
--- Work Calendars
-CREATE TABLE work_calendars (
-    calendar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- WORK CALENDARS TABLE
+    CREATE TABLE IF NOT EXISTS work_calendars (
+        calendar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        year INTEGER NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
+        working_days INTEGER[] NOT NULL,
+        holidays JSONB,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        CONSTRAINT fk_calendar_company
+            FOREIGN KEY (company_id)
+            REFERENCES companies(company_id),
+        CONSTRAINT uq_work_calendar_company_year
+            UNIQUE (company_id, year)
+    );
 
-    company_id UUID NOT NULL,
-    year INTEGER NOT NULL,
-
-    name VARCHAR(100) NOT NULL,
-    timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
-    working_days INTEGER[] NOT NULL,
-    holidays JSONB,
-
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-
-    -- Foreign key
-    CONSTRAINT fk_calendar_company
-        FOREIGN KEY (company_id)
-        REFERENCES companies(company_id),
-
-    -- One calendar per company per year
-    CONSTRAINT uq_work_calendar_company_year
-        UNIQUE (company_id, year)
-);
-
-    -- Schedule Templates
-    CREATE TABLE schedule_templates (
+    -- SCHEDULE TEMPLATES TABLE
+    CREATE TABLE IF NOT EXISTS schedule_templates (
         schedule_template_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         calendar_id UUID NOT NULL,
@@ -695,7 +429,6 @@ CREATE TABLE work_calendars (
         rules JSONB NOT NULL,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT chk_template_type CHECK (template_type IN ('office', 'shift', 'class')),
         CONSTRAINT fk_schedule_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id),
@@ -703,15 +436,14 @@ CREATE TABLE work_calendars (
             FOREIGN KEY (calendar_id) REFERENCES work_calendars(calendar_id)
     );
 
-    -- User Schedule Assignments
-    CREATE TABLE user_schedule_assignments (
+    -- USER SCHEDULE ASSIGNMENTS TABLE
+    CREATE TABLE IF NOT EXISTS user_schedule_assignments (
         user_id UUID NOT NULL,
         schedule_template_id UUID NOT NULL,
         effective_from DATE NOT NULL,
         effective_to DATE,
         assigned_by UUID,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         PRIMARY KEY (user_id, schedule_template_id, effective_from),
         CONSTRAINT no_overlapping_schedules EXCLUDE USING gist (
             user_id WITH =,
@@ -724,8 +456,8 @@ CREATE TABLE work_calendars (
             REFERENCES schedule_templates(schedule_template_id)
     );
 
-    -- Schedule Instances
-    CREATE TABLE schedule_instances (
+    -- SCHEDULE INSTANCES TABLE
+    CREATE TABLE IF NOT EXISTS schedule_instances (
         schedule_instance_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
@@ -736,13 +468,10 @@ CREATE TABLE work_calendars (
         timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
         metadata JSONB,
         generated_at TIMESTAMPTZ DEFAULT NOW(),
-        -- Add cancellation support
         status VARCHAR(20) NOT NULL DEFAULT 'active',
         cancel_reason VARCHAR(50),
         cancelled_at TIMESTAMPTZ,
-        -- Add work center code
         work_center_code VARCHAR(100),
-
         CONSTRAINT fk_si_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
         CONSTRAINT fk_si_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_si_template FOREIGN KEY (schedule_template_id)
@@ -753,15 +482,15 @@ CREATE TABLE work_calendars (
     -- COMPENSATION MODULE TABLES
     -- ==============================================
 
-    -- Pay Units
-    CREATE TABLE pay_units (
+    -- PAY UNITS TABLE
+    CREATE TABLE IF NOT EXISTS pay_units (
         pay_unit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         name VARCHAR(30) NOT NULL UNIQUE,
         description TEXT
     );
 
-    -- Compensation Structures
-    CREATE TABLE compensation_structures (
+    -- COMPENSATION STRUCTURES TABLE
+    CREATE TABLE IF NOT EXISTS compensation_structures (
         structure_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         structure_code VARCHAR(50) NOT NULL,
@@ -770,14 +499,13 @@ CREATE TABLE work_calendars (
         components JSONB NOT NULL,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         UNIQUE (company_id, structure_code),
         CONSTRAINT fk_comp_struct_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- User Compensations
-    CREATE TABLE user_compensations (
+    -- USER COMPENSATIONS TABLE
+    CREATE TABLE IF NOT EXISTS user_compensations (
         user_id UUID NOT NULL,
         structure_id UUID NOT NULL,
         pay_unit_id UUID,
@@ -787,7 +515,6 @@ CREATE TABLE work_calendars (
         assigned_by UUID,
         structure_snapshot JSONB NOT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         PRIMARY KEY (user_id, structure_id, effective_from),
         CONSTRAINT no_overlapping_compensation EXCLUDE USING gist (
             user_id WITH =,
@@ -809,15 +536,65 @@ CREATE TABLE work_calendars (
     -- ATTENDANCE MODULE TABLES
     -- ==============================================
 
-    -- Attendance Source Types
-    CREATE TABLE attendance_source_types (
-        source_type VARCHAR(30) PRIMARY KEY,
-        description TEXT,
-        requires_reference BOOLEAN NOT NULL DEFAULT false
+    -- ATTENDANCE SOURCE TYPES TABLE
+    CREATE TABLE IF NOT EXISTS attendance_source_types (
+        source_type        VARCHAR(30) PRIMARY KEY,
+        description        TEXT NOT NULL,
+        category           VARCHAR(30) NOT NULL,
+        requires_device    BOOLEAN NOT NULL DEFAULT false,
+        is_system          BOOLEAN NOT NULL DEFAULT false,
+        allow_backdated    BOOLEAN NOT NULL DEFAULT false,
+        allow_future       BOOLEAN NOT NULL DEFAULT false,
+        trust_level        SMALLINT NOT NULL DEFAULT 1,
+        is_self_service    BOOLEAN NOT NULL DEFAULT true,
+        created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
-    -- Attendance Sources
-    CREATE TABLE attendance_sources (
+    -- ATTENDANCE DEVICES TABLE
+    CREATE TABLE IF NOT EXISTS attendance_devices (
+        device_id           VARCHAR(256) PRIMARY KEY,
+        company_id          UUID NOT NULL,
+        source_type         VARCHAR(30) NOT NULL,
+        device_code         VARCHAR(100) NOT NULL,
+        device_name         VARCHAR(100),
+        manufacturer        VARCHAR(100),
+        model               VARCHAR(100),
+        work_center_code    VARCHAR(100),
+        location_id         UUID,
+        ip_address          INET,
+        mac_address         VARCHAR(50),
+        is_active           BOOLEAN NOT NULL DEFAULT true,
+        is_trusted          BOOLEAN NOT NULL DEFAULT true,
+        last_seen_at        TIMESTAMPTZ,
+        installed_at        TIMESTAMPTZ,
+        metadata            JSONB NOT NULL DEFAULT '{}',
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (company_id, device_code),
+        FOREIGN KEY (source_type)
+            REFERENCES attendance_source_types(source_type)
+    );
+
+    -- ATTENDANCE USER DEVICE IDENTIFIERS TABLE
+    CREATE TABLE IF NOT EXISTS attendance_user_device_identifiers (
+        mapping_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id         UUID NOT NULL,
+        user_id            UUID NOT NULL,
+        device_id          VARCHAR(256) NOT NULL,
+        source_type        VARCHAR(30) NOT NULL,
+        device_user_code   VARCHAR(100) NOT NULL,
+        is_active          BOOLEAN NOT NULL DEFAULT true,
+        enrolled_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        unenrolled_at      TIMESTAMPTZ,
+        created_by         UUID,
+        UNIQUE (device_id, device_user_code),
+        FOREIGN KEY (device_id)
+            REFERENCES attendance_devices(device_id),
+        FOREIGN KEY (source_type)
+            REFERENCES attendance_source_types(source_type)
+    );
+
+    -- ATTENDANCE SOURCES TABLE
+    CREATE TABLE IF NOT EXISTS attendance_sources (
         source_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         source_type VARCHAR(30) NOT NULL,
@@ -827,7 +604,6 @@ CREATE TABLE work_calendars (
         is_active BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         created_by UUID,
-
         CONSTRAINT fk_attendance_sources_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id),
         CONSTRAINT fk_attendance_sources_type
@@ -835,8 +611,8 @@ CREATE TABLE work_calendars (
             REFERENCES attendance_source_types(source_type)
     );
 
-    -- Attendance Event Types (Master)
-    CREATE TABLE attendance_event_types (
+    -- ATTENDANCE EVENT TYPES TABLE
+    CREATE TABLE IF NOT EXISTS attendance_event_types (
         event_type VARCHAR(30) PRIMARY KEY,
         category VARCHAR(30) NOT NULL,
         description TEXT,
@@ -845,8 +621,8 @@ CREATE TABLE work_calendars (
         is_active BOOLEAN NOT NULL DEFAULT true
     );
 
-    -- Attendance Events
-    CREATE TABLE attendance_events (
+    -- ATTENDANCE EVENTS TABLE
+    CREATE TABLE IF NOT EXISTS attendance_events (
         attendance_event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
@@ -860,7 +636,7 @@ CREATE TABLE work_calendars (
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         created_by UUID,
         event_date DATE GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED,
-
+        context JSONB,
         CONSTRAINT fk_att_events_user
             FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_att_events_company
@@ -876,56 +652,60 @@ CREATE TABLE work_calendars (
             REFERENCES attendance_event_types(event_type)
     );
 
-    CREATE INDEX idx_attendance_events_event_date
-    ON attendance_events (event_date);
-
-    CREATE INDEX idx_attendance_events_company_event_date
-    ON attendance_events (company_id, event_date);
-
-    -- ==============================================
-    -- ATTENDANCE POLICIES (UPDATED: POSITION-BASED)
-    -- ==============================================
-    CREATE TABLE attendance_policies (
+    -- ATTENDANCE POLICIES TABLE
+    CREATE TABLE IF NOT EXISTS attendance_policies (
         policy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
+
+        -- 🔥 PRIMARY ATTACHMENT (matches scheduling)
+        work_center_code TEXT,
+
+        -- 🔁 OPTIONAL OVERRIDE
         position_id UUID,
+
         policy_code VARCHAR(50) NOT NULL,
         policy_type VARCHAR(30) NOT NULL,
         rules JSONB NOT NULL,
+
         is_active BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
         UNIQUE (company_id, policy_code),
+
         CONSTRAINT fk_attendance_policies_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id),
+
         CONSTRAINT fk_attendance_policies_position
             FOREIGN KEY (position_id) REFERENCES positions(position_id)
     );
 
-    -- ==============================================
-    -- USER ATTENDANCE POLICIES (LINKING USERS TO POLICIES)
-    -- ==============================================
-    CREATE TABLE user_attendance_policies (
+    -- Only ONE active policy per work center
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_attendance_policy_work_center
+    ON attendance_policies (work_center_code)
+    WHERE is_active = true;
+
+    -- Only ONE active policy per position (optional override)
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_attendance_policy_position
+    ON attendance_policies (position_id)
+    WHERE is_active = true;
+
+
+    -- USER ATTENDANCE POLICIES TABLE
+    CREATE TABLE IF NOT EXISTS user_attendance_policies (
         user_id UUID NOT NULL,
         policy_id UUID NOT NULL,
         effective_from DATE NOT NULL,
         effective_to DATE,
         assigned_by UUID,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         PRIMARY KEY (user_id, policy_id, effective_from),
         CONSTRAINT fk_uap_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_uap_policy FOREIGN KEY (policy_id) REFERENCES attendance_policies(policy_id)
     );
 
-    -- Add constraint to prevent overlapping policies for a user
-    CREATE UNIQUE INDEX idx_user_attendance_policies_active
-    ON user_attendance_policies (user_id)
-    WHERE effective_to IS NULL;
-
-    -- Attendance Daily Summary
-    CREATE TABLE attendance_daily_summary (
+    -- ATTENDANCE DAILY SUMMARY TABLE
+    CREATE TABLE IF NOT EXISTS attendance_daily_summary (
         attendance_summary_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
@@ -937,14 +717,13 @@ CREATE TABLE work_calendars (
         metadata JSONB,
         generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         generated_by VARCHAR(30) DEFAULT 'system',
-
         UNIQUE (company_id, user_id, attendance_date),
         CONSTRAINT fk_att_summary_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_att_summary_company FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- Attendance Locations
-    CREATE TABLE attendance_locations (
+    -- ATTENDANCE LOCATIONS TABLE
+    CREATE TABLE IF NOT EXISTS attendance_locations (
         location_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         name VARCHAR(100),
@@ -954,17 +733,12 @@ CREATE TABLE work_calendars (
         location_code VARCHAR(50),
         zone VARCHAR(100),
         is_active BOOLEAN DEFAULT true,
-
         CONSTRAINT fk_att_locations_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- ==============================================
-    -- ADDITIONAL TABLES FOR ATTENDANCE LOOKUPS
-    -- ==============================================
-
-    -- RFID Mappings for employees
-    CREATE TABLE employee_rfid_mappings (
+    -- EMPLOYEE RFID MAPPINGS TABLE
+    CREATE TABLE IF NOT EXISTS employee_rfid_mappings (
         rfid_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL,
         company_id UUID NOT NULL,
@@ -974,67 +748,62 @@ CREATE TABLE work_calendars (
         unassigned_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
         UNIQUE (company_id, rfid_tag),
-
         CONSTRAINT fk_employee_rfid_user 
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
         CONSTRAINT fk_employee_rfid_company 
             FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
     );
 
-    CREATE UNIQUE INDEX uq_employee_rfid_active_user
-    ON employee_rfid_mappings (user_id, company_id)
-    WHERE is_active = true AND unassigned_at IS NULL;
+    -- ==============================================
+    -- WORK CENTER TABLES
+    -- ==============================================
 
-    -- ==============================================
-    -- WORK CENTERS AND SHIFT MANAGEMENT
-    -- ==============================================
-    CREATE TABLE work_centers (
+    -- WORK CENTERS TABLE
+    CREATE TABLE IF NOT EXISTS work_centers (
         work_center_code VARCHAR(100) NOT NULL,
         company_id UUID NOT NULL,
-
         name VARCHAR(255) NOT NULL,
         description TEXT,
-
         timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
-
         is_active BOOLEAN NOT NULL DEFAULT true,
-
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
         CONSTRAINT fk_work_centers_company
             FOREIGN KEY (company_id)
             REFERENCES companies(company_id)
             ON DELETE CASCADE,
-
         PRIMARY KEY (company_id, work_center_code)
     );
 
-    -- Work Center to Shift Mapping
-    CREATE TABLE work_center_shifts (
+    -- WORK CENTER SHIFTS TABLE
+    CREATE TABLE IF NOT EXISTS work_center_shifts (
         mapping_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         work_center_code VARCHAR(100) NOT NULL,
-        shift_id UUID NOT NULL, -- References schedule_templates
+        shift_id UUID NOT NULL,
         effective_from DATE NOT NULL,
         effective_to DATE,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
-        
         CONSTRAINT fk_work_center_company 
             FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
         CONSTRAINT fk_work_center_shift 
             FOREIGN KEY (shift_id) REFERENCES schedule_templates(schedule_template_id) ON DELETE CASCADE,
         CONSTRAINT fk_wcs_work_center
             FOREIGN KEY (company_id, work_center_code)
-            REFERENCES work_centers(company_id, work_center_code)
+            REFERENCES work_centers(company_id, work_center_code),
+        CONSTRAINT no_overlap_work_center_shifts
+        EXCLUDE USING gist (
+          company_id WITH =,
+          work_center_code WITH =,
+          daterange(effective_from, COALESCE(effective_to, 'infinity')) WITH &&
+        )
     );
 
-    -- User Work Center Assignments
-    CREATE TABLE user_work_center_assignments (
+    -- USER WORK CENTER ASSIGNMENTS TABLE
+    CREATE TABLE IF NOT EXISTS user_work_center_assignments (
         assignment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
@@ -1044,7 +813,6 @@ CREATE TABLE work_calendars (
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
-        
         UNIQUE (user_id, work_center_code, effective_from),
         CONSTRAINT fk_user_work_center_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_user_work_center_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
@@ -1057,8 +825,8 @@ CREATE TABLE work_calendars (
     -- LEAVE MODULE TABLES
     -- ==============================================
 
-    -- Leave Types
-    CREATE TABLE leave_types (
+    -- LEAVE TYPES TABLE
+    CREATE TABLE IF NOT EXISTS leave_types (
         leave_type_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         leave_code VARCHAR(30) NOT NULL,
@@ -1072,14 +840,13 @@ CREATE TABLE work_calendars (
         allow_hourly BOOLEAN DEFAULT false,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         UNIQUE (company_id, leave_code),
         CONSTRAINT fk_leave_types_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- Leave Policies
-    CREATE TABLE leave_policies (
+    -- LEAVE POLICIES TABLE
+    CREATE TABLE IF NOT EXISTS leave_policies (
         leave_policy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         department_id UUID,
@@ -1088,7 +855,6 @@ CREATE TABLE work_calendars (
         rules JSONB NOT NULL,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         UNIQUE (company_id, policy_code),
         CONSTRAINT fk_leave_policies_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id),
@@ -1096,17 +862,15 @@ CREATE TABLE work_calendars (
             FOREIGN KEY (department_id) REFERENCES departments(department_id)
     );
 
-    -- User Leave Policies
-    CREATE TABLE user_leave_policies (
+    -- USER LEAVE POLICIES TABLE
+    CREATE TABLE IF NOT EXISTS user_leave_policies (
         user_id UUID NOT NULL,
         leave_policy_id UUID NOT NULL,
         effective_from DATE NOT NULL,
         effective_to DATE,
         assigned_by UUID,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         PRIMARY KEY (user_id, leave_policy_id, effective_from),
-
         CONSTRAINT fk_ulp_user
             FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT fk_ulp_policy
@@ -1114,15 +878,14 @@ CREATE TABLE work_calendars (
             REFERENCES leave_policies(leave_policy_id)
     );
 
-    -- Leave Balances
-    CREATE TABLE leave_balances (
+    -- LEAVE BALANCES TABLE
+    CREATE TABLE IF NOT EXISTS leave_balances (
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
         leave_type_id UUID NOT NULL,
         balance NUMERIC(5,2) NOT NULL,
         as_of TIMESTAMPTZ NOT NULL,
         generated_at TIMESTAMPTZ DEFAULT NOW(),
-
         PRIMARY KEY (company_id, user_id, leave_type_id, as_of),
         CONSTRAINT fk_lb_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id),
@@ -1132,8 +895,8 @@ CREATE TABLE work_calendars (
             FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
     );
 
-    -- Leave Requests
-    CREATE TABLE leave_requests (
+    -- LEAVE REQUESTS TABLE
+    CREATE TABLE IF NOT EXISTS leave_requests (
         leave_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
@@ -1144,7 +907,6 @@ CREATE TABLE work_calendars (
         reason TEXT,
         status VARCHAR(30) NOT NULL DEFAULT 'pending',
         requested_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT chk_leave_status CHECK (status IN ('pending','approved','rejected','cancelled','withdrawn')),
         CONSTRAINT no_overlapping_leaves EXCLUDE USING gist (
             user_id WITH =,
@@ -1158,8 +920,8 @@ CREATE TABLE work_calendars (
             FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
     );
 
-    -- Leave Approvals
-    CREATE TABLE leave_approvals (
+    -- LEAVE APPROVALS TABLE
+    CREATE TABLE IF NOT EXISTS leave_approvals (
         approval_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         leave_request_id UUID NOT NULL,
         approved_by UUID NOT NULL,
@@ -1167,22 +929,21 @@ CREATE TABLE work_calendars (
         decision_reason TEXT,
         approval_level INTEGER NOT NULL DEFAULT 1,
         decided_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT uq_leave_approval_once UNIQUE (leave_request_id, approved_by),
         CONSTRAINT fk_la_request
             FOREIGN KEY (leave_request_id)
             REFERENCES leave_requests(leave_request_id)
     );
 
-    -- Leave Transactions
-    CREATE TABLE leave_transactions (
+    -- LEAVE TRANSACTIONS TABLE
+    CREATE TABLE IF NOT EXISTS leave_transactions (
         transaction_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
         leave_type_id UUID NOT NULL,
         leave_request_id UUID,
-        change_amount NUMERIC(5,2) NOT NULL, -- + or -
-        reason VARCHAR(50), -- accrual | request | cancel | manual
+        change_amount NUMERIC(5,2) NOT NULL,
+        reason VARCHAR(50),
         created_at TIMESTAMPTZ DEFAULT NOW(),
         FOREIGN KEY (company_id) REFERENCES companies(company_id),
         FOREIGN KEY (user_id) REFERENCES users(user_id),
@@ -1191,144 +952,81 @@ CREATE TABLE work_calendars (
     );
 
     -- ==============================================
-    -- USER AVATARS (FK → users.user_id)
+    -- AVATAR TABLES
     -- ==============================================
-    CREATE TABLE user_avatars (
+
+    -- USER AVATARS TABLE
+    CREATE TABLE IF NOT EXISTS user_avatars (
         avatar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        -- FK owner
         user_id UUID NOT NULL,
-        -- Avatar reference (NO IMAGE DATA)
-        avatar_type VARCHAR(20) NOT NULL DEFAULT 'uploaded', -- initials | uploaded
-        avatar_hash VARCHAR(128),        -- integrity / dedup
-        avatar_object_key TEXT NOT NULL, -- local path (dev) / S3 key (prod)
-        avatar_mime_type VARCHAR(50),    -- image/jpeg, image/png, image/webp
-        -- State
-        is_active BOOLEAN NOT NULL DEFAULT true,
-        is_primary BOOLEAN NOT NULL DEFAULT true,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        -- Constraints
-        CONSTRAINT fk_user_avatars_user
-            FOREIGN KEY (user_id)
-            REFERENCES users(user_id)
-            ON DELETE CASCADE,
-        -- Only one primary avatar per user
-        CONSTRAINT uq_user_primary_avatar UNIQUE (user_id, is_primary)
-    );
-
-    CREATE INDEX idx_user_avatars_user_active
-    ON user_avatars (user_id)
-    WHERE is_active = true AND is_primary = true;
-
-    CREATE INDEX idx_user_avatars_hash ON user_avatars (avatar_hash);
-
-    -- ==============================================
-    -- ADMIN AVATARS (FK → admin_users.admin_id)
-    -- ==============================================
-    CREATE TABLE admin_avatars (
-        avatar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        -- FK owner
-        admin_id UUID NOT NULL,
-        -- Avatar reference (NO IMAGE DATA)
         avatar_type VARCHAR(20) NOT NULL DEFAULT 'uploaded',
         avatar_hash VARCHAR(128),
         avatar_object_key TEXT NOT NULL,
         avatar_mime_type VARCHAR(50),
-        -- State
         is_active BOOLEAN NOT NULL DEFAULT true,
         is_primary BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        -- Constraints
+        CONSTRAINT fk_user_avatars_user
+            FOREIGN KEY (user_id)
+            REFERENCES users(user_id)
+            ON DELETE CASCADE,
+        CONSTRAINT uq_user_primary_avatar UNIQUE (user_id, is_primary)
+    );
+
+    -- ADMIN AVATARS TABLE
+    CREATE TABLE IF NOT EXISTS admin_avatars (
+        avatar_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        admin_id UUID NOT NULL,
+        avatar_type VARCHAR(20) NOT NULL DEFAULT 'uploaded',
+        avatar_hash VARCHAR(128),
+        avatar_object_key TEXT NOT NULL,
+        avatar_mime_type VARCHAR(50),
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        is_primary BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT fk_admin_avatars_admin
             FOREIGN KEY (admin_id)
             REFERENCES admin_users(admin_id)
             ON DELETE CASCADE,
-        -- Only one primary avatar per admin
         CONSTRAINT uq_admin_primary_avatar UNIQUE (admin_id, is_primary)
     );
 
-    CREATE INDEX idx_admin_avatars_admin_active
-    ON admin_avatars (admin_id)
-    WHERE is_active = true AND is_primary = true;
-
-    CREATE INDEX idx_admin_avatars_hash ON admin_avatars (avatar_hash);
-
     -- ==============================================
-    -- AUDIT SCHEMA (SOURCE OF TRUTH)
+    -- AUDIT SCHEMA & TABLES
     -- ==============================================
     CREATE SCHEMA IF NOT EXISTS audit;
 
-    CREATE TABLE audit.audit_logs (
+    -- AUDIT LOGS TABLE
+    CREATE TABLE IF NOT EXISTS audit.audit_logs (
         audit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
         company_id UUID,
-        -- NULL allowed for system-wide events
-
         module VARCHAR(50) NOT NULL,
-        -- hr | attendance | leave | payroll | admin | system
-
         action VARCHAR(100) NOT NULL,
-        -- leave.approve | leave.reject
-        -- attendance.manual_add
-        -- attendance.manual_remove
-        -- policy.update
-        -- employee.terminate
-
         entity_type VARCHAR(50) NOT NULL,
-        -- leave_request | attendance_event | attendance_policy | employee
-
         entity_id UUID,
-
         actor_type VARCHAR(20) NOT NULL,
-        -- user | admin | system
-
         actor_id UUID,
-
         before_state JSONB,
         after_state JSONB,
-
         metadata JSONB,
-        /*
-        {
-            "reason": "Forgot punch",
-            "ip": "1.2.3.4",
-            "device_id": "xyz",
-            "source": "web"
-        }
-        */
-
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    -- 🔒 Make audit immutable
-    REVOKE UPDATE, DELETE ON audit.audit_logs FROM PUBLIC;
-
-    -- ==============================================
-    -- OUTBOX PATTERN FOR AUDIT LOGS
-    -- ==============================================
-
-    -- Create audit_logs_outbox table for CDC (Change Data Capture)
-    CREATE TABLE audit.audit_logs_outbox (
+    -- AUDIT LOGS OUTBOX TABLE
+    CREATE TABLE IF NOT EXISTS audit.audit_logs_outbox (
         outbox_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         audit_id UUID NOT NULL,
-        operation VARCHAR(10) NOT NULL, -- INSERT, UPDATE, DELETE
+        operation VARCHAR(10) NOT NULL,
         payload JSONB NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMestAMPTZ NOT NULL DEFAULT NOW(),
         processed_at TIMESTAMPTZ,
         error_message TEXT
     );
 
-    -- Index for efficient querying of unprocessed records
-    CREATE INDEX idx_audit_logs_outbox_unprocessed 
-    ON audit.audit_logs_outbox (created_at) 
-    WHERE processed_at IS NULL;
-
-    -- ==============================================
-    -- DEBOUNCE TABLE FOR BATCH PROCESSING
-    -- ==============================================
-
-    CREATE TABLE audit.outbox_debounce (
+    -- OUTBOX DEBOUNCE TABLE
+    CREATE TABLE IF NOT EXISTS audit.outbox_debounce (
         debounce_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         last_processed_id UUID,
         last_processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1339,131 +1037,110 @@ CREATE TABLE work_calendars (
     -- ADDITIONAL ATTENDANCE TABLES
     -- ==============================================
 
-    -- Company Attendance Rules (Global)
-    CREATE TABLE company_attendance_rules (
+    -- COMPANY ATTENDANCE RULES TABLE
+    CREATE TABLE IF NOT EXISTS company_attendance_rules (
         company_id UUID PRIMARY KEY,
         allowed_source_types VARCHAR(30)[] NOT NULL,
         allow_multiple_checkins BOOLEAN NOT NULL DEFAULT false,
         timezone VARCHAR(50) NOT NULL DEFAULT 'UTC',
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT fk_company_attendance_rules_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
             ON DELETE CASCADE
     );
 
-    -- Department Attendance Rules
-    CREATE TABLE department_attendance_rules (
+    -- DEPARTMENT ATTENDANCE RULES TABLE
+    CREATE TABLE IF NOT EXISTS department_attendance_rules (
         rule_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         department_id UUID NOT NULL,
-
         allowed_source_types VARCHAR(30)[] NOT NULL,
         allowed_event_types VARCHAR(30)[] NOT NULL,
-
         require_location BOOLEAN NOT NULL DEFAULT false,
         require_device BOOLEAN NOT NULL DEFAULT false,
-
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         UNIQUE (company_id, department_id),
-
         CONSTRAINT fk_dept_att_rules_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
             ON DELETE CASCADE,
-
         CONSTRAINT fk_dept_att_rules_department
             FOREIGN KEY (department_id) REFERENCES departments(department_id)
             ON DELETE CASCADE
     );
 
-    -- User Attendance Profiles (Overrides)
-    CREATE TABLE user_attendance_profiles (
+    -- USER ATTENDANCE PROFILES TABLE
+    CREATE TABLE IF NOT EXISTS user_attendance_profiles (
         user_id UUID PRIMARY KEY,
         company_id UUID NOT NULL,
-
         override_source_types VARCHAR(30)[],
         override_event_types VARCHAR(30)[],
-
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT fk_user_att_profile_user
             FOREIGN KEY (user_id) REFERENCES users(user_id)
             ON DELETE CASCADE,
-
         CONSTRAINT fk_user_att_profile_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
             ON DELETE CASCADE
     );
 
-    -- User Off Entitlements
-    CREATE TABLE user_off_entitlements (
+    -- USER OFF ENTITLEMENTS TABLE
+    CREATE TABLE IF NOT EXISTS user_off_entitlements (
         entitlement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
-
-        period_type VARCHAR(20) NOT NULL, -- weekly | monthly
-        off_count INTEGER NOT NULL,        -- e.g. 1 per week, 4 per month
-
+        period_type VARCHAR(20) NOT NULL,
+        off_count INTEGER NOT NULL,
         requires_approval BOOLEAN DEFAULT true,
         effective_from DATE NOT NULL,
         effective_to DATE,
-
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT fk_ent_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
         CONSTRAINT fk_ent_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT chk_period_type CHECK (period_type IN ('weekly','monthly'))
     );
 
-    -- Off Requests
-    CREATE TABLE off_requests (
+    -- OFF REQUESTS TABLE
+    CREATE TABLE IF NOT EXISTS off_requests (
         off_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
-
         request_dates DATE[] NOT NULL,
-        status VARCHAR(20) DEFAULT 'pending', -- pending | approved | rejected
-
+        status VARCHAR(20) DEFAULT 'pending',
         requested_by UUID,
         approved_by UUID,
         approved_at TIMESTAMPTZ,
-
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         CONSTRAINT fk_or_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
         CONSTRAINT fk_or_user FOREIGN KEY (user_id) REFERENCES users(user_id)
     );
 
-    -- Schedule Overrides
-    CREATE TABLE schedule_overrides (
+    -- SCHEDULE OVERRIDES TABLE
+    CREATE TABLE IF NOT EXISTS schedule_overrides (
         override_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
         override_date DATE NOT NULL,
-
-        override_type VARCHAR(20) NOT NULL, -- off | force_work | holiday_override
+        override_type VARCHAR(20) NOT NULL,
         reason TEXT,
-
         created_by UUID,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-
         UNIQUE (user_id, override_date),
-
         CONSTRAINT fk_so_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
         CONSTRAINT fk_so_user FOREIGN KEY (user_id) REFERENCES users(user_id),
         CONSTRAINT chk_override_type CHECK (override_type IN ('off','force_work','holiday_override'))
     );
 
     -- ==============================================
-    -- ORGANIZATIONAL UNITS
+    -- ORGANIZATIONAL UNITS TABLES
     -- ==============================================
-    CREATE TABLE org_units (
+
+    -- ORGANIZATIONAL UNITS TABLE
+    CREATE TABLE IF NOT EXISTS org_units (
         org_unit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
-        org_unit_type VARCHAR(30) NOT NULL, -- class | team | batch | project
+        org_unit_type VARCHAR(30) NOT NULL,
         name VARCHAR(255) NOT NULL,
-        department_id UUID, -- OPTIONAL link (academic / HR)
+        department_id UUID,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -1473,7 +1150,8 @@ CREATE TABLE work_calendars (
             FOREIGN KEY (department_id) REFERENCES departments(department_id)
     );
 
-    CREATE TABLE org_unit_members (
+    -- ORGANIZATIONAL UNIT MEMBERS TABLE
+    CREATE TABLE IF NOT EXISTS org_unit_members (
         org_unit_id UUID NOT NULL,
         user_id UUID NOT NULL,
         effective_from DATE NOT NULL,
@@ -1485,11 +1163,12 @@ CREATE TABLE work_calendars (
             FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
     );
 
-    CREATE TABLE org_unit_roles (
+    -- ORGANIZATIONAL UNIT ROLES TABLE
+    CREATE TABLE IF NOT EXISTS org_unit_roles (
         org_unit_id UUID NOT NULL,
         user_id UUID NOT NULL,
-        role VARCHAR(30) NOT NULL, -- teacher | supervisor | coordinator
-        position_id UUID,          -- optional but powerful
+        role VARCHAR(30) NOT NULL,
+        position_id UUID,
         effective_from DATE NOT NULL,
         effective_to DATE,
         PRIMARY KEY (org_unit_id, user_id, role, effective_from),
@@ -1502,299 +1181,345 @@ CREATE TABLE work_calendars (
     );
 
     -- ==============================================
+    -- ATTENDANCE SCHEMA & OUTBOX
+    -- ==============================================
+    CREATE SCHEMA IF NOT EXISTS attendance;
+
+    CREATE TABLE IF NOT EXISTS attendance.attendance_events_outbox (
+        outbox_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(50) NOT NULL,
+        aggregate_id UUID NOT NULL,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        processed_at TIMESTAMPTZ
+    );
+
+    -- ==============================================
     -- INDEXES
     -- ==============================================
-    -- Indexes for admin_users
-    CREATE INDEX idx_admin_users_search_tsv ON admin_users USING GIN (user_search_tsv);
-    CREATE INDEX idx_admin_users_username_trgm ON admin_users USING GIN (username gin_trgm_ops);
-    CREATE INDEX idx_admin_users_fullname_trgm ON admin_users USING GIN (full_name gin_trgm_ops);
-    CREATE INDEX idx_admin_users_role ON admin_users (admin_role_id) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_role_type ON admin_users (role_type) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_role_type_role ON admin_users (role_type, admin_role_id) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_phone_hash ON admin_users (phone_hash);
-    CREATE INDEX idx_admin_users_active ON admin_users (is_active) WHERE is_active = true;
-    CREATE INDEX idx_admin_users_username ON admin_users (username);
-    CREATE INDEX idx_admin_users_role_active_login ON admin_users (admin_role_id, is_active, last_login DESC);
 
-    -- Indexes for admin_roles
-    CREATE INDEX idx_admin_roles_name ON admin_roles (role_name);
-    CREATE INDEX idx_admin_roles_level ON admin_roles (role_level);
-    CREATE INDEX idx_admin_roles_type ON admin_roles (role_type);
+    -- INDEXES FOR ADMIN_USERS
+    CREATE INDEX IF NOT EXISTS idx_admin_users_search_tsv ON admin_users USING GIN (user_search_tsv);
+    CREATE INDEX IF NOT EXISTS idx_admin_users_username_trgm ON admin_users USING GIN (username gin_trgm_ops);
+    CREATE INDEX IF NOT EXISTS idx_admin_users_fullname_trgm ON admin_users USING GIN (full_name gin_trgm_ops);
+    CREATE INDEX IF NOT EXISTS idx_admin_users_role ON admin_users (admin_role_id) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_admin_users_role_type ON admin_users (role_type) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_admin_users_role_type_role ON admin_users (role_type, admin_role_id) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_admin_users_phone_hash ON admin_users (phone_hash);
+    CREATE INDEX IF NOT EXISTS idx_admin_users_active ON admin_users (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_admin_users_username ON admin_users (username);
+    CREATE INDEX IF NOT EXISTS idx_admin_users_role_active_login ON admin_users (admin_role_id, is_active, last_login DESC);
 
-    -- Indexes for admin_role_permissions
-    CREATE INDEX idx_admin_role_perms_role ON admin_role_permissions (admin_role_id);
-    CREATE INDEX idx_admin_role_perms_permission ON admin_role_permissions (permission_id);
+    -- INDEXES FOR ADMIN_ROLES
+    CREATE INDEX IF NOT EXISTS idx_admin_roles_name ON admin_roles (role_name);
+    CREATE INDEX IF NOT EXISTS idx_admin_roles_level ON admin_roles (role_level);
+    CREATE INDEX IF NOT EXISTS idx_admin_roles_type ON admin_roles (role_type);
 
-    -- Indexes for admin_role_departments
-    CREATE INDEX idx_admin_role_departments_role ON admin_role_departments (admin_role_id);
-    CREATE INDEX idx_admin_role_departments_dept ON admin_role_departments (system_department_id);
+    -- INDEXES FOR ADMIN_ROLE_PERMISSIONS
+    CREATE INDEX IF NOT EXISTS idx_admin_role_perms_role ON admin_role_permissions (admin_role_id);
+    CREATE INDEX IF NOT EXISTS idx_admin_role_perms_permission ON admin_role_permissions (permission_id);
 
-    -- Indexes for permissions
-    CREATE INDEX idx_permissions_name ON permissions (permission_name);
-    CREATE INDEX idx_permissions_bit_index ON permissions (bit_index);
-    CREATE INDEX idx_permissions_module ON permissions (module);
-    CREATE INDEX idx_permissions_scope ON permissions (scope);
+    -- INDEXES FOR ADMIN_ROLE_DEPARTMENTS
+    CREATE INDEX IF NOT EXISTS idx_admin_role_departments_role ON admin_role_departments (admin_role_id);
+    CREATE INDEX IF NOT EXISTS idx_admin_role_departments_dept ON admin_role_departments (system_department_id);
 
-    -- Indexes for system_departments
-    CREATE INDEX idx_system_departments_name ON system_departments (name);
-    CREATE INDEX idx_system_departments_module ON system_departments (module_code);
-    CREATE INDEX idx_system_departments_bitmask ON system_departments (bitmask);
+    -- INDEXES FOR PERMISSIONS
+    CREATE INDEX IF NOT EXISTS idx_permissions_name ON permissions (permission_name);
+    CREATE INDEX IF NOT EXISTS idx_permissions_bit_index ON permissions (bit_index);
+    CREATE INDEX IF NOT EXISTS idx_permissions_module ON permissions (module);
+    CREATE INDEX IF NOT EXISTS idx_permissions_scope ON permissions (scope);
 
-    -- Indexes for HR Module
-    CREATE INDEX idx_employee_profiles_user ON employee_profiles (user_id);
-    CREATE INDEX idx_employee_profiles_company ON employee_profiles (company_id);
-    CREATE INDEX idx_employee_profiles_employment_status ON employee_profiles (employment_status) WHERE employment_status = 'active';
-    
-    CREATE INDEX idx_employee_department_history_user ON employee_department_history (user_id);
-    CREATE INDEX idx_employee_department_history_dept ON employee_department_history (department_id);
-    CREATE INDEX idx_employee_department_history_dates ON employee_department_history (start_date, end_date);
-    
-    CREATE INDEX idx_employee_documents_user ON employee_documents (user_id);
-    CREATE INDEX idx_employee_documents_company ON employee_documents (company_id);
-    CREATE INDEX idx_employee_documents_type ON employee_documents (document_type);
-    
-    CREATE INDEX idx_positions_company ON positions (company_id);
-    CREATE INDEX idx_positions_department ON positions (department_id);
-    CREATE INDEX idx_positions_open ON positions (is_open) WHERE is_open = true;
-    
-    CREATE INDEX idx_employee_role_history_user ON employee_role_history (user_id);
-    CREATE INDEX idx_employee_role_history_role ON employee_role_history (role_id);
-    
-    CREATE INDEX idx_employee_exit_user ON employee_exit (user_id);
-    CREATE INDEX idx_employee_exit_company ON employee_exit (company_id);
-    CREATE INDEX idx_employee_exit_date ON employee_exit (exit_date);
+    -- INDEXES FOR SYSTEM_DEPARTMENTS
+    CREATE INDEX IF NOT EXISTS idx_system_departments_name ON system_departments (name);
+    CREATE INDEX IF NOT EXISTS idx_system_departments_module ON system_departments (module_code);
+    CREATE INDEX IF NOT EXISTS idx_system_departments_bitmask ON system_departments (bitmask);
 
-    -- Indexes for Scheduling Module
-    CREATE INDEX idx_work_calendars_company ON work_calendars (company_id);
-    CREATE INDEX idx_work_calendars_active ON work_calendars (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_schedule_templates_company ON schedule_templates (company_id);
-    CREATE INDEX idx_schedule_templates_calendar ON schedule_templates (calendar_id);
-    CREATE INDEX idx_schedule_templates_active ON schedule_templates (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_user_schedule_assignments_user ON user_schedule_assignments (user_id);
-    CREATE INDEX idx_user_schedule_assignments_template ON user_schedule_assignments (schedule_template_id);
-    CREATE INDEX idx_user_schedule_assignments_dates ON user_schedule_assignments (effective_from, effective_to);
-    
-    CREATE INDEX idx_schedule_instances_user_date ON schedule_instances (user_id, schedule_date);
-    CREATE INDEX idx_schedule_instances_company ON schedule_instances (company_id);
-    CREATE INDEX idx_schedule_instances_template ON schedule_instances (schedule_template_id);
-    CREATE INDEX idx_schedule_instances_status ON schedule_instances (status) WHERE status = 'active';
+    -- INDEXES FOR DEPARTMENTS
+    CREATE INDEX IF NOT EXISTS idx_departments_company_active ON departments (company_id) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_departments_parent_active ON departments (parent_department_id) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_departments_company ON departments (company_id);
+    CREATE INDEX IF NOT EXISTS idx_departments_parent ON departments (parent_department_id);
+    CREATE INDEX IF NOT EXISTS idx_departments_system ON departments (system_department_id);
 
-    -- Indexes for Compensation Module
-    CREATE INDEX idx_pay_units_name ON pay_units (name);
-    
-    CREATE INDEX idx_compensation_structures_company ON compensation_structures (company_id);
-    CREATE INDEX idx_compensation_structures_code ON compensation_structures (structure_code);
-    CREATE INDEX idx_compensation_structures_active ON compensation_structures (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_user_compensations_user ON user_compensations (user_id);
-    CREATE INDEX idx_user_compensations_structure ON user_compensations (structure_id);
-    CREATE INDEX idx_user_compensations_pay_unit ON user_compensations (pay_unit_id);
-    CREATE INDEX idx_user_compensations_dates ON user_compensations (effective_from, effective_to);
+    -- UNIQUE INDEX FOR DEPARTMENTS
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_departments_company_name_active ON departments (company_id, department_name) WHERE is_active = true;
 
-    -- Indexes for Attendance Module
-    CREATE INDEX idx_attendance_sources_company ON attendance_sources (company_id);
-    CREATE INDEX idx_attendance_sources_type ON attendance_sources (source_type);
-    CREATE INDEX idx_attendance_sources_active ON attendance_sources (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_attendance_events_user_time ON attendance_events (user_id, event_time DESC);
-    CREATE INDEX idx_attendance_events_company ON attendance_events (company_id);
-    CREATE INDEX idx_attendance_events_type ON attendance_events (event_type);
-    CREATE INDEX idx_attendance_events_source ON attendance_events (source_type, source_id);
-    
-    CREATE INDEX idx_attendance_policies_company ON attendance_policies (company_id);
-    CREATE INDEX idx_attendance_policies_position ON attendance_policies (position_id) WHERE position_id IS NOT NULL;
-    CREATE INDEX idx_attendance_policies_active ON attendance_policies (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_user_attendance_policies_user ON user_attendance_policies (user_id);
-    CREATE INDEX idx_user_attendance_policies_policy ON user_attendance_policies (policy_id);
-    CREATE INDEX idx_user_attendance_policies_dates ON user_attendance_policies (effective_from, effective_to);
-    CREATE INDEX idx_attendance_policies_effective ON user_attendance_policies (user_id, effective_from, effective_to);
-    
-    CREATE INDEX idx_attendance_daily_summary_user_date ON attendance_daily_summary (user_id, attendance_date DESC);
-    CREATE INDEX idx_attendance_daily_summary_company ON attendance_daily_summary (company_id);
-    CREATE INDEX idx_attendance_daily_summary_status ON attendance_daily_summary (status);
-    CREATE INDEX idx_attendance_daily_summary_date_status ON attendance_daily_summary (attendance_date, status);
-    
-    CREATE INDEX idx_attendance_locations_company ON attendance_locations (company_id);
-    CREATE INDEX idx_attendance_locations_active ON attendance_locations (is_active) WHERE is_active = true;
-    CREATE INDEX idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
-    CREATE INDEX idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
+    -- INDEXES FOR USERS
+    CREATE INDEX IF NOT EXISTS idx_users_search_tsv ON users USING GIN (user_search_tsv);
+    CREATE INDEX IF NOT EXISTS idx_users_username_trgm ON users USING GIN (username gin_trgm_ops);
+    CREATE INDEX IF NOT EXISTS idx_users_fullname_trgm ON users USING GIN (full_name gin_trgm_ops);
+    CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
+    CREATE INDEX IF NOT EXISTS idx_users_fullname ON users (full_name);
+    CREATE INDEX IF NOT EXISTS idx_users_name_search ON users (username, full_name);
+    CREATE INDEX IF NOT EXISTS idx_users_phone_hash ON users (phone_hash);
+    CREATE INDEX IF NOT EXISTS idx_users_created_at ON users (created_at);
+    CREATE INDEX IF NOT EXISTS idx_users_status ON users (is_active, kyc_status);
+    CREATE INDEX IF NOT EXISTS idx_users_region ON users (data_region);
+    CREATE INDEX IF NOT EXISTS idx_users_kyc_status ON users(kyc_status);
 
-    -- Indexes for employee_rfid_mappings
-    CREATE INDEX idx_employee_rfid_tag ON employee_rfid_mappings (rfid_tag);
-    CREATE INDEX idx_employee_rfid_user ON employee_rfid_mappings (user_id);
-    CREATE INDEX idx_employee_rfid_company ON employee_rfid_mappings (company_id);
-    CREATE INDEX idx_employee_rfid_active ON employee_rfid_mappings (is_active) WHERE is_active = true;
+    -- INDEXES FOR COMPANIES
+    CREATE INDEX IF NOT EXISTS idx_companies_name_tsv ON companies USING GIN (company_name_tsv);
+    CREATE INDEX IF NOT EXISTS idx_companies_name_trgm ON companies USING GIN (company_name gin_trgm_ops);
+    CREATE INDEX IF NOT EXISTS idx_companies_name ON companies (company_name);
+    CREATE INDEX IF NOT EXISTS idx_companies_owner_name ON companies (owner_user_id, company_name);
+    CREATE INDEX IF NOT EXISTS idx_companies_owner ON companies (owner_user_id);
+    CREATE INDEX IF NOT EXISTS idx_companies_status ON companies (is_active, subscription_status);
+    CREATE INDEX IF NOT EXISTS idx_companies_region ON companies (data_region);
 
-    -- Indexes for work_center_shifts
-    CREATE INDEX idx_work_center_shifts_code ON work_center_shifts (work_center_code);
-    CREATE INDEX idx_work_center_shifts_company ON work_center_shifts (company_id);
-    CREATE INDEX idx_work_center_shifts_active ON work_center_shifts (is_active) WHERE is_active = true;
-    CREATE INDEX idx_work_center_shifts_dates ON work_center_shifts (effective_from, effective_to);
+    -- INDEXES FOR ROLES
+    CREATE INDEX IF NOT EXISTS idx_roles_company ON roles (company_id);
+    CREATE INDEX IF NOT EXISTS idx_roles_level ON roles (role_level);
 
-    -- Indexes for user_work_center_assignments
-    CREATE INDEX idx_user_work_center_user ON user_work_center_assignments (user_id, is_active, effective_from DESC);
-    CREATE INDEX idx_user_work_center_company ON user_work_center_assignments (company_id, work_center_code, is_active);
+    -- INDEXES FOR ROLE_PERMISSIONS
+    CREATE INDEX IF NOT EXISTS idx_role_perms_permission ON role_permissions (permission_id);
 
-    -- Indexes for work_centers
-    CREATE INDEX idx_work_centers_company ON work_centers (company_id, is_active);
+    -- INDEXES FOR COMPANY_EMPLOYEES
+    CREATE INDEX IF NOT EXISTS idx_employees_user ON company_employees (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employees_role ON company_employees (role_id);
+    CREATE INDEX IF NOT EXISTS idx_employees_active ON company_employees (is_active);
+    CREATE INDEX IF NOT EXISTS idx_employees_company_active ON company_employees (company_id, is_active);
+    CREATE INDEX IF NOT EXISTS idx_employees_reports_to ON company_employees (company_id, reports_to);
+    CREATE INDEX IF NOT EXISTS idx_company_employees_position ON company_employees (position_id) WHERE position_id IS NOT NULL;
 
-    -- Indexes for Leave Module
-    CREATE INDEX idx_leave_types_company ON leave_types (company_id);
-    CREATE INDEX idx_leave_types_code ON leave_types (leave_code);
-    CREATE INDEX idx_leave_types_active ON leave_types (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_leave_policies_company ON leave_policies (company_id);
-    CREATE INDEX idx_leave_policies_department ON leave_policies (department_id);
-    CREATE INDEX idx_leave_policies_active ON leave_policies (is_active) WHERE is_active = true;
-    
-    CREATE INDEX idx_user_leave_policies_user ON user_leave_policies (user_id);
-    CREATE INDEX idx_user_leave_policies_policy ON user_leave_policies (leave_policy_id);
-    CREATE INDEX idx_user_leave_policies_dates ON user_leave_policies (effective_from, effective_to);
-    
-    CREATE INDEX idx_leave_balances_user ON leave_balances (user_id);
-    CREATE INDEX idx_leave_balances_type ON leave_balances (leave_type_id);
-    CREATE INDEX idx_leave_balances_as_of ON leave_balances (as_of);
-    
-    CREATE INDEX idx_leave_requests_user ON leave_requests (user_id);
-    CREATE INDEX idx_leave_requests_company ON leave_requests (company_id);
-    CREATE INDEX idx_leave_requests_type ON leave_requests (leave_type_id);
-    CREATE INDEX idx_leave_requests_status ON leave_requests (status);
-    CREATE INDEX idx_leave_requests_dates ON leave_requests (start_date, end_date);
-    CREATE INDEX idx_leave_requests_requested_at ON leave_requests (requested_at DESC);
-    CREATE INDEX idx_leave_requests_pending ON leave_requests (company_id) WHERE status = 'pending';
-    
-    CREATE INDEX idx_leave_approvals_request ON leave_approvals (leave_request_id);
-    CREATE INDEX idx_leave_approvals_approver ON leave_approvals (approved_by);
+    -- INDEXES FOR ROLE_DEPARTMENTS
+    CREATE INDEX IF NOT EXISTS idx_role_departments_role ON role_departments (role_id);
+    CREATE INDEX IF NOT EXISTS idx_role_departments_department ON role_departments (department_id);
 
-    -- Indexes for additional attendance tables
-    CREATE INDEX idx_company_attendance_rules_company ON company_attendance_rules (company_id);
-    CREATE INDEX idx_department_attendance_rules_dept ON department_attendance_rules (department_id);
-    CREATE INDEX idx_user_attendance_profiles_user ON user_attendance_profiles (user_id);
-    CREATE INDEX idx_user_off_entitlements_user ON user_off_entitlements (user_id, company_id);
-    CREATE INDEX idx_off_requests_user ON off_requests (user_id, company_id);
-    CREATE INDEX idx_schedule_overrides_user_date ON schedule_overrides (user_id, override_date);
+    -- INDEXES FOR USER_DEVICES
+    CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices (user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_devices_active ON user_devices (is_active);
+    CREATE INDEX IF NOT EXISTS idx_user_devices_last_active ON user_devices (last_active);
 
-    -- Indexes for organizational units
-    CREATE INDEX idx_org_units_company ON org_units (company_id, org_unit_type) WHERE is_active = true;
-    CREATE INDEX idx_oum_user_active ON org_unit_members (user_id) WHERE effective_to IS NULL;
-    CREATE INDEX idx_our_user_active ON org_unit_roles (user_id) WHERE effective_to IS NULL;
+    -- INDEXES FOR LOGIN_ATTEMPTS
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_user ON login_attempts (user_id);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_device ON login_attempts (device_id);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_success ON login_attempts (success);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_time ON login_attempts (attempted_at DESC);
 
-    -- Indexes for Audit
-    CREATE INDEX idx_audit_logs_company_time ON audit.audit_logs (company_id, created_at DESC);
-    CREATE INDEX idx_audit_logs_module_action ON audit.audit_logs (module, action);
-    CREATE INDEX idx_audit_logs_entity ON audit.audit_logs (entity_type, entity_id);
+    -- INDEXES FOR HR MODULE
+    CREATE INDEX IF NOT EXISTS idx_employee_profiles_user ON employee_profiles (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_profiles_company ON employee_profiles (company_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_profiles_employment_status ON employee_profiles (employment_status) WHERE employment_status = 'active';
+    CREATE INDEX IF NOT EXISTS idx_employee_department_history_user ON employee_department_history (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_department_history_dept ON employee_department_history (department_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_department_history_dates ON employee_department_history (start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_employee_documents_user ON employee_documents (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_documents_company ON employee_documents (company_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_documents_type ON employee_documents (document_type);
+    CREATE INDEX IF NOT EXISTS idx_positions_company ON positions (company_id);
+    CREATE INDEX IF NOT EXISTS idx_positions_department ON positions (department_id);
+    CREATE INDEX IF NOT EXISTS idx_positions_open ON positions (is_open) WHERE is_open = true;
+    CREATE INDEX IF NOT EXISTS idx_positions_work_center ON positions (company_id, work_center_code) WHERE work_center_code IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_employee_role_history_user ON employee_role_history (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_role_history_role ON employee_role_history (role_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_exit_user ON employee_exit (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_exit_company ON employee_exit (company_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_exit_date ON employee_exit (exit_date);
 
-    -- Other indexes (from original schema)
-    CREATE INDEX idx_users_search_tsv ON users USING GIN (user_search_tsv);
-    CREATE INDEX idx_users_username_trgm ON users USING GIN (username gin_trgm_ops);
-    CREATE INDEX idx_users_fullname_trgm ON users USING GIN (full_name gin_trgm_ops);
-    CREATE INDEX idx_users_username ON users (username);
-    CREATE INDEX idx_users_fullname ON users (full_name);
-    CREATE INDEX idx_users_name_search ON users (username, full_name);
-    CREATE INDEX idx_companies_name_tsv ON companies USING GIN (company_name_tsv);
-    CREATE INDEX idx_companies_name_trgm ON companies USING GIN (company_name gin_trgm_ops);
-    CREATE INDEX idx_companies_name ON companies (company_name);
-    CREATE INDEX idx_companies_owner_name ON companies (owner_user_id, company_name);
-    CREATE INDEX idx_users_phone_hash ON users (phone_hash);
-    CREATE INDEX idx_users_created_at ON users (created_at);
-    CREATE INDEX idx_users_status ON users (is_active, kyc_status);
-    CREATE INDEX idx_users_region ON users (data_region);
-    CREATE INDEX idx_users_kyc_status ON users(kyc_status);
-    CREATE INDEX idx_companies_owner ON companies (owner_user_id);
-    CREATE INDEX idx_companies_status ON companies (is_active, subscription_status);
-    CREATE INDEX idx_companies_region ON companies (data_region);
-    CREATE INDEX idx_roles_company ON roles (company_id);
-    CREATE INDEX idx_roles_level ON roles (role_level);
-    CREATE INDEX idx_role_perms_permission ON role_permissions (permission_id);
-    CREATE INDEX idx_employees_user ON company_employees (user_id);
-    CREATE INDEX idx_employees_role ON company_employees (role_id);
-    CREATE INDEX idx_employees_active ON company_employees (is_active);
-    CREATE INDEX idx_employees_company_active ON company_employees (company_id, is_active);
-    CREATE INDEX idx_employees_reports_to ON company_employees (company_id, reports_to);
-    CREATE INDEX idx_departments_company ON departments (company_id);
-    CREATE INDEX idx_departments_parent ON departments (parent_department_id);
-    CREATE INDEX idx_departments_system ON departments (system_department_id);
-    CREATE INDEX idx_role_departments_role ON role_departments (role_id);
-    CREATE INDEX idx_role_departments_department ON role_departments (department_id);
-    CREATE INDEX idx_user_devices_user ON user_devices (user_id);
-    CREATE INDEX idx_user_devices_active ON user_devices (is_active);
-    CREATE INDEX idx_user_devices_last_active ON user_devices (last_active);
-    CREATE INDEX idx_login_attempts_user ON login_attempts (user_id);
-    CREATE INDEX idx_login_attempts_device ON login_attempts (device_id);
-    CREATE INDEX idx_login_attempts_success ON login_attempts (success);
-    CREATE INDEX idx_login_attempts_time ON login_attempts (attempted_at DESC);
+    -- INDEXES FOR SCHEDULING MODULE
+    CREATE INDEX IF NOT EXISTS idx_work_calendars_company ON work_calendars (company_id);
+    CREATE INDEX IF NOT EXISTS idx_work_calendars_active ON work_calendars (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_schedule_templates_company ON schedule_templates (company_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_templates_calendar ON schedule_templates (calendar_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_templates_active ON schedule_templates (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_user ON user_schedule_assignments (user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_template ON user_schedule_assignments (schedule_template_id);
+    CREATE INDEX IF NOT EXISTS idx_user_schedule_assignments_dates ON user_schedule_assignments (effective_from, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_schedule_instances_user_date ON schedule_instances (user_id, schedule_date);
+    CREATE INDEX IF NOT EXISTS idx_schedule_instances_company ON schedule_instances (company_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_instances_template ON schedule_instances (schedule_template_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_instances_status ON schedule_instances (status) WHERE status = 'active';
+
+    -- UNIQUE INDEX FOR SCHEDULE INSTANCES
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_instances_user_date_active ON schedule_instances (user_id, schedule_date) WHERE status = 'active';
+
+    -- INDEXES FOR COMPENSATION MODULE
+    CREATE INDEX IF NOT EXISTS idx_pay_units_name ON pay_units (name);
+    CREATE INDEX IF NOT EXISTS idx_compensation_structures_company ON compensation_structures (company_id);
+    CREATE INDEX IF NOT EXISTS idx_compensation_structures_code ON compensation_structures (structure_code);
+    CREATE INDEX IF NOT EXISTS idx_compensation_structures_active ON compensation_structures (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_user_compensations_user ON user_compensations (user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_compensations_structure ON user_compensations (structure_id);
+    CREATE INDEX IF NOT EXISTS idx_user_compensations_pay_unit ON user_compensations (pay_unit_id);
+    CREATE INDEX IF NOT EXISTS idx_user_compensations_dates ON user_compensations (effective_from, effective_to);
+
+    -- INDEXES FOR ATTENDANCE MODULE
+    CREATE INDEX IF NOT EXISTS idx_attendance_sources_company ON attendance_sources (company_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_sources_type ON attendance_sources (source_type);
+    CREATE INDEX IF NOT EXISTS idx_attendance_sources_active ON attendance_sources (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_user_time ON attendance_events (user_id, event_time DESC);
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_company ON attendance_events (company_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_type ON attendance_events (event_type);
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_source ON attendance_events (source_type, source_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_event_date ON attendance_events (event_date);
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_company_event_date ON attendance_events (company_id, event_date);
+    CREATE INDEX IF NOT EXISTS idx_attendance_policies_company ON attendance_policies (company_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_policies_position ON attendance_policies (position_id) WHERE position_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_attendance_policies_active ON attendance_policies (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_user ON user_attendance_policies (user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_policy ON user_attendance_policies (policy_id);
+    CREATE INDEX IF NOT EXISTS idx_user_attendance_policies_dates ON user_attendance_policies (effective_from, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_attendance_policies_effective ON user_attendance_policies (user_id, effective_from, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_user_date ON attendance_daily_summary (user_id, attendance_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_company ON attendance_daily_summary (company_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_status ON attendance_daily_summary (status);
+    CREATE INDEX IF NOT EXISTS idx_attendance_daily_summary_date_status ON attendance_daily_summary (attendance_date, status);
+    CREATE INDEX IF NOT EXISTS idx_attendance_locations_company ON attendance_locations (company_id);
+    CREATE INDEX IF NOT EXISTS idx_attendance_locations_active ON attendance_locations (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
+
+    -- INDEXES FOR EMPLOYEE_RFID_MAPPINGS
+    CREATE INDEX IF NOT EXISTS idx_employee_rfid_tag ON employee_rfid_mappings (rfid_tag);
+    CREATE INDEX IF NOT EXISTS idx_employee_rfid_user ON employee_rfid_mappings (user_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_rfid_company ON employee_rfid_mappings (company_id);
+    CREATE INDEX IF NOT EXISTS idx_employee_rfid_active ON employee_rfid_mappings (is_active) WHERE is_active = true;
+
+    -- UNIQUE INDEX FOR EMPLOYEE_RFID_MAPPINGS
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_rfid_active_user ON employee_rfid_mappings (user_id, company_id) WHERE is_active = true AND unassigned_at IS NULL;
+
+    -- INDEXES FOR WORK_CENTER_SHIFTS
+    CREATE INDEX IF NOT EXISTS idx_work_center_shifts_code ON work_center_shifts (work_center_code);
+    CREATE INDEX IF NOT EXISTS idx_work_center_shifts_company ON work_center_shifts (company_id);
+    CREATE INDEX IF NOT EXISTS idx_work_center_shifts_active ON work_center_shifts (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_work_center_shifts_dates ON work_center_shifts (effective_from, effective_to);
+
+    -- INDEXES FOR USER_WORK_CENTER_ASSIGNMENTS
+    CREATE INDEX IF NOT EXISTS idx_user_work_center_user ON user_work_center_assignments (user_id, is_active, effective_from DESC);
+    CREATE INDEX IF NOT EXISTS idx_user_work_center_company ON user_work_center_assignments (company_id, work_center_code, is_active);
+
+    -- INDEXES FOR WORK_CENTERS
+    CREATE INDEX IF NOT EXISTS idx_work_centers_company ON work_centers (company_id, is_active);
+
+    -- INDEXES FOR LEAVE MODULE
+    CREATE INDEX IF NOT EXISTS idx_leave_types_company ON leave_types (company_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_types_code ON leave_types (leave_code);
+    CREATE INDEX IF NOT EXISTS idx_leave_types_active ON leave_types (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_leave_policies_company ON leave_policies (company_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_policies_department ON leave_policies (department_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_policies_active ON leave_policies (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_user_leave_policies_user ON user_leave_policies (user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_leave_policies_policy ON user_leave_policies (leave_policy_id);
+    CREATE INDEX IF NOT EXISTS idx_user_leave_policies_dates ON user_leave_policies (effective_from, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_leave_balances_user ON leave_balances (user_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_balances_type ON leave_balances (leave_type_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_balances_as_of ON leave_balances (as_of);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_user ON leave_requests (user_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_company ON leave_requests (company_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_type ON leave_requests (leave_type_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_status ON leave_requests (status);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_dates ON leave_requests (start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_requested_at ON leave_requests (requested_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_leave_requests_pending ON leave_requests (company_id) WHERE status = 'pending';
+    CREATE INDEX IF NOT EXISTS idx_leave_approvals_request ON leave_approvals (leave_request_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_approvals_approver ON leave_approvals (approved_by);
+
+    -- INDEXES FOR ADDITIONAL ATTENDANCE TABLES
+    CREATE INDEX IF NOT EXISTS idx_company_attendance_rules_company ON company_attendance_rules (company_id);
+    CREATE INDEX IF NOT EXISTS idx_department_attendance_rules_dept ON department_attendance_rules (department_id);
+    CREATE INDEX IF NOT EXISTS idx_user_attendance_profiles_user ON user_attendance_profiles (user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_off_entitlements_user ON user_off_entitlements (user_id, company_id);
+    CREATE INDEX IF NOT EXISTS idx_off_requests_user ON off_requests (user_id, company_id);
+    CREATE INDEX IF NOT EXISTS idx_schedule_overrides_user_date ON schedule_overrides (user_id, override_date);
+
+    -- INDEXES FOR ORGANIZATIONAL UNITS
+    CREATE INDEX IF NOT EXISTS idx_org_units_company ON org_units (company_id, org_unit_type) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_oum_user_active ON org_unit_members (user_id) WHERE effective_to IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_our_user_active ON org_unit_roles (user_id) WHERE effective_to IS NULL;
+
+    -- INDEXES FOR AUDIT
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_company_time ON audit.audit_logs (company_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_module_action ON audit.audit_logs (module, action);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit.audit_logs (entity_type, entity_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_outbox_unprocessed ON audit.audit_logs_outbox (created_at) WHERE processed_at IS NULL;
+
+    -- INDEXES FOR ATTENDANCE OUTBOX
+    CREATE INDEX IF NOT EXISTS idx_attendance_outbox_unprocessed ON attendance.attendance_events_outbox (processed_at) WHERE processed_at IS NULL;
+
+    -- UNIQUE INDEX FOR EMPLOYEE DEPARTMENT HISTORY
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_active_department ON employee_department_history (user_id) WHERE end_date IS NULL;
+
+    -- UNIQUE INDEX FOR EMPLOYEE ROLE HISTORY
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_role_active ON employee_role_history (user_id) WHERE end_date IS NULL;
+
+    -- UNIQUE INDEX FOR EMPLOYEE EXIT
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_exit_active ON employee_exit (company_id, user_id) WHERE exit_state IN ('scheduled','effective');
+
+    -- UNIQUE INDEX FOR USER ATTENDANCE POLICIES
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_attendance_policies_active ON user_attendance_policies (user_id) WHERE effective_to IS NULL;
+
+    -- ATTENDANCE DUPLICATE PROTECTION INDEXES
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_correction_event ON attendance_events (company_id, user_id, event_type, event_time) WHERE source_type = 'correction';
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_user_type_time ON attendance_events (company_id, user_id, event_type, event_time DESC) WHERE source_type != 'correction';
+    CREATE INDEX IF NOT EXISTS idx_attendance_events_device_time ON attendance_events (company_id, user_id, device_id, event_type, event_time DESC) WHERE device_id IS NOT NULL AND source_type != 'correction';
+
+    -- INDEXES FOR USER AVATARS
+    CREATE INDEX IF NOT EXISTS idx_user_avatars_user_active ON user_avatars (user_id) WHERE is_active = true AND is_primary = true;
+    CREATE INDEX IF NOT EXISTS idx_user_avatars_hash ON user_avatars (avatar_hash);
+
+    -- INDEXES FOR ADMIN AVATARS
+    CREATE INDEX IF NOT EXISTS idx_admin_avatars_admin_active ON admin_avatars (admin_id) WHERE is_active = true AND is_primary = true;
+    CREATE INDEX IF NOT EXISTS idx_admin_avatars_hash ON admin_avatars (avatar_hash);
 
     -- ==============================================
     -- SEED DATA
     -- ==============================================
 
     -- SEED DATA FOR ATTENDANCE SOURCE TYPES
-    INSERT INTO attendance_source_types (source_type, description, requires_reference) VALUES
-    ('biometric', 'Biometric device', false),
-    ('rfid', 'RFID gate', false),
-    ('mobile', 'Mobile application', false),
-    ('web', 'Web portal', false),
-    ('system', 'System generated', false),
-    ('manual', 'Manual HR entry', true),
-    ('classroom', 'Classroom system', true),
-    ('machine', 'Factory machine / gate', true),
-    ('correction', 'Manual correction of attendance event', false),
-    ('import', 'Imported from external system', true)
+    INSERT INTO attendance_source_types
+    (source_type, description, category, requires_device, is_system,
+    allow_backdated, allow_future, trust_level, is_self_service)
+    VALUES
+    ('mobile', 'Mobile App Punch', 'mobile', false, false, false, false, 2, true),
+    ('web', 'Web Portal Punch', 'web', false, false, false, false, 2, true),
+    ('biometric', 'Biometric Attendance Device', 'biometric', true, false, false, false, 5, true),
+    ('rfid', 'RFID Card Attendance', 'rfid', true, false, false, false, 5, true),
+    ('kiosk', 'Shared Kiosk / Tablet', 'machine', true, false, false, false, 4, true),
+    ('manual', 'Manual Attendance Entry', 'manual', false, false, true, false, 1, false),
+    ('correction', 'Attendance Correction', 'manual', false, false, true, false, 1, false),
+    ('system', 'System Generated Attendance', 'system', false, true, false, false, 5, false),
+    ('import', 'Bulk Attendance Import', 'system', false, true, true, false, 4, false),
+    ('api', 'External Attendance API', 'system', false, true, false, false, 3, false),
+    ('factory', 'Factory Machine Sync', 'machine', true, true, false, false, 5, true),
+    ('classroom', 'Classroom / Lab Attendance', 'machine', true, false, false, false, 3, true),
+    ('geo', 'Geo-fenced Mobile Attendance', 'mobile', false, false, false, false, 3, true)
     ON CONFLICT DO NOTHING;
 
     -- SEED DATA FOR ATTENDANCE EVENT TYPES
     INSERT INTO attendance_event_types
     (event_type, category, description, is_user_triggered, is_system_generated)
     VALUES
-    -- Core
     ('check_in', 'core', 'User check-in', true, false),
     ('check_out', 'core', 'User check-out', true, false),
     ('break_start', 'core', 'Break started', true, false),
     ('break_end', 'core', 'Break ended', true, false),
-
-    -- Shift
     ('shift_start', 'shift', 'Shift started', true, false),
     ('shift_end', 'shift', 'Shift ended', true, false),
     ('overtime_start', 'shift', 'Overtime started', true, false),
     ('overtime_end', 'shift', 'Overtime ended', true, false),
     ('early_exit', 'shift', 'Left early', false, true),
     ('late_entry', 'shift', 'Late arrival', false, true),
-
-    -- Location
     ('gate_entry', 'location', 'Gate entry', true, false),
     ('gate_exit', 'location', 'Gate exit', true, false),
     ('zone_entry', 'location', 'Zone entry', true, false),
     ('zone_exit', 'location', 'Zone exit', true, false),
-
-    -- Class / Session
     ('class_start', 'class', 'Class started', true, false),
     ('class_end', 'class', 'Class ended', true, false),
     ('session_join', 'class', 'Joined session', true, false),
     ('session_leave', 'class', 'Left session', true, false),
-
-    -- Leave
     ('leave_start', 'leave', 'Leave started', false, true),
     ('leave_end', 'leave', 'Leave ended', false, true),
     ('absent_marked', 'leave', 'Absent marked', false, true),
     ('holiday_marked', 'leave', 'Holiday', false, true),
     ('weekly_off', 'leave', 'Weekly off', false, true),
-
-    -- Manual / HR
     ('manual_check_in', 'manual', 'Manual check-in', false, false),
     ('manual_check_out', 'manual', 'Manual check-out', false, false),
     ('manual_override', 'manual', 'Manual override', false, false),
     ('attendance_adjustment', 'manual', 'Attendance adjustment', false, false),
-
-    -- System / Device
     ('biometric_sync', 'system', 'Biometric sync', false, true),
     ('rfid_scan', 'system', 'RFID scan', false, true),
     ('system_generated', 'system', 'System generated event', false, true),
     ('imported_event', 'system', 'Imported attendance', false, true),
-
-    -- Exceptions
     ('missing_punch', 'exception', 'Missing punch', false, true),
     ('duplicate_punch', 'exception', 'Duplicate punch', false, true),
     ('invalid_punch', 'exception', 'Invalid punch', false, true),
@@ -1837,7 +1562,6 @@ CREATE TABLE work_calendars (
 
     -- INSERT PERMISSIONS
     INSERT INTO permissions (permission_name, description, category, module, scope, requires_tier, bit_index) VALUES
-    -- User permissions (scope = 'user')
     ('hr.employee.create', 'Create employees', 'employee', 'hr', 'user', 'basic', 0),
     ('hr.employee.update', 'Update employees', 'employee', 'hr', 'user', 'basic', 1),
     ('hr.employee.delete', 'Delete employees', 'employee', 'hr', 'user', 'basic', 2),
@@ -2047,58 +1771,38 @@ CREATE TABLE work_calendars (
     ('rnd.document.update', 'Update R&D documents', 'document', 'rnd', 'user', 'basic', 206),
     ('rnd.document.view', 'View R&D documents', 'document', 'rnd', 'user', 'basic', 207),
     ('rnd.document.delete', 'Delete R&D documents', 'document', 'rnd', 'user', 'basic', 208),
-
-    -- Company administration
     ('administration.company.view', 'View company administration settings', 'company', 'administration', 'user', 'basic', 210),
     ('administration.company.update', 'Update company administration settings', 'company', 'administration', 'user', 'basic', 211),
-
-    -- Policy & configuration
     ('administration.policy.create', 'Create company policies', 'policy', 'administration', 'user', 'basic', 212),
     ('administration.policy.update', 'Update company policies', 'policy', 'administration', 'user', 'basic', 213),
     ('administration.policy.delete', 'Delete company policies', 'policy', 'administration', 'user', 'basic', 214),
     ('administration.policy.view', 'View company policies', 'policy', 'administration', 'user', 'basic', 215),
-
-    -- Internal approvals
     ('administration.approval.create', 'Create approval workflows', 'approval', 'administration', 'user', 'basic', 216),
     ('administration.approval.update', 'Update approval workflows', 'approval', 'administration', 'user', 'basic', 217),
     ('administration.approval.delete', 'Delete approval workflows', 'approval', 'administration', 'user', 'basic', 218),
     ('administration.approval.view', 'View approval workflows', 'approval', 'administration', 'user', 'basic', 219),
-
-    -- Internal audit (company only)
     ('administration.audit.view', 'View company audit logs', 'audit', 'administration', 'user', 'basic', 220),
-
-    -- Security & access (company scope)
     ('administration.security.view', 'View company security settings', 'security', 'administration', 'user', 'basic', 221),
     ('administration.security.update', 'Update company security settings', 'security', 'administration', 'user', 'basic', 222),
-
-    -- Attendance permissions
     ('attendance.self.punch', 'Allow user to punch their own attendance (check-in/check-out)', 'attendance', 'attendance', 'user', 'basic', 223),
     ('attendance.team.punch', 'Allow manager/lead to punch attendance for team members', 'attendance', 'attendance', 'user', 'basic', 224),
     ('attendance.correct', 'Allow correction or adjustment of attendance records', 'attendance', 'attendance', 'user', 'basic', 225),
     ('attendance.configure', 'Configure attendance rules, sources, and policies', 'attendance', 'attendance', 'user', 'basic', 226),
-    
-    -- Admin Employee Management permissions (scope = 'admin')
     ('admin.employee.create', 'Create admin employees', 'employee', 'employee_management', 'admin', 'admin', 235),
     ('admin.employee.update', 'Update admin employees', 'employee', 'employee_management', 'admin', 'admin', 236),
     ('admin.employee.view', 'View admin employees', 'employee', 'employee_management', 'admin', 'admin', 237),
     ('admin.employee.delete', 'Delete admin employees', 'employee', 'employee_management', 'admin', 'admin', 238),
     ('admin.employee.assign', 'Assign admin employees to departments', 'employee', 'employee_management', 'admin', 'admin', 239),
-    
-    -- Admin Manager Management permissions (scope = 'admin')
     ('admin.manager.create', 'Create admin managers', 'manager', 'manager_management', 'admin', 'admin', 240),
     ('admin.manager.update', 'Update admin managers', 'manager', 'manager_management', 'admin', 'admin', 241),
     ('admin.manager.view', 'View admin managers', 'manager', 'manager_management', 'admin', 'admin', 242),
     ('admin.manager.delete', 'Delete admin managers', 'manager', 'manager_management', 'admin', 'admin', 243),
     ('admin.manager.assign', 'Assign admin managers to departments', 'manager', 'manager_management', 'admin', 'admin', 244),
-    
-    -- Company Management permissions (scope = 'admin')
     ('admin.company.create', 'Create companies', 'company', 'company_management', 'admin', 'admin', 245),
     ('admin.company.update', 'Update companies', 'company', 'company_management', 'admin', 'admin', 246),
     ('admin.company.view', 'View companies', 'company', 'company_management', 'admin', 'admin', 247),
     ('admin.company.delete', 'Delete companies', 'company', 'company_management', 'admin', 'admin', 248),
     ('admin.company.suspend', 'Suspend companies', 'company', 'company_management', 'admin', 'admin', 249),
-    
-    -- Super Admin specific permissions (scope = 'admin')
     ('admin.super.manage_roles', 'Manage all admin roles', 'role', 'super_admin', 'admin', 'super_admin', 250),
     ('admin.super.manage_permissions', 'Manage all permissions', 'permission', 'super_admin', 'admin', 'super_admin', 251),
     ('admin.super.manage_departments', 'Manage all departments', 'department', 'super_admin', 'admin', 'super_admin', 252),
@@ -2137,6 +1841,484 @@ CREATE TABLE work_calendars (
                 'created_at', NEW.created_at
             )
         );
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ENFORCE DEPARTMENT LIMIT FUNCTION
+    CREATE OR REPLACE FUNCTION enforce_department_limit()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        current_dept_count INTEGER;
+        max_dept_allowed INTEGER;
+    BEGIN
+        PERFORM 1
+        FROM companies
+        WHERE company_id = NEW.company_id
+        FOR UPDATE;
+
+        SELECT COUNT(*)
+        INTO current_dept_count
+        FROM departments
+        WHERE company_id = NEW.company_id
+        AND is_active = true;
+
+        SELECT max_departments
+        INTO max_dept_allowed
+        FROM companies
+        WHERE company_id = NEW.company_id;
+
+        IF max_dept_allowed > 1000 THEN
+            max_dept_allowed := 1000;
+        END IF;
+
+        IF TG_OP = 'INSERT' THEN
+            IF current_dept_count >= max_dept_allowed THEN
+                RAISE EXCEPTION
+                    'Department limit exceeded (% allowed)',
+                    max_dept_allowed
+                    USING ERRCODE = '23514';
+            END IF;
+        END IF;
+
+        IF TG_OP = 'UPDATE' THEN
+            IF OLD.is_active = false AND NEW.is_active = true THEN
+                IF current_dept_count >= max_dept_allowed THEN
+                    RAISE EXCEPTION
+                        'Department limit exceeded (% allowed)',
+                        max_dept_allowed
+                        USING ERRCODE = '23514';
+                END IF;
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- CASCADE DEPARTMENT DEACTIVATION FUNCTION
+    CREATE OR REPLACE FUNCTION deactivate_child_departments(p_dept_id UUID)
+    RETURNS VOID AS $$
+    DECLARE
+        child_id UUID;
+    BEGIN
+        FOR child_id IN
+            SELECT department_id
+            FROM departments
+            WHERE parent_department_id = p_dept_id
+            AND is_active = true
+        LOOP
+            UPDATE departments
+            SET is_active = false
+            WHERE department_id = child_id;
+
+            PERFORM deactivate_child_departments(child_id);
+        END LOOP;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- CASCADE DEPARTMENT SOFT DELETE FUNCTION
+    CREATE OR REPLACE FUNCTION cascade_department_soft_delete()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF OLD.is_active = true AND NEW.is_active = false THEN
+            PERFORM deactivate_child_departments(OLD.department_id);
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- PREVENT CHILD ON INACTIVE PARENT FUNCTION
+    CREATE OR REPLACE FUNCTION prevent_child_on_inactive_parent()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        parent_active BOOLEAN;
+    BEGIN
+        IF NEW.parent_department_id IS NOT NULL THEN
+            SELECT is_active
+            INTO parent_active
+            FROM departments
+            WHERE department_id = NEW.parent_department_id;
+
+            IF parent_active IS DISTINCT FROM true THEN
+                RAISE EXCEPTION 'Cannot create or activate department under inactive or missing parent';
+            END IF;
+        END IF;
+
+        IF TG_OP = 'UPDATE'
+        AND OLD.is_active = false
+        AND NEW.is_active = true
+        AND NEW.parent_department_id IS NOT NULL THEN
+
+            SELECT is_active
+            INTO parent_active
+            FROM departments
+            WHERE department_id = NEW.parent_department_id;
+
+            IF parent_active IS DISTINCT FROM true THEN
+                RAISE EXCEPTION 'Cannot activate department under inactive parent';
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ENFORCE UNIQUE ACTIVE DEPARTMENT NAME FUNCTION
+    CREATE OR REPLACE FUNCTION enforce_unique_active_department_name()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.is_active = true THEN
+            IF EXISTS (
+                SELECT 1
+                FROM departments
+                WHERE company_id = NEW.company_id
+                AND department_name = NEW.department_name
+                AND is_active = true
+                AND department_id <> NEW.department_id
+            ) THEN
+                RAISE EXCEPTION 'Active department name already exists';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- PREVENT DEPARTMENT DELETE FUNCTION
+    CREATE OR REPLACE FUNCTION prevent_department_delete()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        RAISE EXCEPTION 'Hard delete of departments is not allowed';
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ENFORCE EMPLOYEE LIMIT FUNCTION
+    CREATE OR REPLACE FUNCTION enforce_employee_limit()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        active_count INTEGER;
+        max_allowed INTEGER;
+    BEGIN
+        IF (TG_OP = 'INSERT' AND NEW.is_active = true)
+        OR (TG_OP = 'UPDATE' AND OLD.is_active = false AND NEW.is_active = true) THEN
+
+            SELECT max_employees
+            INTO max_allowed
+            FROM companies
+            WHERE company_id = NEW.company_id
+            FOR UPDATE;
+
+            SELECT COUNT(*)
+            INTO active_count
+            FROM company_employees
+            WHERE company_id = NEW.company_id
+            AND is_active = true;
+
+            IF active_count + 1 > max_allowed THEN
+                RAISE EXCEPTION
+                    'Employee limit exceeded (%/%). Deactivate another employee.',
+                    active_count + 1,
+                    max_allowed;
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- GET ACTIVE EMPLOYEE COUNT FUNCTION
+    CREATE OR REPLACE FUNCTION get_active_employee_count(p_company_id UUID)
+    RETURNS INTEGER AS $$
+    DECLARE
+        total INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+        INTO total
+        FROM company_employees
+        WHERE company_id = p_company_id
+        AND is_active = true;
+
+        RETURN total;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- PREVENT POSITION IN INACTIVE DEPARTMENT FUNCTION
+    CREATE OR REPLACE FUNCTION prevent_position_in_inactive_department()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        dept_active BOOLEAN;
+    BEGIN
+        SELECT is_active
+        INTO dept_active
+        FROM departments
+        WHERE department_id = NEW.department_id;
+
+        IF dept_active = false THEN
+            RAISE EXCEPTION 'Cannot assign position to inactive department';
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- CLOSE POSITIONS ON DEPARTMENT DEACTIVATE FUNCTION
+    CREATE OR REPLACE FUNCTION close_positions_on_department_deactivate()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF OLD.is_active = true AND NEW.is_active = false THEN
+            UPDATE positions
+            SET is_open = false
+            WHERE department_id = OLD.department_id
+            AND is_open = true;
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- SYNC EMPLOYEE DEPARTMENT ON POSITION FUNCTION
+    CREATE OR REPLACE FUNCTION sync_employee_department_on_position()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        new_department_id UUID;
+    BEGIN
+        IF NEW.position_id IS NULL THEN
+            RETURN NEW;
+        END IF;
+
+        SELECT department_id
+        INTO new_department_id
+        FROM positions
+        WHERE position_id = NEW.position_id;
+
+        UPDATE employee_department_history
+        SET end_date = CURRENT_DATE
+        WHERE user_id = NEW.user_id
+        AND company_id = NEW.company_id
+        AND end_date IS NULL;
+
+        INSERT INTO employee_department_history (
+            user_id,
+            company_id,
+            department_id,
+            start_date,
+            change_reason
+        ) VALUES (
+            NEW.user_id,
+            NEW.company_id,
+            new_department_id,
+            CURRENT_DATE,
+            CASE
+                WHEN TG_OP = 'INSERT' THEN 'initial position assignment'
+                ELSE 'position change'
+            END
+        );
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- SYNC EMPLOYEE ROLE HISTORY FUNCTION
+    CREATE OR REPLACE FUNCTION sync_employee_role_history()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        UPDATE employee_role_history
+        SET end_date = CURRENT_DATE
+        WHERE user_id = NEW.user_id
+        AND end_date IS NULL;
+
+        INSERT INTO employee_role_history (
+            user_id,
+            role_id,
+            start_date,
+            reason
+        ) VALUES (
+            NEW.user_id,
+            NEW.role_id,
+            CURRENT_DATE,
+            CASE
+                WHEN TG_OP = 'INSERT' THEN 'initial role assignment'
+                ELSE 'role change'
+            END
+        );
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ENFORCE SCHEDULED EMPLOYEE EXITS FUNCTION
+    CREATE OR REPLACE FUNCTION enforce_scheduled_employee_exits(
+        p_effective_date DATE DEFAULT CURRENT_DATE,
+        p_enforced_by UUID DEFAULT NULL
+    )
+    RETURNS INTEGER AS $$
+    DECLARE
+        affected_count INTEGER := 0;
+    BEGIN
+        UPDATE employee_exit
+        SET exit_state  = 'effective',
+            enforced_at = NOW(),
+            enforced_by = p_enforced_by
+        WHERE exit_state = 'scheduled'
+          AND exit_date <= p_effective_date;
+
+        GET DIAGNOSTICS affected_count = ROW_COUNT;
+
+        UPDATE company_employees ce
+        SET is_active = false
+        FROM employee_exit ee
+        WHERE ce.company_id = ee.company_id
+          AND ce.user_id   = ee.user_id
+          AND ee.exit_state = 'effective'
+          AND ce.is_active  = true;
+
+        UPDATE employee_profiles ep
+        SET employment_status = 'terminated',
+            updated_at        = NOW()
+        FROM employee_exit ee
+        WHERE ep.company_id = ee.company_id
+          AND ep.user_id    = ee.user_id
+          AND ee.exit_state = 'effective'
+          AND ep.employment_status <> 'terminated';
+
+        RETURN affected_count;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- MARK EMPLOYEE REHIRED FUNCTION
+    CREATE OR REPLACE FUNCTION mark_employee_rehired(
+        p_company_id UUID,
+        p_user_id UUID
+    )
+    RETURNS VOID AS $$
+    BEGIN
+        UPDATE employee_exit
+        SET exit_state = 'rehired'
+        WHERE company_id = p_company_id
+        AND user_id = p_user_id
+        AND exit_state = 'effective';
+
+        UPDATE company_employees
+        SET is_active = true
+        WHERE company_id = p_company_id
+        AND user_id = p_user_id;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- PREVENT EXIT FOR INACTIVE EMPLOYEE FUNCTION
+    CREATE OR REPLACE FUNCTION prevent_exit_for_inactive_employee()
+    RETURNS TRIGGER AS $$
+    DECLARE
+        active_status BOOLEAN;
+    BEGIN
+        SELECT is_active
+        INTO active_status
+        FROM company_employees
+        WHERE company_id = NEW.company_id
+        AND user_id = NEW.user_id;
+
+        IF active_status IS DISTINCT FROM true THEN
+            RAISE EXCEPTION 'Cannot create exit for inactive employee';
+        END IF;
+
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- CHECK RECENT ATTENDANCE DUPLICATE FUNCTION
+    CREATE OR REPLACE FUNCTION check_recent_attendance_duplicate(
+        p_company_id UUID,
+        p_user_id UUID,
+        p_event_type VARCHAR(30),
+        p_event_time TIMESTAMPTZ,
+        p_time_window_minutes INTEGER DEFAULT 5
+    ) RETURNS BOOLEAN AS $$
+    DECLARE
+        duplicate_count INTEGER;
+    BEGIN
+        SELECT COUNT(*)
+        INTO duplicate_count
+        FROM attendance_events
+        WHERE company_id = p_company_id
+          AND user_id = p_user_id
+          AND event_type = p_event_type
+          AND source_type != 'correction'
+          AND ABS(EXTRACT(EPOCH FROM (event_time - p_event_time))) <= p_time_window_minutes * 60;
+        
+        RETURN duplicate_count > 0;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- FIND EXISTING CORRECTION FUNCTION
+    CREATE OR REPLACE FUNCTION find_existing_correction(
+        p_company_id UUID,
+        p_user_id UUID,
+        p_event_type VARCHAR(30),
+        p_event_time TIMESTAMPTZ
+    ) RETURNS TABLE (
+        attendance_event_id UUID,
+        company_id UUID,
+        user_id UUID,
+        event_type VARCHAR(30),
+        event_time TIMESTAMPTZ,
+        source_type VARCHAR(30),
+        source_id UUID,
+        device_id VARCHAR(256),
+        ip_address VARCHAR(64),
+        metadata JSONB,
+        created_at TIMESTAMPTZ,
+        created_by UUID
+    ) AS $$
+    BEGIN
+        RETURN QUERY
+        SELECT 
+            ae.attendance_event_id,
+            ae.company_id,
+            ae.user_id,
+            ae.event_type,
+            ae.event_time,
+            ae.source_type,
+            ae.source_id,
+            ae.device_id,
+            ae.ip_address,
+            ae.metadata,
+            ae.created_at,
+            ae.created_by
+        FROM attendance_events ae
+        WHERE ae.company_id = p_company_id
+          AND ae.user_id = p_user_id
+          AND ae.event_type = p_event_type
+          AND ae.event_time = p_event_time
+          AND ae.source_type = 'correction'
+        LIMIT 1;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- PREVENT PAST SCHEDULE UPDATE FUNCTION
+    CREATE OR REPLACE FUNCTION prevent_past_schedule_update()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF OLD.schedule_date <= CURRENT_DATE THEN
+            RAISE EXCEPTION 'Past or current schedules are immutable';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- ENFORCE SCHEDULE CANCELLATION RULES FUNCTION
+    CREATE OR REPLACE FUNCTION enforce_schedule_cancellation()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF OLD.status = 'active'
+           AND NEW.status = 'cancelled'
+           AND OLD.schedule_date > CURRENT_DATE THEN
+            RETURN NEW;
+        END IF;
+
+        IF OLD.status = 'active' AND NEW.status = 'active' THEN
+            RAISE EXCEPTION 'Direct modification not allowed. Cancel and regenerate.';
+        END IF;
+
         RETURN NEW;
     END;
     $$ LANGUAGE plpgsql;
@@ -2235,7 +2417,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql STABLE;
 
-    -- Helper function for role type specific searches
+    -- SEARCH ADMIN USERS BY ROLE TYPE FUNCTION
     CREATE OR REPLACE FUNCTION search_admin_users_by_role_type(
         role_type_param INTEGER,
         search_query TEXT DEFAULT NULL,
@@ -2271,22 +2453,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to close positions when department is deactivated
-    CREATE OR REPLACE FUNCTION close_positions_on_department_deactivate()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF OLD.is_active = true AND NEW.is_active = false THEN
-            UPDATE positions
-            SET is_open = false
-            WHERE department_id = OLD.department_id
-            AND is_open = true;
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to search admin employees (role_type = 1)
+    -- SEARCH ADMIN EMPLOYEES FUNCTION
     CREATE OR REPLACE FUNCTION search_admin_employees(
         search_query TEXT DEFAULT NULL,
         search_type TEXT DEFAULT 'autocomplete',
@@ -2321,7 +2488,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to search admin managers (role_type = 2)
+    -- SEARCH ADMIN MANAGERS FUNCTION
     CREATE OR REPLACE FUNCTION search_admin_managers(
         search_query TEXT DEFAULT NULL,
         search_type TEXT DEFAULT 'autocomplete',
@@ -2356,7 +2523,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to search super admins (role_type = 4)
+    -- SEARCH SUPER ADMINS FUNCTION
     CREATE OR REPLACE FUNCTION search_super_admins(
         search_query TEXT DEFAULT NULL,
         search_type TEXT DEFAULT 'autocomplete',
@@ -2391,7 +2558,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to get admins with their permissions and departments
+    -- GET ADMIN WITH PERMISSIONS FUNCTION
     CREATE OR REPLACE FUNCTION get_admin_with_permissions(
         admin_id_param UUID
     ) RETURNS TABLE(
@@ -2466,7 +2633,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to check if admin has permission
+    -- ADMIN HAS PERMISSION FUNCTION
     CREATE OR REPLACE FUNCTION admin_has_permission(
         admin_id_param UUID,
         permission_name_param VARCHAR(100)
@@ -2484,7 +2651,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to check if admin has department access
+    -- ADMIN HAS DEPARTMENT ACCESS FUNCTION
     CREATE OR REPLACE FUNCTION admin_has_department_access(
         admin_id_param UUID,
         department_bitmask BIGINT
@@ -2502,7 +2669,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function for admin autocomplete suggestions
+    -- GET ADMIN SUGGESTIONS FUNCTION
     CREATE OR REPLACE FUNCTION get_admin_suggestions(
         prefix VARCHAR(100),
         role_type_filter INTEGER DEFAULT NULL,
@@ -2545,7 +2712,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to get admin permissions by role
+    -- GET ADMIN ROLE PERMISSIONS FUNCTION
     CREATE OR REPLACE FUNCTION get_admin_role_permissions(
         role_id_param UUID
     ) RETURNS TABLE(
@@ -2574,7 +2741,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to get admin departments by role
+    -- GET ADMIN ROLE DEPARTMENTS FUNCTION
     CREATE OR REPLACE FUNCTION get_admin_role_departments(
         role_id_param UUID
     ) RETURNS TABLE(
@@ -2599,7 +2766,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to search admin users with department filtering
+    -- SEARCH ADMIN USERS WITH DEPARTMENTS FUNCTION
     CREATE OR REPLACE FUNCTION search_admin_users_with_departments(
         search_query TEXT DEFAULT NULL,
         role_type_filter INTEGER DEFAULT NULL,
@@ -2698,9 +2865,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- ==============================================
-    -- EXISTING USER AND COMPANY SEARCH FUNCTIONS
-    -- ==============================================
+    -- USER SEARCH FUNCTION
     CREATE OR REPLACE FUNCTION user_search(
         search_query TEXT,
         search_type TEXT DEFAULT 'fulltext',
@@ -2832,6 +2997,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql STABLE;
 
+    -- COMPANY SEARCH FUNCTION
     CREATE OR REPLACE FUNCTION company_search(
         search_query TEXT,
         search_type TEXT DEFAULT 'fulltext',
@@ -2947,9 +3113,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- ==============================================
-    -- COMPANY EMPLOYEE SEARCH FUNCTIONS
-    -- ==============================================
+    -- COMPANY EMPLOYEE SEARCH FUNCTION
     CREATE OR REPLACE FUNCTION company_employee_search(
         search_query TEXT,
         company_id_param UUID,
@@ -3107,6 +3271,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
+    -- GET COMPANY EMPLOYEE SUGGESTIONS FUNCTION
     CREATE OR REPLACE FUNCTION get_company_employee_suggestions(
         company_id_param UUID,
         prefix VARCHAR(100),
@@ -3146,6 +3311,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
+    -- FIND COMPANY EMPLOYEE BY USERNAME FUNCTION
     CREATE OR REPLACE FUNCTION find_company_employee_by_username(
         company_id_search UUID,
         username_search VARCHAR(100)
@@ -3187,9 +3353,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- ==============================================
-    -- HELPER FUNCTIONS
-    -- ==============================================
+    -- UPDATE UPDATED_AT COLUMN FUNCTION
     CREATE OR REPLACE FUNCTION update_updated_at_column()
     RETURNS TRIGGER AS $$
     BEGIN
@@ -3204,6 +3368,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
+    -- UPDATE ADMIN USER SEARCH TSV FUNCTION
     CREATE OR REPLACE FUNCTION update_admin_user_search_tsv()
     RETURNS TRIGGER AS $$
     BEGIN
@@ -3215,6 +3380,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
+    -- UPDATE USER SEARCH TSV FUNCTION
     CREATE OR REPLACE FUNCTION update_user_search_tsv()
     RETURNS TRIGGER AS $$
     BEGIN
@@ -3226,6 +3392,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
+    -- UPDATE COMPANY NAME TSV FUNCTION
     CREATE OR REPLACE FUNCTION update_company_name_tsv()
     RETURNS TRIGGER AS $$
     BEGIN
@@ -3236,7 +3403,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Find users by username (exact match)
+    -- FIND USER BY USERNAME FUNCTION
     CREATE OR REPLACE FUNCTION find_user_by_username(username_search VARCHAR(100))
     RETURNS TABLE(
         user_id UUID,
@@ -3261,7 +3428,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Find companies by owner with name search
+    -- FIND COMPANIES BY OWNER FUNCTION
     CREATE OR REPLACE FUNCTION find_companies_by_owner(
         owner_id UUID,
         name_filter VARCHAR(255) DEFAULT NULL
@@ -3289,7 +3456,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Get user suggestions for autocomplete
+    -- GET USER SUGGESTIONS FUNCTION
     CREATE OR REPLACE FUNCTION get_user_suggestions(
         prefix VARCHAR(100),
         limit_suggestions INTEGER DEFAULT 10
@@ -3318,7 +3485,7 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Get company suggestions for autocomplete
+    -- GET COMPANY SUGGESTIONS FUNCTION
     CREATE OR REPLACE FUNCTION get_company_suggestions(
         prefix VARCHAR(255),
         limit_suggestions INTEGER DEFAULT 10
@@ -3338,263 +3505,6 @@ CREATE TABLE work_calendars (
     END;
     $$ LANGUAGE plpgsql;
 
-    -- Function to sync employee department on position change
-    CREATE OR REPLACE FUNCTION sync_employee_department_on_position()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        new_department_id UUID;
-    BEGIN
-        -- Ignore if position is NULL
-        IF NEW.position_id IS NULL THEN
-            RETURN NEW;
-        END IF;
-
-        -- Get department from position
-        SELECT department_id
-        INTO new_department_id
-        FROM positions
-        WHERE position_id = NEW.position_id;
-
-        -- Close existing active department
-        UPDATE employee_department_history
-        SET end_date = CURRENT_DATE
-        WHERE user_id = NEW.user_id
-        AND company_id = NEW.company_id
-        AND end_date IS NULL;
-
-        -- Insert new department history
-        INSERT INTO employee_department_history (
-            user_id,
-            company_id,
-            department_id,
-            start_date,
-            change_reason
-        ) VALUES (
-            NEW.user_id,
-            NEW.company_id,
-            new_department_id,
-            CURRENT_DATE,
-            CASE
-                WHEN TG_OP = 'INSERT' THEN 'initial position assignment'
-                ELSE 'position change'
-            END
-        );
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to sync employee role history
-    CREATE OR REPLACE FUNCTION sync_employee_role_history()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        -- Close existing active role
-        UPDATE employee_role_history
-        SET end_date = CURRENT_DATE
-        WHERE user_id = NEW.user_id
-        AND end_date IS NULL;
-
-        -- Insert new role
-        INSERT INTO employee_role_history (
-            user_id,
-            role_id,
-            start_date,
-            reason
-        ) VALUES (
-            NEW.user_id,
-            NEW.role_id,
-            CURRENT_DATE,
-            CASE
-                WHEN TG_OP = 'INSERT' THEN 'initial role assignment'
-                ELSE 'role change'
-            END
-        );
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to enforce scheduled employee exits
-    CREATE OR REPLACE FUNCTION enforce_scheduled_employee_exits(
-        p_effective_date DATE DEFAULT CURRENT_DATE,
-        p_enforced_by UUID DEFAULT NULL
-    )
-    RETURNS INTEGER AS $$
-    DECLARE
-        affected_count INTEGER := 0;
-    BEGIN
-        -- 1️⃣ Mark scheduled exits as EFFECTIVE (date-based enforcement)
-        UPDATE employee_exit
-        SET exit_state  = 'effective',
-            enforced_at = NOW(),
-            enforced_by = p_enforced_by
-        WHERE exit_state = 'scheduled'
-          AND exit_date <= p_effective_date;
-
-        GET DIAGNOSTICS affected_count = ROW_COUNT;
-
-        -- 2️⃣ Deactivate employees whose exit is now effective
-        UPDATE company_employees ce
-        SET is_active = false
-        FROM employee_exit ee
-        WHERE ce.company_id = ee.company_id
-          AND ce.user_id   = ee.user_id
-          AND ee.exit_state = 'effective'
-          AND ce.is_active  = true;
-
-        -- 3️⃣ Sync employee profile employment status
-        UPDATE employee_profiles ep
-        SET employment_status = 'terminated',
-            updated_at        = NOW()
-        FROM employee_exit ee
-        WHERE ep.company_id = ee.company_id
-          AND ep.user_id    = ee.user_id
-          AND ee.exit_state = 'effective'
-          AND ep.employment_status <> 'terminated';
-
-        -- 4️⃣ Return number of exits enforced
-        RETURN affected_count;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to mark employee as rehired
-    CREATE OR REPLACE FUNCTION mark_employee_rehired(
-        p_company_id UUID,
-        p_user_id UUID
-    )
-    RETURNS VOID AS $$
-    BEGIN
-        UPDATE employee_exit
-        SET exit_state = 'rehired'
-        WHERE company_id = p_company_id
-        AND user_id = p_user_id
-        AND exit_state = 'effective';
-
-        UPDATE company_employees
-        SET is_active = true
-        WHERE company_id = p_company_id
-        AND user_id = p_user_id;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to prevent exit for inactive employee
-    CREATE OR REPLACE FUNCTION prevent_exit_for_inactive_employee()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        active_status BOOLEAN;
-    BEGIN
-        SELECT is_active
-        INTO active_status
-        FROM company_employees
-        WHERE company_id = NEW.company_id
-        AND user_id = NEW.user_id;
-
-        IF active_status IS DISTINCT FROM true THEN
-            RAISE EXCEPTION 'Cannot create exit for inactive employee';
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to check for recent attendance duplicates
-    CREATE OR REPLACE FUNCTION check_recent_attendance_duplicate(
-        p_company_id UUID,
-        p_user_id UUID,
-        p_event_type VARCHAR(30),
-        p_event_time TIMESTAMPTZ,
-        p_time_window_minutes INTEGER DEFAULT 5
-    ) RETURNS BOOLEAN AS $$
-    DECLARE
-        duplicate_count INTEGER;
-    BEGIN
-        SELECT COUNT(*)
-        INTO duplicate_count
-        FROM attendance_events
-        WHERE company_id = p_company_id
-          AND user_id = p_user_id
-          AND event_type = p_event_type
-          AND source_type != 'correction'
-          AND ABS(EXTRACT(EPOCH FROM (event_time - p_event_time))) <= p_time_window_minutes * 60;
-        
-        RETURN duplicate_count > 0;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to find existing correction
-    CREATE OR REPLACE FUNCTION find_existing_correction(
-        p_company_id UUID,
-        p_user_id UUID,
-        p_event_type VARCHAR(30),
-        p_event_time TIMESTAMPTZ
-    ) RETURNS TABLE (
-        attendance_event_id UUID,
-        company_id UUID,
-        user_id UUID,
-        event_type VARCHAR(30),
-        event_time TIMESTAMPTZ,
-        source_type VARCHAR(30),
-        source_id UUID,
-        device_id VARCHAR(256),
-        ip_address VARCHAR(64),
-        metadata JSONB,
-        created_at TIMESTAMPTZ,
-        created_by UUID
-    ) AS $$
-    BEGIN
-        RETURN QUERY
-        SELECT 
-            ae.attendance_event_id,
-            ae.company_id,
-            ae.user_id,
-            ae.event_type,
-            ae.event_time,
-            ae.source_type,
-            ae.source_id,
-            ae.device_id,
-            ae.ip_address,
-            ae.metadata,
-            ae.created_at,
-            ae.created_by
-        FROM attendance_events ae
-        WHERE ae.company_id = p_company_id
-          AND ae.user_id = p_user_id
-          AND ae.event_type = p_event_type
-          AND ae.event_time = p_event_time
-          AND ae.source_type = 'correction'
-        LIMIT 1;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to prevent past schedule updates
-    CREATE OR REPLACE FUNCTION prevent_past_schedule_update()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF OLD.schedule_date <= CURRENT_DATE THEN
-            RAISE EXCEPTION 'Past or current schedules are immutable';
-        END IF;
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    -- Function to enforce schedule cancellation rules
-    CREATE OR REPLACE FUNCTION enforce_schedule_cancellation()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF OLD.status = 'active'
-           AND NEW.status = 'cancelled'
-           AND OLD.schedule_date > CURRENT_DATE THEN
-            RETURN NEW;
-        END IF;
-
-        IF OLD.status = 'active' AND NEW.status = 'active' THEN
-            RAISE EXCEPTION 'Direct modification not allowed. Cancel and regenerate.';
-        END IF;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
     -- ==============================================
     -- TRIGGERS
     -- ==============================================
@@ -3605,6 +3515,7 @@ CREATE TABLE work_calendars (
     FOR EACH ROW
     EXECUTE FUNCTION audit.audit_logs_outbox_trigger();
 
+    -- Update triggers for search vectors
     CREATE TRIGGER update_admin_user_search_tsv
     BEFORE UPDATE OF username, full_name ON admin_users
     FOR EACH ROW EXECUTE FUNCTION update_admin_user_search_tsv();
@@ -3617,6 +3528,7 @@ CREATE TABLE work_calendars (
     BEFORE UPDATE OF company_name ON companies
     FOR EACH ROW EXECUTE FUNCTION update_company_name_tsv();
 
+    -- Update triggers for updated_at columns
     CREATE TRIGGER update_admin_users_updated_at
     BEFORE UPDATE ON admin_users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -3628,10 +3540,15 @@ CREATE TABLE work_calendars (
     CREATE TRIGGER update_company_employees_updated_at BEFORE UPDATE ON company_employees FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_user_devices_updated_at BEFORE UPDATE ON user_devices FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_admin_roles_updated_at BEFORE UPDATE ON admin_roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_employee_profiles_updated_at BEFORE UPDATE ON employee_profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_attendance_policies_updated_at BEFORE UPDATE ON attendance_policies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_employee_rfid_updated_at BEFORE UPDATE ON employee_rfid_mappings FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_work_center_shifts_updated_at BEFORE UPDATE ON work_center_shifts FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_user_work_center_assignments_updated_at BEFORE UPDATE ON user_work_center_assignments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_work_centers_updated_at BEFORE UPDATE ON work_centers FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+    CREATE TRIGGER update_org_units_updated_at BEFORE UPDATE ON org_units FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-    -- ==============================================
-    -- DEPARTMENT-RELATED TRIGGERS
-    -- ==============================================
+    -- Department-related triggers
     CREATE TRIGGER trg_enforce_department_limit
     BEFORE INSERT OR UPDATE OF is_active ON departments
     FOR EACH ROW
@@ -3657,51 +3574,24 @@ CREATE TABLE work_calendars (
     FOR EACH ROW
     EXECUTE FUNCTION enforce_unique_active_department_name();
 
-    -- Triggers for HR module tables
-    CREATE TRIGGER update_employee_profiles_updated_at BEFORE UPDATE ON employee_profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_attendance_policies_updated_at BEFORE UPDATE ON attendance_policies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    -- Trigger to close positions when department is deactivated
+    -- Position-related triggers
     CREATE TRIGGER trg_close_positions_on_department_deactivate
     BEFORE UPDATE OF is_active ON departments
     FOR EACH ROW
     EXECUTE FUNCTION close_positions_on_department_deactivate();
 
-    -- Trigger to prevent assigning position to inactive department
     CREATE TRIGGER trg_prevent_position_in_inactive_department
     BEFORE INSERT OR UPDATE ON positions
     FOR EACH ROW
     EXECUTE FUNCTION prevent_position_in_inactive_department();
 
-    -- Trigger to enforce employee limit
+    -- Employee-related triggers
     CREATE TRIGGER trg_enforce_employee_limit
     BEFORE INSERT OR UPDATE OF is_active
     ON company_employees
     FOR EACH ROW
     EXECUTE FUNCTION enforce_employee_limit();
 
-    -- Triggers for new tables
-    CREATE TRIGGER update_employee_rfid_updated_at 
-    BEFORE UPDATE ON employee_rfid_mappings 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    CREATE TRIGGER update_work_center_shifts_updated_at 
-    BEFORE UPDATE ON work_center_shifts 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    CREATE TRIGGER update_user_work_center_assignments_updated_at
-    BEFORE UPDATE ON user_work_center_assignments
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    CREATE TRIGGER update_work_centers_updated_at
-    BEFORE UPDATE ON work_centers
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    CREATE TRIGGER update_org_units_updated_at
-    BEFORE UPDATE ON org_units
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
-    -- Sync triggers for employee data
     CREATE TRIGGER trg_sync_department_on_position
     AFTER INSERT OR UPDATE OF position_id
     ON company_employees
@@ -3732,73 +3622,8 @@ CREATE TABLE work_calendars (
     EXECUTE FUNCTION enforce_schedule_cancellation();
 
     -- ==============================================
-    -- ADDITIONAL INDEXES
+    -- FOREIGN KEY CONSTRAINTS (Additional)
     -- ==============================================
-
-    -- Index for department parent and active status
-    CREATE INDEX idx_departments_parent_active
-    ON departments (parent_department_id)
-    WHERE is_active = true;
-
-    -- Index for company employees position
-    CREATE INDEX idx_company_employees_position 
-    ON company_employees (position_id) 
-    WHERE position_id IS NOT NULL;
-
-    -- Unique index for employee exit (active only)
-    CREATE UNIQUE INDEX uq_employee_exit_active
-    ON employee_exit (company_id, user_id)
-    WHERE exit_state IN ('scheduled','effective');
-
-    -- Unique index for schedule instances (active only)
-    CREATE UNIQUE INDEX uq_schedule_instances_user_date_active
-    ON schedule_instances (user_id, schedule_date)
-    WHERE status = 'active';
-
-    -- Index for positions work center
-    CREATE INDEX idx_positions_work_center 
-    ON positions (company_id, work_center_code) 
-    WHERE work_center_code IS NOT NULL;
-
-    -- Duplicate protection for attendance events
-    CREATE UNIQUE INDEX uniq_correction_event
-    ON attendance_events (
-      company_id,
-      user_id,
-      event_type,
-      event_time
-    )
-    WHERE source_type = 'correction';
-
-    -- Index for efficient duplicate detection for regular events
-    CREATE INDEX idx_attendance_events_user_type_time
-    ON attendance_events (
-      company_id,
-      user_id,
-      event_type,
-      event_time DESC
-    )
-    WHERE source_type != 'correction';
-
-    -- Index for device-based duplicate detection
-    CREATE INDEX idx_attendance_events_device_time
-    ON attendance_events (
-      company_id,
-      user_id,
-      device_id,
-      event_type,
-      event_time DESC
-    )
-    WHERE device_id IS NOT NULL AND source_type != 'correction';
-
-    -- Constraint for overlapping work center shifts
-    ALTER TABLE work_center_shifts
-    ADD CONSTRAINT no_overlap_work_center_shifts
-    EXCLUDE USING gist (
-      company_id WITH =,
-      work_center_code WITH =,
-      daterange(effective_from, COALESCE(effective_to, 'infinity')) WITH &&
-    );
 
     -- Add foreign key constraint for schedule_instances work_center_code
     ALTER TABLE schedule_instances
@@ -3812,10 +3637,18 @@ CREATE TABLE work_calendars (
     FOREIGN KEY (company_id, work_center_code)
     REFERENCES work_centers(company_id, work_center_code);
 
-    -- Add index for org units
-    CREATE INDEX idx_org_units_company
-    ON org_units (company_id, org_unit_type)
-    WHERE is_active = true;
+    -- ==============================================
+    -- AUDIT TABLE PERMISSIONS
+    -- ==============================================
+
+    -- Make audit immutable
+    REVOKE UPDATE, DELETE ON audit.audit_logs FROM PUBLIC;
+
+    -- ==============================================
+    -- COMPLETION MESSAGE
+    -- ==============================================
+    ALTER TABLE org_units
+    ADD COLUMN description TEXT;
 
 EOSQL
 

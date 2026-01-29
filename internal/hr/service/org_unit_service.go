@@ -263,26 +263,43 @@ func (s *OrgUnitService) AddMember(
 ) error {
 	startTime := time.Now()
 
-	// Verify org unit exists and belongs to company
+	// 1️⃣ Verify org unit exists and belongs to company
 	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
 	if err != nil {
-		return fmt.Errorf("failed to get org unit: %w", err)
+		return fmt.Errorf("org unit not found")
 	}
 
+	// 2️⃣ Parse effective_from
 	effectiveFrom, err := time.Parse("2006-01-02", req.EffectiveFrom)
 	if err != nil {
-		return fmt.Errorf("invalid effective_from date: %w", err)
+		return fmt.Errorf("invalid effective_from date")
 	}
 
+	// 3️⃣ Parse effective_to (optional)
 	var effectiveTo *time.Time
 	if req.EffectiveTo != nil {
 		to, err := time.Parse("2006-01-02", *req.EffectiveTo)
 		if err != nil {
-			return fmt.Errorf("invalid effective_to date: %w", err)
+			return fmt.Errorf("invalid effective_to date")
 		}
 		effectiveTo = &to
 	}
 
+	// 4️⃣ 🔥 BUSINESS RULE CHECK (prevent duplicates)
+	exists, err := s.orgUnitRepo.MemberExists(
+		ctx,
+		orgUnitID,
+		req.UserID,
+		effectiveFrom,
+	)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("member already exists for this effective_from date")
+	}
+
+	// 5️⃣ Create member
 	member := &orgunit.OrgUnitMember{
 		OrgUnitID:     orgUnitID,
 		UserID:        req.UserID,
@@ -290,12 +307,11 @@ func (s *OrgUnitService) AddMember(
 		EffectiveTo:   effectiveTo,
 	}
 
-	err = s.orgUnitRepo.AddMember(ctx, member)
-	if err != nil {
+	if err := s.orgUnitRepo.AddMember(ctx, member); err != nil {
 		return fmt.Errorf("failed to add member: %w", err)
 	}
 
-	// Audit log
+	// 6️⃣ Audit log
 	auditMetadata := make(map[string]interface{})
 	for k, v := range metadata {
 		auditMetadata[k] = v
@@ -317,17 +333,22 @@ func (s *OrgUnitService) AddMember(
 		actorType,
 		&actorID,
 		[]byte("{}"),
-		[]byte(fmt.Sprintf(`{"user_id": "%s", "org_unit_id": "%s"}`, req.UserID, orgUnitID)),
+		[]byte(fmt.Sprintf(
+			`{"user_id":"%s","org_unit_id":"%s"}`,
+			req.UserID, orgUnitID,
+		)),
 		auditMetadata,
 	)
 
+	// 7️⃣ Log success
 	s.logger.Info("Member added to org unit",
 		util.String("org_unit_id", orgUnitID.String()),
 		util.String("user_id", req.UserID.String()),
 		util.String("company_id", companyID.String()),
 		util.String("actor_type", actorType),
 		util.String("actor_id", actorID.String()),
-		util.Duration("duration", time.Since(startTime)))
+		util.Duration("duration", time.Since(startTime)),
+	)
 
 	return nil
 }
@@ -600,4 +621,81 @@ func (s *OrgUnitService) GetOrgUnitRoles(
 
 func (s *OrgUnitService) HealthCheck(ctx context.Context) error {
 	return s.orgUnitRepo.HealthCheck(ctx)
+}
+
+func (s *OrgUnitService) UpdateMember(
+	ctx context.Context,
+	companyID uuid.UUID,
+	orgUnitID uuid.UUID,
+	userID uuid.UUID,
+	req *orgunit.UpdateMemberRequest,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+
+	// 1️⃣ Validate org unit
+	_, err := s.orgUnitRepo.GetOrgUnitByID(ctx, companyID, orgUnitID)
+	if err != nil {
+		return fmt.Errorf("org unit not found")
+	}
+
+	// 2️⃣ Get current membership
+	existing, err := s.orgUnitRepo.GetMember(ctx, orgUnitID, userID)
+	if err != nil || existing == nil {
+		return fmt.Errorf("membership not found")
+	}
+
+	newFrom, err := time.Parse("2006-01-02", req.EffectiveFrom)
+	if err != nil {
+		return fmt.Errorf("invalid effective_from")
+	}
+
+	if !newFrom.After(existing.EffectiveFrom) {
+		return fmt.Errorf("effective_from must be after current membership start")
+	}
+
+	var newTo *time.Time
+	if req.EffectiveTo != nil {
+		t, err := time.Parse("2006-01-02", *req.EffectiveTo)
+		if err != nil {
+			return fmt.Errorf("invalid effective_to")
+		}
+		newTo = &t
+	}
+
+	// 3️⃣ End existing membership
+	endDate := newFrom.AddDate(0, 0, -1)
+	if err := s.orgUnitRepo.EndActiveMembership(ctx, orgUnitID, userID, endDate); err != nil {
+		return fmt.Errorf("failed to end existing membership")
+	}
+
+	// 4️⃣ Insert new membership
+	newMember := &orgunit.OrgUnitMember{
+		OrgUnitID:     orgUnitID,
+		UserID:        userID,
+		EffectiveFrom: newFrom,
+		EffectiveTo:   newTo,
+	}
+
+	if err := s.orgUnitRepo.AddMember(ctx, newMember); err != nil {
+		return fmt.Errorf("failed to create new membership")
+	}
+
+	// 5️⃣ Audit
+	_ = s.auditService.LogAction(
+		ctx,
+		&companyID,
+		"hr",
+		"org_unit.member.update",
+		"org_unit_members",
+		nil,
+		actorType,
+		&actorID,
+		[]byte("{}"),
+		[]byte(fmt.Sprintf(`{"user_id":"%s","org_unit_id":"%s"}`, userID, orgUnitID)),
+		metadata,
+	)
+
+	return nil
 }

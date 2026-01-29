@@ -7633,3 +7633,92 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	)
 	return nil
 }
+func (r *CompanyRepositoryImpl) AddRoleDepartments(ctx context.Context, roleID uuid.UUID, departmentIDs []uuid.UUID) error {
+	query := `
+        INSERT INTO role_departments (role_id, department_id, created_at)
+        SELECT $1, unnest($2::uuid[]), NOW()
+        ON CONFLICT (role_id, department_id) DO NOTHING`
+
+	_, err := r.client.Exec(ctx, query, roleID, departmentIDs)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to add role departments: %w", err)
+	}
+	r.recordQuery()
+	return nil
+}
+
+func (r *CompanyRepositoryImpl) RemoveRoleDepartments(ctx context.Context, roleID uuid.UUID, departmentIDs []uuid.UUID) error {
+	query := `
+        DELETE FROM role_departments 
+        WHERE role_id = $1 AND department_id = ANY($2::uuid[])`
+
+	_, err := r.client.Exec(ctx, query, roleID, departmentIDs)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to remove role departments: %w", err)
+	}
+	r.recordQuery()
+	return nil
+}
+
+func (r *CompanyRepositoryImpl) ClearRolePermissions(ctx context.Context, roleID uuid.UUID) error {
+	query := `DELETE FROM role_permissions WHERE role_id = $1`
+
+	_, err := r.client.Exec(ctx, query, roleID)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to clear role permissions: %w", err)
+	}
+	r.recordQuery()
+	return nil
+}
+
+func (r *CompanyRepositoryImpl) AddRolePermissions(ctx context.Context, roleID uuid.UUID, permissionIDs []uuid.UUID, grantedBy uuid.UUID) error {
+	query := `
+        INSERT INTO role_permissions (role_id, permission_id, granted_at, granted_by)
+        SELECT $1, unnest($2::uuid[]), NOW(), $3
+        ON CONFLICT (role_id, permission_id) DO NOTHING`
+
+	_, err := r.client.Exec(ctx, query, roleID, permissionIDs, grantedBy)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to add role permissions: %w", err)
+	}
+	r.recordQuery()
+	return nil
+}
+
+func (r *CompanyRepositoryImpl) RemoveRolePermissions(ctx context.Context, roleID uuid.UUID, permissionIDs []uuid.UUID) error {
+	query := `
+        DELETE FROM role_permissions 
+        WHERE role_id = $1 AND permission_id = ANY($2::uuid[])`
+
+	_, err := r.client.Exec(ctx, query, roleID, permissionIDs)
+	if err != nil {
+		r.recordError()
+		return fmt.Errorf("failed to remove role permissions: %w", err)
+	}
+	r.recordQuery()
+	return nil
+}
+
+func (r *CompanyRepositoryImpl) GetDepartmentByName(ctx context.Context, companyID uuid.UUID, departmentName string) (*models.Department, error) {
+	query := `
+        SELECT department_id, company_id, department_name, system_department_id, 
+               parent_department_id, is_active, created_at, updated_at
+        FROM departments 
+        WHERE company_id = $1 AND department_name = $2 AND is_active = true`
+
+	var dept models.Department
+	err := r.client.QueryRow(ctx, query, companyID, departmentName).Scan(
+		&dept.DepartmentID, &dept.CompanyID, &dept.DepartmentName, &dept.SystemDepartmentID,
+		&dept.ParentDepartmentID, &dept.IsActive, &dept.CreatedAt, &dept.UpdatedAt,
+	)
+	if err != nil {
+		r.recordError()
+		return nil, fmt.Errorf("failed to get department by name: %w", err)
+	}
+	r.recordQuery()
+	return &dept, nil
+}

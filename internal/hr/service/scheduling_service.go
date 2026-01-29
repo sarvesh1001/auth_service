@@ -125,6 +125,7 @@ type PositionBasedResolvedDay struct {
 	ExpectedEnd        *time.Time `json:"expected_end,omitempty"`
 	PositionID         *uuid.UUID `json:"position_id,omitempty"`
 	PositionTitle      *string    `json:"position_title,omitempty"`
+	DepartmentID       *uuid.UUID `json:"department_id,omitempty"` // ✅ ADD
 	WorkCenterCode     *string    `json:"work_center_code,omitempty"`
 	WorkCenterName     *string    `json:"work_center_name,omitempty"`
 	ShiftID            *uuid.UUID `json:"shift_id,omitempty"`
@@ -938,17 +939,16 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(
 
 	startTime := time.Now()
 
-	// ✅ 1. Business date is already normalized at API boundary
-	// DO NOT convert to UTC or truncate again
+	// 1️⃣ Business date is already normalized at API boundary
 	businessDate := date
 
-	// ✅ 2. Resolve the user's day FIRST
+	// 2️⃣ Resolve the user's day FIRST
 	resolvedDay, err := s.ResolveUserDay(ctx, companyID, userID, businessDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve schedule: %w", err)
 	}
 
-	// ✅ 3. Compute "today" in the SAME timezone as the schedule
+	// 3️⃣ Compute "today" in the SAME timezone as the schedule
 	loc, err := time.LoadLocation(resolvedDay.Timezone)
 	if err != nil {
 		loc = time.UTC
@@ -962,7 +962,16 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(
 		loc,
 	)
 
-	// ✅ 4. Business validations
+	// 🔒 🔒 🔒 HARD FREEZE CHECK (FIX)
+	// Prevent creating schedules for past or today dates
+	if !businessDate.After(today) {
+		return nil, fmt.Errorf(
+			"cannot create schedule instance for past or today date: %s",
+			businessDate.Format("2006-01-02"),
+		)
+	}
+
+	// 4️⃣ Business validations
 	if !resolvedDay.IsSchedulable {
 		return nil, fmt.Errorf("position is not schedulable")
 	}
@@ -971,17 +980,9 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(
 		return nil, fmt.Errorf("cannot create schedule instance: %s", resolvedDay.ScheduleStatus)
 	}
 
-	// ✅ 5. Handle existing instance (freeze logic)
+	// 5️⃣ Handle existing instance (regeneration case)
 	existing, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, businessDate)
 	if err == nil && existing != nil {
-
-		// 🔒 Freeze check (local timezone aware)
-		if !businessDate.After(today) {
-			return nil, fmt.Errorf(
-				"schedule is frozen for %s",
-				businessDate.Format("2006-01-02"),
-			)
-		}
 
 		reason := "regenerated_from_position"
 		cancelledAt := time.Now().UTC()
@@ -1008,12 +1009,12 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(
 		}
 	}
 
-	// ✅ 6. Create new schedule instance
+	// 6️⃣ Create new schedule instance
 	instance := &scheduling.ScheduleInstance{
 		ScheduleInstanceID: uuid.New(),
 		CompanyID:          companyID,
 		UserID:             userID,
-		ScheduleDate:       businessDate, // 🔑 untouched business date
+		ScheduleDate:       businessDate,
 		ScheduleTemplateID: *resolvedDay.ShiftID,
 		ExpectedStart:      resolvedDay.ExpectedStart,
 		ExpectedEnd:        resolvedDay.ExpectedEnd,
@@ -1027,7 +1028,7 @@ func (s *schedulingServiceImpl) CreateScheduleInstanceFromPosition(
 		return nil, fmt.Errorf("failed to create schedule instance: %w", err)
 	}
 
-	// ✅ 7. Audit
+	// 7️⃣ Audit
 	if s.auditService != nil {
 		go s.logAuditAction(
 			ctx,

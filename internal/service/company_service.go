@@ -840,32 +840,32 @@ func (s *CompanyService) IsUserActiveEmployee(ctx context.Context, companyID, us
 	return s.companyRepo.IsUserActiveEmployee(ctx, companyID, userID)
 }
 
-func (s *CompanyService) UpdateRole(ctx context.Context, roleID uuid.UUID, roleName string, roleLevel int, updatedBy uuid.UUID, description string) error {
-	role, err := s.companyRepo.GetRole(ctx, roleID)
-	if err != nil {
-		return fmt.Errorf("role not found: %w", err)
-	}
+// func (s *CompanyService) UpdateRole(ctx context.Context, roleID uuid.UUID, roleName string, roleLevel int, updatedBy uuid.UUID, description string) error {
+// 	role, err := s.companyRepo.GetRole(ctx, roleID)
+// 	if err != nil {
+// 		return fmt.Errorf("role not found: %w", err)
+// 	}
 
-	if role.IsSystemRole {
-		return fmt.Errorf("cannot update system roles")
-	}
+// 	if role.IsSystemRole {
+// 		return fmt.Errorf("cannot update system roles")
+// 	}
 
-	role.RoleName = roleName
-	role.RoleLevel = roleLevel
-	role.Description = description
-	role.UpdatedAt = time.Now().UTC()
+// 	role.RoleName = roleName
+// 	role.RoleLevel = roleLevel
+// 	role.Description = description
+// 	role.UpdatedAt = time.Now().UTC()
 
-	if err := s.companyRepo.UpdateRole(ctx, role); err != nil {
-		return fmt.Errorf("failed to update role: %w", err)
-	}
+// 	if err := s.companyRepo.UpdateRole(ctx, role); err != nil {
+// 		return fmt.Errorf("failed to update role: %w", err)
+// 	}
 
-	s.logger.Info("Role updated",
-		util.String("role_id", roleID.String()),
-		util.String("role_name", roleName),
-		util.Int("role_level", roleLevel),
-		util.String("updated_by", updatedBy.String()))
-	return nil
-}
+// 	s.logger.Info("Role updated",
+// 		util.String("role_id", roleID.String()),
+// 		util.String("role_name", roleName),
+// 		util.Int("role_level", roleLevel),
+// 		util.String("updated_by", updatedBy.String()))
+// 	return nil
+// }
 
 func (s *CompanyService) DeleteRole(ctx context.Context, roleID uuid.UUID, deletedBy uuid.UUID) error {
 	role, err := s.companyRepo.GetRole(ctx, roleID)
@@ -4034,4 +4034,321 @@ func (s *CompanyService) CreateCompany(
 	)
 
 	return company, nil
+}
+
+type UpdateRoleRequest struct {
+	CompanyID          uuid.UUID
+	RoleID             uuid.UUID
+	RoleName           string
+	Description        string
+	AddDepartments     []string // Department names to add
+	RemoveDepartments  []string // Department names to remove
+	AddPermissions     []string // Permission names to add
+	RemovePermissions  []string // Permission names to remove
+	ReplacePermissions []string // Permission names to replace all existing
+	UpdatedBy          uuid.UUID
+}
+
+func (s *CompanyService) UpdateRole(
+	ctx context.Context,
+	req UpdateRoleRequest,
+) error {
+
+	// 1. Get the role
+	role, err := s.companyRepo.GetRole(ctx, req.RoleID)
+	if err != nil {
+		return fmt.Errorf("role not found: %w", err)
+	}
+
+	// 2. Prevent system role updates
+	if role.IsSystemRole {
+		return fmt.Errorf("cannot update system roles")
+	}
+
+	// 3. Verify role belongs to the company
+	if role.CompanyID != req.CompanyID {
+		return fmt.Errorf("role does not belong to specified company")
+	}
+
+	// 4. Update basic role information
+	role.RoleName = req.RoleName
+	role.Description = req.Description
+	role.UpdatedAt = time.Now().UTC()
+
+	if err := s.companyRepo.UpdateRole(ctx, role); err != nil {
+		return fmt.Errorf("failed to update role: %w", err)
+	}
+
+	// ============================
+	// DEPARTMENT UPDATES
+	// ============================
+	if len(req.AddDepartments) > 0 || len(req.RemoveDepartments) > 0 {
+		if err := s.updateRoleDepartments(ctx, req, role); err != nil {
+			return fmt.Errorf("failed to update role departments: %w", err)
+		}
+	}
+
+	// ============================
+	// PERMISSION UPDATES
+	// ============================
+	if len(req.ReplacePermissions) > 0 {
+		if err := s.replaceRolePermissions(ctx, req, role); err != nil {
+			return fmt.Errorf("failed to replace role permissions: %w", err)
+		}
+	} else {
+		if err := s.updateRolePermissions(ctx, req, role); err != nil {
+			return fmt.Errorf("failed to update role permissions: %w", err)
+		}
+	}
+
+	// ============================
+	// LOG
+	// ============================
+	s.logger.Info(
+		"Role updated with departments and permissions",
+		util.String("role_id", req.RoleID.String()),
+		util.String("role_name", req.RoleName),
+		util.String("updated_by", req.UpdatedBy.String()),
+		util.Int("added_departments", len(req.AddDepartments)),
+		util.Int("removed_departments", len(req.RemoveDepartments)),
+		util.Int("added_permissions", len(req.AddPermissions)),
+		util.Int("removed_permissions", len(req.RemovePermissions)),
+	)
+
+	return nil
+}
+
+func (s *CompanyService) updateRoleDepartments(ctx context.Context, req UpdateRoleRequest, role *models.Role) error {
+	// Get current role departments
+	currentDepts, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
+	if err != nil {
+		return fmt.Errorf("failed to get current role departments: %w", err)
+	}
+
+	// Convert current departments to map for easy lookup
+	currentDeptMap := make(map[string]uuid.UUID)
+	for _, dept := range currentDepts {
+		currentDeptMap[dept.DepartmentName] = dept.DepartmentID
+	}
+
+	// Add departments
+	for _, deptName := range req.AddDepartments {
+		// Check if department already assigned
+		if _, exists := currentDeptMap[deptName]; exists {
+			continue // Already assigned
+		}
+
+		// Get department by name for this company
+		dept, err := s.companyRepo.GetDepartmentByName(ctx, role.CompanyID, deptName)
+		if err != nil {
+			return fmt.Errorf("department not found: %s", deptName)
+		}
+
+		// Validate permission compatibility for this department
+		if err := s.validatePermissionDepartmentCompatibilityForUpdate(ctx, []uuid.UUID{dept.DepartmentID}, req); err != nil {
+			return fmt.Errorf("permission department compatibility check failed: %w", err)
+		}
+
+		// Add role to department
+		if err := s.companyRepo.CreateRoleDepartment(ctx, role.RoleID, dept.DepartmentID); err != nil {
+			return fmt.Errorf("failed to add role to department %s: %w", deptName, err)
+		}
+	}
+
+	// Remove departments
+	for _, deptName := range req.RemoveDepartments {
+		deptID, exists := currentDeptMap[deptName]
+		if !exists {
+			continue // Not assigned, skip
+		}
+
+		if err := s.companyRepo.RemoveRoleDepartment(ctx, role.RoleID, deptID); err != nil {
+			return fmt.Errorf("failed to remove role from department %s: %w", deptName, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *CompanyService) replaceRolePermissions(ctx context.Context, req UpdateRoleRequest, role *models.Role) error {
+	// Get all permissions to validate they exist
+	allPermissions, err := s.companyRepo.GetAllPermissions(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get all permissions: %w", err)
+	}
+
+	permMap := make(map[string]uuid.UUID)
+	for _, perm := range allPermissions {
+		permMap[perm.PermissionName] = perm.PermissionID
+	}
+
+	var permissionIDs []uuid.UUID
+	for _, permName := range req.ReplacePermissions {
+		permID, exists := permMap[permName]
+		if !exists {
+			return fmt.Errorf("permission not found: %s", permName)
+		}
+		permissionIDs = append(permissionIDs, permID)
+	}
+
+	// Validate permission compatibility with current departments
+	currentDepts, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
+	if err != nil {
+		return fmt.Errorf("failed to get role departments: %w", err)
+	}
+
+	var deptIDs []uuid.UUID
+	for _, dept := range currentDepts {
+		deptIDs = append(deptIDs, dept.DepartmentID)
+	}
+
+	if len(deptIDs) > 0 && len(permissionIDs) > 0 {
+		compatible, errorMsg, err := s.ValidatePermissionDepartmentCompatibility(ctx, deptIDs, permissionIDs)
+		if err != nil {
+			return fmt.Errorf("failed to validate permissions: %w", err)
+		}
+		if !compatible {
+			return fmt.Errorf("PERMISSION_DEPARTMENT_MISMATCH: %s", errorMsg)
+		}
+	}
+
+	// Replace all permissions
+	if err := s.companyRepo.ReplaceRolePermissions(ctx, role.RoleID, permissionIDs, req.UpdatedBy); err != nil {
+		return fmt.Errorf("failed to replace role permissions: %w", err)
+	}
+
+	return nil
+}
+
+func (s *CompanyService) updateRolePermissions(ctx context.Context, req UpdateRoleRequest, role *models.Role) error {
+	// Get current role permissions
+	currentPermissions, err := s.companyRepo.GetRolePermissions(ctx, role.RoleID)
+	if err != nil {
+		return fmt.Errorf("failed to get current role permissions: %w", err)
+	}
+
+	currentPermMap := make(map[string]bool)
+	for _, perm := range currentPermissions {
+		currentPermMap[perm.PermissionName] = true
+	}
+
+	// Get all permissions to validate they exist
+	allPermissions, err := s.companyRepo.GetAllPermissions(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get all permissions: %w", err)
+	}
+
+	permMap := make(map[string]uuid.UUID)
+	for _, perm := range allPermissions {
+		permMap[perm.PermissionName] = perm.PermissionID
+	}
+
+	// Add permissions
+	var permissionsToAdd []uuid.UUID
+	for _, permName := range req.AddPermissions {
+		// Check if already has permission
+		if currentPermMap[permName] {
+			continue // Already has permission
+		}
+
+		permID, exists := permMap[permName]
+		if !exists {
+			return fmt.Errorf("permission not found: %s", permName)
+		}
+		permissionsToAdd = append(permissionsToAdd, permID)
+	}
+
+	// Remove permissions
+	var permissionsToRemove []uuid.UUID
+	for _, permName := range req.RemovePermissions {
+		if !currentPermMap[permName] {
+			continue // Doesn't have this permission
+		}
+
+		permID, exists := permMap[permName]
+		if !exists {
+			return fmt.Errorf("permission not found: %s", permName)
+		}
+		permissionsToRemove = append(permissionsToRemove, permID)
+	}
+
+	// Validate permission compatibility with current departments
+	currentDepts, err := s.companyRepo.GetRoleDepartments(ctx, req.RoleID)
+	if err != nil {
+		return fmt.Errorf("failed to get role departments: %w", err)
+	}
+
+	var deptIDs []uuid.UUID
+	for _, dept := range currentDepts {
+		deptIDs = append(deptIDs, dept.DepartmentID)
+	}
+
+	if len(deptIDs) > 0 && len(permissionsToAdd) > 0 {
+		compatible, errorMsg, err := s.ValidatePermissionDepartmentCompatibility(ctx, deptIDs, permissionsToAdd)
+		if err != nil {
+			return fmt.Errorf("failed to validate permissions: %w", err)
+		}
+		if !compatible {
+			return fmt.Errorf("PERMISSION_DEPARTMENT_MISMATCH: %s", errorMsg)
+		}
+	}
+
+	// Apply permission changes
+	if len(permissionsToAdd) > 0 {
+		if err := s.companyRepo.GrantMultipleRolePermissions(ctx, role.RoleID, permissionsToAdd, req.UpdatedBy); err != nil {
+			return fmt.Errorf("failed to add permissions to role: %w", err)
+		}
+	}
+
+	if len(permissionsToRemove) > 0 {
+		if err := s.companyRepo.RevokeMultipleRolePermissions(ctx, role.RoleID, permissionsToRemove); err != nil {
+			return fmt.Errorf("failed to remove permissions from role: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *CompanyService) validatePermissionDepartmentCompatibilityForUpdate(ctx context.Context, departmentIDs []uuid.UUID, req UpdateRoleRequest) error {
+	// Get all permissions to check
+	allPermissions, err := s.companyRepo.GetAllPermissions(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get all permissions: %w", err)
+	}
+
+	permMap := make(map[string]uuid.UUID)
+	for _, perm := range allPermissions {
+		permMap[perm.PermissionName] = perm.PermissionID
+	}
+
+	var permissionIDs []uuid.UUID
+
+	// Check permissions being added
+	for _, permName := range req.AddPermissions {
+		if permID, exists := permMap[permName]; exists {
+			permissionIDs = append(permissionIDs, permID)
+		}
+	}
+
+	// Check replace permissions if specified
+	if len(req.ReplacePermissions) > 0 {
+		permissionIDs = nil // Clear and use replace permissions
+		for _, permName := range req.ReplacePermissions {
+			if permID, exists := permMap[permName]; exists {
+				permissionIDs = append(permissionIDs, permID)
+			}
+		}
+	}
+
+	if len(departmentIDs) > 0 && len(permissionIDs) > 0 {
+		compatible, errorMsg, err := s.ValidatePermissionDepartmentCompatibility(ctx, departmentIDs, permissionIDs)
+		if err != nil {
+			return err
+		}
+		if !compatible {
+			return fmt.Errorf("PERMISSION_DEPARTMENT_MISMATCH: %s", errorMsg)
+		}
+	}
+
+	return nil
 }
