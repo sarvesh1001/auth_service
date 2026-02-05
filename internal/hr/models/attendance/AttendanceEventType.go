@@ -223,6 +223,11 @@ type PolicyRules struct {
 	// Overtime rules
 	OvertimeThreshold   *int  `json:"overtime_threshold,omitempty"`
 	AutoApproveOvertime *bool `json:"auto_approve_overtime,omitempty"`
+	// === 🔥 NEW: ATTENDANCE CAPABILITY RULES ===
+	AllowedSourceTypes []string `json:"allowed_source_types,omitempty"`
+	AllowSelfService   *bool    `json:"allow_self_service,omitempty"`
+	AllowAdminMarking  *bool    `json:"allow_admin_marking,omitempty"`
+	AllowDeviceMarking *bool    `json:"allow_device_marking,omitempty"`
 }
 
 // UserAttendancePolicy links users to attendance policies

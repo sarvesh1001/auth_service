@@ -15,17 +15,17 @@ import (
 
 //
 // ===========================
-// SERVICE-LEVEL DTOs
+// DTOs
 // ===========================
 //
 
 type PunchRequest struct {
 	CompanyID         uuid.UUID
-	ActorID           uuid.UUID // uuid.Nil for device/system punches
+	ActorID           uuid.UUID // uuid.Nil for device/system
 	TargetUserID      uuid.UUID
 	EventType         string
-	EventTime         *time.Time // RAW input (optional)
-	ResolvedEventTime time.Time  // FINAL authoritative time
+	EventTime         *time.Time
+	ResolvedEventTime time.Time
 	Source            PunchSource
 	Context           *attendance.EventContext
 }
@@ -39,20 +39,17 @@ type PunchSource struct {
 
 //
 // ===========================
-// SERVICE INTERFACE
+// INTERFACE
 // ===========================
 //
 
 type AttendanceIngestService interface {
-	IngestPunch(
-		ctx context.Context,
-		req *PunchRequest,
-	) (*attendance.AttendanceEvent, error)
+	IngestPunch(ctx context.Context, req *PunchRequest) (*attendance.AttendanceEvent, error)
 }
 
 //
 // ===========================
-// SERVICE IMPLEMENTATION
+// IMPLEMENTATION
 // ===========================
 //
 
@@ -61,6 +58,7 @@ type attendanceIngestService struct {
 	deviceRepo     repository.AttendanceDeviceRepository
 	identityRepo   repository.AttendanceIdentityRepository
 	sourceResolver AttendanceSourceResolver
+	adminService   AttendanceAdminService // 🔥 NEW
 	omService      AttendanceOMService
 	auditService   *AuditService
 	logger         *zap.Logger
@@ -71,6 +69,7 @@ func NewAttendanceIngestService(
 	deviceRepo repository.AttendanceDeviceRepository,
 	identityRepo repository.AttendanceIdentityRepository,
 	sourceResolver AttendanceSourceResolver,
+	adminService AttendanceAdminService,
 	omService AttendanceOMService,
 	auditService *AuditService,
 	logger *zap.Logger,
@@ -80,6 +79,7 @@ func NewAttendanceIngestService(
 		deviceRepo:     deviceRepo,
 		identityRepo:   identityRepo,
 		sourceResolver: sourceResolver,
+		adminService:   adminService,
 		omService:      omService,
 		auditService:   auditService,
 		logger:         logger,
@@ -97,152 +97,171 @@ func (s *attendanceIngestService) IngestPunch(
 	req *PunchRequest,
 ) (*attendance.AttendanceEvent, error) {
 
-	startTime := time.Now().UTC()
+	start := time.Now().UTC()
 
 	// --------------------------------------------------
-	// AUDIT METADATA
+	// BASIC VALIDATION
 	// --------------------------------------------------
-	auditMetadata := map[string]interface{}{
-		"event_type":     req.EventType,
-		"source_type":    req.Source.SourceType,
-		"target_user_id": req.TargetUserID.String(),
+	if req.CompanyID == uuid.Nil {
+		return nil, errors.New("company_id required")
 	}
-	if req.EventTime != nil {
-		auditMetadata["input_event_time"] = req.EventTime.UTC()
+	if req.EventType == "" {
+		return nil, errors.New("event_type required")
 	}
-	if req.Source.DeviceID != nil {
-		auditMetadata["device_id"] = *req.Source.DeviceID
+	if req.Source.SourceType == "" {
+		return nil, errors.New("source_type required")
 	}
-	if req.Source.IPAddress != nil {
-		auditMetadata["ip_address"] = *req.Source.IPAddress
-	}
-
-	// --------------------------------------------------
-	// STEP 1: BASIC VALIDATION
-	// --------------------------------------------------
-	if err := s.validateBasicRequest(req); err != nil {
-		return nil, err
-	}
-
 	if req.Context == nil {
 		req.Context = &attendance.EventContext{}
 	}
 
 	// --------------------------------------------------
-	// STEP 2: SOURCE RULES
+	// SOURCE RULES
 	// --------------------------------------------------
-	rules, err := s.sourceResolver.Resolve(ctx, req.Source.SourceType)
+	sourceRules, err := s.sourceResolver.Resolve(ctx, req.Source.SourceType)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve source rules: %w", err)
+		return nil, fmt.Errorf("invalid source type: %w", err)
 	}
 
 	// --------------------------------------------------
-	// STEP 3: RESOLVE + VALIDATE EVENT TIME (CORE CHANGE)
+	// RESOLVE ATTENDANCE RULES (🔥 CORE FIX)
 	// --------------------------------------------------
-	resolvedTime, err := s.resolveAndValidateEventTime(req, rules)
+	resolvedRules, err := s.adminService.ResolveAttendanceRules(
+		ctx,
+		req.TargetUserID,
+		req.CompanyID,
+		derefString(req.Context.WorkCenterCode),
+		nil,
+		time.Now().UTC(),
+	)
 	if err != nil {
 		return nil, err
 	}
-	req.ResolvedEventTime = resolvedTime
-	auditMetadata["resolved_event_time"] = resolvedTime
 
 	// --------------------------------------------------
-	// STEP 4: DEVICE VALIDATION
+	// ENFORCE SOURCE PER POLICY
+	// --------------------------------------------------
+	if !resolvedRules.AllowedSourceTypesMap[req.Source.SourceType] {
+		return nil, fmt.Errorf(
+			"source '%s' not allowed for this user",
+			req.Source.SourceType,
+		)
+	}
+
+	// --------------------------------------------------
+	// ENFORCE CAPABILITIES
+	// --------------------------------------------------
+	if resolvedRules.PolicyRules != nil {
+
+		// Self-service (mobile / web)
+		if sourceRules.IsSelfService {
+			if resolvedRules.PolicyRules.AllowSelfService != nil &&
+				!*resolvedRules.PolicyRules.AllowSelfService {
+				return nil, errors.New("self-service attendance not allowed")
+			}
+		}
+
+		// Admin marking
+		if req.ActorID != uuid.Nil && !sourceRules.IsSelfService {
+			if resolvedRules.PolicyRules.AllowAdminMarking != nil &&
+				!*resolvedRules.PolicyRules.AllowAdminMarking {
+				return nil, errors.New("admin marking not allowed")
+			}
+		}
+
+		// Device marking
+		if sourceRules.RequiresDevice {
+			if resolvedRules.PolicyRules.AllowDeviceMarking != nil &&
+				!*resolvedRules.PolicyRules.AllowDeviceMarking {
+				return nil, errors.New("device attendance not allowed")
+			}
+		}
+	}
+
+	// --------------------------------------------------
+	// RESOLVE + VALIDATE EVENT TIME (🔥 FIXED)
+	// --------------------------------------------------
+	eventTime, err := s.resolveEventTime(req, sourceRules)
+	if err != nil {
+		return nil, err
+	}
+	req.ResolvedEventTime = eventTime
+
+	// --------------------------------------------------
+	// DEVICE VALIDATION
 	// --------------------------------------------------
 	var device *attendance.AttendanceDevice
 
-	if rules.RequiresDevice {
+	if sourceRules.RequiresDevice {
 		if req.Source.DeviceID == nil {
-			return nil, errors.New("device_id required for this source")
+			return nil, errors.New("device_id required")
 		}
 
-		device, err = s.deviceRepo.GetActiveDevice(
-			ctx,
-			req.CompanyID,
-			*req.Source.DeviceID,
-		)
-		if err != nil || device == nil {
-			return nil, errors.New("invalid or inactive device")
-		}
-
-		if !device.IsTrusted {
-			return nil, errors.New("untrusted device")
+		device, err = s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, *req.Source.DeviceID)
+		if err != nil || device == nil || !device.IsTrusted {
+			return nil, errors.New("invalid or untrusted device")
 		}
 
 		req.Context.WorkCenterCode = device.WorkCenterCode
 	}
 
 	// --------------------------------------------------
-	// STEP 5: IDENTITY RESOLUTION (DEVICE SOURCES)
+	// IDENTITY RESOLUTION
 	// --------------------------------------------------
-	if rules.RequiresDevice {
-		externalRef := getExternalRef(req.Context)
-		if externalRef == "" {
-			return nil, errors.New("external_ref required for device punch")
+	if sourceRules.RequiresDevice {
+		ref := getExternalRef(req.Context)
+		if ref == "" {
+			return nil, errors.New("external_ref required")
 		}
 
 		userID, err := s.identityRepo.ResolveUserByDeviceCode(
-			ctx,
-			req.CompanyID,
-			externalRef,
-			req.Source.SourceType,
-			externalRef,
+			ctx, req.CompanyID, ref, req.Source.SourceType, ref,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("identity resolution failed: %w", err)
+			return nil, err
 		}
 		req.TargetUserID = userID
 	}
 
 	// --------------------------------------------------
-	// STEP 6: OM AUTHORIZATION
+	// OM AUTHORIZATION (LAST GATE)
 	// --------------------------------------------------
-	if !rules.IsSystem {
-		var actorID *uuid.UUID
+	if !sourceRules.IsSystem {
+		var actor *uuid.UUID
 		if req.ActorID != uuid.Nil {
-			actorID = &req.ActorID
+			actor = &req.ActorID
 		}
 
-		allowed, reason := s.omService.CanPunchAttendance(
+		ok, reason := s.omService.CanPunchAttendance(
 			ctx,
 			req.CompanyID,
-			actorID,
+			actor,
 			req.TargetUserID,
 			req.Source.SourceType,
 			req.Context.WorkCenterCode,
 		)
-		if !allowed {
+		if !ok {
 			return nil, fmt.Errorf("attendance punch not allowed: %s", reason)
 		}
 	}
 
 	// --------------------------------------------------
-	// STEP 7: CREATE EVENT
+	// CREATE EVENT
 	// --------------------------------------------------
-	event := s.createAttendanceEvent(req, rules)
+	event := s.createAttendanceEvent(req, sourceRules)
 
-	// --------------------------------------------------
-	// STEP 8: PERSIST
-	// --------------------------------------------------
 	if err := s.attendanceRepo.CreateAttendanceEvent(ctx, event); err != nil {
-		return nil, fmt.Errorf("failed to persist attendance event: %w", err)
+		return nil, err
 	}
 
-	// --------------------------------------------------
-	// STEP 9: DEVICE HEARTBEAT
-	// --------------------------------------------------
 	if device != nil {
 		_ = s.deviceRepo.UpdateLastSeen(ctx, device.DeviceID)
 	}
 
-	// --------------------------------------------------
-	// FINAL LOG
-	// --------------------------------------------------
-	s.logger.Info("Attendance event ingested",
+	s.logger.Info("Attendance punch ingested",
 		util.String("event_id", event.AttendanceEventID.String()),
 		util.String("user_id", event.UserID.String()),
-		util.String("source", event.SourceType),
-		util.Duration("duration", time.Since(startTime)),
+		util.Duration("duration", time.Since(start)),
 	)
 
 	return event, nil
@@ -250,36 +269,47 @@ func (s *attendanceIngestService) IngestPunch(
 
 //
 // ===========================
-// TIME RESOLUTION (CORE SAP LOGIC)
+// EVENT TIME LOGIC (FIXED)
 // ===========================
 //
 
-func (s *attendanceIngestService) resolveAndValidateEventTime(
+func (s *attendanceIngestService) resolveEventTime(
 	req *PunchRequest,
-	rules *ResolvedSourceRules,
+	sourceRules *ResolvedSourceRules,
 ) (time.Time, error) {
 
 	now := time.Now().UTC()
 
+	// --------------------------------------------------
 	// SERVER-AUTHORITATIVE SOURCES
-	if rules.IsSystem || !rules.RequiresDevice {
+	// --------------------------------------------------
+	// system-generated OR self-service (mobile / web)
+	// → server time is ALWAYS used
+	if sourceRules.IsSystem || sourceRules.IsSelfService {
 		return now, nil
 	}
 
-	// DEVICE / MANUAL / IMPORT MUST PROVIDE TIME
+	// --------------------------------------------------
+	// DEVICE / IMPORT / MANUAL SOURCES
+	// --------------------------------------------------
+	// These sources MUST provide event_time
 	if req.EventTime == nil || req.EventTime.IsZero() {
-		return time.Time{}, errors.New("event_time required for this source")
+		return time.Time{}, errors.New("event_time required")
 	}
 
 	eventTime := req.EventTime.UTC()
 
-	// BACKDATED CHECK
-	if !rules.AllowBackdated && eventTime.Before(now.Add(-2*time.Minute)) {
+	// --------------------------------------------------
+	// BACKDATED PROTECTION
+	// --------------------------------------------------
+	if !sourceRules.AllowBackdated && eventTime.Before(now.Add(-2*time.Minute)) {
 		return time.Time{}, errors.New("backdated punch not allowed")
 	}
 
-	// FUTURE CHECK
-	if !rules.AllowFuture && eventTime.After(now.Add(2*time.Minute)) {
+	// --------------------------------------------------
+	// FUTURE PROTECTION
+	// --------------------------------------------------
+	if !sourceRules.AllowFuture && eventTime.After(now.Add(2*time.Minute)) {
 		return time.Time{}, errors.New("future punch not allowed")
 	}
 
@@ -292,22 +322,16 @@ func (s *attendanceIngestService) resolveAndValidateEventTime(
 // ===========================
 //
 
-func (s *attendanceIngestService) validateBasicRequest(req *PunchRequest) error {
-	if req.CompanyID == uuid.Nil {
-		return errors.New("company_id required")
-	}
-	if req.EventType == "" {
-		return errors.New("event_type required")
-	}
-	if req.Source.SourceType == "" {
-		return errors.New("source_type required")
-	}
-	return nil
-}
-
 func getExternalRef(ctx *attendance.EventContext) string {
 	if ctx != nil && ctx.ExternalRef != nil {
 		return *ctx.ExternalRef
+	}
+	return ""
+}
+
+func derefString(s *string) string {
+	if s != nil {
+		return *s
 	}
 	return ""
 }
@@ -332,7 +356,6 @@ func (s *attendanceIngestService) createAttendanceEvent(
 		Context:           *req.Context,
 		Metadata: attendance.EventMetadata{
 			IsAutoGenerated: boolPtr(rules.IsSystem),
-			IsCorrection:    boolPtr(req.Source.SourceType == "correction"),
 		},
 		CreatedAt: now,
 		CreatedBy: func() *uuid.UUID {

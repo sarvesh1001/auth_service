@@ -3743,6 +3743,42 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     );
     CREATE INDEX IF NOT EXISTS idx_payroll_snapshot_run ON payroll.payroll_snapshot(payroll_run_id);
     CREATE INDEX IF NOT EXISTS idx_payroll_snapshot_company ON payroll.payroll_snapshot(company_id);
+
+
+    ALTER TABLE attendance_events
+    ADD COLUMN IF NOT EXISTS device_user_code VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS raw_event_payload JSONB;
+
+    ALTER TABLE attendance_user_device_identifiers
+    ADD COLUMN IF NOT EXISTS enrollment_version INT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS revoked_reason TEXT;
+
+    DROP INDEX IF EXISTS attendance_user_device_identifiers_device_id_device_user_code_key;
+
+    CREATE UNIQUE INDEX uq_device_user_per_company
+    ON attendance_user_device_identifiers (company_id, device_id, device_user_code);
+
+    ALTER TABLE attendance_events
+    ADD CONSTRAINT chk_device_identity_required
+    CHECK (
+    source_type NOT IN ('biometric','kiosk','factory','classroom')
+    OR device_user_code IS NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS attendance_device_trust_history (
+    trust_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id VARCHAR(256) NOT NULL,
+    company_id UUID NOT NULL,
+    action VARCHAR(20) NOT NULL, -- trust | revoke
+    reason TEXT,
+    acted_by UUID,
+    acted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (device_id) REFERENCES attendance_devices(device_id)
+    );
+
+    ALTER TABLE attendance_devices
+    ADD COLUMN IF NOT EXISTS last_punch_at TIMESTAMPTZ;
+    
 EOSQL
 
 echo "✅ Database schema created successfully!"

@@ -641,6 +641,7 @@ func (s *attendanceAdminService) UpsertDepartmentAttendanceRules(
 
 	return nil
 }
+
 func (s *attendanceAdminService) ResolveAttendanceRules(
 	ctx context.Context,
 	userID, companyID uuid.UUID,
@@ -649,18 +650,20 @@ func (s *attendanceAdminService) ResolveAttendanceRules(
 	date time.Time,
 ) (*attendance.ResolvedAttendanceRules, error) {
 
+	now := time.Now().UTC()
+
 	resolved := &attendance.ResolvedAttendanceRules{
 		CompanyID:             companyID,
 		AllowedSourceTypesMap: make(map[string]bool),
 		AllowedEventTypesMap:  make(map[string]bool),
-		AppliedAt:             time.Now().UTC(),
+		AppliedAt:             now,
 		SourceLevel:           "company",
 		PolicySource:          "company",
 	}
 
-	// ------------------------------------------------
-	// 1️⃣ COMPANY-LEVEL RULES (BASE)
-	// ------------------------------------------------
+	// =================================================
+	// 1️⃣ COMPANY-LEVEL RULES (BASELINE)
+	// =================================================
 	companyRules, err := s.attendanceRepo.GetCompanyAttendanceRules(ctx, companyID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get company attendance rules: %w", err)
@@ -674,16 +677,14 @@ func (s *attendanceAdminService) ResolveAttendanceRules(
 		resolved.AllowedSourceTypesMap[src] = true
 	}
 
-	// ------------------------------------------------
-	// 2️⃣ POLICY RESOLUTION (NO SOURCE/EVENT LOGIC)
-	// Priority:
-	//   user → work_center → position
-	// ------------------------------------------------
+	// =================================================
+	// 2️⃣ POLICY RESOLUTION (user → work_center → position)
+	// =================================================
 	var resolvedPolicy *attendance.AttendancePolicy
 
 	// USER POLICY
 	if userID != uuid.Nil {
-		if p, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, date); err == nil && p != nil {
+		if p, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, date); err == nil && p != nil && p.IsActive {
 			resolvedPolicy = p
 			resolved.PolicySource = "user"
 		}
@@ -707,16 +708,41 @@ func (s *attendanceAdminService) ResolveAttendanceRules(
 		}
 	}
 
-	// APPLY POLICY (ONLY TIMING / BEHAVIOR RULES)
+	// =================================================
+	// 3️⃣ APPLY POLICY RULES (🔥 CORE CHANGE)
+	// =================================================
 	if resolvedPolicy != nil {
 		resolved.PolicyID = &resolvedPolicy.PolicyID
 		resolved.PolicyRules = &resolvedPolicy.Rules
 		resolved.SourceLevel = resolved.PolicySource
+
+		rules := resolvedPolicy.Rules
+
+		// ── SOURCE TYPE OVERRIDE
+		if len(rules.AllowedSourceTypes) > 0 {
+			resolved.AllowedSourceTypes = rules.AllowedSourceTypes
+			resolved.AllowedSourceTypesMap = make(map[string]bool)
+			for _, src := range rules.AllowedSourceTypes {
+				resolved.AllowedSourceTypesMap[src] = true
+			}
+		}
+
+		// ── REQUIREMENTS
+		if rules.RequireWorkCenter != nil && *rules.RequireWorkCenter {
+			resolved.RequireReference = true
+		}
+
+		// ── DEVICE / SELF / ADMIN FLAGS
+		resolved.RequireDevice = false
+
+		if rules.AllowDeviceMarking != nil && *rules.AllowDeviceMarking {
+			resolved.RequireDevice = true
+		}
 	}
 
-	// ------------------------------------------------
-	// 3️⃣ USER-LEVEL OVERRIDES (FINAL AUTHORITY)
-	// ------------------------------------------------
+	// =================================================
+	// 4️⃣ USER-LEVEL OVERRIDES (FINAL AUTHORITY)
+	// =================================================
 	if userID != uuid.Nil {
 		userProfile, err := s.attendanceRepo.GetUserAttendanceProfile(ctx, userID)
 		if err == nil && userProfile != nil {
@@ -749,32 +775,22 @@ func (s *attendanceAdminService) ResolveAttendanceRules(
 		}
 	}
 
-	// ------------------------------------------------
-	// 4️⃣ DEFAULT EVENT BEHAVIOR
-	// ------------------------------------------------
+	// =================================================
+	// 5️⃣ DEFAULT EVENT BEHAVIOR
+	// =================================================
 	if len(resolved.AllowedEventTypes) == 0 {
 		resolved.AllowAllEventTypes = true
 	}
 
-	// ------------------------------------------------
-	// 5️⃣ REQUIREMENT FLAGS (POLICY-BASED)
-	// ------------------------------------------------
-	resolved.RequireLocation = false
-	resolved.RequireDevice = false
-	resolved.RequireReference = false
-
-	if resolved.PolicyRules != nil &&
-		resolved.PolicyRules.RequireWorkCenter != nil &&
-		*resolved.PolicyRules.RequireWorkCenter {
-		resolved.RequireReference = true
-	}
-
+	// =================================================
+	// 6️⃣ FINAL LOG
+	// =================================================
 	s.logger.Debug("Attendance rules resolved",
 		zap.String("company_id", companyID.String()),
 		zap.String("user_id", userID.String()),
-		zap.String("source_level", resolved.SourceLevel),
 		zap.String("policy_source", resolved.PolicySource),
-		zap.String("work_center_code", safeString(resolved.WorkCenterCode)),
+		zap.String("source_level", resolved.SourceLevel),
+		zap.Any("allowed_sources", resolved.AllowedSourceTypes),
 		zap.Time("date", date),
 	)
 

@@ -535,6 +535,7 @@ func (f *Factory) GetAttendanceIngestService() a.AttendanceIngestService {
 			f.AttendanceDeviceRepository(),
 			f.AttendanceIdentityRepository(),
 			f.GetAttendanceSourceResolver(),
+			f.GetAttendanceAdminService(), // ✅ ADD THIS
 			f.GetAttendanceOMService(),
 			f.GetAuditService(),
 			f.logger,
