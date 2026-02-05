@@ -2,6 +2,7 @@ package handler
 
 import (
 	"auth-service/internal/hr/service"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,13 +14,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// AttendanceQueryHandler handles attendance query operations
 type AttendanceQueryHandler struct {
 	queryService service.AttendanceQueryService
 	logger       *zap.Logger
 }
 
-// NewAttendanceQueryHandler creates a new query handler
 func NewAttendanceQueryHandler(
 	queryService service.AttendanceQueryService,
 	logger *zap.Logger,
@@ -30,14 +29,11 @@ func NewAttendanceQueryHandler(
 	}
 }
 
-// GetEvent handles retrieving a specific attendance event
 func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -48,7 +44,6 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:event:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -68,7 +63,6 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Check if event belongs to user's company
 	if event.CompanyID != companyID {
 		h.respondWithError(w, http.StatusForbidden, "access denied")
 		return
@@ -80,24 +74,19 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// SearchEvents handles searching for attendance events
 func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:event:search") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Parse query parameters
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
@@ -108,10 +97,8 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		pageSize = 100
 	}
 
-	// Parse dates
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	var startDate, endDate time.Time
 	if startDateStr != "" {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
@@ -120,7 +107,7 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 			return
 		}
 	} else {
-		startDate = time.Now().AddDate(0, 0, -30) // Default: last 30 days
+		startDate = time.Now().AddDate(0, 0, -30)
 	}
 
 	if endDateStr != "" {
@@ -133,13 +120,11 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		endDate = time.Now()
 	}
 
-	// Validate date range
 	if startDate.After(endDate) {
 		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
 		return
 	}
 
-	// Parse filters
 	filters := service.AttendanceSearchFilters{
 		CompanyID: companyID,
 		StartDate: startDate,
@@ -181,7 +166,6 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		filters.ShiftID = &shiftID
 	}
 
-	// Search events
 	events, total, err := h.queryService.SearchAttendanceEventsTyped(ctx, companyID, filters, page, pageSize)
 	if err != nil {
 		h.logger.Error("Failed to search attendance events",
@@ -194,7 +178,6 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 	}
 
 	totalPages := (total + pageSize - 1) / pageSize
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
@@ -212,14 +195,11 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// GetDailySummary handles retrieving daily summary for a user
 func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -237,7 +217,6 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Check permission (users can view their own, managers can view their team)
 	if !h.canViewUserAttendance(ctx, companyID, userID) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -264,14 +243,11 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 	})
 }
 
-// GetUserSummaries handles retrieving summaries for a user over a date range
 func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -282,10 +258,8 @@ func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Parse dates
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	var startDate, endDate time.Time
 	if startDateStr != "" {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
@@ -294,7 +268,7 @@ func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http
 			return
 		}
 	} else {
-		startDate = time.Now().AddDate(0, 0, -30) // Default: last 30 days
+		startDate = time.Now().AddDate(0, 0, -30)
 	}
 
 	if endDateStr != "" {
@@ -307,13 +281,11 @@ func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http
 		endDate = time.Now()
 	}
 
-	// Validate date range
 	if startDate.After(endDate) {
 		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
 		return
 	}
 
-	// Check permission
 	if !h.canViewUserAttendance(ctx, companyID, userID) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -342,27 +314,21 @@ func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http
 	})
 }
 
-// GetCompanyStats handles retrieving company-wide attendance statistics
 func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:stats:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Parse dates
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	var startDate, endDate time.Time
 	if startDateStr != "" {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
@@ -371,7 +337,7 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 			return
 		}
 	} else {
-		startDate = time.Now().AddDate(0, 0, -30) // Default: last 30 days
+		startDate = time.Now().AddDate(0, 0, -30)
 	}
 
 	if endDateStr != "" {
@@ -384,7 +350,6 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 		endDate = time.Now()
 	}
 
-	// Validate date range
 	if startDate.After(endDate) {
 		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
 		return
@@ -407,14 +372,11 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 	})
 }
 
-// GetUserStats handles retrieving user attendance statistics
 func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -425,10 +387,8 @@ func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Parse dates
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
-
 	var startDate, endDate time.Time
 	if startDateStr != "" {
 		startDate, err = time.Parse("2006-01-02", startDateStr)
@@ -437,7 +397,7 @@ func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Req
 			return
 		}
 	} else {
-		startDate = time.Now().AddDate(0, 0, -30) // Default: last 30 days
+		startDate = time.Now().AddDate(0, 0, -30)
 	}
 
 	if endDateStr != "" {
@@ -450,13 +410,11 @@ func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Req
 		endDate = time.Now()
 	}
 
-	// Validate date range
 	if startDate.After(endDate) {
 		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
 		return
 	}
 
-	// Check permission
 	if !h.canViewUserAttendance(ctx, companyID, userID) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -479,24 +437,19 @@ func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// GenerateReport handles generating attendance reports
 func (h *AttendanceQueryHandler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:report:generate") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Parse dates
 	startDateStr := r.URL.Query().Get("start_date")
 	endDateStr := r.URL.Query().Get("end_date")
 	reportType := r.URL.Query().Get("type")
@@ -512,7 +465,7 @@ func (h *AttendanceQueryHandler) GenerateReport(w http.ResponseWriter, r *http.R
 			return
 		}
 	} else {
-		startDate = time.Now().AddDate(0, 0, -30) // Default: last 30 days
+		startDate = time.Now().AddDate(0, 0, -30)
 	}
 
 	if endDateStr != "" {
@@ -525,13 +478,11 @@ func (h *AttendanceQueryHandler) GenerateReport(w http.ResponseWriter, r *http.R
 		endDate = time.Now()
 	}
 
-	// Validate date range
 	if startDate.After(endDate) {
 		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
 		return
 	}
 
-	// Generate report
 	reportData, contentType, err := h.queryService.GenerateAttendanceReport(ctx, companyID, reportType, startDate, endDate)
 	if err != nil {
 		h.logger.Error("Failed to generate report",
@@ -544,31 +495,25 @@ func (h *AttendanceQueryHandler) GenerateReport(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Set response headers for file download
 	filename := fmt.Sprintf("attendance_report_%s_%s_to_%s.%s",
 		companyID.String(),
 		startDate.Format("20060102"),
 		endDate.Format("20060102"),
 		reportType)
-
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	w.Header().Set("Content-Length", strconv.Itoa(len(reportData)))
 	w.Write(reportData)
 }
 
-// ListEventTypes handles listing all valid event types
 func (h *AttendanceQueryHandler) ListEventTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:metadata:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -598,18 +543,14 @@ func (h *AttendanceQueryHandler) ListEventTypes(w http.ResponseWriter, r *http.R
 	})
 }
 
-// ListSourceTypes handles listing all valid source types
 func (h *AttendanceQueryHandler) ListSourceTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:metadata:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -633,16 +574,41 @@ func (h *AttendanceQueryHandler) ListSourceTypes(w http.ResponseWriter, r *http.
 	})
 }
 
-// Helper function to extract company ID from request
+func (h *AttendanceQueryHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
+	permissions, ok := ctx.Value("permissions").([]string)
+	if !ok {
+		return false
+	}
 
-func (h *AttendanceQueryHandler) hasPermission(ctx interface{}, companyID uuid.UUID, permission string) bool {
-	// TODO: Implement actual permission checking
-	return true
+	for _, p := range permissions {
+		if p == permission {
+			return true
+		}
+	}
+	return false
 }
 
-func (h *AttendanceQueryHandler) canViewUserAttendance(ctx interface{}, companyID, userID uuid.UUID) bool {
-	// TODO: Implement actual permission checking
-	return true
+func (h *AttendanceQueryHandler) canViewUserAttendance(ctx context.Context, companyID, userID uuid.UUID) bool {
+	// Check if user has permission to view all attendance or just their own
+	permissions, ok := ctx.Value("permissions").([]string)
+	if !ok {
+		return false
+	}
+
+	// If user has permission to view all attendance
+	for _, p := range permissions {
+		if p == "attendance:view:all" {
+			return true
+		}
+	}
+
+	// Check if user is viewing their own attendance
+	currentUserID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		return false
+	}
+
+	return currentUserID == userID
 }
 
 func (h *AttendanceQueryHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {

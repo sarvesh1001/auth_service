@@ -1,6 +1,8 @@
 package service
 
 import (
+	leaveModels "auth-service/internal/hr/leave/models"
+	leave "auth-service/internal/hr/leave/service" // Add this
 	"auth-service/internal/hr/models/scheduling"
 	"auth-service/internal/hr/repository"
 	"auth-service/internal/util"
@@ -61,6 +63,21 @@ type SchedulingService interface {
 	UpdateScheduleTemplate(ctx context.Context, templateID uuid.UUID, update ScheduleTemplateUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleTemplate, error)
 	DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	ValidateScheduleTemplate(ctx context.Context, template *scheduling.ScheduleTemplate) error
+	ApplyApprovedLeave(
+		ctx context.Context,
+		leaveRequest *leaveModels.LeaveRequest,
+		actorType string,
+		actorID uuid.UUID,
+	) error
+	UpdateWorkCenterShiftMappingByKey(
+		ctx context.Context,
+		companyID uuid.UUID,
+		workCenterCode string,
+		update scheduling.WorkCenterShiftMappingUpdate,
+		actorType string,
+		actorID uuid.UUID,
+		metadata map[string]interface{},
+	) error
 
 	// Schedule Instance Operations
 	CreateScheduleInstance(ctx context.Context, instance *scheduling.ScheduleInstance, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleInstance, error)
@@ -78,33 +95,27 @@ type SchedulingService interface {
 	CreateScheduleInstanceFromPosition(ctx context.Context, companyID, userID uuid.UUID, date time.Time, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleInstance, error)
 
 	// Schedule Availability & Conflict Checking
-	CheckScheduleAvailability(ctx context.Context, userID uuid.UUID, date time.Time, timezone string) ([]time.Time, error)
 	CheckDateAvailability(ctx context.Context, userID uuid.UUID, date time.Time) (map[string]interface{}, error)
 	ValidateScheduleConflict(ctx context.Context, userID uuid.UUID, startTime, endTime time.Time, excludeInstanceID *uuid.UUID) (bool, error)
-
-	// Off Management
-	CreateOffEntitlement(ctx context.Context, companyID uuid.UUID, entitlement *scheduling.UserOffEntitlement, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.UserOffEntitlement, error)
-	UpdateOffEntitlement(ctx context.Context, entitlementID uuid.UUID, update scheduling.OffEntitlementUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.UserOffEntitlement, error)
-	DeleteOffEntitlement(ctx context.Context, entitlementID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-	GetUserOffBalance(ctx context.Context, userID uuid.UUID, periodType string, startDate, endDate time.Time) (map[string]interface{}, error)
-
-	// Off Requests
-	CreateOffRequest(ctx context.Context, companyID uuid.UUID, request *scheduling.OffRequest, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.OffRequest, error)
-	UpdateOffRequest(ctx context.Context, requestID uuid.UUID, update scheduling.OffRequestUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.OffRequest, error)
-	DeleteOffRequest(ctx context.Context, requestID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-	ApproveOffRequest(ctx context.Context, requestID uuid.UUID, approvedBy uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-	RejectOffRequest(ctx context.Context, requestID uuid.UUID, rejectedBy uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
-	ValidateOffRequest(ctx context.Context, userID uuid.UUID, requestDates []string, excludeRequestID *uuid.UUID) error
-	RequestTimeOff(ctx context.Context, companyID, userID uuid.UUID, requestDates []string, reason string, actorType string, actorID uuid.UUID) (*scheduling.OffRequest, error)
-	GetUserTimeOffSummary(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
-
+	CheckScheduleAvailability(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		date time.Time,
+		timezone string,
+	) ([]time.Time, error)
 	// Schedule Overrides
 	CreateScheduleOverride(ctx context.Context, companyID uuid.UUID, override *scheduling.ScheduleOverride, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleOverride, error)
 	UpdateScheduleOverride(ctx context.Context, overrideID uuid.UUID, update scheduling.ScheduleOverrideUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) (*scheduling.ScheduleOverride, error)
 	DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleOverride, error)
-
-	// Work Center Operations (NEW)
+	RollbackCancelledLeave(
+		ctx context.Context,
+		leaveRequest *leaveModels.LeaveRequest,
+		actorType string,
+		actorID uuid.UUID,
+	) error
+	// Work Center Operations
 	CreateWorkCenterShiftMapping(ctx context.Context, companyID uuid.UUID, mapping *scheduling.WorkCenterShiftMapping, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	UpdateWorkCenterShiftMapping(ctx context.Context, mappingID uuid.UUID, update scheduling.WorkCenterShiftMappingUpdate, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
 	AssignUserToWorkCenter(ctx context.Context, companyID uuid.UUID, assignment *scheduling.UserWorkCenterAssignment, actorType string, actorID uuid.UUID, metadata map[string]interface{}) error
@@ -114,7 +125,7 @@ type SchedulingService interface {
 	HealthCheck(ctx context.Context) error
 }
 
-// PositionBasedResolvedDay - New response structure for position-based scheduling
+// PositionBasedResolvedDay - Response structure for position-based scheduling
 type PositionBasedResolvedDay struct {
 	Date               time.Time  `json:"date"`
 	Timezone           string     `json:"timezone"`
@@ -125,7 +136,7 @@ type PositionBasedResolvedDay struct {
 	ExpectedEnd        *time.Time `json:"expected_end,omitempty"`
 	PositionID         *uuid.UUID `json:"position_id,omitempty"`
 	PositionTitle      *string    `json:"position_title,omitempty"`
-	DepartmentID       *uuid.UUID `json:"department_id,omitempty"` // ✅ ADD
+	DepartmentID       *uuid.UUID `json:"department_id,omitempty"`
 	WorkCenterCode     *string    `json:"work_center_code,omitempty"`
 	WorkCenterName     *string    `json:"work_center_name,omitempty"`
 	ShiftID            *uuid.UUID `json:"shift_id,omitempty"`
@@ -140,6 +151,7 @@ type PositionBasedResolvedDay struct {
 
 type schedulingServiceImpl struct {
 	schedulingRepo repository.SchedulingRepository
+	leaveQuery     leave.LeaveQueryService // ✅ NEW
 	auditService   *AuditService
 	logger         *zap.Logger
 	mu             sync.RWMutex
@@ -147,11 +159,13 @@ type schedulingServiceImpl struct {
 
 func NewSchedulingService(
 	schedulingRepo repository.SchedulingRepository,
+	leaveQuery leave.LeaveQueryService, // ✅ NEW
 	auditService *AuditService,
 	logger *zap.Logger,
 ) SchedulingService {
 	return &schedulingServiceImpl{
 		schedulingRepo: schedulingRepo,
+		leaveQuery:     leaveQuery, // ✅ NEW
 		auditService:   auditService,
 		logger:         logger,
 	}
@@ -742,28 +756,34 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 		}, nil
 	}
 
-	// 5️⃣ Check for approved leave
-	statusApproved := "approved"
-	leaveRequests, err := s.schedulingRepo.GetOffRequestsByUser(
-		ctx,
-		userID,
-		&businessDate,
-		&businessDate,
-		&statusApproved,
-	)
-	if err == nil && len(leaveRequests) > 0 {
-		return &PositionBasedResolvedDay{
-			Date:               businessDate,
-			Timezone:           "UTC",
-			IsSchedulable:      true,
-			AttendanceRequired: position.AttendanceRequired,
-			OvertimeAllowed:    position.OvertimeAllowed,
-			PositionID:         &position.PositionID,
-			PositionTitle:      &position.Title,
-			ScheduleStatus:     "on_leave",
-			IsOnLeave:          true,
-			LeaveRequestID:     &leaveRequests[0].OffRequestID,
-		}, nil
+	// 5️⃣ Check for approved leave - UPDATED WITH REAL INTEGRATION
+	if s.leaveQuery != nil {
+		isOnLeave, leaveInfo, err := s.leaveQuery.IsUserOnLeave(ctx, companyID, userID, businessDate)
+		if err != nil {
+			s.logger.Warn("Failed to check leave status",
+				util.String("user_id", userID.String()),
+				util.String("company_id", companyID.String()),
+				util.String("date", businessDate.Format("2006-01-02")),
+				util.ErrorField(err))
+			// Continue without leave check if error occurs
+		} else if isOnLeave && leaveInfo != nil {
+			return &PositionBasedResolvedDay{
+				Date:               businessDate,
+				Timezone:           "UTC",
+				IsSchedulable:      false,
+				AttendanceRequired: false,
+				OvertimeAllowed:    false,
+				PositionID:         &position.PositionID,
+				PositionTitle:      &position.Title,
+				ScheduleStatus:     "on_leave",
+				IsOnLeave:          true,
+				LeaveRequestID:     &leaveInfo.LeaveRequestID,
+			}, nil
+		}
+	} else {
+		s.logger.Warn("Leave query service not available",
+			util.String("user_id", userID.String()),
+			util.String("date", businessDate.Format("2006-01-02")))
 	}
 
 	// 6️⃣ Check existing schedule instance
@@ -1170,7 +1190,9 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(
 	actorType string,
 	actorID uuid.UUID,
 ) ([]*scheduling.ScheduleInstance, error) {
+
 	startTime := time.Now()
+
 	if err := s.validateScheduleGenerationConfig(config); err != nil {
 		return nil, err
 	}
@@ -1184,10 +1206,15 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(
 	if err != nil {
 		loc = time.UTC
 	}
+
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 
+	// 🔑 IN-MEMORY DEDUPE (user_id|date)
+	seen := make(map[string]struct{})
+
 	var instances []*scheduling.ScheduleInstance
+
 	for _, emp := range employees {
 		if emp.PositionID == nil {
 			continue
@@ -1195,16 +1222,34 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(
 
 		for d := config.StartDate; !d.After(config.EndDate); d = d.AddDate(0, 0, 1) {
 			businessDate := d
-			// Skip past dates - can only generate for future dates
+
+			// Skip past / today dates
 			if !businessDate.After(today) {
 				continue
 			}
 
-			// Check if schedule already exists for this user and date
-			existing, err := s.schedulingRepo.GetScheduleInstanceByUserDate(ctx, emp.UserID, businessDate)
-			if err == nil && existing != nil && existing.Status == "active" {
-				// Skip if active schedule already exists
+			key := emp.UserID.String() + "|" + businessDate.Format("2006-01-02")
+
+			// ✅ Prevent duplicates in same request
+			if _, exists := seen[key]; exists {
 				continue
+			}
+			seen[key] = struct{}{}
+
+			// ✅ Respect overwrite flag
+			if !config.Overwrite {
+				exists, err := s.schedulingRepo.HasActiveSchedule(
+					ctx,
+					companyID,
+					emp.UserID,
+					businessDate,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if exists {
+					continue
+				}
 			}
 
 			resolvedDay, err := s.ResolveUserDay(ctx, companyID, emp.UserID, businessDate)
@@ -1225,11 +1270,11 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(
 				GeneratedAt:        time.Now().UTC(),
 				Status:             "active",
 			}
+
 			instances = append(instances, instance)
 		}
 	}
 
-	// Return empty slice if no instances to generate
 	if len(instances) == 0 {
 		s.logger.Info("No schedule instances to generate for company",
 			util.String("company_id", companyID.String()),
@@ -1240,6 +1285,7 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(
 		return []*scheduling.ScheduleInstance{}, nil
 	}
 
+	// Bulk insert (repo already safe)
 	if err := s.BulkCreateScheduleInstances(ctx, instances, actorType, actorID, nil); err != nil {
 		return nil, err
 	}
@@ -1248,8 +1294,10 @@ func (s *schedulingServiceImpl) GenerateScheduleForCompany(
 		util.Int("count", len(instances)),
 		util.Duration("duration", time.Since(startTime)),
 	)
+
 	return instances, nil
 }
+
 func (s *schedulingServiceImpl) GenerateScheduleForTemplate(
 	ctx context.Context,
 	templateID uuid.UUID,
@@ -1605,9 +1653,6 @@ func (s *schedulingServiceImpl) EndUserWorkCenterAssignment(
 	return nil
 }
 
-// REST OF THE FUNCTIONS (CreateScheduleInstance, UpdateScheduleInstance, etc.)
-// These functions need to be updated to use position-based approach
-
 func (s *schedulingServiceImpl) CreateScheduleInstance(
 	ctx context.Context,
 	instance *scheduling.ScheduleInstance,
@@ -1690,6 +1735,7 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 
 	return instance, nil
 }
+
 func (s *schedulingServiceImpl) UpdateScheduleInstance(
 	ctx context.Context,
 	instanceID uuid.UUID,
@@ -1795,7 +1841,7 @@ func (s *schedulingServiceImpl) DeleteScheduleInstance(
 	return nil
 }
 
-// VALIDATION FUNCTIONS (unchanged but included for completeness)
+// VALIDATION FUNCTIONS
 func (s *schedulingServiceImpl) validateWorkCalendar(calendar *scheduling.WorkCalendar) error {
 	if calendar.CompanyID == uuid.Nil {
 		return fmt.Errorf("company ID is required")
@@ -2063,10 +2109,6 @@ func (s *schedulingServiceImpl) calculateExpectedTimesFromTemplate(
 	return nil, nil, fmt.Errorf("unsupported template type")
 }
 
-// Note: The rest of the functions (off management, schedule overrides, etc.) remain mostly the same
-// but need to be included in the complete file. Due to length constraints, I've included the
-// most critical position-based functions. The remaining functions follow similar patterns.
-
 func (s *schedulingServiceImpl) HealthCheck(ctx context.Context) error {
 	if err := s.schedulingRepo.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("scheduling repository health check failed: %w", err)
@@ -2129,465 +2171,7 @@ func (s *schedulingServiceImpl) logAuditAction(
 	}
 }
 
-func (s *schedulingServiceImpl) CreateOffEntitlement(
-	ctx context.Context,
-	companyID uuid.UUID,
-	entitlement *scheduling.UserOffEntitlement,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) (*scheduling.UserOffEntitlement, error) {
-	startTime := time.Now()
-
-	if err := s.validateOffEntitlement(entitlement); err != nil {
-		return nil, fmt.Errorf("off entitlement validation failed: %w", err)
-	}
-
-	if entitlement.EntitlementID == uuid.Nil {
-		entitlement.EntitlementID = uuid.New()
-	}
-
-	entitlement.CompanyID = companyID
-	entitlement.CreatedAt = time.Now().UTC()
-
-	// Check for overlapping entitlements
-	existingEntitlements, err := s.schedulingRepo.GetOffEntitlementsByUser(ctx, entitlement.UserID, true)
-	if err == nil {
-		for _, existing := range existingEntitlements {
-			if s.entitlementsOverlap(existing, entitlement) {
-				return nil, fmt.Errorf("overlapping off entitlement exists for user")
-			}
-		}
-	}
-
-	// Verify user belongs to company
-	userExists, err := s.schedulingRepo.IsUserActiveInCompany(ctx, companyID, entitlement.UserID)
-	if err != nil || !userExists {
-		return nil, fmt.Errorf("user not found or not active in company")
-	}
-
-	err = s.schedulingRepo.CreateOffEntitlement(ctx, entitlement)
-	if err != nil {
-		s.logger.Error("Failed to create off entitlement",
-			util.String("user_id", entitlement.UserID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to create off entitlement: %w", err)
-	}
-
-	if s.auditService != nil {
-		go s.logAuditAction(ctx, companyID, "off_entitlement.create",
-			entitlement.EntitlementID, actorType, actorID, nil, entitlement, metadata)
-	}
-
-	s.logger.Info("Off entitlement created",
-		util.String("entitlement_id", entitlement.EntitlementID.String()),
-		util.String("user_id", entitlement.UserID.String()),
-		util.String("period_type", entitlement.PeriodType),
-		util.Int("off_count", entitlement.OffCount),
-		util.Duration("duration", time.Since(startTime)))
-
-	return entitlement, nil
-}
-
-func (s *schedulingServiceImpl) UpdateOffEntitlement(
-	ctx context.Context,
-	entitlementID uuid.UUID,
-	update scheduling.OffEntitlementUpdate,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) (*scheduling.UserOffEntitlement, error) {
-	startTime := time.Now()
-
-	entitlement, err := s.schedulingRepo.GetOffEntitlementByID(ctx, entitlementID)
-	if err != nil {
-		return nil, fmt.Errorf("off entitlement not found: %w", err)
-	}
-
-	beforeState, _ := json.Marshal(entitlement)
-
-	if update.PeriodType != nil {
-		entitlement.PeriodType = *update.PeriodType
-	}
-	if update.OffCount != nil {
-		entitlement.OffCount = *update.OffCount
-	}
-	if update.RequiresApproval != nil {
-		entitlement.RequiresApproval = *update.RequiresApproval
-	}
-	if update.EffectiveFrom != nil {
-		entitlement.EffectiveFrom = *update.EffectiveFrom
-	}
-	if update.EffectiveTo != nil {
-		entitlement.EffectiveTo = update.EffectiveTo
-	}
-
-	if err := s.validateOffEntitlement(entitlement); err != nil {
-		return nil, fmt.Errorf("off entitlement validation failed: %w", err)
-	}
-
-	err = s.schedulingRepo.UpdateOffEntitlement(ctx, entitlement)
-	if err != nil {
-		s.logger.Error("Failed to update off entitlement",
-			util.String("entitlement_id", entitlementID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to update off entitlement: %w", err)
-	}
-
-	s.logAuditAction(ctx, entitlement.CompanyID, "off_entitlement.update",
-		entitlementID, actorType, actorID, beforeState, entitlement, metadata)
-
-	s.logger.Info("Off entitlement updated",
-		util.String("entitlement_id", entitlementID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return entitlement, nil
-}
-
-func (s *schedulingServiceImpl) DeleteOffEntitlement(
-	ctx context.Context,
-	entitlementID uuid.UUID,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) error {
-	startTime := time.Now()
-
-	entitlement, err := s.schedulingRepo.GetOffEntitlementByID(ctx, entitlementID)
-	if err != nil {
-		return fmt.Errorf("off entitlement not found: %w", err)
-	}
-
-	beforeState, _ := json.Marshal(entitlement)
-
-	err = s.schedulingRepo.DeleteOffEntitlement(ctx, entitlementID)
-	if err != nil {
-		s.logger.Error("Failed to delete off entitlement",
-			util.String("entitlement_id", entitlementID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to delete off entitlement: %w", err)
-	}
-
-	s.logAuditAction(ctx, entitlement.CompanyID, "off_entitlement.delete",
-		entitlementID, actorType, actorID, beforeState, nil, metadata)
-
-	s.logger.Info("Off entitlement deleted",
-		util.String("entitlement_id", entitlementID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return nil
-}
-
-func (s *schedulingServiceImpl) CreateOffRequest(
-	ctx context.Context,
-	companyID uuid.UUID,
-	request *scheduling.OffRequest,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) (*scheduling.OffRequest, error) {
-	startTime := time.Now()
-
-	if err := s.validateOffRequest(request); err != nil {
-		return nil, fmt.Errorf("off request validation failed: %w", err)
-	}
-
-	if request.OffRequestID == uuid.Nil {
-		request.OffRequestID = uuid.New()
-	}
-
-	request.CompanyID = companyID
-	if request.Status == "" {
-		request.Status = "pending"
-	}
-	request.CreatedAt = time.Now().UTC()
-
-	// Check if user belongs to company
-	userExists, err := s.schedulingRepo.IsUserActiveInCompany(ctx, companyID, request.UserID)
-	if err != nil || !userExists {
-		return nil, fmt.Errorf("user not found or not active in company")
-	}
-
-	// Validate dates are not in the past
-	for _, dateStr := range request.RequestDates {
-		date, err := time.Parse("2006-01-02", dateStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid date format: %s", dateStr)
-		}
-		if date.Before(time.Now().UTC().Truncate(24 * time.Hour)) {
-			return nil, fmt.Errorf("cannot request off for past dates: %s", dateStr)
-		}
-
-		// Check if there's already a schedule override
-		override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, request.UserID, date)
-		if err == nil && override != nil && override.OverrideType == "force_work" {
-			return nil, fmt.Errorf("user is scheduled to work on %s", dateStr)
-		}
-	}
-
-	// Check off entitlement
-	entitlement, err := s.schedulingRepo.GetCurrentOffEntitlement(ctx, request.UserID, time.Now())
-	if err != nil {
-		return nil, fmt.Errorf("no active off entitlement found: %w", err)
-	}
-
-	// Check balance
-	usedDays, err := s.schedulingRepo.GetOffBalance(ctx, request.UserID, entitlement.PeriodType,
-		entitlement.EffectiveFrom, time.Now().AddDate(0, 0, 30))
-	if err != nil {
-		usedDays = 0
-	}
-
-	remaining := entitlement.OffCount - usedDays
-	if remaining < len(request.RequestDates) {
-		return nil, fmt.Errorf("insufficient off balance: %d days remaining, requested %d days",
-			remaining, len(request.RequestDates))
-	}
-
-	// Auto-approve if no approval required
-	if !entitlement.RequiresApproval {
-		request.Status = "approved"
-		now := time.Now().UTC()
-		request.ApprovedAt = &now
-		request.ApprovedBy = &actorID
-	}
-
-	err = s.schedulingRepo.CreateOffRequest(ctx, request)
-	if err != nil {
-		s.logger.Error("Failed to create off request",
-			util.String("user_id", request.UserID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to create off request: %w", err)
-	}
-
-	// Create schedule overrides for approved requests
-	if request.Status == "approved" {
-		for _, dateStr := range request.RequestDates {
-			date, _ := time.Parse("2006-01-02", dateStr)
-			override := &scheduling.ScheduleOverride{
-				OverrideID:   uuid.New(),
-				CompanyID:    companyID,
-				UserID:       request.UserID,
-				OverrideDate: date,
-				OverrideType: "off",
-				CreatedBy:    &actorID,
-				CreatedAt:    time.Now().UTC(),
-			}
-			if err := s.schedulingRepo.CreateScheduleOverride(ctx, override); err != nil {
-				s.logger.Warn("Failed to create schedule override for off request",
-					util.String("user_id", request.UserID.String()),
-					util.String("date", dateStr),
-					util.ErrorField(err))
-			}
-		}
-	}
-
-	if s.auditService != nil {
-		go s.logAuditAction(ctx, companyID, "off_request.create",
-			request.OffRequestID, actorType, actorID, nil, request, metadata)
-	}
-
-	s.logger.Info("Off request created",
-		util.String("request_id", request.OffRequestID.String()),
-		util.String("user_id", request.UserID.String()),
-		util.String("status", request.Status),
-		util.Int("days_requested", len(request.RequestDates)),
-		util.Duration("duration", time.Since(startTime)))
-
-	return request, nil
-}
-
-func (s *schedulingServiceImpl) UpdateOffRequest(
-	ctx context.Context,
-	requestID uuid.UUID,
-	update scheduling.OffRequestUpdate,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) (*scheduling.OffRequest, error) {
-	startTime := time.Now()
-
-	request, err := s.schedulingRepo.GetOffRequestByID(ctx, requestID)
-	if err != nil {
-		return nil, fmt.Errorf("off request not found: %w", err)
-	}
-
-	beforeState, _ := json.Marshal(request)
-
-	if update.RequestDates != nil {
-		request.RequestDates = *update.RequestDates
-	}
-	if update.Status != nil {
-		request.Status = *update.Status
-	}
-	if update.ApprovedBy != nil {
-		request.ApprovedBy = update.ApprovedBy
-	}
-	if update.ApprovedAt != nil {
-		request.ApprovedAt = update.ApprovedAt
-	}
-
-	if err := s.validateOffRequest(request); err != nil {
-		return nil, fmt.Errorf("off request validation failed: %w", err)
-	}
-
-	err = s.schedulingRepo.UpdateOffRequest(ctx, request)
-	if err != nil {
-		s.logger.Error("Failed to update off request",
-			util.String("request_id", requestID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to update off request: %w", err)
-	}
-
-	s.logAuditAction(ctx, request.CompanyID, "off_request.update",
-		requestID, actorType, actorID, beforeState, request, metadata)
-
-	s.logger.Info("Off request updated",
-		util.String("request_id", requestID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return request, nil
-}
-
-func (s *schedulingServiceImpl) DeleteOffRequest(
-	ctx context.Context,
-	requestID uuid.UUID,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) error {
-	startTime := time.Now()
-
-	request, err := s.schedulingRepo.GetOffRequestByID(ctx, requestID)
-	if err != nil {
-		return fmt.Errorf("off request not found: %w", err)
-	}
-
-	beforeState, _ := json.Marshal(request)
-
-	err = s.schedulingRepo.DeleteOffRequest(ctx, requestID)
-	if err != nil {
-		s.logger.Error("Failed to delete off request",
-			util.String("request_id", requestID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to delete off request: %w", err)
-	}
-
-	s.logAuditAction(ctx, request.CompanyID, "off_request.delete",
-		requestID, actorType, actorID, beforeState, nil, metadata)
-
-	s.logger.Info("Off request deleted",
-		util.String("request_id", requestID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return nil
-}
-
-func (s *schedulingServiceImpl) ApproveOffRequest(
-	ctx context.Context,
-	requestID uuid.UUID,
-	approvedBy uuid.UUID,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) error {
-	startTime := time.Now()
-
-	request, err := s.schedulingRepo.GetOffRequestByID(ctx, requestID)
-	if err != nil {
-		return fmt.Errorf("off request not found: %w", err)
-	}
-
-	if request.Status != "pending" {
-		return fmt.Errorf("cannot approve a request with status: %s", request.Status)
-	}
-
-	beforeState, _ := json.Marshal(request)
-
-	now := time.Now().UTC()
-	request.Status = "approved"
-	request.ApprovedBy = &approvedBy
-	request.ApprovedAt = &now
-
-	err = s.schedulingRepo.UpdateOffRequest(ctx, request)
-	if err != nil {
-		return fmt.Errorf("failed to approve off request: %w", err)
-	}
-
-	// Create schedule overrides
-	for _, dateStr := range request.RequestDates {
-		date, _ := time.Parse("2006-01-02", dateStr)
-		override := &scheduling.ScheduleOverride{
-			OverrideID:   uuid.New(),
-			CompanyID:    request.CompanyID,
-			UserID:       request.UserID,
-			OverrideDate: date,
-			OverrideType: "off",
-			CreatedBy:    &approvedBy,
-			CreatedAt:    now,
-		}
-		if err := s.schedulingRepo.CreateScheduleOverride(ctx, override); err != nil {
-			s.logger.Warn("Failed to create schedule override for approved off request",
-				util.String("user_id", request.UserID.String()),
-				util.String("date", dateStr),
-				util.ErrorField(err))
-		}
-	}
-
-	s.logAuditAction(ctx, request.CompanyID, "off_request.approve",
-		requestID, actorType, actorID, beforeState, request, metadata)
-
-	s.logger.Info("Off request approved",
-		util.String("request_id", requestID.String()),
-		util.String("user_id", request.UserID.String()),
-		util.String("approved_by", approvedBy.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return nil
-}
-
-func (s *schedulingServiceImpl) RejectOffRequest(
-	ctx context.Context,
-	requestID uuid.UUID,
-	rejectedBy uuid.UUID,
-	actorType string,
-	actorID uuid.UUID,
-	metadata map[string]interface{},
-) error {
-	startTime := time.Now()
-
-	request, err := s.schedulingRepo.GetOffRequestByID(ctx, requestID)
-	if err != nil {
-		return fmt.Errorf("off request not found: %w", err)
-	}
-
-	if request.Status != "pending" {
-		return fmt.Errorf("cannot reject a request with status: %s", request.Status)
-	}
-
-	beforeState, _ := json.Marshal(request)
-
-	now := time.Now().UTC()
-	request.Status = "rejected"
-	request.ApprovedBy = &rejectedBy
-	request.ApprovedAt = &now
-
-	err = s.schedulingRepo.UpdateOffRequest(ctx, request)
-	if err != nil {
-		return fmt.Errorf("failed to reject off request: %w", err)
-	}
-
-	s.logAuditAction(ctx, request.CompanyID, "off_request.reject",
-		requestID, actorType, actorID, beforeState, request, metadata)
-
-	s.logger.Info("Off request rejected",
-		util.String("request_id", requestID.String()),
-		util.String("rejected_by", rejectedBy.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return nil
-}
-
+// SCHEDULE OVERRIDE OPERATIONS
 func (s *schedulingServiceImpl) CreateScheduleOverride(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2737,164 +2321,6 @@ func (s *schedulingServiceImpl) DeleteScheduleOverride(
 	return nil
 }
 
-func (s *schedulingServiceImpl) GetUserOffBalance(
-	ctx context.Context,
-	userID uuid.UUID,
-	periodType string,
-	startDate, endDate time.Time,
-) (map[string]interface{}, error) {
-	entitlement, err := s.schedulingRepo.GetCurrentOffEntitlement(ctx, userID, time.Now())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current entitlement: %w", err)
-	}
-
-	usedDays, err := s.schedulingRepo.GetOffBalance(ctx, userID, periodType, startDate, endDate)
-	if err != nil {
-		usedDays = 0
-	}
-
-	result := map[string]interface{}{
-		"user_id":     userID,
-		"period_type": periodType,
-		"start_date":  startDate,
-		"end_date":    endDate,
-		"used_days":   usedDays,
-		"total_days":  entitlement.OffCount,
-		"remaining":   entitlement.OffCount - usedDays,
-		"entitlement": entitlement,
-	}
-
-	return result, nil
-}
-
-func (s *schedulingServiceImpl) GetUserTimeOffSummary(
-	ctx context.Context,
-	userID uuid.UUID,
-	startDate, endDate time.Time,
-) (map[string]interface{}, error) {
-	entitlement, err := s.schedulingRepo.GetCurrentOffEntitlement(ctx, userID, time.Now())
-	if err != nil {
-		entitlement = nil
-	}
-
-	statusApproved := "approved"
-	offRequests, err := s.schedulingRepo.GetOffRequestsByUser(ctx, userID, &startDate, &endDate, &statusApproved)
-	if err != nil {
-		offRequests = []*scheduling.OffRequest{}
-	}
-
-	overrides, err := s.schedulingRepo.GetScheduleOverridesByUser(ctx, userID, &startDate, &endDate, nil)
-	if err != nil {
-		overrides = []*scheduling.ScheduleOverride{}
-	}
-
-	usedDays := 0
-	for _, req := range offRequests {
-		usedDays += len(req.RequestDates)
-	}
-
-	result := map[string]interface{}{
-		"user_id":            userID,
-		"start_date":         startDate.Format("2006-01-02"),
-		"end_date":           endDate.Format("2006-01-02"),
-		"off_requests":       offRequests,
-		"schedule_overrides": overrides,
-		"used_days":          usedDays,
-	}
-
-	if entitlement != nil {
-		result["entitlement"] = entitlement
-		result["total_days"] = entitlement.OffCount
-		result["remaining_days"] = entitlement.OffCount - usedDays
-	}
-
-	return result, nil
-}
-
-func (s *schedulingServiceImpl) RequestTimeOff(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	requestDates []string,
-	reason string,
-	actorType string,
-	actorID uuid.UUID,
-) (*scheduling.OffRequest, error) {
-	// This is a convenience method that wraps CreateOffRequest
-	request := &scheduling.OffRequest{
-		OffRequestID: uuid.New(),
-		CompanyID:    companyID,
-		UserID:       userID,
-		RequestDates: requestDates,
-		Status:       "pending",
-		RequestedBy:  &actorID,
-		CreatedAt:    time.Now().UTC(),
-	}
-
-	return s.CreateOffRequest(ctx, companyID, request, actorType, actorID, map[string]interface{}{
-		"reason": reason,
-	})
-}
-
-func (s *schedulingServiceImpl) ValidateOffRequest(
-	ctx context.Context,
-	userID uuid.UUID,
-	requestDates []string,
-	excludeRequestID *uuid.UUID,
-) error {
-	for _, dateStr := range requestDates {
-		date, err := time.Parse("2006-01-02", dateStr)
-		if err != nil {
-			return fmt.Errorf("invalid date format: %s", dateStr)
-		}
-
-		// Check for schedule overrides
-		override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
-		if err == nil && override != nil {
-			if override.OverrideType == "force_work" {
-				return fmt.Errorf("user is scheduled to work on %s", dateStr)
-			}
-		}
-	}
-
-	// Check for duplicate requests
-	statusPending := "pending"
-	statusApproved := "approved"
-
-	existingRequests, err := s.schedulingRepo.GetOffRequestsByUser(ctx, userID, nil, nil, &statusPending)
-	if err == nil {
-		for _, existing := range existingRequests {
-			if excludeRequestID != nil && existing.OffRequestID == *excludeRequestID {
-				continue
-			}
-			for _, existingDate := range existing.RequestDates {
-				for _, newDate := range requestDates {
-					if existingDate == newDate {
-						return fmt.Errorf("duplicate request for date: %s", newDate)
-					}
-				}
-			}
-		}
-	}
-
-	approvedRequests, err := s.schedulingRepo.GetOffRequestsByUser(ctx, userID, nil, nil, &statusApproved)
-	if err == nil {
-		for _, existing := range approvedRequests {
-			if excludeRequestID != nil && existing.OffRequestID == *excludeRequestID {
-				continue
-			}
-			for _, existingDate := range existing.RequestDates {
-				for _, newDate := range requestDates {
-					if existingDate == newDate {
-						return fmt.Errorf("already has approved request for date: %s", newDate)
-					}
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
 func (s *schedulingServiceImpl) GetScheduleOverridesByUser(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2982,15 +2408,19 @@ func (s *schedulingServiceImpl) ProcessHolidayForDate(
 
 func (s *schedulingServiceImpl) CheckScheduleAvailability(
 	ctx context.Context,
+	companyID uuid.UUID,
 	userID uuid.UUID,
 	date time.Time,
 	timezone string,
 ) ([]time.Time, error) {
-	resolvedDay, err := s.ResolveUserDay(ctx, uuid.Nil, userID, date)
+
+	// ✅ IMPORTANT: pass REAL companyID
+	resolvedDay, err := s.ResolveUserDay(ctx, companyID, userID, date)
 	if err != nil {
-		return []time.Time{}, fmt.Errorf("failed to resolve schedule: %w", err)
+		return nil, fmt.Errorf("failed to resolve schedule: %w", err)
 	}
 
+	// If not schedulable or not actually scheduled → empty availability
 	if !resolvedDay.IsSchedulable || resolvedDay.ScheduleStatus != "scheduled" {
 		return []time.Time{}, nil
 	}
@@ -3039,26 +2469,6 @@ func (s *schedulingServiceImpl) CheckDateAvailability(
 			result["available"] = true
 			result["holiday_work"] = true
 			result["reasons"] = append(result["reasons"].([]string), "Schedule override: holiday work")
-		}
-	}
-
-	// Check for approved off requests
-	statusApproved := "approved"
-	offRequests, err := s.schedulingRepo.GetOffRequestsByUser(ctx, userID, &date, &date, &statusApproved)
-	if err == nil && len(offRequests) > 0 {
-		result["available"] = false
-		result["off_request"] = offRequests[0]
-		result["reasons"] = append(result["reasons"].([]string), "Approved off request")
-		result["is_off_day"] = true
-	}
-
-	// Check for pending requests
-	statusPending := "pending"
-	pendingRequests, err := s.schedulingRepo.GetOffRequestsByUser(ctx, userID, &date, &date, &statusPending)
-	if err == nil && len(pendingRequests) > 0 {
-		result["pending_request"] = pendingRequests[0]
-		if result["available"] == true {
-			result["reasons"] = append(result["reasons"].([]string), "Pending off request awaiting approval")
 		}
 	}
 
@@ -3203,47 +2613,6 @@ func (s *schedulingServiceImpl) BulkCreateScheduleInstances(
 }
 
 // Helper validation methods
-func (s *schedulingServiceImpl) validateOffEntitlement(entitlement *scheduling.UserOffEntitlement) error {
-	if entitlement.CompanyID == uuid.Nil {
-		return fmt.Errorf("company ID is required")
-	}
-	if entitlement.UserID == uuid.Nil {
-		return fmt.Errorf("user ID is required")
-	}
-	if entitlement.PeriodType != "weekly" && entitlement.PeriodType != "monthly" {
-		return fmt.Errorf("period type must be 'weekly' or 'monthly'")
-	}
-	if entitlement.OffCount < 1 {
-		return fmt.Errorf("off count must be at least 1")
-	}
-	if entitlement.EffectiveFrom.IsZero() {
-		return fmt.Errorf("effective from date is required")
-	}
-	return nil
-}
-
-func (s *schedulingServiceImpl) validateOffRequest(request *scheduling.OffRequest) error {
-	if request.CompanyID == uuid.Nil {
-		return fmt.Errorf("company ID is required")
-	}
-	if request.UserID == uuid.Nil {
-		return fmt.Errorf("user ID is required")
-	}
-	if len(request.RequestDates) == 0 {
-		return fmt.Errorf("at least one request date is required")
-	}
-	for i, dateStr := range request.RequestDates {
-		if _, err := time.Parse("2006-01-02", dateStr); err != nil {
-			return fmt.Errorf("invalid date format at index %d: %s", i, dateStr)
-		}
-	}
-	if request.Status != "" && request.Status != "pending" &&
-		request.Status != "approved" && request.Status != "rejected" {
-		return fmt.Errorf("invalid status: %s", request.Status)
-	}
-	return nil
-}
-
 func (s *schedulingServiceImpl) validateScheduleOverride(override *scheduling.ScheduleOverride) error {
 	if override.CompanyID == uuid.Nil {
 		return fmt.Errorf("company ID is required")
@@ -3261,16 +2630,201 @@ func (s *schedulingServiceImpl) validateScheduleOverride(override *scheduling.Sc
 	return nil
 }
 
-func (s *schedulingServiceImpl) entitlementsOverlap(e1, e2 *scheduling.UserOffEntitlement) bool {
-	e1To := time.Now().AddDate(100, 0, 0)
-	if e1.EffectiveTo != nil {
-		e1To = *e1.EffectiveTo
+// ApplyLeaveOverrides creates "off" schedule overrides for approved leave days
+func (s *schedulingServiceImpl) ApplyApprovedLeave(
+	ctx context.Context,
+	leaveRequest *leaveModels.LeaveRequest,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+
+	if leaveRequest.Status != "approved" {
+		return nil // nothing to do
 	}
 
-	e2To := time.Now().AddDate(100, 0, 0)
-	if e2.EffectiveTo != nil {
-		e2To = *e2.EffectiveTo
+	// 🔥 Resolve timezone from user's work calendar (NOT company)
+	tz := s.getUserTimezone(
+		ctx,
+		leaveRequest.CompanyID,
+		leaveRequest.UserID,
+	)
+
+	start := normalizeBusinessDate(leaveRequest.StartDate, tz)
+	end := normalizeBusinessDate(leaveRequest.EndDate, tz)
+
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+
+		override := &scheduling.ScheduleOverride{
+			OverrideID:   uuid.New(),
+			CompanyID:    leaveRequest.CompanyID,
+			UserID:       leaveRequest.UserID,
+			OverrideDate: d,
+			OverrideType: "off",
+			Reason: util.StringPtr(
+				fmt.Sprintf("leave_%s", leaveRequest.LeaveRequestID),
+			),
+		}
+
+		_, err := s.CreateScheduleOverride(
+			ctx,
+			leaveRequest.CompanyID,
+			override,
+			actorType,
+			actorID,
+			map[string]interface{}{
+				"leave_request_id": leaveRequest.LeaveRequestID.String(),
+				"timezone":         tz,
+			},
+		)
+
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			s.logger.Warn(
+				"Failed to apply leave schedule override",
+				util.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
+				util.String("date", d.Format("2006-01-02")),
+				util.String("timezone", tz),
+				util.ErrorField(err),
+			)
+		}
 	}
 
-	return e1.EffectiveFrom.Before(e2To) && e2.EffectiveFrom.Before(e1To)
+	return nil
+}
+
+// RollbackCancelledLeave removes schedule overrides created for a leave request
+func (s *schedulingServiceImpl) RollbackCancelledLeave(
+	ctx context.Context,
+	leaveRequest *leaveModels.LeaveRequest,
+	actorType string,
+	actorID uuid.UUID,
+) error {
+
+	reason := fmt.Sprintf("leave_%s", leaveRequest.LeaveRequestID)
+
+	err := s.schedulingRepo.DeleteScheduleOverridesByReason(
+		ctx,
+		leaveRequest.CompanyID,
+		leaveRequest.UserID,
+		reason,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to rollback leave overrides: %w", err)
+	}
+
+	s.logger.Info(
+		"Leave schedule overrides rolled back",
+		util.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
+		util.String("user_id", leaveRequest.UserID.String()),
+		util.String("reason", reason),
+	)
+
+	return nil
+}
+
+func (s *schedulingServiceImpl) getUserTimezone(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+) string {
+
+	tz, err := s.schedulingRepo.GetWorkCalendarTimezoneForUser(
+		ctx,
+		companyID,
+		userID,
+	)
+	if err != nil || tz == "" {
+		return "UTC"
+	}
+
+	return tz
+}
+
+func (s *schedulingServiceImpl) UpdateWorkCenterShiftMappingByKey(
+	ctx context.Context,
+	companyID uuid.UUID,
+	workCenterCode string,
+	update scheduling.WorkCenterShiftMappingUpdate,
+	actorType string,
+	actorID uuid.UUID,
+	metadata map[string]interface{},
+) error {
+	startTime := time.Now()
+
+	if workCenterCode == "" {
+		return fmt.Errorf("work_center_code is required")
+	}
+
+	// Get the current active mapping for this work center
+	currentDate := time.Now().UTC()
+	mapping, err := s.schedulingRepo.GetWorkCenterShiftByCode(ctx, companyID, workCenterCode, currentDate)
+	if err != nil {
+		return fmt.Errorf("failed to get current work center shift mapping: %w", err)
+	}
+
+	if mapping == nil {
+		return fmt.Errorf("no active shift mapping found for work center: %s", workCenterCode)
+	}
+
+	beforeState, _ := json.Marshal(mapping)
+
+	// Apply the update
+	if update.ShiftID != nil {
+		// Validate the new shift exists and belongs to the company
+		shiftTemplate, err := s.schedulingRepo.GetScheduleTemplateByID(ctx, *update.ShiftID)
+		if err != nil {
+			return fmt.Errorf("shift template not found: %w", err)
+		}
+		if shiftTemplate.CompanyID != companyID {
+			return fmt.Errorf("shift template does not belong to company")
+		}
+		mapping.ShiftID = *update.ShiftID
+	}
+
+	if update.EffectiveTo != nil {
+		mapping.EffectiveTo = update.EffectiveTo
+		mapping.IsActive = false // Setting an effective_to ends the mapping
+	}
+
+	// Update the mapping
+	err = s.schedulingRepo.UpdateWorkCenterShiftMapping(ctx, mapping)
+	if err != nil {
+		s.logger.Error("Failed to update work center shift mapping by key",
+			util.String("company_id", companyID.String()),
+			util.String("work_center", workCenterCode),
+			util.String("mapping_id", mapping.MappingID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to update work center shift mapping: %w", err)
+	}
+
+	// Log audit
+	if s.auditService != nil {
+		go func() {
+			auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			afterState, _ := json.Marshal(mapping)
+			s.auditService.LogAction(
+				auditCtx,
+				&companyID,
+				"scheduling",
+				"work_center_shift_mapping.update_by_key",
+				"work_center_shift_mapping",
+				&mapping.MappingID,
+				actorType,
+				&actorID,
+				beforeState,
+				afterState,
+				metadata,
+			)
+		}()
+	}
+
+	s.logger.Info("Work center shift mapping updated by key",
+		util.String("mapping_id", mapping.MappingID.String()),
+		util.String("company_id", companyID.String()),
+		util.String("work_center", workCenterCode),
+		util.String("shift_id", mapping.ShiftID.String()),
+		util.Duration("duration", time.Since(startTime)),
+	)
+
+	return nil
 }

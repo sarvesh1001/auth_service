@@ -2,6 +2,7 @@ package handler
 
 import (
 	"auth-service/internal/hr/service"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,13 +13,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// AttendanceResolutionHandler handles attendance resolution operations
 type AttendanceResolutionHandler struct {
 	resolutionService service.AttendanceResolutionService
 	logger            *zap.Logger
 }
 
-// NewAttendanceResolutionHandler creates a new resolution handler
 func NewAttendanceResolutionHandler(
 	resolutionService service.AttendanceResolutionService,
 	logger *zap.Logger,
@@ -29,35 +28,28 @@ func NewAttendanceResolutionHandler(
 	}
 }
 
-// ResolveEventRequest represents a request to resolve a specific event
 type ResolveEventRequest struct {
 	EventID uuid.UUID `json:"event_id"`
 }
 
-// ResolveDayRequest represents a request to resolve a day for a user
 type ResolveDayRequest struct {
 	UserID      uuid.UUID `json:"user_id"`
 	Date        time.Time `json:"date"`
 	Recalculate bool      `json:"recalculate,omitempty"`
 }
 
-// BatchResolveRequest represents a batch resolution request
 type BatchResolveRequest struct {
 	EventIDs []uuid.UUID `json:"event_ids"`
 }
 
-// ResolveEvent handles resolving a specific attendance event
 func (h *AttendanceResolutionHandler) ResolveEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:resolve") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -91,18 +83,14 @@ func (h *AttendanceResolutionHandler) ResolveEvent(w http.ResponseWriter, r *htt
 	})
 }
 
-// ResolveDay handles resolving attendance for a specific day
 func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:resolve") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -132,7 +120,6 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
 			return
 		}
-
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Day recalculated successfully",
@@ -146,7 +133,6 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 			h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
 			return
 		}
-
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Day resolved successfully",
@@ -154,18 +140,14 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 	}
 }
 
-// BatchResolve handles batch resolution of events
 func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	// Check permission
 	if !h.hasPermission(ctx, companyID, "attendance:resolve:batch") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -182,7 +164,6 @@ func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Limit batch size
 	if len(req.EventIDs) > 1000 {
 		h.respondWithError(w, http.StatusBadRequest, "batch size cannot exceed 1000 events")
 		return
@@ -205,14 +186,11 @@ func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *htt
 	})
 }
 
-// ResolveDayByPath handles resolving attendance via URL parameters
 func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// ✅ FIXED: Use mustGetCompanyID helper
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -231,12 +209,11 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 	}
 
 	recalculate := r.URL.Query().Get("recalculate") == "true"
-
-	// Check permission
 	permission := "attendance:resolve"
 	if recalculate {
 		permission = "attendance:recalculate"
 	}
+
 	if !h.hasPermission(ctx, companyID, permission) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -251,7 +228,6 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
 			return
 		}
-
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Day recalculated successfully",
@@ -265,7 +241,6 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 			h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
 			return
 		}
-
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Day resolved successfully",
@@ -273,18 +248,18 @@ func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r 
 	}
 }
 
-// ✅ ADDED: Single source of truth for company ID
-func mustGetCompanyID(r *http.Request) (uuid.UUID, error) {
-	companyIDStr := chi.URLParam(r, "companyID")
-	if companyIDStr == "" {
-		return uuid.Nil, fmt.Errorf("company ID missing in URL")
+func (h *AttendanceResolutionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
+	permissions, ok := ctx.Value("permissions").([]string)
+	if !ok {
+		return false
 	}
-	return uuid.Parse(companyIDStr)
-}
 
-func (h *AttendanceResolutionHandler) hasPermission(ctx interface{}, companyID uuid.UUID, permission string) bool {
-	// Implement permission checking logic
-	return true
+	for _, p := range permissions {
+		if p == permission {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *AttendanceResolutionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {

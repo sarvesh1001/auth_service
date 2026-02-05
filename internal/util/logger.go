@@ -2,6 +2,7 @@ package util
 
 import (
 	"encoding/json" // ✅ add this
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -13,6 +14,10 @@ import (
 var (
 	globalLogger *zap.Logger
 	once         sync.Once
+)
+
+var (
+	ErrUnauthorized = errors.New("unauthorized")
 )
 
 // Init initializes the global logger based on environment

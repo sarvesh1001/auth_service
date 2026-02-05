@@ -1,9 +1,6 @@
-// attendance_source_resolver.go
 package service
 
 import (
-	"auth-service/internal/hr/models/attendance"
-	"auth-service/internal/hr/repository"
 	"context"
 	"fmt"
 	"sync"
@@ -15,17 +12,15 @@ import (
 // INTERFACE
 // ==============================================
 
-// AttendanceSourceResolver converts a source_type into runtime rules used by ingest
-// Source types are GLOBAL - same for all companies
 type AttendanceSourceResolver interface {
 	Resolve(ctx context.Context, sourceType string) (*ResolvedSourceRules, error)
+	GetAvailableSourceTypes(ctx context.Context) []*ResolvedSourceRules
 }
 
 // ==============================================
-// RUNTIME RULES STRUCT (NOT a DB model)
+// RUNTIME RULES (AUTHORITATIVE)
 // ==============================================
 
-// ResolvedSourceRules contains runtime validation rules for a specific source type
 type ResolvedSourceRules struct {
 	SourceType     string
 	Category       string
@@ -42,132 +37,169 @@ type ResolvedSourceRules struct {
 // ==============================================
 
 type attendanceSourceResolver struct {
-	repo   repository.AttendanceRepository
 	logger *zap.Logger
-	cache  sync.Map // sourceType -> *ResolvedSourceRules
+	cache  sync.Map
 }
 
-// NewAttendanceSourceResolver creates a new source resolver
+// NewAttendanceSourceResolver creates resolver
 func NewAttendanceSourceResolver(
-	repo repository.AttendanceRepository,
 	logger *zap.Logger,
 ) AttendanceSourceResolver {
 	return &attendanceSourceResolver{
-		repo:   repo,
 		logger: logger,
 		cache:  sync.Map{},
 	}
 }
 
-// Resolve converts a source_type into runtime rules (company-agnostic)
+// ==============================================
+// CANONICAL SOURCE DEFINITIONS (SAP STYLE)
+// ==============================================
+
+var canonicalSourceRules = map[string]*ResolvedSourceRules{
+
+	// ─────────────────────────────
+	// HUMAN SOURCES
+	// ─────────────────────────────
+
+	"manual": {
+		SourceType:     "manual",
+		Category:       "human",
+		RequiresDevice: false,
+		IsSystem:       false,
+		AllowBackdated: true,
+		AllowFuture:    false,
+		TrustLevel:     90,
+		IsSelfService:  false,
+	},
+
+	"mobile": {
+		SourceType:     "mobile",
+		Category:       "human",
+		RequiresDevice: false,
+		IsSystem:       false,
+		AllowBackdated: false,
+		AllowFuture:    false,
+		TrustLevel:     70,
+		IsSelfService:  true,
+	},
+
+	"web": {
+		SourceType:     "web",
+		Category:       "human",
+		RequiresDevice: false,
+		IsSystem:       false,
+		AllowBackdated: false,
+		AllowFuture:    false,
+		TrustLevel:     70,
+		IsSelfService:  false,
+	},
+
+	// ─────────────────────────────
+	// DEVICE SOURCES
+	// ─────────────────────────────
+
+	"biometric": {
+		SourceType:     "biometric",
+		Category:       "device",
+		RequiresDevice: true,
+		IsSystem:       false,
+		AllowBackdated: false,
+		AllowFuture:    false,
+		TrustLevel:     100,
+		IsSelfService:  true,
+	},
+
+	"kiosk": {
+		SourceType:     "kiosk",
+		Category:       "device",
+		RequiresDevice: true,
+		IsSystem:       false,
+		AllowBackdated: false,
+		AllowFuture:    false,
+		TrustLevel:     95,
+		IsSelfService:  true,
+	},
+
+	"classroom": {
+		SourceType:     "classroom",
+		Category:       "device",
+		RequiresDevice: true,
+		IsSystem:       false,
+		AllowBackdated: false,
+		AllowFuture:    false,
+		TrustLevel:     90,
+		IsSelfService:  false,
+	},
+
+	// ─────────────────────────────
+	// SYSTEM SOURCES
+	// ─────────────────────────────
+
+	"auto": {
+		SourceType:     "auto",
+		Category:       "system",
+		RequiresDevice: false,
+		IsSystem:       true,
+		AllowBackdated: true,
+		AllowFuture:    true,
+		TrustLevel:     100,
+		IsSelfService:  false,
+	},
+}
+
+// ==============================================
+// RESOLVE
+// ==============================================
+
 func (r *attendanceSourceResolver) Resolve(
 	ctx context.Context,
 	sourceType string,
 ) (*ResolvedSourceRules, error) {
-	// 1. Validate input
+
 	if sourceType == "" {
-		return nil, fmt.Errorf("sourceType is required")
+		return nil, fmt.Errorf("source_type is required")
 	}
 
-	// 2. Check cache first
-	if cached, found := r.cache.Load(sourceType); found {
-		rules := cached.(*ResolvedSourceRules)
-		r.logger.Debug("Cache hit for source type",
+	// Cache
+	if cached, ok := r.cache.Load(sourceType); ok {
+		return cached.(*ResolvedSourceRules), nil
+	}
+
+	// Canonical lookup
+	rules, ok := canonicalSourceRules[sourceType]
+	if !ok {
+		r.logger.Warn("Unsupported attendance source type",
 			zap.String("source_type", sourceType))
-		return rules, nil
+		return nil, fmt.Errorf("unsupported source type: %s", sourceType)
 	}
 
-	// 3. Get all source types from repository
-	sourceTypes, err := r.repo.GetAttendanceSourceTypes(ctx)
-	if err != nil {
-		r.logger.Error("Failed to get attendance source types",
-			zap.String("source_type", sourceType),
-			zap.Error(err))
-		return nil, fmt.Errorf("failed to load source types: %w", err)
-	}
+	// Defensive copy
+	resolved := *rules
+	r.cache.Store(sourceType, &resolved)
 
-	// 4. Find the specific source type
-	var resolvedType *attendance.AttendanceSourceType
-	for _, st := range sourceTypes {
-		if st.SourceType == sourceType {
-			resolvedType = st
-			break
-		}
-	}
+	r.logger.Debug("Resolved attendance source rules",
+		zap.String("source_type", resolved.SourceType),
+		zap.String("category", resolved.Category),
+		zap.Bool("requires_device", resolved.RequiresDevice),
+		zap.Bool("is_system", resolved.IsSystem),
+		zap.Int16("trust_level", resolved.TrustLevel),
+	)
 
-	// 5. Return error if not found
-	if resolvedType == nil {
-		r.logger.Warn("Source type not found",
-			zap.String("source_type", sourceType))
-		return nil, fmt.Errorf("source type '%s' not found or not supported", sourceType)
-	}
-
-	// 6. Create resolved rules
-	rules := &ResolvedSourceRules{
-		SourceType:     resolvedType.SourceType,
-		Category:       resolvedType.Category,
-		RequiresDevice: resolvedType.RequiresDevice,
-		IsSystem:       resolvedType.IsSystem,
-		AllowBackdated: resolvedType.AllowBackdated,
-		AllowFuture:    resolvedType.AllowFuture,
-		TrustLevel:     resolvedType.TrustLevel,
-		IsSelfService:  resolvedType.IsSelfService,
-	}
-
-	// 7. Cache the result
-	r.cache.Store(sourceType, rules)
-
-	r.logger.Debug("Resolved source type rules",
-		zap.String("source_type", sourceType),
-		zap.String("category", rules.Category),
-		zap.Bool("requires_device", rules.RequiresDevice),
-		zap.Bool("is_system", rules.IsSystem),
-		zap.Bool("allow_backdated", rules.AllowBackdated),
-		zap.Bool("allow_future", rules.AllowFuture),
-		zap.Int16("trust_level", rules.TrustLevel),
-		zap.Bool("is_self_service", rules.IsSelfService))
-
-	return rules, nil
+	return &resolved, nil
 }
 
-// GetAvailableSourceTypes returns all valid source types
+// ==============================================
+// LIST ALL
+// ==============================================
+
 func (r *attendanceSourceResolver) GetAvailableSourceTypes(
 	ctx context.Context,
-) ([]*ResolvedSourceRules, error) {
-	// Get all source types from repository
-	sourceTypes, err := r.repo.GetAttendanceSourceTypes(ctx)
-	if err != nil {
-		r.logger.Error("Failed to get attendance source types",
-			zap.Error(err))
-		return nil, fmt.Errorf("failed to load source types: %w", err)
-	}
+) []*ResolvedSourceRules {
 
-	// Convert to resolved rules
-	var rules []*ResolvedSourceRules
-	for _, st := range sourceTypes {
-		rules = append(rules, &ResolvedSourceRules{
-			SourceType:     st.SourceType,
-			Category:       st.Category,
-			RequiresDevice: st.RequiresDevice,
-			IsSystem:       st.IsSystem,
-			AllowBackdated: st.AllowBackdated,
-			AllowFuture:    st.AllowFuture,
-			TrustLevel:     st.TrustLevel,
-			IsSelfService:  st.IsSelfService,
-		})
+	var result []*ResolvedSourceRules
+	for _, v := range canonicalSourceRules {
+		c := *v
+		result = append(result, &c)
 	}
-
-	return rules, nil
-}
-
-// ValidateSourceType checks if a source type is valid
-func (r *attendanceSourceResolver) ValidateSourceType(
-	ctx context.Context,
-	sourceType string,
-) (bool, error) {
-	_, err := r.Resolve(ctx, sourceType)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return result
 }

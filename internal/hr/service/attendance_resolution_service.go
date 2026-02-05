@@ -1,12 +1,15 @@
 package service
 
 import (
-	"auth-service/internal/hr/models/attendance"
-	"auth-service/internal/hr/repository"
 	"context"
 	"fmt"
 	"sort"
 	"time"
+
+	"auth-service/internal/hr/models/attendance"
+	"auth-service/internal/hr/repository"
+
+	attconstants "auth-service/internal/hr/models/attendance"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -16,7 +19,6 @@ import (
 // INTERFACES
 // ============================================
 
-// AttendanceResolutionService resolves attendance events into daily summaries
 type AttendanceResolutionService interface {
 	ResolveEvent(
 		ctx context.Context,
@@ -42,13 +44,40 @@ type AttendanceResolutionService interface {
 }
 
 // ============================================
-// MAIN SERVICE IMPLEMENTATION
+// HELPER TYPES
+// ============================================
+
+type PairedEvent struct {
+	CheckIn      *attendance.AttendanceEvent
+	CheckOut     *attendance.AttendanceEvent
+	CheckInTime  *time.Time
+	CheckOutTime *time.Time
+	BreakStart   *time.Time
+	BreakEnd     *time.Time
+}
+
+type DailyMetrics struct {
+	WorkedMinutes   *int
+	OvertimeMinutes *int
+	LateMinutes     *int
+	BreakMinutes    *int
+	CheckIns        int
+	CheckOuts       int
+	FirstCheckIn    *time.Time
+	LastCheckOut    *time.Time
+	Status          string
+	PairedEvents    []PairedEvent
+}
+
+// ============================================
+// MAIN SERVICE IMPLEMENTATION WITH AUDIT LOGS
 // ============================================
 
 type attendanceResolutionService struct {
 	attendanceRepo repository.AttendanceRepository
 	schedulingQS   SchedulingQueryService
 	schedulingQSA  SchedulingService
+	auditService   *AuditService
 	logger         *zap.Logger
 }
 
@@ -56,35 +85,111 @@ func NewAttendanceResolutionService(
 	attendanceRepo repository.AttendanceRepository,
 	schedulingQS SchedulingQueryService,
 	schedulingQSA SchedulingService,
+	auditService *AuditService,
 	logger *zap.Logger,
 ) AttendanceResolutionService {
 	return &attendanceResolutionService{
 		attendanceRepo: attendanceRepo,
 		schedulingQS:   schedulingQS,
 		schedulingQSA:  schedulingQSA,
+		auditService:   auditService,
 		logger:         logger,
 	}
 }
 
 // ============================================
-// PUBLIC METHODS
+// PUBLIC METHODS WITH AUDIT LOGS
 // ============================================
 
 func (s *attendanceResolutionService) ResolveEvent(
 	ctx context.Context,
 	eventID uuid.UUID,
 ) error {
+	startTime := time.Now()
+
+	// 🎯 Initialize audit metadata
+	auditMetadata := map[string]interface{}{
+		"event_id":  eventID.String(),
+		"operation": "resolve_event",
+	}
+
 	if eventID == uuid.Nil {
-		return fmt.Errorf("eventID is required")
+		err := fmt.Errorf("eventID is required")
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				nil,
+				"attendance",
+				"resolution.event.invalid",
+				"attendance_event",
+				&eventID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
+		return err
 	}
 
 	// Load the event
 	event, err := s.attendanceRepo.GetAttendanceEventByID(ctx, eventID)
 	if err != nil {
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				nil,
+				"attendance",
+				"resolution.event.load_failed",
+				"attendance_event",
+				&eventID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 		return fmt.Errorf("failed to load attendance event: %w", err)
 	}
 	if event == nil {
-		return fmt.Errorf("attendance event not found")
+		err := fmt.Errorf("attendance event not found")
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				nil,
+				"attendance",
+				"resolution.event.not_found",
+				"attendance_event",
+				&eventID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
+		return err
+	}
+
+	// 🎯 Log event loaded
+	if s.auditService != nil {
+		auditMetadata["user_id"] = event.UserID.String()
+		auditMetadata["company_id"] = event.CompanyID.String()
+		auditMetadata["event_type"] = event.EventType
+		s.auditService.LogAction(ctx,
+			&event.CompanyID,
+			"attendance",
+			"resolution.event.loaded",
+			"attendance_event",
+			&eventID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
 	}
 
 	// Get shift information for timezone
@@ -100,6 +205,24 @@ func (s *attendanceResolutionService) ResolveEvent(
 			ScheduleStatus: "unknown",
 			Timezone:       "UTC", // Default fallback
 		}
+
+		// 🎯 Log shift resolution failure
+		if s.auditService != nil {
+			auditMetadata["shift_resolution_error"] = err.Error()
+			auditMetadata["timezone_fallback"] = "UTC"
+			s.auditService.LogAction(ctx,
+				&event.CompanyID,
+				"attendance",
+				"resolution.event.shift_fallback",
+				"user",
+				&event.UserID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 	}
 
 	// 🔴 FIX 1: TIMEZONE BUG - Truncate in business timezone, not UTC
@@ -110,6 +233,23 @@ func (s *attendanceResolutionService) ResolveEvent(
 			zap.Error(err),
 		)
 		loc = time.UTC
+
+		// 🎯 Log timezone load failure
+		if s.auditService != nil {
+			auditMetadata["timezone_load_error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				&event.CompanyID,
+				"attendance",
+				"resolution.event.timezone_fallback",
+				"user",
+				&event.UserID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 	}
 
 	// Convert event time to business timezone and extract date
@@ -122,16 +262,62 @@ func (s *attendanceResolutionService) ResolveEvent(
 		loc,
 	)
 
-	// 🔴 FIX 3: IDEMPOTENCY - Check if already resolved
+	// ✅ NEW PAYROLL LOCK CHECK
 	existingSummary, _ := s.attendanceRepo.GetAttendanceDailySummaryByUserDate(
 		ctx, event.UserID, businessDate,
 	)
+	if existingSummary != nil && existingSummary.IsPayrollLocked {
+		s.logger.Info("Attendance locked by payroll, skipping resolution",
+			zap.String("user_id", event.UserID.String()),
+			zap.Time("date", businessDate),
+		)
+
+		// 🎯 Log payroll lock
+		if s.auditService != nil {
+			auditMetadata["payroll_locked"] = true
+			auditMetadata["summary_id"] = existingSummary.AttendanceSummaryID.String()
+			auditMetadata["business_date"] = businessDate.Format("2006-01-02")
+			s.auditService.LogAction(ctx,
+				&event.CompanyID,
+				"attendance",
+				"resolution.event.payroll_locked",
+				"attendance_summary",
+				&existingSummary.AttendanceSummaryID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
+		return nil
+	}
+
+	// 🔴 FIX 3: IDEMPOTENCY - Check if already resolved
 	if existingSummary != nil && existingSummary.GeneratedBy == "attendance_resolution_service" {
 		// Already resolved by our service, skip unless forced
 		s.logger.Debug("Day already resolved, skipping",
 			zap.String("user_id", event.UserID.String()),
 			zap.Time("business_date", businessDate),
 		)
+
+		// 🎯 Log already resolved
+		if s.auditService != nil {
+			auditMetadata["already_resolved"] = true
+			auditMetadata["summary_id"] = existingSummary.AttendanceSummaryID.String()
+			s.auditService.LogAction(ctx,
+				&event.CompanyID,
+				"attendance",
+				"resolution.event.already_resolved",
+				"attendance_summary",
+				&existingSummary.AttendanceSummaryID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 		return nil
 	}
 
@@ -148,6 +334,21 @@ func (s *attendanceResolutionService) ResolveEvent(
 		0, // no limit
 	)
 	if err != nil {
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				&event.CompanyID,
+				"attendance",
+				"resolution.event.fetch_events_failed",
+				"user",
+				&event.UserID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 		return fmt.Errorf("failed to get user events for date: %w", err)
 	}
 
@@ -168,10 +369,63 @@ func (s *attendanceResolutionService) ResolveEvent(
 		}
 	}
 
+	// 🎯 Log event filtering
+	if s.auditService != nil {
+		auditMetadata["total_events"] = len(events)
+		auditMetadata["filtered_events"] = len(filteredEvents)
+		auditMetadata["fetch_window_start"] = fetchStart.Format(time.RFC3339)
+		auditMetadata["fetch_window_end"] = fetchEnd.Format(time.RFC3339)
+		s.auditService.LogAction(ctx,
+			&event.CompanyID,
+			"attendance",
+			"resolution.event.filtered",
+			"user",
+			&event.UserID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
+	}
+
 	// Apply attendance rules
 	err = s.applyAttendanceRules(ctx, filteredEvents, event.CompanyID, event.UserID, businessDate, shift)
 	if err != nil {
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			s.auditService.LogAction(ctx,
+				&event.CompanyID,
+				"attendance",
+				"resolution.event.rules_failed",
+				"user",
+				&event.UserID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 		return fmt.Errorf("failed to apply attendance rules: %w", err)
+	}
+
+	// 🎯 Log successful resolution
+	if s.auditService != nil {
+		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		s.auditService.LogAction(ctx,
+			&event.CompanyID,
+			"attendance",
+			"resolution.event.completed",
+			"user",
+			&event.UserID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
 	}
 
 	s.logger.Info("Attendance event resolved",
@@ -190,6 +444,16 @@ func (s *attendanceResolutionService) ResolveDay(
 	companyID, userID uuid.UUID,
 	date time.Time,
 ) error {
+	startTime := time.Now()
+
+	// 🎯 Initialize audit metadata
+	auditMetadata := map[string]interface{}{
+		"user_id":    userID.String(),
+		"company_id": companyID.String(),
+		"date":       date.Format("2006-01-02"),
+		"operation":  "resolve_day",
+	}
+
 	// Get shift information for timezone
 	shift, err := s.resolveShift(ctx, companyID, userID, date)
 	if err != nil {
@@ -203,12 +467,45 @@ func (s *attendanceResolutionService) ResolveDay(
 			ScheduleStatus: "unknown",
 			Timezone:       "UTC",
 		}
+
+		// 🎯 Log shift resolution failure
+		if s.auditService != nil {
+			auditMetadata["shift_resolution_error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"resolution.day.shift_fallback",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 	}
 
 	// 🔴 FIX 1: TIMEZONE BUG - Truncate in business timezone
 	loc, err := time.LoadLocation(shift.Timezone)
 	if err != nil {
 		loc = time.UTC
+		// 🎯 Log timezone load failure
+		if s.auditService != nil {
+			auditMetadata["timezone_load_error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"resolution.day.timezone_fallback",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 	}
 
 	dateInLoc := date.In(loc)
@@ -232,6 +529,22 @@ func (s *attendanceResolutionService) ResolveDay(
 		0,
 	)
 	if err != nil {
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"resolution.day.fetch_events_failed",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 		return fmt.Errorf("failed to get user events for date: %w", err)
 	}
 
@@ -251,15 +564,93 @@ func (s *attendanceResolutionService) ResolveDay(
 		}
 	}
 
-	return s.applyAttendanceRules(ctx, filteredEvents, companyID, userID, businessDate, shift)
+	// 🎯 Log event statistics
+	if s.auditService != nil {
+		auditMetadata["total_events"] = len(events)
+		auditMetadata["filtered_events"] = len(filteredEvents)
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"resolution.day.events_loaded",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
+	}
+
+	err = s.applyAttendanceRules(ctx, filteredEvents, companyID, userID, businessDate, shift)
+	if err != nil {
+		if s.auditService != nil {
+			auditMetadata["error"] = err.Error()
+			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"resolution.day.rules_failed",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
+		return err
+	}
+
+	// 🎯 Log successful resolution
+	if s.auditService != nil {
+		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"resolution.day.completed",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
+	}
+
+	return nil
 }
 
 func (s *attendanceResolutionService) BatchResolveEvents(
 	ctx context.Context,
 	eventIDs []uuid.UUID,
 ) error {
+	startTime := time.Now()
+
 	if len(eventIDs) == 0 {
 		return fmt.Errorf("no event IDs provided")
+	}
+
+	// 🎯 Log batch start
+	auditMetadata := map[string]interface{}{
+		"event_count": len(eventIDs),
+		"operation":   "batch_resolve_events",
+	}
+	if s.auditService != nil {
+		s.auditService.LogAction(ctx,
+			nil,
+			"attendance",
+			"resolution.batch.start",
+			"batch_operation",
+			nil,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
 	}
 
 	// Group by (user, business_date) to avoid duplicate processing
@@ -271,6 +662,8 @@ func (s *attendanceResolutionService) BatchResolveEvents(
 	}
 
 	processedDays := make(map[userDateKey]struct{})
+	processedCount := 0
+	skippedCount := 0
 
 	for _, eventID := range eventIDs {
 		event, err := s.attendanceRepo.GetAttendanceEventByID(ctx, eventID)
@@ -310,6 +703,19 @@ func (s *attendanceResolutionService) BatchResolveEvents(
 			loc,
 		)
 
+		// ✅ NEW PAYROLL LOCK CHECK for batch processing
+		existingSummary, _ := s.attendanceRepo.GetAttendanceDailySummaryByUserDate(
+			ctx, event.UserID, businessDate,
+		)
+		if existingSummary != nil && existingSummary.IsPayrollLocked {
+			s.logger.Info("Attendance locked by payroll, skipping resolution in batch",
+				zap.String("user_id", event.UserID.String()),
+				zap.Time("date", businessDate),
+			)
+			skippedCount++
+			continue
+		}
+
 		key := userDateKey{
 			UserID:       event.UserID,
 			CompanyID:    event.CompanyID,
@@ -325,8 +731,31 @@ func (s *attendanceResolutionService) BatchResolveEvents(
 					zap.Time("business_date", businessDate),
 					zap.Error(err),
 				)
+			} else {
+				processedCount++
 			}
+		} else {
+			skippedCount++
 		}
+	}
+
+	// 🎯 Log batch completion
+	if s.auditService != nil {
+		auditMetadata["processed_days"] = processedCount
+		auditMetadata["skipped_days"] = skippedCount
+		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		s.auditService.LogAction(ctx,
+			nil,
+			"attendance",
+			"resolution.batch.completed",
+			"batch_operation",
+			nil,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
 	}
 
 	return nil
@@ -337,10 +766,37 @@ func (s *attendanceResolutionService) RecalculateDay(
 	companyID, userID uuid.UUID,
 	date time.Time,
 ) error {
+	startTime := time.Now()
+
+	// 🎯 Initialize audit metadata
+	auditMetadata := map[string]interface{}{
+		"user_id":    userID.String(),
+		"company_id": companyID.String(),
+		"date":       date.Format("2006-01-02"),
+		"operation":  "recalculate_day",
+	}
+
 	// Get shift for timezone
 	shift, err := s.resolveShift(ctx, companyID, userID, date)
 	if err != nil {
 		shift = &ShiftContext{Timezone: "UTC"}
+
+		// 🎯 Log shift resolution failure
+		if s.auditService != nil {
+			auditMetadata["shift_resolution_error"] = err.Error()
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"recalculation.day.shift_fallback",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
 	}
 
 	// Calculate business date
@@ -358,23 +814,123 @@ func (s *attendanceResolutionService) RecalculateDay(
 		loc,
 	)
 
-	// Delete existing summary
+	// ✅ NEW PAYROLL LOCK CHECK
 	existingSummary, err := s.attendanceRepo.GetAttendanceDailySummaryByUserDate(ctx, userID, businessDate)
 	if err == nil && existingSummary != nil {
+		if existingSummary.IsPayrollLocked {
+			s.logger.Info("Attendance locked by payroll, skipping recalculation",
+				zap.String("user_id", userID.String()),
+				zap.Time("business_date", businessDate),
+			)
+
+			// 🎯 Log payroll lock
+			if s.auditService != nil {
+				auditMetadata["payroll_locked"] = true
+				auditMetadata["summary_id"] = existingSummary.AttendanceSummaryID.String()
+				auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"recalculation.day.payroll_locked",
+					"attendance_summary",
+					&existingSummary.AttendanceSummaryID,
+					"system",
+					nil,
+					nil,
+					nil,
+					auditMetadata,
+				)
+			}
+			return nil
+		}
+
+		// Delete existing summary if not payroll locked
 		if err := s.attendanceRepo.DeleteAttendanceDailySummary(ctx, existingSummary.AttendanceSummaryID); err != nil {
 			s.logger.Warn("Failed to delete existing summary",
 				zap.String("summary_id", existingSummary.AttendanceSummaryID.String()),
 				zap.Error(err),
 			)
+
+			// 🎯 Log deletion failure
+			if s.auditService != nil {
+				auditMetadata["delete_summary_error"] = err.Error()
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"recalculation.day.delete_failed",
+					"attendance_summary",
+					&existingSummary.AttendanceSummaryID,
+					"system",
+					nil,
+					nil,
+					nil,
+					auditMetadata,
+				)
+			}
+		} else {
+			// 🎯 Log successful deletion
+			if s.auditService != nil {
+				auditMetadata["summary_deleted"] = true
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"recalculation.day.deleted",
+					"attendance_summary",
+					&existingSummary.AttendanceSummaryID,
+					"system",
+					nil,
+					nil,
+					nil,
+					auditMetadata,
+				)
+			}
 		}
 	}
 
+	// 🎯 Log recalculation start
+	if s.auditService != nil {
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"recalculation.day.start",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
+	}
+
 	// Resolve the day
-	return s.ResolveDay(ctx, companyID, userID, date)
+	err = s.ResolveDay(ctx, companyID, userID, date)
+
+	// 🎯 Log recalculation completion
+	if s.auditService != nil {
+		if err != nil {
+			auditMetadata["error"] = err.Error()
+		}
+		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"recalculation.day.completed",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
+	}
+
+	return err
 }
 
 // ============================================
-// CORE LOGIC - applyAttendanceRules
+// CORE LOGIC - applyAttendanceRules WITH AUDIT LOGS
 // ============================================
 func (s *attendanceResolutionService) applyAttendanceRules(
 	ctx context.Context,
@@ -383,6 +939,31 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 	businessDate time.Time,
 	shift *ShiftContext,
 ) error {
+	// 🎯 Initialize audit metadata for rule application
+	auditMetadata := map[string]interface{}{
+		"user_id":         userID.String(),
+		"company_id":      companyID.String(),
+		"business_date":   businessDate.Format("2006-01-02"),
+		"event_count":     len(events),
+		"timezone":        shift.Timezone,
+		"schedule_status": shift.ScheduleStatus,
+	}
+
+	// 🎯 Log rule application start
+	if s.auditService != nil {
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"rules.apply.start",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			auditMetadata,
+		)
+	}
 
 	// 🔴 FIX 4.2: STATUS UPSERT HELPER (define BEFORE usage)
 	upsertStatus := func(status string, anomalies []string) error {
@@ -392,6 +973,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 			UserID:              userID,
 			AttendanceDate:      businessDate,
 			Status:              status,
+			IsPayrollLocked:     false, // ✅ Always false when created by resolution service
 			GeneratedAt:         time.Now().UTC(),
 			GeneratedBy:         "attendance_resolution_service",
 			Metadata: attendance.SummaryMetadata{
@@ -405,9 +987,62 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 		if existing, err := s.attendanceRepo.
 			GetAttendanceDailySummaryByUserDate(ctx, userID, businessDate); err == nil && existing != nil {
 			summary.AttendanceSummaryID = existing.AttendanceSummaryID
+			auditMetadata["existing_summary_id"] = existing.AttendanceSummaryID.String()
 		}
 
-		return s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary)
+		// 🎯 Log before upsert
+		if s.auditService != nil {
+			upsertMetadata := map[string]interface{}{
+				"user_id":       userID.String(),
+				"business_date": businessDate.Format("2006-01-02"),
+				"status":        status,
+				"anomalies":     anomalies,
+				"summary_id":    summary.AttendanceSummaryID.String(),
+			}
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"rules.upsert.before",
+				"attendance_summary",
+				&summary.AttendanceSummaryID,
+				"system",
+				nil,
+				nil,
+				nil,
+				upsertMetadata,
+			)
+		}
+
+		err := s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary)
+
+		// 🎯 Log after upsert
+		if s.auditService != nil {
+			upsertMetadata := map[string]interface{}{
+				"user_id":       userID.String(),
+				"business_date": businessDate.Format("2006-01-02"),
+				"status":        status,
+				"anomalies":     anomalies,
+				"summary_id":    summary.AttendanceSummaryID.String(),
+				"success":       err == nil,
+			}
+			if err != nil {
+				upsertMetadata["error"] = err.Error()
+			}
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"rules.upsert.after",
+				"attendance_summary",
+				&summary.AttendanceSummaryID,
+				"system",
+				nil,
+				nil,
+				nil,
+				upsertMetadata,
+			)
+		}
+
+		return err
 	}
 
 	// 🔴 FIX 4.1: MANUAL OVERRIDE CORRECTIONS (HIGHEST PRIORITY)
@@ -417,6 +1052,30 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 
 				status := *event.Metadata.OverrideStatus
 				anomalies := s.detectAnomalies(events)
+
+				// 🎯 Log manual override detection
+				if s.auditService != nil {
+					overrideMetadata := map[string]interface{}{
+						"user_id":         userID.String(),
+						"business_date":   businessDate.Format("2006-01-02"),
+						"event_id":        event.AttendanceEventID.String(),
+						"override_status": status,
+						"anomalies":       anomalies,
+						"event_type":      event.EventType,
+					}
+					s.auditService.LogAction(ctx,
+						&companyID,
+						"attendance",
+						"rules.manual_override.detected",
+						"attendance_event",
+						&event.AttendanceEventID,
+						"system",
+						nil,
+						nil,
+						nil,
+						overrideMetadata,
+					)
+				}
 
 				// ✅ call closure directly
 				return upsertStatus(status, anomalies)
@@ -428,19 +1087,116 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 	if shift != nil {
 		switch shift.ScheduleStatus {
 		case "weekly_off", "off":
-			return upsertStatus("weekly_off", nil)
+			// 🎯 Log schedule override
+			if s.auditService != nil {
+				scheduleMetadata := map[string]interface{}{
+					"user_id":          userID.String(),
+					"business_date":    businessDate.Format("2006-01-02"),
+					"schedule_status":  shift.ScheduleStatus,
+					"resulting_status": attconstants.StatusWeeklyOff,
+				}
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"rules.schedule_override",
+					"user",
+					&userID,
+					"system",
+					nil,
+					nil,
+					nil,
+					scheduleMetadata,
+				)
+			}
+			return upsertStatus(attconstants.StatusWeeklyOff, nil)
 		case "holiday":
-			return upsertStatus("holiday", nil)
+			if s.auditService != nil {
+				scheduleMetadata := map[string]interface{}{
+					"user_id":          userID.String(),
+					"business_date":    businessDate.Format("2006-01-02"),
+					"schedule_status":  shift.ScheduleStatus,
+					"resulting_status": attconstants.StatusHoliday,
+				}
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"rules.schedule_override",
+					"user",
+					&userID,
+					"system",
+					nil,
+					nil,
+					nil,
+					scheduleMetadata,
+				)
+			}
+			return upsertStatus(attconstants.StatusHoliday, nil)
 		case "on_leave":
-			return upsertStatus("on_leave", nil)
+			if s.auditService != nil {
+				scheduleMetadata := map[string]interface{}{
+					"user_id":          userID.String(),
+					"business_date":    businessDate.Format("2006-01-02"),
+					"schedule_status":  shift.ScheduleStatus,
+					"resulting_status": attconstants.StatusLeavePaid,
+				}
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"rules.schedule_override",
+					"user",
+					&userID,
+					"system",
+					nil,
+					nil,
+					nil,
+					scheduleMetadata,
+				)
+			}
+			return upsertStatus(attconstants.StatusLeavePaid, nil)
 		case "not_schedulable":
-			return upsertStatus("not_scheduled", nil)
+			if s.auditService != nil {
+				scheduleMetadata := map[string]interface{}{
+					"user_id":          userID.String(),
+					"business_date":    businessDate.Format("2006-01-02"),
+					"schedule_status":  shift.ScheduleStatus,
+					"resulting_status": attconstants.StatusNotScheduled,
+				}
+				s.auditService.LogAction(ctx,
+					&companyID,
+					"attendance",
+					"rules.schedule_override",
+					"user",
+					&userID,
+					"system",
+					nil,
+					nil,
+					nil,
+					scheduleMetadata,
+				)
+			}
+			return upsertStatus(attconstants.StatusNotScheduled, nil)
 		}
 	}
 
 	// ⚪ No events → absent
 	if len(events) == 0 {
-		return upsertStatus("absent", nil)
+		// 🎯 Log no events scenario
+		if s.auditService != nil {
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"rules.no_events",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				auditMetadata,
+			)
+		}
+		// ✅ FIX 1: Use status constant
+		return upsertStatus(attconstants.StatusAbsent, nil)
 	}
 
 	// 1️⃣ Sort events by time
@@ -450,6 +1206,28 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 
 	// 2️⃣ Detect anomalies
 	anomalies := s.detectAnomalies(events)
+
+	// 🎯 Log anomaly detection
+	if s.auditService != nil {
+		anomalyMetadata := map[string]interface{}{
+			"user_id":       userID.String(),
+			"business_date": businessDate.Format("2006-01-02"),
+			"anomalies":     anomalies,
+			"anomaly_count": len(anomalies),
+		}
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"rules.anomalies.detected",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			anomalyMetadata,
+		)
+	}
 
 	// 3️⃣ Pair check-in / check-out
 	pairedEvents := s.pairCheckInCheckOut(events)
@@ -468,6 +1246,50 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 			zap.Time("date", businessDate),
 			zap.Error(err),
 		)
+
+		// 🎯 Log policy resolution failure
+		if s.auditService != nil {
+			policyMetadata := map[string]interface{}{
+				"user_id":       userID.String(),
+				"business_date": businessDate.Format("2006-01-02"),
+				"error":         err.Error(),
+			}
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"rules.policy.resolution_failed",
+				"user",
+				&userID,
+				"system",
+				nil,
+				nil,
+				nil,
+				policyMetadata,
+			)
+		}
+	} else {
+		// 🎯 Log policy resolution success
+		if s.auditService != nil {
+			policyMetadata := map[string]interface{}{
+				"user_id":       userID.String(),
+				"business_date": businessDate.Format("2006-01-02"),
+				"policy_id":     policy.PolicyID.String(),
+				"policy_code":   policy.PolicyCode,
+				"policy_type":   policy.PolicyType,
+			}
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"rules.policy.resolved",
+				"attendance_policy",
+				&policy.PolicyID,
+				"system",
+				nil,
+				nil,
+				nil,
+				policyMetadata,
+			)
+		}
 	}
 
 	// 5️⃣ Calculate metrics
@@ -476,6 +1298,32 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 	// 6️⃣ Determine final status
 	status := s.determineStatus(metrics, shift, policy)
 
+	// 🎯 Log status determination
+	if s.auditService != nil {
+		statusMetadata := map[string]interface{}{
+			"user_id":        userID.String(),
+			"business_date":  businessDate.Format("2006-01-02"),
+			"final_status":   status,
+			"checkins":       metrics.CheckIns,
+			"checkouts":      metrics.CheckOuts,
+			"worked_minutes": intValue(metrics.WorkedMinutes),
+			"late_minutes":   intValue(metrics.LateMinutes),
+			"paired_events":  len(pairedEvents),
+		}
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"rules.status.determined",
+			"user",
+			&userID,
+			"system",
+			nil,
+			nil,
+			nil,
+			statusMetadata,
+		)
+	}
+
 	// 7️⃣ Build summary
 	summary := &attendance.AttendanceDailySummary{
 		AttendanceSummaryID: uuid.New(),
@@ -483,6 +1331,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 		UserID:              userID,
 		AttendanceDate:      businessDate,
 		Status:              status,
+		IsPayrollLocked:     false, // ✅ Always false when created by resolution service
 		WorkedMinutes:       metrics.WorkedMinutes,
 		OvertimeMinutes:     metrics.OvertimeMinutes,
 		LateMinutes:         metrics.LateMinutes,
@@ -510,7 +1359,56 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 
 	// 8️⃣ Save summary
 	if err := s.attendanceRepo.UpsertAttendanceDailySummary(ctx, summary); err != nil {
+		// 🎯 Log save failure
+		if s.auditService != nil {
+			saveMetadata := map[string]interface{}{
+				"user_id":       userID.String(),
+				"business_date": businessDate.Format("2006-01-02"),
+				"summary_id":    summary.AttendanceSummaryID.String(),
+				"status":        status,
+				"error":         err.Error(),
+			}
+			s.auditService.LogAction(ctx,
+				&companyID,
+				"attendance",
+				"rules.summary.save_failed",
+				"attendance_summary",
+				&summary.AttendanceSummaryID,
+				"system",
+				nil,
+				nil,
+				nil,
+				saveMetadata,
+			)
+		}
 		return fmt.Errorf("failed to save attendance summary: %w", err)
+	}
+
+	// 🎯 Log successful save
+	if s.auditService != nil {
+		saveMetadata := map[string]interface{}{
+			"user_id":          userID.String(),
+			"business_date":    businessDate.Format("2006-01-02"),
+			"summary_id":       summary.AttendanceSummaryID.String(),
+			"status":           status,
+			"worked_minutes":   intValue(metrics.WorkedMinutes),
+			"late_minutes":     intValue(metrics.LateMinutes),
+			"overtime_minutes": intValue(metrics.OvertimeMinutes),
+			"anomalies":        anomalies,
+			"timezone":         shift.Timezone,
+		}
+		s.auditService.LogAction(ctx,
+			&companyID,
+			"attendance",
+			"rules.summary.saved",
+			"attendance_summary",
+			&summary.AttendanceSummaryID,
+			"system",
+			nil,
+			nil,
+			nil,
+			saveMetadata,
+		)
 	}
 
 	s.logger.Info("Attendance summary saved",
@@ -529,34 +1427,53 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 }
 
 // ============================================
-// HELPER TYPES
+// HELPER METHODS (copied from original)
 // ============================================
 
-type PairedEvent struct {
-	CheckIn      *attendance.AttendanceEvent
-	CheckOut     *attendance.AttendanceEvent
-	CheckInTime  *time.Time
-	CheckOutTime *time.Time
-	BreakStart   *time.Time
-	BreakEnd     *time.Time
+func (s *attendanceResolutionService) resolveShift(
+	ctx context.Context,
+	companyID, userID uuid.UUID,
+	date time.Time,
+) (*ShiftContext, error) {
+	// Call scheduling service to resolve the day
+	resolvedDay, err := s.schedulingQSA.ResolveUserDay(ctx, companyID, userID, date)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve schedule: %w", err)
+	}
+
+	shiftCtx := &ShiftContext{
+		ScheduleDate:   resolvedDay.Date,
+		ScheduleStatus: resolvedDay.ScheduleStatus,
+		Timezone:       resolvedDay.Timezone,
+		IsOnLeave:      resolvedDay.IsOnLeave,
+		IsOverride:     resolvedDay.IsOverride,
+		OverrideType:   resolvedDay.OverrideType,
+		ExpectedStart:  resolvedDay.ExpectedStart,
+		ExpectedEnd:    resolvedDay.ExpectedEnd,
+		WorkCenterCode: resolvedDay.WorkCenterCode,
+		PositionID:     resolvedDay.PositionID,
+		DepartmentID:   resolvedDay.DepartmentID,
+	}
+
+	// Get shift details if schedule instance exists
+	if resolvedDay.ScheduleInstanceID != nil {
+		instance, err := s.schedulingQS.GetScheduleInstanceByID(ctx, *resolvedDay.ScheduleInstanceID)
+		if err == nil && instance != nil {
+			shiftCtx.ShiftID = &instance.ScheduleTemplateID
+			shiftCtx.Timezone = instance.Timezone // Use instance timezone if available
+		}
+	}
+
+	// Get shift name
+	if shiftCtx.ShiftID != nil {
+		template, err := s.schedulingQS.GetScheduleTemplateByID(ctx, *shiftCtx.ShiftID)
+		if err == nil && template != nil {
+			shiftCtx.ShiftName = &template.Name
+		}
+	}
+
+	return shiftCtx, nil
 }
-
-type DailyMetrics struct {
-	WorkedMinutes   *int
-	OvertimeMinutes *int
-	LateMinutes     *int
-	BreakMinutes    *int
-	CheckIns        int
-	CheckOuts       int
-	FirstCheckIn    *time.Time
-	LastCheckOut    *time.Time
-	Status          string
-	PairedEvents    []PairedEvent
-}
-
-// ============================================
-// CORE BUSINESS LOGIC
-// ============================================
 
 func (s *attendanceResolutionService) detectAnomalies(events []*attendance.AttendanceEvent) []string {
 	var anomalies []string
@@ -615,11 +1532,11 @@ func (s *attendanceResolutionService) pairCheckInCheckOut(
 		}
 
 		// Second: priority (higher wins)
-		priorityI := getSourcePriority(
+		priorityI := s.getSourcePriority(
 			events[i].SourceType,
 			events[i].Metadata.IsCorrection,
 		)
-		priorityJ := getSourcePriority(
+		priorityJ := s.getSourcePriority(
 			events[j].SourceType,
 			events[j].Metadata.IsCorrection,
 		)
@@ -682,7 +1599,7 @@ func (s *attendanceResolutionService) pairCheckInCheckOut(
 	return paired
 }
 
-func getSourcePriority(sourceType string, isCorrection *bool) int {
+func (s *attendanceResolutionService) getSourcePriority(sourceType string, isCorrection *bool) int {
 	// Corrections always win
 	if isCorrection != nil && *isCorrection {
 		return 100
@@ -691,7 +1608,6 @@ func getSourcePriority(sourceType string, isCorrection *bool) int {
 	priorityMap := map[string]int{
 		"manual":    90,
 		"biometric": 80,
-		"rfid":      70,
 		"kiosk":     60,
 		"mobile":    50,
 		"web":       40,
@@ -714,7 +1630,7 @@ func (s *attendanceResolutionService) calculateMetrics(
 	anomalies []string,
 ) *DailyMetrics {
 	metrics := &DailyMetrics{
-		Status:       "present",
+		Status:       attconstants.StatusPresent,
 		PairedEvents: pairedEvents,
 	}
 
@@ -822,30 +1738,41 @@ func (s *attendanceResolutionService) determineStatus(
 	shift *ShiftContext,
 	policy *attendance.AttendancePolicy,
 ) string {
-	// No check-ins at all
-	if metrics.CheckIns == 0 {
-		return "absent"
+	// ✅ FIX 2: Don't overwrite schedule statuses blindly
+	if shift != nil && shift.ScheduleStatus != "" {
+		switch shift.ScheduleStatus {
+		case "weekly_off":
+			return attconstants.StatusWeeklyOff
+		case "holiday":
+			return attconstants.StatusHoliday
+		case "on_leave":
+			return attconstants.StatusLeavePaid
+			// For "active", "scheduled", or any other status, continue with normal flow
+		}
 	}
 
-	// Check schedule status
-	if shift != nil && shift.ScheduleStatus != "" &&
-		shift.ScheduleStatus != "active" && shift.ScheduleStatus != "scheduled" {
-		return shift.ScheduleStatus
+	// No check-ins at all
+	if metrics.CheckIns == 0 {
+		// ✅ FIX 1: Use status constant
+		return attconstants.StatusAbsent
 	}
 
 	// Late arrival handling
 	if metrics.LateMinutes != nil && *metrics.LateMinutes > 0 {
 		if policy != nil && policy.Rules.MaxLateAllowed != nil &&
 			*metrics.LateMinutes > *policy.Rules.MaxLateAllowed {
-			return "absent"
+			// ✅ FIX 1: Use status constant
+			return attconstants.StatusAbsent
 		}
-		return "late"
+		// ✅ FIX 1: Use status constant
+		return attconstants.StatusLate
 	}
 
 	// Half day check
 	if metrics.WorkedMinutes != nil && policy != nil && policy.Rules.HalfDayAfter != nil {
 		if *metrics.WorkedMinutes < *policy.Rules.HalfDayAfter {
-			return "half_day"
+			// ✅ FIX 1: Use status constant
+			return attconstants.StatusHalfDay
 		}
 	}
 
@@ -853,68 +1780,23 @@ func (s *attendanceResolutionService) determineStatus(
 	if metrics.CheckIns > 0 && metrics.CheckOuts == 0 {
 		if policy != nil && policy.Rules.AutoCheckout != nil && *policy.Rules.AutoCheckout {
 			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 { // 4 hours
-				return "present"
+				// ✅ FIX 1: Use status constant
+				return attconstants.StatusPresent
 			}
 		}
+		// No constant for "incomplete" - using string literal
 		return "incomplete"
 	}
 
 	// Check-out without check-in
 	if metrics.CheckIns == 0 && metrics.CheckOuts > 0 {
+		// No constant for "incomplete" - using string literal
 		return "incomplete"
 	}
 
 	// Default to present
-	return "present"
-}
-
-// ============================================
-// RESOLUTION HELPERS
-// ============================================
-
-func (s *attendanceResolutionService) resolveShift(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	date time.Time,
-) (*ShiftContext, error) {
-	// Call scheduling service to resolve the day
-	resolvedDay, err := s.schedulingQSA.ResolveUserDay(ctx, companyID, userID, date)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve schedule: %w", err)
-	}
-
-	shiftCtx := &ShiftContext{
-		ScheduleDate:   resolvedDay.Date,
-		ScheduleStatus: resolvedDay.ScheduleStatus,
-		Timezone:       resolvedDay.Timezone,
-		IsOnLeave:      resolvedDay.IsOnLeave,
-		IsOverride:     resolvedDay.IsOverride,
-		OverrideType:   resolvedDay.OverrideType,
-		ExpectedStart:  resolvedDay.ExpectedStart,
-		ExpectedEnd:    resolvedDay.ExpectedEnd,
-		WorkCenterCode: resolvedDay.WorkCenterCode,
-		PositionID:     resolvedDay.PositionID,
-		DepartmentID:   resolvedDay.DepartmentID,
-	}
-
-	// Get shift details if schedule instance exists
-	if resolvedDay.ScheduleInstanceID != nil {
-		instance, err := s.schedulingQS.GetScheduleInstanceByID(ctx, *resolvedDay.ScheduleInstanceID)
-		if err == nil && instance != nil {
-			shiftCtx.ShiftID = &instance.ScheduleTemplateID
-			shiftCtx.Timezone = instance.Timezone // Use instance timezone if available
-		}
-	}
-
-	// Get shift name
-	if shiftCtx.ShiftID != nil {
-		template, err := s.schedulingQS.GetScheduleTemplateByID(ctx, *shiftCtx.ShiftID)
-		if err == nil && template != nil {
-			shiftCtx.ShiftName = &template.Name
-		}
-	}
-
-	return shiftCtx, nil
+	// ✅ FIX 1: Use status constant
+	return attconstants.StatusPresent
 }
 
 // ✅ UPDATED: resolvePolicy with work center and position hierarchy

@@ -46,6 +46,11 @@ type OrgUnitRepository interface {
 		orgUnitID, userID uuid.UUID,
 		effectiveTo time.Time,
 	) error
+	GetActiveUsersByOrgUnit(
+		ctx context.Context,
+		orgUnitID uuid.UUID,
+	) ([]uuid.UUID, error)
+
 	// Health
 	HealthCheck(ctx context.Context) error
 }

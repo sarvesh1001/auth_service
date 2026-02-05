@@ -6,6 +6,8 @@ import (
 	"auth-service/internal/middleware"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -90,13 +92,34 @@ func (h *SchedulingHandler) getCompanyDefaultTimezone(ctx context.Context, compa
 	return calendars[0].Timezone
 }
 
+// getCompanyIDFromContext helper function
+func getCompanyIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	rawCompanyID := ctx.Value("company_id")
+	if rawCompanyID == nil {
+		return uuid.Nil, errors.New("company_id not found in context")
+	}
+
+	switch v := rawCompanyID.(type) {
+	case uuid.UUID:
+		return v, nil
+	case string:
+		return uuid.Parse(v)
+	default:
+		return uuid.Nil, errors.New("invalid company_id type in context")
+	}
+}
+
 // Work Calendar Handlers
-func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) CreateWorkCalendar(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -109,7 +132,9 @@ func (h *SchedulingHandler) CreateWorkCalendar(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	calendar.CompanyID = companyID
+	// 🔒 ENFORCE SERVER OWNERSHIP
+	calendar.CompanyID = companyID // enforce company
+
 	result, err := h.schedulingService.CreateWorkCalendar(ctx, &calendar, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -249,12 +274,16 @@ func (h *SchedulingHandler) GetCalendarAvailability(w http.ResponseWriter, r *ht
 }
 
 // Schedule Template Handlers
-func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) CreateScheduleTemplate(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -267,7 +296,9 @@ func (h *SchedulingHandler) CreateScheduleTemplate(w http.ResponseWriter, r *htt
 		return
 	}
 
-	template.CompanyID = companyID
+	// 🔒 ENFORCE SERVER OWNERSHIP
+	template.CompanyID = companyID // enforce company
+
 	result, err := h.schedulingService.CreateScheduleTemplate(ctx, &template, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -380,10 +411,10 @@ func (h *SchedulingHandler) CreateScheduleInstance(
 ) {
 	ctx := r.Context()
 
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -424,7 +455,7 @@ func (h *SchedulingHandler) CreateScheduleInstance(
 
 	// Build instance (times resolved in service from template)
 	instance := &scheduling.ScheduleInstance{
-		CompanyID:          companyID,
+		CompanyID:          companyID, // from context
 		UserID:             req.UserID,
 		ScheduleDate:       businessDate,
 		ScheduleTemplateID: req.ScheduleTemplateID,
@@ -457,11 +488,10 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(
 ) {
 	ctx := r.Context()
 
-	// 1. Company ID (from URL)
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -515,7 +545,7 @@ func (h *SchedulingHandler) CreateScheduleInstanceFromPosition(
 	// 8. Call service
 	result, err := h.schedulingService.CreateScheduleInstanceFromPosition(
 		ctx,
-		companyID,
+		companyID, // from context
 		userID,
 		date,
 		actorType,
@@ -701,6 +731,14 @@ func (h *SchedulingHandler) SearchScheduleInstances(w http.ResponseWriter, r *ht
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
+
+	// ✅ ENFORCE company scope from context
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "Company ID not found in context")
+		return
+	}
+	filters.CompanyID = &companyID
 
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
@@ -924,286 +962,91 @@ func (h *SchedulingHandler) ResolveUserDay(w http.ResponseWriter, r *http.Reques
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-// Time Off Handlers
-func (h *SchedulingHandler) CreateOffEntitlement(w http.ResponseWriter, r *http.Request) {
+type CreateScheduleOverrideRequest struct {
+	UserID       uuid.UUID `json:"user_id"`
+	OverrideDate string    `json:"override_date"` // YYYY-MM-DD
+	OverrideType string    `json:"override_type"` // off | force_work | holiday_override
+	Reason       *string   `json:"reason,omitempty"`
+}
+
+// Schedule Override Handlers
+func (h *SchedulingHandler) CreateScheduleOverride(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
-	var entitlement scheduling.UserOffEntitlement
-	if err := json.NewDecoder(r.Body).Decode(&entitlement); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-		return
-	}
-
-	result, err := h.schedulingService.CreateOffEntitlement(ctx, companyID, &entitlement, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, result)
-}
-
-func (h *SchedulingHandler) GetOffEntitlements(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-		return
-	}
-
-	activeOnly := r.URL.Query().Get("active_only") != "false"
-	result, err := h.schedulingQueryService.GetOffEntitlementsByUser(ctx, userID, activeOnly)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) UpdateOffEntitlement(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	entitlementIDStr := chi.URLParam(r, "entitlementID")
-	entitlementID, err := uuid.Parse(entitlementIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid entitlement ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	var update scheduling.OffEntitlementUpdate
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-		return
-	}
-
-	result, err := h.schedulingService.UpdateOffEntitlement(ctx, entitlementID, update, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) DeleteOffEntitlement(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	entitlementIDStr := chi.URLParam(r, "entitlementID")
-	entitlementID, err := uuid.Parse(entitlementIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid entitlement ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	err = h.schedulingService.DeleteOffEntitlement(ctx, entitlementID, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]string{
-		"message": "Off entitlement deleted successfully",
-	})
-}
-
-func (h *SchedulingHandler) CreateOffRequest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	var request scheduling.OffRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-		return
-	}
-
-	result, err := h.schedulingService.CreateOffRequest(ctx, companyID, &request, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusCreated, result)
-}
-
-func (h *SchedulingHandler) GetOffRequests(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-
-	userIDStr := r.URL.Query().Get("user_id")
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	status := r.URL.Query().Get("status")
-
-	var startDate, endDate time.Time
-	if startDateStr != "" && endDateStr != "" {
-		startDate, err = normalizeBusinessDateFromString(startDateStr, "UTC")
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
-			return
-		}
-		endDate, err = normalizeBusinessDateFromString(endDateStr, "UTC")
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
-			return
-		}
-	}
-
-	var result []*scheduling.OffRequest
-	if userIDStr != "" {
-		userID, err := uuid.Parse(userIDStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-			return
-		}
-		result, err = h.schedulingQueryService.GetOffRequestsByUser(ctx, userID, startDate, endDate, &status)
-	} else {
-		result, err = h.schedulingQueryService.GetOffRequestsByCompany(ctx, companyID, startDate, endDate, &status)
-	}
-
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) ApproveOffRequest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	requestIDStr := chi.URLParam(r, "requestID")
-	requestID, err := uuid.Parse(requestIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	err = h.schedulingService.ApproveOffRequest(ctx, requestID, actorID, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]string{
-		"message": "Off request approved successfully",
-	})
-}
-
-func (h *SchedulingHandler) RejectOffRequest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	requestIDStr := chi.URLParam(r, "requestID")
-	requestID, err := uuid.Parse(requestIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	err = h.schedulingService.RejectOffRequest(ctx, requestID, actorID, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]string{
-		"message": "Off request rejected successfully",
-	})
-}
-
-func (h *SchedulingHandler) RequestTimeOff(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	var req struct {
-		Dates  []string `json:"dates"`
-		Reason string   `json:"reason"`
-	}
+	var req CreateScheduleOverrideRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 
-	if len(req.Dates) == 0 {
-		h.respondWithError(w, http.StatusBadRequest, "At least one date is required")
+	if req.UserID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
 		return
 	}
 
-	result, err := h.schedulingService.RequestTimeOff(ctx, companyID, userID, req.Dates, req.Reason, actorType, actorID)
+	if req.OverrideType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "override_type is required")
+		return
+	}
+
+	// Get user's timezone
+	userTimezone := h.getUserTimezone(ctx, req.UserID)
+
+	// Parse date in user's timezone
+	overrideDate, err := normalizeBusinessDateFromString(req.OverrideDate, userTimezone)
 	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.respondWithError(
+			w,
+			http.StatusBadRequest,
+			"override_date must be in YYYY-MM-DD format",
+		)
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusCreated, result)
-}
-
-// Schedule Override Handlers
-func (h *SchedulingHandler) CreateScheduleOverride(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+	// Check if override already exists for this user and date
+	existingOverride, err := h.schedulingQueryService.GetScheduleOverrideByUserDate(
+		ctx, req.UserID, overrideDate)
+	if err == nil && existingOverride != nil {
+		h.respondWithError(
+			w,
+			http.StatusConflict,
+			"Schedule override already exists for this date",
+		)
 		return
 	}
 
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	var override scheduling.ScheduleOverride
-	if err := json.NewDecoder(r.Body).Decode(&override); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-		return
+	// Create override with all required fields
+	now := time.Now()
+	override := &scheduling.ScheduleOverride{
+		OverrideID:   uuid.New(),
+		CompanyID:    companyID,
+		UserID:       req.UserID,
+		OverrideDate: overrideDate,
+		OverrideType: req.OverrideType,
+		Reason:       req.Reason,
+		CreatedBy:    &actorID,
+		CreatedAt:    now,
 	}
 
-	result, err := h.schedulingService.CreateScheduleOverride(ctx, companyID, &override, actorType, actorID, nil)
+	result, err := h.schedulingService.CreateScheduleOverride(
+		ctx,
+		companyID,
+		override,
+		actorType,
+		actorID,
+		nil,
+	)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1231,16 +1074,20 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Get appropriate timezone
 	timezone := "UTC"
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
 		if err == nil {
 			timezone = h.getUserTimezone(ctx, userID)
+		} else {
+			timezone = h.getCompanyDefaultTimezone(ctx, companyID)
 		}
 	} else {
 		timezone = h.getCompanyDefaultTimezone(ctx, companyID)
 	}
 
+	// Parse dates in the correct timezone
 	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
@@ -1253,16 +1100,33 @@ func (h *SchedulingHandler) GetScheduleOverrides(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Log for debugging
+	h.logger.Debug("Getting schedule overrides",
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userIDStr),
+		zap.String("start_date", startDateStr),
+		zap.String("end_date", endDateStr),
+		zap.String("timezone", timezone),
+		zap.String("override_type", overrideType),
+	)
+
 	var result []*scheduling.ScheduleOverride
+	var overrideTypePtr *string
+	if overrideType != "" {
+		overrideTypePtr = &overrideType
+	}
+
 	if userIDStr != "" {
 		userID, err := uuid.Parse(userIDStr)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 			return
 		}
-		result, err = h.schedulingQueryService.GetScheduleOverridesByUser(ctx, userID, startDate, endDate, &overrideType)
+		result, err = h.schedulingQueryService.GetScheduleOverridesByUser(
+			ctx, userID, startDate, endDate, overrideTypePtr)
 	} else {
-		result, err = h.schedulingQueryService.GetScheduleOverridesByCompany(ctx, companyID, startDate, endDate, &overrideType)
+		result, err = h.schedulingQueryService.GetScheduleOverridesByCompany(
+			ctx, companyID, startDate, endDate, overrideTypePtr)
 	}
 
 	if err != nil {
@@ -1313,12 +1177,16 @@ func (h *SchedulingHandler) ListWorkCenters(w http.ResponseWriter, r *http.Reque
 }
 
 // Work Center Shift Mapping Handlers
-func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) CreateWorkCenterShiftMapping(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -1331,6 +1199,9 @@ func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, 
 		return
 	}
 
+	// 🔒 ENFORCE SERVER OWNERSHIP
+	mapping.CompanyID = companyID // enforce company
+
 	err = h.schedulingService.CreateWorkCenterShiftMapping(ctx, companyID, &mapping, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1342,25 +1213,53 @@ func (h *SchedulingHandler) CreateWorkCenterShiftMapping(w http.ResponseWriter, 
 	})
 }
 
-func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) UpdateWorkCenterShiftMapping(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	mappingIDStr := chi.URLParam(r, "mappingID")
-	mappingID, err := uuid.Parse(mappingIDStr)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid mapping ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
 	actorType := middleware.GetSessionTypeFromContext(ctx)
 	actorID := middleware.GetUserIDFromContext(ctx)
 
-	var update scheduling.WorkCenterShiftMappingUpdate
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+	var req struct {
+		WorkCenterCode string    `json:"work_center_code"`
+		EffectiveTo    time.Time `json:"effective_to"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
 
-	err = h.schedulingService.UpdateWorkCenterShiftMapping(ctx, mappingID, update, actorType, actorID, nil)
+	if req.WorkCenterCode == "" {
+		h.respondWithError(
+			w,
+			http.StatusBadRequest,
+			"work_center_code is required",
+		)
+		return
+	}
+
+	update := scheduling.WorkCenterShiftMappingUpdate{
+		EffectiveTo: &req.EffectiveTo,
+	}
+
+	err = h.schedulingService.UpdateWorkCenterShiftMappingByKey(
+		ctx,
+		companyID,
+		req.WorkCenterCode,
+		update,
+		actorType,
+		actorID,
+		nil,
+	)
+
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1430,12 +1329,16 @@ func (h *SchedulingHandler) GetWorkCenterShifts(w http.ResponseWriter, r *http.R
 }
 
 // User Work Center Assignment Handlers
-func (h *SchedulingHandler) AssignUserToWorkCenter(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) AssignUserToWorkCenter(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -1447,6 +1350,9 @@ func (h *SchedulingHandler) AssignUserToWorkCenter(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
 		return
 	}
+
+	// 🔒 ENFORCE SERVER OWNERSHIP
+	assignment.CompanyID = companyID // enforce company
 
 	err = h.schedulingService.AssignUserToWorkCenter(ctx, companyID, &assignment, actorType, actorID, nil)
 	if err != nil {
@@ -1687,46 +1593,9 @@ func (h *SchedulingHandler) GetUserScheduleSummary(w http.ResponseWriter, r *htt
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-func (h *SchedulingHandler) GetUserTimeOffSummary(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-		return
-	}
-
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	if startDateStr == "" || endDateStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
-		return
-	}
-
-	userTimezone := h.getUserTimezone(ctx, userID)
-	startDate, err := normalizeBusinessDateFromString(startDateStr, userTimezone)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
-		return
-	}
-
-	endDate, err := normalizeBusinessDateFromString(endDateStr, userTimezone)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
-		return
-	}
-
-	result, err := h.schedulingQueryService.GetUserTimeOffSummary(ctx, userID, startDate, endDate)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
 func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userIDParam := r.URL.Query().Get("user_id")
 	if userIDParam == "" {
 		h.respondWithError(w, http.StatusBadRequest, "user_id parameter is required")
@@ -1739,13 +1608,20 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 		return
 	}
 
+	// ✅ Get company ID from context
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Company ID not found in context")
+		return
+	}
+
 	dateStr := r.URL.Query().Get("date")
-	timezone := r.URL.Query().Get("timezone")
 	if dateStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "date is required")
 		return
 	}
 
+	timezone := r.URL.Query().Get("timezone")
 	if timezone == "" {
 		timezone = h.getUserTimezone(ctx, userID)
 	}
@@ -1756,7 +1632,31 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 		return
 	}
 
-	result, err := h.schedulingService.CheckScheduleAvailability(ctx, userID, date, timezone)
+	// ✅ Validate employee exists
+	employee, err := h.schedulingQueryService.GetCompanyEmployeeByUserID(ctx, userID)
+	if err != nil {
+		h.respondWithError(
+			w,
+			http.StatusNotFound,
+			fmt.Sprintf("User %s is not an employee in this company", userID.String()),
+		)
+		return
+	}
+
+	// ✅ Validate employee belongs to this company
+	if employee.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "User does not belong to the specified company")
+		return
+	}
+
+	// ✅ PASS companyID INTO SERVICE
+	result, err := h.schedulingService.CheckScheduleAvailability(
+		ctx,
+		companyID,
+		userID,
+		date,
+		timezone,
+	)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1768,31 +1668,6 @@ func (h *SchedulingHandler) CheckScheduleAvailability(w http.ResponseWriter, r *
 		"timezone":       timezone,
 		"schedule_times": result,
 	})
-}
-
-func (h *SchedulingHandler) CheckDateAvailability(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	userID := middleware.GetUserIDFromContext(ctx)
-	dateStr := r.URL.Query().Get("date")
-	if dateStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "date parameter is required")
-		return
-	}
-
-	userTimezone := h.getUserTimezone(ctx, userID)
-	date, err := normalizeBusinessDateFromString(dateStr, userTimezone)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
-		return
-	}
-
-	result, err := h.schedulingQueryService.CheckDateAvailability(ctx, userID, date)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
 }
 
 func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *http.Request) {
@@ -1862,12 +1737,16 @@ func (h *SchedulingHandler) ValidateScheduleConflict(w http.ResponseWriter, r *h
 }
 
 // Bulk Operations
-func (h *SchedulingHandler) BulkCreateScheduleInstances(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) BulkCreateScheduleInstances(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+
+	// ✅ Company from context (single source of truth)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -1885,7 +1764,7 @@ func (h *SchedulingHandler) BulkCreateScheduleInstances(w http.ResponseWriter, r
 		return
 	}
 
-	// Set company ID for all instances
+	// Set company ID for all instances (from context)
 	for _, instance := range instances {
 		instance.CompanyID = companyID
 	}
@@ -1903,8 +1782,12 @@ func (h *SchedulingHandler) BulkCreateScheduleInstances(w http.ResponseWriter, r
 }
 
 // Work Center Schedule Handlers
-func (h *SchedulingHandler) GetWorkCenterSchedule(w http.ResponseWriter, r *http.Request) {
+func (h *SchedulingHandler) GetWorkCenterSchedule(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -1913,25 +1796,32 @@ func (h *SchedulingHandler) GetWorkCenterSchedule(w http.ResponseWriter, r *http
 	}
 
 	workCenterCode := chi.URLParam(r, "workCenterCode")
-	dateStr := r.URL.Query().Get("date")
 
-	var date time.Time
-	if dateStr != "" {
-		workCenter, err := h.schedulingQueryService.GetWorkCenterByCode(ctx, companyID, workCenterCode)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Work center not found")
-			return
-		}
-		date, err = normalizeBusinessDateFromString(dateStr, workCenter.Timezone)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
-			return
-		}
-	} else {
-		date = time.Now()
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "date is required")
+		return
 	}
 
-	result, err := h.schedulingQueryService.GetWorkCenterSchedule(ctx, companyID, workCenterCode, date)
+	workCenter, err := h.schedulingQueryService.
+		GetWorkCenterByCode(ctx, companyID, workCenterCode)
+	if err != nil || workCenter == nil {
+		h.respondWithError(w, http.StatusBadRequest, "Work center not found")
+		return
+	}
+
+	date, err := normalizeBusinessDateFromString(
+		dateStr,
+		workCenter.Timezone,
+	)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid date format")
+		return
+	}
+
+	result, err := h.schedulingQueryService.
+		GetWorkCenterSchedule(ctx, companyID, workCenterCode, date)
+
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2132,137 +2022,6 @@ func (h *SchedulingHandler) ProcessHolidayForDate(w http.ResponseWriter, r *http
 	})
 }
 
-func (h *SchedulingHandler) GetOffEntitlementByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	entitlementIDStr := chi.URLParam(r, "entitlementID")
-	entitlementID, err := uuid.Parse(entitlementIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid entitlement ID")
-		return
-	}
-
-	result, err := h.schedulingQueryService.GetOffEntitlementByID(ctx, entitlementID)
-	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, "Off entitlement not found")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) GetOffRequestByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	requestIDStr := chi.URLParam(r, "requestID")
-	requestID, err := uuid.Parse(requestIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request ID")
-		return
-	}
-
-	result, err := h.schedulingQueryService.GetOffRequestByID(ctx, requestID)
-	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, "Off request not found")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) UpdateOffRequest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	requestIDStr := chi.URLParam(r, "requestID")
-	requestID, err := uuid.Parse(requestIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	var update scheduling.OffRequestUpdate
-	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request payload")
-		return
-	}
-
-	result, err := h.schedulingService.UpdateOffRequest(ctx, requestID, update, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) DeleteOffRequest(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	requestIDStr := chi.URLParam(r, "requestID")
-	requestID, err := uuid.Parse(requestIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid request ID")
-		return
-	}
-
-	actorType := middleware.GetSessionTypeFromContext(ctx)
-	actorID := middleware.GetUserIDFromContext(ctx)
-
-	err = h.schedulingService.DeleteOffRequest(ctx, requestID, actorType, actorID, nil)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]string{
-		"message": "Off request deleted successfully",
-	})
-}
-
-func (h *SchedulingHandler) GetUserOffBalance(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
-		return
-	}
-
-	periodType := r.URL.Query().Get("period_type")
-	if periodType == "" {
-		periodType = "monthly"
-	}
-
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-
-	var startDate, endDate time.Time
-	if startDateStr != "" && endDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
-			return
-		}
-		endDate, err = time.Parse("2006-01-02", endDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
-			return
-		}
-	} else {
-		// Default to current month
-		now := time.Now()
-		startDate = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-		endDate = startDate.AddDate(0, 1, -1)
-	}
-
-	result, err := h.schedulingService.GetUserOffBalance(ctx, userID, periodType, startDate, endDate)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
 func (h *SchedulingHandler) GetScheduleOverrideByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	overrideIDStr := chi.URLParam(r, "overrideID")
@@ -2299,7 +2058,23 @@ func (h *SchedulingHandler) UpdateScheduleOverride(w http.ResponseWriter, r *htt
 		return
 	}
 
-	result, err := h.schedulingService.UpdateScheduleOverride(ctx, overrideID, update, actorType, actorID, nil)
+	// Validate override type
+	if update.OverrideType != nil && *update.OverrideType != "" {
+		validTypes := map[string]bool{
+			"off": true, "force_work": true, "holiday_override": true,
+		}
+		if !validTypes[*update.OverrideType] {
+			h.respondWithError(
+				w,
+				http.StatusBadRequest,
+				"Invalid override_type. Must be one of: off, force_work, holiday_override",
+			)
+			return
+		}
+	}
+
+	result, err := h.schedulingService.UpdateScheduleOverride(
+		ctx, overrideID, update, actorType, actorID, nil)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2383,44 +2158,6 @@ func (h *SchedulingHandler) GetScheduleInstancesByPosition(w http.ResponseWriter
 	h.respondWithJSON(w, http.StatusOK, result)
 }
 
-func (h *SchedulingHandler) GetCompanyTimeOffStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	if startDateStr == "" || endDateStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
-		return
-	}
-
-	timezone := h.getCompanyDefaultTimezone(ctx, companyID)
-	startDate, err := normalizeBusinessDateFromString(startDateStr, timezone)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid start date format")
-		return
-	}
-
-	endDate, err := normalizeBusinessDateFromString(endDateStr, timezone)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid end date format")
-		return
-	}
-
-	result, err := h.schedulingQueryService.GetCompanyTimeOffStats(ctx, companyID, startDate, endDate)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
 func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userIDStr := chi.URLParam(r, "userID")
@@ -2444,24 +2181,6 @@ func (h *SchedulingHandler) GetUserCurrentAssignment(w http.ResponseWriter, r *h
 	}
 
 	result, err := h.schedulingQueryService.GetUserCurrentScheduleAssignment(ctx, userID, date)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, result)
-}
-
-func (h *SchedulingHandler) GetPendingOffRequests(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
-		return
-	}
-
-	result, err := h.schedulingQueryService.GetPendingOffRequests(ctx, companyID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return

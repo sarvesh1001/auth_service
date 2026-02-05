@@ -163,28 +163,11 @@ type SchedulingQueryService interface {
 	GetUserScheduledPosition(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.Position, error)
 	GetUsersByPosition(ctx context.Context, positionID uuid.UUID, activeOnly bool) ([]uuid.UUID, error)
 
-	// Off Management
-	GetOffEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*scheduling.UserOffEntitlement, error)
-	GetOffEntitlementsByUser(ctx context.Context, userID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error)
-	GetOffEntitlementsByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error)
-	GetUserOffBalance(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
-
-	// Off Requests
-	GetOffRequestByID(ctx context.Context, requestID uuid.UUID) (*scheduling.OffRequest, error)
-	GetOffRequestsByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time, status *string) ([]*scheduling.OffRequest, error)
-	GetOffRequestsByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time, status *string) ([]*scheduling.OffRequest, error)
-	GetPendingOffRequests(ctx context.Context, companyID uuid.UUID) ([]*scheduling.OffRequest, error)
-
 	// Schedule Overrides
 	GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*scheduling.ScheduleOverride, error)
 	GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error)
 	GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error)
 	GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.ScheduleOverride, error)
-
-	// Time Off Summary
-	GetUserTimeOffSummary(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
-	GetCompanyTimeOffStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
-	CheckDateAvailability(ctx context.Context, userID uuid.UUID, date time.Time) (map[string]interface{}, error)
 
 	// Statistics and Coverage
 	GetScheduleStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (*ScheduleStats, error)
@@ -292,6 +275,10 @@ func (qs *schedulingQueryServiceImpl) GetWorkCenterShifts(
 	return shifts, nil
 }
 
+// ==============================================
+// POSITION-BASED SCHEDULING - NEW METHODS
+// ==============================================
+
 func (qs *schedulingQueryServiceImpl) GetWorkCenterSchedule(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -300,18 +287,36 @@ func (qs *schedulingQueryServiceImpl) GetWorkCenterSchedule(
 ) (*WorkCenterSchedule, error) {
 	startTime := time.Now()
 
-	// Get work center details
+	// 1️⃣ Get work center
 	workCenter, err := qs.schedulingRepo.GetWorkCenterByCode(ctx, companyID, workCenterCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get work center: %w", err)
 	}
-
 	if workCenter == nil {
 		return nil, fmt.Errorf("work center not found: %s", workCenterCode)
 	}
 
-	// Get current shift for the date
-	shifts, err := qs.schedulingRepo.GetWorkCenterShifts(ctx, companyID, workCenterCode, &date, &date)
+	// 2️⃣ Normalize business date in WC timezone
+	loc, err := time.LoadLocation(workCenter.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	businessDate := time.Date(
+		date.In(loc).Year(),
+		date.In(loc).Month(),
+		date.In(loc).Day(),
+		0, 0, 0, 0,
+		loc,
+	)
+
+	// 3️⃣ Fetch active shift for the date (date <= effective_to)
+	shifts, err := qs.schedulingRepo.GetWorkCenterShifts(
+		ctx,
+		companyID,
+		workCenterCode,
+		&businessDate,
+		nil, // open-ended to catch active shifts
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get work center shifts: %w", err)
 	}
@@ -319,7 +324,6 @@ func (qs *schedulingQueryServiceImpl) GetWorkCenterSchedule(
 	var currentShift *WorkCenterShiftDetail
 	if len(shifts) > 0 {
 		shift := shifts[0]
-		// Get template details
 		template, err := qs.schedulingRepo.GetScheduleTemplateByID(ctx, shift.ShiftID)
 		if err == nil && template != nil {
 			currentShift = &WorkCenterShiftDetail{
@@ -334,41 +338,43 @@ func (qs *schedulingQueryServiceImpl) GetWorkCenterSchedule(
 		}
 	}
 
-	// Get positions assigned to this work center
+	// 4️⃣ Get positions for work center
 	positions, err := qs.schedulingRepo.GetPositionsByWorkCenter(ctx, companyID, workCenterCode)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get positions by work center: %w", err)
 	}
 
-	// Count total employees in these positions
 	totalEmployees := int64(0)
 	scheduledToday := int64(0)
 
 	for _, position := range positions {
-		if position.IsSchedulable {
-			// Get employees in this position
-			employees, err := qs.schedulingRepo.GetUsersByPosition(ctx, position.PositionID)
-			if err == nil {
-				totalEmployees += int64(len(employees))
+		if !position.IsSchedulable {
+			continue
+		}
 
-				// Check who is scheduled today
-				for _, userID := range employees {
-					instance, err := qs.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, date)
-					if err == nil && instance != nil && instance.Status == "active" {
-						scheduledToday++
-					}
-				}
+		users, err := qs.schedulingRepo.GetUsersByPosition(ctx, position.PositionID)
+		if err != nil {
+			continue
+		}
+
+		totalEmployees += int64(len(users))
+
+		// 5️⃣ Bulk-safe check (correct date)
+		for _, userID := range users {
+			instance, err := qs.schedulingRepo.
+				GetScheduleInstanceByUserDate(ctx, userID, businessDate)
+			if err == nil && instance != nil && instance.Status == "active" {
+				scheduledToday++
 			}
 		}
 	}
 
-	// Calculate utilization
 	utilization := 0.0
 	if totalEmployees > 0 {
 		utilization = float64(scheduledToday) / float64(totalEmployees) * 100
 	}
 
-	schedule := &WorkCenterSchedule{
+	result := &WorkCenterSchedule{
 		WorkCenterCode: workCenter.WorkCenterCode,
 		WorkCenterName: workCenter.Name,
 		CurrentShift:   currentShift,
@@ -380,16 +386,11 @@ func (qs *schedulingQueryServiceImpl) GetWorkCenterSchedule(
 	qs.logger.Debug("Work center schedule retrieved",
 		util.String("company_id", companyID.String()),
 		util.String("work_center_code", workCenterCode),
-		util.Time("date", date),
+		util.Time("business_date", businessDate),
 		util.Duration("duration", time.Since(startTime)))
 
-	return schedule, nil
+	return result, nil
 }
-
-// ==============================================
-// POSITION-BASED SCHEDULING - NEW METHODS
-// ==============================================
-
 func (qs *schedulingQueryServiceImpl) GetPositionScheduleSummary(
 	ctx context.Context,
 	positionID uuid.UUID,
@@ -397,17 +398,16 @@ func (qs *schedulingQueryServiceImpl) GetPositionScheduleSummary(
 ) (*PositionScheduleSummary, error) {
 	startTime := time.Now()
 
-	// Get position details
+	// 1️⃣ Get position
 	position, err := qs.schedulingRepo.GetPositionByID(ctx, positionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get position: %w", err)
 	}
-
 	if position == nil {
 		return nil, fmt.Errorf("position not found: %s", positionID.String())
 	}
 
-	// Get department details
+	// 2️⃣ Department
 	var departmentName string
 	if position.DepartmentID != uuid.Nil {
 		dept, err := qs.schedulingRepo.GetDepartmentByID(ctx, position.DepartmentID)
@@ -416,39 +416,46 @@ func (qs *schedulingQueryServiceImpl) GetPositionScheduleSummary(
 		}
 	}
 
-	// Get work center details
+	// 3️⃣ Work center
 	var workCenterName string
-	if position.WorkCenterCode != nil && *position.WorkCenterCode != "" {
-		wc, err := qs.schedulingRepo.GetWorkCenterByCode(ctx, position.CompanyID, *position.WorkCenterCode)
+	if position.WorkCenterCode != nil {
+		wc, err := qs.schedulingRepo.GetWorkCenterByCode(
+			ctx,
+			position.CompanyID,
+			*position.WorkCenterCode,
+		)
 		if err == nil && wc != nil {
 			workCenterName = wc.Name
 		}
 	}
 
-	// Get employees in this position
-	employees, err := qs.schedulingRepo.GetUsersByPosition(ctx, positionID)
+	// 4️⃣ Employees in position
+	users, err := qs.schedulingRepo.GetUsersByPosition(ctx, positionID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get users by position: %w", err)
 	}
 
-	// Count scheduled employees in date range
 	scheduledCount := int64(0)
-	for _, userID := range employees {
-		instances, err := qs.schedulingRepo.GetScheduleInstancesByUser(ctx, userID, startDate, endDate)
-		if err == nil {
-			for _, instance := range instances {
-				if instance.Status == "active" {
-					scheduledCount++
-					break // Count once per employee
-				}
+
+	// 5️⃣ Correct logic: at least ONE active day in range
+	for _, userID := range users {
+		instances, err := qs.schedulingRepo.
+			GetScheduleInstancesByUser(ctx, userID, startDate, endDate)
+		if err != nil {
+			continue
+		}
+
+		for _, inst := range instances {
+			if inst.Status == "active" {
+				scheduledCount++
+				break
 			}
 		}
 	}
 
-	// Calculate coverage
-	coveragePercent := 0.0
-	if len(employees) > 0 {
-		coveragePercent = float64(scheduledCount) / float64(len(employees)) * 100
+	coverage := 0.0
+	if len(users) > 0 {
+		coverage = float64(scheduledCount) / float64(len(users)) * 100
 	}
 
 	summary := &PositionScheduleSummary{
@@ -459,9 +466,9 @@ func (qs *schedulingQueryServiceImpl) GetPositionScheduleSummary(
 		DepartmentID:    position.DepartmentID,
 		DepartmentName:  departmentName,
 		IsSchedulable:   position.IsSchedulable,
-		TotalEmployees:  int64(len(employees)),
+		TotalEmployees:  int64(len(users)),
 		ScheduledCount:  scheduledCount,
-		CoveragePercent: coveragePercent,
+		CoveragePercent: coverage,
 	}
 
 	qs.logger.Debug("Position schedule summary retrieved",
@@ -507,29 +514,121 @@ func (qs *schedulingQueryServiceImpl) GetWorkCenterSchedulesByCompany(
 	companyID uuid.UUID,
 	date time.Time,
 ) ([]*WorkCenterSchedule, error) {
+
 	startTime := time.Now()
 
-	// Get all active work centers
+	// 1️⃣ Get all active work centers
 	workCenters, err := qs.schedulingRepo.GetWorkCentersByCompany(ctx, companyID, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get work centers: %w", err)
 	}
 
-	var schedules []*WorkCenterSchedule
+	results := make([]*WorkCenterSchedule, 0, len(workCenters))
+
 	for _, wc := range workCenters {
-		schedule, err := qs.GetWorkCenterSchedule(ctx, companyID, wc.WorkCenterCode, date)
-		if err == nil && schedule != nil {
-			schedules = append(schedules, schedule)
+
+		// 2️⃣ Normalize business date using WC timezone
+		loc, err := time.LoadLocation(wc.Timezone)
+		if err != nil {
+			loc = time.UTC
 		}
+
+		businessDate := time.Date(
+			date.In(loc).Year(),
+			date.In(loc).Month(),
+			date.In(loc).Day(),
+			0, 0, 0, 0,
+			loc,
+		)
+
+		// 3️⃣ Get active shift (repo call only)
+		shifts, _ := qs.schedulingRepo.GetWorkCenterShifts(
+			ctx,
+			companyID,
+			wc.WorkCenterCode,
+			&businessDate,
+			nil,
+		)
+
+		var currentShift *WorkCenterShiftDetail
+		if len(shifts) > 0 {
+			template, err := qs.schedulingRepo.GetScheduleTemplateByID(ctx, shifts[0].ShiftID)
+			if err == nil && template != nil {
+				currentShift = &WorkCenterShiftDetail{
+					ShiftID:       shifts[0].ShiftID,
+					ShiftName:     template.Name,
+					TemplateType:  template.TemplateType,
+					EffectiveFrom: shifts[0].EffectiveFrom,
+					EffectiveTo:   shifts[0].EffectiveTo,
+					ExpectedStart: &shifts[0].EffectiveFrom,
+					ExpectedEnd:   shifts[0].EffectiveTo,
+				}
+			}
+		}
+
+		// 4️⃣ Employees assigned to this work center
+		assignments, err := qs.schedulingRepo.GetUserWorkCenterAssignments(
+			ctx,
+			uuid.Nil, // we want ALL users
+			nil,
+			nil,
+		)
+
+		var totalEmployees int64
+		for _, a := range assignments {
+			if a.CompanyID == companyID &&
+				a.WorkCenterCode == wc.WorkCenterCode &&
+				a.IsActive &&
+				a.EffectiveFrom.Before(businessDate.Add(24*time.Hour)) &&
+				(a.EffectiveTo == nil || a.EffectiveTo.After(businessDate)) {
+				totalEmployees++
+			}
+		}
+
+		// 5️⃣ Scheduled users today (repo method)
+		instances, err := qs.schedulingRepo.GetScheduleInstancesByWorkCenter(
+			ctx,
+			companyID,
+			wc.WorkCenterCode,
+			businessDate,
+			businessDate,
+		)
+
+		var scheduledToday int64
+		if err == nil {
+			userSet := make(map[uuid.UUID]struct{})
+			for _, inst := range instances {
+				if inst.Status == "active" {
+					userSet[inst.UserID] = struct{}{}
+				}
+			}
+			scheduledToday = int64(len(userSet))
+		}
+
+		// 6️⃣ Utilization
+		utilization := 0.0
+		if totalEmployees > 0 {
+			utilization = float64(scheduledToday) / float64(totalEmployees) * 100
+		}
+
+		results = append(results, &WorkCenterSchedule{
+			WorkCenterCode: wc.WorkCenterCode,
+			WorkCenterName: wc.Name,
+			CurrentShift:   currentShift,
+			TotalEmployees: totalEmployees,
+			ScheduledToday: scheduledToday,
+			Utilization:    utilization,
+		})
 	}
 
-	qs.logger.Debug("Work center schedules retrieved by company",
+	qs.logger.Debug(
+		"Work center schedules retrieved",
 		util.String("company_id", companyID.String()),
-		util.Time("date", date),
-		util.Int("work_center_count", len(schedules)),
-		util.Duration("duration", time.Since(startTime)))
+		util.Int("count", len(results)),
+		util.Duration("duration", time.Since(startTime)),
+	)
 
-	return schedules, nil
+	return results, nil
 }
 
 func (qs *schedulingQueryServiceImpl) GetUserScheduledPosition(
@@ -730,13 +829,18 @@ func (qs *schedulingQueryServiceImpl) GetScheduleStats(
 	companyID uuid.UUID,
 	startDate, endDate time.Time,
 ) (*ScheduleStats, error) {
+
 	startTime := time.Now()
 
 	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
 	if calendarDays > 365 {
-		return nil, fmt.Errorf("date range cannot exceed 365 days for statistics, got %d days", calendarDays)
+		return nil, fmt.Errorf(
+			"date range cannot exceed 365 days for statistics, got %d days",
+			calendarDays,
+		)
 	}
 
+	// 1️⃣ Coverage (single source of truth)
 	coverage, err := qs.schedulingRepo.GetScheduleCoverage(ctx, companyID, startDate, endDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get schedule coverage: %w", err)
@@ -748,89 +852,103 @@ func (qs *schedulingQueryServiceImpl) GetScheduleStats(
 		ByWorkCenter:   make(map[string]int64),
 	}
 
-	if totalInstances, ok := coverage["total_scheduled_days"].(int); ok {
-		stats.TotalInstances = int64(totalInstances)
+	// 2️⃣ Basic totals
+	if v, ok := coverage["total_scheduled_days"].(int); ok {
+		stats.TotalInstances = int64(v)
 	}
-	if totalUsers, ok := coverage["total_scheduled_users"].(int); ok {
-		stats.TotalUsers = int64(totalUsers)
+	if v, ok := coverage["total_scheduled_users"].(int); ok {
+		stats.TotalUsers = int64(v)
 	}
-	if templateDist, ok := coverage["template_distribution"].(map[string]int); ok {
-		for templateType, count := range templateDist {
-			stats.ByTemplateType[templateType] = int64(count)
-		}
-	}
-	if workCenterDist, ok := coverage["work_center_distribution"].(map[string]int); ok {
-		for workCenter, count := range workCenterDist {
-			stats.ByWorkCenter[workCenter] = int64(count)
+
+	// 3️⃣ Template distribution
+	if dist, ok := coverage["template_distribution"].(map[string]int); ok {
+		for k, v := range dist {
+			stats.ByTemplateType[k] = int64(v)
 		}
 	}
 
+	// 4️⃣ Upcoming schedules (next 7 days)
 	today := time.Now().UTC()
 	weekFromNow := today.AddDate(0, 0, 7)
-	upcomingInstances, err := qs.schedulingRepo.GetScheduleInstancesByCompany(ctx, companyID, today, weekFromNow)
-	if err == nil && len(upcomingInstances) > 0 {
-		for _, instance := range upcomingInstances {
-			template, _ := qs.schedulingRepo.GetScheduleTemplateByID(ctx, instance.ScheduleTemplateID)
+
+	upcoming, err := qs.schedulingRepo.
+		GetScheduleInstancesByCompany(ctx, companyID, today, weekFromNow)
+	if err == nil {
+		for _, instance := range upcoming {
+
+			if instance.Status != "active" {
+				continue
+			}
+
+			// Template
 			templateName := ""
 			templateType := ""
-			if template != nil {
+			template, err := qs.schedulingRepo.
+				GetScheduleTemplateByID(ctx, instance.ScheduleTemplateID)
+			if err == nil && template != nil {
 				templateName = template.Name
 				templateType = template.TemplateType
 			}
 
-			// Get position and work center info
+			// Position & Work Center
 			var positionID *uuid.UUID
 			var positionTitle string
 			var workCenterCode string
-			employee, err := qs.schedulingRepo.GetCompanyEmployeeByUserID(ctx, instance.UserID)
+
+			employee, err := qs.schedulingRepo.
+				GetCompanyEmployeeByUserID(ctx, instance.UserID)
 			if err == nil && employee != nil && employee.PositionID != nil {
 				positionID = employee.PositionID
-				position, err := qs.schedulingRepo.GetPositionByID(ctx, *employee.PositionID)
+
+				position, err := qs.schedulingRepo.
+					GetPositionByID(ctx, *employee.PositionID)
 				if err == nil && position != nil {
 					positionTitle = position.Title
+					if position.WorkCenterCode != nil {
+						workCenterCode = *position.WorkCenterCode
+					}
 				}
 			}
 
-			summary := ScheduleInstanceSummary{
-				InstanceID:     instance.ScheduleInstanceID,
-				UserID:         instance.UserID,
-				ScheduleDate:   instance.ScheduleDate,
-				ExpectedStart:  instance.ExpectedStart,
-				ExpectedEnd:    instance.ExpectedEnd,
-				TemplateName:   templateName,
-				TemplateType:   templateType,
-				PositionID:     positionID,
-				PositionTitle:  positionTitle,
-				WorkCenterCode: workCenterCode,
-			}
+			stats.UpcomingSchedules = append(
+				stats.UpcomingSchedules,
+				ScheduleInstanceSummary{
+					InstanceID:     instance.ScheduleInstanceID,
+					UserID:         instance.UserID,
+					ScheduleDate:   instance.ScheduleDate,
+					ExpectedStart:  instance.ExpectedStart,
+					ExpectedEnd:    instance.ExpectedEnd,
+					TemplateName:   templateName,
+					TemplateType:   templateType,
+					PositionID:     positionID,
+					PositionTitle:  positionTitle,
+					WorkCenterCode: workCenterCode,
+				},
+			)
 
-			if len(stats.UpcomingSchedules) < 10 {
-				stats.UpcomingSchedules = append(stats.UpcomingSchedules, summary)
+			if len(stats.UpcomingSchedules) >= 10 {
+				break
 			}
 		}
 	}
 
-	templates, err := qs.schedulingRepo.GetScheduleTemplatesByCompany(ctx, companyID)
-	if err == nil {
+	// 5️⃣ Totals (safe + explicit)
+	if templates, err := qs.schedulingRepo.GetScheduleTemplatesByCompany(ctx, companyID); err == nil {
 		stats.TotalTemplates = int64(len(templates))
 	}
-
-	positions, err := qs.schedulingRepo.GetPositionsByCompany(ctx, companyID)
-	if err == nil {
+	if positions, err := qs.schedulingRepo.GetPositionsByCompany(ctx, companyID); err == nil {
 		stats.TotalPositions = int64(len(positions))
 	}
-
-	workCenters, err := qs.schedulingRepo.GetWorkCentersByCompany(ctx, companyID, true)
-	if err == nil {
+	if workCenters, err := qs.schedulingRepo.
+		GetWorkCentersByCompany(ctx, companyID, true); err == nil {
 		stats.TotalWorkCenters = int64(len(workCenters))
 	}
 
 	qs.logger.Debug("Schedule statistics retrieved",
 		util.String("company_id", companyID.String()),
-		util.Time("start_date", startDate),
-		util.Time("end_date", endDate),
 		util.Int("calendar_days", calendarDays),
-		util.Duration("duration", time.Since(startTime)))
+		util.Duration("duration", time.Since(startTime)),
+	)
 
 	return stats, nil
 }
@@ -907,14 +1025,22 @@ func (qs *schedulingQueryServiceImpl) GetUserScheduleSummary(
 		return nil, fmt.Errorf("date range cannot exceed 90 days, got %d days", calendarDays)
 	}
 
-	summary, err := qs.schedulingRepo.GetUserScheduleSummary(ctx, userID, startDate, endDate)
+	employee, err := qs.schedulingRepo.GetCompanyEmployeeByUserID(ctx, userID)
+	if err != nil || employee == nil {
+		return nil, fmt.Errorf("user does not belong to any company")
+	}
+
+	summary, err := qs.schedulingRepo.GetUserScheduleSummary(
+		ctx,
+		userID,
+		startDate,
+		endDate,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user schedule summary: %w", err)
 	}
 
-	// Add position information
-	employee, err := qs.schedulingRepo.GetCompanyEmployeeByUserID(ctx, userID)
-	if err == nil && employee != nil && employee.PositionID != nil {
+	if employee.PositionID != nil {
 		position, err := qs.schedulingRepo.GetPositionByID(ctx, *employee.PositionID)
 		if err == nil && position != nil {
 			summary["position"] = map[string]interface{}{
@@ -925,15 +1051,13 @@ func (qs *schedulingQueryServiceImpl) GetUserScheduleSummary(
 				"attendance_required": position.AttendanceRequired,
 			}
 
-			// Get work center details
-			if position.WorkCenterCode != nil && *position.WorkCenterCode != "" {
+			if position.WorkCenterCode != nil {
 				wc, err := qs.schedulingRepo.GetWorkCenterByCode(ctx, position.CompanyID, *position.WorkCenterCode)
 				if err == nil && wc != nil {
 					summary["work_center"] = map[string]interface{}{
-						"code":        wc.WorkCenterCode,
-						"name":        wc.Name,
-						"timezone":    wc.Timezone,
-						"description": wc.Description,
+						"code":     wc.WorkCenterCode,
+						"name":     wc.Name,
+						"timezone": wc.Timezone,
 					}
 				}
 			}
@@ -942,8 +1066,6 @@ func (qs *schedulingQueryServiceImpl) GetUserScheduleSummary(
 
 	qs.logger.Debug("User schedule summary retrieved",
 		util.String("user_id", userID.String()),
-		util.Time("start_date", startDate),
-		util.Time("end_date", endDate),
 		util.Int("calendar_days", calendarDays),
 		util.Duration("duration", time.Since(startTime)))
 
@@ -1005,7 +1127,7 @@ func (qs *schedulingQueryServiceImpl) CheckDateAvailability(
 		}
 	}
 
-	// Existing checks (overrides, off requests, etc.)
+	// Existing checks (overrides, etc.)
 	override, err := qs.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, date)
 	if err == nil && override != nil {
 		result["available"] = false
@@ -1017,16 +1139,6 @@ func (qs *schedulingQueryServiceImpl) CheckDateAvailability(
 			result["available"] = true
 			result["forced_work"] = true
 		}
-	}
-
-	statusApproved := "approved"
-	offRequests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, &date, &date, &statusApproved)
-	if err == nil && len(offRequests) > 0 {
-		result["available"] = false
-		result["off_request"] = offRequests[0]
-		reasons := result["reasons"].([]string)
-		reasons = append(reasons, "Approved off request")
-		result["reasons"] = reasons
 	}
 
 	instance, err := qs.schedulingRepo.GetScheduleInstanceByUserDate(ctx, userID, date)
@@ -1383,20 +1495,18 @@ func (qs *schedulingQueryServiceImpl) GetScheduleCoverage(
 	startDate, endDate time.Time,
 ) (map[string]interface{}, error) {
 	startTime := time.Now()
-	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
-	if calendarDays > 31 {
-		return nil, fmt.Errorf("date range cannot exceed 31 days for coverage report, got %d days", calendarDays)
-	}
+
 	coverage, err := qs.schedulingRepo.GetScheduleCoverage(ctx, companyID, startDate, endDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get schedule coverage: %w", err)
 	}
+
 	qs.logger.Debug("Schedule coverage retrieved",
 		util.String("company_id", companyID.String()),
 		util.Time("start_date", startDate),
 		util.Time("end_date", endDate),
-		util.Int("calendar_days", calendarDays),
 		util.Duration("duration", time.Since(startTime)))
+
 	return coverage, nil
 }
 
@@ -1428,177 +1538,6 @@ func (qs *schedulingQueryServiceImpl) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("scheduling repository health check failed: %w", err)
 	}
 	return nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetOffEntitlementByID(
-	ctx context.Context,
-	entitlementID uuid.UUID,
-) (*scheduling.UserOffEntitlement, error) {
-	startTime := time.Now()
-	entitlement, err := qs.schedulingRepo.GetOffEntitlementByID(ctx, entitlementID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off entitlement: %w", err)
-	}
-	qs.logger.Debug("Off entitlement retrieved by ID",
-		util.String("entitlement_id", entitlementID.String()),
-		util.Duration("duration", time.Since(startTime)))
-	return entitlement, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetOffEntitlementsByUser(
-	ctx context.Context,
-	userID uuid.UUID,
-	activeOnly bool,
-) ([]*scheduling.UserOffEntitlement, error) {
-	startTime := time.Now()
-	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByUser(ctx, userID, activeOnly)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off entitlements by user: %w", err)
-	}
-	qs.logger.Debug("Off entitlements retrieved by user",
-		util.String("user_id", userID.String()),
-		util.Bool("active_only", activeOnly),
-		util.Int("entitlement_count", len(entitlements)),
-		util.Duration("duration", time.Since(startTime)))
-	return entitlements, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetOffEntitlementsByCompany(
-	ctx context.Context,
-	companyID uuid.UUID,
-	activeOnly bool,
-) ([]*scheduling.UserOffEntitlement, error) {
-	startTime := time.Now()
-	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByCompany(ctx, companyID, activeOnly)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off entitlements by company: %w", err)
-	}
-	qs.logger.Debug("Off entitlements retrieved by company",
-		util.String("company_id", companyID.String()),
-		util.Bool("active_only", activeOnly),
-		util.Int("entitlement_count", len(entitlements)),
-		util.Duration("duration", time.Since(startTime)))
-	return entitlements, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetUserOffBalance(
-	ctx context.Context,
-	userID uuid.UUID,
-	startDate, endDate time.Time,
-) (map[string]interface{}, error) {
-	startTime := time.Now()
-	entitlement, err := qs.schedulingRepo.GetCurrentOffEntitlement(ctx, userID, time.Now())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current entitlement: %w", err)
-	}
-	var periodType string
-	if entitlement != nil {
-		periodType = entitlement.PeriodType
-	} else {
-		periodType = "monthly"
-	}
-	usedDays, err := qs.schedulingRepo.GetOffBalance(ctx, userID, periodType, startDate, endDate)
-	if err != nil {
-		usedDays = 0
-	}
-	result := map[string]interface{}{
-		"user_id":     userID,
-		"start_date":  startDate.Format("2006-01-02"),
-		"end_date":    endDate.Format("2006-01-02"),
-		"period_type": periodType,
-		"used_days":   usedDays,
-	}
-	if entitlement != nil {
-		result["entitlement"] = entitlement
-		result["total_days"] = entitlement.OffCount
-		result["remaining_days"] = entitlement.OffCount - usedDays
-		result["requires_approval"] = entitlement.RequiresApproval
-	}
-	qs.logger.Debug("User off balance retrieved",
-		util.String("user_id", userID.String()),
-		util.Int("used_days", usedDays),
-		util.Duration("duration", time.Since(startTime)))
-	return result, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetOffRequestByID(
-	ctx context.Context,
-	requestID uuid.UUID,
-) (*scheduling.OffRequest, error) {
-	startTime := time.Now()
-	request, err := qs.schedulingRepo.GetOffRequestByID(ctx, requestID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off request: %w", err)
-	}
-	qs.logger.Debug("Off request retrieved by ID",
-		util.String("request_id", requestID.String()),
-		util.Duration("duration", time.Since(startTime)))
-	return request, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetOffRequestsByUser(
-	ctx context.Context,
-	userID uuid.UUID,
-	startDate, endDate time.Time,
-	status *string,
-) ([]*scheduling.OffRequest, error) {
-	startTime := time.Now()
-	var startPtr, endPtr *time.Time
-	if !startDate.IsZero() && !endDate.IsZero() {
-		startPtr = &startDate
-		endPtr = &endDate
-	}
-	requests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, startPtr, endPtr, status)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off requests by user: %w", err)
-	}
-	qs.logger.Debug("Off requests retrieved by user",
-		util.String("user_id", userID.String()),
-		util.String("status", getStatusString(status)),
-		util.Int("request_count", len(requests)),
-		util.Duration("duration", time.Since(startTime)))
-	return requests, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetOffRequestsByCompany(
-	ctx context.Context,
-	companyID uuid.UUID,
-	startDate, endDate time.Time,
-	status *string,
-) ([]*scheduling.OffRequest, error) {
-	startTime := time.Now()
-	var startPtr, endPtr *time.Time
-	if !startDate.IsZero() && !endDate.IsZero() {
-		startPtr = &startDate
-		endPtr = &endDate
-	}
-	requests, err := qs.schedulingRepo.GetOffRequestsByCompany(ctx, companyID, startPtr, endPtr, status)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off requests by company: %w", err)
-	}
-	qs.logger.Debug("Off requests retrieved by company",
-		util.String("company_id", companyID.String()),
-		util.String("status", getStatusString(status)),
-		util.Int("request_count", len(requests)),
-		util.Duration("duration", time.Since(startTime)))
-	return requests, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetPendingOffRequests(
-	ctx context.Context,
-	companyID uuid.UUID,
-) ([]*scheduling.OffRequest, error) {
-	startTime := time.Now()
-	status := "pending"
-	requests, err := qs.schedulingRepo.GetOffRequestsByCompany(ctx, companyID, nil, nil, &status)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get pending off requests: %w", err)
-	}
-	qs.logger.Debug("Pending off requests retrieved",
-		util.String("company_id", companyID.String()),
-		util.Int("request_count", len(requests)),
-		util.Duration("duration", time.Since(startTime)))
-	return requests, nil
 }
 
 func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByID(
@@ -1681,111 +1620,6 @@ func (qs *schedulingQueryServiceImpl) GetScheduleOverrideByUserDate(
 	return override, nil
 }
 
-func (qs *schedulingQueryServiceImpl) GetUserTimeOffSummary(
-	ctx context.Context,
-	userID uuid.UUID,
-	startDate, endDate time.Time,
-) (map[string]interface{}, error) {
-	startTime := time.Now()
-	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
-	if calendarDays > 90 {
-		return nil, fmt.Errorf("date range cannot exceed 90 days, got %d days", calendarDays)
-	}
-	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByUser(ctx, userID, true)
-	if err != nil {
-		entitlements = []*scheduling.UserOffEntitlement{}
-	}
-	statusApproved := "approved"
-	offRequests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, &startDate, &endDate, &statusApproved)
-	if err != nil {
-		offRequests = []*scheduling.OffRequest{}
-	}
-	statusPending := "pending"
-	pendingRequests, err := qs.schedulingRepo.GetOffRequestsByUser(ctx, userID, &startDate, &endDate, &statusPending)
-	if err != nil {
-		pendingRequests = []*scheduling.OffRequest{}
-	}
-	overrides, err := qs.schedulingRepo.GetScheduleOverridesByUser(ctx, userID, &startDate, &endDate, nil)
-	if err != nil {
-		overrides = []*scheduling.ScheduleOverride{}
-	}
-	usedDays := 0
-	for _, req := range offRequests {
-		usedDays += len(req.RequestDates)
-	}
-	totalEntitlement := 0
-	if len(entitlements) > 0 {
-		totalEntitlement = entitlements[0].OffCount
-	}
-	summary := map[string]interface{}{
-		"user_id":            userID,
-		"start_date":         startDate.Format("2006-01-02"),
-		"end_date":           endDate.Format("2006-01-02"),
-		"entitlements":       entitlements,
-		"off_requests":       offRequests,
-		"pending_requests":   pendingRequests,
-		"schedule_overrides": overrides,
-		"total_entitlement":  totalEntitlement,
-		"used_days":          usedDays,
-		"remaining_days":     totalEntitlement - usedDays,
-	}
-	qs.logger.Debug("User time off summary retrieved",
-		util.String("user_id", userID.String()),
-		util.Time("start_date", startDate),
-		util.Time("end_date", endDate),
-		util.Int("entitlement_count", len(entitlements)),
-		util.Int("off_request_count", len(offRequests)),
-		util.Int("pending_request_count", len(pendingRequests)),
-		util.Int("override_count", len(overrides)),
-		util.Duration("duration", time.Since(startTime)))
-	return summary, nil
-}
-
-func (qs *schedulingQueryServiceImpl) GetCompanyTimeOffStats(
-	ctx context.Context,
-	companyID uuid.UUID,
-	startDate, endDate time.Time,
-) (map[string]interface{}, error) {
-	startTime := time.Now()
-	calendarDays := int(endDate.Sub(startDate).Hours()/24) + 1
-	if calendarDays > 31 {
-		return nil, fmt.Errorf("date range cannot exceed 31 days for stats, got %d days", calendarDays)
-	}
-	stats, err := qs.schedulingRepo.GetOffUtilizationStats(ctx, companyID, startDate, endDate)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off utilization stats: %w", err)
-	}
-	pendingRequests, err := qs.GetPendingOffRequests(ctx, companyID)
-	if err == nil {
-		stats["pending_requests_count"] = len(pendingRequests)
-	}
-	entitlements, err := qs.schedulingRepo.GetOffEntitlementsByCompany(ctx, companyID, true)
-	if err == nil {
-		stats["active_entitlements"] = len(entitlements)
-	}
-	qs.logger.Debug("Company time off stats retrieved",
-		util.String("company_id", companyID.String()),
-		util.Time("start_date", startDate),
-		util.Time("end_date", endDate),
-		util.Int("calendar_days", calendarDays),
-		util.Duration("duration", time.Since(startTime)))
-	return stats, nil
-}
-
-// Helper functions
-func getStatusString(status *string) string {
-	if status != nil {
-		return *status
-	}
-	return "all"
-}
-
-func getOverrideTypeString(overrideType *string) string {
-	if overrideType != nil {
-		return *overrideType
-	}
-	return "all"
-}
 func (qs *schedulingQueryServiceImpl) GetCompanyEmployeeByUserID(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -1822,4 +1656,12 @@ func (qs *schedulingQueryServiceImpl) GetPositionByID(
 	)
 
 	return position, nil
+}
+
+// Helper function
+func getOverrideTypeString(overrideType *string) string {
+	if overrideType != nil {
+		return *overrideType
+	}
+	return "all"
 }

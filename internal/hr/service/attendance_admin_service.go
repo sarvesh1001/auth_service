@@ -132,26 +132,6 @@ type AttendanceAdminService interface {
 	// ─────────────────────────────
 	// RFID / Identity Management
 	// ─────────────────────────────
-	AssignRFIDToEmployee(
-		ctx context.Context,
-		companyID, userID uuid.UUID,
-		rfidTag string,
-		assignedBy uuid.UUID,
-	) error
-
-	UnassignRFID(
-		ctx context.Context,
-		rfidID uuid.UUID,
-		unassignedBy uuid.UUID,
-	) error
-
-	GetEmployeeByRFID(
-		ctx context.Context,
-		rfidTag string,
-		companyID uuid.UUID,
-	) (*attendance.EmployeeRFIDMapping, error)
-
-	// ─────────────────────────────
 	// Validation Helpers (USED BY INGEST)
 	// ─────────────────────────────
 	ValidateAttendanceEventType(
@@ -179,6 +159,7 @@ type attendanceAdminService struct {
 	attendanceRepo    repository.AttendanceRepository
 	schedulingRepo    repository.SchedulingRepository
 	resolutionService AttendanceResolutionService
+	omService         AttendanceOMService
 	logger            *zap.Logger
 	auditService      *AuditService
 }
@@ -187,14 +168,16 @@ type attendanceAdminService struct {
 func NewAttendanceAdminService(
 	attendanceRepo repository.AttendanceRepository,
 	schedulingRepo repository.SchedulingRepository,
-	resolutionService AttendanceResolutionService, // NEW
+	resolutionService AttendanceResolutionService,
+	omService AttendanceOMService, // 🔥 NEW
 	logger *zap.Logger,
 	auditService *AuditService,
 ) AttendanceAdminService {
 	return &attendanceAdminService{
 		attendanceRepo:    attendanceRepo,
 		schedulingRepo:    schedulingRepo,
-		resolutionService: resolutionService, // NEW
+		resolutionService: resolutionService,
+		omService:         omService,
 		logger:            logger,
 		auditService:      auditService,
 	}
@@ -852,122 +835,6 @@ func (s *attendanceAdminService) UpsertUserAttendanceProfile(
 // RFID / IDENTITY MANAGEMENT
 // ============================================
 
-func (s *attendanceAdminService) AssignRFIDToEmployee(
-	ctx context.Context,
-	companyID uuid.UUID,
-	userID uuid.UUID,
-	rfidTag string,
-	assignedBy uuid.UUID,
-) error {
-	startTime := time.Now()
-
-	// Validate input
-	if rfidTag == "" {
-		return fmt.Errorf("RFID tag is required")
-	}
-
-	// Check for existing RFID assignment
-	existingMapping, err := s.attendanceRepo.GetEmployeeRFIDMapping(ctx, rfidTag)
-	if err != nil {
-		return fmt.Errorf("failed to check RFID mapping: %w", err)
-	}
-	if existingMapping != nil && existingMapping.UserID != userID && existingMapping.IsActive {
-		return fmt.Errorf("RFID tag %s is already assigned to another employee", rfidTag)
-	}
-
-	// Deactivate any existing RFID for this user
-	userMapping, err := s.attendanceRepo.GetEmployeeRFIDMappingByUser(ctx, userID)
-	if err == nil && userMapping != nil && userMapping.IsActive {
-		if err := s.attendanceRepo.DeactivateEmployeeRFIDMapping(ctx, userMapping.RFIDID); err != nil {
-			s.logger.Warn("Failed to deactivate existing RFID mapping",
-				util.String("user_id", userID.String()),
-				util.String("rfid_tag", userMapping.RFIDTag),
-				util.ErrorField(err))
-		}
-	}
-
-	// Create new mapping
-	mapping := &attendance.EmployeeRFIDMapping{
-		RFIDID:     uuid.New(),
-		UserID:     userID,
-		CompanyID:  companyID,
-		RFIDTag:    rfidTag,
-		IsActive:   true,
-		AssignedAt: time.Now().UTC(),
-		CreatedAt:  time.Now().UTC(),
-		UpdatedAt:  time.Now().UTC(),
-	}
-
-	// Save mapping
-	if err := s.attendanceRepo.CreateEmployeeRFIDMapping(ctx, mapping); err != nil {
-		s.logger.Error("Failed to assign RFID to employee",
-			util.String("user_id", userID.String()),
-			util.String("rfid_tag", rfidTag),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to assign RFID to employee: %w", err)
-	}
-
-	s.logger.Info("RFID assigned to employee",
-		util.String("user_id", userID.String()),
-		util.String("rfid_tag", rfidTag),
-		util.String("company_id", companyID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return nil
-}
-
-func (s *attendanceAdminService) UnassignRFID(
-	ctx context.Context,
-	rfidID uuid.UUID,
-	unassignedBy uuid.UUID,
-) error {
-	startTime := time.Now()
-
-	// Get the mapping
-	mapping, err := s.attendanceRepo.GetAttendanceSourceByID(ctx, rfidID)
-	if err != nil {
-		return fmt.Errorf("failed to get RFID mapping: %w", err)
-	}
-	if mapping == nil {
-		return fmt.Errorf("RFID mapping not found")
-	}
-
-	// Deactivate the mapping
-	if err := s.attendanceRepo.DeactivateEmployeeRFIDMapping(ctx, rfidID); err != nil {
-		s.logger.Error("Failed to unassign RFID",
-			util.String("rfid_id", rfidID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to unassign RFID: %w", err)
-	}
-
-	s.logger.Info("RFID unassigned",
-		util.String("rfid_id", rfidID.String()),
-		util.Duration("duration", time.Since(startTime)))
-
-	return nil
-}
-
-func (s *attendanceAdminService) GetEmployeeByRFID(
-	ctx context.Context,
-	rfidTag string,
-	companyID uuid.UUID,
-) (*attendance.EmployeeRFIDMapping, error) {
-	mapping, err := s.attendanceRepo.GetEmployeeRFIDMapping(ctx, rfidTag)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get employee by RFID: %w", err)
-	}
-	if mapping == nil {
-		return nil, nil
-	}
-	if mapping.CompanyID != companyID {
-		return nil, fmt.Errorf("RFID tag does not belong to this company")
-	}
-	if !mapping.IsActive {
-		return nil, fmt.Errorf("RFID mapping is not active")
-	}
-	return mapping, nil
-}
-
 // ============================================
 // VALIDATION HELPERS
 // ============================================
@@ -1185,7 +1052,10 @@ func (s *attendanceAdminService) CreateAttendanceCorrection(
 	// 🔴 FIX: event_time must match business_date
 	// ─────────────────────────────
 	if req.EventTime != nil {
-		eventDate := req.EventTime.In(req.BusinessDate.Location()).Format("2006-01-02")
+		eventDate := req.EventTime.
+			In(req.BusinessDate.Location()).
+			Format("2006-01-02")
+
 		businessDate := req.BusinessDate.Format("2006-01-02")
 
 		if eventDate != businessDate {
@@ -1246,7 +1116,7 @@ func (s *attendanceAdminService) CreateAttendanceCorrection(
 		DeviceID:          nil,
 		IPAddress:         nil,
 
-		// ✅ Human intent lives here
+		// ✅ Human intent (why correction happened)
 		Context: attendance.EventContext{
 			CorrectionReason: &req.Reason,
 		},
@@ -1270,7 +1140,8 @@ func (s *attendanceAdminService) CreateAttendanceCorrection(
 			zap.String("company_id", req.CompanyID.String()),
 			zap.String("user_id", req.TargetUserID.String()),
 			zap.String("correction_type", req.CorrectionType),
-			zap.Error(err))
+			zap.Error(err),
+		)
 		return fmt.Errorf("failed to create correction event: %w", err)
 	}
 
@@ -1285,7 +1156,8 @@ func (s *attendanceAdminService) CreateAttendanceCorrection(
 	); err != nil {
 		s.logger.Warn("Correction created but recalculation failed",
 			zap.String("event_id", event.AttendanceEventID.String()),
-			zap.Error(err))
+			zap.Error(err),
+		)
 	}
 
 	// ─────────────────────────────

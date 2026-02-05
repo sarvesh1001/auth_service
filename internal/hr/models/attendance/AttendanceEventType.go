@@ -269,6 +269,7 @@ type AttendanceDailySummary struct {
 	WorkedMinutes       *int            `json:"worked_minutes" db:"worked_minutes"`
 	OvertimeMinutes     *int            `json:"overtime_minutes" db:"overtime_minutes"`
 	LateMinutes         *int            `json:"late_minutes" db:"late_minutes"`
+	IsPayrollLocked     bool            `json:"is_payroll_locked" db:"is_payroll_locked"` // NEW FIELD
 	Metadata            SummaryMetadata `json:"metadata" db:"metadata"`
 	GeneratedAt         time.Time       `json:"generated_at" db:"generated_at"`
 	GeneratedBy         string          `json:"generated_by" db:"generated_by"`
@@ -448,3 +449,25 @@ type PairedEvent struct {
 	IsAutoClosed bool     `json:"is_auto_closed"`
 	Anomalies    []string `json:"anomalies,omitempty"`
 }
+type BulkAttendanceRequest struct {
+	CompanyID     uuid.UUID
+	ActorID       uuid.UUID
+	ActorType     string
+	OrgUnitID     uuid.UUID // class / section / team
+	EventType     string    // present / absent / manual_check_in
+	EventTime     time.Time
+	TargetUserIDs []uuid.UUID
+	Reason        *string
+}
+
+const (
+	StatusPresent      = "present"
+	StatusAbsent       = "absent"
+	StatusLate         = "late"
+	StatusHalfDay      = "half_day"
+	StatusLeavePaid    = "leave"
+	StatusLeaveUnpaid  = "leave_unpaid"
+	StatusHoliday      = "holiday"
+	StatusWeeklyOff    = "weekly_off"
+	StatusNotScheduled = "not_scheduled"
+)

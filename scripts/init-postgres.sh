@@ -23,6 +23,16 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     CREATE EXTENSION IF NOT EXISTS "btree_gist";
 
     -- ==============================================
+    -- CREATE LEAVE SCHEMA
+    -- ==============================================
+    CREATE SCHEMA IF NOT EXISTS leave;
+
+    -- ==============================================
+    -- CREATE PAYROLL SCHEMA
+    -- ==============================================
+    CREATE SCHEMA IF NOT EXISTS payroll;
+
+    -- ==============================================
     -- CORE TABLES
     -- ==============================================
 
@@ -227,7 +237,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     CREATE TABLE IF NOT EXISTS role_departments (
         role_id UUID NOT NULL,
         department_id UUID NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMestAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (role_id, department_id),
         CONSTRAINT fk_role_departments_role FOREIGN KEY (role_id)
             REFERENCES roles(role_id) ON DELETE CASCADE,
@@ -479,60 +489,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     );
 
     -- ==============================================
-    -- COMPENSATION MODULE TABLES
-    -- ==============================================
-
-    -- PAY UNITS TABLE
-    CREATE TABLE IF NOT EXISTS pay_units (
-        pay_unit_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        name VARCHAR(30) NOT NULL UNIQUE,
-        description TEXT
-    );
-
-    -- COMPENSATION STRUCTURES TABLE
-    CREATE TABLE IF NOT EXISTS compensation_structures (
-        structure_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id UUID NOT NULL,
-        structure_code VARCHAR(50) NOT NULL,
-        name VARCHAR(100) NOT NULL,
-        currency VARCHAR(10) NOT NULL DEFAULT 'INR',
-        components JSONB NOT NULL,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (company_id, structure_code),
-        CONSTRAINT fk_comp_struct_company
-            FOREIGN KEY (company_id) REFERENCES companies(company_id)
-    );
-
-    -- USER COMPENSATIONS TABLE
-    CREATE TABLE IF NOT EXISTS user_compensations (
-        user_id UUID NOT NULL,
-        structure_id UUID NOT NULL,
-        pay_unit_id UUID,
-        ctc_amount NUMERIC(12,2) NOT NULL,
-        effective_from DATE NOT NULL,
-        effective_to DATE,
-        assigned_by UUID,
-        structure_snapshot JSONB NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        PRIMARY KEY (user_id, structure_id, effective_from),
-        CONSTRAINT no_overlapping_compensation EXCLUDE USING gist (
-            user_id WITH =,
-            daterange(
-            effective_from,
-            COALESCE(effective_to, 'infinity'),
-            '[]'
-            )
-                WITH &&
-        ),
-        CONSTRAINT fk_uc_user FOREIGN KEY (user_id) REFERENCES users(user_id),
-        CONSTRAINT fk_uc_structure FOREIGN KEY (structure_id)
-            REFERENCES compensation_structures(structure_id),
-        CONSTRAINT fk_uc_pay_unit
-            FOREIGN KEY (pay_unit_id) REFERENCES pay_units(pay_unit_id)
-    );
-
-    -- ==============================================
     -- ATTENDANCE MODULE TABLES
     -- ==============================================
 
@@ -737,24 +693,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
             FOREIGN KEY (company_id) REFERENCES companies(company_id)
     );
 
-    -- EMPLOYEE RFID MAPPINGS TABLE
-    CREATE TABLE IF NOT EXISTS employee_rfid_mappings (
-        rfid_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID NOT NULL,
-        company_id UUID NOT NULL,
-        rfid_tag VARCHAR(100) NOT NULL,
-        is_active BOOLEAN DEFAULT true,
-        assigned_at TIMESTAMPTZ DEFAULT NOW(),
-        unassigned_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (company_id, rfid_tag),
-        CONSTRAINT fk_employee_rfid_user 
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-        CONSTRAINT fk_employee_rfid_company 
-            FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
-    );
-
     -- ==============================================
     -- WORK CENTER TABLES
     -- ==============================================
@@ -822,134 +760,231 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     );
 
     -- ==============================================
-    -- LEAVE MODULE TABLES
+    -- LEAVE MODULE TABLES (NEW DESIGN)
     -- ==============================================
 
-    -- LEAVE TYPES TABLE
-    CREATE TABLE IF NOT EXISTS leave_types (
+    -- 1️⃣ Leave Type (Policy Definition)
+    CREATE TABLE IF NOT EXISTS leave.leave_type (
         leave_type_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
-        leave_code VARCHAR(30) NOT NULL,
-        name VARCHAR(100) NOT NULL,
-        category VARCHAR(30) NOT NULL,
-        is_statutory BOOLEAN NOT NULL DEFAULT false,
-        affects_pay BOOLEAN NOT NULL DEFAULT true,
+        code TEXT NOT NULL,         -- CL, SL, EL
+        name TEXT NOT NULL,
+        is_paid BOOLEAN NOT NULL DEFAULT true,
         requires_approval BOOLEAN NOT NULL DEFAULT true,
-        requires_document BOOLEAN NOT NULL DEFAULT false,
-        allow_half_day BOOLEAN DEFAULT true,
-        allow_hourly BOOLEAN DEFAULT false,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (company_id, leave_code),
-        CONSTRAINT fk_leave_types_company
-            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+        accrual_method TEXT NOT NULL,  -- monthly | yearly | none
+        carry_forward_limit INT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_leave_type_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+        CONSTRAINT uq_leave_type_company_code UNIQUE (company_id, code)
     );
 
-    -- LEAVE POLICIES TABLE
-    CREATE TABLE IF NOT EXISTS leave_policies (
-        leave_policy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id UUID NOT NULL,
-        department_id UUID,
-        country_code VARCHAR(10) NOT NULL,
-        policy_code VARCHAR(50) NOT NULL,
-        rules JSONB NOT NULL,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (company_id, policy_code),
-        CONSTRAINT fk_leave_policies_company
-            FOREIGN KEY (company_id) REFERENCES companies(company_id),
-        CONSTRAINT fk_leave_policies_department
-            FOREIGN KEY (department_id) REFERENCES departments(department_id)
-    );
-
-    -- USER LEAVE POLICIES TABLE
-    CREATE TABLE IF NOT EXISTS user_leave_policies (
-        user_id UUID NOT NULL,
-        leave_policy_id UUID NOT NULL,
-        effective_from DATE NOT NULL,
-        effective_to DATE,
-        assigned_by UUID,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        PRIMARY KEY (user_id, leave_policy_id, effective_from),
-        CONSTRAINT fk_ulp_user
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-        CONSTRAINT fk_ulp_policy
-            FOREIGN KEY (leave_policy_id)
-            REFERENCES leave_policies(leave_policy_id)
-    );
-
-    -- LEAVE BALANCES TABLE
-    CREATE TABLE IF NOT EXISTS leave_balances (
+    -- 2️⃣ Leave Entitlement (Per User)
+    CREATE TABLE IF NOT EXISTS leave.leave_entitlement (
+        entitlement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
         leave_type_id UUID NOT NULL,
-        balance NUMERIC(5,2) NOT NULL,
-        as_of TIMESTAMPTZ NOT NULL,
-        generated_at TIMESTAMPTZ DEFAULT NOW(),
-        PRIMARY KEY (company_id, user_id, leave_type_id, as_of),
-        CONSTRAINT fk_lb_company
-            FOREIGN KEY (company_id) REFERENCES companies(company_id),
-        CONSTRAINT fk_lb_user
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-        CONSTRAINT fk_lb_type
-            FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
+        total_days INT NOT NULL,
+        effective_from DATE NOT NULL,
+        effective_to DATE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_leave_entitlement_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+        CONSTRAINT fk_leave_entitlement_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_leave_entitlement_type FOREIGN KEY (leave_type_id) REFERENCES leave.leave_type(leave_type_id)
     );
 
-    -- LEAVE REQUESTS TABLE
-    CREATE TABLE IF NOT EXISTS leave_requests (
+    -- 3️⃣ Leave Accrual Ledger (VERY IMPORTANT)
+    CREATE TABLE IF NOT EXISTS leave.leave_accrual (
+        accrual_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        entitlement_id UUID NOT NULL,
+        accrual_date DATE NOT NULL,
+        days_accrued INT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_leave_accrual_entitlement FOREIGN KEY (entitlement_id) REFERENCES leave.leave_entitlement(entitlement_id) ON DELETE CASCADE
+    );
+
+    -- 4️⃣ Leave Request (Workflow)
+    CREATE TABLE IF NOT EXISTS leave.leave_request (
         leave_request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         company_id UUID NOT NULL,
         user_id UUID NOT NULL,
         leave_type_id UUID NOT NULL,
         start_date DATE NOT NULL,
         end_date DATE NOT NULL,
-        duration NUMERIC(5,2) NOT NULL,
-        reason TEXT,
-        status VARCHAR(30) NOT NULL DEFAULT 'pending',
-        requested_at TIMESTAMPTZ DEFAULT NOW(),
-        CONSTRAINT chk_leave_status CHECK (status IN ('pending','approved','rejected','cancelled','withdrawn')),
-        CONSTRAINT no_overlapping_leaves EXCLUDE USING gist (
-            user_id WITH =,
-            daterange(start_date, end_date, '[]') WITH &&
-        ) WHERE (status IN ('pending','approved')),
-        CONSTRAINT fk_lr_company
-            FOREIGN KEY (company_id) REFERENCES companies(company_id),
-        CONSTRAINT fk_lr_user
-            FOREIGN KEY (user_id) REFERENCES users(user_id),
-        CONSTRAINT fk_lr_type
-            FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id)
+        total_days INT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', -- pending | approved | rejected | cancelled
+        requested_by UUID,
+        approved_by UUID,
+        requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        approved_at TIMESTAMPTZ,
+        CONSTRAINT fk_leave_request_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+        CONSTRAINT fk_leave_request_user FOREIGN KEY (user_id) REFERENCES users(user_id),
+        CONSTRAINT fk_leave_request_type FOREIGN KEY (leave_type_id) REFERENCES leave.leave_type(leave_type_id),
+        CONSTRAINT check_status CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled'))
     );
 
-    -- LEAVE APPROVALS TABLE
-    CREATE TABLE IF NOT EXISTS leave_approvals (
-        approval_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        leave_request_id UUID NOT NULL,
-        approved_by UUID NOT NULL,
-        decision VARCHAR(20) NOT NULL,
-        decision_reason TEXT,
-        approval_level INTEGER NOT NULL DEFAULT 1,
-        decided_at TIMESTAMPTZ DEFAULT NOW(),
-        CONSTRAINT uq_leave_approval_once UNIQUE (leave_request_id, approved_by),
-        CONSTRAINT fk_la_request
-            FOREIGN KEY (leave_request_id)
-            REFERENCES leave_requests(leave_request_id)
-    );
-
-    -- LEAVE TRANSACTIONS TABLE
-    CREATE TABLE IF NOT EXISTS leave_transactions (
-        transaction_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        company_id UUID NOT NULL,
-        user_id UUID NOT NULL,
-        leave_type_id UUID NOT NULL,
+    -- 5️⃣ Leave Ledger (Consumption)
+    CREATE TABLE IF NOT EXISTS leave.leave_ledger (
+        ledger_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        entitlement_id UUID NOT NULL,
         leave_request_id UUID,
-        change_amount NUMERIC(5,2) NOT NULL,
-        reason VARCHAR(50),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        FOREIGN KEY (company_id) REFERENCES companies(company_id),
-        FOREIGN KEY (user_id) REFERENCES users(user_id),
-        FOREIGN KEY (leave_type_id) REFERENCES leave_types(leave_type_id),
-        FOREIGN KEY (leave_request_id) REFERENCES leave_requests(leave_request_id)
+        entry_type TEXT NOT NULL, -- accrual | consumption | reversal
+        days INT NOT NULL,
+        entry_date DATE NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_leave_ledger_entitlement FOREIGN KEY (entitlement_id) REFERENCES leave.leave_entitlement(entitlement_id) ON DELETE CASCADE,
+        CONSTRAINT fk_leave_ledger_request FOREIGN KEY (leave_request_id) REFERENCES leave.leave_request(leave_request_id) ON DELETE SET NULL,
+        CONSTRAINT check_entry_type CHECK (entry_type IN ('accrual', 'consumption', 'reversal'))
     );
+
+    -- 6️⃣ Leave Balance Snapshot Table
+    CREATE TABLE IF NOT EXISTS leave.leave_balance_snapshot (
+        snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        entitlement_id UUID NOT NULL,
+        balance_days INT NOT NULL,
+        calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fk_lbs_entitlement
+            FOREIGN KEY (entitlement_id)
+            REFERENCES leave.leave_entitlement(entitlement_id)
+            ON DELETE CASCADE
+    );
+    CREATE INDEX idx_leave_balance_snapshot_entitlement
+    ON leave.leave_balance_snapshot (entitlement_id);
+
+    -- ==============================================
+    -- PAYROLL MODULE TABLES
+    -- ==============================================
+
+    -- 3️⃣ Payroll Core Tables (MANDATORY)
+    -- 3.1 payroll_run (one payroll cycle)
+    CREATE TABLE IF NOT EXISTS payroll.payroll_run (
+        payroll_run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+
+        period_start DATE NOT NULL,
+        period_end DATE NOT NULL,
+
+        status VARCHAR(20) NOT NULL CHECK (
+            status IN ('draft','calculated','approved','paid')
+        ),
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by UUID,
+
+        CONSTRAINT fk_payroll_run_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+    CREATE INDEX idx_payroll_run_company_period
+    ON payroll.payroll_run (company_id, period_start, period_end);
+
+    -- 3.2 payroll_item (per employee)
+    CREATE TABLE IF NOT EXISTS payroll.payroll_item (
+        payroll_item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        payroll_run_id UUID NOT NULL,
+        user_id UUID NOT NULL,
+
+        payable_days NUMERIC(5,2) NOT NULL,
+        unpaid_days NUMERIC(5,2) NOT NULL,
+
+        gross_amount NUMERIC(12,2) NOT NULL,
+        net_amount NUMERIC(12,2) NOT NULL,
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        CONSTRAINT fk_payroll_item_run
+            FOREIGN KEY (payroll_run_id)
+            REFERENCES payroll.payroll_run(payroll_run_id)
+            ON DELETE CASCADE,
+
+        CONSTRAINT fk_payroll_item_user
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+    );
+    CREATE INDEX idx_payroll_item_run_user
+    ON payroll.payroll_item (payroll_run_id, user_id);
+
+    -- 3.3 payroll_component (earnings & deductions)
+    -- This is where tax, PF, ESIC live as data, not logic.
+    CREATE TABLE IF NOT EXISTS payroll.payroll_component (
+        component_code VARCHAR(50) PRIMARY KEY,
+        component_type VARCHAR(20) NOT NULL CHECK (
+            component_type IN ('earning','deduction')
+        ),
+        description TEXT,
+        is_taxable BOOLEAN NOT NULL DEFAULT false,
+        is_system BOOLEAN NOT NULL DEFAULT false,
+        is_active BOOLEAN NOT NULL DEFAULT true
+    );
+    CREATE INDEX idx_payroll_component_active
+    ON payroll.payroll_component (is_active);
+
+    -- 3.4 payroll_ledger (immutable truth)
+    CREATE TABLE IF NOT EXISTS payroll.payroll_ledger (
+        ledger_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        payroll_item_id UUID NOT NULL,
+
+        component_code VARCHAR(50) NOT NULL,
+        amount NUMERIC(12,2) NOT NULL,
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+        CONSTRAINT fk_ledger_item
+            FOREIGN KEY (payroll_item_id)
+            REFERENCES payroll.payroll_item(payroll_item_id)
+            ON DELETE CASCADE,
+
+        CONSTRAINT fk_ledger_component
+            FOREIGN KEY (component_code)
+            REFERENCES payroll.payroll_component(component_code)
+    );
+    CREATE INDEX idx_payroll_ledger_item
+    ON payroll.payroll_ledger (payroll_item_id);
+
+    -- 4️⃣ Tax System (USER / COUNTRY PLUGIN) — DESIGN ONLY ✅
+    -- ❗ Important: We design tables, but NO formulas hardcoded.
+
+    -- 4.1 payroll_tax_profile (country / company)
+    CREATE TABLE IF NOT EXISTS payroll.payroll_tax_profile (
+        tax_profile_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id UUID NOT NULL,
+        country_code VARCHAR(10) NOT NULL, -- IN, US, AE
+        name VARCHAR(100) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        CONSTRAINT fk_tax_profile_company
+            FOREIGN KEY (company_id) REFERENCES companies(company_id)
+    );
+    CREATE INDEX idx_tax_profile_company_country
+    ON payroll.payroll_tax_profile (company_id, country_code);
+
+    -- 4.2 payroll_tax_rule (configurable rules)
+    CREATE TABLE IF NOT EXISTS payroll.payroll_tax_rule (
+        tax_rule_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tax_profile_id UUID NOT NULL,
+
+        component_code VARCHAR(50) NOT NULL, -- PF / TDS
+        calculation_type VARCHAR(20) NOT NULL CHECK (
+            calculation_type IN ('flat','percentage','formula')
+        ),
+
+        value NUMERIC(10,4),         -- % or flat
+        formula TEXT,                -- optional expression
+        min_amount NUMERIC(12,2),
+        max_amount NUMERIC(12,2),
+
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+
+        CONSTRAINT fk_tax_rule_profile
+            FOREIGN KEY (tax_profile_id)
+            REFERENCES payroll.payroll_tax_profile(tax_profile_id)
+            ON DELETE CASCADE,
+
+        CONSTRAINT fk_tax_rule_component
+            FOREIGN KEY (component_code)
+            REFERENCES payroll.payroll_component(component_code)
+    );
+    CREATE INDEX idx_tax_rule_profile
+    ON payroll.payroll_tax_rule (tax_profile_id);
 
     -- ==============================================
     -- AVATAR TABLES
@@ -1020,7 +1055,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         audit_id UUID NOT NULL,
         operation VARCHAR(10) NOT NULL,
         payload JSONB NOT NULL,
-        created_at TIMestAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         processed_at TIMESTAMPTZ,
         error_message TEXT
     );
@@ -1140,10 +1175,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         company_id UUID NOT NULL,
         org_unit_type VARCHAR(30) NOT NULL,
         name VARCHAR(255) NOT NULL,
+        description TEXT,
         department_id UUID,
         is_active BOOLEAN DEFAULT true,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMestAMPTZ DEFAULT NOW(),
         CONSTRAINT fk_org_units_company
             FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
         CONSTRAINT fk_org_units_department
@@ -1333,16 +1369,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     -- UNIQUE INDEX FOR SCHEDULE INSTANCES
     CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_instances_user_date_active ON schedule_instances (user_id, schedule_date) WHERE status = 'active';
 
-    -- INDEXES FOR COMPENSATION MODULE
-    CREATE INDEX IF NOT EXISTS idx_pay_units_name ON pay_units (name);
-    CREATE INDEX IF NOT EXISTS idx_compensation_structures_company ON compensation_structures (company_id);
-    CREATE INDEX IF NOT EXISTS idx_compensation_structures_code ON compensation_structures (structure_code);
-    CREATE INDEX IF NOT EXISTS idx_compensation_structures_active ON compensation_structures (is_active) WHERE is_active = true;
-    CREATE INDEX IF NOT EXISTS idx_user_compensations_user ON user_compensations (user_id);
-    CREATE INDEX IF NOT EXISTS idx_user_compensations_structure ON user_compensations (structure_id);
-    CREATE INDEX IF NOT EXISTS idx_user_compensations_pay_unit ON user_compensations (pay_unit_id);
-    CREATE INDEX IF NOT EXISTS idx_user_compensations_dates ON user_compensations (effective_from, effective_to);
-
     -- INDEXES FOR ATTENDANCE MODULE
     CREATE INDEX IF NOT EXISTS idx_attendance_sources_company ON attendance_sources (company_id);
     CREATE INDEX IF NOT EXISTS idx_attendance_sources_type ON attendance_sources (source_type);
@@ -1369,15 +1395,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     CREATE INDEX IF NOT EXISTS idx_attendance_locations_code ON attendance_locations (company_id, location_code) WHERE location_code IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_attendance_locations_zone ON attendance_locations (company_id, zone) WHERE zone IS NOT NULL;
 
-    -- INDEXES FOR EMPLOYEE_RFID_MAPPINGS
-    CREATE INDEX IF NOT EXISTS idx_employee_rfid_tag ON employee_rfid_mappings (rfid_tag);
-    CREATE INDEX IF NOT EXISTS idx_employee_rfid_user ON employee_rfid_mappings (user_id);
-    CREATE INDEX IF NOT EXISTS idx_employee_rfid_company ON employee_rfid_mappings (company_id);
-    CREATE INDEX IF NOT EXISTS idx_employee_rfid_active ON employee_rfid_mappings (is_active) WHERE is_active = true;
-
-    -- UNIQUE INDEX FOR EMPLOYEE_RFID_MAPPINGS
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_rfid_active_user ON employee_rfid_mappings (user_id, company_id) WHERE is_active = true AND unassigned_at IS NULL;
-
     -- INDEXES FOR WORK_CENTER_SHIFTS
     CREATE INDEX IF NOT EXISTS idx_work_center_shifts_code ON work_center_shifts (work_center_code);
     CREATE INDEX IF NOT EXISTS idx_work_center_shifts_company ON work_center_shifts (company_id);
@@ -1391,30 +1408,89 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     -- INDEXES FOR WORK_CENTERS
     CREATE INDEX IF NOT EXISTS idx_work_centers_company ON work_centers (company_id, is_active);
 
-    -- INDEXES FOR LEAVE MODULE
-    CREATE INDEX IF NOT EXISTS idx_leave_types_company ON leave_types (company_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_types_code ON leave_types (leave_code);
-    CREATE INDEX IF NOT EXISTS idx_leave_types_active ON leave_types (is_active) WHERE is_active = true;
-    CREATE INDEX IF NOT EXISTS idx_leave_policies_company ON leave_policies (company_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_policies_department ON leave_policies (department_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_policies_active ON leave_policies (is_active) WHERE is_active = true;
-    CREATE INDEX IF NOT EXISTS idx_user_leave_policies_user ON user_leave_policies (user_id);
-    CREATE INDEX IF NOT EXISTS idx_user_leave_policies_policy ON user_leave_policies (leave_policy_id);
-    CREATE INDEX IF NOT EXISTS idx_user_leave_policies_dates ON user_leave_policies (effective_from, effective_to);
-    CREATE INDEX IF NOT EXISTS idx_leave_balances_user ON leave_balances (user_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_balances_type ON leave_balances (leave_type_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_balances_as_of ON leave_balances (as_of);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_user ON leave_requests (user_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_company ON leave_requests (company_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_type ON leave_requests (leave_type_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_status ON leave_requests (status);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_dates ON leave_requests (start_date, end_date);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_requested_at ON leave_requests (requested_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_leave_requests_pending ON leave_requests (company_id) WHERE status = 'pending';
-    CREATE INDEX IF NOT EXISTS idx_leave_approvals_request ON leave_approvals (leave_request_id);
-    CREATE INDEX IF NOT EXISTS idx_leave_approvals_approver ON leave_approvals (approved_by);
+    -- ==============================================
+    -- INDEXES FOR NEW LEAVE MODULE TABLES
+    -- ==============================================
 
+    -- Indexes for leave.leave_type
+    CREATE INDEX IF NOT EXISTS idx_leave_type_company ON leave.leave_type (company_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_type_code ON leave.leave_type (code);
+    CREATE INDEX IF NOT EXISTS idx_leave_type_accrual_method ON leave.leave_type (accrual_method);
+
+    -- Indexes for leave.leave_entitlement
+    CREATE INDEX IF NOT EXISTS idx_leave_entitlement_company_user ON leave.leave_entitlement (company_id, user_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_entitlement_user ON leave.leave_entitlement (user_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_entitlement_leave_type ON leave.leave_entitlement (leave_type_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_entitlement_dates ON leave.leave_entitlement (effective_from, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_leave_entitlement_current
+    ON leave.leave_entitlement (user_id, leave_type_id)
+    WHERE effective_to IS NULL;
+
+    -- Indexes for leave.leave_accrual
+    CREATE INDEX IF NOT EXISTS idx_leave_accrual_entitlement ON leave.leave_accrual (entitlement_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_accrual_date ON leave.leave_accrual (accrual_date);
+    CREATE INDEX IF NOT EXISTS idx_leave_accrual_entitlement_date ON leave.leave_accrual (entitlement_id, accrual_date);
+
+    -- Indexes for leave.leave_request
+    CREATE INDEX IF NOT EXISTS idx_leave_request_company_user ON leave.leave_request (company_id, user_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_request_user ON leave.leave_request (user_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_request_leave_type ON leave.leave_request (leave_type_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_request_status ON leave.leave_request (status);
+    CREATE INDEX IF NOT EXISTS idx_leave_request_dates ON leave.leave_request (start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_leave_request_requested_at ON leave.leave_request (requested_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_leave_request_pending ON leave.leave_request (company_id) WHERE status = 'pending';
+    CREATE INDEX IF NOT EXISTS idx_leave_request_approved_by ON leave.leave_request (approved_by) WHERE approved_by IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_leave_request_date_range ON leave.leave_request USING gist (daterange(start_date, end_date, '[]'));
+
+    -- Indexes for leave.leave_ledger
+    CREATE INDEX IF NOT EXISTS idx_leave_ledger_entitlement ON leave.leave_ledger (entitlement_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_ledger_request ON leave.leave_ledger (leave_request_id);
+    CREATE INDEX IF NOT EXISTS idx_leave_ledger_entry_date ON leave.leave_ledger (entry_date);
+    CREATE INDEX IF NOT EXISTS idx_leave_ledger_entry_type ON leave.leave_ledger (entry_type);
+    CREATE INDEX IF NOT EXISTS idx_leave_ledger_entitlement_date ON leave.leave_ledger (entitlement_id, entry_date);
+    CREATE INDEX IF NOT EXISTS idx_leave_ledger_request_type ON leave.leave_ledger (leave_request_id, entry_type) WHERE leave_request_id IS NOT NULL;
+
+    -- Indexes for leave.leave_balance_snapshot
+    CREATE INDEX IF NOT EXISTS idx_leave_balance_snapshot_entitlement ON leave.leave_balance_snapshot (entitlement_id);
+
+    -- ==============================================
+    -- INDEXES FOR PAYROLL MODULE TABLES
+    -- ==============================================
+
+    -- Indexes for payroll.payroll_run
+    CREATE INDEX IF NOT EXISTS idx_payroll_run_company ON payroll.payroll_run (company_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_run_status ON payroll.payroll_run (status) WHERE status IN ('draft','calculated');
+    CREATE INDEX IF NOT EXISTS idx_payroll_run_period ON payroll.payroll_run (period_start, period_end);
+    CREATE INDEX IF NOT EXISTS idx_payroll_run_created_at ON payroll.payroll_run (created_at DESC);
+
+    -- Indexes for payroll.payroll_item
+    CREATE INDEX IF NOT EXISTS idx_payroll_item_user ON payroll.payroll_item (user_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_item_run ON payroll.payroll_item (payroll_run_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_item_created_at ON payroll.payroll_item (created_at DESC);
+
+    -- Indexes for payroll.payroll_component
+    CREATE INDEX IF NOT EXISTS idx_payroll_component_type ON payroll.payroll_component (component_type);
+    CREATE INDEX IF NOT EXISTS idx_payroll_component_taxable ON payroll.payroll_component (is_taxable) WHERE is_taxable = true;
+    CREATE INDEX IF NOT EXISTS idx_payroll_component_system ON payroll.payroll_component (is_system) WHERE is_system = true;
+
+    -- Indexes for payroll.payroll_ledger
+    CREATE INDEX IF NOT EXISTS idx_payroll_ledger_component ON payroll.payroll_ledger (component_code);
+    CREATE INDEX IF NOT EXISTS idx_payroll_ledger_created_at ON payroll.payroll_ledger (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_payroll_ledger_item_component ON payroll.payroll_ledger (payroll_item_id, component_code);
+
+    -- Indexes for payroll.payroll_tax_profile
+    CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_country ON payroll.payroll_tax_profile (country_code);
+    CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_active ON payroll.payroll_tax_profile (is_active) WHERE is_active = true;
+    CREATE INDEX IF NOT EXISTS idx_payroll_tax_profile_created_at ON payroll.payroll_tax_profile (created_at DESC);
+
+    -- Indexes for payroll.payroll_tax_rule
+    CREATE INDEX IF NOT EXISTS idx_payroll_tax_rule_component ON payroll.payroll_tax_rule (component_code);
+    CREATE INDEX IF NOT EXISTS idx_payroll_tax_rule_type ON payroll.payroll_tax_rule (calculation_type);
+    CREATE INDEX IF NOT EXISTS idx_payroll_tax_rule_profile ON payroll.payroll_tax_rule (tax_profile_id);
+
+    -- ==============================================
     -- INDEXES FOR ADDITIONAL ATTENDANCE TABLES
+    -- ==============================================
     CREATE INDEX IF NOT EXISTS idx_company_attendance_rules_company ON company_attendance_rules (company_id);
     CREATE INDEX IF NOT EXISTS idx_department_attendance_rules_dept ON department_attendance_rules (department_id);
     CREATE INDEX IF NOT EXISTS idx_user_attendance_profiles_user ON user_attendance_profiles (user_id);
@@ -1473,7 +1549,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('mobile', 'Mobile App Punch', 'mobile', false, false, false, false, 2, true),
     ('web', 'Web Portal Punch', 'web', false, false, false, false, 2, true),
     ('biometric', 'Biometric Attendance Device', 'biometric', true, false, false, false, 5, true),
-    ('rfid', 'RFID Card Attendance', 'rfid', true, false, false, false, 5, true),
     ('kiosk', 'Shared Kiosk / Tablet', 'machine', true, false, false, false, 4, true),
     ('manual', 'Manual Attendance Entry', 'manual', false, false, true, false, 1, false),
     ('correction', 'Attendance Correction', 'manual', false, false, true, false, 1, false),
@@ -1517,7 +1592,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('manual_override', 'manual', 'Manual override', false, false),
     ('attendance_adjustment', 'manual', 'Attendance adjustment', false, false),
     ('biometric_sync', 'system', 'Biometric sync', false, true),
-    ('rfid_scan', 'system', 'RFID scan', false, true),
     ('system_generated', 'system', 'System generated event', false, true),
     ('imported_event', 'system', 'Imported attendance', false, true),
     ('missing_punch', 'exception', 'Missing punch', false, true),
@@ -1526,13 +1600,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('policy_violation', 'exception', 'Attendance policy violation', false, true)
     ON CONFLICT DO NOTHING;
 
-    -- SEED DATA FOR PAY UNITS
-    INSERT INTO pay_units (name, description) VALUES
-    ('monthly', 'Monthly salary'),
-    ('daily', 'Daily wage'),
-    ('hourly', 'Hourly wage'),
-    ('per_class', 'Per class/session'),
-    ('per_shift', 'Per shift')
+    -- SEED DATA FOR PAYROLL COMPONENTS
+    INSERT INTO payroll.payroll_component VALUES
+    ('BASIC', 'earning', 'Basic Salary', true, true, true),
+    ('HRA', 'earning', 'House Rent Allowance', true, false, true),
+    ('PF', 'deduction', 'Provident Fund', false, false, true),
+    ('TDS', 'deduction', 'Income Tax', false, false, true)
     ON CONFLICT DO NOTHING;
 
     -- INSERT DEFAULT SYSTEM DEPARTMENTS
@@ -1557,7 +1630,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('Manager Management', 'manager_management', 'Manager oversight and coordination', 1 << 17),
     ('Company Management', 'company_management', 'Overall company management and strategy', 1 << 18),
     ('Super Admin Management', 'super_admin', 'Super Admin management and system control', 1 << 19),
-    ('Attendance', 'attendance', 'Attendance and time tracking management', 1 << 20)
+    ('Attendance', 'attendance', 'Attendance and time tracking management', 1 << 20),
+    ('Payroll', 'payroll', 'Payroll management and processing', 1 << 21)
     ON CONFLICT (name) DO NOTHING;
 
     -- INSERT PERMISSIONS
@@ -1788,6 +1862,14 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     ('attendance.team.punch', 'Allow manager/lead to punch attendance for team members', 'attendance', 'attendance', 'user', 'basic', 224),
     ('attendance.correct', 'Allow correction or adjustment of attendance records', 'attendance', 'attendance', 'user', 'basic', 225),
     ('attendance.configure', 'Configure attendance rules, sources, and policies', 'attendance', 'attendance', 'user', 'basic', 226),
+    ('payroll.run.create', 'Create payroll runs', 'payroll', 'payroll', 'user', 'basic', 227),
+    ('payroll.run.update', 'Update payroll runs', 'payroll', 'payroll', 'user', 'basic', 228),
+    ('payroll.run.view', 'View payroll runs', 'payroll', 'payroll', 'user', 'basic', 229),
+    ('payroll.run.delete', 'Delete payroll runs', 'payroll', 'payroll', 'user', 'basic', 230),
+    ('payroll.run.approve', 'Approve payroll runs', 'payroll', 'payroll', 'user', 'basic', 231),
+    ('payroll.run.process', 'Process payroll runs', 'payroll', 'payroll', 'user', 'basic', 232),
+    ('payroll.component.manage', 'Manage payroll components', 'payroll', 'payroll', 'user', 'basic', 233),
+    ('payroll.tax.manage', 'Manage tax rules and profiles', 'payroll', 'payroll', 'user', 'basic', 234),
     ('admin.employee.create', 'Create admin employees', 'employee', 'employee_management', 'admin', 'admin', 235),
     ('admin.employee.update', 'Update admin employees', 'employee', 'employee_management', 'admin', 'admin', 236),
     ('admin.employee.view', 'View admin employees', 'employee', 'employee_management', 'admin', 'admin', 237),
@@ -2787,7 +2869,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         reports_to_name VARCHAR(255),
         is_active BOOLEAN,
         last_login TIMESTAMPTZ,
-        admin_created_at TIMESTAMPTZ,
+        admin_created_at TIMestAMPTZ,
         relevance_score FLOAT,
         match_type TEXT
     ) AS $$
@@ -3542,7 +3624,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     CREATE TRIGGER update_admin_roles_updated_at BEFORE UPDATE ON admin_roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_employee_profiles_updated_at BEFORE UPDATE ON employee_profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_attendance_policies_updated_at BEFORE UPDATE ON attendance_policies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    CREATE TRIGGER update_employee_rfid_updated_at BEFORE UPDATE ON employee_rfid_mappings FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_work_center_shifts_updated_at BEFORE UPDATE ON work_center_shifts FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_user_work_center_assignments_updated_at BEFORE UPDATE ON user_work_center_assignments FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     CREATE TRIGGER update_work_centers_updated_at BEFORE UPDATE ON work_centers FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -3644,12 +3725,24 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
     -- Make audit immutable
     REVOKE UPDATE, DELETE ON audit.audit_logs FROM PUBLIC;
 
-    -- ==============================================
-    -- COMPLETION MESSAGE
-    -- ==============================================
-    ALTER TABLE org_units
-    ADD COLUMN description TEXT;
+    -- Add payroll lock column to attendance_daily_summary table
+    ALTER TABLE attendance_daily_summary
+    ADD COLUMN IF NOT EXISTS is_payroll_locked BOOLEAN NOT NULL DEFAULT false;
 
+    -- Add this to your schema script
+    CREATE TABLE IF NOT EXISTS payroll.payroll_snapshot (
+        snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        payroll_run_id UUID NOT NULL,
+        company_id UUID NOT NULL,
+        snapshot_type VARCHAR(20) NOT NULL,
+        snapshot_data JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_by UUID NOT NULL,
+        CONSTRAINT fk_snapshot_run FOREIGN KEY (payroll_run_id) 
+            REFERENCES payroll.payroll_run(payroll_run_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_payroll_snapshot_run ON payroll.payroll_snapshot(payroll_run_id);
+    CREATE INDEX IF NOT EXISTS idx_payroll_snapshot_company ON payroll.payroll_snapshot(company_id);
 EOSQL
 
 echo "✅ Database schema created successfully!"

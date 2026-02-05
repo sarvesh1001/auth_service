@@ -33,6 +33,7 @@ func NewSchedulingRepository(postgresClient *client.PostgresClient, logger *zap.
 	go repo.initializePreparedStatements(context.Background())
 	return repo
 }
+
 func (r *SchedulingRepositoryImpl) CreateWorkCalendar(
 	ctx context.Context,
 	calendar *scheduling.WorkCalendar,
@@ -80,6 +81,7 @@ func (r *SchedulingRepositoryImpl) CreateWorkCalendar(
 	)
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCalendarByID(
 	ctx context.Context,
 	calendarID uuid.UUID,
@@ -120,6 +122,7 @@ func (r *SchedulingRepositoryImpl) GetWorkCalendarByID(
 	}
 	return nil, fmt.Errorf("work calendar not found: %s", calendarID)
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCalendarsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -158,6 +161,7 @@ func (r *SchedulingRepositoryImpl) GetWorkCalendarsByCompany(
 	}
 	return calendars, nil
 }
+
 func (r *SchedulingRepositoryImpl) DeleteWorkCalendar(ctx context.Context, calendarID uuid.UUID) error {
 	query := `DELETE FROM work_calendars WHERE calendar_id = $1`
 	result, err := r.client.Exec(ctx, query, calendarID)
@@ -170,6 +174,7 @@ func (r *SchedulingRepositoryImpl) DeleteWorkCalendar(ctx context.Context, calen
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) CreateScheduleTemplate(ctx context.Context, template *scheduling.ScheduleTemplate) error {
 	startTime := time.Now()
 	rulesJSON, err := json.Marshal(template.Rules)
@@ -203,6 +208,7 @@ func (r *SchedulingRepositoryImpl) CreateScheduleTemplate(ctx context.Context, t
 		util.Duration("duration", time.Since(startTime)))
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleTemplateByID(ctx context.Context, templateID uuid.UUID) (*scheduling.ScheduleTemplate, error) {
 	stmt, ok := r.getStmt("get_schedule_template_by_id")
 	if !ok {
@@ -230,6 +236,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleTemplateByID(ctx context.Context, 
 	}
 	return nil, fmt.Errorf("schedule template not found: %s", templateID)
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleTemplatesByCompany(ctx context.Context, companyID uuid.UUID) ([]*scheduling.ScheduleTemplate, error) {
 	query := `
 		SELECT schedule_template_id, company_id, calendar_id, template_type, name,
@@ -256,6 +263,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleTemplatesByCompany(ctx context.Con
 	}
 	return templates, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleTemplatesByCalendar(ctx context.Context, calendarID uuid.UUID) ([]*scheduling.ScheduleTemplate, error) {
 	query := `
 		SELECT schedule_template_id, company_id, calendar_id, template_type, name,
@@ -282,6 +290,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleTemplatesByCalendar(ctx context.Co
 	}
 	return templates, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetActiveTemplatesByType(ctx context.Context, companyID uuid.UUID, templateType string) ([]*scheduling.ScheduleTemplate, error) {
 	query := `
 		SELECT schedule_template_id, company_id, calendar_id, template_type, name,
@@ -308,6 +317,7 @@ func (r *SchedulingRepositoryImpl) GetActiveTemplatesByType(ctx context.Context,
 	}
 	return templates, nil
 }
+
 func (r *SchedulingRepositoryImpl) UpdateScheduleTemplate(ctx context.Context, template *scheduling.ScheduleTemplate) error {
 	rulesJSON, err := json.Marshal(template.Rules)
 	if err != nil {
@@ -335,6 +345,7 @@ func (r *SchedulingRepositoryImpl) UpdateScheduleTemplate(ctx context.Context, t
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) DeleteScheduleTemplate(ctx context.Context, templateID uuid.UUID) error {
 	query := `DELETE FROM schedule_templates WHERE schedule_template_id = $1`
 	result, err := r.client.Exec(ctx, query, templateID)
@@ -347,6 +358,7 @@ func (r *SchedulingRepositoryImpl) DeleteScheduleTemplate(ctx context.Context, t
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) CreateUserScheduleAssignment(ctx context.Context, assignment *scheduling.UserScheduleAssignment) error {
 	query := `
 		INSERT INTO user_schedule_assignments (
@@ -370,6 +382,7 @@ func (r *SchedulingRepositoryImpl) CreateUserScheduleAssignment(ctx context.Cont
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) GetUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, effectiveFrom time.Time) (*scheduling.UserScheduleAssignment, error) {
 	query := `
 		SELECT user_id, schedule_template_id, effective_from, effective_to,
@@ -386,6 +399,7 @@ func (r *SchedulingRepositoryImpl) GetUserScheduleAssignment(ctx context.Context
 	}
 	return nil, fmt.Errorf("user schedule assignment not found")
 }
+
 func (r *SchedulingRepositoryImpl) GetUserCurrentScheduleAssignment(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.UserScheduleAssignment, error) {
 	stmt, ok := r.getStmt("get_user_current_schedule_assignment")
 	if !ok {
@@ -418,6 +432,7 @@ func (r *SchedulingRepositoryImpl) GetUserCurrentScheduleAssignment(ctx context.
 	}
 	return nil, fmt.Errorf("no active schedule assignment found for user: %s", userID)
 }
+
 func (r *SchedulingRepositoryImpl) GetUserScheduleAssignments(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time) ([]*scheduling.UserScheduleAssignment, error) {
 	var query string
 	var args []interface{}
@@ -460,6 +475,7 @@ func (r *SchedulingRepositoryImpl) GetUserScheduleAssignments(ctx context.Contex
 	}
 	return assignments, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetAssignmentsByTemplate(ctx context.Context, templateID uuid.UUID, activeOnly bool) ([]*scheduling.UserScheduleAssignment, error) {
 	var query string
 	if activeOnly {
@@ -497,6 +513,7 @@ func (r *SchedulingRepositoryImpl) GetAssignmentsByTemplate(ctx context.Context,
 	}
 	return assignments, nil
 }
+
 func (r *SchedulingRepositoryImpl) UpdateUserScheduleAssignment(ctx context.Context, assignment *scheduling.UserScheduleAssignment) error {
 	query := `
 		UPDATE user_schedule_assignments SET
@@ -518,6 +535,7 @@ func (r *SchedulingRepositoryImpl) UpdateUserScheduleAssignment(ctx context.Cont
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) EndUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, endDate time.Time) error {
 	query := `
 		UPDATE user_schedule_assignments
@@ -533,6 +551,7 @@ func (r *SchedulingRepositoryImpl) EndUserScheduleAssignment(ctx context.Context
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) DeleteUserScheduleAssignment(ctx context.Context, userID, templateID uuid.UUID, effectiveFrom time.Time) error {
 	query := `
 		DELETE FROM user_schedule_assignments
@@ -547,6 +566,7 @@ func (r *SchedulingRepositoryImpl) DeleteUserScheduleAssignment(ctx context.Cont
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstanceByID(ctx context.Context, instanceID uuid.UUID) (*scheduling.ScheduleInstance, error) {
 	stmt, ok := r.getStmt("get_schedule_instance_by_id")
 	if !ok {
@@ -575,6 +595,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstanceByID(ctx context.Context, 
 	}
 	return nil, fmt.Errorf("schedule instance not found: %s", instanceID)
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstancesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error) {
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date,
@@ -602,6 +623,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByUser(ctx context.Contex
 	}
 	return instances, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstancesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error) {
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date,
@@ -629,6 +651,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByCompany(ctx context.Con
 	}
 	return instances, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstancesByTemplate(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) ([]*scheduling.ScheduleInstance, error) {
 	query := `
 		SELECT schedule_instance_id, company_id, user_id, schedule_date,
@@ -656,6 +679,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByTemplate(ctx context.Co
 	}
 	return instances, nil
 }
+
 func (r *SchedulingRepositoryImpl) UpdateScheduleInstance(ctx context.Context, instance *scheduling.ScheduleInstance) error {
 	metadataJSON, err := json.Marshal(instance.Metadata)
 	if err != nil {
@@ -681,6 +705,7 @@ func (r *SchedulingRepositoryImpl) UpdateScheduleInstance(ctx context.Context, i
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) CancelScheduleInstance(
 	ctx context.Context,
 	instanceID uuid.UUID,
@@ -704,6 +729,7 @@ func (r *SchedulingRepositoryImpl) CancelScheduleInstance(
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID) error {
 	query := `DELETE FROM schedule_instances WHERE schedule_instance_id = $1`
 	result, err := r.client.Exec(ctx, query, instanceID)
@@ -812,51 +838,98 @@ func (r *SchedulingRepositoryImpl) BulkCreateScheduleInstances(
 	return nil
 }
 
-func (r *SchedulingRepositoryImpl) GetScheduleCoverage(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error) {
+func (r *SchedulingRepositoryImpl) GetScheduleCoverage(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+) (map[string]interface{}, error) {
+
 	stats := make(map[string]interface{})
+
+	// 1️⃣ Total scheduled days
 	var totalScheduledDays int
 	err := r.client.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT schedule_date)
 		FROM schedule_instances
-		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
-		companyID, startDate, endDate).Scan(&totalScheduledDays)
+		WHERE company_id = $1
+		  AND schedule_date BETWEEN $2 AND $3
+		  AND status = 'active'
+	`, companyID, startDate, endDate).Scan(&totalScheduledDays)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total scheduled days: %w", err)
 	}
 	stats["total_scheduled_days"] = totalScheduledDays
+
+	// 2️⃣ Total scheduled users
 	var totalScheduledUsers int
 	err = r.client.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT user_id)
 		FROM schedule_instances
-		WHERE company_id = $1 AND schedule_date BETWEEN $2 AND $3 AND status = 'active'`,
-		companyID, startDate, endDate).Scan(&totalScheduledUsers)
+		WHERE company_id = $1
+		  AND schedule_date BETWEEN $2 AND $3
+		  AND status = 'active'
+	`, companyID, startDate, endDate).Scan(&totalScheduledUsers)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get total scheduled users: %w", err)
 	}
 	stats["total_scheduled_users"] = totalScheduledUsers
-	query := `
-		SELECT st.template_type, COUNT(si.schedule_instance_id) as count
+
+	// 3️⃣ Template distribution
+	templateRows, err := r.client.Query(ctx, `
+		SELECT st.template_type, COUNT(si.schedule_instance_id)
 		FROM schedule_instances si
-		JOIN schedule_templates st ON si.schedule_template_id = st.schedule_template_id
-		WHERE si.company_id = $1 AND si.schedule_date BETWEEN $2 AND $3 AND si.status = 'active'
-		GROUP BY st.template_type`
-	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate)
+		JOIN schedule_templates st
+		  ON si.schedule_template_id = st.schedule_template_id
+		WHERE si.company_id = $1
+		  AND si.schedule_date BETWEEN $2 AND $3
+		  AND si.status = 'active'
+		GROUP BY st.template_type
+	`, companyID, startDate, endDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get template distribution: %w", err)
 	}
-	defer rows.Close()
+	defer templateRows.Close()
+
 	templateStats := make(map[string]int)
-	for rows.Next() {
+	for templateRows.Next() {
 		var templateType string
 		var count int
-		if err := rows.Scan(&templateType, &count); err != nil {
-			continue
+		if err := templateRows.Scan(&templateType, &count); err == nil {
+			templateStats[templateType] = count
 		}
-		templateStats[templateType] = count
 	}
 	stats["template_distribution"] = templateStats
+
+	// 4️⃣ ✅ Work center distribution (FIXED – uses schedule_instances)
+	wcRows, err := r.client.Query(ctx, `
+		SELECT
+			si.work_center_code,
+			COUNT(DISTINCT si.user_id)
+		FROM schedule_instances si
+		WHERE si.company_id = $1
+		  AND si.schedule_date BETWEEN $2 AND $3
+		  AND si.status = 'active'
+		  AND si.work_center_code IS NOT NULL
+		GROUP BY si.work_center_code
+	`, companyID, startDate, endDate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get work center distribution: %w", err)
+	}
+	defer wcRows.Close()
+
+	workCenterStats := make(map[string]int)
+	for wcRows.Next() {
+		var workCenterCode string
+		var count int
+		if err := wcRows.Scan(&workCenterCode, &count); err == nil {
+			workCenterStats[workCenterCode] = count
+		}
+	}
+	stats["work_center_distribution"] = workCenterStats
+
 	return stats, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetUserScheduleSummary(ctx context.Context, userID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 	var totalScheduledDays int
@@ -900,6 +973,7 @@ func (r *SchedulingRepositoryImpl) GetUserScheduleSummary(ctx context.Context, u
 	stats["schedule_by_type"] = templateStats
 	return stats, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetTemplateUtilization(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 	template, err := r.GetScheduleTemplateByID(ctx, templateID)
@@ -957,6 +1031,7 @@ func (r *SchedulingRepositoryImpl) GetTemplateUtilization(ctx context.Context, t
 	stats["daily_utilization"] = dailyStats
 	return stats, nil
 }
+
 func (r *SchedulingRepositoryImpl) scanWorkCalendar(
 	rows *sql.Rows,
 ) (*scheduling.WorkCalendar, error) {
@@ -991,6 +1066,7 @@ func (r *SchedulingRepositoryImpl) scanWorkCalendar(
 	}
 	return &calendar, nil
 }
+
 func (r *SchedulingRepositoryImpl) scanScheduleTemplate(rows *sql.Rows) (*scheduling.ScheduleTemplate, error) {
 	var template scheduling.ScheduleTemplate
 	var rulesJSON []byte
@@ -1017,6 +1093,7 @@ func (r *SchedulingRepositoryImpl) scanScheduleTemplate(rows *sql.Rows) (*schedu
 	}
 	return &template, nil
 }
+
 func (r *SchedulingRepositoryImpl) scanUserScheduleAssignment(rows *sql.Rows) (*scheduling.UserScheduleAssignment, error) {
 	var assignment scheduling.UserScheduleAssignment
 	var assignedBy sql.NullString
@@ -1039,6 +1116,7 @@ func (r *SchedulingRepositoryImpl) scanUserScheduleAssignment(rows *sql.Rows) (*
 	}
 	return &assignment, nil
 }
+
 func (r *SchedulingRepositoryImpl) initializePreparedStatements(ctx context.Context) {
 	statements := map[string]string{
 		"get_work_calendar_by_id": `
@@ -1094,6 +1172,7 @@ func (r *SchedulingRepositoryImpl) initializePreparedStatements(ctx context.Cont
 		util.Int("statements", len(r.stmtCache)),
 	)
 }
+
 func (r *SchedulingRepositoryImpl) UpdateWorkCalendar(
 	ctx context.Context,
 	calendar *scheduling.WorkCalendar,
@@ -1131,12 +1210,14 @@ func (r *SchedulingRepositoryImpl) UpdateWorkCalendar(
 	}
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) getStmt(name string) (*sql.Stmt, bool) {
 	r.stmtMutex.RLock()
 	defer r.stmtMutex.RUnlock()
 	stmt, exists := r.stmtCache[name]
 	return stmt, exists
 }
+
 func (r *SchedulingRepositoryImpl) HealthCheck(ctx context.Context) error {
 	query := `SELECT 1 FROM work_calendars LIMIT 1`
 	_, err := r.client.Exec(ctx, query)
@@ -1145,211 +1226,16 @@ func (r *SchedulingRepositoryImpl) HealthCheck(ctx context.Context) error {
 	}
 	return nil
 }
-func (r *SchedulingRepositoryImpl) CreateOffEntitlement(ctx context.Context, entitlement *scheduling.UserOffEntitlement) error {
-	query := `
-		INSERT INTO user_off_entitlements (
-			entitlement_id, company_id, user_id, period_type, off_count,
-			requires_approval, effective_from, effective_to, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-	_, err := r.client.Exec(ctx, query,
-		entitlement.EntitlementID,
-		entitlement.CompanyID,
-		entitlement.UserID,
-		entitlement.PeriodType,
-		entitlement.OffCount,
-		entitlement.RequiresApproval,
-		entitlement.EffectiveFrom,
-		entitlement.EffectiveTo,
-		entitlement.CreatedAt,
-	)
-	if err != nil {
-		r.logger.Error("Failed to create off entitlement",
-			util.String("user_id", entitlement.UserID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to create off entitlement: %w", err)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) GetOffEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*scheduling.UserOffEntitlement, error) {
-	query := `
-		SELECT entitlement_id, company_id, user_id, period_type, off_count,
-			   requires_approval, effective_from, effective_to, created_at
-		FROM user_off_entitlements
-		WHERE entitlement_id = $1`
-	rows, err := r.client.Query(ctx, query, entitlementID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off entitlement: %w", err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return r.scanOffEntitlement(rows)
-	}
-	return nil, fmt.Errorf("off entitlement not found: %s", entitlementID)
-}
-func (r *SchedulingRepositoryImpl) GetOffEntitlementsByUser(ctx context.Context, userID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error) {
-	var query string
-	if activeOnly {
-		query = `
-			SELECT entitlement_id, company_id, user_id, period_type, off_count,
-				   requires_approval, effective_from, effective_to, created_at
-			FROM user_off_entitlements
-			WHERE user_id = $1
-			  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
-			  AND effective_from <= CURRENT_DATE
-			ORDER BY effective_from DESC`
-	} else {
-		query = `
-			SELECT entitlement_id, company_id, user_id, period_type, off_count,
-				   requires_approval, effective_from, effective_to, created_at
-			FROM user_off_entitlements
-			WHERE user_id = $1
-			ORDER BY effective_from DESC`
-	}
-	rows, err := r.client.Query(ctx, query, userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off entitlements: %w", err)
-	}
-	defer rows.Close()
-	entitlements := make([]*scheduling.UserOffEntitlement, 0)
-	for rows.Next() {
-		entitlement, err := r.scanOffEntitlement(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan off entitlement", util.ErrorField(err))
-			continue
-		}
-		entitlements = append(entitlements, entitlement)
-	}
-	return entitlements, nil
-}
-func (r *SchedulingRepositoryImpl) GetCurrentOffEntitlement(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.UserOffEntitlement, error) {
-	query := `
-		SELECT entitlement_id, company_id, user_id, period_type, off_count,
-			   requires_approval, effective_from, effective_to, created_at
-		FROM user_off_entitlements
-		WHERE user_id = $1
-		  AND effective_from <= $2
-		  AND (effective_to IS NULL OR effective_to >= $2)
-		ORDER BY effective_from DESC
-		LIMIT 1`
-	rows, err := r.client.Query(ctx, query, userID, date)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current off entitlement: %w", err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return r.scanOffEntitlement(rows)
-	}
-	return nil, fmt.Errorf("no active off entitlement found")
-}
-func (r *SchedulingRepositoryImpl) CreateOffRequest(ctx context.Context, request *scheduling.OffRequest) error {
-	query := `
-		INSERT INTO off_requests (
-			off_request_id, company_id, user_id, request_dates, status,
-			requested_by, approved_by, approved_at, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-	_, err := r.client.Exec(ctx, query,
-		request.OffRequestID,
-		request.CompanyID,
-		request.UserID,
-		pq.Array(request.RequestDates),
-		request.Status,
-		request.RequestedBy,
-		request.ApprovedBy,
-		request.ApprovedAt,
-		request.CreatedAt,
-	)
-	if err != nil {
-		r.logger.Error("Failed to create off request",
-			util.String("user_id", request.UserID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to create off request: %w", err)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) GetOffRequestByID(ctx context.Context, requestID uuid.UUID) (*scheduling.OffRequest, error) {
-	query := `
-		SELECT off_request_id, company_id, user_id, request_dates, status,
-			   requested_by, approved_by, approved_at, created_at
-		FROM off_requests
-		WHERE off_request_id = $1`
-	rows, err := r.client.Query(ctx, query, requestID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off request: %w", err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return r.scanOffRequest(rows)
-	}
-	return nil, fmt.Errorf("off request not found: %s", requestID)
-}
-func (r *SchedulingRepositoryImpl) GetOffRequestsByUser(
-	ctx context.Context,
-	userID uuid.UUID,
-	startDate, endDate *time.Time,
-	status *string,
-) ([]*scheduling.OffRequest, error) {
-	query := `
-		SELECT off_request_id, company_id, user_id, request_dates, status,
-			   requested_by, approved_by, approved_at, created_at
-		FROM off_requests
-		WHERE user_id = $1
-	`
-	args := []interface{}{userID}
-	argIndex := 2
-	if startDate != nil && endDate != nil {
-		query += fmt.Sprintf(`
-			AND EXISTS (
-				SELECT 1
-				FROM unnest(request_dates) AS d
-				WHERE d BETWEEN $%d AND $%d
-			)
-		`, argIndex, argIndex+1)
-		args = append(args, *startDate, *endDate)
-		argIndex += 2
-	}
-	if status != nil {
-		query += fmt.Sprintf(" AND status = $%d", argIndex)
-		args = append(args, *status)
-		argIndex++
-	}
-	query += " ORDER BY created_at DESC"
-	rows, err := r.client.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off requests: %w", err)
-	}
-	defer rows.Close()
-	requests := make([]*scheduling.OffRequest, 0)
-	for rows.Next() {
-		request, err := r.scanOffRequest(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan off request", util.ErrorField(err))
-			continue
-		}
-		requests = append(requests, request)
-	}
-	return requests, nil
-}
-func (r *SchedulingRepositoryImpl) ApproveOffRequest(ctx context.Context, requestID uuid.UUID, approvedBy uuid.UUID) error {
-	query := `
-		UPDATE off_requests
-		SET status = 'approved', approved_by = $1, approved_at = NOW()
-		WHERE off_request_id = $2 AND status = 'pending'`
-	result, err := r.client.Exec(ctx, query, approvedBy, requestID)
-	if err != nil {
-		return fmt.Errorf("failed to approve off request: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("off request not found or already processed")
-	}
-	return nil
-}
+
 func (r *SchedulingRepositoryImpl) CreateScheduleOverride(ctx context.Context, override *scheduling.ScheduleOverride) error {
 	query := `
-		INSERT INTO schedule_overrides (
-			override_id, company_id, user_id, override_date, override_type,
-			reason, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+        INSERT INTO schedule_overrides (
+            override_id, company_id, user_id, override_date, override_type,
+            reason, created_by, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (user_id, override_date) 
+        DO NOTHING`
+
 	_, err := r.client.Exec(ctx, query,
 		override.OverrideID,
 		override.CompanyID,
@@ -1360,30 +1246,47 @@ func (r *SchedulingRepositoryImpl) CreateScheduleOverride(ctx context.Context, o
 		override.CreatedBy,
 		override.CreatedAt,
 	)
+
 	if err != nil {
 		r.logger.Error("Failed to create schedule override",
 			util.String("user_id", override.UserID.String()),
+			util.String("override_date", override.OverrideDate.Format("2006-01-02")),
 			util.ErrorField(err))
 		return fmt.Errorf("failed to create schedule override: %w", err)
 	}
+
 	return nil
 }
-func (r *SchedulingRepositoryImpl) GetScheduleOverrideByUserDate(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.ScheduleOverride, error) {
+
+func (r *SchedulingRepositoryImpl) GetScheduleOverrideByUserDate(
+	ctx context.Context,
+	userID uuid.UUID,
+	date time.Time,
+) (*scheduling.ScheduleOverride, error) {
+
 	query := `
 		SELECT override_id, company_id, user_id, override_date, override_type,
 			   reason, created_by, created_at
 		FROM schedule_overrides
-		WHERE user_id = $1 AND override_date = $2`
+		WHERE user_id = $1
+		  AND override_date = $2::date
+		LIMIT 1
+	`
+
 	rows, err := r.client.Query(ctx, query, userID, date)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get schedule override: %w", err)
 	}
 	defer rows.Close()
+
 	if rows.Next() {
 		return r.scanScheduleOverride(rows)
 	}
-	return nil, fmt.Errorf("schedule override not found")
+
+	// ✅ IMPORTANT: not found is NOT an error in your service logic
+	return nil, nil
 }
+
 func (r *SchedulingRepositoryImpl) CheckScheduleOverrideConflict(ctx context.Context, userID uuid.UUID, date time.Time, excludeOverrideID *uuid.UUID) (bool, error) {
 	query := `
 		SELECT EXISTS(
@@ -1403,65 +1306,7 @@ func (r *SchedulingRepositoryImpl) CheckScheduleOverrideConflict(ctx context.Con
 	}
 	return exists, nil
 }
-func (r *SchedulingRepositoryImpl) scanOffEntitlement(rows *sql.Rows) (*scheduling.UserOffEntitlement, error) {
-	var entitlement scheduling.UserOffEntitlement
-	var effectiveTo sql.NullTime
-	err := rows.Scan(
-		&entitlement.EntitlementID,
-		&entitlement.CompanyID,
-		&entitlement.UserID,
-		&entitlement.PeriodType,
-		&entitlement.OffCount,
-		&entitlement.RequiresApproval,
-		&entitlement.EffectiveFrom,
-		&effectiveTo,
-		&entitlement.CreatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if effectiveTo.Valid {
-		entitlement.EffectiveTo = &effectiveTo.Time
-	}
-	return &entitlement, nil
-}
-func (r *SchedulingRepositoryImpl) scanOffRequest(rows *sql.Rows) (*scheduling.OffRequest, error) {
-	var request scheduling.OffRequest
-	var dates pq.StringArray
-	var requestedBy, approvedBy sql.NullString
-	var approvedAt sql.NullTime
-	err := rows.Scan(
-		&request.OffRequestID,
-		&request.CompanyID,
-		&request.UserID,
-		&dates,
-		&request.Status,
-		&requestedBy,
-		&approvedBy,
-		&approvedAt,
-		&request.CreatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	request.RequestDates = []string(dates)
-	if requestedBy.Valid && requestedBy.String != "" {
-		parsedUUID, err := uuid.Parse(requestedBy.String)
-		if err == nil {
-			request.RequestedBy = &parsedUUID
-		}
-	}
-	if approvedBy.Valid && approvedBy.String != "" {
-		parsedUUID, err := uuid.Parse(approvedBy.String)
-		if err == nil {
-			request.ApprovedBy = &parsedUUID
-		}
-	}
-	if approvedAt.Valid {
-		request.ApprovedAt = &approvedAt.Time
-	}
-	return &request, nil
-}
+
 func (r *SchedulingRepositoryImpl) scanScheduleOverride(rows *sql.Rows) (*scheduling.ScheduleOverride, error) {
 	var override scheduling.ScheduleOverride
 	var reason sql.NullString
@@ -1490,374 +1335,7 @@ func (r *SchedulingRepositoryImpl) scanScheduleOverride(rows *sql.Rows) (*schedu
 	}
 	return &override, nil
 }
-func (r *SchedulingRepositoryImpl) UpdateOffEntitlement(ctx context.Context, entitlement *scheduling.UserOffEntitlement) error {
-	query := `
-		UPDATE user_off_entitlements SET
-			period_type = $1, off_count = $2, requires_approval = $3,
-			effective_from = $4, effective_to = $5
-		WHERE entitlement_id = $6`
-	result, err := r.client.Exec(ctx, query,
-		entitlement.PeriodType,
-		entitlement.OffCount,
-		entitlement.RequiresApproval,
-		entitlement.EffectiveFrom,
-		entitlement.EffectiveTo,
-		entitlement.EntitlementID,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update off entitlement: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("off entitlement not found: %s", entitlement.EntitlementID)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) DeleteOffEntitlement(ctx context.Context, entitlementID uuid.UUID) error {
-	query := `DELETE FROM user_off_entitlements WHERE entitlement_id = $1`
-	result, err := r.client.Exec(ctx, query, entitlementID)
-	if err != nil {
-		return fmt.Errorf("failed to delete off entitlement: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("off entitlement not found: %s", entitlementID)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) GetOffEntitlementsByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error) {
-	var query string
-	if activeOnly {
-		query = `
-			SELECT entitlement_id, company_id, user_id, period_type, off_count,
-				   requires_approval, effective_from, effective_to, created_at
-			FROM user_off_entitlements
-			WHERE company_id = $1
-			  AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
-			  AND effective_from <= CURRENT_DATE
-			ORDER BY user_id, effective_from DESC`
-	} else {
-		query = `
-			SELECT entitlement_id, company_id, user_id, period_type, off_count,
-				   requires_approval, effective_from, effective_to, created_at
-			FROM user_off_entitlements
-			WHERE company_id = $1
-			ORDER BY user_id, effective_from DESC`
-	}
-	rows, err := r.client.Query(ctx, query, companyID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off entitlements by company: %w", err)
-	}
-	defer rows.Close()
-	entitlements := make([]*scheduling.UserOffEntitlement, 0)
-	for rows.Next() {
-		entitlement, err := r.scanOffEntitlement(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan off entitlement", util.ErrorField(err))
-			continue
-		}
-		entitlements = append(entitlements, entitlement)
-	}
-	return entitlements, nil
-}
-func (r *SchedulingRepositoryImpl) UpdateOffRequest(ctx context.Context, request *scheduling.OffRequest) error {
-	query := `
-		UPDATE off_requests SET
-			request_dates = $1, status = $2, approved_by = $3, approved_at = $4
-		WHERE off_request_id = $5`
-	result, err := r.client.Exec(ctx, query,
-		pq.Array(request.RequestDates),
-		request.Status,
-		request.ApprovedBy,
-		request.ApprovedAt,
-		request.OffRequestID,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update off request: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("off request not found: %s", request.OffRequestID)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) DeleteOffRequest(ctx context.Context, requestID uuid.UUID) error {
-	query := `DELETE FROM off_requests WHERE off_request_id = $1`
-	result, err := r.client.Exec(ctx, query, requestID)
-	if err != nil {
-		return fmt.Errorf("failed to delete off request: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("off request not found: %s", requestID)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) RejectOffRequest(ctx context.Context, requestID uuid.UUID, approvedBy uuid.UUID) error {
-	query := `
-		UPDATE off_requests
-		SET status = 'rejected', approved_by = $1, approved_at = NOW()
-		WHERE off_request_id = $2 AND status = 'pending'`
-	result, err := r.client.Exec(ctx, query, approvedBy, requestID)
-	if err != nil {
-		return fmt.Errorf("failed to reject off request: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("off request not found or already processed")
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) GetOffRequestsByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate *time.Time, status *string) ([]*scheduling.OffRequest, error) {
-	query := `
-		SELECT off_request_id, company_id, user_id, request_dates, status,
-			   requested_by, approved_by, approved_at, created_at
-		FROM off_requests
-		WHERE company_id = $1`
-	args := []interface{}{companyID}
-	argIndex := 2
-	if startDate != nil && endDate != nil {
-		query += fmt.Sprintf(" AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(request_dates) AS date WHERE date::date BETWEEN $%d AND $%d)", argIndex, argIndex+1)
-		args = append(args, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
-		argIndex += 2
-	}
-	if status != nil {
-		query += fmt.Sprintf(" AND status = $%d", argIndex)
-		args = append(args, *status)
-		argIndex++
-	}
-	query += " ORDER BY created_at DESC"
-	rows, err := r.client.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off requests by company: %w", err)
-	}
-	defer rows.Close()
-	requests := make([]*scheduling.OffRequest, 0)
-	for rows.Next() {
-		request, err := r.scanOffRequest(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan off request", util.ErrorField(err))
-			continue
-		}
-		requests = append(requests, request)
-	}
-	return requests, nil
-}
-func (r *SchedulingRepositoryImpl) GetOffRequestsByDateRange(ctx context.Context, companyID uuid.UUID, userID *uuid.UUID, startDate, endDate time.Time) ([]*scheduling.OffRequest, error) {
-	query := `
-		SELECT off_request_id, company_id, user_id, request_dates, status,
-			   requested_by, approved_by, approved_at, created_at
-		FROM off_requests
-		WHERE company_id = $1
-		  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(request_dates) AS date
-		              WHERE date::date BETWEEN $2 AND $3)`
-	args := []interface{}{companyID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02")}
-	argIndex := 4
-	if userID != nil {
-		query += fmt.Sprintf(" AND user_id = $%d", argIndex)
-		args = append(args, *userID)
-	}
-	query += " ORDER BY created_at DESC"
-	rows, err := r.client.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get off requests by date range: %w", err)
-	}
-	defer rows.Close()
-	requests := make([]*scheduling.OffRequest, 0)
-	for rows.Next() {
-		request, err := r.scanOffRequest(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan off request", util.ErrorField(err))
-			continue
-		}
-		requests = append(requests, request)
-	}
-	return requests, nil
-}
-func (r *SchedulingRepositoryImpl) GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*scheduling.ScheduleOverride, error) {
-	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type,
-			   reason, created_by, created_at
-		FROM schedule_overrides
-		WHERE override_id = $1`
-	rows, err := r.client.Query(ctx, query, overrideID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get schedule override: %w", err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return r.scanScheduleOverride(rows)
-	}
-	return nil, fmt.Errorf("schedule override not found: %s", overrideID)
-}
-func (r *SchedulingRepositoryImpl) GetScheduleOverridesByUser(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error) {
-	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type,
-			   reason, created_by, created_at
-		FROM schedule_overrides
-		WHERE user_id = $1`
-	args := []interface{}{userID}
-	argIndex := 2
-	if startDate != nil && endDate != nil {
-		query += fmt.Sprintf(" AND override_date BETWEEN $%d AND $%d", argIndex, argIndex+1)
-		args = append(args, *startDate, *endDate)
-		argIndex += 2
-	}
-	if overrideType != nil {
-		query += fmt.Sprintf(" AND override_type = $%d", argIndex)
-		args = append(args, *overrideType)
-	}
-	query += " ORDER BY override_date"
-	rows, err := r.client.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get schedule overrides by user: %w", err)
-	}
-	defer rows.Close()
-	overrides := make([]*scheduling.ScheduleOverride, 0)
-	for rows.Next() {
-		override, err := r.scanScheduleOverride(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan schedule override", util.ErrorField(err))
-			continue
-		}
-		overrides = append(overrides, override)
-	}
-	return overrides, nil
-}
-func (r *SchedulingRepositoryImpl) GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error) {
-	query := `
-		SELECT override_id, company_id, user_id, override_date, override_type,
-			   reason, created_by, created_at
-		FROM schedule_overrides
-		WHERE company_id = $1`
-	args := []interface{}{companyID}
-	argIndex := 2
-	if startDate != nil && endDate != nil {
-		query += fmt.Sprintf(" AND override_date BETWEEN $%d AND $%d", argIndex, argIndex+1)
-		args = append(args, *startDate, *endDate)
-		argIndex += 2
-	}
-	if overrideType != nil {
-		query += fmt.Sprintf(" AND override_type = $%d", argIndex)
-		args = append(args, *overrideType)
-	}
-	query += " ORDER BY user_id, override_date"
-	rows, err := r.client.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get schedule overrides by company: %w", err)
-	}
-	defer rows.Close()
-	overrides := make([]*scheduling.ScheduleOverride, 0)
-	for rows.Next() {
-		override, err := r.scanScheduleOverride(rows)
-		if err != nil {
-			r.logger.Warn("Failed to scan schedule override", util.ErrorField(err))
-			continue
-		}
-		overrides = append(overrides, override)
-	}
-	return overrides, nil
-}
-func (r *SchedulingRepositoryImpl) UpdateScheduleOverride(ctx context.Context, override *scheduling.ScheduleOverride) error {
-	query := `
-		UPDATE schedule_overrides SET
-			override_type = $1, reason = $2
-		WHERE override_id = $3`
-	result, err := r.client.Exec(ctx, query,
-		override.OverrideType,
-		override.Reason,
-		override.OverrideID,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update schedule override: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("schedule override not found: %s", override.OverrideID)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID) error {
-	query := `DELETE FROM schedule_overrides WHERE override_id = $1`
-	result, err := r.client.Exec(ctx, query, overrideID)
-	if err != nil {
-		return fmt.Errorf("failed to delete schedule override: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("schedule override not found: %s", overrideID)
-	}
-	return nil
-}
-func (r *SchedulingRepositoryImpl) GetOffBalance(ctx context.Context, userID uuid.UUID, periodType string, startDate, endDate time.Time) (int, error) {
-	var totalUsed int
-	query := `
-		SELECT COUNT(DISTINCT date) as used_days
-		FROM off_requests,
-		     jsonb_array_elements_text(request_dates) AS date
-		WHERE user_id = $1
-		  AND status = 'approved'
-		  AND date::date BETWEEN $2 AND $3`
-	err := r.client.QueryRow(ctx, query, userID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02")).Scan(&totalUsed)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("failed to get off balance: %w", err)
-	}
-	return totalUsed, nil
-}
-func (r *SchedulingRepositoryImpl) GetOffUtilizationStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error) {
-	stats := make(map[string]interface{})
-	var totalOffDays int
-	err := r.client.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT date) as total_off_days
-		FROM off_requests,
-		     jsonb_array_elements_text(request_dates) AS date
-		WHERE company_id = $1
-		  AND status = 'approved'
-		  AND date::date BETWEEN $2 AND $3`,
-		companyID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02")).Scan(&totalOffDays)
-	if err != nil {
-		totalOffDays = 0
-	}
-	stats["total_off_days"] = totalOffDays
-	var usersWithOff int
-	err = r.client.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT user_id) as users_with_off
-		FROM off_requests
-		WHERE company_id = $1
-		  AND status = 'approved'
-		  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(request_dates) AS date
-		              WHERE date::date BETWEEN $2 AND $3)`,
-		companyID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02")).Scan(&usersWithOff)
-	if err != nil {
-		usersWithOff = 0
-	}
-	stats["users_with_off"] = usersWithOff
-	query := `
-		SELECT status, COUNT(*) as count
-		FROM off_requests
-		WHERE company_id = $1
-		  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(request_dates) AS date
-		              WHERE date::date BETWEEN $2 AND $3)
-		GROUP BY status`
-	rows, err := r.client.Query(ctx, query, companyID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
-	if err == nil {
-		defer rows.Close()
-		statusStats := make(map[string]int)
-		for rows.Next() {
-			var status string
-			var count int
-			if err := rows.Scan(&status, &count); err != nil {
-				continue
-			}
-			statusStats[status] = count
-		}
-		stats["by_status"] = statusStats
-	}
-	return stats, nil
-}
+
 func (r *SchedulingRepositoryImpl) IsUserActiveInCompany(ctx context.Context, companyID, userID uuid.UUID) (bool, error) {
 	query := `
         SELECT EXISTS(
@@ -1872,6 +1350,7 @@ func (r *SchedulingRepositoryImpl) IsUserActiveInCompany(ctx context.Context, co
 	}
 	return exists, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetUserCurrentWorkCenter(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -1900,6 +1379,7 @@ func (r *SchedulingRepositoryImpl) GetUserCurrentWorkCenter(
 	}
 	return nil, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCenterShiftByCode(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1938,48 +1418,52 @@ func (r *SchedulingRepositoryImpl) GetWorkCenterShiftByCode(
 	}
 	return &m, nil
 }
+
 func (r *SchedulingRepositoryImpl) CreateScheduleInstance(
 	ctx context.Context,
 	instance *scheduling.ScheduleInstance,
 ) error {
+
 	metadataJSON, err := json.Marshal(instance.Metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-
-	// Check if schedule instance already exists for this user and date
-	existing, err := r.GetScheduleInstanceByUserDate(ctx, instance.UserID, instance.ScheduleDate)
-	if err != nil && err.Error() != "schedule instance not found" {
-		return fmt.Errorf("failed to check existing schedule: %w", err)
-	}
-
-	// If active schedule already exists, skip creation and return the existing instance
-	if existing != nil && existing.Status == "active" {
-		instance.ScheduleInstanceID = existing.ScheduleInstanceID
-		instance.GeneratedAt = existing.GeneratedAt
-		return nil
-	}
-
-	// If there's a cancelled schedule, we can create a new one
-	query := `
-        INSERT INTO schedule_instances (
-            schedule_instance_id, company_id, user_id, schedule_date,
-            schedule_template_id, expected_start, expected_end, timezone,
-            metadata, generated_at, status, work_center_code
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11)
-        RETURNING schedule_instance_id
-    `
 
 	var workCenterCode *string
 	if instance.WorkCenterCode != nil && *instance.WorkCenterCode != "" {
 		workCenterCode = instance.WorkCenterCode
 	}
 
-	err = r.client.QueryRow(ctx, query,
+	query := `
+		INSERT INTO schedule_instances (
+			schedule_instance_id,
+			company_id,
+			user_id,
+			schedule_date,
+			schedule_template_id,
+			expected_start,
+			expected_end,
+			timezone,
+			metadata,
+			generated_at,
+			status,
+			work_center_code
+		)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11)
+		ON CONFLICT (user_id, schedule_date)
+		WHERE status = 'active'
+		DO NOTHING
+		RETURNING schedule_instance_id
+	`
+
+	var returnedID uuid.UUID
+	err = r.client.QueryRow(
+		ctx,
+		query,
 		instance.ScheduleInstanceID,
 		instance.CompanyID,
 		instance.UserID,
-		instance.ScheduleDate,
+		instance.ScheduleDate.UTC().Truncate(24*time.Hour),
 		instance.ScheduleTemplateID,
 		instance.ExpectedStart,
 		instance.ExpectedEnd,
@@ -1987,18 +1471,21 @@ func (r *SchedulingRepositoryImpl) CreateScheduleInstance(
 		metadataJSON,
 		instance.GeneratedAt,
 		workCenterCode,
-	).Scan(&instance.ScheduleInstanceID)
+	).Scan(&returnedID)
+
+	// 👇 DO NOTHING → no row returned → safe skip
+	if err == sql.ErrNoRows {
+		return nil
+	}
 
 	if err != nil {
-		r.logger.Error("Failed to create schedule instance",
-			util.String("user_id", instance.UserID.String()),
-			util.String("date", instance.ScheduleDate.Format("2006-01-02")),
-			util.ErrorField(err))
 		return fmt.Errorf("failed to create schedule instance: %w", err)
 	}
 
+	instance.ScheduleInstanceID = returnedID
 	return nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstanceByUserDate(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2025,6 +1512,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstanceByUserDate(
 	}
 	return nil, nil
 }
+
 func (r *SchedulingRepositoryImpl) scanUserWorkCenterAssignment(
 	rows *sql.Rows,
 ) (*scheduling.UserWorkCenterAssignment, error) {
@@ -2048,14 +1536,19 @@ func (r *SchedulingRepositoryImpl) scanUserWorkCenterAssignment(
 	}
 	return &a, nil
 }
+
 func (r *SchedulingRepositoryImpl) scanScheduleInstance(
 	rows *sql.Rows,
 ) (*scheduling.ScheduleInstance, error) {
+
 	var instance scheduling.ScheduleInstance
+
 	var expectedStart, expectedEnd, cancelledAt sql.NullTime
 	var metadataJSON []byte
 	var cancelReason sql.NullString
 	var status sql.NullString
+	var workCenterCode sql.NullString // ✅ NEW
+
 	err := rows.Scan(
 		&instance.ScheduleInstanceID,
 		&instance.CompanyID,
@@ -2070,27 +1563,36 @@ func (r *SchedulingRepositoryImpl) scanScheduleInstance(
 		&status,
 		&cancelReason,
 		&cancelledAt,
+		&workCenterCode, // ✅ FIX
 	)
 	if err != nil {
 		return nil, err
 	}
+
 	if expectedStart.Valid {
 		instance.ExpectedStart = &expectedStart.Time
 	}
 	if expectedEnd.Valid {
 		instance.ExpectedEnd = &expectedEnd.Time
 	}
+
 	if status.Valid {
 		instance.Status = status.String
 	} else {
 		instance.Status = "active"
 	}
+
 	if cancelReason.Valid {
 		instance.CancelReason = &cancelReason.String
 	}
 	if cancelledAt.Valid {
 		instance.CancelledAt = &cancelledAt.Time
 	}
+
+	if workCenterCode.Valid {
+		instance.WorkCenterCode = &workCenterCode.String
+	}
+
 	if len(metadataJSON) > 0 {
 		if err := json.Unmarshal(metadataJSON, &instance.Metadata); err != nil {
 			r.logger.Warn("Failed to unmarshal instance metadata", util.ErrorField(err))
@@ -2099,8 +1601,10 @@ func (r *SchedulingRepositoryImpl) scanScheduleInstance(
 	} else {
 		instance.Metadata = scheduling.InstanceMetadata{}
 	}
+
 	return &instance, nil
 }
+
 func (r *SchedulingRepositoryImpl) DeactivateWorkCenterShift(
 	ctx context.Context,
 	mappingID uuid.UUID,
@@ -2114,6 +1618,7 @@ func (r *SchedulingRepositoryImpl) DeactivateWorkCenterShift(
 	_, err := r.client.Exec(ctx, query, mappingID)
 	return err
 }
+
 func (r *SchedulingRepositoryImpl) CreateUserWorkCenterAssignment(
 	ctx context.Context,
 	a *scheduling.UserWorkCenterAssignment,
@@ -2142,6 +1647,7 @@ func (r *SchedulingRepositoryImpl) CreateUserWorkCenterAssignment(
 	)
 	return err
 }
+
 func (r *SchedulingRepositoryImpl) EndUserWorkCenterAssignment(
 	ctx context.Context,
 	assignmentID uuid.UUID,
@@ -2155,6 +1661,7 @@ func (r *SchedulingRepositoryImpl) EndUserWorkCenterAssignment(
 	_, err := r.client.Exec(ctx, query, endDate, assignmentID)
 	return err
 }
+
 func (r *SchedulingRepositoryImpl) GetUserWorkCenterAssignments(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2202,6 +1709,7 @@ func (r *SchedulingRepositoryImpl) GetUserWorkCenterAssignments(
 	}
 	return list, nil
 }
+
 func (r *SchedulingRepositoryImpl) CreateWorkCenterShiftMapping(
 	ctx context.Context,
 	m *scheduling.WorkCenterShiftMapping,
@@ -2226,6 +1734,7 @@ func (r *SchedulingRepositoryImpl) CreateWorkCenterShiftMapping(
 	)
 	return err
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCenterShiftMappingByID(
 	ctx context.Context,
 	mappingID uuid.UUID,
@@ -2255,6 +1764,7 @@ func (r *SchedulingRepositoryImpl) GetWorkCenterShiftMappingByID(
 	}
 	return &m, nil
 }
+
 func (r *SchedulingRepositoryImpl) UpdateWorkCenterShiftMapping(
 	ctx context.Context,
 	m *scheduling.WorkCenterShiftMapping,
@@ -2278,6 +1788,7 @@ func (r *SchedulingRepositoryImpl) UpdateWorkCenterShiftMapping(
 	)
 	return err
 }
+
 func (r *SchedulingRepositoryImpl) GetActiveEmployeesByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2317,6 +1828,7 @@ func (r *SchedulingRepositoryImpl) GetActiveEmployeesByCompany(
 	}
 	return employees, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetCompanyEmployee(
 	ctx context.Context,
 	companyID, userID uuid.UUID,
@@ -2349,6 +1861,7 @@ func (r *SchedulingRepositoryImpl) GetCompanyEmployee(
 	}
 	return nil, sql.ErrNoRows
 }
+
 func (r *SchedulingRepositoryImpl) scanCompanyEmployee(
 	rows *sql.Rows,
 ) (*scheduling.CompanyEmployee, error) {
@@ -2377,6 +1890,7 @@ func (r *SchedulingRepositoryImpl) scanCompanyEmployee(
 	}
 	return &e, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetPositionByID(
 	ctx context.Context,
 	positionID uuid.UUID,
@@ -2408,6 +1922,7 @@ func (r *SchedulingRepositoryImpl) GetPositionByID(
 	}
 	return nil, sql.ErrNoRows
 }
+
 func (r *SchedulingRepositoryImpl) scanPosition(
 	rows *sql.Rows,
 ) (*scheduling.Position, error) {
@@ -2430,6 +1945,7 @@ func (r *SchedulingRepositoryImpl) scanPosition(
 	}
 	return &p, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetUserCompany(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2462,6 +1978,7 @@ func (r *SchedulingRepositoryImpl) GetUserCompany(
 	}
 	return nil, sql.ErrNoRows
 }
+
 func (r *SchedulingRepositoryImpl) GetUserWorkCenterAssignment(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2497,6 +2014,7 @@ func (r *SchedulingRepositoryImpl) GetUserWorkCenterAssignment(
 	}
 	return nil, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCenterByCode(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2537,6 +2055,7 @@ func (r *SchedulingRepositoryImpl) GetWorkCenterByCode(
 	}
 	return &wc, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCenterShiftMappingsByShift(
 	ctx context.Context,
 	shiftID uuid.UUID,
@@ -2588,6 +2107,7 @@ func (r *SchedulingRepositoryImpl) GetWorkCenterShiftMappingsByShift(
 	}
 	return mappings, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCentersByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2639,6 +2159,7 @@ func (r *SchedulingRepositoryImpl) GetWorkCentersByCompany(
 	}
 	return result, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCenterShifts(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2646,32 +2167,36 @@ func (r *SchedulingRepositoryImpl) GetWorkCenterShifts(
 	startDate, endDate *time.Time,
 ) ([]*scheduling.WorkCenterShiftMapping, error) {
 	query := `
-		SELECT mapping_id, company_id, work_center_code,
-			   shift_id, effective_from, effective_to,
-			   is_active, created_at
-		FROM work_center_shifts
-		WHERE company_id = $1 AND work_center_code = $2
-		  AND is_active = true
-	`
+        SELECT mapping_id, company_id, work_center_code,
+               shift_id, effective_from, effective_to,
+               is_active, created_at
+        FROM work_center_shifts
+        WHERE company_id = $1 AND work_center_code = $2
+          AND is_active = true
+    `
 	args := []interface{}{companyID, workCenterCode}
 	argIdx := 3
+
 	if startDate != nil && endDate != nil {
 		query += fmt.Sprintf(`
-			AND (
-				(effective_from <= $%d AND (effective_to IS NULL OR effective_to >= $%d))
-				OR (effective_from BETWEEN $%d AND $%d)
-				OR ($%d BETWEEN effective_from AND COALESCE(effective_to, $%d))
-			)
-		`, argIdx, argIdx, argIdx, argIdx+1, argIdx, argIdx+1)
-		args = append(args, *endDate, *startDate, *endDate)
+            AND (
+                (effective_from <= $%d AND (effective_to IS NULL OR effective_to >= $%d))
+                OR (effective_from BETWEEN $%d AND $%d)
+                OR ($%d BETWEEN effective_from AND COALESCE(effective_to, $%d))
+            )
+        `, argIdx, argIdx, argIdx, argIdx+1, argIdx, argIdx+1)
+		args = append(args, *endDate, *startDate) // ← FIXED: Only 2 values
 		argIdx += 2
 	}
+
 	query += " ORDER BY effective_from DESC"
+
 	rows, err := r.client.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get work center shifts: %w", err)
 	}
 	defer rows.Close()
+
 	var shifts []*scheduling.WorkCenterShiftMapping
 	for rows.Next() {
 		var shift scheduling.WorkCenterShiftMapping
@@ -2748,6 +2273,7 @@ func (r *SchedulingRepositoryImpl) GetPositionsByWorkCenter(
 	}
 	return positions, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetUsersByPosition(
 	ctx context.Context,
 	positionID uuid.UUID,
@@ -2775,6 +2301,7 @@ func (r *SchedulingRepositoryImpl) GetUsersByPosition(
 	}
 	return userIDs, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetDepartmentByID(
 	ctx context.Context,
 	departmentID uuid.UUID,
@@ -2803,6 +2330,7 @@ func (r *SchedulingRepositoryImpl) GetDepartmentByID(
 	}
 	return &result, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetPositionsByCompany(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2850,6 +2378,7 @@ func (r *SchedulingRepositoryImpl) GetPositionsByCompany(
 	}
 	return positions, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetCompanyEmployeeByUserID(
 	ctx context.Context,
 	userID uuid.UUID,
@@ -2903,6 +2432,7 @@ func (r *SchedulingRepositoryImpl) GetCompanyEmployeeByUserID(
 	}
 	return nil, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstancesByPosition(
 	ctx context.Context,
 	positionID uuid.UUID,
@@ -2940,6 +2470,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByPosition(
 	}
 	return instances, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetScheduleInstancesByWorkCenter(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2977,6 +2508,7 @@ func (r *SchedulingRepositoryImpl) GetScheduleInstancesByWorkCenter(
 	}
 	return instances, nil
 }
+
 func (r *SchedulingRepositoryImpl) SearchScheduleInstances(
 	ctx context.Context,
 	filters map[string]interface{},
@@ -3038,7 +2570,14 @@ func (r *SchedulingRepositoryImpl) SearchScheduleInstances(
 		argIdx++
 	}
 	if workCenterCode, ok := filters["work_center_code"].(string); ok {
-		whereClause += fmt.Sprintf(" AND work_center_code = $%d", argIdx)
+		if joinClause == "" {
+			joinClause = `
+				JOIN company_employees ce
+				  ON si.user_id = ce.user_id
+				 AND si.company_id = ce.company_id
+			`
+		}
+		whereClause += fmt.Sprintf(" AND ce.work_center_code = $%d AND ce.is_active = true", argIdx)
 		args = append(args, workCenterCode)
 		argIdx++
 	}
@@ -3086,6 +2625,7 @@ func (r *SchedulingRepositoryImpl) SearchScheduleInstances(
 	}
 	return instances, totalCount, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetPositionCoverage(
 	ctx context.Context,
 	positionID uuid.UUID,
@@ -3163,6 +2703,7 @@ func (r *SchedulingRepositoryImpl) GetPositionCoverage(
 	result["daily_coverage"] = dailyCoverage
 	return result, nil
 }
+
 func (r *SchedulingRepositoryImpl) GetWorkCenterUtilization(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -3277,4 +2818,237 @@ func (r *SchedulingRepositoryImpl) GetWorkCenterUtilization(
 		result["shift_distribution"] = shiftDistribution
 	}
 	return result, nil
+}
+
+func (r *SchedulingRepositoryImpl) GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*scheduling.ScheduleOverride, error) {
+	query := `
+		SELECT override_id, company_id, user_id, override_date, override_type,
+			   reason, created_by, created_at
+		FROM schedule_overrides
+		WHERE override_id = $1`
+	rows, err := r.client.Query(ctx, query, overrideID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule override: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return r.scanScheduleOverride(rows)
+	}
+	return nil, fmt.Errorf("schedule override not found: %s", overrideID)
+}
+
+func (r *SchedulingRepositoryImpl) GetScheduleOverridesByUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	startDate, endDate *time.Time,
+	overrideType *string,
+) ([]*scheduling.ScheduleOverride, error) {
+
+	query := `
+		SELECT override_id, company_id, user_id, override_date, override_type,
+			   reason, created_by, created_at
+		FROM schedule_overrides
+		WHERE user_id = $1
+	`
+
+	args := []interface{}{userID}
+	argIndex := 2
+
+	// 🔑 FIX: CAST PARAMS TO DATE
+	if startDate != nil && endDate != nil {
+		query += fmt.Sprintf(
+			" AND override_date BETWEEN $%d::date AND $%d::date",
+			argIndex,
+			argIndex+1,
+		)
+		args = append(args, *startDate, *endDate)
+		argIndex += 2
+	}
+
+	if overrideType != nil {
+		query += fmt.Sprintf(" AND override_type = $%d", argIndex)
+		args = append(args, *overrideType)
+		argIndex++
+	}
+
+	query += " ORDER BY override_date"
+
+	rows, err := r.client.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule overrides by user: %w", err)
+	}
+	defer rows.Close()
+
+	overrides := make([]*scheduling.ScheduleOverride, 0)
+	for rows.Next() {
+		override, err := r.scanScheduleOverride(rows)
+		if err != nil {
+			r.logger.Warn("Failed to scan schedule override", util.ErrorField(err))
+			continue
+		}
+		overrides = append(overrides, override)
+	}
+
+	return overrides, nil
+}
+
+func (r *SchedulingRepositoryImpl) GetScheduleOverridesByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate *time.Time, overrideType *string) ([]*scheduling.ScheduleOverride, error) {
+	query := `
+		SELECT override_id, company_id, user_id, override_date, override_type,
+			   reason, created_by, created_at
+		FROM schedule_overrides
+		WHERE company_id = $1`
+	args := []interface{}{companyID}
+	argIndex := 2
+	if startDate != nil && endDate != nil {
+		query += fmt.Sprintf(" AND override_date BETWEEN $%d AND $%d", argIndex, argIndex+1)
+		args = append(args, *startDate, *endDate)
+		argIndex += 2
+	}
+	if overrideType != nil {
+		query += fmt.Sprintf(" AND override_type = $%d", argIndex)
+		args = append(args, *overrideType)
+	}
+	query += " ORDER BY user_id, override_date"
+	rows, err := r.client.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get schedule overrides by company: %w", err)
+	}
+	defer rows.Close()
+	overrides := make([]*scheduling.ScheduleOverride, 0)
+	for rows.Next() {
+		override, err := r.scanScheduleOverride(rows)
+		if err != nil {
+			r.logger.Warn("Failed to scan schedule override", util.ErrorField(err))
+			continue
+		}
+		overrides = append(overrides, override)
+	}
+	return overrides, nil
+}
+
+func (r *SchedulingRepositoryImpl) UpdateScheduleOverride(ctx context.Context, override *scheduling.ScheduleOverride) error {
+	query := `
+		UPDATE schedule_overrides SET
+			override_type = $1, reason = $2
+		WHERE override_id = $3`
+	result, err := r.client.Exec(ctx, query,
+		override.OverrideType,
+		override.Reason,
+		override.OverrideID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update schedule override: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("schedule override not found: %s", override.OverrideID)
+	}
+	return nil
+}
+
+func (r *SchedulingRepositoryImpl) DeleteScheduleOverride(ctx context.Context, overrideID uuid.UUID) error {
+	query := `DELETE FROM schedule_overrides WHERE override_id = $1`
+	result, err := r.client.Exec(ctx, query, overrideID)
+	if err != nil {
+		return fmt.Errorf("failed to delete schedule override: %w", err)
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("schedule override not found: %s", overrideID)
+	}
+	return nil
+}
+func (r *SchedulingRepositoryImpl) DeleteScheduleOverridesByReason(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	reason string,
+) error {
+
+	query := `
+		DELETE FROM scheduling.schedule_overrides
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND reason = $3
+	`
+
+	_, err := r.client.DB.ExecContext(
+		ctx,
+		query,
+		companyID,
+		userID,
+		reason,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete schedule overrides by reason: %w", err)
+	}
+
+	return nil
+}
+func (r *SchedulingRepositoryImpl) GetWorkCalendarTimezoneForUser(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+) (string, error) {
+
+	var timezone string
+
+	query := `
+		SELECT wc.timezone
+		FROM scheduling.work_calendars wc
+		JOIN scheduling.work_centers wcn
+		  ON wcn.work_calendar_id = wc.work_calendar_id
+		JOIN scheduling.positions p
+		  ON p.work_center_id = wcn.work_center_id
+		WHERE p.company_id = $1
+		  AND p.user_id = $2
+		LIMIT 1
+	`
+
+	err := r.client.DB.QueryRowContext(
+		ctx,
+		query,
+		companyID,
+		userID,
+	).Scan(&timezone)
+
+	if err != nil || timezone == "" {
+		return "UTC", nil
+	}
+
+	return timezone, nil
+}
+func (r *SchedulingRepositoryImpl) HasActiveSchedule(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	date time.Time,
+) (bool, error) {
+
+	businessDate := date.UTC().Truncate(24 * time.Hour)
+
+	var exists bool
+	err := r.client.QueryRow(
+		ctx,
+		`
+		SELECT EXISTS (
+			SELECT 1
+			FROM schedule_instances
+			WHERE company_id = $1
+			  AND user_id = $2
+			  AND schedule_date = $3
+			  AND status = 'active'
+		)
+		`,
+		companyID,
+		userID,
+		businessDate,
+	).Scan(&exists)
+
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
 }

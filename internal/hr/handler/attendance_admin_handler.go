@@ -3,7 +3,9 @@ package handler
 import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/service"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -75,9 +77,9 @@ type RFIDAssignmentRequest struct {
 
 func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -87,23 +89,18 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:policy:create") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
 	var req PolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// 🔴 REQUIRED VALIDATION: Ensure policy has either position OR work center, not both
 	if req.PositionID != nil && req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 		h.respondWithError(w, http.StatusBadRequest,
 			"policy can be assigned to either position or work center, not both")
 		return
 	}
+
 	if req.PositionID == nil && (req.WorkCenterCode == nil || *req.WorkCenterCode == "") {
 		h.respondWithError(w, http.StatusBadRequest,
 			"either position_id or work_center_code is required")
@@ -120,7 +117,6 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 🔴 REQUIRED: Include WorkCenterCode in policy creation
 	policy := &attendance.AttendancePolicy{
 		PolicyID:       uuid.New(),
 		CompanyID:      companyID,
@@ -159,9 +155,9 @@ func (h *AttendanceAdminHandler) CreatePolicy(w http.ResponseWriter, r *http.Req
 
 func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -169,11 +165,6 @@ func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Reques
 	policyID, err := uuid.Parse(policyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:policy:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -199,14 +190,9 @@ func (h *AttendanceAdminHandler) GetPolicy(w http.ResponseWriter, r *http.Reques
 
 func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:policy:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -215,11 +201,9 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		activeOnly = false
 	}
 
-	// Add filters for position or work center
 	positionIDStr := r.URL.Query().Get("position_id")
 	workCenterCode := r.URL.Query().Get("work_center_code")
 
-	// Get all policies first
 	policies, err := h.queryService.GetAttendancePoliciesByCompany(ctx, companyID, activeOnly)
 	if err != nil {
 		h.logger.Error("Failed to list attendance policies",
@@ -229,10 +213,8 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Apply filters
 	var filteredPolicies []*attendance.AttendancePolicy
 	for _, policy := range policies {
-		// Filter by position_id
 		if positionIDStr != "" {
 			if policy.PositionID == nil {
 				continue
@@ -242,14 +224,11 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 				continue
 			}
 		}
-
-		// Filter by work_center_code
 		if workCenterCode != "" {
 			if policy.WorkCenterCode == nil || *policy.WorkCenterCode != workCenterCode {
 				continue
 			}
 		}
-
 		filteredPolicies = append(filteredPolicies, policy)
 	}
 
@@ -269,9 +248,9 @@ func (h *AttendanceAdminHandler) ListPolicies(w http.ResponseWriter, r *http.Req
 
 func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -279,11 +258,6 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 	policyID, err := uuid.Parse(policyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:policy:update") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -307,19 +281,18 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// 🔴 REQUIRED VALIDATION: Ensure policy has either position OR work center, not both
 	if req.PositionID != nil && req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
 		h.respondWithError(w, http.StatusBadRequest,
 			"policy can be assigned to either position or work center, not both")
 		return
 	}
+
 	if req.PositionID == nil && (req.WorkCenterCode == nil || *req.WorkCenterCode == "") {
 		h.respondWithError(w, http.StatusBadRequest,
 			"either position_id or work_center_code is required")
 		return
 	}
 
-	// 🔴 REQUIRED: Update WorkCenterCode in policy
 	existingPolicy.PolicyCode = req.PolicyCode
 	existingPolicy.PolicyType = req.PolicyType
 	existingPolicy.PositionID = req.PositionID
@@ -345,9 +318,9 @@ func (h *AttendanceAdminHandler) UpdatePolicy(w http.ResponseWriter, r *http.Req
 
 func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
@@ -355,11 +328,6 @@ func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Req
 	policyID, err := uuid.Parse(policyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid policy ID")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:policy:delete") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -383,20 +351,15 @@ func (h *AttendanceAdminHandler) DeletePolicy(w http.ResponseWriter, r *http.Req
 
 func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
 	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:policy:assign") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -458,6 +421,8 @@ func (h *AttendanceAdminHandler) AssignPolicyToUser(w http.ResponseWriter, r *ht
 
 func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// ---- companyID from URL ----
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -465,14 +430,11 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:rules:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
+	// ---- fetch rules ----
 	rules, err := h.adminService.GetCompanyAttendanceRules(ctx, companyID)
 	if err != nil {
-		h.logger.Error("Failed to get company rules",
+		h.logger.Error(
+			"Failed to get company attendance rules",
 			zap.String("company_id", companyID.String()),
 			zap.Error(err),
 		)
@@ -480,6 +442,7 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// ---- response ----
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
@@ -487,23 +450,34 @@ func (h *AttendanceAdminHandler) GetCompanyRules(w http.ResponseWriter, r *http.
 }
 
 func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
 	ctx := r.Context()
+
+	// ---- companyID from URL ----
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 
-	_, actorID, err := h.getActorInfo(ctx)
+	// ---- actor info ----
+	actorType, actorID, err := h.getActorInfo(ctx)
 	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		h.respondWithError(w, http.StatusUnauthorized, "Authentication required")
 		return
 	}
 
+	// ---- admin-only ----
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can update company attendance rules")
+		return
+	}
+
+	// ---- decode request ----
 	var req CompanyRulesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -511,145 +485,49 @@ func (h *AttendanceAdminHandler) UpdateCompanyRules(w http.ResponseWriter, r *ht
 		req.Timezone = "UTC"
 	}
 
+	// ---- build rules ----
 	rules := &attendance.CompanyAttendanceRules{
 		CompanyID:             companyID,
 		AllowedSourceTypes:    req.AllowedSourceTypes,
 		AllowMultipleCheckins: req.AllowMultipleCheckins,
 		Timezone:              req.Timezone,
-		CreatedAt:             time.Now().UTC(),
 	}
 
+	// ---- update ----
 	if err := h.adminService.UpdateCompanyAttendanceRules(ctx, rules, actorID); err != nil {
 		h.logger.Error(
-			"Failed to update company rules",
+			"Failed to update company attendance rules",
 			zap.String("company_id", companyID.String()),
 			zap.String("actor_id", actorID.String()),
 			zap.Error(err),
 		)
-		h.respondWithError(w, http.StatusInternalServerError, "failed to update company rules")
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to update company rules")
 		return
 	}
 
+	// ---- response ----
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
-		"message": "Company rules updated successfully",
-	})
-}
-
-func (h *AttendanceAdminHandler) AssignRFID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
-		return
-	}
-
-	_, actorID, err := h.getActorInfo(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:rfid:assign") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req RFIDAssignmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if req.UserID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "user ID is required")
-		return
-	}
-
-	if req.RFIDTag == "" {
-		h.respondWithError(w, http.StatusBadRequest, "RFID tag is required")
-		return
-	}
-
-	if req.Assigner == uuid.Nil {
-		req.Assigner = actorID
-	}
-
-	if err := h.adminService.AssignRFIDToEmployee(ctx, companyID, req.UserID, req.RFIDTag, req.Assigner); err != nil {
-		h.logger.Error("Failed to assign RFID",
-			zap.String("company_id", companyID.String()),
-			zap.String("user_id", req.UserID.String()),
-			zap.String("rfid_tag", req.RFIDTag),
-			zap.Error(err))
-		if strings.Contains(err.Error(), "RFID tag already assigned") {
-			h.respondWithError(w, http.StatusConflict, err.Error())
-		} else {
-			h.respondWithError(w, http.StatusInternalServerError, "failed to assign RFID")
-		}
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "RFID assigned successfully",
-		"data": map[string]interface{}{
-			"user_id":     req.UserID,
-			"rfid_tag":    req.RFIDTag,
-			"assigned_by": req.Assigner,
-			"company_id":  companyID,
+		"message": "Company attendance rules updated successfully",
+		"meta": map[string]interface{}{
+			"duration": time.Since(startTime).String(),
 		},
-	})
-}
-
-func (h *AttendanceAdminHandler) GetRFIDAssignment(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
-		return
-	}
-
-	rfidTag := r.URL.Query().Get("rfid_tag")
-	if rfidTag == "" {
-		h.respondWithError(w, http.StatusBadRequest, "RFID tag is required")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:rfid:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	mapping, err := h.adminService.GetEmployeeByRFID(ctx, rfidTag, companyID)
-	if err != nil {
-		h.logger.Error("Failed to get RFID assignment",
-			zap.String("company_id", companyID.String()),
-			zap.String("rfid_tag", rfidTag),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve RFID assignment")
-		return
-	}
-
-	if mapping == nil {
-		h.respondWithError(w, http.StatusNotFound, "RFID assignment not found")
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    mapping,
 	})
 }
 
 func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := mustGetCompanyID(r)
+
+	// ---- companyID from URL ----
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
 
+	// ---- optional user ----
 	userIDStr := r.URL.Query().Get("user_id")
 	var userID uuid.UUID
 	if userIDStr != "" {
@@ -660,10 +538,10 @@ func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http
 		}
 	}
 
-	// Get work center code from query parameters
+	// ---- optional work center ----
 	workCenterCode := r.URL.Query().Get("work_center_code")
 
-	// Get date parameter (required for date-based resolution)
+	// ---- date ----
 	dateStr := r.URL.Query().Get("date")
 	var date time.Time
 	if dateStr == "" {
@@ -676,7 +554,7 @@ func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http
 		}
 	}
 
-	// Get position ID if provided
+	// ---- optional position ----
 	positionIDStr := r.URL.Query().Get("position_id")
 	var positionID *uuid.UUID
 	if positionIDStr != "" {
@@ -688,36 +566,63 @@ func (h *AttendanceAdminHandler) GetResolvedRules(w http.ResponseWriter, r *http
 		positionID = &parsedID
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:rules:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	// Update service call to include workCenterCode, positionID, and date
-	rules, err := h.adminService.ResolveAttendanceRules(ctx, userID, companyID, workCenterCode, positionID, date)
+	// ---- resolve rules ----
+	rules, err := h.adminService.ResolveAttendanceRules(
+		ctx,
+		userID,
+		companyID,
+		workCenterCode,
+		positionID,
+		date,
+	)
 	if err != nil {
-		h.logger.Error("Failed to resolve attendance rules",
+		h.logger.Error(
+			"Failed to resolve attendance rules",
 			zap.String("company_id", companyID.String()),
 			zap.String("user_id", userID.String()),
-			zap.Error(err))
+			zap.Error(err),
+		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve attendance rules")
 		return
 	}
 
+	// ---- response ----
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    rules,
 	})
 }
 
-func (h *AttendanceAdminHandler) getActorInfo(ctx interface{}) (string, uuid.UUID, error) {
-	// TODO: Implement actual authentication
-	return "user", uuid.New(), nil
+func (h *AttendanceAdminHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, error) {
+	actorID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	actorType := getSessionTypeFromContext(ctx)
+	return actorType, actorID, nil
 }
 
-func (h *AttendanceAdminHandler) hasPermission(ctx interface{}, companyID uuid.UUID, permission string) bool {
-	// TODO: Implement actual permission checking
-	return true
+func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	rawUserID := ctx.Value("user_id")
+	if rawUserID == nil {
+		return uuid.Nil, errors.New("user_id not found in context")
+	}
+	switch v := rawUserID.(type) {
+	case uuid.UUID:
+		return v, nil
+	case string:
+		return uuid.Parse(v)
+	default:
+		return uuid.Nil, errors.New("invalid user_id type in context")
+	}
+}
+
+func getSessionTypeFromContext(ctx context.Context) string {
+	sessionType, ok := ctx.Value("session_type").(string)
+	if !ok {
+		return "user"
+	}
+	return sessionType
 }
 
 func (h *AttendanceAdminHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {

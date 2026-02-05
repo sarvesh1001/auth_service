@@ -1000,3 +1000,32 @@ func (r *OrgUnitRepositoryImpl) EndActiveMembership(
 	_, err := r.client.Exec(ctx, query, effectiveTo, orgUnitID, userID)
 	return err
 }
+func (r *OrgUnitRepositoryImpl) GetActiveUsersByOrgUnit(
+	ctx context.Context,
+	orgUnitID uuid.UUID,
+) ([]uuid.UUID, error) {
+
+	query := `
+		SELECT user_id
+		FROM org_unit_members
+		WHERE org_unit_id = $1
+		  AND effective_to IS NULL
+	`
+
+	rows, err := r.client.Query(ctx, query, orgUnitID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch org unit users: %w", err)
+	}
+	defer rows.Close()
+
+	userIDs := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var userID uuid.UUID
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("failed to scan user_id: %w", err)
+		}
+		userIDs = append(userIDs, userID)
+	}
+
+	return userIDs, nil
+}

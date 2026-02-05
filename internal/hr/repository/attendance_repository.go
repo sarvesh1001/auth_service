@@ -223,31 +223,6 @@ type AttendanceRepository interface {
 		activeOnly bool,
 	) ([]*attendance.AttendanceLocation, error)
 
-	CreateEmployeeRFIDMapping(
-		ctx context.Context,
-		mapping *attendance.EmployeeRFIDMapping,
-	) error
-
-	GetEmployeeRFIDMappingByUser(
-		ctx context.Context,
-		userID uuid.UUID,
-	) (*attendance.EmployeeRFIDMapping, error)
-
-	GetEmployeeRFIDMapping(
-		ctx context.Context,
-		rfidTag string,
-	) (*attendance.EmployeeRFIDMapping, error)
-
-	UpdateEmployeeRFIDMapping(
-		ctx context.Context,
-		mapping *attendance.EmployeeRFIDMapping,
-	) error
-
-	DeactivateEmployeeRFIDMapping(
-		ctx context.Context,
-		rfidID uuid.UUID,
-	) error
-
 	// ============================================================
 	// ANALYTICS
 	// ============================================================

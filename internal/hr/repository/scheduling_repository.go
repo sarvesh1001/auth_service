@@ -52,26 +52,6 @@ type SchedulingRepository interface {
 	CancelScheduleInstance(ctx context.Context, instanceID uuid.UUID, reason string) error
 	DeleteScheduleInstance(ctx context.Context, instanceID uuid.UUID) error
 
-	// Off Entitlement methods
-	CreateOffEntitlement(ctx context.Context, entitlement *scheduling.UserOffEntitlement) error
-	GetOffEntitlementByID(ctx context.Context, entitlementID uuid.UUID) (*scheduling.UserOffEntitlement, error)
-	GetOffEntitlementsByUser(ctx context.Context, userID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error)
-	GetOffEntitlementsByCompany(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*scheduling.UserOffEntitlement, error)
-	GetCurrentOffEntitlement(ctx context.Context, userID uuid.UUID, date time.Time) (*scheduling.UserOffEntitlement, error)
-	UpdateOffEntitlement(ctx context.Context, entitlement *scheduling.UserOffEntitlement) error
-	DeleteOffEntitlement(ctx context.Context, entitlementID uuid.UUID) error
-
-	// Off Request methods
-	CreateOffRequest(ctx context.Context, request *scheduling.OffRequest) error
-	GetOffRequestByID(ctx context.Context, requestID uuid.UUID) (*scheduling.OffRequest, error)
-	GetOffRequestsByUser(ctx context.Context, userID uuid.UUID, startDate, endDate *time.Time, status *string) ([]*scheduling.OffRequest, error)
-	GetOffRequestsByCompany(ctx context.Context, companyID uuid.UUID, startDate, endDate *time.Time, status *string) ([]*scheduling.OffRequest, error)
-	GetOffRequestsByDateRange(ctx context.Context, companyID uuid.UUID, userID *uuid.UUID, startDate, endDate time.Time) ([]*scheduling.OffRequest, error)
-	ApproveOffRequest(ctx context.Context, requestID uuid.UUID, approvedBy uuid.UUID) error
-	RejectOffRequest(ctx context.Context, requestID uuid.UUID, approvedBy uuid.UUID) error
-	UpdateOffRequest(ctx context.Context, request *scheduling.OffRequest) error
-	DeleteOffRequest(ctx context.Context, requestID uuid.UUID) error
-
 	// Schedule Override methods
 	CreateScheduleOverride(ctx context.Context, override *scheduling.ScheduleOverride) error
 	GetScheduleOverrideByID(ctx context.Context, overrideID uuid.UUID) (*scheduling.ScheduleOverride, error)
@@ -122,12 +102,27 @@ type SchedulingRepository interface {
 	GetTemplateUtilization(ctx context.Context, templateID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
 	GetPositionCoverage(ctx context.Context, positionID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
 	GetWorkCenterUtilization(ctx context.Context, companyID uuid.UUID, workCenterCode string, startDate, endDate time.Time) (map[string]interface{}, error)
-	GetOffBalance(ctx context.Context, userID uuid.UUID, periodType string, startDate, endDate time.Time) (int, error)
-	GetOffUtilizationStats(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (map[string]interface{}, error)
 	GetWorkCenterShiftMappingsByShift(
 		ctx context.Context,
 		shiftID uuid.UUID,
 	) ([]*scheduling.WorkCenterShiftMapping, error)
 	// Health check
 	HealthCheck(ctx context.Context) error
+	DeleteScheduleOverridesByReason(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		reason string,
+	) error
+	GetWorkCalendarTimezoneForUser(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+	) (string, error)
+	HasActiveSchedule(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		date time.Time,
+	) (bool, error)
 }

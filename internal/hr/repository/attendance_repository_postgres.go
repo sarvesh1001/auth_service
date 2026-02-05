@@ -1419,183 +1419,6 @@ func (r *attendanceRepository) GetAttendanceLocationsByCompany(
 	return locations, nil
 }
 
-func (r *attendanceRepository) CreateEmployeeRFIDMapping(
-	ctx context.Context,
-	mapping *attendance.EmployeeRFIDMapping,
-) error {
-	query := `
-        INSERT INTO employee_rfid_mappings (
-            rfid_id, user_id, company_id, rfid_tag,
-            is_active, assigned_at, unassigned_at,
-            created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    `
-	if mapping.RFIDID == uuid.Nil {
-		mapping.RFIDID = uuid.New()
-	}
-	if mapping.AssignedAt.IsZero() {
-		now := time.Now().UTC()
-		mapping.AssignedAt = now
-		mapping.CreatedAt = now
-		mapping.UpdatedAt = now
-	}
-	_, err := r.client.Exec(ctx, query,
-		mapping.RFIDID,
-		mapping.UserID,
-		mapping.CompanyID,
-		mapping.RFIDTag,
-		mapping.IsActive,
-		mapping.AssignedAt,
-		mapping.UnassignedAt,
-		mapping.CreatedAt,
-		mapping.UpdatedAt,
-	)
-	if err != nil {
-		r.logger.Error("Failed to create employee RFID mapping",
-			util.String("rfid_id", mapping.RFIDID.String()),
-			util.String("user_id", mapping.UserID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to create employee RFID mapping: %w", err)
-	}
-	return nil
-}
-
-func (r *attendanceRepository) GetEmployeeRFIDMappingByUser(
-	ctx context.Context,
-	userID uuid.UUID,
-) (*attendance.EmployeeRFIDMapping, error) {
-	query := `
-        SELECT * FROM employee_rfid_mappings
-        WHERE user_id = $1
-        AND is_active = true
-        AND unassigned_at IS NULL
-        ORDER BY assigned_at DESC
-        LIMIT 1
-    `
-	row := r.client.QueryRow(ctx, query, userID)
-	var mapping attendance.EmployeeRFIDMapping
-	err := row.Scan(
-		&mapping.RFIDID,
-		&mapping.UserID,
-		&mapping.CompanyID,
-		&mapping.RFIDTag,
-		&mapping.IsActive,
-		&mapping.AssignedAt,
-		&mapping.UnassignedAt,
-		&mapping.CreatedAt,
-		&mapping.UpdatedAt,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		r.logger.Error("Failed to get employee RFID mapping by user",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get employee RFID mapping: %w", err)
-	}
-	return &mapping, nil
-}
-
-func (r *attendanceRepository) GetEmployeeRFIDMapping(
-	ctx context.Context,
-	rfidTag string,
-) (*attendance.EmployeeRFIDMapping, error) {
-	query := `
-        SELECT * FROM employee_rfid_mappings
-        WHERE rfid_tag = $1
-        AND is_active = true
-        AND unassigned_at IS NULL
-        ORDER BY assigned_at DESC
-        LIMIT 1
-    `
-	row := r.client.QueryRow(ctx, query, rfidTag)
-	var mapping attendance.EmployeeRFIDMapping
-	err := row.Scan(
-		&mapping.RFIDID,
-		&mapping.UserID,
-		&mapping.CompanyID,
-		&mapping.RFIDTag,
-		&mapping.IsActive,
-		&mapping.AssignedAt,
-		&mapping.UnassignedAt,
-		&mapping.CreatedAt,
-		&mapping.UpdatedAt,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		r.logger.Error("Failed to get employee RFID mapping",
-			util.String("rfid_tag", rfidTag),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("failed to get employee RFID mapping: %w", err)
-	}
-	return &mapping, nil
-}
-
-func (r *attendanceRepository) UpdateEmployeeRFIDMapping(
-	ctx context.Context,
-	mapping *attendance.EmployeeRFIDMapping,
-) error {
-	mapping.UpdatedAt = time.Now().UTC()
-	query := `
-        UPDATE employee_rfid_mappings SET
-            user_id = $1,
-            company_id = $2,
-            rfid_tag = $3,
-            is_active = $4,
-            assigned_at = $5,
-            unassigned_at = $6,
-            updated_at = $7
-        WHERE rfid_id = $8
-    `
-	result, err := r.client.Exec(ctx, query,
-		mapping.UserID,
-		mapping.CompanyID,
-		mapping.RFIDTag,
-		mapping.IsActive,
-		mapping.AssignedAt,
-		mapping.UnassignedAt,
-		mapping.UpdatedAt,
-		mapping.RFIDID,
-	)
-	if err != nil {
-		r.logger.Error("Failed to update employee RFID mapping",
-			util.String("rfid_id", mapping.RFIDID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to update employee RFID mapping: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("employee RFID mapping not found")
-	}
-	return nil
-}
-
-func (r *attendanceRepository) DeactivateEmployeeRFIDMapping(
-	ctx context.Context,
-	rfidID uuid.UUID,
-) error {
-	query := `
-        UPDATE employee_rfid_mappings
-        SET is_active = false, unassigned_at = $1
-        WHERE rfid_id = $2
-    `
-	result, err := r.client.Exec(ctx, query, time.Now().UTC(), rfidID)
-	if err != nil {
-		r.logger.Error("Failed to deactivate employee RFID mapping",
-			util.String("rfid_id", rfidID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("failed to deactivate employee RFID mapping: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("employee RFID mapping not found")
-	}
-	return nil
-}
-
 func (r *attendanceRepository) UpsertAttendanceDailySummary(
 	ctx context.Context,
 	summary *attendance.AttendanceDailySummary,
@@ -1610,13 +1433,14 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 			worked_minutes,
 			overtime_minutes,
 			late_minutes,
+			is_payroll_locked,
 			metadata,
 			generated_at,
 			generated_by
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9,
-			$10, $11
+			$10, $11, $12
 		)
 		ON CONFLICT (company_id, user_id, attendance_date)
 		DO UPDATE SET
@@ -1624,17 +1448,21 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 			worked_minutes   = EXCLUDED.worked_minutes,
 			overtime_minutes = EXCLUDED.overtime_minutes,
 			late_minutes     = EXCLUDED.late_minutes,
+			is_payroll_locked = EXCLUDED.is_payroll_locked,
 			metadata         = EXCLUDED.metadata,
 			generated_at     = EXCLUDED.generated_at,
 			generated_by     = EXCLUDED.generated_by
 	`
+
 	if summary.AttendanceSummaryID == uuid.Nil {
 		summary.AttendanceSummaryID = uuid.New()
 	}
 	if summary.GeneratedAt.IsZero() {
 		summary.GeneratedAt = time.Now().UTC()
 	}
+
 	metadataJSON, _ := json.Marshal(summary.Metadata)
+
 	_, err := r.client.Exec(ctx, query,
 		summary.AttendanceSummaryID,
 		summary.CompanyID,
@@ -1644,10 +1472,12 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 		summary.WorkedMinutes,
 		summary.OvertimeMinutes,
 		summary.LateMinutes,
+		summary.IsPayrollLocked, // ✅ NEW FIELD
 		metadataJSON,
 		summary.GeneratedAt,
 		summary.GeneratedBy,
 	)
+
 	if err != nil {
 		r.logger.Error(
 			"Failed to upsert attendance daily summary",
@@ -1660,7 +1490,6 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 	}
 	return nil
 }
-
 func (r *attendanceRepository) GetDistinctUsersWithEvents(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1825,6 +1654,7 @@ func (r *attendanceRepository) HealthCheck(ctx context.Context) error {
 
 func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDailySummary) error {
 	var metadataJSON []byte
+
 	err := row.Scan(
 		&summary.AttendanceSummaryID,
 		&summary.CompanyID,
@@ -1834,6 +1664,7 @@ func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDai
 		&summary.WorkedMinutes,
 		&summary.OvertimeMinutes,
 		&summary.LateMinutes,
+		&summary.IsPayrollLocked, // ✅ NEW FIELD
 		&metadataJSON,
 		&summary.GeneratedAt,
 		&summary.GeneratedBy,
@@ -1841,6 +1672,7 @@ func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDai
 	if err != nil {
 		return err
 	}
+
 	if len(metadataJSON) > 0 {
 		err = json.Unmarshal(metadataJSON, &summary.Metadata)
 		if err != nil {
@@ -2386,13 +2218,14 @@ func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
 	date time.Time,
 ) (*attendance.AttendanceDailySummary, error) {
 	query := `
-        SELECT * FROM attendance_daily_summary
-        WHERE user_id = $1
-        AND attendance_date = $2
-    `
+		SELECT * FROM attendance_daily_summary
+		WHERE user_id = $1
+		AND attendance_date = $2
+	`
 	row := r.client.QueryRow(ctx, query, userID, date)
 	var summary attendance.AttendanceDailySummary
 	var metadataJSON []byte
+
 	err := row.Scan(
 		&summary.AttendanceSummaryID,
 		&summary.CompanyID,
@@ -2402,6 +2235,7 @@ func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
 		&summary.WorkedMinutes,
 		&summary.OvertimeMinutes,
 		&summary.LateMinutes,
+		&summary.IsPayrollLocked, // ✅ NEW FIELD
 		&metadataJSON,
 		&summary.GeneratedAt,
 		&summary.GeneratedBy,
@@ -2416,6 +2250,7 @@ func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
 			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get attendance daily summary: %w", err)
 	}
+
 	if len(metadataJSON) > 0 {
 		err = json.Unmarshal(metadataJSON, &summary.Metadata)
 		if err != nil {

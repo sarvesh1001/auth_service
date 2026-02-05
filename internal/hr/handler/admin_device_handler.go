@@ -1,12 +1,12 @@
-// auth-service/internal/hr/handler/device_handler.go
 package handler
 
 import (
 	"auth-service/internal/hr/models/attendance"
+	"auth-service/internal/hr/repository"
 	"auth-service/internal/hr/service"
-	device "auth-service/internal/hr/service"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -18,16 +18,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// DeviceHandler handles device management operations
 type DeviceHandler struct {
-	deviceService device.AttendanceDeviceService
+	deviceService service.AttendanceDeviceService
 	auditService  *service.AuditService
 	logger        *zap.Logger
 }
 
-// NewDeviceHandler creates a new device handler
 func NewDeviceHandler(
-	deviceService device.AttendanceDeviceService,
+	deviceService service.AttendanceDeviceService,
 	auditService *service.AuditService,
 	logger *zap.Logger,
 ) *DeviceHandler {
@@ -38,9 +36,7 @@ func NewDeviceHandler(
 	}
 }
 
-// DeviceRequest represents a device creation/update request
 type DeviceRequest struct {
-	DeviceID       string                 `json:"device_id"`
 	SourceType     string                 `json:"source_type"`
 	DeviceCode     string                 `json:"device_code"`
 	DeviceName     *string                `json:"device_name,omitempty"`
@@ -51,12 +47,10 @@ type DeviceRequest struct {
 	IPAddress      *string                `json:"ip_address,omitempty"`
 	MacAddress     *string                `json:"mac_address,omitempty"`
 	IsActive       *bool                  `json:"is_active,omitempty"`
-	IsTrusted      *bool                  `json:"is_trusted,omitempty"`
 	InstalledAt    *time.Time             `json:"installed_at,omitempty"`
 	Metadata       map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// DeviceResponse represents a device response
 type DeviceResponse struct {
 	DeviceID       string                 `json:"device_id"`
 	CompanyID      uuid.UUID              `json:"company_id"`
@@ -77,7 +71,6 @@ type DeviceResponse struct {
 	CreatedAt      time.Time              `json:"created_at"`
 }
 
-// DeviceListResponse represents a paginated list of devices
 type DeviceListResponse struct {
 	Devices    []DeviceResponse `json:"devices"`
 	Total      int              `json:"total"`
@@ -86,8 +79,19 @@ type DeviceListResponse struct {
 	TotalPages int              `json:"total_pages"`
 }
 
-// CreateDevice handles device registration
+func (h *DeviceHandler) panicRecovery(w http.ResponseWriter, method string) {
+	if r := recover(); r != nil {
+		h.logger.Error("panic recovered in DeviceHandler",
+			zap.Any("panic", r),
+			zap.String("method", method),
+			zap.Stack("stack"),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "Internal server error")
+	}
+}
+
 func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "CreateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -104,33 +108,48 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
+		return
+	}
+
 	var req DeviceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	// Validate required fields
-	if req.DeviceID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Device ID is required")
-		return
-	}
 	if req.SourceType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Source type is required")
 		return
 	}
+
 	if req.DeviceCode == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Device code is required")
 		return
 	}
 
-	// Build metadata for audit
+	if req.SourceType == "rfid" {
+		h.respondWithError(w, http.StatusBadRequest, "rfid devices are not supported")
+		return
+	}
+
+	if req.SourceType == "biometric" || req.SourceType == "kiosk" || req.SourceType == "classroom" {
+		if req.WorkCenterCode == nil || *req.WorkCenterCode == "" {
+			h.respondWithError(w, http.StatusBadRequest, "work_center_code is required for device source")
+			return
+		}
+	}
+
+	// Generate UUID for device ID
+	deviceID := uuid.New().String()
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
 		"endpoint":       r.URL.Path,
 		"request_method": r.Method,
-		"device_id":      req.DeviceID,
+		"device_id":      deviceID,
 		"device_code":    req.DeviceCode,
 		"source_type":    req.SourceType,
 	}
@@ -139,9 +158,8 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		metadata["device_name"] = *req.DeviceName
 	}
 
-	// Convert to domain model
 	device := &attendance.AttendanceDevice{
-		DeviceID:       req.DeviceID,
+		DeviceID:       deviceID,
 		CompanyID:      companyID,
 		SourceType:     req.SourceType,
 		DeviceCode:     req.DeviceCode,
@@ -161,18 +179,12 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		device.IsActive = true
 	}
 
-	if req.IsTrusted != nil {
-		device.IsTrusted = *req.IsTrusted
-	}
-
+	device.IsTrusted = false
 	if req.InstalledAt != nil {
 		device.InstalledAt = req.InstalledAt
 	}
 
-	// Marshal after state for audit
 	afterState, _ := json.Marshal(device)
-
-	// Register device
 	if err := h.deviceService.RegisterDevice(ctx, device); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "already exists") {
@@ -180,39 +192,35 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(err.Error(), "validation failed") {
 			statusCode = http.StatusBadRequest
 		}
-
 		h.logger.Error("Failed to register device",
 			zap.String("company_id", companyID.String()),
-			zap.String("device_id", req.DeviceID),
+			zap.String("device_id", deviceID),
 			zap.Error(err))
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
 
-	// Audit log - fixed signature
 	err = h.auditService.LogAction(
 		ctx,
 		&companyID,
 		"device",
 		"create",
 		"device",
-		nil, // EntityID is nil for creation
+		nil,
 		actorType,
 		&actorID,
-		nil, // Before state is nil for creation
+		nil,
 		afterState,
 		metadata,
 	)
 	if err != nil {
 		h.logger.Warn("Failed to create audit log",
 			zap.String("company_id", companyID.String()),
-			zap.String("device_id", req.DeviceID),
+			zap.String("device_id", deviceID),
 			zap.Error(err))
-		// Don't fail the request if audit logging fails
 	}
 
 	response := h.buildDeviceResponse(device)
-
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -223,8 +231,8 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetDevice handles retrieving a single device
 func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "GetDevice")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -243,20 +251,25 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 
 	device, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, repository.ErrDeviceNotFound) {
 			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get device",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+			return
 		}
+		h.logger.Error("Failed to get device",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if device == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
 
 	response := h.buildDeviceResponse(device)
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -266,8 +279,8 @@ func (h *DeviceHandler) GetDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// UpdateDevice handles updating a device
 func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "UpdateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -290,18 +303,27 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get existing device for before state
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
+		return
+	}
+
 	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if errors.Is(err, repository.ErrDeviceNotFound) {
 			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get existing device",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+			return
 		}
+		h.logger.Error("Failed to get existing device",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if existingDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
 		return
 	}
 
@@ -311,17 +333,31 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if at least one field is provided
 	if req.SourceType == "" && req.DeviceCode == "" && req.DeviceName == nil &&
 		req.Manufacturer == nil && req.Model == nil && req.WorkCenterCode == nil &&
 		req.LocationID == nil && req.IPAddress == nil && req.MacAddress == nil &&
-		req.IsActive == nil && req.IsTrusted == nil && req.InstalledAt == nil &&
-		req.Metadata == nil {
+		req.IsActive == nil && req.InstalledAt == nil && req.Metadata == nil {
 		h.respondWithError(w, http.StatusBadRequest, "No update fields provided")
 		return
 	}
 
-	// Build metadata for audit
+	if req.SourceType != "" && req.SourceType != existingDevice.SourceType {
+		h.respondWithError(w, http.StatusBadRequest, "source_type cannot be changed")
+		return
+	}
+
+	if req.SourceType == "rfid" {
+		h.respondWithError(w, http.StatusBadRequest, "rfid devices are not supported")
+		return
+	}
+
+	if req.WorkCenterCode != nil && (existingDevice.SourceType == "biometric" || existingDevice.SourceType == "kiosk" || existingDevice.SourceType == "classroom") {
+		if *req.WorkCenterCode == "" {
+			h.respondWithError(w, http.StatusBadRequest, "work_center_code is required for device source")
+			return
+		}
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -330,11 +366,10 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		"device_id":      deviceID,
 	}
 
-	// Convert to domain model
 	device := &attendance.AttendanceDevice{
 		DeviceID:       deviceID,
 		CompanyID:      companyID,
-		SourceType:     req.SourceType,
+		SourceType:     existingDevice.SourceType,
 		DeviceCode:     req.DeviceCode,
 		DeviceName:     req.DeviceName,
 		Manufacturer:   req.Manufacturer,
@@ -346,10 +381,6 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		Metadata:       req.Metadata,
 	}
 
-	// Preserve existing values if not provided in request
-	if req.SourceType == "" {
-		device.SourceType = existingDevice.SourceType
-	}
 	if req.DeviceCode == "" {
 		device.DeviceCode = existingDevice.DeviceCode
 	}
@@ -377,36 +408,26 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 	if req.Metadata == nil {
 		device.Metadata = existingDevice.Metadata
 	}
-
 	if req.IsActive != nil {
 		device.IsActive = *req.IsActive
 	} else {
 		device.IsActive = existingDevice.IsActive
 	}
-
-	if req.IsTrusted != nil {
-		device.IsTrusted = *req.IsTrusted
-	} else {
-		device.IsTrusted = existingDevice.IsTrusted
-	}
-
+	device.IsTrusted = existingDevice.IsTrusted
 	if req.InstalledAt != nil {
 		device.InstalledAt = req.InstalledAt
 	} else {
 		device.InstalledAt = existingDevice.InstalledAt
 	}
 
-	// Marshal before and after states for audit
 	beforeState, _ := json.Marshal(existingDevice)
 	afterState, _ := json.Marshal(device)
 
-	// Update device
 	if err := h.deviceService.UpdateDevice(ctx, device); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			statusCode = http.StatusNotFound
 		}
-
 		h.logger.Error("Failed to update device",
 			zap.String("company_id", companyID.String()),
 			zap.String("device_id", deviceID),
@@ -415,7 +436,6 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Audit log - fixed signature
 	entityUUID := uuid.Nil
 	err = h.auditService.LogAction(
 		ctx,
@@ -423,7 +443,7 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		"device",
 		"update",
 		"device",
-		&entityUUID, // Using nil UUID since device ID is string
+		&entityUUID,
 		actorType,
 		&actorID,
 		beforeState,
@@ -437,7 +457,6 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 			zap.Error(err))
 	}
 
-	// Get updated device for response
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device",
@@ -448,8 +467,12 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := h.buildDeviceResponse(updatedDevice)
+	if updatedDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found after update")
+		return
+	}
 
+	response := h.buildDeviceResponse(updatedDevice)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    response,
@@ -460,8 +483,8 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeleteDevice handles deleting a device
 func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "DeleteDevice")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -484,22 +507,30 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get device for before state
-	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get device for deletion",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
-		}
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
 
-	// Build metadata for audit
+	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	if err != nil {
+		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Device not found")
+			return
+		}
+		h.logger.Error("Failed to get device for deletion",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if existingDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -510,10 +541,8 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		"source_type":    existingDevice.SourceType,
 	}
 
-	// Marshal before state for audit
 	beforeState, _ := json.Marshal(existingDevice)
 
-	// Delete device
 	if err := h.deviceService.DeleteDevice(ctx, companyID, deviceID); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			h.respondWithError(w, http.StatusNotFound, "Device not found")
@@ -527,7 +556,6 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Audit log - fixed signature
 	entityUUID := uuid.Nil
 	err = h.auditService.LogAction(
 		ctx,
@@ -535,11 +563,11 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 		"device",
 		"delete",
 		"device",
-		&entityUUID, // Using nil UUID since device ID is string
+		&entityUUID,
 		actorType,
 		&actorID,
 		beforeState,
-		nil, // After state is nil for deletion
+		nil,
 		metadata,
 	)
 	if err != nil {
@@ -558,8 +586,8 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ListDevices handles listing devices with filters
 func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "ListDevices")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -580,43 +608,35 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 		pageSize = 50
 	}
 
-	// Build filters
 	filters := make(map[string]interface{})
-
 	if sourceType := r.URL.Query().Get("source_type"); sourceType != "" {
 		filters["source_type"] = sourceType
 	}
-
 	if workCenterCode := r.URL.Query().Get("work_center_code"); workCenterCode != "" {
 		filters["work_center_code"] = workCenterCode
 	}
-
 	if locationIDStr := r.URL.Query().Get("location_id"); locationIDStr != "" {
 		if locationID, err := uuid.Parse(locationIDStr); err == nil {
 			filters["location_id"] = locationID
 		}
 	}
-
 	if isActive := r.URL.Query().Get("is_active"); isActive != "" {
 		if active, err := strconv.ParseBool(isActive); err == nil {
 			filters["is_active"] = active
 		}
 	}
-
 	if isTrusted := r.URL.Query().Get("is_trusted"); isTrusted != "" {
 		if trusted, err := strconv.ParseBool(isTrusted); err == nil {
 			filters["is_trusted"] = trusted
 		}
 	}
-
 	if includeInactive := r.URL.Query().Get("include_inactive"); includeInactive != "" {
 		if include, err := strconv.ParseBool(includeInactive); err == nil && include {
 			filters["include_inactive"] = true
 		}
 	}
 
-	// Convert to service filter
-	filter := device.DeviceFilter{
+	filter := service.DeviceFilter{
 		Page:     page,
 		PageSize: pageSize,
 	}
@@ -625,32 +645,26 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 		strVal := val.(string)
 		filter.SourceType = &strVal
 	}
-
 	if val, ok := filters["work_center_code"]; ok {
 		strVal := val.(string)
 		filter.WorkCenterCode = &strVal
 	}
-
 	if val, ok := filters["location_id"]; ok {
 		uuidVal := val.(uuid.UUID)
 		filter.LocationID = &uuidVal
 	}
-
 	if val, ok := filters["is_active"]; ok {
 		boolVal := val.(bool)
 		filter.IsActive = &boolVal
 	}
-
 	if val, ok := filters["is_trusted"]; ok {
 		boolVal := val.(bool)
 		filter.IsTrusted = &boolVal
 	}
-
 	if val, ok := filters["include_inactive"]; ok {
 		filter.IncludeInactive = val.(bool)
 	}
 
-	// List devices
 	devices, err := h.deviceService.ListDevices(ctx, companyID, filter)
 	if err != nil {
 		h.logger.Error("Failed to list devices",
@@ -660,13 +674,11 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build response
 	deviceResponses := make([]DeviceResponse, len(devices))
 	for i, d := range devices {
 		deviceResponses[i] = h.buildDeviceResponse(d)
 	}
 
-	// For now, use total from devices slice; you might want to get total count from service
 	total := len(devices)
 	totalPages := (total + pageSize - 1) / pageSize
 
@@ -688,8 +700,8 @@ func (h *DeviceHandler) ListDevices(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ActivateDevice handles activating a device
 func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "ActivateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -712,22 +724,30 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get device for before state
-	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get device for activation",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
-		}
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
 
-	// Build metadata for audit
+	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	if err != nil {
+		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Device not found")
+			return
+		}
+		h.logger.Error("Failed to get device for activation",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if existingDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -737,10 +757,8 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		"device_code":    existingDevice.DeviceCode,
 	}
 
-	// Marshal before state
 	beforeState, _ := json.Marshal(existingDevice)
 
-	// Activate device
 	if err := h.deviceService.ActivateDevice(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -748,7 +766,6 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(err.Error(), "already active") {
 			statusCode = http.StatusBadRequest
 		}
-
 		h.logger.Error("Failed to activate device",
 			zap.String("company_id", companyID.String()),
 			zap.String("device_id", deviceID),
@@ -757,7 +774,6 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get updated device for after state
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after activation",
@@ -768,10 +784,12 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Marshal after state
-	afterState, _ := json.Marshal(updatedDevice)
+	if updatedDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found after activation")
+		return
+	}
 
-	// Audit log - fixed signature
+	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
 	err = h.auditService.LogAction(
 		ctx,
@@ -802,8 +820,8 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// DeactivateDevice handles deactivating a device
 func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "DeactivateDevice")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -826,22 +844,30 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get device for before state
-	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get device for deactivation",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
-		}
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
 
-	// Build metadata for audit
+	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	if err != nil {
+		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Device not found")
+			return
+		}
+		h.logger.Error("Failed to get device for deactivation",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if existingDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -851,10 +877,8 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		"device_code":    existingDevice.DeviceCode,
 	}
 
-	// Marshal before state
 	beforeState, _ := json.Marshal(existingDevice)
 
-	// Deactivate device
 	if err := h.deviceService.DeactivateDevice(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -862,7 +886,6 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		} else if strings.Contains(err.Error(), "already inactive") {
 			statusCode = http.StatusBadRequest
 		}
-
 		h.logger.Error("Failed to deactivate device",
 			zap.String("company_id", companyID.String()),
 			zap.String("device_id", deviceID),
@@ -871,7 +894,6 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Get updated device for after state
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after deactivation",
@@ -882,10 +904,12 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Marshal after state
-	afterState, _ := json.Marshal(updatedDevice)
+	if updatedDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found after deactivation")
+		return
+	}
 
-	// Audit log - fixed signature
+	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
 	err = h.auditService.LogAction(
 		ctx,
@@ -916,8 +940,8 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// MarkAsTrusted handles marking a device as trusted
 func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "MarkAsTrusted")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -940,22 +964,30 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get device for before state
-	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get device for marking as trusted",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
-		}
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
 
-	// Build metadata for audit
+	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	if err != nil {
+		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Device not found")
+			return
+		}
+		h.logger.Error("Failed to get device for marking as trusted",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if existingDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -965,10 +997,8 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		"device_code":    existingDevice.DeviceCode,
 	}
 
-	// Marshal before state
 	beforeState, _ := json.Marshal(existingDevice)
 
-	// Mark as trusted
 	if err := h.deviceService.MarkAsTrusted(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -976,7 +1006,6 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(err.Error(), "already trusted") {
 			statusCode = http.StatusBadRequest
 		}
-
 		h.logger.Error("Failed to mark device as trusted",
 			zap.String("company_id", companyID.String()),
 			zap.String("device_id", deviceID),
@@ -985,7 +1014,6 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get updated device for after state
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after marking as trusted",
@@ -996,10 +1024,12 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Marshal after state
-	afterState, _ := json.Marshal(updatedDevice)
+	if updatedDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found after marking as trusted")
+		return
+	}
 
-	// Audit log - fixed signature
+	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
 	err = h.auditService.LogAction(
 		ctx,
@@ -1030,8 +1060,8 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RevokeTrust handles revoking trust from a device
 func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "RevokeTrust")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -1054,22 +1084,30 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get device for before state
-	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			h.respondWithError(w, http.StatusNotFound, "Device not found")
-		} else {
-			h.logger.Error("Failed to get device for revoking trust",
-				zap.String("company_id", companyID.String()),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
-		}
+	if actorType != "admin" {
+		h.respondWithError(w, http.StatusForbidden, "only admins can manage devices")
 		return
 	}
 
-	// Build metadata for audit
+	existingDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
+	if err != nil {
+		if errors.Is(err, repository.ErrDeviceNotFound) || strings.Contains(err.Error(), "not found") {
+			h.respondWithError(w, http.StatusNotFound, "Device not found")
+			return
+		}
+		h.logger.Error("Failed to get device for revoking trust",
+			zap.String("company_id", companyID.String()),
+			zap.String("device_id", deviceID),
+			zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve device")
+		return
+	}
+
+	if existingDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found")
+		return
+	}
+
 	metadata := map[string]interface{}{
 		"ip_address":     r.RemoteAddr,
 		"user_agent":     r.UserAgent(),
@@ -1079,10 +1117,8 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		"device_code":    existingDevice.DeviceCode,
 	}
 
-	// Marshal before state
 	beforeState, _ := json.Marshal(existingDevice)
 
-	// Revoke trust
 	if err := h.deviceService.RevokeTrust(ctx, companyID, deviceID); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -1090,7 +1126,6 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(err.Error(), "already not trusted") {
 			statusCode = http.StatusBadRequest
 		}
-
 		h.logger.Error("Failed to revoke device trust",
 			zap.String("company_id", companyID.String()),
 			zap.String("device_id", deviceID),
@@ -1099,7 +1134,6 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get updated device for after state
 	updatedDevice, err := h.deviceService.GetDevice(ctx, companyID, deviceID)
 	if err != nil {
 		h.logger.Error("Failed to get updated device after revoking trust",
@@ -1110,10 +1144,12 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Marshal after state
-	afterState, _ := json.Marshal(updatedDevice)
+	if updatedDevice == nil {
+		h.respondWithError(w, http.StatusNotFound, "Device not found after revoking trust")
+		return
+	}
 
-	// Audit log - fixed signature
+	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
 	err = h.auditService.LogAction(
 		ctx,
@@ -1144,8 +1180,8 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetDeviceStatistics handles getting device statistics
 func (h *DeviceHandler) GetDeviceStatistics(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "GetDeviceStatistics")
 	startTime := time.Now()
 	ctx := r.Context()
 
@@ -1156,7 +1192,6 @@ func (h *DeviceHandler) GetDeviceStatistics(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Get statistics
 	stats, err := h.deviceService.GetDeviceStatistics(ctx, companyID)
 	if err != nil {
 		h.logger.Error("Failed to get device statistics",
@@ -1175,21 +1210,15 @@ func (h *DeviceHandler) GetDeviceStatistics(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// HealthCheck handles health check for device service
 func (h *DeviceHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
+	defer h.panicRecovery(w, "HealthCheck")
 	_ = r.Context()
-
-	// You might want to add actual health check logic here
-	// For now, just return success if services are initialized
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success":   true,
 		"message":   "Device service is healthy",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
-
-// Helper Methods
 
 func (h *DeviceHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, error) {
 	sessionType, ok := ctx.Value("session_type").(string)
@@ -1216,12 +1245,21 @@ func (h *DeviceHandler) getActorInfo(ctx context.Context) (string, uuid.UUID, er
 }
 
 func (h *DeviceHandler) buildDeviceResponse(device *attendance.AttendanceDevice) DeviceResponse {
+	if device == nil {
+		return DeviceResponse{}
+	}
+
+	var deviceNamePtr *string
+	if device.DeviceName != nil && *device.DeviceName != "" {
+		deviceNamePtr = device.DeviceName
+	}
+
 	return DeviceResponse{
 		DeviceID:       device.DeviceID,
 		CompanyID:      device.CompanyID,
 		SourceType:     device.SourceType,
 		DeviceCode:     device.DeviceCode,
-		DeviceName:     device.DeviceName,
+		DeviceName:     deviceNamePtr,
 		Manufacturer:   device.Manufacturer,
 		Model:          device.Model,
 		WorkCenterCode: device.WorkCenterCode,
