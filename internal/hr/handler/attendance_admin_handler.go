@@ -603,18 +603,27 @@ func (h *AttendanceAdminHandler) getActorInfo(ctx context.Context) (string, uuid
 }
 
 func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	rawUserID := ctx.Value("user_id")
-	if rawUserID == nil {
-		return uuid.Nil, errors.New("user_id not found in context")
+	// ✅ Primary: validated UUID set by EnhancedCompanyAccessMiddleware
+	if v := ctx.Value("current_user_id"); v != nil {
+		if uid, ok := v.(uuid.UUID); ok {
+			return uid, nil
+		}
+		return uuid.Nil, errors.New("invalid current_user_id type in context")
 	}
-	switch v := rawUserID.(type) {
-	case uuid.UUID:
-		return v, nil
-	case string:
-		return uuid.Parse(v)
-	default:
-		return uuid.Nil, errors.New("invalid user_id type in context")
+
+	// ♻️ Fallback: JWT middleware (string)
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw, nil
+		case string:
+			return uuid.Parse(raw)
+		default:
+			return uuid.Nil, errors.New("invalid user_id type in context")
+		}
 	}
+
+	return uuid.Nil, errors.New("user not authenticated")
 }
 
 func getSessionTypeFromContext(ctx context.Context) string {

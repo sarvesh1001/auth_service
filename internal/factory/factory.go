@@ -11,12 +11,15 @@ import (
 	"auth-service/internal/hashing/pepperstore"
 	b "auth-service/internal/hr/consumer"
 	hrhandler "auth-service/internal/hr/handler"
-	orgunithandler "auth-service/internal/hr/handler"
+	leavehandler "auth-service/internal/hr/leave/handler"
 	leaverepo "auth-service/internal/hr/leave/repository"
+	leavesvc "auth-service/internal/hr/leave/service"
+	hrmiddleware "auth-service/internal/hr/middleware"
+	payrollhandler "auth-service/internal/hr/payroll/handler"
 	payrollrepo "auth-service/internal/hr/payroll/repository"
+	payrollsvc "auth-service/internal/hr/payroll/service"
 	hrpostgres "auth-service/internal/hr/repository"
-	a "auth-service/internal/hr/service"
-	orgunitservice "auth-service/internal/hr/service"
+	hrservice "auth-service/internal/hr/service"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
@@ -29,163 +32,148 @@ import (
 	"sync"
 	"time"
 
-	leavehandler "auth-service/internal/hr/leave/handler"
-	leavesvc "auth-service/internal/hr/leave/service"
-	payrollhandler "auth-service/internal/hr/payroll/handler"
-	payrollsvc "auth-service/internal/hr/payroll/service"
-
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 )
 
 type Factory struct {
-	config            *config.Config
-	tlsManager        *tls.TLSManager
-	redisClient       *client.RedisClient
-	scyllaClient      *scylla.ScyllaClient
-	kafkaProducer     *client.KafkaProducer
-	esClient          *client.ESClient
-	clickhouseClient  *client.ClickHouseClient
-	hasher            *hashing.Hasher
-	encryptionManager *encryption.EncryptionManager
-	bucketingManager  *bucketing.BucketingManager
-	pairingRepo       redis.PairingRepository
-	pairingService    *service.PairingService
-	wsService         *service.WebSocketService
-	pairingHandler    *handler.PairingHandler
-	wsHandler         *handler.WebSocketHandler
-	qrUtil            *util.QRUtil
-	hmacUtil          *util.HMACUtil
+	config                            *config.Config
+	tlsManager                        *tls.TLSManager
+	redisClient                       *client.RedisClient
+	scyllaClient                      *scylla.ScyllaClient
+	kafkaProducer                     *client.KafkaProducer
+	esClient                          *client.ESClient
+	clickhouseClient                  *client.ClickHouseClient
+	hasher                            *hashing.Hasher
+	encryptionManager                 *encryption.EncryptionManager
+	bucketingManager                  *bucketing.BucketingManager
+	pairingRepo                       redis.PairingRepository
+	pairingService                    *service.PairingService
+	wsService                         *service.WebSocketService
+	pairingHandler                    *handler.PairingHandler
+	wsHandler                         *handler.WebSocketHandler
+	qrUtil                            *util.QRUtil
+	hmacUtil                          *util.HMACUtil
+	hrEmployeeRepository              hrpostgres.EmployeeRepository
+	attendanceRepository              hrpostgres.AttendanceRepository
+	schedulingRepository              hrpostgres.SchedulingRepository
+	auditRepository                   hrpostgres.AuditRepository
+	workCenterRepository              hrpostgres.WorkCenterRepository
+	orgUnitRepository                 hrpostgres.OrgUnitRepository
+	attendanceIdentityRepository      hrpostgres.AttendanceIdentityRepository
+	attendanceDeviceRepository        hrpostgres.AttendanceDeviceRepository
+	deviceEnrollmentRepository        hrpostgres.DeviceEnrollmentRepository
+	deviceTokenRepository             hrpostgres.DeviceTokenRepository
+	deviceHeartbeatRepository         hrpostgres.DeviceHeartbeatRepository
+	attendanceBatchRepository         hrpostgres.AttendanceBatchRepository
+	leaveRepository                   leaverepo.LeaveRepository
+	payrollRepository                 payrollrepo.PayrollRepository
+	attendanceDeviceHandler           *hrhandler.DeviceHandler
+	attendanceAdminHandler            *hrhandler.AttendanceAdminHandler
+	attendanceQueryHandler            *hrhandler.AttendanceQueryHandler
+	attendanceResolutionHandler       *hrhandler.AttendanceResolutionHandler
+	attendanceCorrectionHandler       *hrhandler.AttendanceCorrectionHandler
+	workCenterHandler                 *hrhandler.WorkCenterHandler
+	orgUnitHandler                    *hrhandler.OrgUnitHandler
+	hrAuditHandler                    *hrhandler.AuditHandler
+	hrEmployeeHandler                 *hrhandler.EmployeeHandler
+	hrSchedulingHandler               *hrhandler.SchedulingHandler
+	leaveAdminHandler                 *leavehandler.LeaveAdminHandler
+	leaveQueryHandler                 *leavehandler.LeaveQueryHandler
+	leaveRequestHandler               *leavehandler.LeaveRequestHandler
+	attendanceClassService            hrservice.ClassAttendanceService
+	attendanceClassHandler            *hrhandler.AttendanceClassHandler
+	attendanceOMHandler               *hrhandler.AttendanceOMHandler
+	payrollAdminHandler               *payrollhandler.PayrollAdminHandler
+	payrollRunHandler                 *payrollhandler.PayrollRunHandler
+	attendanceBulkService             hrservice.AttendanceBulkService
+	attendanceBatchService            hrservice.AttendanceBatchService
+	workCenterService                 *hrservice.WorkCenterService
+	workCenterQueryService            *hrservice.WorkCenterQueryService
+	orgUnitService                    *hrservice.OrgUnitService
+	orgUnitQueryService               *hrservice.OrgUnitQueryService
+	auditService                      *hrservice.AuditService
+	auditQueryService                 *hrservice.AuditQueryService
+	employeeQueryService              *hrservice.EmployeeQueryService
+	employeeService                   *hrservice.EmployeeService
+	schedulingService                 hrservice.SchedulingService
+	schedulingQueryService            hrservice.SchedulingQueryService
+	attendanceIngestService           hrservice.AttendanceIngestService
+	attendanceSourceResolver          hrservice.AttendanceSourceResolver
+	attendanceAdminService            hrservice.AttendanceAdminService
+	attendanceQueryService            hrservice.AttendanceQueryService
+	attendanceDeviceService           hrservice.AttendanceDeviceService
+	attendanceResolutionService       hrservice.AttendanceResolutionService
+	attendanceOMService               hrservice.AttendanceOMService
+	attendanceOutboxService           *hrservice.AttendanceOutboxService
+	attendanceOutboxCancel            context.CancelFunc
+	attendanceResolutionConsumer      *b.AttendanceResolutionConsumer
+	attendanceResolutionCancel        context.CancelFunc
+	leaveBalanceService               leavesvc.LeaveBalanceService
+	leavePolicyService                leavesvc.LeavePolicyService
+	leaveAccrualService               leavesvc.LeaveAccrualService
+	leaveQueryService                 leavesvc.LeaveQueryService
+	leaveRequestService               leavesvc.LeaveRequestService
+	payrollRunService                 payrollsvc.PayrollRunService
+	payrollCalculationService         payrollsvc.PayrollCalculationService
+	payrollLockService                payrollsvc.PayrollLockService
+	compensationResolver              payrollsvc.CompensationResolver
+	taxEngine                         payrollsvc.TaxEngine
+	payslipService                    payrollsvc.PayslipService
+	documentStorage                   hrservice.DocumentStorage
+	attendanceIngestHandler           *hrhandler.AttendanceIngestHandler
+	attendanceDeviceEnrollmentHandler *hrhandler.AttendanceDeviceEnrollmentHandler
+	deviceTokenAdminHandler           *hrhandler.DeviceTokenAdminHandler
+	deviceAuthMiddleware              *hrmiddleware.DeviceAuthMiddleware
+	postgresClient                    *client.PostgresClient
+	postgresUserRepository            postgres.UserRepository
+	postgresCompanyRepository         postgres.CompanyRepository
+	smsManager                        *sms.SMSManager
+	serviceFactory                    *service.ServiceFactory
+	adminDeviceRepo                   *scylla.AdminDeviceRepositoryImpl
+	adminDeviceTrustRepo              scylla.AdminDeviceTrustRepository
+	adminMPINRepo                     *scylla.AdminMPINRepositoryImpl
+	adminDeviceHistoryRepo            *scylla.AdminDeviceHistoryRepositoryImpl
+	userOTPService                    *service.UserOTPService
+	companyService                    *service.CompanyService
+	adminDeviceService                *service.AdminDeviceService
+	adminMPINService                  *service.AdminMPINService
+	userService                       *service.UserService
+	mpinRepository                    scylla.MPINRepository
+	mpinService                       *service.MPINService
+	pepperStoreRepo                   pepperstore.PepperStore
+	deviceTrustRepo                   scylla.DeviceTrustRepository
+	otpRepository                     scylla.OTPRepository
+	otpService                        *service.OTPService
+	sessionRepo                       redis.SessionRepository
+	sessionService                    *service.SessionService
+	deviceRepository                  scylla.DeviceRepository
+	deviceService                     *service.DeviceService
+	deviceHistoryRepo                 *scylla.DeviceHistoryRepositoryImpl
+	kafkaLoggingMgr                   *KafkaLoggingManager
+	payslipHandler                    *payrollhandler.PayslipHandler
+	adminRepository                   postgres.AdminRepository
+	adminService                      *service.AdminService
+	jwtService                        *service.JWTService
+	rbacInitService                   *service.RBACInitService
+	authHandler                       *handler.AuthHandler
+	router                            chi.Router
+	logger                            *zap.Logger
+	auditOutboxService                *service.AuditOutboxService
+	auditOutboxCancel                 context.CancelFunc
+	once                              sync.Once
+	closeOnce                         sync.Once
+	closed                            chan struct{}
+	// Attendance Source (Admin)
+	attendanceSourceAdminService hrservice.AttendanceSourceAdminService
+	attendanceSourceAdminHandler *hrhandler.AttendanceSourceAdminHandler
 
-	// HR Repositories
-	hrEmployeeRepository         hrpostgres.EmployeeRepository
-	attendanceRepository         hrpostgres.AttendanceRepository
-	schedulingRepository         hrpostgres.SchedulingRepository
-	auditRepository              hrpostgres.AuditRepository
-	workCenterRepository         hrpostgres.WorkCenterRepository
-	orgUnitRepository            hrpostgres.OrgUnitRepository
-	attendanceIdentityRepository hrpostgres.AttendanceIdentityRepository
-	attendanceDeviceRepository   hrpostgres.AttendanceDeviceRepository
-
-	// Leave Repository
-	leaveRepository leaverepo.LeaveRepository
-
-	// Payroll Repository
-	payrollRepository payrollrepo.PayrollRepository
-
-	// Handlers
-	attendanceDeviceHandler     *hrhandler.DeviceHandler
-	attendanceAdminHandler      *hrhandler.AttendanceAdminHandler
-	attendanceQueryHandler      *hrhandler.AttendanceQueryHandler
-	attendanceResolutionHandler *hrhandler.AttendanceResolutionHandler
-	attendanceCorrectionHandler *hrhandler.AttendanceCorrectionHandler
-	workCenterHandler           *hrhandler.WorkCenterHandler
-	orgUnitHandler              *orgunithandler.OrgUnitHandler
-	hrAuditHandler              *hrhandler.AuditHandler
-	hrEmployeeHandler           *hrhandler.EmployeeHandler
-	hrSchedulingHandler         *hrhandler.SchedulingHandler
-
-	// Leave Handlers
-	leaveAdminHandler   *leavehandler.LeaveAdminHandler
-	leaveQueryHandler   *leavehandler.LeaveQueryHandler
-	leaveRequestHandler *leavehandler.LeaveRequestHandler
-	// Attendance – Class & OM
-	attendanceClassService a.ClassAttendanceService
-	attendanceClassHandler *hrhandler.AttendanceClassHandler
-	attendanceOMHandler    *hrhandler.AttendanceOMHandler
-
-	// Payroll Handlers
-	payrollAdminHandler    *payrollhandler.PayrollAdminHandler
-	payrollRunHandler      *payrollhandler.PayrollRunHandler
-	attendanceBulkService  a.AttendanceBulkService
-	attendanceBatchService a.AttendanceBatchService
-
-	// Services
-	workCenterService            *a.WorkCenterService
-	workCenterQueryService       *a.WorkCenterQueryService
-	orgUnitService               *orgunitservice.OrgUnitService
-	orgUnitQueryService          *orgunitservice.OrgUnitQueryService
-	auditService                 *a.AuditService
-	auditQueryService            *a.AuditQueryService
-	employeeQueryService         *a.EmployeeQueryService
-	employeeService              *a.EmployeeService
-	schedulingService            a.SchedulingService
-	schedulingQueryService       a.SchedulingQueryService
-	attendanceIngestService      a.AttendanceIngestService
-	attendanceSourceResolver     a.AttendanceSourceResolver
-	attendanceAdminService       a.AttendanceAdminService
-	attendanceQueryService       a.AttendanceQueryService
-	attendanceDeviceService      a.AttendanceDeviceService
-	attendanceResolutionService  a.AttendanceResolutionService
-	attendanceOMService          a.AttendanceOMService
-	attendanceOutboxService      *a.AttendanceOutboxService
-	attendanceOutboxCancel       context.CancelFunc
-	attendanceResolutionConsumer *b.AttendanceResolutionConsumer
-	attendanceResolutionCancel   context.CancelFunc
-
-	// Leave Services
-	leaveBalanceService leavesvc.LeaveBalanceService
-	leavePolicyService  leavesvc.LeavePolicyService
-	leaveAccrualService leavesvc.LeaveAccrualService
-	leaveQueryService   leavesvc.LeaveQueryService
-	leaveRequestService leavesvc.LeaveRequestService
-
-	// Payroll Services
-	payrollRunService         payrollsvc.PayrollRunService
-	payrollCalculationService payrollsvc.PayrollCalculationService
-	payrollLockService        payrollsvc.PayrollLockService
-	compensationResolver      payrollsvc.CompensationResolver
-	taxEngine                 payrollsvc.TaxEngine
-	payslipService            payrollsvc.PayslipService // 👈 ADD THIS
-	documentStorage           a.DocumentStorage
-
-	attendanceIngestHandler *hrhandler.AttendanceIngestHandler
-
-	postgresClient            *client.PostgresClient
-	postgresUserRepository    postgres.UserRepository
-	postgresCompanyRepository postgres.CompanyRepository
-	smsManager                *sms.SMSManager
-	serviceFactory            *service.ServiceFactory
-
-	adminDeviceRepo        *scylla.AdminDeviceRepositoryImpl
-	adminDeviceTrustRepo   scylla.AdminDeviceTrustRepository
-	adminMPINRepo          *scylla.AdminMPINRepositoryImpl
-	adminDeviceHistoryRepo *scylla.AdminDeviceHistoryRepositoryImpl
-
-	userOTPService     *service.UserOTPService
-	companyService     *service.CompanyService
-	adminDeviceService *service.AdminDeviceService
-	adminMPINService   *service.AdminMPINService
-	userService        *service.UserService
-	mpinRepository     scylla.MPINRepository
-	mpinService        *service.MPINService
-	pepperStoreRepo    pepperstore.PepperStore
-	deviceTrustRepo    scylla.DeviceTrustRepository
-	otpRepository      scylla.OTPRepository
-	otpService         *service.OTPService
-	sessionRepo        redis.SessionRepository
-	sessionService     *service.SessionService
-	deviceRepository   scylla.DeviceRepository
-	deviceService      *service.DeviceService
-	deviceHistoryRepo  *scylla.DeviceHistoryRepositoryImpl
-
-	kafkaLoggingMgr *KafkaLoggingManager
-	payslipHandler  *payrollhandler.PayslipHandler // 👈 ADD
-	adminRepository postgres.AdminRepository
-	adminService    *service.AdminService
-	jwtService      *service.JWTService
-	rbacInitService *service.RBACInitService
-	authHandler     *handler.AuthHandler
-	router          chi.Router
-	logger          *zap.Logger
-
-	auditOutboxService *service.AuditOutboxService
-	auditOutboxCancel  context.CancelFunc
-
-	once      sync.Once
-	closeOnce sync.Once
-	closed    chan struct{}
+	// New fields for device heartbeat and batch ingest
+	deviceHeartbeatService       hrservice.DeviceHeartbeatService
+	attendanceBatchIngestService hrservice.AttendanceBatchIngestService
+	deviceHeartbeatHandler       *hrhandler.DeviceHeartbeatHandler
+	attendanceBatchHandler       *hrhandler.AttendanceBatchHandler
 }
 
 type KafkaLoggingManager struct {
@@ -249,7 +237,6 @@ func NewFactory() (*Factory, error) {
 		closed: make(chan struct{}),
 		logger: logger,
 	}
-
 	if cfg.Server.EnableTLS {
 		tlsConfig := &tls.TLSConfig{
 			EnableTLS: cfg.Server.EnableTLS,
@@ -258,28 +245,22 @@ func NewFactory() (*Factory, error) {
 		}
 		f.tlsManager = tls.NewTLSManager(tlsConfig)
 	}
-
 	if err := f.initializeClients(); err != nil {
 		return nil, fmt.Errorf("failed to initialize clients: %w", err)
 	}
-
 	f.initializeManagers()
-
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
-
 	ctx := context.Background()
 	if err := f.InitializeRBAC(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
 	}
-
 	if err := f.initializeDocumentStorage(); err != nil {
 		return nil, err
 	}
-
 	if outbox := f.GetAuditOutboxService(); outbox != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		f.auditOutboxCancel = cancel
@@ -293,15 +274,157 @@ func NewFactory() (*Factory, error) {
 		}()
 		f.logger.Info("Audit outbox service started")
 	}
-
 	if err := f.initializeAttendanceOutbox(); err != nil {
 		f.logger.Error("Failed to initialize attendance outbox", zap.Error(err))
 	}
-
 	return f, nil
 }
 
-// Payroll Repository
+// Device Heartbeat Repository
+func (f *Factory) DeviceHeartbeatRepository() hrpostgres.DeviceHeartbeatRepository {
+	if f.deviceHeartbeatRepository == nil {
+		f.deviceHeartbeatRepository = hrpostgres.NewDeviceHeartbeatRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.deviceHeartbeatRepository
+}
+
+// Attendance Batch Repository
+func (f *Factory) AttendanceBatchRepository() hrpostgres.AttendanceBatchRepository {
+	if f.attendanceBatchRepository == nil {
+		f.attendanceBatchRepository = hrpostgres.NewAttendanceBatchRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.attendanceBatchRepository
+}
+
+// Device Heartbeat Service
+func (f *Factory) GetDeviceHeartbeatService() hrservice.DeviceHeartbeatService {
+	if f.deviceHeartbeatService == nil {
+		f.deviceHeartbeatService = hrservice.NewDeviceHeartbeatService(
+			f.DeviceHeartbeatRepository(),
+			f.AttendanceDeviceRepository(),
+			f.logger,
+		)
+	}
+	return f.deviceHeartbeatService
+}
+
+// Attendance Batch Ingest Service
+func (f *Factory) GetAttendanceBatchIngestService() hrservice.AttendanceBatchIngestService {
+	if f.attendanceBatchIngestService == nil {
+		f.attendanceBatchIngestService = hrservice.NewAttendanceBatchIngestService(
+			f.AttendanceBatchRepository(),
+			f.AttendanceDeviceRepository(),
+			f.GetAttendanceIngestService(),
+			f.GetDeviceEnrollmentService(),
+			f.logger,
+		)
+	}
+	return f.attendanceBatchIngestService
+}
+
+// Device Heartbeat Handler
+func (f *Factory) GetDeviceHeartbeatHandler() *hrhandler.DeviceHeartbeatHandler {
+	if f.deviceHeartbeatHandler == nil {
+		f.deviceHeartbeatHandler = hrhandler.NewDeviceHeartbeatHandler(
+			f.GetDeviceHeartbeatService(),
+			f.logger,
+		)
+	}
+	return f.deviceHeartbeatHandler
+}
+
+// Attendance Batch Handler
+func (f *Factory) GetAttendanceBatchHandler() *hrhandler.AttendanceBatchHandler {
+	if f.attendanceBatchHandler == nil {
+		f.attendanceBatchHandler = hrhandler.NewAttendanceBatchHandler(
+			f.GetAttendanceBatchIngestService(),
+			f.logger,
+		)
+	}
+	return f.attendanceBatchHandler
+}
+
+// Device Enrollment and Token Services
+func (f *Factory) DeviceEnrollmentRepository() hrpostgres.DeviceEnrollmentRepository {
+	if f.deviceEnrollmentRepository == nil {
+		f.deviceEnrollmentRepository = hrpostgres.NewDeviceEnrollmentRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.deviceEnrollmentRepository
+}
+
+func (f *Factory) DeviceTokenRepository() hrpostgres.DeviceTokenRepository {
+	if f.deviceTokenRepository == nil {
+		f.deviceTokenRepository = hrpostgres.NewDeviceTokenRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.deviceTokenRepository
+}
+
+func (f *Factory) GetDeviceEnrollmentService() hrservice.AttendanceDeviceEnrollmentService {
+	return hrservice.NewAttendanceDeviceEnrollmentService(
+		f.DeviceEnrollmentRepository(),
+		f.AttendanceDeviceRepository(),
+		f.AttendanceRepository(), // ✅ ADD THIS
+		f.GetAuditService(),
+		f.logger,
+	)
+}
+
+func (f *Factory) GetDeviceTokenService() hrservice.DeviceTokenService {
+	return hrservice.NewDeviceTokenService(
+		f.DeviceTokenRepository(),
+		f.AttendanceDeviceRepository(),
+		f.logger,
+		hrservice.DeviceTokenServiceConfig{
+			TokenPrefix:   f.config.HR.Attendance.DeviceTokenPrefix,
+			TokenSecret:   f.config.HR.Attendance.DeviceTokenSecret,
+			TokenValidity: f.config.HR.Attendance.DeviceTokenValidity,
+		},
+	)
+}
+
+func (f *Factory) GetDeviceAuthMiddleware() *hrmiddleware.DeviceAuthMiddleware {
+	if f.deviceAuthMiddleware == nil {
+		f.deviceAuthMiddleware = hrmiddleware.NewDeviceAuthMiddleware(
+			f.GetDeviceTokenService(),
+			f.logger,
+		)
+	}
+	return f.deviceAuthMiddleware
+}
+
+func (f *Factory) GetDeviceTokenAdminHandler() *hrhandler.DeviceTokenAdminHandler {
+	if f.deviceTokenAdminHandler == nil {
+		f.deviceTokenAdminHandler = hrhandler.NewDeviceTokenAdminHandler(
+			f.GetDeviceTokenService(),
+			f.logger,
+		)
+	}
+	return f.deviceTokenAdminHandler
+}
+
+func (f *Factory) GetAttendanceDeviceEnrollmentHandler() *hrhandler.AttendanceDeviceEnrollmentHandler {
+	if f.attendanceDeviceEnrollmentHandler == nil {
+		f.attendanceDeviceEnrollmentHandler = hrhandler.NewAttendanceDeviceEnrollmentHandler(
+			f.GetDeviceEnrollmentService(),
+			f.logger,
+		)
+	}
+	return f.attendanceDeviceEnrollmentHandler
+}
+
+// Payroll Services
 func (f *Factory) PayrollRepository() payrollrepo.PayrollRepository {
 	if f.payrollRepository == nil {
 		f.payrollRepository = payrollrepo.NewPayrollRepository(
@@ -312,7 +435,6 @@ func (f *Factory) PayrollRepository() payrollrepo.PayrollRepository {
 	return f.payrollRepository
 }
 
-// Payroll Services
 func (f *Factory) CompensationResolver() payrollsvc.CompensationResolver {
 	if f.compensationResolver == nil {
 		f.compensationResolver = payrollsvc.NewCompensationResolver(
@@ -368,7 +490,6 @@ func (f *Factory) PayrollRunService() payrollsvc.PayrollRunService {
 	return f.payrollRunService
 }
 
-// Payroll Handlers
 func (f *Factory) PayrollAdminHandler() *payrollhandler.PayrollAdminHandler {
 	if f.payrollAdminHandler == nil {
 		f.payrollAdminHandler = payrollhandler.NewPayrollAdminHandler(
@@ -390,7 +511,7 @@ func (f *Factory) PayrollRunHandler() *payrollhandler.PayrollRunHandler {
 	return f.payrollRunHandler
 }
 
-// Leave Services (already existing but kept for completeness)
+// Leave Services
 func (f *Factory) LeaveRepository() leaverepo.LeaveRepository {
 	if f.leaveRepository == nil {
 		f.leaveRepository = leaverepo.NewLeaveRepository(
@@ -430,6 +551,7 @@ func (f *Factory) LeaveQueryService() leavesvc.LeaveQueryService {
 	}
 	return f.leaveQueryService
 }
+
 func (f *Factory) PayslipHandler() *payrollhandler.PayslipHandler {
 	if f.payslipHandler == nil {
 		f.payslipHandler = payrollhandler.NewPayslipHandler(
@@ -460,7 +582,6 @@ func (f *Factory) LeaveRequestService() leavesvc.LeaveRequestService {
 	return f.leaveRequestService
 }
 
-// Leave Handlers
 func (f *Factory) LeaveAdminHandler() *leavehandler.LeaveAdminHandler {
 	if f.leaveAdminHandler == nil {
 		f.leaveAdminHandler = leavehandler.NewLeaveAdminHandler(
@@ -494,9 +615,9 @@ func (f *Factory) LeaveRequestHandler() *leavehandler.LeaveRequestHandler {
 	return f.leaveRequestHandler
 }
 
-func (f *Factory) GetAttendanceBatchService() a.AttendanceBatchService {
+func (f *Factory) GetAttendanceBatchService() hrservice.AttendanceBatchService {
 	if f.attendanceBatchService == nil {
-		f.attendanceBatchService = a.NewAttendanceBatchService(
+		f.attendanceBatchService = hrservice.NewAttendanceBatchService(
 			f.GetAttendanceAdminService(),
 			f.GetAttendanceOMService(),
 			f.GetAttendanceResolutionService(),
@@ -507,10 +628,9 @@ func (f *Factory) GetAttendanceBatchService() a.AttendanceBatchService {
 	return f.attendanceBatchService
 }
 
-// Existing HR Services (kept for reference)
-func (f *Factory) GetAttendanceOMService() a.AttendanceOMService {
+func (f *Factory) GetAttendanceOMService() hrservice.AttendanceOMService {
 	if f.attendanceOMService == nil {
-		f.attendanceOMService = a.NewAttendanceOMService(
+		f.attendanceOMService = hrservice.NewAttendanceOMService(
 			f.OrgUnitRepository(),
 			f.GetAuditService(),
 			f.logger,
@@ -528,14 +648,15 @@ func (f *Factory) PayslipService() payrollsvc.PayslipService {
 	return f.payslipService
 }
 
-func (f *Factory) GetAttendanceIngestService() a.AttendanceIngestService {
+func (f *Factory) GetAttendanceIngestService() hrservice.AttendanceIngestService {
 	if f.attendanceIngestService == nil {
-		f.attendanceIngestService = a.NewAttendanceIngestService(
+		f.attendanceIngestService = hrservice.NewAttendanceIngestService(
 			f.AttendanceRepository(),
 			f.AttendanceDeviceRepository(),
 			f.AttendanceIdentityRepository(),
+			f.GetDeviceEnrollmentService(),
 			f.GetAttendanceSourceResolver(),
-			f.GetAttendanceAdminService(), // ✅ ADD THIS
+			f.GetAttendanceAdminService(),
 			f.GetAttendanceOMService(),
 			f.GetAuditService(),
 			f.logger,
@@ -544,18 +665,18 @@ func (f *Factory) GetAttendanceIngestService() a.AttendanceIngestService {
 	return f.attendanceIngestService
 }
 
-func (f *Factory) GetAttendanceSourceResolver() a.AttendanceSourceResolver {
+func (f *Factory) GetAttendanceSourceResolver() hrservice.AttendanceSourceResolver {
 	if f.attendanceSourceResolver == nil {
-		f.attendanceSourceResolver = a.NewAttendanceSourceResolver(
+		f.attendanceSourceResolver = hrservice.NewAttendanceSourceResolver(
 			f.logger,
 		)
 	}
 	return f.attendanceSourceResolver
 }
 
-func (f *Factory) GetAttendanceAdminService() a.AttendanceAdminService {
+func (f *Factory) GetAttendanceAdminService() hrservice.AttendanceAdminService {
 	if f.attendanceAdminService == nil {
-		f.attendanceAdminService = a.NewAttendanceAdminService(
+		f.attendanceAdminService = hrservice.NewAttendanceAdminService(
 			f.AttendanceRepository(),
 			f.GetSchedulingRepository(),
 			f.GetAttendanceResolutionService(),
@@ -567,9 +688,9 @@ func (f *Factory) GetAttendanceAdminService() a.AttendanceAdminService {
 	return f.attendanceAdminService
 }
 
-func (f *Factory) GetAttendanceQueryService() a.AttendanceQueryService {
+func (f *Factory) GetAttendanceQueryService() hrservice.AttendanceQueryService {
 	if f.attendanceQueryService == nil {
-		f.attendanceQueryService = a.NewAttendanceQueryService(
+		f.attendanceQueryService = hrservice.NewAttendanceQueryService(
 			f.AttendanceRepository(),
 			f.logger,
 		)
@@ -577,9 +698,9 @@ func (f *Factory) GetAttendanceQueryService() a.AttendanceQueryService {
 	return f.attendanceQueryService
 }
 
-func (f *Factory) GetAttendanceClassService() a.ClassAttendanceService {
+func (f *Factory) GetAttendanceClassService() hrservice.ClassAttendanceService {
 	if f.attendanceClassService == nil {
-		f.attendanceClassService = a.NewClassAttendanceService(
+		f.attendanceClassService = hrservice.NewClassAttendanceService(
 			f.OrgUnitRepository(),
 			f.GetAttendanceBatchService(),
 			f.logger,
@@ -597,6 +718,7 @@ func (f *Factory) GetAttendanceClassHandler() *hrhandler.AttendanceClassHandler 
 	}
 	return f.attendanceClassHandler
 }
+
 func (f *Factory) GetAttendanceOMHandler() *hrhandler.AttendanceOMHandler {
 	if f.attendanceOMHandler == nil {
 		f.attendanceOMHandler = hrhandler.NewAttendanceOMHandler(
@@ -607,9 +729,9 @@ func (f *Factory) GetAttendanceOMHandler() *hrhandler.AttendanceOMHandler {
 	return f.attendanceOMHandler
 }
 
-func (f *Factory) GetAttendanceDeviceService() a.AttendanceDeviceService {
+func (f *Factory) GetAttendanceDeviceService() hrservice.AttendanceDeviceService {
 	if f.attendanceDeviceService == nil {
-		f.attendanceDeviceService = a.NewAttendanceDeviceService(
+		f.attendanceDeviceService = hrservice.NewAttendanceDeviceService(
 			f.AttendanceDeviceRepository(),
 			f.AttendanceRepository(),
 			f.logger,
@@ -617,10 +739,29 @@ func (f *Factory) GetAttendanceDeviceService() a.AttendanceDeviceService {
 	}
 	return f.attendanceDeviceService
 }
+func (f *Factory) GetAttendanceSourceAdminService() hrservice.AttendanceSourceAdminService {
+	if f.attendanceSourceAdminService == nil {
+		f.attendanceSourceAdminService = hrservice.NewAttendanceSourceAdminService(
+			f.AttendanceRepository(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.attendanceSourceAdminService
+}
+func (f *Factory) GetAttendanceSourceAdminHandler() *hrhandler.AttendanceSourceAdminHandler {
+	if f.attendanceSourceAdminHandler == nil {
+		f.attendanceSourceAdminHandler = hrhandler.NewAttendanceSourceAdminHandler(
+			f.GetAttendanceSourceAdminService(),
+			f.logger,
+		)
+	}
+	return f.attendanceSourceAdminHandler
+}
 
-func (f *Factory) GetAttendanceResolutionService() a.AttendanceResolutionService {
+func (f *Factory) GetAttendanceResolutionService() hrservice.AttendanceResolutionService {
 	if f.attendanceResolutionService == nil {
-		f.attendanceResolutionService = a.NewAttendanceResolutionService(
+		f.attendanceResolutionService = hrservice.NewAttendanceResolutionService(
 			f.AttendanceRepository(),
 			f.GetSchedulingQueryService(),
 			f.GetSchedulingService(),
@@ -666,15 +807,13 @@ func (f *Factory) initializeAttendanceOutbox() error {
 		f.logger.Warn("Kafka producer not available, attendance outbox disabled")
 		return nil
 	}
-
-	f.attendanceOutboxService = a.NewAttendanceOutboxService(
+	f.attendanceOutboxService = hrservice.NewAttendanceOutboxService(
 		f.PostgresClient(),
 		f.kafkaProducer,
 		500,
 		2*time.Second,
 		"attendance.events",
 	)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	f.attendanceOutboxCancel = cancel
 	go func() {
@@ -685,7 +824,6 @@ func (f *Factory) initializeAttendanceOutbox() error {
 		}
 	}()
 	f.logger.Info("Attendance outbox service started")
-
 	kafkaConsumer, err := client.NewKafkaConsumer(
 		f.config,
 		"attendance.events",
@@ -695,14 +833,12 @@ func (f *Factory) initializeAttendanceOutbox() error {
 	if err != nil {
 		return fmt.Errorf("failed to create attendance kafka consumer: %w", err)
 	}
-
 	resolutionService := f.GetAttendanceResolutionService()
 	f.attendanceResolutionConsumer = b.NewAttendanceResolutionConsumer(
 		kafkaConsumer,
 		resolutionService,
 		f.logger,
 	)
-
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	f.attendanceResolutionCancel = cancel2
 	go func() {
@@ -713,7 +849,6 @@ func (f *Factory) initializeAttendanceOutbox() error {
 		}
 	}()
 	f.logger.Info("Attendance resolution consumer started")
-
 	return nil
 }
 
@@ -771,6 +906,7 @@ func (f *Factory) GetAttendanceDeviceHandler() *hrhandler.DeviceHandler {
 	if f.attendanceDeviceHandler == nil {
 		f.attendanceDeviceHandler = hrhandler.NewDeviceHandler(
 			f.GetAttendanceDeviceService(),
+			f.GetAttendanceSourceAdminService(), // ✅ ADD
 			f.GetAuditService(),
 			f.logger,
 		)
@@ -820,12 +956,12 @@ func (f *Factory) OrgUnitRepository() hrpostgres.OrgUnitRepository {
 	return f.orgUnitRepository
 }
 
-func (f *Factory) GetEmployeeService() *a.EmployeeService {
+func (f *Factory) GetEmployeeService() *hrservice.EmployeeService {
 	if f.employeeService == nil {
-		f.employeeService = a.NewEmployeeService(
+		f.employeeService = hrservice.NewEmployeeService(
 			f.HREmployeeRepository(),
 			f.GetAuditService(),
-			a.EmployeeServiceConfig{
+			hrservice.EmployeeServiceConfig{
 				MaxDocumentSizeMB: f.config.HR.Documents.MaxSizeMB,
 				DocumentStorage:   f.DocumentStorage(),
 			},
@@ -835,9 +971,9 @@ func (f *Factory) GetEmployeeService() *a.EmployeeService {
 	return f.employeeService
 }
 
-func (f *Factory) GetEmployeeQueryService() *a.EmployeeQueryService {
+func (f *Factory) GetEmployeeQueryService() *hrservice.EmployeeQueryService {
 	if f.employeeQueryService == nil {
-		f.employeeQueryService = a.NewEmployeeQueryService(
+		f.employeeQueryService = hrservice.NewEmployeeQueryService(
 			f.HREmployeeRepository(),
 			f.DocumentStorage(),
 			f.logger,
@@ -846,9 +982,9 @@ func (f *Factory) GetEmployeeQueryService() *a.EmployeeQueryService {
 	return f.employeeQueryService
 }
 
-func (f *Factory) GetSchedulingService() a.SchedulingService {
+func (f *Factory) GetSchedulingService() hrservice.SchedulingService {
 	if f.schedulingService == nil {
-		f.schedulingService = a.NewSchedulingService(
+		f.schedulingService = hrservice.NewSchedulingService(
 			f.GetSchedulingRepository(),
 			f.LeaveQueryService(),
 			f.GetAuditService(),
@@ -858,9 +994,9 @@ func (f *Factory) GetSchedulingService() a.SchedulingService {
 	return f.schedulingService
 }
 
-func (f *Factory) GetSchedulingQueryService() a.SchedulingQueryService {
+func (f *Factory) GetSchedulingQueryService() hrservice.SchedulingQueryService {
 	if f.schedulingQueryService == nil {
-		f.schedulingQueryService = a.NewSchedulingQueryService(
+		f.schedulingQueryService = hrservice.NewSchedulingQueryService(
 			f.GetSchedulingRepository(),
 			f.logger,
 		)
@@ -868,9 +1004,9 @@ func (f *Factory) GetSchedulingQueryService() a.SchedulingQueryService {
 	return f.schedulingQueryService
 }
 
-func (f *Factory) GetWorkCenterService() *a.WorkCenterService {
+func (f *Factory) GetWorkCenterService() *hrservice.WorkCenterService {
 	if f.workCenterService == nil {
-		f.workCenterService = a.NewWorkCenterService(
+		f.workCenterService = hrservice.NewWorkCenterService(
 			f.WorkCenterRepository(),
 			f.GetAuditService(),
 			f.logger,
@@ -879,9 +1015,9 @@ func (f *Factory) GetWorkCenterService() *a.WorkCenterService {
 	return f.workCenterService
 }
 
-func (f *Factory) GetWorkCenterQueryService() *a.WorkCenterQueryService {
+func (f *Factory) GetWorkCenterQueryService() *hrservice.WorkCenterQueryService {
 	if f.workCenterQueryService == nil {
-		f.workCenterQueryService = a.NewWorkCenterQueryService(
+		f.workCenterQueryService = hrservice.NewWorkCenterQueryService(
 			f.WorkCenterRepository(),
 			f.logger,
 		)
@@ -889,9 +1025,9 @@ func (f *Factory) GetWorkCenterQueryService() *a.WorkCenterQueryService {
 	return f.workCenterQueryService
 }
 
-func (f *Factory) GetOrgUnitService() *orgunitservice.OrgUnitService {
+func (f *Factory) GetOrgUnitService() *hrservice.OrgUnitService {
 	if f.orgUnitService == nil {
-		f.orgUnitService = orgunitservice.NewOrgUnitService(
+		f.orgUnitService = hrservice.NewOrgUnitService(
 			f.OrgUnitRepository(),
 			f.GetAuditService(),
 			f.logger,
@@ -900,9 +1036,9 @@ func (f *Factory) GetOrgUnitService() *orgunitservice.OrgUnitService {
 	return f.orgUnitService
 }
 
-func (f *Factory) GetOrgUnitQueryService() *orgunitservice.OrgUnitQueryService {
+func (f *Factory) GetOrgUnitQueryService() *hrservice.OrgUnitQueryService {
 	if f.orgUnitQueryService == nil {
-		f.orgUnitQueryService = orgunitservice.NewOrgUnitQueryService(
+		f.orgUnitQueryService = hrservice.NewOrgUnitQueryService(
 			f.OrgUnitRepository(),
 			f.logger,
 		)
@@ -910,28 +1046,29 @@ func (f *Factory) GetOrgUnitQueryService() *orgunitservice.OrgUnitQueryService {
 	return f.orgUnitQueryService
 }
 
-func (f *Factory) GetAuditService() *a.AuditService {
+func (f *Factory) GetAuditService() *hrservice.AuditService {
 	if f.auditService == nil {
-		f.auditService = a.NewAuditService(
+		f.auditService = hrservice.NewAuditService(
 			f.AuditRepository(),
 			f.logger,
 		)
 	}
 	return f.auditService
 }
-func (f *Factory) GetAttendanceBulkService() a.AttendanceBulkService {
+
+func (f *Factory) GetAttendanceBulkService() hrservice.AttendanceBulkService {
 	if f.attendanceBulkService == nil {
-		f.attendanceBulkService = a.NewAttendanceBulkService(
-			f.GetAttendanceBatchService(), // 🔥 delegate
+		f.attendanceBulkService = hrservice.NewAttendanceBulkService(
+			f.GetAttendanceBatchService(),
 			f.logger,
 		)
 	}
 	return f.attendanceBulkService
 }
 
-func (f *Factory) GetAuditQueryService() *a.AuditQueryService {
+func (f *Factory) GetAuditQueryService() *hrservice.AuditQueryService {
 	if f.auditQueryService == nil {
-		f.auditQueryService = a.NewAuditQueryService(
+		f.auditQueryService = hrservice.NewAuditQueryService(
 			f.AuditRepository(),
 			f.logger,
 		)
@@ -951,9 +1088,9 @@ func (f *Factory) GetWorkCenterHandler() *hrhandler.WorkCenterHandler {
 	return f.workCenterHandler
 }
 
-func (f *Factory) GetOrgUnitHandler() *orgunithandler.OrgUnitHandler {
+func (f *Factory) GetOrgUnitHandler() *hrhandler.OrgUnitHandler {
 	if f.orgUnitHandler == nil {
-		f.orgUnitHandler = orgunithandler.NewOrgUnitHandler(
+		f.orgUnitHandler = hrhandler.NewOrgUnitHandler(
 			f.GetOrgUnitService(),
 			f.GetOrgUnitQueryService(),
 			f.GetAuditService(),
@@ -1011,7 +1148,7 @@ func (f *Factory) initializeDocumentStorage() error {
 	cfg := f.config
 	basePath := cfg.HR.Documents.BasePath
 	maxSizeMB := cfg.HR.Documents.MaxSizeMB
-	ds, err := a.NewLocalDocumentStorage(
+	ds, err := hrservice.NewLocalDocumentStorage(
 		basePath,
 		maxSizeMB,
 		f.logger,
@@ -1019,19 +1156,16 @@ func (f *Factory) initializeDocumentStorage() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize document storage: %w", err)
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := ds.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("document storage health check failed: %w", err)
 	}
-
 	f.documentStorage = ds
-
 	return nil
 }
 
-func (f *Factory) DocumentStorage() a.DocumentStorage {
+func (f *Factory) DocumentStorage() hrservice.DocumentStorage {
 	if f.documentStorage == nil {
 		f.logger.Fatal("Document storage not initialized")
 	}
@@ -1044,27 +1178,23 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		logger.Warn("Kafka brokers not configured, logging to stdout only")
 		return nil, nil
 	}
-
 	kafkaProducer, err := client.NewKafkaProducer(f.config, logger)
 	if err != nil {
 		logger.Error("failed to initialize Kafka producer", zap.Error(err))
 		return nil, err
 	}
 	f.kafkaProducer = kafkaProducer
-
 	logProducer := service.NewLogProducerService(
 		kafkaProducer,
 		f.config.Environment,
 		"v1.0.0",
 	)
-
 	consumerCtx, cancel := context.WithCancel(context.Background())
 	mgr := &KafkaLoggingManager{
 		producer:  logProducer,
 		cancelCtx: cancel,
 		logger:    logger,
 	}
-
 	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
 		esTopics := []string{
 			"admin-events",
@@ -1110,7 +1240,6 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 			}
 		}
 	}
-
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
 		chTopics := []string{
 			"device-events",
@@ -1154,7 +1283,6 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 				zap.Strings("topics", chTopics))
 		}
 	}
-
 	logger.Info("Kafka logging system initialized with optimized event distribution",
 		zap.Bool("es_enabled", mgr.esConsumer != nil),
 		zap.Bool("ch_enabled", mgr.chConsumer != nil),
@@ -1703,9 +1831,7 @@ func (f *Factory) GetWebSocketHandler() *handler.WebSocketHandler {
 func (f *Factory) initializeClients() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
 	var initErrors []error
-
 	if rc, err := client.NewRedisClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("redis: %w", err))
 	} else {
@@ -1714,7 +1840,6 @@ func (f *Factory) initializeClients() error {
 			initErrors = append(initErrors, fmt.Errorf("redis health check: %w", err))
 		}
 	}
-
 	if pgc, err := client.NewPostgresClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("postgres: %w", err))
 	} else {
@@ -1723,7 +1848,6 @@ func (f *Factory) initializeClients() error {
 			initErrors = append(initErrors, fmt.Errorf("postgres health check: %w", err))
 		}
 	}
-
 	if sc, err := scylla.NewScyllaClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("scylla: %w", err))
 	} else {
@@ -1732,7 +1856,6 @@ func (f *Factory) initializeClients() error {
 			initErrors = append(initErrors, fmt.Errorf("scylla health check: %w", err))
 		}
 	}
-
 	if ec, err := client.NewElasticsearchClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("elasticsearch: %w", err))
 	} else {
@@ -1741,7 +1864,6 @@ func (f *Factory) initializeClients() error {
 			initErrors = append(initErrors, fmt.Errorf("elasticsearch health check: %w", err))
 		}
 	}
-
 	if chc, err := client.NewClickHouseClient(f.config, f.logger); err != nil {
 		initErrors = append(initErrors, fmt.Errorf("clickhouse: %w", err))
 	} else {
@@ -1750,13 +1872,11 @@ func (f *Factory) initializeClients() error {
 			initErrors = append(initErrors, fmt.Errorf("clickhouse health check: %w", err))
 		}
 	}
-
 	if len(initErrors) > 0 {
 		for _, e := range initErrors {
 			f.logger.Error("Client initialization failed", zap.Error(e))
 		}
 	}
-
 	return nil
 }
 
@@ -1774,7 +1894,6 @@ func (f *Factory) initializeManagers() {
 	} else {
 		f.hasher = hasher
 	}
-
 	var kmsClient *kms.Client
 	if f.config.KMS.Enabled {
 		kmsClient = nil
@@ -1782,7 +1901,6 @@ func (f *Factory) initializeManagers() {
 	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
 	f.bucketingManager = bucketing.NewBucketingManager(f.config)
 	f.smsManager = sms.NewSMSManager(f.logger)
-
 	if f.hasher != nil && f.config.IsProduction() {
 		f.hasher.StartPepperRotation()
 	}
@@ -1801,13 +1919,11 @@ func (f *Factory) InitializeHandlers() error {
 	companyService := f.GetCompanyService()
 	jwtService := f.GetJWTService()
 	userOTPService := f.GetUserOTPService()
-
 	otpHandler := handler.NewOTPHandler(
 		otpService,
 		sessionService,
 		logger,
 	)
-
 	adminHandler := handler.NewAdminHandler(
 		adminService,
 		companyService,
@@ -1819,9 +1935,7 @@ func (f *Factory) InitializeHandlers() error {
 		jwtService,
 		logger,
 	)
-
 	rbacHandler := handler.NewRBACHandler(companyService, logger)
-
 	authHandler := handler.NewAuthHandler(
 		userOTPService,
 		mpinService,
@@ -1833,10 +1947,8 @@ func (f *Factory) InitializeHandlers() error {
 		logger,
 	)
 	f.authHandler = authHandler
-
 	pairingHandler := f.GetPairingHandler()
 	wsHandler := f.GetWebSocketHandler()
-
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
@@ -1863,8 +1975,15 @@ func (f *Factory) InitializeHandlers() error {
 		f.GetAttendanceQueryHandler(),
 		f.GetAttendanceResolutionHandler(),
 		f.GetAttendanceCorrectionHandler(),
+		f.GetAttendanceClassHandler(),
+		f.GetAttendanceOMHandler(),
+		f.GetAttendanceDeviceEnrollmentHandler(),
+		f.GetDeviceHeartbeatHandler(),
+		f.GetAttendanceBatchHandler(),
+		f.GetDeviceAuthMiddleware(),
+		f.GetDeviceTokenAdminHandler(),
+		f.GetAttendanceSourceAdminHandler(), // ✅ ADD THIS
 	)
-
 	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, and payroll systems")
 	return nil
 }
@@ -1889,7 +2008,6 @@ func (f *Factory) InitializeRBAC(ctx context.Context) error {
 
 func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	errs := make(map[string]error)
-
 	if f.postgresClient != nil {
 		if err := f.postgresClient.HealthCheck(ctx); err != nil {
 			errs["postgres"] = err
@@ -1897,8 +2015,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["postgres"] = fmt.Errorf("postgres client not initialized")
 	}
-
-	// Check payroll services
 	if f.payrollRepository != nil {
 		if err := f.payrollRepository.HealthCheck(ctx); err != nil {
 			errs["payroll_repository"] = err
@@ -1906,7 +2022,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["payroll_repository"] = fmt.Errorf("payroll repository not initialized")
 	}
-
 	if f.leaveRepository != nil {
 		if err := f.leaveRepository.HealthCheck(ctx); err != nil {
 			errs["leave_repository"] = err
@@ -1914,17 +2029,12 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	} else {
 		errs["leave_repository"] = fmt.Errorf("leave repository not initialized")
 	}
-
-	// Existing health checks remain...
-	// [Previous health check code remains the same, just showing payroll addition]
-
 	return errs
 }
 
 func (f *Factory) Close() error {
 	f.closeOnce.Do(func() {
 		close(f.closed)
-
 		if f.kafkaLoggingMgr != nil {
 			if f.kafkaLoggingMgr.cancelCtx != nil {
 				f.kafkaLoggingMgr.cancelCtx()
@@ -1936,7 +2046,6 @@ func (f *Factory) Close() error {
 				}
 			}
 		}
-
 		if f.kafkaProducer != nil {
 			if err := f.kafkaProducer.Close(); err != nil {
 				f.logger.Error("Failed to close Kafka producer", zap.Error(err))
@@ -1944,50 +2053,39 @@ func (f *Factory) Close() error {
 				f.logger.Info("Kafka producer closed successfully")
 			}
 		}
-
 		if f.attendanceOutboxCancel != nil {
 			f.logger.Info("Stopping attendance outbox service...")
 			f.attendanceOutboxCancel()
 		}
-
 		if f.attendanceResolutionCancel != nil {
 			f.logger.Info("Stopping attendance resolution consumer...")
 			f.attendanceResolutionCancel()
 		}
-
 		if f.auditOutboxCancel != nil {
 			f.logger.Info("Stopping audit outbox service...")
 			f.auditOutboxCancel()
 		}
-
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
 		}
-
 		if f.clickhouseClient != nil {
 			f.clickhouseClient.Close()
 		}
-
 		if f.esClient != nil {
 			f.esClient.Close()
 		}
-
 		if f.serviceFactory != nil {
 			f.serviceFactory.Cleanup()
 		}
-
 		if f.scyllaClient != nil {
 			f.scyllaClient.Close()
 		}
-
 		if f.redisClient != nil {
 			f.redisClient.Close()
 		}
-
 		if f.encryptionManager != nil {
 			f.encryptionManager.ClearCache()
 		}
-
 		if f.wsService != nil {
 			if closer, ok := interface{}(f.wsService).(interface{ Close() error }); ok {
 				_ = closer.Close()
@@ -2009,11 +2107,9 @@ func (f *Factory) GetLogProducerService() *service.LogProducerService {
 	}
 	return f.kafkaLoggingMgr.GetLogProducerService()
 }
-
 func (f *Factory) GetSMSManager() *sms.SMSManager {
 	return f.smsManager
 }
-
 func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	if f.postgresUserRepository == nil {
 		f.postgresUserRepository = postgres.NewUserRepository(
@@ -2023,7 +2119,6 @@ func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	}
 	return f.postgresUserRepository
 }
-
 func (f *Factory) PostgresCompanyRepository() postgres.CompanyRepository {
 	if f.postgresCompanyRepository == nil {
 		f.postgresCompanyRepository = postgres.NewCompanyRepository(

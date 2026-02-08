@@ -19,20 +19,23 @@ import (
 )
 
 type DeviceHandler struct {
-	deviceService service.AttendanceDeviceService
-	auditService  *service.AuditService
-	logger        *zap.Logger
+	deviceService       service.AttendanceDeviceService
+	attendanceSourceSvc service.AttendanceSourceAdminService
+	auditService        *service.AuditService
+	logger              *zap.Logger
 }
 
 func NewDeviceHandler(
 	deviceService service.AttendanceDeviceService,
+	attendanceSourceSvc service.AttendanceSourceAdminService,
 	auditService *service.AuditService,
 	logger *zap.Logger,
 ) *DeviceHandler {
 	return &DeviceHandler{
-		deviceService: deviceService,
-		auditService:  auditService,
-		logger:        logger,
+		deviceService:       deviceService,
+		attendanceSourceSvc: attendanceSourceSvc,
+		auditService:        auditService,
+		logger:              logger,
 	}
 }
 
@@ -119,6 +122,10 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ------------------------------
+	// VALIDATION
+	// ------------------------------
+
 	if req.SourceType == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Source type is required")
 		return
@@ -136,12 +143,38 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 
 	if req.SourceType == "biometric" || req.SourceType == "kiosk" || req.SourceType == "classroom" {
 		if req.WorkCenterCode == nil || *req.WorkCenterCode == "" {
-			h.respondWithError(w, http.StatusBadRequest, "work_center_code is required for device source")
+			h.respondWithError(
+				w,
+				http.StatusBadRequest,
+				"work_center_code is required for device source",
+			)
 			return
 		}
 	}
 
-	// Generate UUID for device ID
+	// ------------------------------
+	// 🔥 ENSURE ATTENDANCE SOURCE EXISTS (HYBRID CORE)
+	// ------------------------------
+
+	_, err = h.attendanceSourceSvc.CreateSource(
+		ctx,
+		companyID,
+		req.SourceType,
+		"",       // default name
+		&actorID, // admin actor
+	)
+	if err != nil {
+		// Ignore "already exists" → expected in hybrid model
+		if !strings.Contains(err.Error(), "already exists") {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	// ------------------------------
+	// DEVICE CREATION
+	// ------------------------------
+
 	deviceID := uuid.New().String()
 
 	metadata := map[string]interface{}{
@@ -171,6 +204,7 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		IPAddress:      req.IPAddress,
 		MacAddress:     req.MacAddress,
 		Metadata:       req.Metadata,
+		IsTrusted:      false,
 	}
 
 	if req.IsActive != nil {
@@ -179,12 +213,12 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		device.IsActive = true
 	}
 
-	device.IsTrusted = false
 	if req.InstalledAt != nil {
 		device.InstalledAt = req.InstalledAt
 	}
 
 	afterState, _ := json.Marshal(device)
+
 	if err := h.deviceService.RegisterDevice(ctx, device); err != nil {
 		statusCode := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "already exists") {
@@ -192,35 +226,44 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(err.Error(), "validation failed") {
 			statusCode = http.StatusBadRequest
 		}
-		h.logger.Error("Failed to register device",
+
+		h.logger.Error(
+			"Failed to register device",
 			zap.String("company_id", companyID.String()),
 			zap.String("device_id", deviceID),
-			zap.Error(err))
+			zap.Error(err),
+		)
+
 		h.respondWithError(w, statusCode, err.Error())
 		return
 	}
 
-	err = h.auditService.LogAction(
-		ctx,
-		&companyID,
-		"device",
-		"create",
-		"device",
-		nil,
-		actorType,
-		&actorID,
-		nil,
-		afterState,
-		metadata,
-	)
-	if err != nil {
-		h.logger.Warn("Failed to create audit log",
-			zap.String("company_id", companyID.String()),
-			zap.String("device_id", deviceID),
-			zap.Error(err))
+	// ------------------------------
+	// AUDIT
+	// ------------------------------
+
+	if h.auditService != nil {
+		_ = h.auditService.LogAction(
+			ctx,
+			&companyID,
+			"device",
+			"create",
+			"device",
+			nil,
+			actorType,
+			&actorID,
+			nil,
+			afterState,
+			metadata,
+		)
 	}
 
+	// ------------------------------
+	// RESPONSE
+	// ------------------------------
+
 	response := h.buildDeviceResponse(device)
+
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
 		"data":    response,

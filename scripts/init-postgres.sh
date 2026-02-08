@@ -542,7 +542,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
         enrolled_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
         unenrolled_at      TIMESTAMPTZ,
         created_by         UUID,
-        UNIQUE (device_id, device_user_code),
         FOREIGN KEY (device_id)
             REFERENCES attendance_devices(device_id),
         FOREIGN KEY (source_type)
@@ -3755,15 +3754,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
 
     DROP INDEX IF EXISTS attendance_user_device_identifiers_device_id_device_user_code_key;
 
-    CREATE UNIQUE INDEX uq_device_user_per_company
-    ON attendance_user_device_identifiers (company_id, device_id, device_user_code);
 
     ALTER TABLE attendance_events
-    ADD CONSTRAINT chk_device_identity_required
-    CHECK (
-    source_type NOT IN ('biometric','kiosk','factory','classroom')
-    OR device_user_code IS NOT NULL
-    );
 
     CREATE TABLE IF NOT EXISTS attendance_device_trust_history (
     trust_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3778,7 +3770,159 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'E
 
     ALTER TABLE attendance_devices
     ADD COLUMN IF NOT EXISTS last_punch_at TIMESTAMPTZ;
-    
-EOSQL
+
+    CREATE TABLE attendance_device_tokens (
+    token_id UUID PRIMARY KEY,
+    company_id UUID NOT NULL,
+    device_id VARCHAR(64) NOT NULL,
+    source_type VARCHAR(32) NOT NULL,
+
+    token_hash TEXT NOT NULL,
+    token_version INT NOT NULL DEFAULT 1,
+
+    is_active BOOLEAN NOT NULL DEFAULT true,
+
+    issued_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+
+    issued_by UUID,
+    revoked_by UUID,
+    revoke_reason TEXT,
+
+    metadata JSONB,
+
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT fk_device_token_device
+        FOREIGN KEY (device_id)
+        REFERENCES attendance_devices(device_id)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX idx_device_tokens_device
+        ON attendance_device_tokens (company_id, device_id);
+
+    CREATE INDEX idx_device_tokens_active
+        ON attendance_device_tokens (company_id, device_id, is_active);
+
+    CREATE TABLE IF NOT EXISTS attendance_device_heartbeats (
+    heartbeat_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    company_id UUID NOT NULL,
+    device_id VARCHAR(256) NOT NULL,
+    source_type VARCHAR(30) NOT NULL,
+
+    device_time TIMESTAMPTZ,
+    server_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    firmware_version TEXT,
+    ip_address INET,
+
+    status VARCHAR(20) NOT NULL DEFAULT 'online', -- online | degraded | offline
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT fk_heartbeat_device
+        FOREIGN KEY (device_id)
+        REFERENCES attendance_devices(device_id)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX idx_device_heartbeats_latest
+    ON attendance_device_heartbeats (company_id, device_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS attendance_device_punch_batches (
+    batch_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    company_id UUID NOT NULL,
+    device_id VARCHAR(256) NOT NULL,
+
+    batch_ref TEXT NOT NULL, -- device-generated unique ref
+    total_events INT NOT NULL,
+
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at TIMESTAMPTZ,
+
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    -- pending | processed | partially_processed | rejected
+
+    failure_reason TEXT,
+
+    CONSTRAINT fk_batch_device
+        FOREIGN KEY (device_id)
+        REFERENCES attendance_devices(device_id)
+        ON DELETE CASCADE
+    );
+
+    CREATE UNIQUE INDEX uq_device_batch_ref
+    ON attendance_device_punch_batches (company_id, device_id, batch_ref);
+    ALTER TABLE attendance_user_device_identifiers
+    ADD CONSTRAINT fk_attendance_enroll_employee
+    FOREIGN KEY (company_id, user_id)
+    REFERENCES company_employees (company_id, user_id)
+    ON DELETE CASCADE;
+
+    ALTER TABLE attendance_user_device_identifiers
+    ADD CONSTRAINT fk_attendance_enroll_created_by
+    FOREIGN KEY (created_by)
+    REFERENCES users(user_id);
+
+    ALTER TABLE attendance_user_device_identifiers
+    ADD CONSTRAINT chk_created_by_not_zero
+    CHECK (created_by IS NULL OR created_by <> '00000000-0000-0000-0000-000000000000');
+
+    CREATE INDEX idx_active_enrollment_lookup
+    ON attendance_user_device_identifiers (company_id, device_id, device_user_code)
+    WHERE is_active = true;
+
+
+    CREATE OR REPLACE FUNCTION revoke_enrollment_on_exit()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE attendance_user_device_identifiers
+    SET is_active = false,
+        unenrolled_at = NOW(),
+        revoked_reason = 'employee_exit'
+    WHERE company_id = NEW.company_id
+      AND user_id = NEW.user_id
+      AND is_active = true;
+
+    RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE TRIGGER trg_revoke_device_on_employee_exit
+    AFTER UPDATE OF exit_state ON employee_exit
+    FOR EACH ROW
+    WHEN (NEW.exit_state = 'effective')
+    EXECUTE FUNCTION revoke_enrollment_on_exit();
+    ALTER TABLE attendance_user_device_identifiers
+    ADD COLUMN IF NOT EXISTS revoked_by UUID,
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_user_device_source
+    ON attendance_user_device_identifiers (
+        company_id,
+        device_id,
+        user_id,
+        source_type
+    )
+    WHERE is_active = true;
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_device_code
+    ON attendance_user_device_identifiers (
+        company_id,
+        device_id,
+        device_user_code
+    )
+    WHERE is_active = true;
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_enrollment_version
+    ON attendance_user_device_identifiers (
+    company_id,
+    device_id,
+    user_id,
+    source_type,
+    enrollment_version
+);
+
+EOSQL   
 
 echo "✅ Database schema created successfully!"

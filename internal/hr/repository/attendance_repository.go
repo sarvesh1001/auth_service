@@ -291,6 +291,12 @@ type AttendanceRepository interface {
 		ctx context.Context,
 		positionID uuid.UUID,
 	) (*Position, error)
+	// Lookup source by type (used during ingest)
+	GetAttendanceSourceByType(
+		ctx context.Context,
+		companyID uuid.UUID,
+		sourceType string,
+	) (*attendance.AttendanceSource, error)
 
 	// Active department for employee
 	GetEmployeeActiveDepartment(
@@ -308,6 +314,11 @@ type AttendanceRepository interface {
 		eventType string,
 		since time.Time,
 	) (*attendance.AttendanceEvent, error)
+	GetAttendanceSourceByCompanyAndType(
+		ctx context.Context,
+		companyID uuid.UUID,
+		sourceType string,
+	) (*attendance.AttendanceSource, error)
 }
 
 type AttendanceEventFilter struct {

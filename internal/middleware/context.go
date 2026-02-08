@@ -22,9 +22,24 @@ func GetCompanyIDFromContext(ctx context.Context) uuid.UUID {
 }
 
 func GetUserIDFromContext(ctx context.Context) uuid.UUID {
-	if v, ok := ctx.Value(ContextUserID).(uuid.UUID); ok {
+	// ✅ Preferred: set by EnhancedCompanyAccessMiddleware
+	if v, ok := ctx.Value("current_user_id").(uuid.UUID); ok {
 		return v
 	}
+
+	// ♻️ Fallback: JWT middleware (string)
+	if v := ctx.Value("user_id"); v != nil {
+		switch raw := v.(type) {
+		case uuid.UUID:
+			return raw
+		case string:
+			id, err := uuid.Parse(raw)
+			if err == nil {
+				return id
+			}
+		}
+	}
+
 	return uuid.Nil
 }
 

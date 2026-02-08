@@ -64,12 +64,18 @@ type PostgresConfig struct {
 }
 
 type HRConfig struct {
-	Documents DocumentConfig
+	Documents  DocumentConfig
+	Attendance AttendanceConfig
 }
 
 type DocumentConfig struct {
 	BasePath  string `mapstructure:"base_path"`
 	MaxSizeMB int    `mapstructure:"max_size_mb"`
+}
+type AttendanceConfig struct {
+	DeviceTokenPrefix   string        `mapstructure:"device_token_prefix"`
+	DeviceTokenSecret   string        `mapstructure:"device_token_secret"`
+	DeviceTokenValidity time.Duration `mapstructure:"device_token_validity"`
 }
 
 type JWTConfig struct {
@@ -348,8 +354,12 @@ func LoadConfig() *Config {
 					BasePath:  getEnv("HR_DOCUMENT_BASE_PATH", "/var/lib/auth-service/hr-documents"),
 					MaxSizeMB: getEnvAsInt("HR_DOCUMENT_MAX_SIZE_MB", 50),
 				},
-			},
-			Security: SecurityConfig{
+				Attendance: AttendanceConfig{
+					DeviceTokenPrefix:   getEnv("HR_ATTENDANCE_DEVICE_TOKEN_PREFIX", "DEV"),
+					DeviceTokenSecret:   getSecureEnv("HR_ATTENDANCE_DEVICE_TOKEN_SECRET", "dev-device-secret-change-me"),
+					DeviceTokenValidity: getEnvAsDuration("HR_ATTENDANCE_DEVICE_TOKEN_VALIDITY", 30*24*time.Hour),
+				},
+			}, Security: SecurityConfig{
 				JWTSecret:    getSecureEnv("JWT_SECRET", "default-insecure-secret-change-in-production"),
 				APIKey:       getSecureEnv("API_KEY", ""),
 				CORSOrigins:  getEnvAsSlice("CORS_ORIGINS", []string{"*"}, ","),

@@ -313,3 +313,8 @@ func SafeString(s *string) string {
 func BoolPtr(v bool) *bool {
 	return &v
 }
+func JSONEncode(w http.ResponseWriter, payload interface{}) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(payload)
+}

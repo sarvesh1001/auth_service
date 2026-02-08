@@ -5,5 +5,5 @@ import "fmt"
 
 // NewError creates a new formatted error
 func NewError(format string, args ...interface{}) error {
-    return fmt.Errorf(format, args...)
+	return fmt.Errorf(format, args...)
 }

@@ -4,6 +4,7 @@ import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/service"
 	"auth-service/internal/util"
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -11,10 +12,6 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
-
-// ============================================
-// ATTENDANCE INGEST HANDLER (STRICT I/O ONLY)
-// ============================================
 
 type AttendanceIngestHandler struct {
 	attendanceIngestService service.AttendanceIngestService
@@ -31,10 +28,11 @@ func NewAttendanceIngestHandler(
 	}
 }
 
-// ============================================
-// HTTP REQUEST DTO
-// ============================================
-
+/*
+===========================
+COMMON USER / ADMIN REQUEST
+===========================
+*/
 type PunchHTTPRequest struct {
 	TargetUserID uuid.UUID  `json:"target_user_id"`
 	EventType    string     `json:"event_type"`
@@ -48,55 +46,81 @@ type PunchHTTPRequest struct {
 	Context *attendance.EventContext `json:"context,omitempty"`
 }
 
-// ============================================
-// HANDLER
-// ============================================
-
+/*
+===========================
+ENTRY POINT
+===========================
+*/
 func (h *AttendanceIngestHandler) PunchAttendance(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
 	ctx := r.Context()
 
-	// --------------------------------------------------
-	// 1️⃣ AUTH CONTEXT (SAFE)
-	// --------------------------------------------------
-
 	sessionType, ok := ctx.Value("session_type").(string)
-	if !ok || sessionType == "" {
+	if !ok {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
-	var actorID uuid.UUID
-	if sessionType != "device" {
-		if v := ctx.Value("user_id"); v != nil {
-			switch t := v.(type) {
-			case uuid.UUID:
-				actorID = t
-			case string:
-				parsed, err := uuid.Parse(t)
-				if err != nil {
-					h.respondWithError(w, http.StatusUnauthorized, "invalid user identity")
-					return
-				}
-				actorID = parsed
-			default:
-				h.respondWithError(w, http.StatusUnauthorized, "invalid user context")
-				return
-			}
-		} else {
-			h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-			return
-		}
+	if sessionType == "device" {
+		h.handleDevicePunch(w, r, ctx)
+		return
 	}
 
-	// --------------------------------------------------
-	// 2️⃣ COMPANY CONTEXT (UUID SAFE)
-	// --------------------------------------------------
+	h.handleUserPunch(w, r, ctx)
+}
+
+/*
+===========================
+DEVICE PUNCH (LEGACY PATH)
+(kept for safety – DO NOT REMOVE)
+===========================
+*/
+func (h *AttendanceIngestHandler) handleDevicePunch(
+	w http.ResponseWriter,
+	r *http.Request,
+	ctx context.Context,
+) {
+	h.respondWithError(
+		w,
+		http.StatusBadRequest,
+		"use /attendance-device/events/punch for device attendance",
+	)
+}
+
+/*
+===========================
+USER / ADMIN PUNCH
+===========================
+*/
+func (h *AttendanceIngestHandler) handleUserPunch(
+	w http.ResponseWriter,
+	r *http.Request,
+	ctx context.Context,
+) {
+	var actorID uuid.UUID
+	if v := ctx.Value("user_id"); v != nil {
+		switch t := v.(type) {
+		case uuid.UUID:
+			actorID = t
+		case string:
+			parsed, err := uuid.Parse(t)
+			if err != nil {
+				h.respondWithError(w, http.StatusUnauthorized, "invalid user identity")
+				return
+			}
+			actorID = parsed
+		default:
+			h.respondWithError(w, http.StatusUnauthorized, "invalid user context")
+			return
+		}
+	} else {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 
 	var companyID uuid.UUID
-
 	if v := ctx.Value("company_id"); v != nil {
 		switch t := v.(type) {
 		case uuid.UUID:
@@ -113,22 +137,9 @@ func (h *AttendanceIngestHandler) PunchAttendance(
 			return
 		}
 	} else {
-		hdr := r.Header.Get("X-Company-ID")
-		if hdr == "" {
-			h.respondWithError(w, http.StatusBadRequest, "company context required")
-			return
-		}
-		parsed, err := uuid.Parse(hdr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid company id")
-			return
-		}
-		companyID = parsed
+		h.respondWithError(w, http.StatusBadRequest, "company context required")
+		return
 	}
-
-	// --------------------------------------------------
-	// 3️⃣ DECODE REQUEST
-	// --------------------------------------------------
 
 	var req PunchHTTPRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -136,52 +147,26 @@ func (h *AttendanceIngestHandler) PunchAttendance(
 		return
 	}
 
-	// --------------------------------------------------
-	// 4️⃣ IP RESOLUTION
-	// --------------------------------------------------
-
 	ip := req.Source.IPAddress
 	if ip == nil || *ip == "" {
 		resolved := h.getClientIP(r)
 		ip = &resolved
 	}
 
-	// --------------------------------------------------
-	// 5️⃣ DEVICE HEADER FALLBACK
-	// --------------------------------------------------
-
-	deviceID := req.Source.DeviceID
-	if deviceID == nil {
-		if d := r.Header.Get("X-Device-ID"); d != "" {
-			deviceID = &d
-		}
-	}
-
-	// --------------------------------------------------
-	// 6️⃣ BUILD SERVICE REQUEST
-	// --------------------------------------------------
-
 	punchReq := &service.PunchRequest{
 		CompanyID:    companyID,
+		ActorID:      actorID,
 		TargetUserID: req.TargetUserID,
 		EventType:    req.EventType,
 		EventTime:    req.EventTime,
 		Source: service.PunchSource{
 			SourceType: req.Source.SourceType,
 			SourceID:   req.Source.SourceID,
-			DeviceID:   deviceID,
+			DeviceID:   req.Source.DeviceID,
 			IPAddress:  ip,
 		},
 		Context: req.Context,
 	}
-
-	if sessionType != "device" {
-		punchReq.ActorID = actorID
-	}
-
-	// --------------------------------------------------
-	// 7️⃣ INGEST
-	// --------------------------------------------------
 
 	event, err := h.attendanceIngestService.IngestPunch(ctx, punchReq)
 	if err != nil {
@@ -189,9 +174,103 @@ func (h *AttendanceIngestHandler) PunchAttendance(
 		return
 	}
 
-	// --------------------------------------------------
-	// 8️⃣ RESPONSE
-	// --------------------------------------------------
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    event,
+	})
+}
+
+/*
+===========================
+DEVICE-ONLY PUNCH (CORRECT)
+===========================
+*/
+func (h *AttendanceIngestHandler) DevicePunchAttendance(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ctx := r.Context()
+
+	// -----------------------
+	// SESSION VALIDATION
+	// -----------------------
+	sessionType, ok := ctx.Value("session_type").(string)
+	if !ok || sessionType != "device" {
+		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
+		return
+	}
+
+	authContext, ok := ctx.Value("device_auth_context").(*attendance.DeviceAuthContext)
+	if !ok || authContext == nil {
+		h.respondWithError(w, http.StatusUnauthorized, "device authentication required")
+		return
+	}
+
+	// -----------------------
+	// REQUEST PAYLOAD
+	// -----------------------
+	var req struct {
+		EventType      string                   `json:"event_type"`
+		EventTime      *time.Time               `json:"event_time,omitempty"`
+		DeviceUserCode string                   `json:"device_user_code"`
+		Context        *attendance.EventContext `json:"context,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.EventType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "event_type required")
+		return
+	}
+
+	if req.DeviceUserCode == "" {
+		h.respondWithError(w, http.StatusBadRequest, "device_user_code required")
+		return
+	}
+
+	// -----------------------
+	// CONTEXT MERGE
+	// -----------------------
+	ctxObj := req.Context
+	if ctxObj == nil {
+		ctxObj = &attendance.EventContext{}
+	}
+
+	if authContext.WorkCenterID != nil && ctxObj.WorkCenterCode == nil {
+		ctxObj.WorkCenterCode = authContext.WorkCenterID
+	}
+
+	ip := h.getClientIP(r)
+	deviceID := authContext.DeviceID
+
+	// -----------------------
+	// BUILD PUNCH REQUEST
+	// ❌ DO NOT SET SourceID HERE
+	// -----------------------
+	punchReq := &service.PunchRequest{
+		CompanyID:      authContext.CompanyID,
+		EventType:      req.EventType,
+		EventTime:      req.EventTime,
+		DeviceUserCode: &req.DeviceUserCode,
+		Source: service.PunchSource{
+			SourceType: authContext.SourceType,
+			DeviceID:   &deviceID,
+			IPAddress:  &ip,
+		},
+		Context: ctxObj,
+	}
+
+	// -----------------------
+	// INGEST
+	// -----------------------
+	event, err := h.attendanceIngestService.IngestPunch(ctx, punchReq)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
@@ -199,10 +278,11 @@ func (h *AttendanceIngestHandler) PunchAttendance(
 	})
 }
 
-// ============================================
-// HELPERS
-// ============================================
-
+/*
+===========================
+HELPERS
+===========================
+*/
 func (h *AttendanceIngestHandler) getClientIP(r *http.Request) string {
 	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
 		return ip
@@ -220,7 +300,6 @@ func (h *AttendanceIngestHandler) respondWithJSON(
 ) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-
 	if err := json.NewEncoder(w).Encode(data); err != nil {
 		h.logger.Error("failed to encode response", util.ErrorField(err))
 	}

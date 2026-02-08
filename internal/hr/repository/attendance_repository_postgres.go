@@ -2444,3 +2444,104 @@ func (r *attendanceRepository) GetDepartment(
 
 	return &d, nil
 }
+func (r *attendanceRepository) GetAttendanceSourceByType(
+	ctx context.Context,
+	companyID uuid.UUID,
+	sourceType string,
+) (*attendance.AttendanceSource, error) {
+
+	query := `
+		SELECT
+			source_id,
+			company_id,
+			source_type,
+			name,
+			reference_type,
+			reference_id,
+			is_active,
+			created_at,
+			created_by
+		FROM attendance_sources
+		WHERE company_id = $1
+		  AND source_type = $2
+		  AND is_active = true
+		LIMIT 1
+	`
+
+	row := r.client.QueryRow(ctx, query, companyID, sourceType)
+
+	var source attendance.AttendanceSource
+
+	err := row.Scan(
+		&source.SourceID,
+		&source.CompanyID,
+		&source.SourceType,
+		&source.Name,
+		&source.ReferenceType,
+		&source.ReferenceID,
+		&source.IsActive,
+		&source.CreatedAt,
+		&source.CreatedBy,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error(
+			"Failed to get attendance source by type",
+			util.String("company_id", companyID.String()),
+			util.String("source_type", sourceType),
+			util.ErrorField(err),
+		)
+		return nil, err
+	}
+
+	return &source, nil
+}
+func (r *attendanceRepository) GetAttendanceSourceByCompanyAndType(
+	ctx context.Context,
+	companyID uuid.UUID,
+	sourceType string,
+) (*attendance.AttendanceSource, error) {
+
+	query := `
+		SELECT
+			source_id,
+			company_id,
+			source_type,
+			name,
+			reference_type,
+			reference_id,
+			is_active,
+			created_at,
+			created_by
+		FROM attendance_sources
+		WHERE company_id = $1
+		  AND source_type = $2
+		LIMIT 1
+	`
+
+	var src attendance.AttendanceSource
+
+	err := r.client.QueryRow(ctx, query, companyID, sourceType).Scan(
+		&src.SourceID,
+		&src.CompanyID,
+		&src.SourceType,
+		&src.Name,
+		&src.ReferenceType,
+		&src.ReferenceID,
+		&src.IsActive,
+		&src.CreatedAt,
+		&src.CreatedBy,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return &src, nil
+}

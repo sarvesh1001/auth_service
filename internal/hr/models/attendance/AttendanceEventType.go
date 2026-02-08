@@ -165,9 +165,13 @@ type AttendanceEvent struct {
 	SourceType string     `json:"source_type" db:"source_type"`
 	SourceID   *uuid.UUID `json:"source_id,omitempty" db:"source_id"`
 	DeviceID   *string    `json:"device_id,omitempty" db:"device_id"`
-	IPAddress  *string    `json:"ip_address,omitempty" db:"ip_address"`
 
-	// NEW
+	// 🔥 ADD THIS (REQUIRED)
+	DeviceUserCode     *string    `json:"device_user_code,omitempty" db:"device_user_code"`
+	DeviceEnrollmentID *uuid.UUID `db:"device_enrollment_id"`
+
+	IPAddress *string `json:"ip_address,omitempty" db:"ip_address"`
+
 	Context  EventContext  `json:"context,omitempty" db:"context"`
 	Metadata EventMetadata `json:"metadata,omitempty" db:"metadata"`
 

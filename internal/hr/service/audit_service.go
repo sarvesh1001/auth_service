@@ -523,3 +523,66 @@ func (qs *AuditQueryService) calculateTopActors(
 func (qs *AuditQueryService) HealthCheck(ctx context.Context) error {
 	return qs.repo.HealthCheck(ctx)
 }
+
+// ===============================
+// DEVICE ENROLLMENT AUDIT HELPERS
+// ===============================
+
+func (s *AuditService) LogDeviceEnrollment(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+	deviceUserCode string,
+	userID uuid.UUID,
+	enrolledBy uuid.UUID,
+) error {
+
+	metadata := map[string]interface{}{
+		"device_id":        deviceID,
+		"device_user_code": deviceUserCode,
+	}
+
+	return s.LogAction(
+		ctx,
+		&companyID,
+		"attendance",
+		"device_enroll",
+		"device_enrollment",
+		nil,
+		"admin",
+		&enrolledBy,
+		nil,
+		nil,
+		metadata,
+	)
+}
+
+func (s *AuditService) LogDeviceEnrollmentRevocation(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+	deviceUserCode string,
+	reason string,
+	revokedBy uuid.UUID,
+) error {
+
+	metadata := map[string]interface{}{
+		"device_id":        deviceID,
+		"device_user_code": deviceUserCode,
+		"reason":           reason,
+	}
+
+	return s.LogAction(
+		ctx,
+		&companyID,
+		"attendance",
+		"device_revoke",
+		"device_enrollment",
+		nil,
+		"admin",
+		&revokedBy,
+		nil,
+		nil,
+		metadata,
+	)
+}
