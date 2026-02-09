@@ -2,7 +2,6 @@ package handler
 
 import (
 	"auth-service/internal/hr/service"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -28,6 +27,10 @@ func NewAttendanceResolutionHandler(
 	}
 }
 
+// =====================================================
+// DTOs
+// =====================================================
+
 type ResolveEventRequest struct {
 	EventID uuid.UUID `json:"event_id"`
 }
@@ -42,16 +45,16 @@ type BatchResolveRequest struct {
 	EventIDs []uuid.UUID `json:"event_ids"`
 }
 
+// =====================================================
+// Handlers
+// =====================================================
+
 func (h *AttendanceResolutionHandler) ResolveEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:resolve") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -62,14 +65,16 @@ func (h *AttendanceResolutionHandler) ResolveEvent(w http.ResponseWriter, r *htt
 	}
 
 	if req.EventID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "event ID is required")
+		h.respondWithError(w, http.StatusBadRequest, "event_id is required")
 		return
 	}
 
 	if err := h.resolutionService.ResolveEvent(ctx, req.EventID); err != nil {
-		h.logger.Error("Failed to resolve event",
+		h.logger.Error(
+			"Failed to resolve event",
 			zap.String("event_id", req.EventID.String()),
-			zap.Error(err))
+			zap.Error(err),
+		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve event")
 		return
 	}
@@ -85,14 +90,10 @@ func (h *AttendanceResolutionHandler) ResolveEvent(w http.ResponseWriter, r *htt
 
 func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:resolve") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -103,7 +104,7 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 	}
 
 	if req.UserID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "user ID is required")
+		h.respondWithError(w, http.StatusBadRequest, "user_id is required")
 		return
 	}
 
@@ -112,44 +113,57 @@ func (h *AttendanceResolutionHandler) ResolveDay(w http.ResponseWriter, r *http.
 	}
 
 	if req.Recalculate {
-		if err := h.resolutionService.RecalculateDay(ctx, companyID, req.UserID, req.Date); err != nil {
-			h.logger.Error("Failed to recalculate day",
+		if err := h.resolutionService.RecalculateDay(
+			ctx,
+			companyID,
+			req.UserID,
+			req.Date,
+		); err != nil {
+			h.logger.Error(
+				"Failed to recalculate day",
 				zap.String("user_id", req.UserID.String()),
 				zap.Time("date", req.Date),
-				zap.Error(err))
+				zap.Error(err),
+			)
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
 			return
 		}
+
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Day recalculated successfully",
 		})
-	} else {
-		if err := h.resolutionService.ResolveDay(ctx, companyID, req.UserID, req.Date); err != nil {
-			h.logger.Error("Failed to resolve day",
-				zap.String("user_id", req.UserID.String()),
-				zap.Time("date", req.Date),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
-			return
-		}
-		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-			"success": true,
-			"message": "Day resolved successfully",
-		})
+		return
 	}
+
+	if err := h.resolutionService.ResolveDay(
+		ctx,
+		companyID,
+		req.UserID,
+		req.Date,
+	); err != nil {
+		h.logger.Error(
+			"Failed to resolve day",
+			zap.String("user_id", req.UserID.String()),
+			zap.Time("date", req.Date),
+			zap.Error(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Day resolved successfully",
+	})
 }
 
 func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:resolve:batch") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -160,7 +174,7 @@ func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *htt
 	}
 
 	if len(req.EventIDs) == 0 {
-		h.respondWithError(w, http.StatusBadRequest, "at least one event ID is required")
+		h.respondWithError(w, http.StatusBadRequest, "at least one event_id is required")
 		return
 	}
 
@@ -170,16 +184,21 @@ func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *htt
 	}
 
 	if err := h.resolutionService.BatchResolveEvents(ctx, req.EventIDs); err != nil {
-		h.logger.Error("Failed to batch resolve events",
+		h.logger.Error(
+			"Failed to batch resolve events",
 			zap.Int("event_count", len(req.EventIDs)),
-			zap.Error(err))
+			zap.Error(err),
+		)
 		h.respondWithError(w, http.StatusInternalServerError, "failed to batch resolve events")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("Batch resolved %d events successfully", len(req.EventIDs)),
+		"message": fmt.Sprintf(
+			"Batch resolved %d events successfully",
+			len(req.EventIDs),
+		),
 		"data": map[string]interface{}{
 			"processed_count": len(req.EventIDs),
 		},
@@ -188,87 +207,92 @@ func (h *AttendanceResolutionHandler) BatchResolve(w http.ResponseWriter, r *htt
 
 func (h *AttendanceResolutionHandler) ResolveDayByPath(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid user ID")
 		return
 	}
 
-	dateStr := chi.URLParam(r, "date")
-	date, err := time.Parse("2006-01-02", dateStr)
+	date, err := time.Parse("2006-01-02", chi.URLParam(r, "date"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid date format, use YYYY-MM-DD")
 		return
 	}
 
 	recalculate := r.URL.Query().Get("recalculate") == "true"
-	permission := "attendance:resolve"
-	if recalculate {
-		permission = "attendance:recalculate"
-	}
-
-	if !h.hasPermission(ctx, companyID, permission) {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
 
 	if recalculate {
-		if err := h.resolutionService.RecalculateDay(ctx, companyID, userID, date); err != nil {
-			h.logger.Error("Failed to recalculate day via path",
+		if err := h.resolutionService.RecalculateDay(
+			ctx,
+			companyID,
+			userID,
+			date,
+		); err != nil {
+			h.logger.Error(
+				"Failed to recalculate day via path",
 				zap.String("user_id", userID.String()),
 				zap.Time("date", date),
-				zap.Error(err))
+				zap.Error(err),
+			)
 			h.respondWithError(w, http.StatusInternalServerError, "failed to recalculate day")
 			return
 		}
+
 		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Day recalculated successfully",
 		})
-	} else {
-		if err := h.resolutionService.ResolveDay(ctx, companyID, userID, date); err != nil {
-			h.logger.Error("Failed to resolve day via path",
-				zap.String("user_id", userID.String()),
-				zap.Time("date", date),
-				zap.Error(err))
-			h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
-			return
-		}
-		h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-			"success": true,
-			"message": "Day resolved successfully",
-		})
+		return
 	}
+
+	if err := h.resolutionService.ResolveDay(
+		ctx,
+		companyID,
+		userID,
+		date,
+	); err != nil {
+		h.logger.Error(
+			"Failed to resolve day via path",
+			zap.String("user_id", userID.String()),
+			zap.Time("date", date),
+			zap.Error(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve day")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Day resolved successfully",
+	})
 }
 
-func (h *AttendanceResolutionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
-	permissions, ok := ctx.Value("permissions").([]string)
-	if !ok {
-		return false
-	}
+// =====================================================
+// Response Helpers
+// =====================================================
 
-	for _, p := range permissions {
-		if p == permission {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *AttendanceResolutionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+func (h *AttendanceResolutionHandler) respondWithJSON(
+	w http.ResponseWriter,
+	status int,
+	data interface{},
+) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }
 
-func (h *AttendanceResolutionHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+func (h *AttendanceResolutionHandler) respondWithError(
+	w http.ResponseWriter,
+	status int,
+	message string,
+) {
 	h.respondWithJSON(w, status, map[string]interface{}{
 		"success": false,
 		"error":   message,

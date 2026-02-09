@@ -35,8 +35,12 @@ type AttendanceCorrectionRequest struct {
 	Reason         string    `json:"reason"`
 }
 
-func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r *http.Request) {
+func (h *AttendanceCorrectionHandler) CreateCorrection(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
@@ -49,17 +53,13 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:correction:create") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
 	var req AttendanceCorrectionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
+	// ---- validations ----
 	if req.TargetUserID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "target_user_id is required")
 		return
@@ -82,7 +82,11 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 
 	businessDate, err := time.Parse("2006-01-02", req.BusinessDate)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid business_date format, use YYYY-MM-DD")
+		h.respondWithError(
+			w,
+			http.StatusBadRequest,
+			"invalid business_date format, use YYYY-MM-DD",
+		)
 		return
 	}
 
@@ -95,12 +99,17 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 	if req.EventTime != "" {
 		parsedTime, err := time.Parse(time.RFC3339, req.EventTime)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid event_time format, use RFC3339")
+			h.respondWithError(
+				w,
+				http.StatusBadRequest,
+				"invalid event_time format, use RFC3339",
+			)
 			return
 		}
 		eventTime = &parsedTime
 	}
 
+	// ---- service request ----
 	correctionReq := &service.AttendanceCorrectionRequest{
 		CompanyID:      companyID,
 		ActorID:        actorID,
@@ -114,11 +123,19 @@ func (h *AttendanceCorrectionHandler) CreateCorrection(w http.ResponseWriter, r 
 	}
 
 	if err := h.adminService.CreateAttendanceCorrection(ctx, correctionReq); err != nil {
-		h.logger.Error("Failed to create attendance correction",
+		h.logger.Error(
+			"Failed to create attendance correction",
 			zap.String("company_id", companyID.String()),
-			zap.String("user_id", req.TargetUserID.String()),
-			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create correction: "+err.Error())
+			zap.String("target_user_id", req.TargetUserID.String()),
+			zap.String("actor_id", actorID.String()),
+			zap.Error(err),
+		)
+
+		h.respondWithError(
+			w,
+			http.StatusInternalServerError,
+			"failed to create attendance correction",
+		)
 		return
 	}
 

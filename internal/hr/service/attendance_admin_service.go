@@ -1127,7 +1127,7 @@ func (s *attendanceAdminService) CreateAttendanceCorrection(
 		UserID:            req.TargetUserID,
 		EventType:         req.CorrectionType,
 		EventTime:         eventTime,
-		SourceType:        "manual",
+		SourceType:        "correction", // ✅ FIX
 		SourceID:          nil,
 		DeviceID:          nil,
 		IPAddress:         nil,

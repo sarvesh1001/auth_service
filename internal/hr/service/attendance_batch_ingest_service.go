@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json" // 👈 ADD THIS
 	"time"
 
 	"auth-service/internal/hr/models/attendance"
@@ -38,6 +39,22 @@ type AttendanceBatchIngestService interface {
 		ctx context.Context,
 		req *AttendanceBatchIngestRequest,
 	) error
+
+	GetFailures(
+		ctx context.Context,
+		companyID uuid.UUID,
+		deviceID string,
+		batchRef string,
+		limit int,
+		offset int,
+	) ([]repository.AttendancePunchFailureView, error)
+
+	GetStatus(
+		ctx context.Context,
+		companyID uuid.UUID,
+		deviceID string,
+		batchRef string,
+	) (*repository.AttendanceBatchStatus, error)
 }
 
 // ============================================
@@ -46,6 +63,7 @@ type AttendanceBatchIngestService interface {
 
 type attendanceBatchIngestService struct {
 	batchRepo         repository.AttendanceBatchRepository
+	outboxRepo        repository.AttendanceBatchOutboxRepository
 	deviceRepo        repository.AttendanceDeviceRepository
 	ingestService     AttendanceIngestService
 	enrollmentService AttendanceDeviceEnrollmentService
@@ -54,6 +72,7 @@ type attendanceBatchIngestService struct {
 
 func NewAttendanceBatchIngestService(
 	batchRepo repository.AttendanceBatchRepository,
+	outboxRepo repository.AttendanceBatchOutboxRepository,
 	deviceRepo repository.AttendanceDeviceRepository,
 	ingestService AttendanceIngestService,
 	enrollmentService AttendanceDeviceEnrollmentService,
@@ -61,6 +80,7 @@ func NewAttendanceBatchIngestService(
 ) AttendanceBatchIngestService {
 	return &attendanceBatchIngestService{
 		batchRepo:         batchRepo,
+		outboxRepo:        outboxRepo,
 		deviceRepo:        deviceRepo,
 		ingestService:     ingestService,
 		enrollmentService: enrollmentService,
@@ -69,7 +89,20 @@ func NewAttendanceBatchIngestService(
 }
 
 // ============================================
-// CORE LOGIC
+// QUERY
+// ============================================
+
+func (s *attendanceBatchIngestService) GetStatus(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+	batchRef string,
+) (*repository.AttendanceBatchStatus, error) {
+	return s.batchRepo.GetByRef(ctx, companyID, deviceID, batchRef)
+}
+
+// ============================================
+// CORE INGEST (PARTIAL FAILURE SAFE)
 // ============================================
 
 func (s *attendanceBatchIngestService) IngestBatch(
@@ -77,21 +110,13 @@ func (s *attendanceBatchIngestService) IngestBatch(
 	req *AttendanceBatchIngestRequest,
 ) error {
 
-	// ─────────────────────────────
 	// 1️⃣ Validate device
-	// ─────────────────────────────
-	device, err := s.deviceRepo.GetActiveDevice(
-		ctx,
-		req.CompanyID,
-		req.DeviceID,
-	)
+	device, err := s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, req.DeviceID)
 	if err != nil || device == nil || !device.IsTrusted {
 		return repository.ErrValidationFailed
 	}
 
-	// ─────────────────────────────
-	// 2️⃣ De-dup batch
-	// ─────────────────────────────
+	// 2️⃣ Idempotency
 	exists, err := s.batchRepo.ExistsByRef(
 		ctx,
 		req.CompanyID,
@@ -109,10 +134,7 @@ func (s *attendanceBatchIngestService) IngestBatch(
 		return nil
 	}
 
-	// ─────────────────────────────
-	// 3️⃣ Create batch record
-	// (REPOSITORY struct, not model)
-	// ─────────────────────────────
+	// 3️⃣ Create batch
 	batch := &repository.AttendancePunchBatch{
 		BatchID:     uuid.New(),
 		CompanyID:   req.CompanyID,
@@ -127,15 +149,28 @@ func (s *attendanceBatchIngestService) IngestBatch(
 		return err
 	}
 
-	// ─────────────────────────────
-	// 4️⃣ Process events (partial success)
-	// ─────────────────────────────
 	successCount := 0
 	failureCount := 0
 
+	// 4️⃣ Emit batch received outbox (ONCE)
+	_ = s.outboxRepo.Insert(ctx, &repository.AttendanceBatchOutbox{
+		OutboxID:    uuid.New(),
+		EventType:   "attendance.batch.received",
+		AggregateID: batch.BatchID,
+		Payload: map[string]interface{}{
+			"batch_id":     batch.BatchID,
+			"batch_ref":    batch.BatchRef,
+			"company_id":   batch.CompanyID,
+			"device_id":    batch.DeviceID,
+			"total_events": batch.TotalEvents,
+			"received_at":  batch.ReceivedAt,
+		},
+		CreatedAt: time.Now().UTC(),
+	})
+
+	// 5️⃣ Process events (PARTIAL FAILURE SAFE)
 	for _, event := range req.Events {
 
-		// Resolve user via enrollment
 		userID, err := s.enrollmentService.ResolveUser(
 			ctx,
 			req.CompanyID,
@@ -144,20 +179,20 @@ func (s *attendanceBatchIngestService) IngestBatch(
 			event.ExternalRef,
 		)
 		if err != nil {
-			s.logger.Warn("Failed to resolve user for batch event",
-				zap.String("external_ref", event.ExternalRef),
-				zap.Error(err),
-			)
+			s.recordFailure(ctx, batch, event, "user_resolution_failed: "+err.Error())
 			failureCount++
 			continue
 		}
 
-		// Build punch request
 		punchReq := &PunchRequest{
 			CompanyID:    req.CompanyID,
 			TargetUserID: userID,
 			EventType:    event.EventType,
 			EventTime:    &event.EventTime,
+
+			// 🔥 REQUIRED FOR DEVICE SOURCES (THIS WAS MISSING)
+			DeviceUserCode: &event.ExternalRef,
+
 			Source: PunchSource{
 				SourceType: req.SourceType,
 				DeviceID:   &req.DeviceID,
@@ -169,38 +204,112 @@ func (s *attendanceBatchIngestService) IngestBatch(
 
 		_, err = s.ingestService.IngestPunch(ctx, punchReq)
 		if err != nil {
-			s.logger.Warn("Failed to ingest batch punch",
-				zap.String("external_ref", event.ExternalRef),
-				zap.Error(err),
-			)
+			s.recordFailure(ctx, batch, event, "punch_ingest_failed: "+err.Error())
 			failureCount++
-		} else {
-			successCount++
+			continue
 		}
+
+		successCount++
+
+		// 🔥 Emit raw event outbox (PER SUCCESS)
+		_ = s.outboxRepo.Insert(ctx, &repository.AttendanceBatchOutbox{
+			OutboxID:    uuid.New(),
+			EventType:   "attendance.raw.events",
+			AggregateID: batch.BatchID,
+			Payload: map[string]interface{}{
+				"company_id":   req.CompanyID,
+				"device_id":    req.DeviceID,
+				"batch_ref":    req.BatchRef,
+				"user_id":      userID,
+				"event_type":   event.EventType,
+				"event_time":   event.EventTime,
+				"external_ref": event.ExternalRef,
+				"source_type":  req.SourceType,
+			},
+			CreatedAt: time.Now().UTC(),
+		})
 	}
 
-	// ─────────────────────────────
-	// 5️⃣ Final batch status
-	// ─────────────────────────────
+	// 6️⃣ Final batch status
 	if successCount == 0 && failureCount > 0 {
-		err = s.batchRepo.MarkFailed(
-			ctx,
-			batch.BatchID,
-			"all_events_failed",
-		)
+		err = s.batchRepo.MarkFailed(ctx, batch.BatchID, "all_events_failed")
 	} else {
-		err = s.batchRepo.MarkProcessed(
-			ctx,
-			batch.BatchID,
-		)
+		err = s.batchRepo.MarkProcessed(ctx, batch.BatchID)
 	}
 
 	if err != nil {
-		s.logger.Error("Failed to update batch status",
+		s.logger.Error(
+			"Failed to update batch status",
 			zap.String("batch_id", batch.BatchID.String()),
 			zap.Error(err),
 		)
 	}
 
 	return nil
+}
+
+// ============================================
+// FAILURE LOGGER
+// ============================================
+
+func (s *attendanceBatchIngestService) recordFailure(
+	ctx context.Context,
+	batch *repository.AttendancePunchBatch,
+	event OfflinePunchEvent,
+	reason string,
+) {
+	rawEvent := map[string]interface{}{
+		"event_type":   event.EventType,
+		"event_time":   event.EventTime,
+		"external_ref": event.ExternalRef,
+	}
+
+	rawJSON, err := json.Marshal(rawEvent)
+	if err != nil {
+		s.logger.Error(
+			"Failed to marshal raw failure event",
+			zap.String("batch_id", batch.BatchID.String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	failure := &repository.AttendancePunchFailure{
+		FailureID:      uuid.New(),
+		BatchID:        batch.BatchID,
+		CompanyID:      batch.CompanyID,
+		DeviceID:       batch.DeviceID,
+		DeviceUserCode: &event.ExternalRef,
+		EventType:      &event.EventType,
+		EventTime:      &event.EventTime,
+		FailureReason:  reason,
+		RawEvent:       rawJSON, // ✅ FIXED (jsonb safe)
+		CreatedAt:      time.Now().UTC(),
+	}
+
+	if err := s.batchRepo.InsertFailure(ctx, failure); err != nil {
+		s.logger.Error(
+			"Failed to persist batch failure",
+			zap.String("batch_id", batch.BatchID.String()),
+			zap.Error(err),
+		)
+	}
+}
+
+func (s *attendanceBatchIngestService) GetFailures(
+	ctx context.Context,
+	companyID uuid.UUID,
+	deviceID string,
+	batchRef string,
+	limit int,
+	offset int,
+) ([]repository.AttendancePunchFailureView, error) {
+	return s.batchRepo.ListFailuresByBatch(
+		ctx,
+		companyID,
+		deviceID,
+		batchRef,
+		limit,
+		offset,
+	)
 }

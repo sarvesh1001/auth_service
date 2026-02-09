@@ -308,27 +308,41 @@ func (r *attendanceRepository) SearchAttendanceEvents(
 	ctx context.Context,
 	filter AttendanceEventFilter,
 ) ([]*attendance.AttendanceEvent, int64, error) {
+
 	var conditions []string
 	var args []interface{}
 	argIdx := 1
 
+	// ─────────────────────────────
+	// Mandatory filters
+	// ─────────────────────────────
 	conditions = append(conditions, fmt.Sprintf("company_id = $%d", argIdx))
 	args = append(args, filter.CompanyID)
 	argIdx++
 
-	conditions = append(conditions, fmt.Sprintf("event_time BETWEEN $%d AND $%d", argIdx, argIdx+1))
+	conditions = append(
+		conditions,
+		fmt.Sprintf("event_time BETWEEN $%d AND $%d", argIdx, argIdx+1),
+	)
 	args = append(args, filter.StartDate, filter.EndDate)
 	argIdx += 2
 
+	// ─────────────────────────────
+	// Optional filters
+	// ─────────────────────────────
 	if filter.UserID != nil {
 		conditions = append(conditions, fmt.Sprintf("user_id = $%d", argIdx))
 		args = append(args, *filter.UserID)
 		argIdx++
 	}
 
-	if filter.EventType != nil {
-		conditions = append(conditions, fmt.Sprintf("event_type = $%d", argIdx))
-		args = append(args, *filter.EventType)
+	// ✅ FIX: support multiple event types
+	if len(filter.EventTypes) > 0 {
+		conditions = append(
+			conditions,
+			fmt.Sprintf("event_type = ANY($%d)", argIdx),
+		)
+		args = append(args, pq.Array(filter.EventTypes))
 		argIdx++
 	}
 
@@ -338,26 +352,36 @@ func (r *attendanceRepository) SearchAttendanceEvents(
 		argIdx++
 	}
 
+	// ─────────────────────────────
+	// Build WHERE clause
+	// ─────────────────────────────
 	whereClause := ""
 	if len(conditions) > 0 {
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
 	}
 
+	// ─────────────────────────────
+	// Count query
+	// ─────────────────────────────
 	countQuery := fmt.Sprintf(`
-        SELECT COUNT(*) FROM attendance_events
-        %s
-    `, whereClause)
+		SELECT COUNT(*)
+		FROM attendance_events
+		%s
+	`, whereClause)
 
 	row := r.client.QueryRow(ctx, countQuery, args...)
 	var total int64
-	err := row.Scan(&total)
-	if err != nil {
+	if err := row.Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("failed to count attendance events: %w", err)
 	}
 
+	// ─────────────────────────────
+	// Data query
+	// ─────────────────────────────
 	offset := (filter.Page - 1) * filter.PageSize
+
 	query := fmt.Sprintf(`
-        SELECT 
+		SELECT
 			attendance_event_id,
 			company_id,
 			user_id,
@@ -371,11 +395,11 @@ func (r *attendanceRepository) SearchAttendanceEvents(
 			metadata,
 			created_at,
 			created_by
-        FROM attendance_events
-        %s
-        ORDER BY event_time DESC
-        LIMIT $%d OFFSET $%d
-    `, whereClause, argIdx, argIdx+1)
+		FROM attendance_events
+		%s
+		ORDER BY event_time DESC
+		LIMIT $%d OFFSET $%d
+	`, whereClause, argIdx, argIdx+1)
 
 	args = append(args, filter.PageSize, offset)
 
@@ -394,9 +418,10 @@ func (r *attendanceRepository) SearchAttendanceEvents(
 		events = append(events, &event)
 	}
 
-	if err = rows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("rows iteration error: %w", err)
 	}
+
 	return events, total, nil
 }
 

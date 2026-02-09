@@ -3923,6 +3923,132 @@ BEGIN
     enrollment_version
 );
 
+CREATE TABLE IF NOT EXISTS attendance_device_punch_failures (
+    failure_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    batch_id UUID NOT NULL,
+    company_id UUID NOT NULL,
+    device_id VARCHAR(256) NOT NULL,
+
+    device_user_code VARCHAR(100),
+    event_type VARCHAR(30),
+    event_time TIMESTAMPTZ,
+
+    failure_reason TEXT NOT NULL,
+    raw_event JSONB,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT fk_failure_batch
+        FOREIGN KEY (batch_id)
+        REFERENCES attendance_device_punch_batches (batch_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_batch_failures_batch
+    ON attendance_device_punch_failures (batch_id);
+
+CREATE INDEX idx_batch_failures_company
+    ON attendance_device_punch_failures (company_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS attendance.attendance_batch_outbox (
+    outbox_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type VARCHAR(50) NOT NULL,
+    aggregate_id UUID NOT NULL,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at TIMESTAMPTZ,
+    error_message TEXT
+    );
+
+    CREATE INDEX idx_attendance_batch_outbox_unprocessed
+    ON attendance.attendance_batch_outbox (created_at)
+    WHERE processed_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS leave.leave_policy (
+    policy_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL,
+
+    policy_name TEXT NOT NULL,
+
+    applies_to_type TEXT NOT NULL,
+    -- position | work_center | org_unit | company
+
+    applies_to_id TEXT,
+    -- position_id::uuid
+    -- work_center_code
+    -- org_unit_id::uuid
+    -- NULL when company-wide
+
+    priority INT NOT NULL DEFAULT 100,
+    -- lower = stronger (position overrides work_center)
+
+    effective_from DATE NOT NULL,
+    effective_to DATE,
+
+    is_active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_leave_policy_scope
+        CHECK (applies_to_type IN ('position','work_center','org_unit','company')),
+
+    CONSTRAINT fk_leave_policy_company
+        FOREIGN KEY (company_id)
+        REFERENCES companies(company_id)
+        ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS leave.leave_policy_rule (
+    policy_rule_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id UUID NOT NULL,
+    leave_type_id UUID NOT NULL,
+
+    total_days INT NOT NULL,
+    accrual_method TEXT NOT NULL,
+    carry_forward_limit INT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT fk_lpr_policy
+        FOREIGN KEY (policy_id)
+        REFERENCES leave.leave_policy(policy_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_lpr_leave_type
+        FOREIGN KEY (leave_type_id)
+        REFERENCES leave.leave_type(leave_type_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_lpr_accrual_method
+        CHECK (accrual_method IN ('monthly','yearly','none')),
+
+    UNIQUE (policy_id, leave_type_id)
+    );
+
+    ALTER TABLE leave.leave_entitlement
+    ADD COLUMN IF NOT EXISTS policy_id UUID,
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'policy',
+    -- policy | manual | migration
+
+    ADD CONSTRAINT fk_leave_entitlement_policy
+    FOREIGN KEY (policy_id)
+    REFERENCES leave.leave_policy(policy_id)
+    ON DELETE SET NULL;
+
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_active_entitlement_per_leave
+    ON leave.leave_entitlement (company_id, user_id, leave_type_id)
+    WHERE effective_to IS NULL;
+
+    CREATE TABLE IF NOT EXISTS leave.leave_policy_resolution (
+    resolution_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    policy_id UUID NOT NULL,
+    resolved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reason TEXT,
+    metadata JSONB
+    );
+
 EOSQL   
 
 echo "✅ Database schema created successfully!"

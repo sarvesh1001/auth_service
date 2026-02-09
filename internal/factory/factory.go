@@ -166,8 +166,11 @@ type Factory struct {
 	closeOnce                         sync.Once
 	closed                            chan struct{}
 	// Attendance Source (Admin)
-	attendanceSourceAdminService hrservice.AttendanceSourceAdminService
-	attendanceSourceAdminHandler *hrhandler.AttendanceSourceAdminHandler
+	attendanceSourceAdminService    hrservice.AttendanceSourceAdminService
+	attendanceSourceAdminHandler    *hrhandler.AttendanceSourceAdminHandler
+	attendanceBatchOutboxRepository hrpostgres.AttendanceBatchOutboxRepository
+	attendanceBatchOutboxProcessor  *hrservice.AttendanceBatchOutboxProcessor
+	attendanceBatchOutboxCancel     context.CancelFunc
 
 	// New fields for device heartbeat and batch ingest
 	deviceHeartbeatService       hrservice.DeviceHeartbeatService
@@ -232,11 +235,14 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 func NewFactory() (*Factory, error) {
 	cfg := config.LoadConfig()
 	logger := util.Get()
+
 	f := &Factory{
 		config: cfg,
 		closed: make(chan struct{}),
 		logger: logger,
 	}
+
+	// TLS
 	if cfg.Server.EnableTLS {
 		tlsConfig := &tls.TLSConfig{
 			EnableTLS: cfg.Server.EnableTLS,
@@ -245,25 +251,40 @@ func NewFactory() (*Factory, error) {
 		}
 		f.tlsManager = tls.NewTLSManager(tlsConfig)
 	}
+
+	// Core clients
 	if err := f.initializeClients(); err != nil {
 		return nil, fmt.Errorf("failed to initialize clients: %w", err)
 	}
+
+	// Managers (hasher, encryption, bucketing, sms)
 	f.initializeManagers()
+
+	// Kafka logging (ES / CH / logs)
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
 	}
 	f.kafkaLoggingMgr = kafkaLoggingMgr
+
+	// RBAC
 	ctx := context.Background()
 	if err := f.InitializeRBAC(ctx); err != nil {
 		return nil, fmt.Errorf("failed to initialize RBAC permission registry: %w", err)
 	}
+
+	// Document storage
 	if err := f.initializeDocumentStorage(); err != nil {
 		return nil, err
 	}
+
+	// ─────────────────────────────────────
+	// AUDIT OUTBOX (existing)
+	// ─────────────────────────────────────
 	if outbox := f.GetAuditOutboxService(); outbox != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		f.auditOutboxCancel = cancel
+
 		go func() {
 			if err := outbox.Start(ctx); err != nil {
 				f.logger.Error(
@@ -272,11 +293,27 @@ func NewFactory() (*Factory, error) {
 				)
 			}
 		}()
+
 		f.logger.Info("Audit outbox service started")
 	}
+
+	// ─────────────────────────────────────
+	// ATTENDANCE OUTBOX (existing)
+	// ─────────────────────────────────────
 	if err := f.initializeAttendanceOutbox(); err != nil {
 		f.logger.Error("Failed to initialize attendance outbox", zap.Error(err))
 	}
+
+	// ─────────────────────────────────────
+	// ✅ ATTENDANCE BATCH OUTBOX PROCESSOR (NEW)
+	// ─────────────────────────────────────
+	if err := f.initializeAttendanceBatchOutboxProcessor(); err != nil {
+		f.logger.Error(
+			"Failed to initialize attendance batch outbox processor",
+			zap.Error(err),
+		)
+	}
+
 	return f, nil
 }
 
@@ -319,6 +356,7 @@ func (f *Factory) GetAttendanceBatchIngestService() hrservice.AttendanceBatchIng
 	if f.attendanceBatchIngestService == nil {
 		f.attendanceBatchIngestService = hrservice.NewAttendanceBatchIngestService(
 			f.AttendanceBatchRepository(),
+			f.AttendanceBatchOutboxRepository(), // ✅ ADD THIS
 			f.AttendanceDeviceRepository(),
 			f.GetAttendanceIngestService(),
 			f.GetDeviceEnrollmentService(),
@@ -540,6 +578,41 @@ func (f *Factory) LeaveAccrualService() leavesvc.LeaveAccrualService {
 		)
 	}
 	return f.leaveAccrualService
+}
+
+// Attendance Batch Outbox Repository
+func (f *Factory) AttendanceBatchOutboxRepository() hrpostgres.AttendanceBatchOutboxRepository {
+	if f.attendanceBatchOutboxRepository == nil {
+		f.attendanceBatchOutboxRepository = hrpostgres.NewAttendanceBatchOutboxRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.attendanceBatchOutboxRepository
+}
+func (f *Factory) initializeAttendanceBatchOutboxProcessor() error {
+	if f.kafkaProducer == nil {
+		f.logger.Warn("Kafka producer not available, attendance batch outbox processor disabled")
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	f.attendanceBatchOutboxCancel = cancel
+
+	processor := hrservice.NewAttendanceBatchOutboxProcessor(
+		f.AttendanceBatchOutboxRepository(),
+		f.kafkaProducer,
+		f.logger,
+		100,           // batch size
+		2*time.Second, // poll interval
+	)
+
+	f.attendanceBatchOutboxProcessor = processor
+
+	go processor.Start(ctx)
+
+	f.logger.Info("Attendance batch outbox processor started")
+	return nil
 }
 
 func (f *Factory) LeaveQueryService() leavesvc.LeaveQueryService {
@@ -2091,6 +2164,11 @@ func (f *Factory) Close() error {
 				_ = closer.Close()
 			}
 		}
+		if f.attendanceBatchOutboxCancel != nil {
+			f.logger.Info("Stopping attendance batch outbox processor...")
+			f.attendanceBatchOutboxCancel()
+		}
+
 	})
 	return nil
 }

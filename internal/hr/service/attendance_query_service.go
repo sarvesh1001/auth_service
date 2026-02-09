@@ -108,7 +108,7 @@ type AttendanceSearchFilters struct {
 	UserID       *uuid.UUID
 	StartDate    time.Time
 	EndDate      time.Time
-	EventType    *string
+	EventTypes   []string // ✅ CHANGED (was EventType)
 	SourceType   *string
 	DepartmentID *uuid.UUID
 	ShiftID      *uuid.UUID
@@ -233,12 +233,14 @@ func (qs *attendanceQueryServiceImpl) SearchAttendanceEvents(
 	filters AttendanceSearchFilters,
 	page, pageSize int,
 ) ([]*attendance.AttendanceEvent, int, error) {
+
 	startTime := time.Now()
+
 	if companyID == uuid.Nil {
 		return nil, 0, fmt.Errorf("company ID is required")
 	}
 
-	// Validate pagination parameters
+	// Pagination defaults
 	if page < 1 {
 		page = 1
 	}
@@ -246,7 +248,7 @@ func (qs *attendanceQueryServiceImpl) SearchAttendanceEvents(
 		pageSize = 100
 	}
 
-	// Set default date range if not provided
+	// Date defaults
 	if filters.StartDate.IsZero() {
 		filters.StartDate = time.Now().AddDate(0, 0, -30)
 	}
@@ -264,12 +266,13 @@ func (qs *attendanceQueryServiceImpl) SearchAttendanceEvents(
 		return nil, 0, fmt.Errorf("date range cannot exceed %d days", maxDays)
 	}
 
+	// 🔥 BUILD REPO FILTER
 	repoFilter := repository.AttendanceEventFilter{
 		CompanyID:  companyID,
 		UserID:     filters.UserID,
 		StartDate:  filters.StartDate,
 		EndDate:    filters.EndDate,
-		EventType:  filters.EventType,
+		EventTypes: filters.EventTypes, // ✅ NEW
 		SourceType: filters.SourceType,
 		Page:       page,
 		PageSize:   pageSize,
@@ -277,25 +280,26 @@ func (qs *attendanceQueryServiceImpl) SearchAttendanceEvents(
 
 	events, total, err := qs.attendanceRepo.SearchAttendanceEvents(ctx, repoFilter)
 	if err != nil {
-		qs.logger.Error("Failed to search attendance events",
+		qs.logger.Error(
+			"Failed to search attendance events",
 			util.String("company_id", companyID.String()),
 			util.Time("start_date", filters.StartDate),
 			util.Time("end_date", filters.EndDate),
-			util.ErrorField(err))
+			util.ErrorField(err),
+		)
 		return nil, 0, fmt.Errorf("failed to search attendance events: %w", err)
 	}
 
-	totalPages := (int(total) + pageSize - 1) / pageSize
-	qs.logger.Debug("Attendance events searched",
+	qs.logger.Debug(
+		"Attendance events searched",
 		util.String("company_id", companyID.String()),
-		util.Time("start_date", filters.StartDate),
-		util.Time("end_date", filters.EndDate),
 		util.Int("page", page),
 		util.Int("page_size", pageSize),
 		util.Int("total_events", int(total)),
-		util.Int("total_pages", totalPages),
 		util.Int("returned_events", len(events)),
-		util.Duration("duration", time.Since(startTime)))
+		util.Duration("duration", time.Since(startTime)),
+	)
+
 	return events, int(total), nil
 }
 
@@ -1140,4 +1144,15 @@ func (qs *attendanceQueryServiceImpl) GetAttendanceSummaryStats(
 		util.Float64("average_attendance", stats.AverageAttendance),
 		util.Duration("duration", time.Since(startTime)))
 	return summaryStats, nil
+}
+
+func expandEventTypes(eventType string) []string {
+	switch eventType {
+	case "check_in":
+		return []string{"check_in", "manual_check_in"}
+	case "check_out":
+		return []string{"check_out", "manual_check_out"}
+	default:
+		return []string{eventType}
+	}
 }

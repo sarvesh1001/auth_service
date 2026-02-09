@@ -189,12 +189,18 @@ func (s *deviceTokenService) ValidateToken(
 	if token == nil {
 		return nil, errors.New("invalid or expired token")
 	}
-
-	go func(ctx context.Context, tokenID uuid.UUID) {
-		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	go func(tokenID uuid.UUID) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = s.tokenRepo.UpdateTokenLastUsed(ctx, tokenID)
-	}(ctx, token.TokenID)
+
+		if err := s.tokenRepo.UpdateTokenLastUsed(ctx, tokenID); err != nil {
+			s.logger.Debug(
+				"failed to update device token last_used_at",
+				util.String("token_id", tokenID.String()),
+				util.ErrorField(err),
+			)
+		}
+	}(token.TokenID)
 
 	device, _ := s.deviceRepo.GetActiveDevice(ctx, companyID, token.DeviceID)
 

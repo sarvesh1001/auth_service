@@ -2,7 +2,6 @@ package handler
 
 import (
 	"auth-service/internal/hr/service"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,8 +28,13 @@ func NewAttendanceQueryHandler(
 	}
 }
 
+// =====================================================
+// Events
+// =====================================================
+
 func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
@@ -41,11 +45,6 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 	eventID, err := uuid.Parse(eventIDStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid event ID")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:event:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -76,14 +75,10 @@ func (h *AttendanceQueryHandler) GetEvent(w http.ResponseWriter, r *http.Request
 
 func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, "attendance:event:search") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -97,31 +92,9 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		pageSize = 100
 	}
 
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	var startDate, endDate time.Time
-	if startDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid start_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		startDate = time.Now().AddDate(0, 0, -30)
-	}
-
-	if endDateStr != "" {
-		endDate, err = time.Parse("2006-01-02", endDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid end_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		endDate = time.Now()
-	}
-
-	if startDate.After(endDate) {
-		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
+	startDate, endDate, err := parseDateRange(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -131,47 +104,58 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 		EndDate:   endDate,
 	}
 
-	if userIDStr := r.URL.Query().Get("user_id"); userIDStr != "" {
-		userID, err := uuid.Parse(userIDStr)
+	if v := r.URL.Query().Get("user_id"); v != "" {
+		id, err := uuid.Parse(v)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid user_id")
 			return
 		}
-		filters.UserID = &userID
+		filters.UserID = &id
 	}
 
-	if eventType := r.URL.Query().Get("event_type"); eventType != "" {
-		filters.EventType = &eventType
+	if v := r.URL.Query().Get("event_type"); v != "" {
+		switch v {
+		case "check_in":
+			filters.EventTypes = []string{"check_in", "manual_check_in"}
+		case "check_out":
+			filters.EventTypes = []string{"check_out", "manual_check_out"}
+		default:
+			filters.EventTypes = []string{v}
+		}
 	}
 
-	if sourceType := r.URL.Query().Get("source_type"); sourceType != "" {
-		filters.SourceType = &sourceType
+	if v := r.URL.Query().Get("source_type"); v != "" {
+		filters.SourceType = &v
 	}
 
-	if departmentIDStr := r.URL.Query().Get("department_id"); departmentIDStr != "" {
-		departmentID, err := uuid.Parse(departmentIDStr)
+	if v := r.URL.Query().Get("department_id"); v != "" {
+		id, err := uuid.Parse(v)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid department_id")
 			return
 		}
-		filters.DepartmentID = &departmentID
+		filters.DepartmentID = &id
 	}
 
-	if shiftIDStr := r.URL.Query().Get("shift_id"); shiftIDStr != "" {
-		shiftID, err := uuid.Parse(shiftIDStr)
+	if v := r.URL.Query().Get("shift_id"); v != "" {
+		id, err := uuid.Parse(v)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid shift_id")
 			return
 		}
-		filters.ShiftID = &shiftID
+		filters.ShiftID = &id
 	}
 
-	events, total, err := h.queryService.SearchAttendanceEventsTyped(ctx, companyID, filters, page, pageSize)
+	events, total, err := h.queryService.SearchAttendanceEventsTyped(
+		ctx,
+		companyID,
+		filters,
+		page,
+		pageSize,
+	)
 	if err != nil {
 		h.logger.Error("Failed to search attendance events",
 			zap.String("company_id", companyID.String()),
-			zap.Time("start_date", startDate),
-			zap.Time("end_date", endDate),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to search events")
 		return
@@ -184,41 +168,39 @@ func (h *AttendanceQueryHandler) SearchEvents(w http.ResponseWriter, r *http.Req
 			"events": events,
 		},
 		"meta": map[string]interface{}{
-			"page":         page,
-			"page_size":    pageSize,
-			"total":        total,
-			"total_pages":  totalPages,
-			"has_next":     page < totalPages,
-			"has_previous": page > 1,
-			"filters":      filters,
+			"page":       page,
+			"page_size":  pageSize,
+			"total":      total,
+			"totalPages": totalPages,
+			"has_next":   page < totalPages,
+			"has_prev":   page > 1,
+			"date_range": map[string]time.Time{"start": startDate, "end": endDate},
 		},
 	})
 }
 
+// =====================================================
+// Summaries
+// =====================================================
+
 func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid user ID")
 		return
 	}
 
-	dateStr := chi.URLParam(r, "date")
-	date, err := time.Parse("2006-01-02", dateStr)
+	date, err := time.Parse("2006-01-02", chi.URLParam(r, "date"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid date format, use YYYY-MM-DD")
-		return
-	}
-
-	if !h.canViewUserAttendance(ctx, companyID, userID) {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -226,7 +208,6 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 	if err != nil {
 		h.logger.Error("Failed to get daily summary",
 			zap.String("user_id", userID.String()),
-			zap.Time("date", date),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve daily summary")
 		return
@@ -245,58 +226,34 @@ func (h *AttendanceQueryHandler) GetDailySummary(w http.ResponseWriter, r *http.
 
 func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid user ID")
 		return
 	}
 
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	var startDate, endDate time.Time
-	if startDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid start_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		startDate = time.Now().AddDate(0, 0, -30)
-	}
-
-	if endDateStr != "" {
-		endDate, err = time.Parse("2006-01-02", endDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid end_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		endDate = time.Now()
-	}
-
-	if startDate.After(endDate) {
-		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
+	startDate, endDate, err := parseDateRange(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if !h.canViewUserAttendance(ctx, companyID, userID) {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	summaries, err := h.queryService.GetAttendanceDailySummariesByUser(ctx, userID, startDate, endDate)
+	summaries, err := h.queryService.GetAttendanceDailySummariesByUser(
+		ctx,
+		userID,
+		startDate,
+		endDate,
+	)
 	if err != nil {
 		h.logger.Error("Failed to get user summaries",
 			zap.String("user_id", userID.String()),
-			zap.Time("start_date", startDate),
-			zap.Time("end_date", endDate),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve summaries")
 		return
@@ -305,53 +262,28 @@ func (h *AttendanceQueryHandler) GetUserSummaries(w http.ResponseWriter, r *http
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
-			"summaries":  summaries,
-			"user_id":    userID,
-			"start_date": startDate,
-			"end_date":   endDate,
-			"total":      len(summaries),
+			"summaries": summaries,
+			"total":     len(summaries),
 		},
 	})
 }
 
+// =====================================================
+// Stats & Metadata
+// =====================================================
+
 func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:stats:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	var startDate, endDate time.Time
-	if startDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid start_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		startDate = time.Now().AddDate(0, 0, -30)
-	}
-
-	if endDateStr != "" {
-		endDate, err = time.Parse("2006-01-02", endDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid end_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		endDate = time.Now()
-	}
-
-	if startDate.After(endDate) {
-		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
+	startDate, endDate, err := parseDateRange(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -359,8 +291,6 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 	if err != nil {
 		h.logger.Error("Failed to get company stats",
 			zap.String("company_id", companyID.String()),
-			zap.Time("start_date", startDate),
-			zap.Time("end_date", endDate),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve statistics")
 		return
@@ -374,49 +304,22 @@ func (h *AttendanceQueryHandler) GetCompanyStats(w http.ResponseWriter, r *http.
 
 func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	userIDStr := chi.URLParam(r, "userID")
-	userID, err := uuid.Parse(userIDStr)
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid user ID")
 		return
 	}
 
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
-	var startDate, endDate time.Time
-	if startDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid start_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		startDate = time.Now().AddDate(0, 0, -30)
-	}
-
-	if endDateStr != "" {
-		endDate, err = time.Parse("2006-01-02", endDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid end_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		endDate = time.Now()
-	}
-
-	if startDate.After(endDate) {
-		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
-		return
-	}
-
-	if !h.canViewUserAttendance(ctx, companyID, userID) {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+	startDate, endDate, err := parseDateRange(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -424,8 +327,6 @@ func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		h.logger.Error("Failed to get user stats",
 			zap.String("user_id", userID.String()),
-			zap.Time("start_date", startDate),
-			zap.Time("end_date", endDate),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve user statistics")
 		return
@@ -437,178 +338,136 @@ func (h *AttendanceQueryHandler) GetUserStats(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// =====================================================
+// Reports & Metadata
+// =====================================================
+
 func (h *AttendanceQueryHandler) GenerateReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:report:generate") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	startDateStr := r.URL.Query().Get("start_date")
-	endDateStr := r.URL.Query().Get("end_date")
 	reportType := r.URL.Query().Get("type")
 	if reportType == "" {
 		reportType = "csv"
 	}
 
-	var startDate, endDate time.Time
-	if startDateStr != "" {
-		startDate, err = time.Parse("2006-01-02", startDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid start_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		startDate = time.Now().AddDate(0, 0, -30)
-	}
-
-	if endDateStr != "" {
-		endDate, err = time.Parse("2006-01-02", endDateStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid end_date format, use YYYY-MM-DD")
-			return
-		}
-	} else {
-		endDate = time.Now()
-	}
-
-	if startDate.After(endDate) {
-		h.respondWithError(w, http.StatusBadRequest, "start_date cannot be after end_date")
+	startDate, endDate, err := parseDateRange(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	reportData, contentType, err := h.queryService.GenerateAttendanceReport(ctx, companyID, reportType, startDate, endDate)
+	data, contentType, err := h.queryService.GenerateAttendanceReport(
+		ctx,
+		companyID,
+		reportType,
+		startDate,
+		endDate,
+	)
 	if err != nil {
 		h.logger.Error("Failed to generate report",
 			zap.String("company_id", companyID.String()),
-			zap.String("report_type", reportType),
-			zap.Time("start_date", startDate),
-			zap.Time("end_date", endDate),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to generate report")
 		return
 	}
 
-	filename := fmt.Sprintf("attendance_report_%s_%s_to_%s.%s",
+	filename := fmt.Sprintf(
+		"attendance_report_%s_%s_to_%s.%s",
 		companyID.String(),
 		startDate.Format("20060102"),
 		endDate.Format("20060102"),
-		reportType)
+		reportType,
+	)
+
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-	w.Header().Set("Content-Length", strconv.Itoa(len(reportData)))
-	w.Write(reportData)
+	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
 }
 
 func (h *AttendanceQueryHandler) ListEventTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:metadata:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
+	activeOnly := r.URL.Query().Get("include_inactive") != "true"
 
-	activeOnly := true
-	if r.URL.Query().Get("include_inactive") == "true" {
-		activeOnly = false
-	}
-
-	eventTypes, err := h.queryService.ListAttendanceEventTypes(ctx, activeOnly)
+	types, err := h.queryService.ListAttendanceEventTypes(ctx, activeOnly)
 	if err != nil {
-		h.logger.Error("Failed to list event types",
-			zap.String("company_id", companyID.String()),
-			zap.Error(err))
+		h.logger.Error("Failed to list event types", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list event types")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"data": map[string]interface{}{
-			"event_types": eventTypes,
-			"total":       len(eventTypes),
-			"active_only": activeOnly,
-		},
+		"data":    types,
 	})
 }
 
 func (h *AttendanceQueryHandler) ListSourceTypes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := getCompanyIDFromContext(ctx)
+
+	_, err := getCompanyIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 
-	if !h.hasPermission(ctx, companyID, "attendance:metadata:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	sourceTypes, err := h.queryService.ListAttendanceSourceTypes(ctx)
+	types, err := h.queryService.ListAttendanceSourceTypes(ctx)
 	if err != nil {
-		h.logger.Error("Failed to list source types",
-			zap.String("company_id", companyID.String()),
-			zap.Error(err))
+		h.logger.Error("Failed to list source types", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list source types")
 		return
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"data": map[string]interface{}{
-			"source_types": sourceTypes,
-			"total":        len(sourceTypes),
-		},
+		"data":    types,
 	})
 }
 
-func (h *AttendanceQueryHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
-	permissions, ok := ctx.Value("permissions").([]string)
-	if !ok {
-		return false
-	}
+// =====================================================
+// Helpers
+// =====================================================
 
-	for _, p := range permissions {
-		if p == permission {
-			return true
-		}
-	}
-	return false
-}
+func parseDateRange(r *http.Request) (time.Time, time.Time, error) {
+	startStr := r.URL.Query().Get("start_date")
+	endStr := r.URL.Query().Get("end_date")
 
-func (h *AttendanceQueryHandler) canViewUserAttendance(ctx context.Context, companyID, userID uuid.UUID) bool {
-	// Check if user has permission to view all attendance or just their own
-	permissions, ok := ctx.Value("permissions").([]string)
-	if !ok {
-		return false
-	}
+	start := time.Now().AddDate(0, 0, -30)
+	end := time.Now()
 
-	// If user has permission to view all attendance
-	for _, p := range permissions {
-		if p == "attendance:view:all" {
-			return true
+	var err error
+	if startStr != "" {
+		start, err = time.Parse("2006-01-02", startStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid start_date format, use YYYY-MM-DD")
 		}
 	}
 
-	// Check if user is viewing their own attendance
-	currentUserID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		return false
+	if endStr != "" {
+		end, err = time.Parse("2006-01-02", endStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid end_date format, use YYYY-MM-DD")
+		}
 	}
 
-	return currentUserID == userID
+	if start.After(end) {
+		return time.Time{}, time.Time{}, fmt.Errorf("start_date cannot be after end_date")
+	}
+
+	return start, end, nil
 }
 
 func (h *AttendanceQueryHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {

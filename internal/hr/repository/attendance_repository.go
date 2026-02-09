@@ -326,7 +326,7 @@ type AttendanceEventFilter struct {
 	UserID     *uuid.UUID
 	StartDate  time.Time
 	EndDate    time.Time
-	EventType  *string
+	EventTypes []string // ✅ FIX
 	SourceType *string
 	Page       int
 	PageSize   int

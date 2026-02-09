@@ -133,9 +133,17 @@ func NewRouter(
 			})
 
 			r.Route("/batch", func(r chi.Router) {
-				r.Use(deviceAuthMiddleware.MiddlewareForDeviceOnly) // ✅ REQUIRED
+				r.Use(deviceAuthMiddleware.MiddlewareForDeviceOnly) // ✅ DEVICE AUTH ONLY
 				r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
+
+				// Ingest batch
 				r.Post("/ingest", attendanceBatchHandler.BatchPunch)
+
+				// Batch status
+				r.Get("/{batch_ref}/status", attendanceBatchHandler.GetBatchStatus)
+
+				// ✅ ✅ ADD THIS LINE HERE (THIS IS THE ANSWER)
+				r.Get("/{batch_ref}/failures", attendanceBatchHandler.GetBatchFailures)
 			})
 
 			r.With(
