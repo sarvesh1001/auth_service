@@ -747,12 +747,30 @@ func (r *attendanceRepository) GetAttendanceDailySummariesByUser(
 	userID uuid.UUID,
 	startDate, endDate time.Time,
 ) ([]*attendance.AttendanceDailySummary, error) {
+
 	query := `
-        SELECT * FROM attendance_daily_summary
-        WHERE user_id = $1
-        AND attendance_date BETWEEN $2 AND $3
-        ORDER BY attendance_date DESC
-    `
+	SELECT
+		attendance_summary_id,
+		company_id,
+		user_id,
+		attendance_date,
+		status,
+		worked_minutes,
+		expected_minutes,
+		overtime_minutes,
+		late_minutes,
+		is_finalized,
+		is_payable,
+		is_payroll_locked,
+		metadata,
+		generated_at,
+		generated_by
+	FROM attendance_daily_summary
+	WHERE user_id = $1
+	  AND attendance_date BETWEEN $2 AND $3
+	ORDER BY attendance_date DESC
+`
+
 	rows, err := r.client.Query(ctx, query, userID, startDate, endDate)
 	if err != nil {
 		r.logger.Error("Failed to get attendance daily summaries",
@@ -794,12 +812,29 @@ func (r *attendanceRepository) GetAttendanceDailySummariesByCompany(
 		return nil, 0, fmt.Errorf("failed to count attendance summaries: %w", err)
 	}
 	query := `
-        SELECT * FROM attendance_daily_summary
-        WHERE company_id = $1
-        AND attendance_date BETWEEN $2 AND $3
-        ORDER BY attendance_date DESC, user_id
-        LIMIT $4 OFFSET $5
-    `
+	SELECT
+		attendance_summary_id,
+		company_id,
+		user_id,
+		attendance_date,
+		status,
+		worked_minutes,
+		expected_minutes,
+		overtime_minutes,
+		late_minutes,
+		is_finalized,
+		is_payable,
+		is_payroll_locked,
+		metadata,
+		generated_at,
+		generated_by
+	FROM attendance_daily_summary
+	WHERE company_id = $1
+	  AND attendance_date BETWEEN $2 AND $3
+	ORDER BY attendance_date DESC, user_id
+	LIMIT $4 OFFSET $5
+`
+
 	rows, err := r.client.Query(ctx, query, companyID, startDate, endDate, pageSize, offset)
 	if err != nil {
 		r.logger.Error("Failed to get attendance daily summaries by company",
@@ -1448,6 +1483,7 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 	ctx context.Context,
 	summary *attendance.AttendanceDailySummary,
 ) error {
+
 	query := `
 		INSERT INTO attendance_daily_summary (
 			attendance_summary_id,
@@ -1456,8 +1492,11 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 			attendance_date,
 			status,
 			worked_minutes,
+			expected_minutes,
 			overtime_minutes,
 			late_minutes,
+			is_finalized,
+			is_payable,
 			is_payroll_locked,
 			metadata,
 			generated_at,
@@ -1465,15 +1504,18 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9,
-			$10, $11, $12
+			$10, $11, $12,
+			$13, $14, $15
 		)
 		ON CONFLICT (company_id, user_id, attendance_date)
 		DO UPDATE SET
 			status           = EXCLUDED.status,
 			worked_minutes   = EXCLUDED.worked_minutes,
+			expected_minutes = EXCLUDED.expected_minutes,
 			overtime_minutes = EXCLUDED.overtime_minutes,
 			late_minutes     = EXCLUDED.late_minutes,
-			is_payroll_locked = EXCLUDED.is_payroll_locked,
+			is_finalized     = EXCLUDED.is_finalized,
+			is_payable       = EXCLUDED.is_payable,
 			metadata         = EXCLUDED.metadata,
 			generated_at     = EXCLUDED.generated_at,
 			generated_by     = EXCLUDED.generated_by
@@ -1495,9 +1537,12 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 		summary.AttendanceDate,
 		summary.Status,
 		summary.WorkedMinutes,
+		summary.ExpectedMinutes,
 		summary.OvertimeMinutes,
 		summary.LateMinutes,
-		summary.IsPayrollLocked, // ✅ NEW FIELD
+		summary.IsFinalized,
+		summary.IsPayable,
+		summary.IsPayrollLocked, // used only on INSERT
 		metadataJSON,
 		summary.GeneratedAt,
 		summary.GeneratedBy,
@@ -1513,8 +1558,10 @@ func (r *attendanceRepository) UpsertAttendanceDailySummary(
 		)
 		return fmt.Errorf("failed to upsert attendance daily summary: %w", err)
 	}
+
 	return nil
 }
+
 func (r *attendanceRepository) GetDistinctUsersWithEvents(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1687,9 +1734,12 @@ func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDai
 		&summary.AttendanceDate,
 		&summary.Status,
 		&summary.WorkedMinutes,
+		&summary.ExpectedMinutes,
 		&summary.OvertimeMinutes,
 		&summary.LateMinutes,
-		&summary.IsPayrollLocked, // ✅ NEW FIELD
+		&summary.IsFinalized,
+		&summary.IsPayable,
+		&summary.IsPayrollLocked,
 		&metadataJSON,
 		&summary.GeneratedAt,
 		&summary.GeneratedBy,
@@ -1699,11 +1749,11 @@ func scanAttendanceDailySummary(row *sql.Rows, summary *attendance.AttendanceDai
 	}
 
 	if len(metadataJSON) > 0 {
-		err = json.Unmarshal(metadataJSON, &summary.Metadata)
-		if err != nil {
+		if err := json.Unmarshal(metadataJSON, &summary.Metadata); err != nil {
 			return fmt.Errorf("failed to unmarshal metadata: %w", err)
 		}
 	}
+
 	return nil
 }
 
@@ -2161,20 +2211,41 @@ func (r *attendanceRepository) CreateAttendanceDailySummary(
 	ctx context.Context,
 	summary *attendance.AttendanceDailySummary,
 ) error {
+
 	query := `
         INSERT INTO attendance_daily_summary (
-            attendance_summary_id, company_id, user_id, attendance_date,
-            status, worked_minutes, overtime_minutes, late_minutes,
-            metadata, generated_at, generated_by
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            attendance_summary_id,
+            company_id,
+            user_id,
+            attendance_date,
+            status,
+            worked_minutes,
+            expected_minutes,
+            overtime_minutes,
+            late_minutes,
+            is_finalized,
+            is_payable,
+            is_payroll_locked,
+            metadata,
+            generated_at,
+            generated_by
+        ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, $12,
+            $13, $14, $15
+        )
     `
+
 	if summary.AttendanceSummaryID == uuid.Nil {
 		summary.AttendanceSummaryID = uuid.New()
 	}
 	if summary.GeneratedAt.IsZero() {
 		summary.GeneratedAt = time.Now().UTC()
 	}
+
 	metadataJSON, _ := json.Marshal(summary.Metadata)
+
 	_, err := r.client.Exec(ctx, query,
 		summary.AttendanceSummaryID,
 		summary.CompanyID,
@@ -2182,19 +2253,27 @@ func (r *attendanceRepository) CreateAttendanceDailySummary(
 		summary.AttendanceDate,
 		summary.Status,
 		summary.WorkedMinutes,
+		summary.ExpectedMinutes,
 		summary.OvertimeMinutes,
 		summary.LateMinutes,
+		summary.IsFinalized,
+		summary.IsPayable,
+		summary.IsPayrollLocked,
 		metadataJSON,
 		summary.GeneratedAt,
 		summary.GeneratedBy,
 	)
+
 	if err != nil {
-		r.logger.Error("Failed to create attendance daily summary",
+		r.logger.Error(
+			"Failed to create attendance daily summary",
 			util.String("summary_id", summary.AttendanceSummaryID.String()),
 			util.String("user_id", summary.UserID.String()),
-			util.ErrorField(err))
+			util.ErrorField(err),
+		)
 		return fmt.Errorf("failed to create attendance daily summary: %w", err)
 	}
+
 	return nil
 }
 
@@ -2242,12 +2321,31 @@ func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
 	userID uuid.UUID,
 	date time.Time,
 ) (*attendance.AttendanceDailySummary, error) {
+
 	query := `
-		SELECT * FROM attendance_daily_summary
+		SELECT
+			attendance_summary_id,
+			company_id,
+			user_id,
+			attendance_date,
+			status,
+			worked_minutes,
+			expected_minutes,
+			overtime_minutes,
+			late_minutes,
+			is_finalized,
+			is_payable,
+			is_payroll_locked,
+			metadata,
+			generated_at,
+			generated_by
+		FROM attendance_daily_summary
 		WHERE user_id = $1
-		AND attendance_date = $2
+		  AND attendance_date = $2
 	`
+
 	row := r.client.QueryRow(ctx, query, userID, date)
+
 	var summary attendance.AttendanceDailySummary
 	var metadataJSON []byte
 
@@ -2258,30 +2356,30 @@ func (r *attendanceRepository) GetAttendanceDailySummaryByUserDate(
 		&summary.AttendanceDate,
 		&summary.Status,
 		&summary.WorkedMinutes,
+		&summary.ExpectedMinutes,
 		&summary.OvertimeMinutes,
 		&summary.LateMinutes,
-		&summary.IsPayrollLocked, // ✅ NEW FIELD
+		&summary.IsFinalized,
+		&summary.IsPayable,
+		&summary.IsPayrollLocked,
 		&metadataJSON,
 		&summary.GeneratedAt,
 		&summary.GeneratedBy,
 	)
+
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
-		r.logger.Error("Failed to get attendance daily summary",
-			util.String("user_id", userID.String()),
-			util.String("date", date.Format("2006-01-02")),
-			util.ErrorField(err))
 		return nil, fmt.Errorf("failed to get attendance daily summary: %w", err)
 	}
 
 	if len(metadataJSON) > 0 {
-		err = json.Unmarshal(metadataJSON, &summary.Metadata)
-		if err != nil {
+		if err := json.Unmarshal(metadataJSON, &summary.Metadata); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 		}
 	}
+
 	return &summary, nil
 }
 
@@ -2569,4 +2667,180 @@ func (r *attendanceRepository) GetAttendanceSourceByCompanyAndType(
 	}
 
 	return &src, nil
+}
+
+// GetAttendanceSummariesInRange retrieves all daily summaries for a specific user and company within a date range.
+// Columns are explicitly listed to match the current schema (including all new fields).
+
+func (r *attendanceRepository) GetAttendanceSummariesInRange(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]*attendance.AttendanceDailySummary, error) {
+
+	query := `
+		SELECT
+			attendance_summary_id,
+			company_id,
+			user_id,
+			attendance_date,
+			status,
+			worked_minutes,
+			expected_minutes,
+			overtime_minutes,
+			late_minutes,
+			is_finalized,
+			is_payroll_locked,
+			is_payable,
+			metadata,
+			generated_at,
+			generated_by
+		FROM attendance_daily_summary
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND attendance_date BETWEEN $3 AND $4
+		ORDER BY attendance_date ASC
+	`
+
+	rows, err := r.client.Query(ctx, query, companyID, userID, startDate, endDate)
+	if err != nil {
+		r.logger.Error("Failed to get attendance summaries in range",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", userID.String()),
+			util.Time("start", startDate),
+			util.Time("end", endDate),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("failed to get attendance summaries: %w", err)
+	}
+	defer rows.Close()
+
+	var summaries []*attendance.AttendanceDailySummary
+	for rows.Next() {
+		summary, err := scanFullAttendanceDailySummary(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan summary: %w", err)
+		}
+		summaries = append(summaries, summary)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return summaries, nil
+}
+
+func (r *attendanceRepository) LockAttendanceSummariesInRange(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) error {
+	query := `
+		UPDATE attendance_daily_summary
+		SET is_payroll_locked = true
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND attendance_date BETWEEN $3 AND $4
+	`
+
+	result, err := r.client.Exec(ctx, query, companyID, userID, startDate, endDate)
+	if err != nil {
+		r.logger.Error("Failed to lock attendance summaries",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", userID.String()),
+			util.Time("start", startDate),
+			util.Time("end", endDate),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to lock attendance summaries: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	r.logger.Info("Attendance summaries locked",
+		util.String("company_id", companyID.String()),
+		util.String("user_id", userID.String()),
+		util.Int64("rows_affected", rowsAffected))
+
+	return nil
+} // CountAttendanceSummariesInRange returns the number of daily summary records for a given user and date range.
+// This is used to validate that no days are missing before payroll processing.
+func (r *attendanceRepository) CountAttendanceSummariesInRange(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) (int, error) {
+	query := `
+		SELECT COUNT(*)
+		FROM attendance_daily_summary
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND attendance_date BETWEEN $3 AND $4
+	`
+
+	var count int
+	err := r.client.QueryRow(ctx, query, companyID, userID, startDate, endDate).Scan(&count)
+	if err != nil {
+		r.logger.Error("Failed to count attendance summaries",
+			util.String("company_id", companyID.String()),
+			util.String("user_id", userID.String()),
+			util.Time("start", startDate),
+			util.Time("end", endDate),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("failed to count attendance summaries: %w", err)
+	}
+	return count, nil
+} // scanFullAttendanceDailySummary scans a full row from attendance_daily_summary,
+// including all fields added after the initial creation.
+func scanFullAttendanceDailySummary(row *sql.Rows) (*attendance.AttendanceDailySummary, error) {
+	var summary attendance.AttendanceDailySummary
+	var metadataJSON []byte
+
+	err := row.Scan(
+		&summary.AttendanceSummaryID,
+		&summary.CompanyID,
+		&summary.UserID,
+		&summary.AttendanceDate,
+		&summary.Status,
+		&summary.WorkedMinutes,
+		&summary.ExpectedMinutes,
+		&summary.OvertimeMinutes,
+		&summary.LateMinutes,
+		&summary.IsFinalized,
+		&summary.IsPayrollLocked,
+		&summary.IsPayable,
+		&metadataJSON,
+		&summary.GeneratedAt,
+		&summary.GeneratedBy,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(metadataJSON) > 0 {
+		if err := json.Unmarshal(metadataJSON, &summary.Metadata); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+	}
+
+	return &summary, nil
+}
+func (r *attendanceRepository) MarkAttendanceFinalized(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	date time.Time,
+) error {
+
+	query := `
+        UPDATE attendance_daily_summary
+        SET is_finalized = true
+        WHERE company_id = $1
+          AND user_id = $2
+          AND attendance_date = $3
+    `
+
+	_, err := r.client.Exec(ctx, query, companyID, userID, date)
+	return err
 }

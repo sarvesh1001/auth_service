@@ -315,3 +315,96 @@ func (h *AttendanceIngestHandler) respondWithError(
 		"error":   message,
 	})
 }
+
+func (h *AttendanceIngestHandler) SelfPunchAttendance(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ctx := r.Context()
+
+	// 🔥 Must be user session
+	sessionType, ok := ctx.Value("session_type").(string)
+	if !ok || sessionType == "device" {
+		h.respondWithError(w, http.StatusUnauthorized, "user authentication required")
+		return
+	}
+
+	// 🔥 Get UserID from context
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "invalid user context")
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "invalid user identity")
+		return
+	}
+
+	// 🔥 Get CompanyID from context
+	companyID, ok := ctx.Value("company_id").(uuid.UUID)
+	if !ok {
+		h.respondWithError(w, http.StatusBadRequest, "company context required")
+		return
+	}
+
+	// 🔥 Request Body (NO target_user_id)
+	var req struct {
+		EventType string `json:"event_type"`
+		Source    struct {
+			SourceType string  `json:"source_type"`
+			DeviceID   *string `json:"device_id"`
+			IPAddress  *string `json:"ip_address"`
+		} `json:"source"`
+		Context *attendance.EventContext `json:"context,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.EventType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "event_type required")
+		return
+	}
+
+	if req.Source.SourceType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "source_type required")
+		return
+	}
+
+	// 🔥 Resolve IP
+	ip := req.Source.IPAddress
+	if ip == nil || *ip == "" {
+		resolved := h.getClientIP(r)
+		ip = &resolved
+	}
+
+	// 🔥 Build PunchRequest
+	punchReq := &service.PunchRequest{
+		CompanyID:    companyID,
+		ActorID:      userID,
+		TargetUserID: userID, // SELF
+		EventType:    req.EventType,
+		EventTime:    nil, // 🔥 FORCE SERVER TIME
+		Source: service.PunchSource{
+			SourceType: req.Source.SourceType,
+			DeviceID:   req.Source.DeviceID,
+			IPAddress:  ip,
+		},
+		Context: req.Context,
+	}
+
+	event, err := h.attendanceIngestService.IngestPunch(ctx, punchReq)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    event,
+	})
+}

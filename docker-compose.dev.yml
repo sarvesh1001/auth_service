@@ -183,7 +183,9 @@ services:
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
+      - ./scripts/01-init-postgres.sh:/docker-entrypoint-initdb.d/01-init-postgres.sh:ro
+      - ./scripts/init-biometric.sh:/docker-entrypoint-initdb.d/02-init-biometric.sh:ro
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-auth_user} -d ${POSTGRES_DATABASE:-auth_service}"]
       interval: 10s

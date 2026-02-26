@@ -270,18 +270,24 @@ type AttendanceSource struct {
 }
 
 type AttendanceDailySummary struct {
-	AttendanceSummaryID uuid.UUID       `json:"attendance_summary_id" db:"attendance_summary_id"`
-	CompanyID           uuid.UUID       `json:"company_id" db:"company_id"`
-	UserID              uuid.UUID       `json:"user_id" db:"user_id"`
-	AttendanceDate      time.Time       `json:"attendance_date" db:"attendance_date"`
-	Status              string          `json:"status" db:"status"`
-	WorkedMinutes       *int            `json:"worked_minutes" db:"worked_minutes"`
-	OvertimeMinutes     *int            `json:"overtime_minutes" db:"overtime_minutes"`
-	LateMinutes         *int            `json:"late_minutes" db:"late_minutes"`
-	IsPayrollLocked     bool            `json:"is_payroll_locked" db:"is_payroll_locked"` // NEW FIELD
-	Metadata            SummaryMetadata `json:"metadata" db:"metadata"`
-	GeneratedAt         time.Time       `json:"generated_at" db:"generated_at"`
-	GeneratedBy         string          `json:"generated_by" db:"generated_by"`
+	AttendanceSummaryID uuid.UUID `json:"attendance_summary_id" db:"attendance_summary_id"`
+	CompanyID           uuid.UUID `json:"company_id" db:"company_id"`
+	UserID              uuid.UUID `json:"user_id" db:"user_id"`
+	AttendanceDate      time.Time `json:"attendance_date" db:"attendance_date"`
+	Status              string    `json:"status" db:"status"`
+
+	WorkedMinutes   *int `json:"worked_minutes" db:"worked_minutes"`
+	ExpectedMinutes *int `json:"expected_minutes" db:"expected_minutes"` // NEW
+	OvertimeMinutes *int `json:"overtime_minutes" db:"overtime_minutes"`
+	LateMinutes     *int `json:"late_minutes" db:"late_minutes"`
+
+	IsFinalized     bool `json:"is_finalized" db:"is_finalized"` // NEW
+	IsPayable       bool `json:"is_payable" db:"is_payable"`     // NEW
+	IsPayrollLocked bool `json:"is_payroll_locked" db:"is_payroll_locked"`
+
+	Metadata    SummaryMetadata `json:"metadata" db:"metadata"`
+	GeneratedAt time.Time       `json:"generated_at" db:"generated_at"`
+	GeneratedBy string          `json:"generated_by" db:"generated_by"`
 }
 
 // type SummaryMetadata struct {
@@ -429,20 +435,29 @@ type ShiftContext struct {
 
 // Update SummaryMetadata to include anomalies:
 type SummaryMetadata struct {
-	ClassesAttended *int          `json:"classes_attended,omitempty"`
-	PeriodsTaken    *int          `json:"periods_taken,omitempty"`
-	ShiftID         *uuid.UUID    `json:"shift_id,omitempty"`
-	PolicyID        *uuid.UUID    `json:"policy_id,omitempty"`
-	WorkCenterCode  *string       `json:"work_center_code,omitempty"`
-	CheckInTime     *time.Time    `json:"check_in_time,omitempty"`
-	CheckOutTime    *time.Time    `json:"check_out_time,omitempty"`
-	TotalCheckIns   *int          `json:"total_checkins,omitempty"`
-	TotalCheckOuts  *int          `json:"total_checkouts,omitempty"`
-	BreakMinutes    *int          `json:"break_minutes,omitempty"`
-	ScheduleStatus  *string       `json:"schedule_status,omitempty"`
-	Timezone        *string       `json:"timezone,omitempty"`
-	Anomalies       []string      `json:"anomalies,omitempty"`
-	PairedEvents    []PairedEvent `json:"paired_events,omitempty"`
+	ClassesAttended *int `json:"classes_attended,omitempty"`
+	PeriodsTaken    *int `json:"periods_taken,omitempty"`
+
+	ShiftID        *uuid.UUID `json:"shift_id,omitempty"`
+	PolicyID       *uuid.UUID `json:"policy_id,omitempty"`
+	WorkCenterCode *string    `json:"work_center_code,omitempty"`
+
+	CheckInTime    *time.Time `json:"check_in_time,omitempty"`
+	CheckOutTime   *time.Time `json:"check_out_time,omitempty"`
+	TotalCheckIns  *int       `json:"total_checkins,omitempty"`
+	TotalCheckOuts *int       `json:"total_checkouts,omitempty"`
+	BreakMinutes   *int       `json:"break_minutes,omitempty"`
+
+	ScheduleStatus *string `json:"schedule_status,omitempty"`
+	Timezone       *string `json:"timezone,omitempty"`
+
+	Anomalies    []string      `json:"anomalies,omitempty"`
+	PairedEvents []PairedEvent `json:"paired_events,omitempty"`
+
+	// ✅ NEW — Leave Financial Context
+	LeaveTypeID    *uuid.UUID `json:"leave_type_id,omitempty"`
+	LeaveRequestID *uuid.UUID `json:"leave_request_id,omitempty"`
+	IsLeavePaid    *bool      `json:"is_leave_paid,omitempty"`
 }
 
 type PairedEvent struct {

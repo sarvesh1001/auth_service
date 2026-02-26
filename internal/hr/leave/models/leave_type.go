@@ -51,8 +51,16 @@ type ScheduleOverride struct {
 }
 
 type LeaveBalanceSnapshot struct {
-	SnapshotID    uuid.UUID `json:"snapshot_id"`
-	EntitlementID uuid.UUID `json:"entitlement_id"`
-	BalanceDays   int       `json:"balance_days"`
-	CalculatedAt  time.Time `json:"calculated_at"`
+	SnapshotID    uuid.UUID  `json:"snapshot_id" db:"snapshot_id"`
+	EntitlementID uuid.UUID  `json:"entitlement_id" db:"entitlement_id"`
+	BalanceDays   float64    `json:"balance_days" db:"balance_days"`
+	CalculatedAt  time.Time  `json:"calculated_at" db:"calculated_at"`
+	UpdatedAt     *time.Time `json:"updated_at,omitempty" db:"updated_at"`
+}
+type LeavePolicyRuleResolution struct {
+	PolicyID          uuid.UUID
+	LeaveTypeID       uuid.UUID
+	TotalDays         int
+	AccrualMethod     string
+	CarryForwardLimit *int
 }

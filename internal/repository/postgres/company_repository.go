@@ -7389,20 +7389,30 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	}
 	defer tx.Rollback()
 
-	// 1. Create the company
+	// 1. Create the company – ✅ UPDATED QUERY with financial_year_start_month
 	companyQuery := `
         INSERT INTO companies (
             company_id, company_name, owner_user_id, subscription_tier,
             subscription_status, max_employees, max_departments, data_region,
-            is_active, created_at, updated_at, subscription_start_date, subscription_end_date
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            is_active, created_at, updated_at, subscription_start_date,
+            subscription_end_date, financial_year_start_month
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     `
 	_, err = tx.ExecContext(ctx, companyQuery,
-		company.CompanyID, company.CompanyName, company.OwnerUserID,
-		company.SubscriptionTier, company.SubscriptionStatus,
-		company.MaxEmployees, company.MaxDepartments, company.DataRegion,
-		company.IsActive, company.CreatedAt, company.UpdatedAt,
-		company.SubscriptionStartDate, company.SubscriptionEndDate,
+		company.CompanyID,
+		company.CompanyName,
+		company.OwnerUserID,
+		company.SubscriptionTier,
+		company.SubscriptionStatus,
+		company.MaxEmployees,
+		company.MaxDepartments,
+		company.DataRegion,
+		company.IsActive,
+		company.CreatedAt,
+		company.UpdatedAt,
+		company.SubscriptionStartDate,
+		company.SubscriptionEndDate,
+		company.FinancialYearStartMonth, // ✅ NEW
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "idx_companies_name_owner_unique") {
@@ -7422,10 +7432,14 @@ func (r *CompanyRepositoryImpl) CreateCompany(
             ON CONFLICT (company_id, work_center_code) DO NOTHING
         `
 		_, err = tx.ExecContext(ctx, workCenterQuery,
-			workCenterDetails.WorkCenterCode, company.CompanyID,
-			workCenterDetails.Name, workCenterDetails.Description,
-			workCenterDetails.Timezone, workCenterDetails.IsActive,
-			company.CreatedAt, company.UpdatedAt,
+			workCenterDetails.WorkCenterCode,
+			company.CompanyID,
+			workCenterDetails.Name,
+			workCenterDetails.Description,
+			workCenterDetails.Timezone,
+			workCenterDetails.IsActive,
+			company.CreatedAt,
+			company.UpdatedAt,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create work center: %w", err)
@@ -7467,7 +7481,7 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 
 	// 5. Create Administration department (main department for owner)
 	adminDeptID := uuid.New()
-	departmentName := "Administration" // Always use "Administration" for owner's department
+	departmentName := "Administration"
 	_, err = tx.ExecContext(ctx, `
         INSERT INTO departments (
             department_id, company_id, department_name,
@@ -7496,18 +7510,16 @@ func (r *CompanyRepositoryImpl) CreateCompany(
             created_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     `
-
-	// Use the provided position details, but with Administration department ID
 	_, err = tx.ExecContext(ctx, positionQuery,
 		ownerPositionID,
 		company.CompanyID,
-		adminDeptID,        // ← This is the key: position gets Administration department ID
-		ownerPositionTitle, // Use the provided owner position title
+		adminDeptID,
+		ownerPositionTitle,
 		positionDetails.IsOpen,
 		positionDetails.IsSchedulable,
 		positionDetails.AttendanceRequired,
 		positionDetails.OvertimeAllowed,
-		positionDetails.WorkCenterCode, // Can be NULL or work center code
+		positionDetails.WorkCenterCode,
 		company.CreatedAt,
 		company.UpdatedAt,
 	)
@@ -7520,7 +7532,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 	if remainingSlots < 0 {
 		remainingSlots = 0
 	}
-
 	if len(additionalDepartments) > remainingSlots {
 		additionalDepartments = additionalDepartments[:remainingSlots]
 	}
@@ -7530,7 +7541,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 
 	for _, deptName := range additionalDepartments {
 		deptID := uuid.New()
-		// Get system department ID for this department
 		var systemDeptID uuid.UUID
 		err = tx.QueryRowContext(ctx, `
             SELECT system_department_id 
@@ -7539,7 +7549,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
             LIMIT 1
         `, strings.ToLower(strings.TrimSpace(deptName))).Scan(&systemDeptID)
 		if err != nil {
-			// Default to operations if not found
 			systemDeptID = adminSystemDeptID
 		}
 
@@ -7565,7 +7574,6 @@ func (r *CompanyRepositoryImpl) CreateCompany(
 		}
 
 		ownerAccessDeptIDs = append(ownerAccessDeptIDs, deptID)
-		// Add module based on system department
 		if systemDeptID == adminSystemDeptID {
 			ownerAccessModules = append(ownerAccessModules, "administration")
 		} else {

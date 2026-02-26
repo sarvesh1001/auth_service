@@ -56,8 +56,11 @@ func (s *leaveRequestService) RequestLeave(
 	req *models.LeaveRequestCreate,
 ) (*models.LeaveRequest, error) {
 
-	// 1. Validate request via repository (overlap + basic rules)
-	valid, message, err := s.repo.ValidateLeaveRequest(ctx, req)
+	valid, message, err := s.repo.ValidateLeaveRequest(
+		ctx,
+		req,
+		nil,
+	)
 	if err != nil {
 		s.logger.Error("Leave validation failed", zap.Error(err))
 		return nil, err
@@ -66,7 +69,6 @@ func (s *leaveRequestService) RequestLeave(
 		return nil, fmt.Errorf(message)
 	}
 
-	// 2. Get leave type
 	leaveType, err := s.repo.GetLeaveTypeByID(ctx, req.LeaveTypeID)
 	if err != nil {
 		return nil, err
@@ -75,7 +77,6 @@ func (s *leaveRequestService) RequestLeave(
 		return nil, fmt.Errorf("leave type not found")
 	}
 
-	// 3. Create request
 	request := &models.LeaveRequest{
 		LeaveRequestID: uuid.New(),
 		CompanyID:      req.CompanyID,
@@ -89,7 +90,6 @@ func (s *leaveRequestService) RequestLeave(
 		RequestedAt:    time.Now().UTC(),
 	}
 
-	// 4. Auto-approval flow
 	if !leaveType.RequiresApproval {
 		request.Status = "approved"
 		request.ApprovedBy = &req.RequestedBy
@@ -101,7 +101,6 @@ func (s *leaveRequestService) RequestLeave(
 		return nil, err
 	}
 
-	// 5. If auto-approved → process ledger
 	if request.Status == "approved" {
 		if err := s.processApproval(ctx, request, *request.ApprovedBy); err != nil {
 			s.logger.Error("Auto approval failed", zap.Error(err))
@@ -132,9 +131,10 @@ func (s *leaveRequestService) ApproveLeave(
 		return nil, fmt.Errorf("leave request is not pending")
 	}
 
-	// 🔥 Explicit balance validation before approval
+	// ✅ FIX: pass companyID as well
 	balance, err := s.balanceService.GetBalanceAsOf(
 		ctx,
+		request.CompanyID,
 		request.UserID,
 		request.LeaveTypeID,
 		request.StartDate,
@@ -142,9 +142,10 @@ func (s *leaveRequestService) ApproveLeave(
 	if err != nil {
 		return nil, err
 	}
-	if balance.Balance < request.TotalDays {
+
+	if balance.Balance < float64(request.TotalDays) {
 		return nil, fmt.Errorf(
-			"insufficient leave balance: available=%d, required=%d",
+			"insufficient leave balance: available=%.2f, required=%d",
 			balance.Balance,
 			request.TotalDays,
 		)

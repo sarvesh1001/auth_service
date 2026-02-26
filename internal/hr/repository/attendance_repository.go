@@ -319,6 +319,30 @@ type AttendanceRepository interface {
 		companyID uuid.UUID,
 		sourceType string,
 	) (*attendance.AttendanceSource, error)
+	GetAttendanceSummariesInRange(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+	) ([]*attendance.AttendanceDailySummary, error)
+	LockAttendanceSummariesInRange(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+	) error
+	MarkAttendanceFinalized(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		date time.Time,
+	) error
+	CountAttendanceSummariesInRange(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+	) (int, error)
 }
 
 type AttendanceEventFilter struct {

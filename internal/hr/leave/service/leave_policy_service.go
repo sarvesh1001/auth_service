@@ -1,12 +1,12 @@
-// internal/hr/leave/service/leave_policy_service.go
 package service
 
 import (
-	"auth-service/internal/hr/leave/models"
-	"auth-service/internal/hr/leave/repository"
 	"context"
 	"fmt"
 	"time"
+
+	"auth-service/internal/hr/leave/models"
+	"auth-service/internal/hr/leave/repository"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -25,15 +25,22 @@ type leavePolicyService struct {
 	logger *zap.Logger
 }
 
-func NewLeavePolicyService(repo repository.LeaveRepository, logger *zap.Logger) LeavePolicyService {
+func NewLeavePolicyService(
+	repo repository.LeaveRepository,
+	logger *zap.Logger,
+) LeavePolicyService {
 	return &leavePolicyService{
 		repo:   repo,
 		logger: logger,
 	}
 }
 
-func (s *leavePolicyService) CreateLeaveType(ctx context.Context, companyID uuid.UUID, req *models.LeaveTypeCreate) (*models.LeaveType, error) {
-	// Check if leave type code already exists
+func (s *leavePolicyService) CreateLeaveType(
+	ctx context.Context,
+	companyID uuid.UUID,
+	req *models.LeaveTypeCreate,
+) (*models.LeaveType, error) {
+
 	existing, err := s.repo.GetLeaveTypeByCode(ctx, companyID, req.Code)
 	if err != nil {
 		s.logger.Error("Failed to check existing leave type",
@@ -47,9 +54,11 @@ func (s *leavePolicyService) CreateLeaveType(ctx context.Context, companyID uuid
 		return nil, fmt.Errorf("leave type with code %s already exists", req.Code)
 	}
 
-	// Validate accrual method
 	validAccrualMethods := map[string]bool{
-		"none": true, "monthly": true, "yearly": true, "quarterly": true,
+		"none":      true,
+		"monthly":   true,
+		"yearly":    true,
+		"quarterly": true,
 	}
 	if !validAccrualMethods[req.AccrualMethod] {
 		return nil, fmt.Errorf("invalid accrual method: %s", req.AccrualMethod)
@@ -78,8 +87,12 @@ func (s *leavePolicyService) CreateLeaveType(ctx context.Context, companyID uuid
 	return leaveType, nil
 }
 
-func (s *leavePolicyService) UpdateLeaveType(ctx context.Context, leaveTypeID uuid.UUID, update *models.LeaveTypeUpdate) error {
-	// Get existing leave type
+func (s *leavePolicyService) UpdateLeaveType(
+	ctx context.Context,
+	leaveTypeID uuid.UUID,
+	update *models.LeaveTypeUpdate,
+) error {
+
 	existing, err := s.repo.GetLeaveTypeByID(ctx, leaveTypeID)
 	if err != nil {
 		s.logger.Error("Failed to get leave type for update",
@@ -92,10 +105,12 @@ func (s *leavePolicyService) UpdateLeaveType(ctx context.Context, leaveTypeID uu
 		return fmt.Errorf("leave type not found")
 	}
 
-	// Validate accrual method if being updated
 	if update.AccrualMethod != nil {
 		validAccrualMethods := map[string]bool{
-			"none": true, "monthly": true, "yearly": true, "quarterly": true,
+			"none":      true,
+			"monthly":   true,
+			"yearly":    true,
+			"quarterly": true,
 		}
 		if !validAccrualMethods[*update.AccrualMethod] {
 			return fmt.Errorf("invalid accrual method: %s", *update.AccrualMethod)
@@ -112,8 +127,11 @@ func (s *leavePolicyService) UpdateLeaveType(ctx context.Context, leaveTypeID uu
 	return nil
 }
 
-func (s *leavePolicyService) AssignEntitlementToUser(ctx context.Context, req *models.LeaveEntitlementCreate) (*models.LeaveEntitlement, error) {
-	// Validate dates
+func (s *leavePolicyService) AssignEntitlementToUser(
+	ctx context.Context,
+	req *models.LeaveEntitlementCreate,
+) (*models.LeaveEntitlement, error) {
+
 	if req.EffectiveFrom.IsZero() {
 		return nil, fmt.Errorf("effective from date is required")
 	}
@@ -126,8 +144,11 @@ func (s *leavePolicyService) AssignEntitlementToUser(ctx context.Context, req *m
 		return nil, fmt.Errorf("total days must be greater than 0")
 	}
 
-	// Check if user already has an active entitlement for this leave type
-	existingEntitlements, err := s.repo.GetLeaveEntitlementsByUser(ctx, req.UserID)
+	existingEntitlements, err := s.repo.GetLeaveEntitlementsByUser(
+		ctx,
+		req.UserID,
+		nil, // manual entitlement (not position-bound)
+	)
 	if err != nil {
 		s.logger.Error("Failed to get existing entitlements",
 			zap.String("user_id", req.UserID.String()),
@@ -136,13 +157,14 @@ func (s *leavePolicyService) AssignEntitlementToUser(ctx context.Context, req *m
 		return nil, fmt.Errorf("failed to check existing entitlements: %w", err)
 	}
 
-	// Check for overlapping entitlements
 	for _, e := range existingEntitlements {
 		if e.LeaveTypeID == req.LeaveTypeID {
-			// Check for overlap
 			if req.EffectiveTo == nil || e.EffectiveTo == nil ||
-				(req.EffectiveFrom.Before(*e.EffectiveTo) && req.EffectiveTo.After(e.EffectiveFrom)) {
-				return nil, fmt.Errorf("user already has an active entitlement for this leave type during the specified period")
+				(req.EffectiveFrom.Before(*e.EffectiveTo) &&
+					req.EffectiveTo.After(e.EffectiveFrom)) {
+				return nil, fmt.Errorf(
+					"user already has an active entitlement for this leave type during the specified period",
+				)
 			}
 		}
 	}
@@ -169,18 +191,25 @@ func (s *leavePolicyService) AssignEntitlementToUser(ctx context.Context, req *m
 	return entitlement, nil
 }
 
-func (s *leavePolicyService) GetLeaveTypesByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.LeaveType, error) {
+func (s *leavePolicyService) GetLeaveTypesByCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+) ([]*models.LeaveType, error) {
 	return s.repo.GetLeaveTypesByCompany(ctx, companyID)
 }
 
-func (s *leavePolicyService) DeleteLeaveType(ctx context.Context, leaveTypeID uuid.UUID) error {
-	// Check if leave type is being used in entitlements
-	entitlements, _, err := s.repo.GetLeaveEntitlementsByCompany(ctx, leaveTypeID, 1, 1)
+func (s *leavePolicyService) DeleteLeaveType(
+	ctx context.Context,
+	leaveTypeID uuid.UUID,
+) error {
+
+	// ✅ FIX: Properly check if this leave type is used in any entitlement
+	inUse, err := s.repo.IsLeaveTypeInUse(ctx, leaveTypeID)
 	if err != nil {
 		return fmt.Errorf("failed to check leave type usage: %w", err)
 	}
 
-	if len(entitlements) > 0 {
+	if inUse {
 		return fmt.Errorf("cannot delete leave type: it is being used in existing entitlements")
 	}
 

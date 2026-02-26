@@ -1,4 +1,3 @@
-// internal/hr/leave/service/leave_accrual_service.go
 package service
 
 import (
@@ -31,16 +30,18 @@ func NewLeaveAccrualService(repo repository.LeaveRepository, logger *zap.Logger)
 	}
 }
 
-func (s *leaveAccrualService) AccrueMonthlyLeave(ctx context.Context, companyID uuid.UUID, accrualDate time.Time) (int, error) {
-	// Validate accrual date (should be first day of month for monthly accruals)
+func (s *leaveAccrualService) AccrueMonthlyLeave(
+	ctx context.Context,
+	companyID uuid.UUID,
+	accrualDate time.Time,
+) (int, error) {
+
 	if accrualDate.Day() != 1 {
 		s.logger.Warn("Accrual date is not the first day of month",
 			zap.Time("accrual_date", accrualDate),
 			zap.String("company_id", companyID.String()))
-		// We'll continue anyway, but log warning
 	}
 
-	// Process all accruals for the company on this date
 	processed, err := s.repo.ProcessLeaveAccruals(ctx, companyID, accrualDate)
 	if err != nil {
 		s.logger.Error("Failed to process monthly leave accruals",
@@ -58,8 +59,13 @@ func (s *leaveAccrualService) AccrueMonthlyLeave(ctx context.Context, companyID 
 	return processed, nil
 }
 
-func (s *leaveAccrualService) RecalculateEntitlement(ctx context.Context, entitlementID uuid.UUID) (*models.LeaveBalance, error) {
-	// Get the entitlement
+// RecalculateEntitlement rebuilds the leave balance using only ledger entries.
+// The accrual table is no longer used for balance calculations.
+func (s *leaveAccrualService) RecalculateEntitlement(
+	ctx context.Context,
+	entitlementID uuid.UUID,
+) (*models.LeaveBalance, error) {
+
 	entitlement, err := s.repo.GetLeaveEntitlementByID(ctx, entitlementID)
 	if err != nil {
 		s.logger.Error("Failed to get entitlement for recalculation",
@@ -67,21 +73,11 @@ func (s *leaveAccrualService) RecalculateEntitlement(ctx context.Context, entitl
 			zap.Error(err))
 		return nil, fmt.Errorf("failed to get entitlement: %w", err)
 	}
-
 	if entitlement == nil {
 		return nil, fmt.Errorf("entitlement not found")
 	}
 
-	// Get all accruals for this entitlement
-	accruals, err := s.repo.GetLeaveAccrualsByEntitlement(ctx, entitlementID)
-	if err != nil {
-		s.logger.Error("Failed to get accruals for recalculation",
-			zap.String("entitlement_id", entitlementID.String()),
-			zap.Error(err))
-		return nil, fmt.Errorf("failed to get accruals: %w", err)
-	}
-
-	// Get all ledger entries for this entitlement
+	// ✅ NEW: Use ledger entries as the single source of truth
 	ledgerEntries, err := s.repo.GetLeaveLedgerEntriesByEntitlement(ctx, entitlementID)
 	if err != nil {
 		s.logger.Error("Failed to get ledger entries for recalculation",
@@ -90,21 +86,19 @@ func (s *leaveAccrualService) RecalculateEntitlement(ctx context.Context, entitl
 		return nil, fmt.Errorf("failed to get ledger entries: %w", err)
 	}
 
-	// Calculate total accrued
-	totalAccrued := 0
-	for _, accrual := range accruals {
-		totalAccrued += accrual.DaysAccrued
-	}
+	var totalAccrued float64
+	var totalConsumed float64
 
-	// Calculate total consumed
-	totalConsumed := 0
 	for _, entry := range ledgerEntries {
-		if entry.EntryType == "consumption" {
-			totalConsumed += entry.Days
+		switch entry.EntryType {
+		case "accrual", "reversal":
+			totalAccrued += float64(entry.Days)
+		case "consumption":
+			totalConsumed += float64(entry.Days)
 		}
+		// ignore other types if any
 	}
 
-	// Get leave type info for the balance response
 	leaveType, err := s.repo.GetLeaveTypeByID(ctx, entitlement.LeaveTypeID)
 	if err != nil {
 		s.logger.Error("Failed to get leave type for balance",
@@ -112,7 +106,6 @@ func (s *leaveAccrualService) RecalculateEntitlement(ctx context.Context, entitl
 			zap.Error(err))
 		return nil, fmt.Errorf("failed to get leave type: %w", err)
 	}
-
 	if leaveType == nil {
 		return nil, fmt.Errorf("leave type not found")
 	}
@@ -122,7 +115,7 @@ func (s *leaveAccrualService) RecalculateEntitlement(ctx context.Context, entitl
 		LeaveTypeID:   entitlement.LeaveTypeID,
 		LeaveTypeCode: leaveType.Code,
 		LeaveTypeName: leaveType.Name,
-		TotalEntitled: entitlement.TotalDays,
+		TotalEntitled: float64(entitlement.TotalDays),
 		Accrued:       totalAccrued,
 		Consumed:      totalConsumed,
 		Balance:       totalAccrued - totalConsumed,
@@ -131,17 +124,26 @@ func (s *leaveAccrualService) RecalculateEntitlement(ctx context.Context, entitl
 
 	s.logger.Info("Entitlement recalculated",
 		zap.String("entitlement_id", entitlementID.String()),
-		zap.Int("total_accrued", totalAccrued),
-		zap.Int("total_consumed", totalConsumed),
-		zap.Int("balance", balance.Balance))
+		zap.Float64("total_accrued", totalAccrued),
+		zap.Float64("total_consumed", totalConsumed),
+		zap.Float64("balance", balance.Balance),
+	)
 
 	return balance, nil
 }
 
-func (s *leaveAccrualService) GetAccrualsByDate(ctx context.Context, companyID uuid.UUID, date time.Time) ([]*models.LeaveAccrual, error) {
+func (s *leaveAccrualService) GetAccrualsByDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	date time.Time,
+) ([]*models.LeaveAccrual, error) {
 	return s.repo.GetLeaveAccrualsByDate(ctx, companyID, date)
 }
 
-func (s *leaveAccrualService) ProcessLeaveAccruals(ctx context.Context, companyID uuid.UUID, accrualDate time.Time) (int, error) {
+func (s *leaveAccrualService) ProcessLeaveAccruals(
+	ctx context.Context,
+	companyID uuid.UUID,
+	accrualDate time.Time,
+) (int, error) {
 	return s.repo.ProcessLeaveAccruals(ctx, companyID, accrualDate)
 }

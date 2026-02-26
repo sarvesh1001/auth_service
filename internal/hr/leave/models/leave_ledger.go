@@ -32,11 +32,13 @@ type LeaveBalance struct {
 	LeaveTypeID   uuid.UUID `json:"leave_type_id"`
 	LeaveTypeCode string    `json:"leave_type_code"`
 	LeaveTypeName string    `json:"leave_type_name"`
-	TotalEntitled int       `json:"total_entitled"`
-	Accrued       int       `json:"accrued"`
-	Consumed      int       `json:"consumed"`
-	Balance       int       `json:"balance"`
-	CarryForward  *int      `json:"carry_forward,omitempty"`
+
+	TotalEntitled float64 `json:"total_entitled"` // was int
+	Accrued       float64 `json:"accrued"`        // must be float64
+	Consumed      float64 `json:"consumed"`       // must be float64
+	Balance       float64 `json:"balance"`        // must be float64
+
+	CarryForward *int `json:"carry_forward,omitempty"`
 }
 
 // LeaveTransaction represents a ledger transaction
@@ -50,4 +52,10 @@ type LeaveTransaction struct {
 	ReferenceID   *uuid.UUID `json:"reference_id,omitempty"`
 	ReferenceType *string    `json:"reference_type,omitempty"`
 	Description   string     `json:"description"`
+}
+
+type LeavePolicyRuleUpdate struct {
+	TotalDays         *int    `json:"total_days,omitempty"`
+	AccrualMethod     *string `json:"accrual_method,omitempty"`
+	CarryForwardLimit *int    `json:"carry_forward_limit,omitempty"`
 }

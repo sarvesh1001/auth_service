@@ -126,6 +126,7 @@ type SchedulingService interface {
 }
 
 // PositionBasedResolvedDay - Response structure for position-based scheduling
+// PositionBasedResolvedDay - Response structure for position-based scheduling
 type PositionBasedResolvedDay struct {
 	Date               time.Time  `json:"date"`
 	Timezone           string     `json:"timezone"`
@@ -147,6 +148,10 @@ type PositionBasedResolvedDay struct {
 	OverrideType       *string    `json:"override_type,omitempty"`
 	IsOnLeave          bool       `json:"is_on_leave"`
 	LeaveRequestID     *uuid.UUID `json:"leave_request_id,omitempty"`
+
+	// ✅ NEW
+	IsLeavePaid bool       `json:"is_leave_paid"`
+	LeaveTypeID *uuid.UUID `json:"leave_type_id,omitempty"`
 }
 
 type schedulingServiceImpl struct {
@@ -696,6 +701,7 @@ func (s *schedulingServiceImpl) ValidateScheduleTemplate(ctx context.Context, te
 }
 
 // POSITION-BASED SCHEDULE RESOLUTION
+// POSITION-BASED SCHEDULE RESOLUTION
 func (s *schedulingServiceImpl) ResolveUserDay(
 	ctx context.Context,
 	companyID, userID uuid.UUID,
@@ -742,6 +748,61 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 	// 4️⃣ Check for schedule overrides
 	override, err := s.schedulingRepo.GetScheduleOverrideByUserDate(ctx, userID, businessDate)
 	if err == nil && override != nil {
+
+		// 🔥 Detect leave override (UPDATED)
+		if override.OverrideType == "off" &&
+			override.Reason != nil &&
+			strings.HasPrefix(*override.Reason, "leave_") {
+
+			leaveIDStr := strings.TrimPrefix(*override.Reason, "leave_")
+			leaveID, _ := uuid.Parse(leaveIDStr)
+
+			// 🔥 Fetch leave info to determine paid/unpaid via leave type
+			isPaid := false
+			var leaveTypeID *uuid.UUID
+
+			if s.leaveQuery != nil {
+				_, leaveInfo, err :=
+					s.leaveQuery.IsUserOnLeave(ctx, companyID, userID, businessDate)
+				if err == nil && leaveInfo != nil {
+					// ✅ Get leave type to determine if paid
+					if leaveInfo.LeaveTypeID != uuid.Nil {
+						leaveType, err := s.leaveQuery.GetLeaveTypeByID(
+							ctx,
+							companyID,
+							leaveInfo.LeaveTypeID,
+						)
+						if err == nil && leaveType != nil {
+							isPaid = leaveType.IsPaid
+						} else {
+							s.logger.Warn("Failed to fetch leave type for override",
+								util.String("leave_type_id", leaveInfo.LeaveTypeID.String()),
+								util.ErrorField(err))
+						}
+					}
+					leaveTypeID = &leaveInfo.LeaveTypeID
+				}
+			}
+
+			return &PositionBasedResolvedDay{
+				Date:               businessDate,
+				Timezone:           "UTC",
+				IsSchedulable:      false,
+				AttendanceRequired: false,
+				OvertimeAllowed:    false,
+				PositionID:         &position.PositionID,
+				PositionTitle:      &position.Title,
+				ScheduleStatus:     "on_leave",
+				IsOverride:         true,
+				IsOnLeave:          true,
+				LeaveRequestID:     &leaveID,
+				OverrideType:       &override.OverrideType,
+				IsLeavePaid:        isPaid,
+				LeaveTypeID:        leaveTypeID,
+			}, nil
+		}
+
+		// Normal override
 		return &PositionBasedResolvedDay{
 			Date:               businessDate,
 			Timezone:           "UTC",
@@ -756,17 +817,37 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 		}, nil
 	}
 
-	// 5️⃣ Check for approved leave - UPDATED WITH REAL INTEGRATION
+	// 5️⃣ Check for approved leave – UPDATED WITH REAL INTEGRATION
 	if s.leaveQuery != nil {
 		isOnLeave, leaveInfo, err := s.leaveQuery.IsUserOnLeave(ctx, companyID, userID, businessDate)
+
 		if err != nil {
 			s.logger.Warn("Failed to check leave status",
 				util.String("user_id", userID.String()),
 				util.String("company_id", companyID.String()),
 				util.String("date", businessDate.Format("2006-01-02")),
-				util.ErrorField(err))
-			// Continue without leave check if error occurs
+				util.ErrorField(err),
+			)
 		} else if isOnLeave && leaveInfo != nil {
+
+			// 🔥 Determine if leave is paid by fetching leave type
+			isPaid := false
+			if leaveInfo.LeaveTypeID != uuid.Nil {
+				leaveType, err := s.leaveQuery.GetLeaveTypeByID(
+					ctx,
+					companyID,
+					leaveInfo.LeaveTypeID,
+				)
+				if err == nil && leaveType != nil {
+					isPaid = leaveType.IsPaid
+				} else {
+					s.logger.Warn("Failed to fetch leave type for leave request",
+						util.String("leave_request_id", leaveInfo.LeaveRequestID.String()),
+						util.String("leave_type_id", leaveInfo.LeaveTypeID.String()),
+						util.ErrorField(err))
+				}
+			}
+
 			return &PositionBasedResolvedDay{
 				Date:               businessDate,
 				Timezone:           "UTC",
@@ -778,6 +859,8 @@ func (s *schedulingServiceImpl) ResolveUserDay(
 				ScheduleStatus:     "on_leave",
 				IsOnLeave:          true,
 				LeaveRequestID:     &leaveInfo.LeaveRequestID,
+				IsLeavePaid:        isPaid,
+				LeaveTypeID:        &leaveInfo.LeaveTypeID,
 			}, nil
 		}
 	} else {
@@ -2691,7 +2774,6 @@ func (s *schedulingServiceImpl) ApplyApprovedLeave(
 	return nil
 }
 
-// RollbackCancelledLeave removes schedule overrides created for a leave request
 func (s *schedulingServiceImpl) RollbackCancelledLeave(
 	ctx context.Context,
 	leaveRequest *leaveModels.LeaveRequest,
@@ -2701,6 +2783,7 @@ func (s *schedulingServiceImpl) RollbackCancelledLeave(
 
 	reason := fmt.Sprintf("leave_%s", leaveRequest.LeaveRequestID)
 
+	// 1️⃣ Delete overrides
 	err := s.schedulingRepo.DeleteScheduleOverridesByReason(
 		ctx,
 		leaveRequest.CompanyID,
@@ -2711,8 +2794,51 @@ func (s *schedulingServiceImpl) RollbackCancelledLeave(
 		return fmt.Errorf("failed to rollback leave overrides: %w", err)
 	}
 
+	// 2️⃣ Regenerate schedule instances for affected date range
+	startDate := leaveRequest.StartDate.UTC().Truncate(24 * time.Hour)
+	endDate := leaveRequest.EndDate.UTC().Truncate(24 * time.Hour)
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+
+	for date := startDate; !date.After(endDate); date = date.AddDate(0, 0, 1) {
+
+		// Only future dates should be regenerated
+		if !date.After(today) {
+			continue
+		}
+
+		hasActive, err := s.schedulingRepo.HasActiveSchedule(
+			ctx,
+			leaveRequest.CompanyID,
+			leaveRequest.UserID,
+			date,
+		)
+		if err != nil {
+			return fmt.Errorf("failed checking active schedule: %w", err)
+		}
+
+		if !hasActive {
+
+			// 🔥 regenerate schedule instance
+			err := s.regenerateScheduleForUserDate(
+				ctx,
+				leaveRequest.CompanyID,
+				leaveRequest.UserID,
+				date,
+			)
+			if err != nil {
+				s.logger.Warn(
+					"Failed to regenerate schedule for cancelled leave",
+					util.String("user_id", leaveRequest.UserID.String()),
+					util.String("date", date.Format("2006-01-02")),
+					util.ErrorField(err),
+				)
+			}
+		}
+	}
+
 	s.logger.Info(
-		"Leave schedule overrides rolled back",
+		"Leave schedule overrides rolled back and schedules regenerated",
 		util.String("leave_request_id", leaveRequest.LeaveRequestID.String()),
 		util.String("user_id", leaveRequest.UserID.String()),
 		util.String("reason", reason),
@@ -2825,6 +2951,35 @@ func (s *schedulingServiceImpl) UpdateWorkCenterShiftMappingByKey(
 		util.String("shift_id", mapping.ShiftID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)
+
+	return nil
+}
+func (s *schedulingServiceImpl) regenerateScheduleForUserDate(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	date time.Time,
+) error {
+
+	// Use the SAME engine used everywhere else
+	_, err := s.CreateScheduleInstanceFromPosition(
+		ctx,
+		companyID,
+		userID,
+		date,
+		"system", // actorType
+		uuid.Nil, // actorID
+		nil,      // metadata
+	)
+
+	if err != nil {
+		// If it's frozen or not schedulable, just ignore
+		if strings.Contains(err.Error(), "cannot create schedule instance") ||
+			strings.Contains(err.Error(), "frozen") {
+			return nil
+		}
+		return err
+	}
 
 	return nil
 }

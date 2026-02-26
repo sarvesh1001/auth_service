@@ -3081,14 +3081,14 @@ func (s *CompanyService) GetDepartment(
 
 // Updated CreatePositionRequest struct
 type CreatePositionRequest struct {
-	CompanyID          uuid.UUID `json:"company_id" validate:"required"`
-	DepartmentID       uuid.UUID `json:"department_id" validate:"required"`
-	Title              string    `json:"title" validate:"required,min=1,max=255"`
-	IsOpen             bool      `json:"is_open" default:"true"`
-	IsSchedulable      bool      `json:"is_schedulable" default:"true"`
-	AttendanceRequired bool      `json:"attendance_required" default:"true"`
-	OvertimeAllowed    bool      `json:"overtime_allowed" default:"false"`
-	WorkCenterCode     *string   `json:"work_center_code,omitempty" validate:"omitempty,max=100"`
+	CompanyID          uuid.UUID `json:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id"`
+	Title              string    `json:"title"`
+	IsOpen             *bool     `json:"is_open"`
+	IsSchedulable      *bool     `json:"is_schedulable"`
+	AttendanceRequired *bool     `json:"attendance_required"`
+	OvertimeAllowed    *bool     `json:"overtime_allowed"`
+	WorkCenterCode     *string   `json:"work_center_code"`
 }
 
 // Updated UpdatePositionRequest struct
@@ -3109,6 +3109,15 @@ func (s *CompanyService) CreatePosition(
 	req *CreatePositionRequest,
 	createdBy uuid.UUID,
 ) (*models.Position, error) {
+
+	// ===== Safety: ensure defaults applied =====
+	if req.IsOpen == nil ||
+		req.IsSchedulable == nil ||
+		req.AttendanceRequired == nil ||
+		req.OvertimeAllowed == nil {
+		return nil, fmt.Errorf("boolean defaults not initialized")
+	}
+
 	// Validate department
 	department, err := s.companyRepo.GetDepartment(ctx, req.DepartmentID)
 	if err != nil {
@@ -3141,9 +3150,13 @@ func (s *CompanyService) CreatePosition(
 		return nil, fmt.Errorf("user lacks access to this department")
 	}
 
-	// Check if work center exists (if provided)
+	// Validate work center if provided
 	if req.WorkCenterCode != nil && *req.WorkCenterCode != "" {
-		exists, err := s.companyRepo.WorkCenterExists(ctx, req.CompanyID, *req.WorkCenterCode)
+		exists, err := s.companyRepo.WorkCenterExists(
+			ctx,
+			req.CompanyID,
+			*req.WorkCenterCode,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to validate work center: %w", err)
 		}
@@ -3167,15 +3180,16 @@ func (s *CompanyService) CreatePosition(
 	}
 
 	now := time.Now().UTC()
+
 	position := &models.Position{
 		PositionID:         uuid.New(),
 		CompanyID:          req.CompanyID,
 		DepartmentID:       req.DepartmentID,
 		Title:              req.Title,
-		IsOpen:             req.IsOpen,
-		IsSchedulable:      req.IsSchedulable,
-		AttendanceRequired: req.AttendanceRequired,
-		OvertimeAllowed:    req.OvertimeAllowed,
+		IsOpen:             *req.IsOpen,
+		IsSchedulable:      *req.IsSchedulable,
+		AttendanceRequired: *req.AttendanceRequired,
+		OvertimeAllowed:    *req.OvertimeAllowed,
 		WorkCenterCode:     req.WorkCenterCode,
 		CreatedAt:          now,
 		UpdatedAt:          now,
@@ -3190,9 +3204,9 @@ func (s *CompanyService) CreatePosition(
 		util.String("department_id", req.DepartmentID.String()),
 		util.String("position_id", position.PositionID.String()),
 		util.String("title", req.Title),
-		util.Bool("is_schedulable", req.IsSchedulable),
-		util.Bool("attendance_required", req.AttendanceRequired),
-		util.Bool("overtime_allowed", req.OvertimeAllowed),
+		util.Bool("is_schedulable", *req.IsSchedulable),
+		util.Bool("attendance_required", *req.AttendanceRequired),
+		util.Bool("overtime_allowed", *req.OvertimeAllowed),
 		util.String("work_center_code", func() string {
 			if req.WorkCenterCode != nil {
 				return *req.WorkCenterCode
@@ -3867,32 +3881,31 @@ func (s *CompanyService) GetEmployeeWithPosition(
 }
 
 type CreateCompanyRequest struct {
-	CompanyName        string   `json:"company_name" validate:"required,max=255"`
-	OwnerPhone         string   `json:"owner_phone" validate:"required"`
-	OwnerUsername      string   `json:"owner_username" validate:"required"`
-	OwnerFullName      string   `json:"owner_full_name" validate:"required"`
-	OwnerPositionTitle string   `json:"owner_position_title" validate:"required"`
-	SubscriptionTier   string   `json:"subscription_tier" validate:"required"`
-	MaxEmployees       int      `json:"max_employees"`
-	MaxDepartments     int      `json:"max_departments"`
-	DataRegion         string   `json:"data_region" validate:"required"`
-	SubscriptionMonths int      `json:"subscription_months,omitempty"`
-	SubscriptionDays   int      `json:"subscription_days,omitempty"`
-	Departments        []string `json:"departments"`
+	CompanyName        string
+	OwnerPhone         string
+	OwnerUsername      string
+	OwnerFullName      string
+	OwnerPositionTitle string
 
-	// Work Center fields
-	WorkCenterCode   string  `json:"work_center_code" validate:"required,max=100"`
-	WorkCenterName   string  `json:"work_center_name" validate:"required,max=255"`
-	WorkCenterDesc   *string `json:"work_center_description,omitempty"`
-	WorkCenterTZ     string  `json:"work_center_timezone" validate:"required"`
-	WorkCenterActive bool    `json:"work_center_is_active"`
+	SubscriptionTier string
+	MaxEmployees     int
+	MaxDepartments   int
+	DataRegion       string
 
-	// Position fields (for owner's position)
-	PositionIsOpen         bool    `json:"position_is_open"`
-	IsSchedulable          bool    `json:"is_schedulable"`
-	AttendanceRequired     bool    `json:"attendance_required"`
-	OvertimeAllowed        bool    `json:"overtime_allowed"`
-	PositionWorkCenterCode *string `json:"position_work_center_code,omitempty"`
+	SubscriptionMonths int
+	SubscriptionDays   int
+	Departments        []string
+
+	// ✅ NEW FIELD
+	FinancialYearStartMonth int
+
+	WorkCenterCode   string
+	WorkCenterName   string
+	WorkCenterDesc   *string
+	WorkCenterTZ     string
+	WorkCenterActive bool
+
+	PositionWorkCenterCode *string
 }
 
 func (s *CompanyService) CreateCompany(
@@ -3905,6 +3918,11 @@ func (s *CompanyService) CreateCompany(
 	// Validate max departments
 	if req.MaxDepartments < 1 || req.MaxDepartments > 100 {
 		return nil, fmt.Errorf("max_departments must be between 1 and 100")
+	}
+
+	// ✅ NEW: Validate financial_year_start_month
+	if req.FinancialYearStartMonth < 1 || req.FinancialYearStartMonth > 12 {
+		return nil, fmt.Errorf("financial_year_start_month must be between 1 and 12")
 	}
 
 	// Validate total departments don't exceed max
@@ -3953,9 +3971,7 @@ func (s *CompanyService) CreateCompany(
 	now := time.Now().UTC()
 	subscriptionEnd := now.AddDate(0, req.SubscriptionMonths, req.SubscriptionDays)
 
-	// ------------------------------------------------------------------
-	// ✅ FIX: Default owner position work center
-	// ------------------------------------------------------------------
+	// Default owner position work center
 	positionWorkCenter := req.PositionWorkCenterCode
 	if positionWorkCenter == nil {
 		positionWorkCenter = &req.WorkCenterCode
@@ -3977,33 +3993,34 @@ func (s *CompanyService) CreateCompany(
 	position := &models.Position{
 		PositionID:         uuid.New(),
 		CompanyID:          companyID,
-		DepartmentID:       uuid.Nil,         // Set by repository
-		DepartmentName:     "Administration", // Always Administration
+		DepartmentID:       uuid.Nil,
+		DepartmentName:     "Administration",
 		Title:              req.OwnerPositionTitle,
-		IsOpen:             false, // Owner position is never open
+		IsOpen:             false,
 		IsSchedulable:      true,
 		AttendanceRequired: true,
 		OvertimeAllowed:    true,
-		WorkCenterCode:     positionWorkCenter, // ✅ ALWAYS SET
+		WorkCenterCode:     positionWorkCenter,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
 
-	// Create company model
+	// ✅ Create company model WITH the new field
 	company := &models.Company{
-		CompanyID:             companyID,
-		CompanyName:           req.CompanyName,
-		OwnerUserID:           ownerUser.UserID,
-		SubscriptionTier:      req.SubscriptionTier,
-		SubscriptionStatus:    models.SubscriptionStatusActive,
-		MaxEmployees:          req.MaxEmployees,
-		MaxDepartments:        req.MaxDepartments,
-		DataRegion:            req.DataRegion,
-		IsActive:              true,
-		CreatedAt:             now,
-		UpdatedAt:             now,
-		SubscriptionStartDate: &now,
-		SubscriptionEndDate:   &subscriptionEnd,
+		CompanyID:               companyID,
+		CompanyName:             req.CompanyName,
+		OwnerUserID:             ownerUser.UserID,
+		SubscriptionTier:        req.SubscriptionTier,
+		SubscriptionStatus:      models.SubscriptionStatusActive,
+		MaxEmployees:            req.MaxEmployees,
+		MaxDepartments:          req.MaxDepartments,
+		DataRegion:              req.DataRegion,
+		IsActive:                true,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		SubscriptionStartDate:   &now,
+		SubscriptionEndDate:     &subscriptionEnd,
+		FinancialYearStartMonth: req.FinancialYearStartMonth, // ✅ NEW
 	}
 
 	// Persist everything in one transaction
@@ -4030,6 +4047,7 @@ func (s *CompanyService) CreateCompany(
 		util.String("subscription_tier", req.SubscriptionTier),
 		util.Int("max_departments", req.MaxDepartments),
 		util.Int("initial_departments", totalDepartments),
+		util.Int("financial_year_start_month", req.FinancialYearStartMonth), // ✅ NEW
 		util.Duration("duration", time.Since(start)),
 	)
 

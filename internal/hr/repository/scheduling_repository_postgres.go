@@ -2959,33 +2959,6 @@ func (r *SchedulingRepositoryImpl) DeleteScheduleOverride(ctx context.Context, o
 	}
 	return nil
 }
-func (r *SchedulingRepositoryImpl) DeleteScheduleOverridesByReason(
-	ctx context.Context,
-	companyID uuid.UUID,
-	userID uuid.UUID,
-	reason string,
-) error {
-
-	query := `
-		DELETE FROM scheduling.schedule_overrides
-		WHERE company_id = $1
-		  AND user_id = $2
-		  AND reason = $3
-	`
-
-	_, err := r.client.DB.ExecContext(
-		ctx,
-		query,
-		companyID,
-		userID,
-		reason,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to delete schedule overrides by reason: %w", err)
-	}
-
-	return nil
-}
 func (r *SchedulingRepositoryImpl) GetWorkCalendarTimezoneForUser(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2996,29 +2969,34 @@ func (r *SchedulingRepositoryImpl) GetWorkCalendarTimezoneForUser(
 
 	query := `
 		SELECT wc.timezone
-		FROM scheduling.work_calendars wc
-		JOIN scheduling.work_centers wcn
-		  ON wcn.work_calendar_id = wc.work_calendar_id
-		JOIN scheduling.positions p
-		  ON p.work_center_id = wcn.work_center_id
-		WHERE p.company_id = $1
-		  AND p.user_id = $2
+		FROM company_employees ce
+		JOIN positions p
+		  ON p.position_id = ce.position_id
+		JOIN work_centers wc
+		  ON wc.company_id = p.company_id
+		 AND wc.work_center_code = p.work_center_code
+		WHERE ce.company_id = $1
+		  AND ce.user_id = $2
+		  AND ce.is_active = true
+		  AND wc.is_active = true
 		LIMIT 1
 	`
 
-	err := r.client.DB.QueryRowContext(
+	err := r.client.QueryRow(
 		ctx,
 		query,
 		companyID,
 		userID,
 	).Scan(&timezone)
 
+	// Safe fallback
 	if err != nil || timezone == "" {
 		return "UTC", nil
 	}
 
 	return timezone, nil
 }
+
 func (r *SchedulingRepositoryImpl) HasActiveSchedule(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -3051,4 +3029,33 @@ func (r *SchedulingRepositoryImpl) HasActiveSchedule(
 	}
 
 	return exists, nil
+}
+func (r *SchedulingRepositoryImpl) DeleteScheduleOverridesByReason(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	reason string,
+) error {
+
+	query := `
+		DELETE FROM schedule_overrides
+		WHERE company_id = $1
+		  AND user_id = $2
+		  AND reason = $3
+		  AND override_type = 'off'
+	`
+
+	_, err := r.client.Exec(
+		ctx,
+		query,
+		companyID,
+		userID,
+		reason,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to delete schedule overrides by reason: %w", err)
+	}
+
+	return nil
 }

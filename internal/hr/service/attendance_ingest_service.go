@@ -109,6 +109,13 @@ func (s *attendanceIngestService) IngestPunch(
 
 	start := time.Now().UTC()
 
+	s.logger.Info("IngestPunch START",
+		zap.String("company_id", req.CompanyID.String()),
+		zap.String("event_type", req.EventType),
+		zap.String("source_type", req.Source.SourceType),
+		zap.Any("event_time_input", req.EventTime),
+	)
+
 	// --------------------------------------------------
 	// BASIC VALIDATION
 	// --------------------------------------------------
@@ -134,6 +141,38 @@ func (s *attendanceIngestService) IngestPunch(
 	}
 
 	// --------------------------------------------------
+	// EVENT TIME RESOLUTION
+	// --------------------------------------------------
+	eventTime, err := s.resolveEventTime(ctx, req, sourceRules)
+	if err != nil {
+		return nil, err
+	}
+	req.ResolvedEventTime = eventTime
+
+	s.logger.Info("EventTime resolved",
+		zap.Time("resolved_event_time", eventTime),
+	)
+
+	// --------------------------------------------------
+	// ATTENDANCE RULE RESOLUTION
+	// --------------------------------------------------
+	resolvedRules, err := s.adminService.ResolveAttendanceRules(
+		ctx,
+		req.TargetUserID,
+		req.CompanyID,
+		derefString(req.Context.WorkCenterCode),
+		nil,
+		eventTime,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if !resolvedRules.AllowedSourceTypesMap[req.Source.SourceType] {
+		return nil, fmt.Errorf("source '%s' not allowed", req.Source.SourceType)
+	}
+
+	// --------------------------------------------------
 	// RESOLVE SOURCE ID
 	// --------------------------------------------------
 	if req.Source.SourceID == nil {
@@ -150,34 +189,6 @@ func (s *attendanceIngestService) IngestPunch(
 		}
 		req.Source.SourceID = &source.SourceID
 	}
-
-	// --------------------------------------------------
-	// RESOLVE RULES
-	// --------------------------------------------------
-	resolvedRules, err := s.adminService.ResolveAttendanceRules(
-		ctx,
-		req.TargetUserID,
-		req.CompanyID,
-		derefString(req.Context.WorkCenterCode),
-		nil,
-		time.Now().UTC(),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	if !resolvedRules.AllowedSourceTypesMap[req.Source.SourceType] {
-		return nil, fmt.Errorf("source '%s' not allowed", req.Source.SourceType)
-	}
-
-	// --------------------------------------------------
-	// EVENT TIME
-	// --------------------------------------------------
-	eventTime, err := s.resolveEventTime(req, sourceRules)
-	if err != nil {
-		return nil, err
-	}
-	req.ResolvedEventTime = eventTime
 
 	// --------------------------------------------------
 	// DEVICE VALIDATION
@@ -202,7 +213,7 @@ func (s *attendanceIngestService) IngestPunch(
 	}
 
 	// --------------------------------------------------
-	// 🔥 DEVICE IDENTITY RESOLUTION (FIX)
+	// DEVICE USER RESOLUTION
 	// --------------------------------------------------
 	if sourceRules.RequiresDevice {
 		if req.DeviceUserCode == nil || *req.DeviceUserCode == "" {
@@ -222,6 +233,32 @@ func (s *attendanceIngestService) IngestPunch(
 
 		req.TargetUserID = enrollment.UserID
 		req.DeviceEnrollmentID = &enrollment.MappingID
+	}
+
+	// --------------------------------------------------
+	// 🔥🔥🔥 OM AUTHORIZATION CHECK (NEW)
+	// --------------------------------------------------
+	var actorPtr *uuid.UUID
+	if req.ActorID != uuid.Nil {
+		actorPtr = &req.ActorID
+	}
+
+	allowed, reason := s.omService.CanPunchAttendance(
+		ctx,
+		req.CompanyID,
+		actorPtr,
+		req.TargetUserID,
+		req.Source.SourceType,
+		req.Context.WorkCenterCode,
+	)
+
+	if !allowed {
+		s.logger.Warn("OM authorization denied",
+			zap.String("actor_id", req.ActorID.String()),
+			zap.String("target_user_id", req.TargetUserID.String()),
+			zap.String("reason", reason),
+		)
+		return nil, fmt.Errorf("not authorized: %s", reason)
 	}
 
 	// --------------------------------------------------
@@ -261,21 +298,60 @@ func derefString(s *string) string {
 }
 
 func (s *attendanceIngestService) resolveEventTime(
+	ctx context.Context,
 	req *PunchRequest,
 	rules *ResolvedSourceRules,
 ) (time.Time, error) {
 
-	now := time.Now().UTC()
-
-	if rules.IsSystem || rules.IsSelfService {
-		return now, nil
+	// 🔥 Load company attendance rules (for timezone)
+	companyRules, err := s.attendanceRepo.GetCompanyAttendanceRules(
+		ctx,
+		req.CompanyID,
+	)
+	if err != nil {
+		return time.Time{}, err
 	}
 
-	if req.EventTime == nil {
-		return time.Time{}, errors.New("event_time required")
+	loc, err := time.LoadLocation(companyRules.Timezone)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid company timezone: %w", err)
 	}
 
-	return req.EventTime.UTC(), nil
+	// --------------------------------------------------
+	// DEVICE EVENT
+	// --------------------------------------------------
+	if rules.RequiresDevice {
+
+		if req.EventTime == nil {
+			return time.Time{}, errors.New("event_time required for device events")
+		}
+
+		// Device time interpreted in company timezone
+		deviceLocalTime := req.EventTime.In(loc)
+
+		// Store in UTC
+		return deviceLocalTime.UTC(), nil
+	}
+
+	// --------------------------------------------------
+	// SYSTEM EVENT
+	// --------------------------------------------------
+	if rules.IsSystem {
+		return time.Now().UTC(), nil
+	}
+
+	// --------------------------------------------------
+	// SELF PUNCH (🔥 YOUR CASE)
+	// --------------------------------------------------
+
+	// Ignore client time completely
+	nowUTC := time.Now().UTC()
+
+	// Convert to company timezone
+	nowInPolicyZone := nowUTC.In(loc)
+
+	// Store back in UTC (Postgres will handle internally)
+	return nowInPolicyZone.UTC(), nil
 }
 
 func (s *attendanceIngestService) createAttendanceEvent(

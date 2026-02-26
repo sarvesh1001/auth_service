@@ -2,7 +2,7 @@ package service
 
 import (
 	"context"
-	"encoding/json" // 👈 ADD THIS
+	"encoding/json"
 	"time"
 
 	"auth-service/internal/hr/models/attendance"
@@ -110,11 +110,28 @@ func (s *attendanceBatchIngestService) IngestBatch(
 	req *AttendanceBatchIngestRequest,
 ) error {
 
+	// 🔥 ENTRY LOG
+	s.logger.Info("IngestBatch START",
+		zap.String("company_id", req.CompanyID.String()),
+		zap.String("device_id", req.DeviceID),
+		zap.String("source_type", req.SourceType),
+		zap.String("batch_ref", req.BatchRef),
+		zap.Int("event_count", len(req.Events)),
+	)
+
 	// 1️⃣ Validate device
 	device, err := s.deviceRepo.GetActiveDevice(ctx, req.CompanyID, req.DeviceID)
 	if err != nil || device == nil || !device.IsTrusted {
+		s.logger.Error("Device validation failed",
+			zap.String("device_id", req.DeviceID),
+			zap.Error(err),
+		)
 		return repository.ErrValidationFailed
 	}
+	s.logger.Info("Device validated",
+		zap.String("device_id", device.DeviceID),
+		zap.Bool("is_trusted", device.IsTrusted),
+	)
 
 	// 2️⃣ Idempotency
 	exists, err := s.batchRepo.ExistsByRef(
@@ -124,15 +141,22 @@ func (s *attendanceBatchIngestService) IngestBatch(
 		req.BatchRef,
 	)
 	if err != nil {
+		s.logger.Error("Idempotency check failed",
+			zap.String("batch_ref", req.BatchRef),
+			zap.Error(err),
+		)
 		return err
 	}
 	if exists {
-		s.logger.Info("Batch already processed",
+		s.logger.Info("Batch already processed, skipping",
 			zap.String("batch_ref", req.BatchRef),
 			zap.String("device_id", req.DeviceID),
 		)
 		return nil
 	}
+	s.logger.Info("Batch is new, proceeding",
+		zap.String("batch_ref", req.BatchRef),
+	)
 
 	// 3️⃣ Create batch
 	batch := &repository.AttendancePunchBatch{
@@ -146,8 +170,16 @@ func (s *attendanceBatchIngestService) IngestBatch(
 	}
 
 	if err := s.batchRepo.CreateBatch(ctx, batch); err != nil {
+		s.logger.Error("Failed to create batch record",
+			zap.String("batch_id", batch.BatchID.String()),
+			zap.Error(err),
+		)
 		return err
 	}
+	s.logger.Info("Batch record created",
+		zap.String("batch_id", batch.BatchID.String()),
+		zap.Int("total_events", batch.TotalEvents),
+	)
 
 	successCount := 0
 	failureCount := 0
@@ -169,8 +201,15 @@ func (s *attendanceBatchIngestService) IngestBatch(
 	})
 
 	// 5️⃣ Process events (PARTIAL FAILURE SAFE)
-	for _, event := range req.Events {
+	for i, event := range req.Events {
+		s.logger.Info("Processing event",
+			zap.Int("event_index", i),
+			zap.String("external_ref", event.ExternalRef),
+			zap.String("event_type", event.EventType),
+			zap.Time("event_time", event.EventTime),
+		)
 
+		// Resolve user
 		userID, err := s.enrollmentService.ResolveUser(
 			ctx,
 			req.CompanyID,
@@ -179,10 +218,18 @@ func (s *attendanceBatchIngestService) IngestBatch(
 			event.ExternalRef,
 		)
 		if err != nil {
+			s.logger.Error("User resolution failed",
+				zap.String("external_ref", event.ExternalRef),
+				zap.Error(err),
+			)
 			s.recordFailure(ctx, batch, event, "user_resolution_failed: "+err.Error())
 			failureCount++
 			continue
 		}
+		s.logger.Info("User resolved",
+			zap.String("external_ref", event.ExternalRef),
+			zap.String("user_id", userID.String()),
+		)
 
 		punchReq := &PunchRequest{
 			CompanyID:    req.CompanyID,
@@ -202,12 +249,28 @@ func (s *attendanceBatchIngestService) IngestBatch(
 			},
 		}
 
-		_, err = s.ingestService.IngestPunch(ctx, punchReq)
+		// 🔥 Log before calling IngestPunch
+		s.logger.Info("Calling IngestPunch for event",
+			zap.String("external_ref", event.ExternalRef),
+			zap.String("user_id", userID.String()),
+		)
+
+		eventResult, err := s.ingestService.IngestPunch(ctx, punchReq)
 		if err != nil {
+			s.logger.Error("IngestPunch failed",
+				zap.String("external_ref", event.ExternalRef),
+				zap.Error(err),
+			)
 			s.recordFailure(ctx, batch, event, "punch_ingest_failed: "+err.Error())
 			failureCount++
 			continue
 		}
+
+		// 🔥 Log after successful ingest
+		s.logger.Info("IngestPunch SUCCESS for event",
+			zap.String("external_ref", event.ExternalRef),
+			zap.String("event_id", eventResult.AttendanceEventID.String()),
+		)
 
 		successCount++
 
@@ -230,18 +293,37 @@ func (s *attendanceBatchIngestService) IngestBatch(
 		})
 	}
 
-	// 6️⃣ Final batch status
+	// 6️⃣ Log summary after processing all events
+	s.logger.Info("Batch processing completed",
+		zap.String("batch_id", batch.BatchID.String()),
+		zap.Int("success_count", successCount),
+		zap.Int("failure_count", failureCount),
+		zap.Int("total_events", len(req.Events)),
+	)
+
+	// 7️⃣ Final batch status
+	var updateErr error
 	if successCount == 0 && failureCount > 0 {
-		err = s.batchRepo.MarkFailed(ctx, batch.BatchID, "all_events_failed")
+		updateErr = s.batchRepo.MarkFailed(ctx, batch.BatchID, "all_events_failed")
 	} else {
-		err = s.batchRepo.MarkProcessed(ctx, batch.BatchID)
+		updateErr = s.batchRepo.MarkProcessed(ctx, batch.BatchID)
 	}
 
-	if err != nil {
+	if updateErr != nil {
 		s.logger.Error(
 			"Failed to update batch status",
 			zap.String("batch_id", batch.BatchID.String()),
-			zap.Error(err),
+			zap.Error(updateErr),
+		)
+	} else {
+		s.logger.Info("Batch status updated successfully",
+			zap.String("batch_id", batch.BatchID.String()),
+			zap.String("status", func() string {
+				if successCount == 0 && failureCount > 0 {
+					return "failed"
+				}
+				return "processed"
+			}()),
 		)
 	}
 
@@ -283,7 +365,7 @@ func (s *attendanceBatchIngestService) recordFailure(
 		EventType:      &event.EventType,
 		EventTime:      &event.EventTime,
 		FailureReason:  reason,
-		RawEvent:       rawJSON, // ✅ FIXED (jsonb safe)
+		RawEvent:       rawJSON,
 		CreatedAt:      time.Now().UTC(),
 	}
 
@@ -292,6 +374,12 @@ func (s *attendanceBatchIngestService) recordFailure(
 			"Failed to persist batch failure",
 			zap.String("batch_id", batch.BatchID.String()),
 			zap.Error(err),
+		)
+	} else {
+		s.logger.Info("Batch failure recorded",
+			zap.String("failure_id", failure.FailureID.String()),
+			zap.String("external_ref", event.ExternalRef),
+			zap.String("reason", reason),
 		)
 	}
 }

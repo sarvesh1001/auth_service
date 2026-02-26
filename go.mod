@@ -20,14 +20,13 @@ require (
 	github.com/jackc/pgx/v4 v4.18.2
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/joho/godotenv v1.5.1
-	github.com/jung-kurt/gofpdf v1.16.2
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.14.0
 	github.com/segmentio/kafka-go v0.4.49
 	github.com/spaolacci/murmur3 v1.1.0
 	go.uber.org/zap v1.27.0
-	golang.org/x/crypto v0.43.0
-	golang.org/x/sync v0.17.0
+	golang.org/x/crypto v0.48.0
+	golang.org/x/sync v0.19.0
 )
 
 require (
@@ -73,8 +72,8 @@ require (
 	go.opentelemetry.io/otel/metric v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/sys v0.37.0 // indirect
-	golang.org/x/text v0.30.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

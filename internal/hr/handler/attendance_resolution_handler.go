@@ -298,3 +298,61 @@ func (h *AttendanceResolutionHandler) respondWithError(
 		"error":   message,
 	})
 }
+func (h *AttendanceResolutionHandler) BatchResolveByPeriod(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	ctx := r.Context()
+
+	companyID, err := getCompanyIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var req BatchResolveByPeriodRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if len(req.UserIDs) == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "at least one user_id is required")
+		return
+	}
+
+	if req.StartDate.IsZero() || req.EndDate.IsZero() {
+		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required")
+		return
+	}
+
+	if req.EndDate.Before(req.StartDate) {
+		h.respondWithError(w, http.StatusBadRequest, "end_date cannot be before start_date")
+		return
+	}
+
+	err = h.resolutionService.ResolvePeriod(
+		ctx,
+		companyID,
+		req.UserIDs,
+		req.StartDate,
+		req.EndDate,
+		req.Recalculate,
+	)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to resolve period")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Attendance period resolved successfully",
+	})
+}
+
+type BatchResolveByPeriodRequest struct {
+	UserIDs     []uuid.UUID `json:"user_ids"`
+	StartDate   time.Time   `json:"start_date"`
+	EndDate     time.Time   `json:"end_date"`
+	Recalculate bool        `json:"recalculate,omitempty"`
+}

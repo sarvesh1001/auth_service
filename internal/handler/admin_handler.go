@@ -7999,6 +7999,16 @@ func (h *AdminHandler) GetDepartmentSuggestions(w http.ResponseWriter, r *http.R
 
 // handler/admin_handler.go
 // Add these methods to the AdminHandler struct
+type CreatePositionRequest struct {
+	CompanyID          uuid.UUID `json:"company_id"`
+	DepartmentID       uuid.UUID `json:"department_id"`
+	Title              string    `json:"title"`
+	IsOpen             *bool     `json:"is_open"`
+	IsSchedulable      *bool     `json:"is_schedulable"`
+	AttendanceRequired *bool     `json:"attendance_required"`
+	OvertimeAllowed    *bool     `json:"overtime_allowed"`
+	WorkCenterCode     string    `json:"work_center_code"`
+}
 
 // Updated CreatePosition handler
 func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
@@ -8026,15 +8036,30 @@ func (h *AdminHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 
 	req.CompanyID = companyID
 
-	// Set default values if not provided
-	if req.IsSchedulable == false && !r.Body.(*util.RequestBodyTracker).FieldExists("is_schedulable") {
-		req.IsSchedulable = true
+	// ===== DEFAULT VALUES (Pointer-safe) =====
+
+	// Default IsOpen = true
+	if req.IsOpen == nil {
+		defaultVal := true
+		req.IsOpen = &defaultVal
 	}
-	if req.AttendanceRequired == false && !r.Body.(*util.RequestBodyTracker).FieldExists("attendance_required") {
-		req.AttendanceRequired = true
+
+	// Default IsSchedulable = true
+	if req.IsSchedulable == nil {
+		defaultVal := true
+		req.IsSchedulable = &defaultVal
 	}
-	if req.OvertimeAllowed == true && !r.Body.(*util.RequestBodyTracker).FieldExists("overtime_allowed") {
-		req.OvertimeAllowed = false
+
+	// Default AttendanceRequired = true
+	if req.AttendanceRequired == nil {
+		defaultVal := true
+		req.AttendanceRequired = &defaultVal
+	}
+
+	// Default OvertimeAllowed = false
+	if req.OvertimeAllowed == nil {
+		defaultVal := false
+		req.OvertimeAllowed = &defaultVal
 	}
 
 	position, err := h.companyService.CreatePosition(ctx, &req, requesterID)
@@ -8423,14 +8448,16 @@ type CreateCompanyRequest struct {
 	SubscriptionDays   int      `json:"subscription_days" validate:"min=0,max=30"`
 	Departments        []string `json:"departments"`
 
-	// 🏭 Work Center (mandatory now)
+	// ✅ NEW FIELD
+	FinancialYearStartMonth int `json:"financial_year_start_month" validate:"required,min=1,max=12"`
+
+	// Work Center
 	WorkCenterCode   string  `json:"work_center_code" validate:"required,max=100"`
 	WorkCenterName   string  `json:"work_center_name" validate:"required,max=255"`
 	WorkCenterDesc   *string `json:"work_center_description,omitempty"`
 	WorkCenterTZ     string  `json:"work_center_timezone" validate:"required"`
 	WorkCenterActive bool    `json:"work_center_is_active"`
 
-	// 👤 Owner position overrides (optional)
 	PositionWorkCenterCode *string `json:"position_work_center_code,omitempty"`
 }
 
@@ -8470,14 +8497,15 @@ func (h *AdminHandler) CreateCompany(w http.ResponseWriter, r *http.Request) {
 		SubscriptionDays:   req.SubscriptionDays,
 		Departments:        req.Departments,
 
-		// Work center
+		// ✅ NEW
+		FinancialYearStartMonth: req.FinancialYearStartMonth,
+
 		WorkCenterCode:   req.WorkCenterCode,
 		WorkCenterName:   req.WorkCenterName,
 		WorkCenterDesc:   req.WorkCenterDesc,
 		WorkCenterTZ:     req.WorkCenterTZ,
 		WorkCenterActive: req.WorkCenterActive,
 
-		// Owner position
 		PositionWorkCenterCode: req.PositionWorkCenterCode,
 	}
 

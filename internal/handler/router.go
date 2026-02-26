@@ -1,6 +1,7 @@
 package handler
 
 import (
+	biometricHandler "auth-service/internal/hr/biometric/handler"
 	hrHandler "auth-service/internal/hr/handler"
 	leavehandler "auth-service/internal/hr/leave/handler"
 	middle "auth-service/internal/hr/middleware"
@@ -39,7 +40,6 @@ func NewRouter(
 	leaveAdminHandler *leavehandler.LeaveAdminHandler,
 	leaveRequestHandler *leavehandler.LeaveRequestHandler,
 	leaveQueryHandler *leavehandler.LeaveQueryHandler,
-	payrollAdminHandler *payrollhandler.PayrollAdminHandler,
 	payrollRunHandler *payrollhandler.PayrollRunHandler,
 	deviceHandler *hrHandler.DeviceHandler,
 	attendanceAdminHandler *hrHandler.AttendanceAdminHandler,
@@ -54,10 +54,21 @@ func NewRouter(
 	deviceAuthMiddleware *middle.DeviceAuthMiddleware,
 	deviceTokenAdminHandler *hrHandler.DeviceTokenAdminHandler,
 	attendanceSourceAdminHandler *hrHandler.AttendanceSourceAdminHandler,
+	leavePolicyResolutionHandler *leavehandler.LeavePolicyResolutionHandler,
+	compHandler *payrollhandler.CompensationHandler,
+	adjHandler *payrollhandler.PayrollAdjustmentHandler,
+	cmdHandler *payrollhandler.PayrollCommandHandler,
+	lockHandler *payrollhandler.PayrollLockHandler,
+	queryHandler *payrollhandler.PayrollQueryHandler,
+	runCmdHandler *payrollhandler.PayrollRunHandler,
+	structHandler *payrollhandler.SalaryStructureHandler,
+	statHandler *payrollhandler.StatutoryProfileHandler,
+	attendanceRuleHandler *payrollhandler.AttendanceRuleHandler,
+	employeeFineHandler *payrollhandler.EmployeeFineHandler,
+	biometricEnrollmentHandler *biometricHandler.BiometricEnrollmentHandler,
+	biometricSyncHandler *biometricHandler.BiometricSyncHandler,
 ) chi.Router {
 	router := chi.NewRouter()
-
-	// Middleware stack
 	router.Use(chiMiddleware.RequestID)
 	router.Use(chiMiddleware.RealIP)
 	router.Use(LoggerMiddleware(logger))
@@ -72,8 +83,6 @@ func NewRouter(
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
-
-	// Health endpoint
 	router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		logger.Info("Health check requested")
 		w.Header().Set("Content-Type", "application/json")
@@ -83,18 +92,12 @@ func NewRouter(
 			"time":    time.Now().UTC().Format(time.RFC3339),
 		})
 	})
-
-	// API v1 routes
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", adminHandler.HealthCheckHandler)
-
-		// Setup routes
 		r.Route("/setup", func(r chi.Router) {
 			r.Post("/super-admin", adminHandler.InitSuperAdminHandler)
 			r.Get("/super-admin/status", adminHandler.CheckSuperAdminStatusHandler)
 		})
-
-		// Admin auth routes
 		r.Route("/admin-auth", func(r chi.Router) {
 			r.Post("/login/initiate", adminHandler.InitiateAdminLogin)
 			r.Post("/login/verify-otp", adminHandler.VerifyAdminOTPLogin)
@@ -107,13 +110,9 @@ func NewRouter(
 			r.Post("/logout", adminHandler.LogoutAdmin)
 			r.Get("/health", adminHandler.HealthCheck)
 		})
-
-		// Public auth routes
 		authHandler.RegisterPublicRoutes(r)
 		authHandler.RegisterUserPublicRoutes(r)
 		otpHandler.RegisterRoutes(r)
-
-		// Web login/pairing routes
 		r.Route("/web/login", func(r chi.Router) {
 			r.Get("/qr", pairingHandler.GenerateQR)
 			r.Get("/status", pairingHandler.Status)
@@ -124,42 +123,37 @@ func NewRouter(
 				authMiddleware.SessionValidationMiddleware(sessionService, logger),
 			).Post("/pair", pairingHandler.Pair)
 		})
-
 		r.Route("/companies/{companyID}/attendance-device", func(r chi.Router) {
 			r.Route("/events", func(r chi.Router) {
 				r.Use(deviceAuthMiddleware.Middleware)
 				r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
-				r.Post("/punch", attendanceIngestHandler.DevicePunchAttendance) // ✅ FIXED
+				r.Post("/punch", attendanceIngestHandler.DevicePunchAttendance)
 			})
-
 			r.Route("/batch", func(r chi.Router) {
-				r.Use(deviceAuthMiddleware.MiddlewareForDeviceOnly) // ✅ DEVICE AUTH ONLY
+				r.Use(deviceAuthMiddleware.MiddlewareForDeviceOnly)
 				r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
-
-				// Ingest batch
 				r.Post("/ingest", attendanceBatchHandler.BatchPunch)
-
-				// Batch status
 				r.Get("/{batch_ref}/status", attendanceBatchHandler.GetBatchStatus)
-
-				// ✅ ✅ ADD THIS LINE HERE (THIS IS THE ANSWER)
 				r.Get("/{batch_ref}/failures", attendanceBatchHandler.GetBatchFailures)
 			})
-
 			r.With(
 				deviceAuthMiddleware.MiddlewareForDeviceOnly,
 				middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger),
 			).Post("/device/heartbeat", deviceHeartbeatHandler.Heartbeat)
 		})
-
-		// JWT-protected routes
+		r.Route("/companies/{companyID}/biometric-device", func(r chi.Router) {
+			r.Use(deviceAuthMiddleware.Middleware)
+			r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
+			r.Post("/sync", biometricSyncHandler.SyncEmbeddings)
+			r.Get("/full/{deviceID}", biometricSyncHandler.FullSync)
+			r.Get("/incremental/{deviceID}", biometricSyncHandler.IncrementalSync)
+			r.Post("/reset/{deviceID}", biometricSyncHandler.ForceDeviceResync)
+			r.Get("/health", biometricSyncHandler.HealthCheck)
+		})
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService, logger))
 			r.Use(authMiddleware.SessionValidationMiddleware(sessionService, logger))
-
 			authHandler.RegisterProtectedRoutes(r)
-
-			// Company employee search routes
 			r.Route("/companies/{companyID}/employees", func(r chi.Router) {
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
 				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
@@ -173,17 +167,13 @@ func NewRouter(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 					Get("/username/{username}", authHandler.FindCompanyEmployeeByUsername)
 			})
-
-			// Company routes
 			r.Route("/companies/{companyID}", func(r chi.Router) {
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
-
 				r.Get("/", adminHandler.GetCompany)
 				r.Get("/getemployees", adminHandler.GetCompanyEmployees)
 				r.Get("/roles", adminHandler.GetCompanyRoles)
 				r.Get("/hierarchy", adminHandler.GetCompanyHierarchy)
 				r.Get("/stats", adminHandler.GetCompanyStats)
-
 				r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view", logger)).
 					Get("/departments/search", adminHandler.SearchDepartments)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view", logger)).
@@ -196,8 +186,6 @@ func NewRouter(
 					Get("/department-info", adminHandler.GetCompanyDepartmentInfo)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.view", logger)).
 					Get("/check-department-limit", adminHandler.CheckDepartmentLimit)
-
-				// Positions routes
 				r.Route("/positions", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.create", logger)).
 						Post("/", adminHandler.CreatePosition)
@@ -216,8 +204,6 @@ func NewRouter(
 							Patch("/status", adminHandler.UpdatePositionStatus)
 					})
 				})
-
-				// Departments routes
 				r.Route("/departments", func(r chi.Router) {
 					r.With(
 						authMiddleware.BitmaskPermissionMiddleware(
@@ -225,7 +211,6 @@ func NewRouter(
 							logger,
 						),
 					).Get("/root", adminHandler.GetRootDepartments)
-
 					r.Route("/{departmentID}", func(r chi.Router) {
 						r.With(
 							authMiddleware.BitmaskPermissionMiddleware(
@@ -262,12 +247,9 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update", logger)).
 							Post("/sub-departments", adminHandler.CreateSubDepartment)
 					})
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update", logger)).
 						Post("/{parentDepartmentID}/sub-departments", adminHandler.CreateSubDepartment)
 				})
-
-				// Work centers routes
 				r.Route("/work-centers", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.view", logger)).
 						Get("/", workCenterHandler.ListWorkCenters)
@@ -279,7 +261,6 @@ func NewRouter(
 						Post("/", workCenterHandler.CreateWorkCenter)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.view", logger)).
 						Get("/health", workCenterHandler.HealthCheck)
-
 					r.Route("/{workCenterCode}", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.view", logger)).
 							Get("/", workCenterHandler.GetWorkCenter)
@@ -289,65 +270,312 @@ func NewRouter(
 							Delete("/", workCenterHandler.DeleteWorkCenter)
 					})
 				})
-
-				// Payroll routes
 				r.Route("/payroll", func(r chi.Router) {
-					r.Route("/admin", func(r chi.Router) {
+					r.Route("/locks", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/dashboard", payrollAdminHandler.GetAdminDashboard)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/components", payrollAdminHandler.GetPayrollComponents)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/period/check", payrollAdminHandler.CheckPeriodLock)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/period/validate", payrollAdminHandler.ValidatePeriodNotLocked)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
-							Post("/period/lock", payrollAdminHandler.LockPeriod)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
-							Post("/period/unlock", payrollAdminHandler.UnlockPeriod)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
-							Post("/recalculate", payrollAdminHandler.ForceRecalculation)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/health", payrollAdminHandler.HealthCheck)
+							Get("/", lockHandler.ListLocks)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.update", logger)).
+							Post("/", lockHandler.CreateLock)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.update", logger)).
+							Delete("/", lockHandler.DeleteLock)
 					})
-
-					r.Route("/runs", func(r chi.Router) {
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/", payrollRunHandler.ListPayrollRuns)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.create", logger)).
-							Post("/", payrollRunHandler.CreatePayrollRun)
-						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-							Get("/summary", payrollRunHandler.GetRunSummary)
-
-						r.Route("/{runID}", func(r chi.Router) {
-							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
-								Get("/", payrollRunHandler.GetPayrollRun)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
-								Post("/calculate", payrollRunHandler.CalculatePayroll)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.approve", logger)).
-								Post("/approve", payrollRunHandler.ApprovePayrollRun)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
-								Post("/pay", payrollRunHandler.PayPayrollRun)
-							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.delete", logger)).
-								Delete("/", payrollRunHandler.DeletePayrollRun)
+					r.Route("/adjustments", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/", adjHandler.ListAdjustments)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/", adjHandler.CreateAdjustment)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/bulk", adjHandler.BulkCreateAdjustments)
+						r.Route("/{adjustmentID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Get("/", adjHandler.GetAdjustment)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Put("/", adjHandler.UpdateAdjustment)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Delete("/", adjHandler.DeleteAdjustment)
 						})
 					})
+					r.Route("/structures", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/", structHandler.ListStructures)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/", structHandler.CreateStructure)
+						r.Route("/{structureID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Get("/", structHandler.GetStructure)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Put("/", structHandler.UpdateStructure)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Post("/clone", structHandler.CloneStructure)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Post("/publish", structHandler.PublishStructure)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Delete("/", structHandler.DeactivateStructure)
+							r.Route("/components", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+									Post("/", structHandler.AddComponent)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+									Post("/reorder", structHandler.ReorderComponents)
+								r.Route("/{componentCode}", func(r chi.Router) {
+									r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+										Put("/", structHandler.UpdateComponent)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+										Delete("/", structHandler.RemoveComponent)
+								})
+							})
+						})
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/assign", structHandler.AssignToEmployee)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/assign/bulk", structHandler.BulkAssignToEmployees)
+					})
 
+					// =========================================================================
+					// NEW STATUTORY ROUTING – Company scoped, rule‑set driven
+					// =========================================================================
+					r.Route("/statutory-profiles", func(r chi.Router) {
+						// 1️⃣ COMPONENT DEFINITIONS (Company Scoped)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Get("/components", statHandler.ListComponentDefinitions)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Post("/components", statHandler.CreateComponentDefinition)
+						r.Route("/components/{statutoryCode}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Put("/", statHandler.UpdateComponentDefinition)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Delete("/", statHandler.DeleteComponentDefinition)
+						})
+
+						// 2️⃣ RULE SETS
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Get("/rule-sets", statHandler.ListRuleSets)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Post("/rule-sets", statHandler.CreateRuleSet)
+						r.Route("/rule-sets/{ruleSetID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Put("/", statHandler.UpdateRuleSet)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Delete("/", statHandler.DeactivateRuleSet)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Post("/activate", statHandler.ActivateRuleSet)
+
+							// 3️⃣ CONTRIBUTION RULES
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Post("/contributions", statHandler.CreateContributionRule)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Get("/contributions", statHandler.ListContributionRules)
+							r.Route("/contributions/{ruleID}", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Put("/", statHandler.UpdateContributionRule)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Delete("/", statHandler.DeleteContributionRule)
+							})
+
+							// 4️⃣ TAX SLABS
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Post("/slabs", statHandler.CreateTaxSlab)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Get("/slabs", statHandler.ListTaxSlabs)
+							r.Route("/slabs/{slabID}", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Put("/", statHandler.UpdateTaxSlab)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Delete("/", statHandler.DeleteTaxSlab)
+							})
+
+							// 5️⃣ LIMITS
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Post("/limits", statHandler.CreateDeductionLimit)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Get("/limits", statHandler.ListDeductionLimits)
+							r.Route("/limits/{limitID}", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Put("/", statHandler.UpdateDeductionLimit)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Delete("/", statHandler.DeleteDeductionLimit)
+							})
+
+							// 6️⃣ COMPONENT MAPPINGS
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Post("/mappings", statHandler.CreateComponentMapping)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Get("/mappings", statHandler.ListComponentMappings)
+							r.Route("/mappings/{mappingID}", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Put("/", statHandler.UpdateComponentMapping)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+									Delete("/", statHandler.DeleteComponentMapping)
+							})
+						})
+
+						// 7️⃣ EMPLOYEE PROFILES
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Get("/", statHandler.ListProfiles)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Post("/", statHandler.CreateProfile)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Post("/bulk", statHandler.BulkUpsertProfiles)
+						r.Route("/{profileID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Put("/", statHandler.UpdateProfile)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+								Delete("/", statHandler.DeactivateProfile)
+						})
+					})
+					// =========================================================================
+					// END NEW STATUTORY ROUTING
+					// =========================================================================
+
+					r.Route("/attendance-rules", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/", attendanceRuleHandler.CreateRule)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/", attendanceRuleHandler.GetRules)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/active", attendanceRuleHandler.GetActiveRules)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/exists-active", attendanceRuleHandler.ExistsActiveRuleOfType)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/types/{ruleType}", attendanceRuleHandler.GetRulesByType)
+						r.Route("/{ruleID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Get("/", attendanceRuleHandler.GetRuleByID)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Post("/versions", attendanceRuleHandler.UpdateRuleVersion)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Put("/activate", attendanceRuleHandler.ActivateRule)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Put("/deactivate", attendanceRuleHandler.DeactivateRule)
+						})
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/bulk-deactivate-by-type", attendanceRuleHandler.BulkDeactivateByType)
+					})
+					r.Route("/fines", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/", employeeFineHandler.CreateFine)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/", employeeFineHandler.ListFines)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/summary", employeeFineHandler.GetCompanyFineSummary)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/bulk", employeeFineHandler.BulkCreateFines)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
+							Post("/lock-for-payroll-run", employeeFineHandler.LockFinesForPayrollRun)
+						r.Route("/{fineID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Get("/", employeeFineHandler.GetFineByID)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Put("/", employeeFineHandler.UpdateFine)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Delete("/", employeeFineHandler.DeleteFine)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
+								Put("/process", employeeFineHandler.MarkFineAsProcessed)
+						})
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Delete("/bulk/unprocessed", employeeFineHandler.BulkDeleteUnprocessed)
+						r.Route("/employee/{userID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Get("/unprocessed", employeeFineHandler.GetEmployeeUnprocessedFines)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Get("/summary", employeeFineHandler.GetFineSummaryByEmployee)
+						})
+					})
+					r.Route("/employee/{userID}", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/salary", compHandler.GetEmployeeSalary)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/salary/snapshot", compHandler.GetSalarySnapshot)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/earnings/preview", compHandler.PreviewEarnings)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/adjustments", adjHandler.GetEmployeeAdjustmentsForPeriod)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Get("/statutory-profiles/active", statHandler.GetEmployeeActiveProfiles)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Get("/statutory-profiles/{code}/active", statHandler.GetActiveProfile)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Get("/statutory-profiles/{code}/history", statHandler.GetProfileHistory)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
+							Post("/tax-regime", statHandler.ChangeTaxRegime)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+							Get("/history", queryHandler.GetEmployeePayrollHistory)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+							Get("/ytd", queryHandler.GetEmployeeYTD)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+							Get("/statutory-summary", queryHandler.GetEmployeeStatutorySummary)
+					})
+					r.Route("/runs", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+							Get("/", queryHandler.ListRuns)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+							Get("/summary", queryHandler.GetRunSummary)
+						r.Route("/{runID}", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+								Get("/", queryHandler.GetRunExecutionStatus)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+								Get("/ledger-summary", queryHandler.GetRunLedgerSummary)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+								Get("/execution-status", queryHandler.GetRunExecutionStatus)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+								Get("/employees", queryHandler.ListEmployeesInRun)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+								Get("/statutory-summary", queryHandler.GetRunStatutorySummary)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+								Get("/export", queryHandler.ExportRunToCSV)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
+								Post("/initialize", runCmdHandler.InitializeRun)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
+								Post("/execute", runCmdHandler.ExecuteRun)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.approve", logger)).
+								Post("/approve", runCmdHandler.ApproveRun)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
+								Post("/mark-paid", runCmdHandler.MarkRunAsPaid)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.update", logger)).
+								Post("/cancel", runCmdHandler.CancelRun)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.process", logger)).
+								Post("/employees/{userID}/reprocess", cmdHandler.ReprocessEmployee)
+						})
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.create", logger)).
+							Post("/", runCmdHandler.CreateRun)
+					})
+					r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+						Get("/trend", queryHandler.GetCompanyPayrollTrend)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
-						Post("/components", payrollAdminHandler.GetPayrollComponents)
-					r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.tax.manage", logger)).
-						Get("/tax-profiles", payrollAdminHandler.GetPayrollComponents)
+						Get("/components/{componentCode}/trend", queryHandler.GetComponentBreakdownTrend)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).
+						Get("/payslip/{payrollItemID}", queryHandler.GetEmployeePayslip)
 				})
-
-				// Leave routes
 				r.Route("/leave", func(r chi.Router) {
 					r.Route("/admin", func(r chi.Router) {
+						r.Route("/policy-config", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+								Post("/", leaveAdminHandler.CreateLeavePolicy)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+								Get("/", leaveAdminHandler.ListActiveLeavePolicies)
+							r.Route("/{policyID}", func(r chi.Router) {
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+									Get("/", leaveAdminHandler.GetLeavePolicy)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+									Patch("/", leaveAdminHandler.UpdateLeavePolicy)
+								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+									Delete("/", leaveAdminHandler.DeactivateLeavePolicy)
+								r.Route("/rules", func(r chi.Router) {
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+										Post("/", leaveAdminHandler.AddPolicyRule)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+										Get("/", leaveAdminHandler.GetPolicyRules)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+										Patch("/{policyRuleID}", leaveAdminHandler.UpdatePolicyRule)
+									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+										Delete("/{policyRuleID}", leaveAdminHandler.DeletePolicyRule)
+								})
+							})
+						})
 						r.Route("/leave-types", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 								Get("/", leaveAdminHandler.ListLeaveTypes)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.create", logger)).
 								Post("/", leaveAdminHandler.CreateLeaveType)
-
 							r.Route("/{leaveTypeID}", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 									Get("/", leaveAdminHandler.GetLeaveType)
@@ -357,31 +585,36 @@ func NewRouter(
 									Delete("/", leaveAdminHandler.DeleteLeaveType)
 							})
 						})
-
 						r.Route("/entitlements", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
 								Post("/", leaveAdminHandler.CreateEntitlement)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+								Get("/", leavePolicyResolutionHandler.ListEntitlements)
 						})
-
 						r.Route("/accruals", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
 								Post("/monthly", leaveAdminHandler.ProcessMonthlyAccruals)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 								Get("/", leaveAdminHandler.GetAccrualsByDate)
 						})
-
 						r.Route("/recalculate", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
 								Post("/{entitlementID}", leaveAdminHandler.RecalculateEntitlement)
 						})
+						r.Route("/policies", func(r chi.Router) {
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+								Post("/resolve/user/{userID}", leavePolicyResolutionHandler.ResolveSingleUser)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+								Post("/resolve/batch", leavePolicyResolutionHandler.ResolveBatchUsers)
+							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+								Get("/effective/{userID}", leavePolicyResolutionHandler.GetEffectivePolicies)
+						})
 					})
-
 					r.Route("/requests", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.request", logger)).
 							Post("/", leaveRequestHandler.RequestLeave)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
 							Get("/", leaveRequestHandler.ListLeaveRequests)
-
 						r.Route("/{requestID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
 								Get("/", leaveRequestHandler.GetLeaveRequest)
@@ -392,22 +625,30 @@ func NewRouter(
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.request", logger)).
 								Post("/cancel", leaveRequestHandler.CancelLeave)
 						})
-
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.approve", logger)).
 							Get("/pending", leaveRequestHandler.GetPendingRequests)
 					})
-
 					r.Route("/query", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
 							Get("/balance", leaveQueryHandler.GetLeaveBalance)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
 							Get("/balance/{leaveTypeID}", leaveQueryHandler.GetLeaveBalanceByType)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
+							Get(
+								"/users/{userID}/balance",
+								leaveQueryHandler.GetLeaveBalanceForUser,
+							)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
+							Get(
+								"/users/{userID}/balance/{leaveTypeID}",
+								leaveQueryHandler.GetLeaveBalanceForUserByType,
+							)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
 							Get("/status", leaveQueryHandler.IsUserOnLeave)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
-							Get("/history", leaveQueryHandler.GetUserLeaveHistory)
+							Get("/users/{userID}/history", leaveQueryHandler.GetUserLeaveHistory)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
-							Get("/transactions", leaveQueryHandler.GetLeaveTransactionHistory)
+							Get("/users/{userID}/transactions", leaveQueryHandler.GetLeaveTransactionHistory)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
 							Get("/forecast", leaveQueryHandler.GetLeaveForecast)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.leave.view", logger)).
@@ -418,10 +659,13 @@ func NewRouter(
 							Get("/report/utilization", leaveQueryHandler.GetLeaveUtilizationReport)
 					})
 				})
-
-				// 🔴 FIXED: Single attendance tree - NO shadowing
 				r.Route("/attendance", func(r chi.Router) {
-					// Device management routes
+					r.With(
+						authMiddleware.BitmaskPermissionMiddleware("attendance.self.punch", logger),
+					).Post("/self/punch", attendanceIngestHandler.SelfPunchAttendance)
+					r.With(
+						authMiddleware.BitmaskPermissionMiddleware("attendance.team.punch", logger),
+					).Post("/punch", attendanceIngestHandler.PunchAttendance)
 					r.Route("/devices", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware(
 							"attendance.configure",
@@ -439,7 +683,6 @@ func NewRouter(
 							"hr.attendance.view",
 							logger,
 						)).Get("/stats", deviceHandler.GetDeviceStatistics)
-
 						r.Route("/{deviceID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware(
 								"hr.attendance.view",
@@ -469,36 +712,28 @@ func NewRouter(
 								"attendance.configure",
 								logger,
 							)).Post("/revoke-trust", deviceHandler.RevokeTrust)
-
 							r.Route("/enrollments", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware(
 									"attendance.configure",
 									logger,
 								)).Post("/", attendanceDeviceEnrollmentHandler.EnrollUser)
-
 								r.With(authMiddleware.BitmaskPermissionMiddleware(
 									"attendance.configure",
 									logger,
 								)).Delete("/", attendanceDeviceEnrollmentHandler.RevokeEnrollment)
-
-								// ✅ NEW: Unrevoke enrollment
 								r.With(authMiddleware.BitmaskPermissionMiddleware(
 									"attendance.configure",
 									logger,
 								)).Post("/unrevoke", attendanceDeviceEnrollmentHandler.UnrevokeEnrollment)
-
-								// ✅ NEW: List revoked enrollments
 								r.With(authMiddleware.BitmaskPermissionMiddleware(
 									"hr.attendance.view",
 									logger,
 								)).Get("/revoked", attendanceDeviceEnrollmentHandler.GetRevokedDeviceEnrollments)
-
 								r.With(authMiddleware.BitmaskPermissionMiddleware(
 									"hr.attendance.view",
 									logger,
 								)).Get("/", attendanceDeviceEnrollmentHandler.GetDeviceEnrollments)
 							})
-
 							r.Route("/tokens", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware(
 									"attendance.configure",
@@ -515,14 +750,12 @@ func NewRouter(
 							})
 						})
 					})
-
 					r.Route("/admin", func(r chi.Router) {
 						r.Route("/policies", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
 								Post("/", attendanceAdminHandler.CreatePolicy)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 								Get("/", attendanceAdminHandler.ListPolicies)
-
 							r.Route("/{policyID}", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 									Get("/", attendanceAdminHandler.GetPolicy)
@@ -532,31 +765,25 @@ func NewRouter(
 									Delete("/", attendanceAdminHandler.DeletePolicy)
 							})
 						})
-
 						r.Route("/rules", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 								Get("/company", attendanceAdminHandler.GetCompanyRules)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 								Get("/resolve", attendanceAdminHandler.GetResolvedRules)
 						})
-
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.configure", logger)).
 							Post("/assign-policy", attendanceAdminHandler.AssignPolicyToUser)
 					})
-
 					r.Route("/events", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
 							Post("/correction", attendanceCorrectionHandler.CreateCorrection)
-
 						r.Route("/{eventID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 								Get("/", attendanceQueryHandler.GetEvent)
 						})
-
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 							Get("/search", attendanceQueryHandler.SearchEvents)
 					})
-
 					r.Route("/summary", func(r chi.Router) {
 						r.Route("/user/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
@@ -565,7 +792,6 @@ func NewRouter(
 								Get("/range", attendanceQueryHandler.GetUserSummaries)
 						})
 					})
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 						Get("/stats", attendanceQueryHandler.GetCompanyStats)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
@@ -576,7 +802,6 @@ func NewRouter(
 						Get("/event-types", attendanceQueryHandler.ListEventTypes)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.attendance.view", logger)).
 						Get("/source-types", attendanceQueryHandler.ListSourceTypes)
-
 					r.Route("/resolve", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
 							Post("/event", attendanceResolutionHandler.ResolveEvent)
@@ -585,15 +810,14 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
 							Post("/batch", attendanceResolutionHandler.BatchResolve)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
+							Post("/period", attendanceResolutionHandler.BatchResolveByPeriod)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("attendance.correct", logger)).
 							Post("/day/{userID}/{date}", attendanceResolutionHandler.ResolveDayByPath)
 					})
 				})
-
-				// Scheduling routes
 				r.Route("/scheduling", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("it.system.config.view", logger)).
 						Get("/health", schedulingHandler.HealthCheck)
-
 					r.Route("/calendars", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/", schedulingHandler.ListWorkCalendars)
@@ -608,14 +832,12 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/{calendarID}/availability", schedulingHandler.GetCalendarAvailability)
 					})
-
 					r.Route("/holidays", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.update", logger)).
 							Post("/", schedulingHandler.AddHolidayToCalendar)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.update", logger)).
 							Post("/process", schedulingHandler.ProcessHolidayForDate)
 					})
-
 					r.Route("/templates", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/", schedulingHandler.ListScheduleTemplates)
@@ -628,7 +850,6 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.delete", logger)).
 							Delete("/{templateID}", schedulingHandler.DeleteScheduleTemplate)
 					})
-
 					r.Route("/instances", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/", schedulingHandler.ListScheduleInstances)
@@ -638,7 +859,6 @@ func NewRouter(
 							Post("/bulk", schedulingHandler.BulkCreateScheduleInstances)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Post("/search", schedulingHandler.SearchScheduleInstances)
-
 						r.Route("/{instanceID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 								Get("/", schedulingHandler.GetScheduleInstance)
@@ -648,7 +868,6 @@ func NewRouter(
 								Delete("/{instanceID}", schedulingHandler.DeleteScheduleInstance)
 						})
 					})
-
 					r.Route("/position-based", func(r chi.Router) {
 						r.Route("/users/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
@@ -656,18 +875,15 @@ func NewRouter(
 							r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 								Get("/position", schedulingHandler.GetUserScheduledPosition)
 						})
-
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.create", logger)).
 							Post("/instances", schedulingHandler.CreateScheduleInstanceFromPosition)
 					})
-
 					r.Route("/generate", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.create", logger)).
 							Post("/user/{userID}", schedulingHandler.GenerateScheduleForUser)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.create", logger)).
 							Post("/company", schedulingHandler.GenerateScheduleForCompany)
 					})
-
 					r.Route("/overrides", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.create", logger)).
 							Post("/", schedulingHandler.CreateScheduleOverride)
@@ -680,7 +896,6 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.delete", logger)).
 							Delete("/{overrideID}", schedulingHandler.DeleteScheduleOverride)
 					})
-
 					r.Route("/work-centers", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.view", logger)).
 							Get("/", schedulingHandler.ListWorkCenters)
@@ -695,7 +910,6 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.assign", logger)).
 							Post("/assign/{assignmentID}/end", schedulingHandler.EndUserWorkCenterAssignment)
 					})
-
 					r.Route("/work-center-shifts", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.create", logger)).
 							Post("/", schedulingHandler.CreateWorkCenterShiftMapping)
@@ -704,7 +918,6 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/", schedulingHandler.GetWorkCenterShifts)
 					})
-
 					r.Route("/positions", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.position.view", logger)).
 							Get("/{positionID}/summary", schedulingHandler.GetPositionScheduleSummary)
@@ -713,14 +926,12 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/{positionID}/instances", schedulingHandler.GetScheduleInstancesByPosition)
 					})
-
 					r.Route("/availability", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/check", schedulingHandler.CheckScheduleAvailability)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/conflict-check", schedulingHandler.ValidateScheduleConflict)
 					})
-
 					r.Route("/reports", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/stats", schedulingHandler.GetScheduleStats)
@@ -731,12 +942,10 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Get("/work-centers/schedules", schedulingHandler.GetWorkCenterSchedulesByCompany)
 					})
-
 					r.Route("/bulk", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.task.create", logger)).
 							Post("/instances", schedulingHandler.BulkCreateScheduleInstances)
 					})
-
 					r.Route("/query", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("operations.shift.view", logger)).
 							Post("/search", schedulingHandler.SearchScheduleInstances)
@@ -744,8 +953,6 @@ func NewRouter(
 							Get("/user/{userID}/assignment", schedulingHandler.GetUserCurrentAssignment)
 					})
 				})
-
-				// Audit routes
 				r.Route("/audit", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.audit.view", logger)).
 						Get("/logs", auditHandler.GetCompanyAuditLogs)
@@ -756,8 +963,6 @@ func NewRouter(
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.audit.view", logger)).
 						Get("/stats", auditHandler.GetCompanyAuditStats)
 				})
-
-				// HR routes
 				r.Route("/hr", func(r chi.Router) {
 					r.Route("/employees", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
@@ -770,7 +975,6 @@ func NewRouter(
 							Get("/stats", employeeHandler.GetEmployeeStats)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 							Get("/export", employeeHandler.ExportEmployeeData)
-
 						r.Route("/{employeeID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 								Get("/", employeeHandler.GetEmployeeProfile)
@@ -778,13 +982,11 @@ func NewRouter(
 								Put("/", employeeHandler.UpdateEmployeeProfile)
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.delete", logger)).
 								Delete("/", employeeHandler.DeleteEmployeeProfile)
-
 							r.Route("/documents", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.document.view", logger)).
 									Get("/", employeeHandler.GetEmployeeDocuments)
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.document.upload", logger)).
 									Post("/", employeeHandler.UploadEmployeeDocument)
-
 								r.Route("/{documentID}", func(r chi.Router) {
 									r.With(authMiddleware.BitmaskPermissionMiddleware("hr.document.view", logger)).
 										Get("/", employeeHandler.DownloadEmployeeDocument)
@@ -794,12 +996,10 @@ func NewRouter(
 										Delete("/", employeeHandler.DeleteEmployeeDocument)
 								})
 							})
-
 							r.Route("/department-history", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 									Get("/", employeeHandler.GetDepartmentHistory)
 							})
-
 							r.Route("/exit", func(r chi.Router) {
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 									Get("/", employeeHandler.GetEmployeeExit)
@@ -808,11 +1008,9 @@ func NewRouter(
 								r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.terminate", logger)).
 									Post("/rehire", employeeHandler.RehireEmployee)
 							})
-
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 								Get("/role-history", employeeHandler.GetRoleHistory)
 						})
-
 						r.Route("/user/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 								Get("/profile", employeeHandler.GetEmployeeProfileByUserID)
@@ -822,15 +1020,31 @@ func NewRouter(
 								Post("/documents", employeeHandler.UploadEmployeeDocument)
 						})
 					})
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 						Get("/health", employeeHandler.HealthCheck)
 				})
-
-				// Org units routes
+				r.Route("/biometric", func(r chi.Router) {
+					r.Route("/face", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+							Post("/enroll", biometricEnrollmentHandler.EnrollFace)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+							Post("/re-enroll", biometricEnrollmentHandler.ReEnrollFace)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+							Post("/deactivate", biometricEnrollmentHandler.DeactivateFace)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+							Post("/activate", biometricEnrollmentHandler.ActivateFace)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+							Get("/{userID}", biometricEnrollmentHandler.GetFaceEmbedding)
+						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
+							Get("/", biometricEnrollmentHandler.ListActiveFaceEmbeddings)
+					})
+					r.Route("/model", func(r chi.Router) {
+						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config", logger)).
+							Post("/rotate", biometricEnrollmentHandler.RotateModelVersion)
+					})
+				})
 				r.Route("/org-units", func(r chi.Router) {
 					r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 						Get("/", orgUnitHandler.ListOrgUnits)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
@@ -841,7 +1055,6 @@ func NewRouter(
 						Post("/", orgUnitHandler.CreateOrgUnit)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("it.system.config.view", logger)).
 						Get("/health", orgUnitHandler.HealthCheck)
-
 					r.Route("/{orgUnitID}", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 							Get("/", orgUnitHandler.GetOrgUnit)
@@ -857,7 +1070,6 @@ func NewRouter(
 							Post("/roles", orgUnitHandler.AssignRole)
 						r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 							Get("/roles", orgUnitHandler.GetOrgUnitRoles)
-
 						r.Route("/members/{userID}", func(r chi.Router) {
 							r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
 								Put("/", orgUnitHandler.UpdateMember)
@@ -867,12 +1079,9 @@ func NewRouter(
 								Delete("/roles/{role}", orgUnitHandler.RemoveRole)
 						})
 					})
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.view", logger)).
 						Get("/user/{userID}/memberships", orgUnitHandler.GetUserMemberships)
 				})
-
-				// RBAC routes
 				r.Route("/rbac", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("administration.company.update", logger)).
 						Post("/roles", rbacHandler.CreateRole)
@@ -924,59 +1133,42 @@ func NewRouter(
 						Post("/bulk-assign", rbacHandler.BulkAssignRoles)
 				})
 			})
-
-			// Admin-only routes
+			r.Route("/internal/leave", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+					Post("/resolve/onboarding", leavePolicyResolutionHandler.ResolveOnboarding)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).
+					Post("/resolve/position-change", leavePolicyResolutionHandler.ResolvePositionChange)
+			})
 			r.Route("/admin", func(r chi.Router) {
 				r.Use(AdminSessionMiddleware(logger))
-
 				r.Route("/admin/companies/{companyID}/attendance", func(r chi.Router) {
-
-					// ===============================
-					// COMPANY ATTENDANCE RULES
-					// ===============================
 					r.With(authMiddleware.BitmaskPermissionMiddleware(
 						"attendance.configure",
 						logger,
 					)).Get("/rules", attendanceAdminHandler.GetCompanyRules)
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware(
 						"attendance.configure",
 						logger,
 					)).Put("/rules", attendanceAdminHandler.UpdateCompanyRules)
-
-					// ===============================
-					// 🔥 ATTENDANCE SOURCES (ADMIN)
-					// ===============================
 					r.Route("/sources", func(r chi.Router) {
-
-						// List sources
-						// GET /admin/companies/{companyID}/attendance/sources
 						r.With(authMiddleware.BitmaskPermissionMiddleware(
 							"attendance.configure",
 							logger,
 						)).Get("/", attendanceSourceAdminHandler.ListSources)
-
-						// Explicit admin create
-						// POST /admin/companies/{companyID}/attendance/sources
 						r.With(authMiddleware.BitmaskPermissionMiddleware(
 							"attendance.configure",
 							logger,
 						)).Post("/", attendanceSourceAdminHandler.CreateSource)
-
-						// Enable / Disable source
-						// PUT /admin/companies/{companyID}/attendance/sources/{sourceType}
 						r.With(authMiddleware.BitmaskPermissionMiddleware(
 							"attendance.configure",
 							logger,
 						)).Put("/{sourceType}", attendanceSourceAdminHandler.UpdateSourceStatus)
 					})
 				})
-
 				r.Route("/system/hr", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.system_config", logger)).
 						Post("/enforce-exits", employeeHandler.EnforceEmployeeExits)
 				})
-
 				r.Route("/admins", func(r chi.Router) {
 					r.Get("/stats", adminHandler.GetStats)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.create", logger)).
@@ -1011,7 +1203,6 @@ func NewRouter(
 						Get("/search/suggestions", adminHandler.GetAdminSuggestions)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 						Get("/search/analytics", adminHandler.GetAdminSearchAnalytics)
-
 					r.Route("/{adminID}", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 							Get("/", adminHandler.GetAdminUser)
@@ -1062,11 +1253,9 @@ func NewRouter(
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update", logger)).
 							Post("/reset-failed-login", adminHandler.ResetAdminFailedLoginAttempts)
 					})
-
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update", logger)).
 						Post("/bulk-update-reports-to", adminHandler.BulkUpdateReportsTo)
 				})
-
 				r.Route("/roles", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.create", logger)).
 						Post("/employee", adminHandler.CreateEmployeeRole)
@@ -1084,7 +1273,6 @@ func NewRouter(
 						Get("/search", adminHandler.SearchAdminRoles)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
 						Get("/type/{roleType}", adminHandler.GetAdminRolesByType)
-
 					r.Route("/{roleID}", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
 							Get("/", adminHandler.GetAdminRole)
@@ -1102,17 +1290,14 @@ func NewRouter(
 							Delete("/departments/{departmentID}", adminHandler.RemoveDepartmentFromAdminRole)
 					})
 				})
-
 				r.Route("/departments", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_departments", logger)).
 						Get("/", adminHandler.GetSystemDepartments)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 						Get("/{departmentID}/admins", adminHandler.GetAdminsByDepartment)
 				})
-
 				r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update", logger)).
 					Post("/mpin/change-by-admin", adminHandler.ChangeAdminMPINByAdmin)
-
 				r.Route("/user-management", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 						Get("/search/advanced", adminHandler.SearchUsersAdvanced)
@@ -1128,7 +1313,6 @@ func NewRouter(
 						Get("/recently-active", adminHandler.GetRecentlyActiveUsers)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 						Get("/banned", adminHandler.GetBannedUsers)
-
 					r.Route("/{userID}", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.update", logger)).
 							Put("/", adminHandler.UpdateUser)
@@ -1140,7 +1324,6 @@ func NewRouter(
 							Post("/unban", adminHandler.UnbanUser)
 					})
 				})
-
 				r.Route("/companies", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.create", logger)).
 						Post("/", adminHandler.CreateCompany)
@@ -1162,7 +1345,6 @@ func NewRouter(
 						Get("/expiring", adminHandler.GetCompaniesWithExpiringSubscription)
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
 						Get("/owner/{ownerID}/search", adminHandler.SearchCompaniesByOwner)
-
 					r.Route("/{companyID}", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("admin.company.view", logger)).
 							Get("/", adminHandler.GetCompany)
@@ -1192,7 +1374,6 @@ func NewRouter(
 							Post("/reactivate", adminHandler.ReactivateCompany)
 					})
 				})
-
 				r.Route("/system", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_departments", logger)).
 						Get("/departments", adminHandler.GetSystemDepartments)
@@ -1201,10 +1382,8 @@ func NewRouter(
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.manage_permissions", logger)).
 						Get("/permissions/module/{module}", adminHandler.GetPermissionsByModule)
 				})
-
 				r.With(authMiddleware.BitmaskPermissionMiddleware("admin.employee.view", logger)).
 					Post("/bulk-avatar-info", adminHandler.BulkGetAvatarInfo)
-
 				r.Route("/audit", func(r chi.Router) {
 					r.With(authMiddleware.BitmaskPermissionMiddleware("admin.super.audit_logs", logger)).
 						Get("/logs", auditHandler.GetSystemAuditLogs)
@@ -1216,8 +1395,6 @@ func NewRouter(
 			})
 		})
 	})
-
-	// 404 handler
 	router.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
@@ -1228,8 +1405,6 @@ func NewRouter(
 			"service": "auth-service",
 		})
 	})
-
-	// 405 handler
 	router.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1240,7 +1415,6 @@ func NewRouter(
 			"service": "auth-service",
 		})
 	})
-
 	return router
 }
 

@@ -62,9 +62,11 @@ type AttendanceQueryService interface {
 	) ([]*attendance.AttendancePolicy, error)
 	GetUserCurrentAttendancePolicy(
 		ctx context.Context,
+		companyID uuid.UUID,
 		userID uuid.UUID,
 		date time.Time,
 	) (*attendance.AttendancePolicy, error)
+
 	GetAttendanceDailySummaryByUserDate(
 		ctx context.Context,
 		userID uuid.UUID,
@@ -967,12 +969,16 @@ func (qs *attendanceQueryServiceImpl) GetAttendancePolicyByID(
 
 func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
 	ctx context.Context,
+	companyID uuid.UUID,
 	userID uuid.UUID,
 	date time.Time,
 ) (*attendance.AttendancePolicy, error) {
 
 	startTime := time.Now()
 
+	if companyID == uuid.Nil {
+		return nil, fmt.Errorf("company ID is required")
+	}
 	if userID == uuid.Nil {
 		return nil, fmt.Errorf("user ID is required")
 	}
@@ -980,32 +986,17 @@ func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
 		date = time.Now()
 	}
 
-	// ------------------------------------------------------------
-	// 1️⃣ USER-LEVEL POLICY (explicit assignment)
-	// ------------------------------------------------------------
+	// 1️⃣ USER-LEVEL POLICY
 	userPolicy, err := qs.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, date)
 	if err != nil {
-		qs.logger.Error(
-			"Failed to get user attendance policy",
-			util.String("user_id", userID.String()),
-			util.ErrorField(err),
-		)
 		return nil, fmt.Errorf("failed to get user attendance policy: %w", err)
 	}
 	if userPolicy != nil {
-		qs.logger.Debug(
-			"Resolved attendance policy at USER level",
-			util.String("user_id", userID.String()),
-			util.String("policy_code", userPolicy.PolicyCode),
-			util.Duration("duration", time.Since(startTime)),
-		)
 		return userPolicy, nil
 	}
 
-	// ------------------------------------------------------------
 	// 2️⃣ POSITION-LEVEL POLICY
-	// ------------------------------------------------------------
-	companyEmployee, err := qs.attendanceRepo.GetCompanyEmployee(ctx, uuid.Nil, userID)
+	companyEmployee, err := qs.attendanceRepo.GetCompanyEmployee(ctx, companyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get company employee: %w", err)
 	}
@@ -1020,18 +1011,10 @@ func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
 			return nil, fmt.Errorf("failed to get position attendance policy: %w", err)
 		}
 		if positionPolicy != nil {
-			qs.logger.Debug(
-				"Resolved attendance policy at POSITION level",
-				util.String("user_id", userID.String()),
-				util.String("policy_code", positionPolicy.PolicyCode),
-				util.Duration("duration", time.Since(startTime)),
-			)
 			return positionPolicy, nil
 		}
 
-		// --------------------------------------------------------
-		// 3️⃣ WORK-CENTER POLICY (via position)
-		// --------------------------------------------------------
+		// 3️⃣ WORK CENTER-LEVEL POLICY
 		position, err := qs.attendanceRepo.GetPosition(ctx, *companyEmployee.PositionID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get position: %w", err)
@@ -1040,28 +1023,19 @@ func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
 		if position != nil && position.WorkCenterCode != nil {
 			wcPolicy, err := qs.attendanceRepo.GetWorkCenterAttendancePolicy(
 				ctx,
-				companyEmployee.CompanyID,
+				companyID,
 				*position.WorkCenterCode,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get work center attendance policy: %w", err)
 			}
 			if wcPolicy != nil {
-				qs.logger.Debug(
-					"Resolved attendance policy at WORK CENTER level",
-					util.String("user_id", userID.String()),
-					util.String("work_center_code", *position.WorkCenterCode),
-					util.String("policy_code", wcPolicy.PolicyCode),
-					util.Duration("duration", time.Since(startTime)),
-				)
 				return wcPolicy, nil
 			}
 		}
 	}
 
-	// ------------------------------------------------------------
-	// 4️⃣ COMPANY DEFAULT POLICY (SAFE FALLBACK)
-	// ------------------------------------------------------------
+	// 4️⃣ DEFAULT FALLBACK
 	defaultPolicy := &attendance.AttendancePolicy{
 		PolicyID:   uuid.New(),
 		PolicyCode: "DEFAULT",
@@ -1080,6 +1054,7 @@ func (qs *attendanceQueryServiceImpl) GetUserCurrentAttendancePolicy(
 
 	qs.logger.Warn(
 		"Falling back to DEFAULT attendance policy",
+		util.String("company_id", companyID.String()),
 		util.String("user_id", userID.String()),
 		util.Duration("duration", time.Since(startTime)),
 	)

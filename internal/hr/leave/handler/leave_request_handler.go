@@ -127,7 +127,7 @@ func (h *LeaveRequestHandler) RequestLeave(w http.ResponseWriter, r *http.Reques
 			zap.String("user_id", req.UserID.String()),
 			zap.String("leave_type_id", req.LeaveTypeID.String()),
 			zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, "failed to create leave request")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

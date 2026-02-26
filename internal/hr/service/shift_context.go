@@ -12,7 +12,8 @@ type ShiftContext struct {
 	ScheduleDate time.Time
 
 	// Scheduling state
-	ScheduleStatus string // active | weekly_off | holiday | on_leave | not_schedulable
+	// active | weekly_off | holiday | on_leave | not_schedulable
+	ScheduleStatus string
 	Timezone       string
 
 	// Shift expectations
@@ -32,4 +33,9 @@ type ShiftContext struct {
 	IsOnLeave    bool
 	IsOverride   bool
 	OverrideType *string
+
+	// ✅ NEW — Leave Financial Context
+	IsLeavePaid    bool       // true = paid leave, false = unpaid leave
+	LeaveTypeID    *uuid.UUID // which leave type triggered the leave
+	LeaveRequestID *uuid.UUID // optional: reference for traceability
 }

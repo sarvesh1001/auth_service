@@ -180,19 +180,20 @@ type LoginAttempt struct {
 // =========================================================
 
 type Company struct {
-	CompanyID             uuid.UUID  `db:"company_id" json:"company_id"`
-	CompanyName           string     `db:"company_name" json:"company_name"`
-	OwnerUserID           uuid.UUID  `db:"owner_user_id" json:"owner_user_id"`
-	SubscriptionTier      string     `db:"subscription_tier" json:"subscription_tier"`
-	SubscriptionStatus    string     `db:"subscription_status" json:"subscription_status"`
-	MaxEmployees          int        `db:"max_employees" json:"max_employees"`     // NEW field
-	MaxDepartments        int        `json:"max_departments" db:"max_departments"` // NEW FIELD
-	DataRegion            string     `db:"data_region" json:"data_region"`
-	IsActive              bool       `db:"is_active" json:"is_active"`
-	CreatedAt             time.Time  `db:"created_at" json:"created_at"`
-	UpdatedAt             time.Time  `db:"updated_at" json:"updated_at"`
-	SubscriptionStartDate *time.Time `db:"subscription_start_date" json:"subscription_start_date,omitempty"`
-	SubscriptionEndDate   *time.Time `db:"subscription_end_date" json:"subscription_end_date,omitempty"`
+	CompanyID               uuid.UUID  `db:"company_id" json:"company_id"`
+	CompanyName             string     `db:"company_name" json:"company_name"`
+	OwnerUserID             uuid.UUID  `db:"owner_user_id" json:"owner_user_id"`
+	SubscriptionTier        string     `db:"subscription_tier" json:"subscription_tier"`
+	SubscriptionStatus      string     `db:"subscription_status" json:"subscription_status"`
+	MaxEmployees            int        `db:"max_employees" json:"max_employees"`     // NEW field
+	MaxDepartments          int        `json:"max_departments" db:"max_departments"` // NEW FIELD
+	DataRegion              string     `db:"data_region" json:"data_region"`
+	IsActive                bool       `db:"is_active" json:"is_active"`
+	CreatedAt               time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt               time.Time  `db:"updated_at" json:"updated_at"`
+	SubscriptionStartDate   *time.Time `db:"subscription_start_date" json:"subscription_start_date,omitempty"`
+	SubscriptionEndDate     *time.Time `db:"subscription_end_date" json:"subscription_end_date,omitempty"`
+	FinancialYearStartMonth int        `db:"financial_year_start_month"`
 }
 
 // CompanySearchResult represents a company search result with relevance score
