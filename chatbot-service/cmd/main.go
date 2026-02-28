@@ -5,100 +5,85 @@ import (
 	"chatbot-service/internal/handler"
 	"chatbot-service/internal/llm"
 	"chatbot-service/internal/middleware"
+	"chatbot-service/internal/repository/postgres"
 	"chatbot-service/internal/service"
-	"chatbot-service/internal/tools" // ✅ REQUIRED
+	"chatbot-service/internal/tools"
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
 
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 )
 
 func main() {
-
-	// ----------------------------------------------------
-	// Load .env (only if ENVIRONMENT not already set)
-	// ----------------------------------------------------
 	if os.Getenv("ENVIRONMENT") == "" {
 		if err := godotenv.Load(); err != nil {
 			log.Println("No .env file found, assuming production environment")
 		}
 	}
 
-	// ----------------------------------------------------
-	// Logger
-	// ----------------------------------------------------
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
-	// ----------------------------------------------------
-	// Load JWT Secret
-	// ----------------------------------------------------
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
 		logger.Fatal("JWT_SECRET environment variable not set")
 	}
 
-	// ----------------------------------------------------
-	// Load Server Port (default 9090)
-	// ----------------------------------------------------
 	port := os.Getenv("SERVER_PORT")
 	if port == "" {
 		port = "9090"
 	}
 
-	// ----------------------------------------------------
-	// HR Base URL (default localhost:8080)
-	// ----------------------------------------------------
 	hrBaseURL := os.Getenv("HR_BASE_URL")
 	if hrBaseURL == "" {
 		hrBaseURL = "http://localhost:8080"
 	}
 
-	// ----------------------------------------------------
-	// LLM (mock for now)
-	// ----------------------------------------------------
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		logger.Fatal("DATABASE_URL environment variable not set")
+	}
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		logger.Fatal("Failed to connect to database", zap.Error(err))
+	}
+	defer db.Close()
+
+	if err = db.Ping(); err != nil {
+		logger.Fatal("Database unreachable", zap.Error(err))
+	}
+	logger.Info("Connected to database")
+
 	llmClient := llm.NewMockClient()
-
-	// ----------------------------------------------------
-	// HR Client
-	// ----------------------------------------------------
 	hrClient := tools.NewHRClient(hrBaseURL)
-
-	// ----------------------------------------------------
-	// Tools
-	// ----------------------------------------------------
 	payrollTool := tools.NewPayrollTool(hrClient)
 
 	toolExecutor := executor.NewToolExecutor([]executor.Tool{
 		payrollTool,
 	})
 
-	// ----------------------------------------------------
-	// Service
-	// ----------------------------------------------------
+	conversationRepo := postgres.NewConversationRepository(db)
+
 	chatService := service.NewChatService(
 		llmClient,
 		toolExecutor,
+		conversationRepo,
 		logger,
 	)
 
-	// ----------------------------------------------------
-	// Handler
-	// ----------------------------------------------------
 	chatHandler := handler.NewChatHandler(chatService, logger)
 
-	// ----------------------------------------------------
-	// Router
-	// ----------------------------------------------------
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat", chatHandler.HandleChat)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
 
-	// ----------------------------------------------------
-	// Middleware Chain
-	// RateLimit → JWT → Handler
-	// ----------------------------------------------------
 	wrapped := middleware.JWTMiddleware(middleware.JWTConfig{
 		Secret: jwtSecret,
 		Logger: logger,

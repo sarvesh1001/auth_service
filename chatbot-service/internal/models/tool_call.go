@@ -6,19 +6,19 @@ type ToolCall struct {
 }
 
 type ToolResult struct {
-	ToolName string      `json:"tool_name"`
-	Success  bool        `json:"success"`
-	Data     interface{} `json:"data,omitempty"`
-	Error    string      `json:"error,omitempty"`
+	ToolName   string      `json:"tool_name"`
+	Success    bool        `json:"success"`
+	HTTPStatus int         `json:"-"` // internal use only, not returned to client
+	Data       interface{} `json:"data,omitempty"`
+	Error      string      `json:"error,omitempty"`
 }
 
-// UPDATED: added DeviceID field
 type ToolCallInput struct {
 	UserID         string
 	CompanyID      interface{}
 	SessionType    string
 	PermissionMask interface{}
 	AuthHeader     string
-	DeviceID       string // NEW
+	DeviceID       string
 	Arguments      map[string]interface{}
 }

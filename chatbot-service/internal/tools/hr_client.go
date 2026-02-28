@@ -1,9 +1,7 @@
 package tools
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,7 +22,8 @@ func NewHRClient(baseURL string) *HRClient {
 	}
 }
 
-// UPDATED: added deviceID and companyID parameters
+// Do sends an HTTP request to the HR service. The body parameter should be an io.Reader
+// (e.g., bytes.Reader) containing the already‑marshalled JSON payload, or nil.
 func (c *HRClient) Do(
 	ctx context.Context,
 	method string,
@@ -32,22 +31,13 @@ func (c *HRClient) Do(
 	authHeader string,
 	deviceID string,
 	companyID string,
-	body interface{},
+	body io.Reader,
 ) ([]byte, int, error) {
-	var bodyReader io.Reader
-	if body != nil {
-		jsonBody, err := json.Marshal(body)
-		if err != nil {
-			return nil, 0, err
-		}
-		bodyReader = bytes.NewBuffer(jsonBody)
-	}
-
 	req, err := http.NewRequestWithContext(
 		ctx,
 		method,
 		fmt.Sprintf("%s%s", c.BaseURL, path),
-		bodyReader,
+		body,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -55,7 +45,6 @@ func (c *HRClient) Do(
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", authHeader)
-	// NEW: set required headers
 	req.Header.Set("X-Device-ID", deviceID)
 	req.Header.Set("X-Company-ID", companyID)
 

@@ -947,7 +947,8 @@ func (h *StatutoryProfileHandler) ListTaxSlabs(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
 		return
 	}
-	statutoryCode := chi.URLParam(r, "statutoryCode")
+	// Read statutory code from query parameter, not from URL path
+	statutoryCode := r.URL.Query().Get("statutory_code")
 	if statutoryCode == "" {
 		h.respondWithError(w, http.StatusBadRequest, "statutory code required")
 		return

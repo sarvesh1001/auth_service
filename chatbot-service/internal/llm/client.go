@@ -1,14 +1,24 @@
 package llm
 
-import "context"
+import (
+	"chatbot-service/internal/models"
+	"context"
+)
 
 type Client interface {
 	Process(ctx context.Context, req Request) (*Response, error)
 }
 
 type Request struct {
-	UserID  string
-	Message string
+	UserID    string
+	Message   string
+	History   []models.ChatMessage
+	Arguments map[string]interface{} // NEW
+}
+
+type Message struct {
+	Role    string // "user" or "assistant"
+	Content string
 }
 
 type Response struct {

@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: chatbot_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: chatbot
+      POSTGRES_PASSWORD: chatbot
+      POSTGRES_DB: chatbot_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatbot -d chatbot_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  chatbot:
+    build: .
+    container_name: chatbot_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "9090:9090"
+    environment:
+      JWT_SECRET: 7eith5Aeghae1ieVoh0ooHoh9aeSh2eeF1aech4Eing
+      HR_BASE_URL: http://host.docker.internal:8080
+      SERVER_PORT: 9090
+      DATABASE_URL: postgres://chatbot:chatbot@postgres:5432/chatbot_db?sslmode=disable
+    restart: always
+
+volumes:
+  postgres_data:
+ 
+ 

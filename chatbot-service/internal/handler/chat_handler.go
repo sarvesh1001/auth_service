@@ -45,7 +45,7 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	sessionType, _ := ctx.Value("session_type").(string)
 	companyID := ctx.Value("company_id")
 	permissionMask := ctx.Value("permission_mask")
-	deviceID, _ := ctx.Value("device_id").(string) // NEW: extract device_id
+	deviceID, _ := ctx.Value("device_id").(string)
 
 	var req models.ChatRequest
 	decoder := json.NewDecoder(r.Body)
@@ -69,7 +69,8 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		PermissionMask: permissionMask,
 		Message:        req.Message,
 		AuthHeader:     r.Header.Get("Authorization"),
-		DeviceID:       deviceID, // NEW: pass device_id
+		DeviceID:       deviceID,
+		Arguments:      req.Arguments, // NEW: pass arguments
 	})
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err, "Failed to process chat request")

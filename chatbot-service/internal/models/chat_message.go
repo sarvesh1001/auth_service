@@ -1,9 +1,14 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 type ChatRequest struct {
-	Message string `json:"message"`
+	Message   string                 `json:"message"`
+	Arguments map[string]interface{} `json:"arguments,omitempty"`
 }
 
 type ChatResponse struct {
@@ -14,9 +19,12 @@ type ChatResponse struct {
 }
 
 type ChatMessage struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"user_id"`
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          uuid.UUID  `json:"id"`
+	UserID      uuid.UUID  `json:"user_id"`
+	CompanyID   *uuid.UUID `json:"company_id,omitempty"`
+	Role        string     `json:"role"` // user, assistant, tool
+	Content     string     `json:"content,omitempty"`
+	ToolName    *string    `json:"tool_name,omitempty"`
+	ToolSuccess *bool      `json:"tool_success,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }

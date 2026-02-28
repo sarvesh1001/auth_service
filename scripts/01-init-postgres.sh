@@ -1055,7 +1055,7 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_component_definition (
     description      TEXT,
     country_code     VARCHAR(10) NOT NULL,
     calculation_basis VARCHAR(30) NOT NULL
-        CHECK (calculation_basis IN ('basic','gross','ctc')),
+        CHECK (calculation_basis IN ('basic','gross','ctc','taxable_income')),
     has_employee_contribution BOOLEAN NOT NULL DEFAULT true,
     has_employer_contribution BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -4139,6 +4139,10 @@ ADD COLUMN IF NOT EXISTS deactivated_by UUID;
 ALTER TABLE payroll.employee_statutory_contribution
 ADD CONSTRAINT fk_esc_user
 FOREIGN KEY (user_id) REFERENCES users(user_id);
+
+ALTER TABLE payroll.company_tax_slab
+ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW(),
+ADD COLUMN updated_by UUID;
 EOSQL
 
 echo "🧬 Initializing biometric schema..."
