@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"auth-service/internal/bucketing"
@@ -18,6 +19,9 @@ import (
 	"auth-service/internal/handler"
 	"auth-service/internal/hashing"
 	"auth-service/internal/hashing/pepperstore"
+	biometricHandler "auth-service/internal/hr/biometric/handler"
+	biometricRepo "auth-service/internal/hr/biometric/repository"
+	biometricSvc "auth-service/internal/hr/biometric/service"
 	b "auth-service/internal/hr/consumer"
 	hrhandler "auth-service/internal/hr/handler"
 	leavehandler "auth-service/internal/hr/leave/handler"
@@ -37,48 +41,60 @@ import (
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
 
-	// New biometric imports
-	biometricHandler "auth-service/internal/hr/biometric/handler"
-	biometricRepo "auth-service/internal/hr/biometric/repository"
-	biometricSvc "auth-service/internal/hr/biometric/service"
+	// ADDED: import for models used in PDFGenerator stub
+	"auth-service/internal/hr/payroll/models"
 )
 
+// Factory holds all clients, repositories, services, and handlers.
 type Factory struct {
-	config                            *config.Config
-	tlsManager                        *tls.TLSManager
-	redisClient                       *client.RedisClient
-	scyllaClient                      *scylla.ScyllaClient
-	kafkaProducer                     *client.KafkaProducer
-	esClient                          *client.ESClient
-	clickhouseClient                  *client.ClickHouseClient
-	hasher                            *hashing.Hasher
-	encryptionManager                 *encryption.EncryptionManager
-	bucketingManager                  *bucketing.BucketingManager
-	pairingRepo                       redis.PairingRepository
-	pairingService                    *service.PairingService
-	wsService                         *service.WebSocketService
-	pairingHandler                    *handler.PairingHandler
-	wsHandler                         *handler.WebSocketHandler
-	qrUtil                            *util.QRUtil
-	hmacUtil                          *util.HMACUtil
-	hrEmployeeRepository              hrpostgres.EmployeeRepository
-	attendanceRepository              hrpostgres.AttendanceRepository
-	schedulingRepository              hrpostgres.SchedulingRepository
-	auditRepository                   hrpostgres.AuditRepository
-	workCenterRepository              hrpostgres.WorkCenterRepository
-	orgUnitRepository                 hrpostgres.OrgUnitRepository
-	attendanceIdentityRepository      hrpostgres.AttendanceIdentityRepository
-	attendanceDeviceRepository        hrpostgres.AttendanceDeviceRepository
-	deviceEnrollmentRepository        hrpostgres.DeviceEnrollmentRepository
-	deviceTokenRepository             hrpostgres.DeviceTokenRepository
-	deviceHeartbeatRepository         hrpostgres.DeviceHeartbeatRepository
-	attendanceBatchRepository         hrpostgres.AttendanceBatchRepository
-	leaveRepository                   leaverepo.LeaveRepository
-	payrollRepository                 payrollrepo.PayrollRepository
-	compensationRepo                  payrollrepo.CompensationRepository
-	salaryStructureRepo               payrollrepo.SalaryStructureRepository
-	statutoryProfileRepo              payrollrepo.StatutoryProfileRepository
-	statutoryRepo                     payrollrepo.StatutoryRepository
+	config                       *config.Config
+	tlsManager                   *tls.TLSManager
+	redisClient                  *client.RedisClient
+	scyllaClient                 *scylla.ScyllaClient
+	kafkaProducer                *client.KafkaProducer
+	esClient                     *client.ESClient
+	clickhouseClient             *client.ClickHouseClient
+	hasher                       *hashing.Hasher
+	encryptionManager            *encryption.EncryptionManager
+	bucketingManager             *bucketing.BucketingManager
+	pairingRepo                  redis.PairingRepository
+	pairingService               *service.PairingService
+	wsService                    *service.WebSocketService
+	pairingHandler               *handler.PairingHandler
+	wsHandler                    *handler.WebSocketHandler
+	qrUtil                       *util.QRUtil
+	hmacUtil                     *util.HMACUtil
+	hrEmployeeRepository         hrpostgres.EmployeeRepository
+	attendanceRepository         hrpostgres.AttendanceRepository
+	schedulingRepository         hrpostgres.SchedulingRepository
+	auditRepository              hrpostgres.AuditRepository
+	workCenterRepository         hrpostgres.WorkCenterRepository
+	orgUnitRepository            hrpostgres.OrgUnitRepository
+	attendanceIdentityRepository hrpostgres.AttendanceIdentityRepository
+	attendanceDeviceRepository   hrpostgres.AttendanceDeviceRepository
+	deviceEnrollmentRepository   hrpostgres.DeviceEnrollmentRepository
+	deviceTokenRepository        hrpostgres.DeviceTokenRepository
+	deviceHeartbeatRepository    hrpostgres.DeviceHeartbeatRepository
+	attendanceBatchRepository    hrpostgres.AttendanceBatchRepository
+	leaveRepository              leaverepo.LeaveRepository
+	payrollRepository            payrollrepo.PayrollRepository
+	compensationRepo             payrollrepo.CompensationRepository
+	salaryStructureRepo          payrollrepo.SalaryStructureRepository
+	statutoryProfileRepo         payrollrepo.StatutoryProfileRepository
+	statutoryRepo                payrollrepo.StatutoryRepository
+	// NEW payroll repositories
+	componentRepo       payrollrepo.ComponentRepository
+	companySettingsRepo payrollrepo.CompanySettingsRepository
+	arrearsRepo         payrollrepo.ArrearsRepository
+	loanRepo            payrollrepo.LoanRepository
+	bankDetailsRepo     payrollrepo.BankDetailsRepository
+	payslipRepo         payrollrepo.PayslipRepository
+	taxDeclarationRepo  payrollrepo.TaxDeclarationRepository // ADDED
+	// NEW PDF generator
+	pdfGenerator payrollsvc.PDFGenerator
+	// NEW services
+	arrearsSvc payrollsvc.ArrearsService
+
 	attendanceDeviceHandler           *hrhandler.DeviceHandler
 	attendanceAdminHandler            *hrhandler.AttendanceAdminHandler
 	attendanceQueryHandler            *hrhandler.AttendanceQueryHandler
@@ -194,25 +210,44 @@ type Factory struct {
 	payrollRunHandler                 *payrollhandler.PayrollRunHandler
 	salaryStructureHandler            *payrollhandler.SalaryStructureHandler
 	statutoryProfileHandler           *payrollhandler.StatutoryProfileHandler
+	attendanceRuleRepo                payrollrepo.AttendanceRuleRepository
+	attendanceRuleSvc                 payrollsvc.AttendanceRuleService
+	attendanceRuleHandler             *payrollhandler.AttendanceRuleHandler
+	employeeFineRepo                  payrollrepo.EmployeeFineRepository
+	employeeFineSvc                   payrollsvc.EmployeeFineService
+	employeeFineHandler               *payrollhandler.EmployeeFineHandler
+	biometricFaceEmbeddingRepo        biometricRepo.FaceEmbeddingRepository
+	biometricEnrollmentService        biometricSvc.BiometricEnrollmentService
+	biometricSyncService              biometricSvc.BiometricSyncService
+	biometricEnrollmentHandler        *biometricHandler.BiometricEnrollmentHandler
+	biometricSyncHandler              *biometricHandler.BiometricSyncHandler
+	// NEW payroll job repo
+	payrollJobRepo payrollrepo.PayrollJobRepository
 
-	// New attendance rule components
-	attendanceRuleRepo    payrollrepo.AttendanceRuleRepository
-	attendanceRuleSvc     payrollsvc.AttendanceRuleService
-	attendanceRuleHandler *payrollhandler.AttendanceRuleHandler
+	// NEW worker
+	payrollWorker       *payrollsvc.PayrollWorker
+	payrollWorkerCancel context.CancelFunc
+	// NEW fields for additional payroll services and handlers
+	bankExportSvc     payrollsvc.BankExportService
+	componentSvc      payrollsvc.ComponentService
+	loanSvc           payrollsvc.LoanService
+	payslipSvc        payrollsvc.PayslipService
+	reportingSvc      payrollsvc.ReportingService
+	taxDeclarationSvc payrollsvc.TaxDeclarationService
 
-	// New employee fine components
-	employeeFineRepo    payrollrepo.EmployeeFineRepository
-	employeeFineSvc     payrollsvc.EmployeeFineService
-	employeeFineHandler *payrollhandler.EmployeeFineHandler
+	bankExportHandler     *payrollhandler.BankExportHandler
+	componentHandler      *payrollhandler.ComponentHandler
+	loanHandler           *payrollhandler.LoanHandler
+	payslipHandler        *payrollhandler.PayslipHandler
+	reportingHandler      *payrollhandler.ReportingHandler
+	taxDeclarationHandler *payrollhandler.TaxDeclarationHandler
 
-	// Biometric components
-	biometricFaceEmbeddingRepo biometricRepo.FaceEmbeddingRepository
-	biometricEnrollmentService biometricSvc.BiometricEnrollmentService
-	biometricSyncService       biometricSvc.BiometricSyncService
-	biometricEnrollmentHandler *biometricHandler.BiometricEnrollmentHandler
-	biometricSyncHandler       *biometricHandler.BiometricSyncHandler
+	// Infrastructure for payslip generation/email
+	objectStorage payrollsvc.ObjectStorage
+	emailSender   payrollsvc.EmailSender
 }
 
+// KafkaLoggingManager handles Kafka-based logging.
 type KafkaLoggingManager struct {
 	producer   *service.LogProducerService
 	esConsumer *consumer.ESConsumer
@@ -266,10 +301,10 @@ func (m *KafkaLoggingManager) HealthCheck(ctx context.Context) map[string]error 
 	return errs
 }
 
+// NewFactory creates a new Factory with all dependencies.
 func NewFactory() (*Factory, error) {
 	cfg := config.LoadConfig()
 	logger := util.Get()
-
 	f := &Factory{
 		config: cfg,
 		closed: make(chan struct{}),
@@ -331,7 +366,297 @@ func NewFactory() (*Factory, error) {
 		)
 	}
 
+	// Initialize default object storage and email sender (stubs)
+	f.objectStorage = &defaultObjectStorage{logger: f.logger}
+	f.emailSender = &defaultEmailSender{logger: f.logger}
+
+	// ADDED: initialize payroll worker
+	f.initializePayrollWorker()
+
 	return f, nil
+}
+
+// ---------------------------------------------------------------------
+// NEW getters for payroll repositories
+// ---------------------------------------------------------------------
+
+func (f *Factory) PayrollJobRepository() payrollrepo.PayrollJobRepository {
+	if f.payrollJobRepo == nil {
+		f.payrollJobRepo = payrollrepo.NewPayrollJobRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.payrollJobRepo
+}
+
+func (f *Factory) ComponentRepository() payrollrepo.ComponentRepository {
+	if f.componentRepo == nil {
+		f.componentRepo = payrollrepo.NewComponentRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.componentRepo
+}
+
+func (f *Factory) CompanySettingsRepository() payrollrepo.CompanySettingsRepository {
+	if f.companySettingsRepo == nil {
+		f.companySettingsRepo = payrollrepo.NewCompanySettingsRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.companySettingsRepo
+}
+
+func (f *Factory) ArrearsRepository() payrollrepo.ArrearsRepository {
+	if f.arrearsRepo == nil {
+		f.arrearsRepo = payrollrepo.NewArrearsRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.arrearsRepo
+}
+
+func (f *Factory) LoanRepository() payrollrepo.LoanRepository {
+	if f.loanRepo == nil {
+		f.loanRepo = payrollrepo.NewLoanRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.loanRepo
+}
+
+func (f *Factory) BankDetailsRepository() payrollrepo.BankDetailsRepository {
+	if f.bankDetailsRepo == nil {
+		f.bankDetailsRepo = payrollrepo.NewBankDetailsRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.bankDetailsRepo
+}
+
+func (f *Factory) PayslipRepository() payrollrepo.PayslipRepository {
+	if f.payslipRepo == nil {
+		f.payslipRepo = payrollrepo.NewPayslipRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.payslipRepo
+}
+
+// ADDED: TaxDeclarationRepository
+func (f *Factory) TaxDeclarationRepository() payrollrepo.TaxDeclarationRepository {
+	if f.taxDeclarationRepo == nil {
+		f.taxDeclarationRepo = payrollrepo.NewTaxDeclarationRepository(
+			f.PostgresClient(),
+			f.logger,
+		)
+	}
+	return f.taxDeclarationRepo
+}
+
+// PDFGenerator returns a PDF generator for payslips.
+// Replace the placeholder with your actual implementation.
+func (f *Factory) PDFGenerator() payrollsvc.PDFGenerator {
+	if f.pdfGenerator == nil {
+		// Replace with actual PDF generator constructor, e.g.:
+		// f.pdfGenerator = pdf.NewGenerator(f.logger)
+		f.pdfGenerator = &defaultPDFGenerator{} // Placeholder
+	}
+	return f.pdfGenerator
+}
+
+// ---------------------------------------------------------------------
+// ArrearsService – TEMPORARY STUB until the real service is implemented
+// ---------------------------------------------------------------------
+
+// stubArrearsService is a minimal implementation of payrollsvc.ArrearsService
+// that does nothing. Replace this with the real implementation once available.
+type stubArrearsService struct{}
+
+func (s *stubArrearsService) GenerateArrearsForSalaryChange(ctx context.Context, companyID, userID uuid.UUID, previousSalaryID, newSalaryID uuid.UUID, effectiveFrom time.Time) error {
+	// TODO: implement actual arrears generation
+	return nil
+}
+func (s *stubArrearsService) GenerateArrearsForSalaryEnd(ctx context.Context, companyID, userID uuid.UUID, salaryID uuid.UUID, endDate time.Time) error {
+	// TODO: implement actual arrears generation
+	return nil
+}
+
+// ArrearsService returns the service that handles arrears.
+// NOTE: This currently returns a stub. Replace with real implementation when ready.
+func (f *Factory) ArrearsService() payrollsvc.ArrearsService {
+	if f.arrearsSvc == nil {
+		// TODO: replace stub with real constructor, e.g.:
+		// f.arrearsSvc = payrollsvc.NewArrearsService(
+		//     f.ArrearsRepository(),
+		//     f.ComponentRepository(),
+		//     f.CompanySettingsRepository(),
+		//     f.GetAuditService(),
+		//     f.logger,
+		// )
+		f.arrearsSvc = &stubArrearsService{}
+	}
+	return f.arrearsSvc
+}
+
+// ---------------------------------------------------------------------
+// NEW service getters (BankExport, Component, Loan, Payslip, Reporting, TaxDeclaration)
+// ---------------------------------------------------------------------
+
+func (f *Factory) BankExportService() payrollsvc.BankExportService {
+	if f.bankExportSvc == nil {
+		f.bankExportSvc = payrollsvc.NewBankExportService(
+			f.PayrollRepository(),
+			f.BankDetailsRepository(),
+			f.logger,
+		)
+	}
+	return f.bankExportSvc
+}
+
+func (f *Factory) ComponentService() payrollsvc.ComponentService {
+	if f.componentSvc == nil {
+		f.componentSvc = payrollsvc.NewComponentService(
+			f.ComponentRepository(),
+			f.CompanySettingsRepository(),
+			f.logger,
+		)
+	}
+	return f.componentSvc
+}
+
+func (f *Factory) LoanService() payrollsvc.LoanService {
+	if f.loanSvc == nil {
+		f.loanSvc = payrollsvc.NewLoanService(
+			f.LoanRepository(),
+			f.ComponentRepository(),
+			f.CompanySettingsRepository(),
+			f.CompensationService(), // ✅ missing dependency
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.loanSvc
+}
+func (f *Factory) PayslipService() payrollsvc.PayslipService {
+	if f.payslipSvc == nil {
+		f.payslipSvc = payrollsvc.NewPayslipService(
+			f.PayslipRepository(),
+			f.PayrollRepository(),
+			f.BankDetailsRepository(),
+			f.PDFGenerator(),
+			f.objectStorage,
+			f.emailSender,
+			f.logger,
+		)
+	}
+	return f.payslipSvc
+}
+
+func (f *Factory) ReportingService() payrollsvc.ReportingService {
+	if f.reportingSvc == nil {
+		f.reportingSvc = payrollsvc.NewReportingService(
+			f.PayrollRepository(),
+			f.logger,
+		)
+	}
+	return f.reportingSvc
+}
+
+func (f *Factory) TaxDeclarationService() payrollsvc.TaxDeclarationService {
+	if f.taxDeclarationSvc == nil {
+		f.taxDeclarationSvc = payrollsvc.NewTaxDeclarationService(
+			f.TaxDeclarationRepository(),
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.taxDeclarationSvc
+}
+
+// ---------------------------------------------------------------------
+// Updated service getters (with missing dependencies added)
+// ---------------------------------------------------------------------
+
+func (f *Factory) AttendanceRuleService() payrollsvc.AttendanceRuleService {
+	if f.attendanceRuleSvc == nil {
+		f.attendanceRuleSvc = payrollsvc.NewAttendanceRuleService(
+			f.AttendanceRuleRepository(),
+			f.ComponentRepository(), // added
+			f.logger,
+		)
+	}
+	return f.attendanceRuleSvc
+}
+
+func (f *Factory) EmployeeFineService() payrollsvc.EmployeeFineService {
+	if f.employeeFineSvc == nil {
+		f.employeeFineSvc = payrollsvc.NewEmployeeFineService(
+			f.EmployeeFineRepository(),
+			f.PayrollRepository(),
+			f.ComponentRepository(),       // added
+			f.CompanySettingsRepository(), // added
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.employeeFineSvc
+}
+
+func (f *Factory) PayrollEngineService() payrollsvc.PayrollEngineService {
+	if f.payrollEngineSvc == nil {
+		f.payrollEngineSvc = payrollsvc.NewPayrollEngineService(
+			f.PayrollRepository(),
+			f.PayrollJobRepository(), // <-- ADD THIS LINE
+			f.CompensationService(),
+			f.StatutoryEngine(),
+			f.GetAttendancePayrollBridge(),
+			f.GetAuditService(),
+			f.AttendanceRuleRepository(),
+			f.EmployeeFineRepository(),
+			f.ArrearsRepository(),
+			f.LoanRepository(),
+			f.ComponentRepository(),
+			f.CompanySettingsRepository(),
+			f.logger,
+		)
+	}
+	return f.payrollEngineSvc
+}
+
+func (f *Factory) PayrollQueryService() payrollsvc.PayrollQueryService {
+	if f.payrollQuerySvc == nil {
+		f.payrollQuerySvc = payrollsvc.NewPayrollQueryService(
+			f.PayrollRepository(),
+			f.BankDetailsRepository(), // added
+			f.PayslipRepository(),     // added
+			f.PDFGenerator(),          // added
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.payrollQuerySvc
+}
+
+func (f *Factory) SalaryStructureService() payrollsvc.SalaryStructureService {
+	if f.salaryStructureSvc == nil {
+		f.salaryStructureSvc = payrollsvc.NewSalaryStructureService(
+			f.CompensationRepository(),
+			f.PayrollLockService(),
+			f.CompensationService(),
+			f.ArrearsService(), // added (now uses stub)
+			f.GetAuditService(),
+			f.logger,
+		)
+	}
+	return f.salaryStructureSvc
 }
 
 // ---------------------------------------------------------------------
@@ -406,16 +731,6 @@ func (f *Factory) AttendanceRuleRepository() payrollrepo.AttendanceRuleRepositor
 	return f.attendanceRuleRepo
 }
 
-func (f *Factory) AttendanceRuleService() payrollsvc.AttendanceRuleService {
-	if f.attendanceRuleSvc == nil {
-		f.attendanceRuleSvc = payrollsvc.NewAttendanceRuleService(
-			f.AttendanceRuleRepository(),
-			f.logger,
-		)
-	}
-	return f.attendanceRuleSvc
-}
-
 func (f *Factory) GetAttendanceRuleHandler() *payrollhandler.AttendanceRuleHandler {
 	if f.attendanceRuleHandler == nil {
 		f.attendanceRuleHandler = payrollhandler.NewAttendanceRuleHandler(
@@ -440,18 +755,6 @@ func (f *Factory) EmployeeFineRepository() payrollrepo.EmployeeFineRepository {
 	return f.employeeFineRepo
 }
 
-func (f *Factory) EmployeeFineService() payrollsvc.EmployeeFineService {
-	if f.employeeFineSvc == nil {
-		f.employeeFineSvc = payrollsvc.NewEmployeeFineService(
-			f.EmployeeFineRepository(),
-			f.PayrollRepository(),
-			f.GetAuditService(),
-			f.logger,
-		)
-	}
-	return f.employeeFineSvc
-}
-
 func (f *Factory) GetEmployeeFineHandler() *payrollhandler.EmployeeFineHandler {
 	if f.employeeFineHandler == nil {
 		f.employeeFineHandler = payrollhandler.NewEmployeeFineHandler(
@@ -463,7 +766,7 @@ func (f *Factory) GetEmployeeFineHandler() *payrollhandler.EmployeeFineHandler {
 }
 
 // ---------------------------------------------------------------------
-// Existing payroll components (updated PayrollEngineService to include new repos)
+// Existing payroll components (Compensation, Payroll, Statutory, etc.)
 // ---------------------------------------------------------------------
 
 func (f *Factory) CompensationRepository() payrollrepo.CompensationRepository {
@@ -550,46 +853,6 @@ func (f *Factory) PayrollLockService() payrollsvc.PayrollLockService {
 	return f.payrollLockSvc
 }
 
-func (f *Factory) PayrollEngineService() payrollsvc.PayrollEngineService {
-	if f.payrollEngineSvc == nil {
-		f.payrollEngineSvc = payrollsvc.NewPayrollEngineService(
-			f.PayrollRepository(),
-			f.CompensationService(),
-			f.StatutoryEngine(),
-			f.GetAttendancePayrollBridge(),
-			f.GetAuditService(),
-			f.AttendanceRuleRepository(), // new dependency
-			f.EmployeeFineRepository(),   // new dependency
-			f.logger,
-		)
-	}
-	return f.payrollEngineSvc
-}
-
-func (f *Factory) PayrollQueryService() payrollsvc.PayrollQueryService {
-	if f.payrollQuerySvc == nil {
-		f.payrollQuerySvc = payrollsvc.NewPayrollQueryService(
-			f.PayrollRepository(),
-			f.GetAuditService(),
-			f.logger,
-		)
-	}
-	return f.payrollQuerySvc
-}
-
-func (f *Factory) SalaryStructureService() payrollsvc.SalaryStructureService {
-	if f.salaryStructureSvc == nil {
-		f.salaryStructureSvc = payrollsvc.NewSalaryStructureService(
-			f.CompensationRepository(),
-			f.PayrollLockService(),
-			f.CompensationService(),
-			f.GetAuditService(),
-			f.logger,
-		)
-	}
-	return f.salaryStructureSvc
-}
-
 func (f *Factory) StatutoryProfileService() payrollsvc.StatutoryProfileService {
 	if f.statutoryProfileSvc == nil {
 		f.statutoryProfileSvc = payrollsvc.NewStatutoryProfileService(
@@ -662,11 +925,13 @@ func (f *Factory) GetPayrollQueryHandler() *payrollhandler.PayrollQueryHandler {
 	return f.payrollQueryHandler
 }
 
+// FIXED: Use PayrollQueryService, not PayrollLockService
 func (f *Factory) GetPayrollRunHandler() *payrollhandler.PayrollRunHandler {
 	if f.payrollRunHandler == nil {
 		f.payrollRunHandler = payrollhandler.NewPayrollRunHandler(
 			f.PayrollEngineService(),
-			f.PayrollLockService(),
+			f.PayrollQueryService(),
+			f.PayrollJobRepository(), // 👈 NEW			// was f.PayrollLockService() – fixed
 			f.logger,
 		)
 	}
@@ -687,7 +952,7 @@ func (f *Factory) GetStatutoryProfileHandler() *payrollhandler.StatutoryProfileH
 	if f.statutoryProfileHandler == nil {
 		f.statutoryProfileHandler = payrollhandler.NewStatutoryProfileHandler(
 			f.StatutoryProfileService(),
-			f.StatutoryEngine(), // 👈 ADD THIS
+			f.StatutoryEngine(),
 			f.logger,
 		)
 	}
@@ -695,7 +960,71 @@ func (f *Factory) GetStatutoryProfileHandler() *payrollhandler.StatutoryProfileH
 }
 
 // ---------------------------------------------------------------------
-// Existing getters (unchanged, except where noted)
+// NEW getters for additional payroll handlers
+// ---------------------------------------------------------------------
+
+func (f *Factory) GetBankExportHandler() *payrollhandler.BankExportHandler {
+	if f.bankExportHandler == nil {
+		f.bankExportHandler = payrollhandler.NewBankExportHandler(
+			f.BankExportService(),
+			f.logger,
+		)
+	}
+	return f.bankExportHandler
+}
+
+func (f *Factory) GetComponentHandler() *payrollhandler.ComponentHandler {
+	if f.componentHandler == nil {
+		f.componentHandler = payrollhandler.NewComponentHandler(
+			f.ComponentService(),
+			f.logger,
+		)
+	}
+	return f.componentHandler
+}
+
+func (f *Factory) GetLoanHandler() *payrollhandler.LoanHandler {
+	if f.loanHandler == nil {
+		f.loanHandler = payrollhandler.NewLoanHandler(
+			f.LoanService(),
+			f.logger,
+		)
+	}
+	return f.loanHandler
+}
+
+func (f *Factory) GetPayslipHandler() *payrollhandler.PayslipHandler {
+	if f.payslipHandler == nil {
+		f.payslipHandler = payrollhandler.NewPayslipHandler(
+			f.PayslipService(),
+			f.logger,
+		)
+	}
+	return f.payslipHandler
+}
+
+func (f *Factory) GetReportingHandler() *payrollhandler.ReportingHandler {
+	if f.reportingHandler == nil {
+		f.reportingHandler = payrollhandler.NewReportingHandler(
+			f.ReportingService(),
+			f.logger,
+		)
+	}
+	return f.reportingHandler
+}
+
+func (f *Factory) GetTaxDeclarationHandler() *payrollhandler.TaxDeclarationHandler {
+	if f.taxDeclarationHandler == nil {
+		f.taxDeclarationHandler = payrollhandler.NewTaxDeclarationHandler(
+			f.TaxDeclarationService(),
+			f.logger,
+		)
+	}
+	return f.taxDeclarationHandler
+}
+
+// ---------------------------------------------------------------------
+// All remaining existing methods (unchanged)
 // ---------------------------------------------------------------------
 
 func (f *Factory) DeviceHeartbeatRepository() hrpostgres.DeviceHeartbeatRepository {
@@ -1549,6 +1878,42 @@ func (f *Factory) DocumentStorage() hrservice.DocumentStorage {
 	return f.documentStorage
 }
 
+// ---------------------------------------------------------------------
+// NEW: initializePayrollWorker – starts the background payroll worker
+// ---------------------------------------------------------------------
+func (f *Factory) initializePayrollWorker() {
+	if f.payrollWorker != nil {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	f.payrollWorkerCancel = cancel
+
+	workerID := fmt.Sprintf("worker-%s", uuid.New().String())
+
+	// ✅ Add concurrency limit
+	maxConcurrentPerCompany := 2 // default (make configurable later)
+
+	f.payrollWorker = payrollsvc.NewPayrollWorker(
+		f.PayrollJobRepository(),
+		f.PayrollEngineService(),
+		f.logger,
+		workerID,
+		maxConcurrentPerCompany, // ✅ NEW PARAM
+	)
+
+	go f.payrollWorker.Start(ctx)
+
+	f.logger.Info("Payroll worker started",
+		zap.String("worker_id", workerID),
+		zap.Int("max_concurrent_per_company", maxConcurrentPerCompany),
+	)
+}
+
+// ---------------------------------------------------------------------
+// InitializeKafkaLogging and other methods remain unchanged
+// ---------------------------------------------------------------------
+
 func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	logger := util.Get()
 	if len(f.config.Kafka.Brokers) == 0 {
@@ -1561,20 +1926,17 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 		return nil, err
 	}
 	f.kafkaProducer = kafkaProducer
-
 	logProducer := service.NewLogProducerService(
 		kafkaProducer,
 		f.config.Environment,
 		"v1.0.0",
 	)
-
 	consumerCtx, cancel := context.WithCancel(context.Background())
 	mgr := &KafkaLoggingManager{
 		producer:  logProducer,
 		cancelCtx: cancel,
 		logger:    logger,
 	}
-
 	if f.config.Elasticsearch.URL != "" && f.esClient != nil {
 		esTopics := []string{
 			"admin-events",
@@ -1620,7 +1982,6 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 			}
 		}
 	}
-
 	if f.config.Clickhouse.URL != "" && f.clickhouseClient != nil {
 		chTopics := []string{
 			"device-events",
@@ -1664,7 +2025,6 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 				zap.Strings("topics", chTopics))
 		}
 	}
-
 	logger.Info("Kafka logging system initialized with optimized event distribution",
 		zap.Bool("es_enabled", mgr.esConsumer != nil),
 		zap.Bool("ch_enabled", mgr.chConsumer != nil),
@@ -1879,16 +2239,13 @@ func (f *Factory) GetUserService() *service.UserService {
 		hasher := f.Hasher()
 		encMgr := f.EncryptionManager()
 		logger := f.logger
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
-
 		f.userService = service.NewUserServiceWithCache(
 			repo, hasher, encMgr, distCache, logger,
 		)
-
 		logProducer := f.GetLogProducerService()
 		if logProducer != nil {
 			f.userService.SetLogProducerService(logProducer)
@@ -1912,15 +2269,12 @@ func (f *Factory) GetOTPService() *service.OTPService {
 		hasher := f.Hasher()
 		cfg := f.Config()
 		logger := f.logger
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
-
 		logProducer := f.GetLogProducerService()
 		phoneValidator := f.GetPhoneValidator()
-
 		f.otpService = service.NewOTPService(
 			repo,
 			hasher,
@@ -1932,7 +2286,6 @@ func (f *Factory) GetOTPService() *service.OTPService {
 			f.AdminDeviceTrustRepository(),
 			f.smsManager,
 		)
-
 		if phoneValidator != nil {
 			phoneValidator.SetAdminService(f.GetAdminService())
 		}
@@ -1971,14 +2324,11 @@ func (f *Factory) GetMPINService() *service.MPINService {
 		hasher := f.Hasher()
 		cfg := f.Config()
 		logger := f.logger
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
-
 		logProducer := f.GetLogProducerService()
-
 		f.mpinService = service.NewMPINService(
 			mpinRepo,
 			userRepo,
@@ -1990,7 +2340,6 @@ func (f *Factory) GetMPINService() *service.MPINService {
 			logger,
 			logProducer,
 		)
-
 		if distCache != nil {
 			f.mpinService.SetDistributedCache(distCache)
 		}
@@ -2006,7 +2355,6 @@ func (f *Factory) GetSessionService() *service.SessionService {
 		logger := f.logger
 		logProducer := f.GetLogProducerService()
 		companyRepo := f.CompanyRepository()
-
 		f.sessionService = service.NewSessionService(
 			sessionRepo,
 			cfg,
@@ -2026,12 +2374,10 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 		adminDeviceTrustRepo := f.AdminDeviceTrustRepository()
 		cfg := f.Config()
 		logger := f.logger
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
-
 		f.deviceService = service.NewDeviceService(
 			deviceRepo,
 			deviceTrustRepo,
@@ -2040,10 +2386,8 @@ func (f *Factory) GetDeviceService() *service.DeviceService {
 			*cfg,
 			logger,
 		)
-
 		historyRepo := f.GetDeviceHistoryRepository()
 		f.deviceService.SetHistoryRepository(historyRepo)
-
 		logProducer := f.GetLogProducerService()
 		if logProducer != nil {
 			f.deviceService.SetLogProducerService(logProducer)
@@ -2070,12 +2414,10 @@ func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
 		mpinRepo := f.AdminMPINRepository()
 		cfg := f.Config()
 		logger := f.logger
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
-
 		f.adminDeviceService = service.NewAdminDeviceService(
 			deviceRepo,
 			trustRepo,
@@ -2084,10 +2426,8 @@ func (f *Factory) GetAdminDeviceService() *service.AdminDeviceService {
 			*cfg,
 			logger,
 		)
-
 		historyRepo := f.AdminDeviceHistoryRepository()
 		f.adminDeviceService.SetHistoryRepository(historyRepo)
-
 		logProducer := f.GetLogProducerService()
 		if logProducer != nil {
 			f.adminDeviceService.SetLogProducerService(logProducer)
@@ -2107,7 +2447,6 @@ func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
 		cfg := f.Config()
 		logger := f.logger
 		logProducer := f.GetLogProducerService()
-
 		f.adminMPINService = service.NewAdminMPINService(
 			mpinRepo,
 			adminRepo,
@@ -2119,7 +2458,6 @@ func (f *Factory) GetAdminMPINService() *service.AdminMPINService {
 			logger,
 			logProducer,
 		)
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
@@ -2135,17 +2473,14 @@ func (f *Factory) GetUserOTPService() *service.UserOTPService {
 		hasher := f.Hasher()
 		cfg := f.Config()
 		logger := f.logger
-
 		var distCache *service.DistributedCache
 		if f.redisClient != nil {
 			distCache = service.NewDistributedCache(f.redisClient.Client(), logger)
 		}
-
 		logProducer := f.GetLogProducerService()
 		phoneValidator := f.GetPhoneValidator()
 		deviceTrustRepo := f.GetDeviceTrustRepository()
 		smsManager := f.GetSMSManager()
-
 		f.userOTPService = service.NewUserOTPService(
 			repo,
 			hasher,
@@ -2157,7 +2492,6 @@ func (f *Factory) GetUserOTPService() *service.UserOTPService {
 			deviceTrustRepo,
 			smsManager,
 		)
-
 		if phoneValidator != nil {
 			phoneValidator.SetAdminService(f.GetAdminService())
 		}
@@ -2312,9 +2646,8 @@ func (f *Factory) initializeManagers() {
 
 	var kmsClient *kms.Client
 	if f.config.KMS.Enabled {
-		kmsClient = nil // Initialize KMS client if needed
+		kmsClient = nil
 	}
-
 	f.encryptionManager = encryption.NewEncryptionManager(f.config, kmsClient)
 	f.bucketingManager = bucketing.NewBucketingManager(f.config)
 	f.smsManager = sms.NewSMSManager(f.logger)
@@ -2324,7 +2657,6 @@ func (f *Factory) initializeManagers() {
 	}
 }
 
-// Updated InitializeHandlers includes new attendance rule and employee fine handlers
 func (f *Factory) InitializeHandlers() error {
 	logger := f.logger
 
@@ -2339,7 +2671,6 @@ func (f *Factory) InitializeHandlers() error {
 	companyService := f.GetCompanyService()
 	jwtService := f.GetJWTService()
 	userOTPService := f.GetUserOTPService()
-
 	leavePolicyResolutionHandler := f.GetLeavePolicyResolutionHandler()
 
 	otpHandler := handler.NewOTPHandler(
@@ -2385,14 +2716,19 @@ func (f *Factory) InitializeHandlers() error {
 	payrollRunHandler := f.GetPayrollRunHandler()
 	salaryStructureHandler := f.GetSalaryStructureHandler()
 	statutoryProfileHandler := f.GetStatutoryProfileHandler()
-
-	// New handlers
 	attendanceRuleHandler := f.GetAttendanceRuleHandler()
 	employeeFineHandler := f.GetEmployeeFineHandler()
 
-	// Biometric handlers
 	biometricEnrollmentHandler := f.GetBiometricEnrollmentHandler()
 	biometricSyncHandler := f.GetBiometricSyncHandler()
+
+	// NEW handlers
+	bankExportHandler := f.GetBankExportHandler()
+	componentHandler := f.GetComponentHandler()
+	loanHandler := f.GetLoanHandler()
+	payslipHandler := f.GetPayslipHandler()
+	reportingHandler := f.GetReportingHandler()
+	taxDeclarationHandler := f.GetTaxDeclarationHandler()
 
 	f.router = handler.NewRouter(
 		otpHandler,
@@ -2436,10 +2772,17 @@ func (f *Factory) InitializeHandlers() error {
 		payrollRunHandler,
 		salaryStructureHandler,
 		statutoryProfileHandler,
-		attendanceRuleHandler, // new
-		employeeFineHandler,   // new
+		attendanceRuleHandler,
+		employeeFineHandler,
 		biometricEnrollmentHandler,
 		biometricSyncHandler,
+		// NEW handlers added at the end
+		bankExportHandler,
+		componentHandler,
+		loanHandler,
+		payslipHandler,
+		reportingHandler,
+		taxDeclarationHandler,
 	)
 
 	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, and biometric systems")
@@ -2495,19 +2838,7 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 			errs["leave_repository"] = err
 		}
 	}
-
-	// Add new repository health checks if they implement HealthCheck
-	if f.attendanceRuleRepo != nil {
-		// if attendanceRuleRepo has HealthCheck method, call it
-	}
-	if f.employeeFineRepo != nil {
-		// if employeeFineRepo has HealthCheck method, call it
-	}
-
-	// Biometric health checks if needed
-	if f.biometricFaceEmbeddingRepo != nil {
-		// Assuming repository has HealthCheck method, otherwise skip
-	}
+	// New repositories health checks can be added similarly
 
 	return errs
 }
@@ -2548,7 +2879,11 @@ func (f *Factory) Close() error {
 			f.logger.Info("Stopping audit outbox service...")
 			f.auditOutboxCancel()
 		}
-
+		// ADDED: Stop payroll worker
+		if f.payrollWorkerCancel != nil {
+			f.logger.Info("Stopping payroll worker...")
+			f.payrollWorkerCancel()
+		}
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
 		}
@@ -2589,18 +2924,15 @@ func (f *Factory) ScyllaClient() *scylla.ScyllaClient               { return f.s
 func (f *Factory) Hasher() *hashing.Hasher                          { return f.hasher }
 func (f *Factory) EncryptionManager() *encryption.EncryptionManager { return f.encryptionManager }
 func (f *Factory) BucketingManager() *bucketing.BucketingManager    { return f.bucketingManager }
-
 func (f *Factory) GetLogProducerService() *service.LogProducerService {
 	if f.kafkaLoggingMgr == nil {
 		return nil
 	}
 	return f.kafkaLoggingMgr.GetLogProducerService()
 }
-
 func (f *Factory) GetSMSManager() *sms.SMSManager {
 	return f.smsManager
 }
-
 func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	if f.postgresUserRepository == nil {
 		f.postgresUserRepository = postgres.NewUserRepository(
@@ -2610,7 +2942,6 @@ func (f *Factory) PostgresUserRepository() postgres.UserRepository {
 	}
 	return f.postgresUserRepository
 }
-
 func (f *Factory) PostgresCompanyRepository() postgres.CompanyRepository {
 	if f.postgresCompanyRepository == nil {
 		f.postgresCompanyRepository = postgres.NewCompanyRepository(
@@ -2619,4 +2950,40 @@ func (f *Factory) PostgresCompanyRepository() postgres.CompanyRepository {
 		)
 	}
 	return f.postgresCompanyRepository
+}
+
+// ---------------------------------------------------------------------
+// Placeholder for PDFGenerator – replace with actual implementation.
+// ---------------------------------------------------------------------
+type defaultPDFGenerator struct{}
+
+func (g *defaultPDFGenerator) GeneratePayslipPDF(payslip *models.Payslip) ([]byte, error) {
+	// Stub implementation – return dummy PDF or error
+	return []byte("PDF content placeholder"), nil
+}
+
+// ---------------------------------------------------------------------
+// Stub implementations for ObjectStorage and EmailSender
+// ---------------------------------------------------------------------
+type defaultObjectStorage struct {
+	logger *zap.Logger
+}
+
+func (s *defaultObjectStorage) Upload(ctx context.Context, key string, data []byte, contentType string) error {
+	s.logger.Info("ObjectStorage.Upload called (stub)", zap.String("key", key))
+	return nil
+}
+
+func (s *defaultObjectStorage) Download(ctx context.Context, key string) ([]byte, error) {
+	s.logger.Info("ObjectStorage.Download called (stub)", zap.String("key", key))
+	return []byte("stub data"), nil
+}
+
+type defaultEmailSender struct {
+	logger *zap.Logger
+}
+
+func (s *defaultEmailSender) SendPayslipEmail(to, subject, body string, attachment []byte, attachmentName string) error {
+	s.logger.Info("EmailSender.SendPayslipEmail called (stub)", zap.String("to", to), zap.String("subject", subject))
+	return nil
 }

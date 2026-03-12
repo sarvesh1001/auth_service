@@ -408,6 +408,12 @@ func (r *statutoryRepository) InsertEmployeeStatutoryContribution(ctx context.Co
 			employee_amount, employer_amount, total_amount,
 			created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (company_id, user_id, statutory_code, period_start, period_end)
+		DO UPDATE SET
+			employee_amount = EXCLUDED.employee_amount,
+			employer_amount = EXCLUDED.employer_amount,
+			total_amount    = EXCLUDED.total_amount,
+			created_at      = EXCLUDED.created_at
 	`
 	if contribution.ContributionID == uuid.Nil {
 		contribution.ContributionID = uuid.New()
@@ -428,12 +434,12 @@ func (r *statutoryRepository) InsertEmployeeStatutoryContribution(ctx context.Co
 		contribution.CreatedAt,
 	)
 	if err != nil {
-		r.logger.Error("Failed to insert employee statutory contribution",
+		r.logger.Error("Failed to upsert employee statutory contribution",
 			util.String("company_id", contribution.CompanyID.String()),
 			util.String("user_id", contribution.UserID.String()),
 			util.ErrorField(err),
 		)
-		return fmt.Errorf("failed to insert contribution: %w", err)
+		return fmt.Errorf("failed to upsert contribution: %w", err)
 	}
 	return nil
 }
@@ -1480,9 +1486,46 @@ func (r *statutoryRepository) ListDeductionLimits(ctx context.Context, companyID
 	return limits, rows.Err()
 }
 
-// ==================== Component Mapping ====================
+// ==================== Component Mapping (with validation) ====================
+
+// componentExistsForCompany checks whether a component_code exists and is active
+// either for the given company OR globally (company_id IS NULL).
+func (r *statutoryRepository) componentExistsForCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	componentCode string,
+) (bool, error) {
+
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM payroll.payroll_component
+			WHERE component_code = $2
+			  AND is_active = true
+			  AND (company_id = $1 OR company_id IS NULL)
+		)
+	`
+
+	var exists bool
+
+	err := r.db.QueryRow(ctx, query, companyID, componentCode).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check component existence: %w", err)
+	}
+
+	return exists, nil
+}
 
 func (r *statutoryRepository) CreateComponentMapping(ctx context.Context, input models.CreateComponentMappingInput) error {
+	// Validate that the component exists for the company
+	exists, err := r.componentExistsForCompany(ctx, input.CompanyID, input.ComponentCode)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("component_code %s does not exist or is not active for company %s", input.ComponentCode, input.CompanyID)
+	}
+
 	const query = `
 		INSERT INTO payroll.statutory_component_mapping (
 			mapping_id, company_id, statutory_code, component_code,
@@ -1491,7 +1534,7 @@ func (r *statutoryRepository) CreateComponentMapping(ctx context.Context, input 
 		) VALUES ($1, $2, $3, $4, $5, NULL, true, 1, NOW(), $6, $7)
 	`
 	mappingID := uuid.New()
-	_, err := r.db.Exec(ctx, query,
+	_, err = r.db.Exec(ctx, query,
 		mappingID,
 		input.CompanyID,
 		input.StatutoryCode,
@@ -1524,6 +1567,25 @@ func (r *statutoryRepository) UpdateComponentMapping(ctx context.Context, input 
 	}
 	if currentVersion != input.Version {
 		return fmt.Errorf("version mismatch: expected %d, got %d", input.Version, currentVersion)
+	}
+
+	// If component_code is being changed, validate that the new code exists for the company.
+	// We need to fetch the company_id for this mapping first.
+	var companyID uuid.UUID
+	const getCompanyQuery = `SELECT company_id FROM payroll.statutory_component_mapping WHERE mapping_id = $1`
+	err = r.db.QueryRow(ctx, getCompanyQuery, input.MappingID).Scan(&companyID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch company_id for mapping: %w", err)
+	}
+
+	if input.ComponentCode != nil {
+		exists, err := r.componentExistsForCompany(ctx, companyID, *input.ComponentCode)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("component_code %s does not exist or is not active for company %s", *input.ComponentCode, companyID)
+		}
 	}
 
 	// Build dynamic update

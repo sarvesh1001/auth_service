@@ -318,3 +318,33 @@ func JSONEncode(w http.ResponseWriter, payload interface{}) error {
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(payload)
 }
+
+// MustMarshalJSON marshals v to JSON and panics on error.
+// Useful for audit logging where failure is unexpected.
+func MustMarshalJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic("failed to marshal JSON: " + err.Error())
+	}
+	return b
+}
+
+// UniqueStrings removes duplicate strings from a slice while preserving order.
+func UniqueStrings(input []string) []string {
+	if len(input) == 0 {
+		return input
+	}
+
+	seen := make(map[string]struct{}, len(input))
+	result := make([]string, 0, len(input))
+
+	for _, v := range input {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		result = append(result, v)
+	}
+
+	return result
+}

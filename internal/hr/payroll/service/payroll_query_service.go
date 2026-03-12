@@ -10,6 +10,7 @@ import (
 )
 
 type PayrollQueryService interface {
+	// Existing methods
 	GetRunSummary(ctx context.Context, companyID, runID uuid.UUID) (*models.PayrollRunDashboard, error)
 	ListRuns(ctx context.Context, filter models.PayrollRunFilter) ([]*models.PayrollRun, int64, error)
 	GetRunLedgerSummary(ctx context.Context, companyID, runID uuid.UUID) ([]*models.LedgerSummary, error)
@@ -24,4 +25,10 @@ type PayrollQueryService interface {
 	GetComponentBreakdownTrend(ctx context.Context, companyID uuid.UUID, componentCode string, from, to time.Time) ([]*models.ComponentTrendPoint, error)
 	GetEmployeePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (*models.Payslip, error)
 	ExportRunToCSV(ctx context.Context, companyID, runID uuid.UUID) ([]byte, error)
+
+	// New methods for missing features
+	ExportBankFile(ctx context.Context, companyID, runID uuid.UUID, bankFormat string) ([]byte, error)
+	GenerateAndStorePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (string, error)
+	GetMyPayslips(ctx context.Context, userID uuid.UUID, from, to time.Time) ([]models.PayslipRecord, error)
+	DownloadPayslip(ctx context.Context, payslipID uuid.UUID) ([]byte, error)
 }

@@ -16,8 +16,7 @@ import (
 // ============================================================
 
 type AttendancePayrollBridge interface {
-
-	// Validates attendance completeness + finalization
+	// Validates attendance completeness + finalization (does NOT check lock)
 	ValidateAttendanceForPayroll(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -33,7 +32,7 @@ type AttendancePayrollBridge interface {
 		startDate, endDate time.Time,
 	) (*PayrollAttendanceSummary, error)
 
-	// Locks attendance after successful payroll run
+	// Locks attendance after successful payroll run (fails if already locked)
 	LockAttendanceForPayroll(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -74,7 +73,7 @@ func NewAttendancePayrollBridge(
 }
 
 // ============================================================
-// VALIDATION
+// VALIDATION (now without lock check)
 // ============================================================
 
 func (b *attendancePayrollBridge) ValidateAttendanceForPayroll(
@@ -121,20 +120,13 @@ func (b *attendancePayrollBridge) ValidateAttendanceForPayroll(
 	}
 
 	for _, s := range summaries {
-
 		if !s.IsFinalized {
 			return fmt.Errorf(
 				"attendance not finalized for date %s",
 				s.AttendanceDate.Format("2006-01-02"),
 			)
 		}
-
-		if s.IsPayrollLocked {
-			return fmt.Errorf(
-				"attendance already payroll locked for date %s",
-				s.AttendanceDate.Format("2006-01-02"),
-			)
-		}
+		// ❌ Lock check removed – now allowed for reading
 	}
 
 	return nil
@@ -151,7 +143,7 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 	startDate, endDate time.Time,
 ) (*PayrollAttendanceSummary, error) {
 
-	// First validate
+	// Validate completeness & finalization (lock status ignored)
 	if err := b.ValidateAttendanceForPayroll(
 		ctx,
 		companyID,
@@ -178,7 +170,6 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 	}
 
 	for _, s := range summaries {
-
 		// Payable days
 		if s.IsPayable {
 			result.PayableDays++
@@ -203,11 +194,23 @@ func (b *attendancePayrollBridge) GetPayrollAttendanceSummary(
 		}
 	}
 
+	// Optional: log if any summaries were already locked (just for visibility)
+	for _, s := range summaries {
+		if s.IsPayrollLocked {
+			b.logger.Warn("attendance already payroll locked, using locked data",
+				zap.String("company_id", companyID.String()),
+				zap.String("user_id", userID.String()),
+				zap.String("date", s.AttendanceDate.Format("2006-01-02")),
+			)
+			break // log once per employee
+		}
+	}
+
 	return result, nil
 }
 
 // ============================================================
-// LOCKING
+// LOCKING (explicit lock check)
 // ============================================================
 
 func (b *attendancePayrollBridge) LockAttendanceForPayroll(
@@ -217,7 +220,7 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 	startDate, endDate time.Time,
 ) error {
 
-	// Validate before locking
+	// 1. Validate completeness & finalization (still required)
 	if err := b.ValidateAttendanceForPayroll(
 		ctx,
 		companyID,
@@ -228,7 +231,29 @@ func (b *attendancePayrollBridge) LockAttendanceForPayroll(
 		return err
 	}
 
-	err := b.attendanceRepo.LockAttendanceSummariesInRange(
+	// 2. Explicitly check for existing locks
+	summaries, err := b.attendanceRepo.GetAttendanceSummariesInRange(
+		ctx,
+		companyID,
+		userID,
+		startDate,
+		endDate,
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, s := range summaries {
+		if s.IsPayrollLocked {
+			return fmt.Errorf(
+				"attendance already payroll locked for date %s",
+				s.AttendanceDate.Format("2006-01-02"),
+			)
+		}
+	}
+
+	// 3. Perform the lock
+	err = b.attendanceRepo.LockAttendanceSummariesInRange(
 		ctx,
 		companyID,
 		userID,

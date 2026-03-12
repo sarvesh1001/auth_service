@@ -254,7 +254,71 @@ func (r *salaryStructureRepository) Deactivate(ctx context.Context, structureID 
 // Component management
 // ---------------------------------------------------------------------
 
+// componentExistsForCompany checks if a component code is active for the given company.
+func (r *salaryStructureRepository) componentExistsForCompany(ctx context.Context, companyID uuid.UUID, componentCode string) (bool, error) {
+
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM payroll.payroll_component
+			WHERE component_code = $2
+			  AND is_active = true
+			  AND (company_id = $1 OR company_id IS NULL)
+		)
+	`
+
+	var exists bool
+	err := r.client.QueryRow(ctx, query, companyID, componentCode).Scan(&exists)
+
+	if err != nil {
+		r.logger.Error("failed to check component existence",
+			util.String("company_id", companyID.String()),
+			util.String("component_code", componentCode),
+			util.ErrorField(err),
+		)
+		return false, fmt.Errorf("check component existence: %w", err)
+	}
+
+	return exists, nil
+}
+
+// getStructureCompanyID returns the company ID of a salary structure.
+func (r *salaryStructureRepository) getStructureCompanyID(ctx context.Context, structureID uuid.UUID) (uuid.UUID, error) {
+	const query = `SELECT company_id FROM payroll.salary_structure WHERE salary_structure_id = $1`
+	var companyID uuid.UUID
+	err := r.client.QueryRow(ctx, query, structureID).Scan(&companyID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return uuid.Nil, fmt.Errorf("salary structure %s not found", structureID)
+		}
+		r.logger.Error("failed to get structure company ID",
+			util.String("structure_id", structureID.String()),
+			util.ErrorField(err),
+		)
+		return uuid.Nil, fmt.Errorf("get structure company ID: %w", err)
+	}
+	return companyID, nil
+}
+
 func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *models.SalaryStructureComponent) error {
+	// Ensure the component's company ID is set; if not, derive it from the structure.
+	if comp.CompanyID == uuid.Nil {
+		companyID, err := r.getStructureCompanyID(ctx, comp.SalaryStructureID)
+		if err != nil {
+			return fmt.Errorf("failed to resolve structure's company: %w", err)
+		}
+		comp.CompanyID = companyID
+	}
+
+	// Validate that the component exists and is active for the company.
+	exists, err := r.componentExistsForCompany(ctx, comp.CompanyID, comp.ComponentCode)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, comp.CompanyID)
+	}
+
 	query := `
 		INSERT INTO payroll.salary_structure_component (
 			mapping_id, salary_structure_id, component_code,
@@ -267,7 +331,7 @@ func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *mode
 	if comp.CreatedAt.IsZero() {
 		comp.CreatedAt = time.Now().UTC()
 	}
-	_, err := r.client.Exec(ctx, query,
+	_, err = r.client.Exec(ctx, query,
 		comp.MappingID,
 		comp.SalaryStructureID,
 		comp.ComponentCode,
@@ -289,6 +353,46 @@ func (r *salaryStructureRepository) AddComponent(ctx context.Context, comp *mode
 }
 
 func (r *salaryStructureRepository) UpdateComponent(ctx context.Context, comp *models.SalaryStructureComponent) error {
+	// If the component code is being changed, validate the new code.
+	// First, fetch the current component to see if code changed.
+	var currentCode string
+	const getCurrentQuery = `
+		SELECT component_code
+		FROM payroll.salary_structure_component
+		WHERE mapping_id = $1
+	`
+	err := r.client.QueryRow(ctx, getCurrentQuery, comp.MappingID).Scan(&currentCode)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("component mapping %s not found", comp.MappingID)
+		}
+		r.logger.Error("failed to fetch current component code",
+			util.String("mapping_id", comp.MappingID.String()),
+			util.ErrorField(err),
+		)
+		return fmt.Errorf("fetch current component: %w", err)
+	}
+
+	// If the component code changed, we need to validate the new one.
+	if currentCode != comp.ComponentCode {
+		// We need the company ID for validation. Try to get it from comp, or fetch from structure.
+		if comp.CompanyID == uuid.Nil {
+			// Need to get structure ID from this component. The comp already has SalaryStructureID.
+			companyID, err := r.getStructureCompanyID(ctx, comp.SalaryStructureID)
+			if err != nil {
+				return fmt.Errorf("failed to resolve structure's company: %w", err)
+			}
+			comp.CompanyID = companyID
+		}
+		exists, err := r.componentExistsForCompany(ctx, comp.CompanyID, comp.ComponentCode)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, comp.CompanyID)
+		}
+	}
+
 	query := `
 		UPDATE payroll.salary_structure_component
 		SET
@@ -391,6 +495,23 @@ func (r *salaryStructureRepository) getComponents(ctx context.Context, structure
 }
 
 func (r *salaryStructureRepository) ReplaceComponents(ctx context.Context, structureID uuid.UUID, comps []models.SalaryStructureComponent) error {
+	// First, get the company ID of the structure.
+	companyID, err := r.getStructureCompanyID(ctx, structureID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve structure's company: %w", err)
+	}
+
+	// Validate all components before making any changes.
+	for _, comp := range comps {
+		exists, err := r.componentExistsForCompany(ctx, companyID, comp.ComponentCode)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("component %s is not active for company %s", comp.ComponentCode, companyID)
+		}
+	}
+
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)

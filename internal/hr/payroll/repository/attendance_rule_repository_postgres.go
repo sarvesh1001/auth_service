@@ -56,12 +56,13 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 			value,
 			based_on,
 			threshold_minutes,
+			component_code,        -- new column
 			is_active,
 			created_at,
 			created_by,
 			updated_at,
 			updated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 
 	_, err := r.client.Exec(ctx, query,
@@ -72,6 +73,7 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 		rule.Value,
 		rule.BasedOn,
 		rule.ThresholdMinutes,
+		rule.ComponentCode, // new field
 		rule.IsActive,
 		rule.CreatedAt,
 		rule.CreatedBy,
@@ -82,6 +84,7 @@ func (r *attendanceRuleRepository) Create(ctx context.Context, rule *models.Atte
 		r.logger.Error("Failed to create attendance rule",
 			util.String("rule_id", rule.RuleID.String()),
 			util.String("company_id", rule.CompanyID.String()),
+			util.String("component_code", rule.ComponentCode),
 			util.ErrorField(err),
 		)
 		return fmt.Errorf("failed to create attendance rule: %w", err)
@@ -101,10 +104,11 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 			value = $3,
 			based_on = $4,
 			threshold_minutes = $5,
-			is_active = $6,
-			updated_at = $7,
-			updated_by = $8
-		WHERE rule_id = $9 AND company_id = $10
+			component_code = $6,        -- new column
+			is_active = $7,
+			updated_at = $8,
+			updated_by = $9
+		WHERE rule_id = $10 AND company_id = $11
 	`
 	result, err := r.client.Exec(ctx, query,
 		rule.RuleType,
@@ -112,6 +116,7 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 		rule.Value,
 		rule.BasedOn,
 		rule.ThresholdMinutes,
+		rule.ComponentCode, // new field
 		rule.IsActive,
 		rule.UpdatedAt,
 		rule.UpdatedBy,
@@ -122,6 +127,7 @@ func (r *attendanceRuleRepository) Update(ctx context.Context, rule *models.Atte
 		r.logger.Error("Failed to update attendance rule",
 			util.String("rule_id", rule.RuleID.String()),
 			util.String("company_id", rule.CompanyID.String()),
+			util.String("component_code", rule.ComponentCode),
 			util.ErrorField(err),
 		)
 		return fmt.Errorf("failed to update attendance rule: %w", err)
@@ -169,6 +175,7 @@ func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleI
 			value,
 			based_on,
 			threshold_minutes,
+			component_code,        -- new column
 			is_active,
 			created_at,
 			created_by,
@@ -187,6 +194,7 @@ func (r *attendanceRuleRepository) GetByID(ctx context.Context, companyID, ruleI
 		&rule.Value,
 		&rule.BasedOn,
 		&rule.ThresholdMinutes,
+		&rule.ComponentCode, // new field
 		&rule.IsActive,
 		&rule.CreatedAt,
 		&rule.CreatedBy,
@@ -225,6 +233,7 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 			value,
 			based_on,
 			threshold_minutes,
+			component_code,        -- new column
 			is_active,
 			created_at,
 			created_by,
@@ -256,6 +265,7 @@ func (r *attendanceRuleRepository) GetActiveByCompany(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
+			&rule.ComponentCode, // new field
 			&rule.IsActive,
 			&rule.CreatedAt,
 			&rule.CreatedBy,
@@ -301,6 +311,7 @@ func (r *attendanceRuleRepository) GetByFilter(
 		args = append(args, *filter.MinThreshold)
 		paramIdx++
 	}
+	// (Optional) filter by component_code if needed, but not part of current filter
 
 	// Count total
 	countQuery := `SELECT COUNT(*) FROM payroll.attendance_rule ` + whereClause
@@ -327,6 +338,7 @@ func (r *attendanceRuleRepository) GetByFilter(
 			value,
 			based_on,
 			threshold_minutes,
+			component_code,        -- new column
 			is_active,
 			created_at,
 			created_by,
@@ -367,6 +379,7 @@ func (r *attendanceRuleRepository) GetByFilter(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
+			&rule.ComponentCode, // new field
 			&rule.IsActive,
 			&rule.CreatedAt,
 			&rule.CreatedBy,
@@ -397,6 +410,7 @@ func (r *attendanceRuleRepository) GetByRuleType(
 			value,
 			based_on,
 			threshold_minutes,
+			component_code,        -- new column
 			is_active,
 			created_at,
 			created_by,
@@ -428,6 +442,7 @@ func (r *attendanceRuleRepository) GetByRuleType(
 			&rule.Value,
 			&rule.BasedOn,
 			&rule.ThresholdMinutes,
+			&rule.ComponentCode, // new field
 			&rule.IsActive,
 			&rule.CreatedAt,
 			&rule.CreatedBy,

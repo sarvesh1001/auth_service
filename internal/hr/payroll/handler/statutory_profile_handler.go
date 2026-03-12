@@ -34,7 +34,10 @@ func NewStatutoryProfileHandler(
 	}
 }
 
-// Request / response types
+// ----------------------------------------------------------------------
+// Request & Response Types
+// ----------------------------------------------------------------------
+
 type createStatutoryProfileRequest struct {
 	UserID        uuid.UUID `json:"user_id"`
 	StatutoryCode string    `json:"statutory_code"`
@@ -42,9 +45,29 @@ type createStatutoryProfileRequest struct {
 	EffectiveFrom time.Time `json:"effective_from"`
 }
 
+func (r *createStatutoryProfileRequest) validate() error {
+	if r.UserID == uuid.Nil {
+		return errors.New("user_id is required")
+	}
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
+}
+
 type updateStatutoryProfileRequest struct {
 	OptIn         *bool     `json:"opt_in,omitempty"`
 	EffectiveFrom time.Time `json:"effective_from"`
+}
+
+func (r *updateStatutoryProfileRequest) validate() error {
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
 }
 
 type changeTaxRegimeRequest struct {
@@ -52,14 +75,49 @@ type changeTaxRegimeRequest struct {
 	EffectiveFrom time.Time `json:"effective_from"`
 }
 
+func (r *changeTaxRegimeRequest) validate() error {
+	if r.TaxRegimeCode == "" {
+		return errors.New("tax_regime_code is required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
+}
+
 type bulkUpsertProfileRequest struct {
 	Profiles []createStatutoryProfileRequest `json:"profiles"`
+}
+
+func (r *bulkUpsertProfileRequest) validate() error {
+	if len(r.Profiles) == 0 {
+		return errors.New("at least one profile is required")
+	}
+	for i, p := range r.Profiles {
+		if err := p.validate(); err != nil {
+			return fmt.Errorf("profile %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 type createRuleSetRequest struct {
 	CountryCode   string    `json:"country_code"`
 	VersionLabel  string    `json:"version_label"`
 	EffectiveFrom time.Time `json:"effective_from"`
+}
+
+func (r *createRuleSetRequest) validate() error {
+	if r.CountryCode == "" {
+		return errors.New("country_code is required")
+	}
+	if r.VersionLabel == "" {
+		return errors.New("version_label is required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
 }
 
 type updateRuleSetRequest struct {
@@ -69,6 +127,16 @@ type updateRuleSetRequest struct {
 	IsActive      bool       `json:"is_active"`
 }
 
+func (r *updateRuleSetRequest) validate() error {
+	if r.VersionLabel == "" {
+		return errors.New("version_label is required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
+}
+
 type createComponentDefinitionRequest struct {
 	StatutoryCode    string `json:"statutory_code"`
 	Description      string `json:"description"`
@@ -76,6 +144,22 @@ type createComponentDefinitionRequest struct {
 	CalculationBasis string `json:"calculation_basis"`
 	HasEmployee      bool   `json:"has_employee"`
 	HasEmployer      bool   `json:"has_employer"`
+}
+
+func (r *createComponentDefinitionRequest) validate() error {
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if r.Description == "" {
+		return errors.New("description is required")
+	}
+	if r.CountryCode == "" {
+		return errors.New("country_code is required")
+	}
+	if r.CalculationBasis == "" {
+		return errors.New("calculation_basis is required")
+	}
+	return nil
 }
 
 type setContributionRuleRequest struct {
@@ -88,7 +172,25 @@ type setContributionRuleRequest struct {
 	EffectiveFrom    time.Time `json:"effective_from"`
 }
 
-// Tax slab request (used directly from service.CreateTaxSlabInput, but we redefine for clarity)
+func (r *setContributionRuleRequest) validate() error {
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if r.ContributionSide != "employee" && r.ContributionSide != "employer" {
+		return errors.New("contribution_side must be 'employee' or 'employer'")
+	}
+	if r.CalculationType != "percentage" && r.CalculationType != "fixed" && r.CalculationType != "slab" {
+		return errors.New("calculation_type must be 'percentage', 'fixed', or 'slab'")
+	}
+	if (r.CalculationType == "percentage" || r.CalculationType == "fixed") && r.RateValue == nil {
+		return errors.New("rate_value is required for percentage/fixed calculation type")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
+}
+
 type createTaxSlabRequest struct {
 	StatutoryCode string    `json:"statutory_code"`
 	MinAmount     float64   `json:"min_amount"`
@@ -97,6 +199,25 @@ type createTaxSlabRequest struct {
 	IsPercentage  bool      `json:"is_percentage"`
 	SlabOrder     int       `json:"slab_order"`
 	EffectiveFrom time.Time `json:"effective_from"`
+}
+
+func (r *createTaxSlabRequest) validate() error {
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if r.MinAmount < 0 {
+		return errors.New("min_amount cannot be negative")
+	}
+	if r.Rate < 0 {
+		return errors.New("rate cannot be negative")
+	}
+	if r.SlabOrder <= 0 {
+		return errors.New("slab_order must be positive")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
 }
 
 type updateTaxSlabRequest struct {
@@ -108,11 +229,20 @@ type updateTaxSlabRequest struct {
 	EffectiveFrom *time.Time `json:"effective_from,omitempty"`
 }
 
-// Deduction limit request
 type createDeductionLimitRequest struct {
 	LimitCode  string                 `json:"limit_code"`
 	LimitValue float64                `json:"limit_value"`
 	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+}
+
+func (r *createDeductionLimitRequest) validate() error {
+	if r.LimitCode == "" {
+		return errors.New("limit_code is required")
+	}
+	if r.LimitValue <= 0 {
+		return errors.New("limit_value must be positive")
+	}
+	return nil
 }
 
 type updateDeductionLimitRequest struct {
@@ -120,11 +250,23 @@ type updateDeductionLimitRequest struct {
 	Metadata   map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// Component mapping request
 type createComponentMappingRequest struct {
 	StatutoryCode string    `json:"statutory_code"`
 	ComponentCode string    `json:"component_code"`
 	EffectiveFrom time.Time `json:"effective_from"`
+}
+
+func (r *createComponentMappingRequest) validate() error {
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if r.ComponentCode == "" {
+		return errors.New("component_code is required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
 }
 
 type updateComponentMappingRequest struct {
@@ -133,7 +275,6 @@ type updateComponentMappingRequest struct {
 	Version       int        `json:"version"`
 }
 
-// Response helpers
 type statutoryProfileResponse struct {
 	ProfileID     uuid.UUID  `json:"profile_id"`
 	CompanyID     uuid.UUID  `json:"company_id"`
@@ -145,8 +286,6 @@ type statutoryProfileResponse struct {
 	IsActive      bool       `json:"is_active"`
 	CreatedAt     time.Time  `json:"created_at"`
 	CreatedBy     uuid.UUID  `json:"created_by"`
-	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
-	UpdatedBy     *uuid.UUID `json:"updated_by,omitempty"`
 }
 
 func mapProfileToResponse(p *models.StatutoryProfileVersion) statutoryProfileResponse {
@@ -165,14 +304,14 @@ func mapProfileToResponse(p *models.StatutoryProfileVersion) statutoryProfileRes
 }
 
 // ----------------------------------------------------------------------
-// Existing handlers (profiles, rule sets, component definitions, etc.)
+// Statutory Profile Handlers
 // ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -184,6 +323,10 @@ func (h *StatutoryProfileHandler) CreateProfile(w http.ResponseWriter, r *http.R
 	var req createStatutoryProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -209,9 +352,9 @@ func (h *StatutoryProfileHandler) CreateProfile(w http.ResponseWriter, r *http.R
 
 func (h *StatutoryProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
+	profileID, err := parseUUIDParam(r, "profileID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid profile id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -223,6 +366,10 @@ func (h *StatutoryProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.R
 	var req updateStatutoryProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -246,9 +393,9 @@ func (h *StatutoryProfileHandler) UpdateProfile(w http.ResponseWriter, r *http.R
 
 func (h *StatutoryProfileHandler) DeactivateProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
+	profileID, err := parseUUIDParam(r, "profileID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid profile id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -269,14 +416,14 @@ func (h *StatutoryProfileHandler) DeactivateProfile(w http.ResponseWriter, r *ht
 
 func (h *StatutoryProfileHandler) ChangeTaxRegime(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	userID, err := parseUUIDParam(r, "userID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -288,6 +435,10 @@ func (h *StatutoryProfileHandler) ChangeTaxRegime(w http.ResponseWriter, r *http
 	var req changeTaxRegimeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -312,9 +463,9 @@ func (h *StatutoryProfileHandler) ChangeTaxRegime(w http.ResponseWriter, r *http
 
 func (h *StatutoryProfileHandler) BulkUpsertProfiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -326,6 +477,10 @@ func (h *StatutoryProfileHandler) BulkUpsertProfiles(w http.ResponseWriter, r *h
 	var req bulkUpsertProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -353,14 +508,14 @@ func (h *StatutoryProfileHandler) BulkUpsertProfiles(w http.ResponseWriter, r *h
 
 func (h *StatutoryProfileHandler) GetActiveProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	userID, err := parseUUIDParam(r, "userID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	statutoryCode := chi.URLParam(r, "code")
@@ -368,14 +523,10 @@ func (h *StatutoryProfileHandler) GetActiveProfile(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "statutory code required")
 		return
 	}
-	asOf := time.Now().UTC()
-	if asOfStr := r.URL.Query().Get("asOf"); asOfStr != "" {
-		parsed, err := time.Parse(time.RFC3339, asOfStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid asOf format, use RFC3339")
-			return
-		}
-		asOf = parsed
+	asOf, err := parseTimeQuery(r, "asOf", time.Now().UTC())
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	profile, err := h.profileService.GetActiveProfile(ctx, companyID, userID, statutoryCode, asOf)
 	if err != nil {
@@ -398,24 +549,20 @@ func (h *StatutoryProfileHandler) GetActiveProfile(w http.ResponseWriter, r *htt
 
 func (h *StatutoryProfileHandler) GetEmployeeActiveProfiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	userID, err := parseUUIDParam(r, "userID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	asOf := time.Now().UTC()
-	if asOfStr := r.URL.Query().Get("asOf"); asOfStr != "" {
-		parsed, err := time.Parse(time.RFC3339, asOfStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid asOf format, use RFC3339")
-			return
-		}
-		asOf = parsed
+	asOf, err := parseTimeQuery(r, "asOf", time.Now().UTC())
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	profiles, err := h.profileService.GetEmployeeActiveProfiles(ctx, companyID, userID, asOf)
 	if err != nil {
@@ -435,14 +582,14 @@ func (h *StatutoryProfileHandler) GetEmployeeActiveProfiles(w http.ResponseWrite
 
 func (h *StatutoryProfileHandler) GetProfileHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	userID, err := parseUUIDParam(r, "userID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	statutoryCode := chi.URLParam(r, "code")
@@ -468,9 +615,9 @@ func (h *StatutoryProfileHandler) GetProfileHistory(w http.ResponseWriter, r *ht
 
 func (h *StatutoryProfileHandler) ListProfiles(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var userID *uuid.UUID
@@ -525,15 +672,15 @@ func (h *StatutoryProfileHandler) ListProfiles(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// ------------------------------
-// Rule set handlers
-// ------------------------------
+// ----------------------------------------------------------------------
+// Rule Set Handlers
+// ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateRuleSet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -545,6 +692,10 @@ func (h *StatutoryProfileHandler) CreateRuleSet(w http.ResponseWriter, r *http.R
 	var req createRuleSetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -566,45 +717,29 @@ func (h *StatutoryProfileHandler) CreateRuleSet(w http.ResponseWriter, r *http.R
 	})
 }
 
-func (h *StatutoryProfileHandler) DeactivateRuleSet(w http.ResponseWriter, r *http.Request) {
+func (h *StatutoryProfileHandler) UpdateRuleSet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
-		return
-	}
-	actorID, err := h.getAdminActor(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	if err := h.engine.DeactivateRuleSet(ctx, ruleSetID, actorID); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "rule set deactivated",
-	})
-}
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-func (h *StatutoryProfileHandler) UpdateRuleSet(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
-		return
-	}
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
-		return
-	}
 	var req updateRuleSetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	input := &models.UpdateRuleSetInput{
 		RuleSetID:     ruleSetID,
 		CompanyID:     companyID,
@@ -623,29 +758,11 @@ func (h *StatutoryProfileHandler) UpdateRuleSet(w http.ResponseWriter, r *http.R
 	})
 }
 
-func (h *StatutoryProfileHandler) ListRuleSets(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
-		return
-	}
-	ruleSets, err := h.engine.ListRuleSets(ctx, companyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    ruleSets,
-	})
-}
-
 func (h *StatutoryProfileHandler) ActivateRuleSet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -663,15 +780,11 @@ func (h *StatutoryProfileHandler) ActivateRuleSet(w http.ResponseWriter, r *http
 	})
 }
 
-// ------------------------------
-// Component definition handlers
-// ------------------------------
-
-func (h *StatutoryProfileHandler) CreateComponentDefinition(w http.ResponseWriter, r *http.Request) {
+func (h *StatutoryProfileHandler) DeactivateRuleSet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -679,11 +792,61 @@ func (h *StatutoryProfileHandler) CreateComponentDefinition(w http.ResponseWrite
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+	if err := h.engine.DeactivateRuleSet(ctx, ruleSetID, actorID); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "rule set deactivated",
+	})
+}
+
+func (h *StatutoryProfileHandler) ListRuleSets(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ruleSets, err := h.engine.ListRuleSets(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    ruleSets,
+	})
+}
+
+// ----------------------------------------------------------------------
+// Component Definition Handlers
+// ----------------------------------------------------------------------
+
+func (h *StatutoryProfileHandler) CreateComponentDefinition(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
 	var req createComponentDefinitionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	input := &service.CreateComponentDefinitionInput{
 		CompanyID:        companyID,
 		StatutoryCode:    req.StatutoryCode,
@@ -700,33 +863,15 @@ func (h *StatutoryProfileHandler) CreateComponentDefinition(w http.ResponseWrite
 	}
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
+		"message": "component definition created",
 	})
 }
 
-func (h *StatutoryProfileHandler) ListComponentDefinitions(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
-		return
-	}
-	defs, err := h.engine.ListComponentDefinitions(ctx, companyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    defs,
-	})
-}
-
-// NEW: UpdateComponentDefinition
 func (h *StatutoryProfileHandler) UpdateComponentDefinition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	code := chi.URLParam(r, "statutoryCode")
@@ -740,9 +885,15 @@ func (h *StatutoryProfileHandler) UpdateComponentDefinition(w http.ResponseWrite
 		return
 	}
 
-	var req createComponentDefinitionRequest
+	var req createComponentDefinitionRequest // reuse, but note that StatutoryCode is taken from URL
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	// ignore req.StatutoryCode; use code from URL
+	req.StatutoryCode = code
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -759,15 +910,17 @@ func (h *StatutoryProfileHandler) UpdateComponentDefinition(w http.ResponseWrite
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "component definition updated",
+	})
 }
 
-// NEW: DeleteComponentDefinition
 func (h *StatutoryProfileHandler) DeleteComponentDefinition(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	code := chi.URLParam(r, "statutoryCode")
@@ -784,23 +937,44 @@ func (h *StatutoryProfileHandler) DeleteComponentDefinition(w http.ResponseWrite
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "component definition deleted",
+	})
 }
 
-// ------------------------------
-// Contribution rule handlers
-// ------------------------------
+func (h *StatutoryProfileHandler) ListComponentDefinitions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defs, err := h.engine.ListComponentDefinitions(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    defs,
+	})
+}
+
+// ----------------------------------------------------------------------
+// Contribution Rule Handlers
+// ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) SetContributionRule(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -808,23 +982,17 @@ func (h *StatutoryProfileHandler) SetContributionRule(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
 	var req setContributionRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if req.ContributionSide != "employee" && req.ContributionSide != "employer" {
-		h.respondWithError(w, http.StatusBadRequest, "invalid contribution_side: must be 'employee' or 'employer'")
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.CalculationType != "percentage" && req.CalculationType != "fixed" && req.CalculationType != "slab" {
-		h.respondWithError(w, http.StatusBadRequest, "invalid calculation_type: must be 'percentage', 'fixed', or 'slab'")
-		return
-	}
-	if req.EffectiveFrom.IsZero() {
-		h.respondWithError(w, http.StatusBadRequest, "effective_from is required")
-		return
-	}
+
 	input := &models.CreateStatutoryContributionRuleInput{
 		CompanyID:        companyID,
 		RuleSetID:        ruleSetID,
@@ -841,18 +1009,83 @@ func (h *StatutoryProfileHandler) SetContributionRule(w http.ResponseWriter, r *
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "contribution rule set",
+	})
+}
+
+// BulkSetContributionRules – new handler
+func (h *StatutoryProfileHandler) BulkSetContributionRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var reqs []setContributionRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if len(reqs) == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "at least one rule is required")
+		return
+	}
+
+	inputs := make([]models.CreateStatutoryContributionRuleInput, 0, len(reqs))
+	for i, req := range reqs {
+		if err := req.validate(); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("rule %d: %s", i, err.Error()))
+			return
+		}
+		inputs = append(inputs, models.CreateStatutoryContributionRuleInput{
+			CompanyID:        companyID,
+			RuleSetID:        ruleSetID,
+			StatutoryCode:    req.StatutoryCode,
+			ContributionSide: req.ContributionSide,
+			CalculationType:  req.CalculationType,
+			RateValue:        req.RateValue,
+			WageCeiling:      req.WageCeiling,
+			MinThreshold:     req.MinThreshold,
+			EffectiveFrom:    req.EffectiveFrom,
+			ActorID:          actorID,
+		})
+	}
+	if err := h.engine.BulkSetContributionRules(ctx, inputs); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("%d contribution rules upserted", len(inputs)),
+	})
 }
 
 func (h *StatutoryProfileHandler) ListContributionRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	code := r.URL.Query().Get("statutory_code")
-	rules, err := h.engine.ListContributionRules(ctx, companyID, code)
+	statutoryCode := r.URL.Query().Get("statutory_code")
+	if statutoryCode == "" {
+		h.respondWithError(w, http.StatusBadRequest, "statutory_code query parameter is required")
+		return
+	}
+	rules, err := h.engine.ListContributionRules(ctx, companyID, statutoryCode)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -865,9 +1098,9 @@ func (h *StatutoryProfileHandler) ListContributionRules(w http.ResponseWriter, r
 
 func (h *StatutoryProfileHandler) DeactivateContributionRule(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
+	ruleID, err := parseUUIDParam(r, "ruleID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -879,36 +1112,37 @@ func (h *StatutoryProfileHandler) DeactivateContributionRule(w http.ResponseWrit
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "contribution rule deactivated",
+	})
 }
 
-// Aliases for router compatibility
+// Aliases for REST consistency
 func (h *StatutoryProfileHandler) CreateContributionRule(w http.ResponseWriter, r *http.Request) {
 	h.SetContributionRule(w, r)
 }
-
 func (h *StatutoryProfileHandler) UpdateContributionRule(w http.ResponseWriter, r *http.Request) {
 	h.SetContributionRule(w, r)
 }
-
 func (h *StatutoryProfileHandler) DeleteContributionRule(w http.ResponseWriter, r *http.Request) {
 	h.DeactivateContributionRule(w, r)
 }
 
-// ------------------------------
-// Tax slab handlers
-// ------------------------------
+// ----------------------------------------------------------------------
+// Tax Slab Handlers
+// ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateTaxSlab(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -916,11 +1150,17 @@ func (h *StatutoryProfileHandler) CreateTaxSlab(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
 	var req createTaxSlabRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	input := &service.CreateTaxSlabInput{
 		CompanyID:     companyID,
 		StatutoryCode: req.StatutoryCode,
@@ -937,38 +1177,17 @@ func (h *StatutoryProfileHandler) CreateTaxSlab(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{"success": true})
-}
-
-func (h *StatutoryProfileHandler) ListTaxSlabs(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
-		return
-	}
-	// Read statutory code from query parameter, not from URL path
-	statutoryCode := r.URL.Query().Get("statutory_code")
-	if statutoryCode == "" {
-		h.respondWithError(w, http.StatusBadRequest, "statutory code required")
-		return
-	}
-	slabs, err := h.engine.ListTaxSlabs(ctx, companyID, statutoryCode)
-	if err != nil {
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 		"success": true,
-		"data":    slabs,
+		"message": "tax slab created",
 	})
 }
 
 func (h *StatutoryProfileHandler) UpdateTaxSlab(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	slabID, err := uuid.Parse(chi.URLParam(r, "slabID"))
+	slabID, err := parseUUIDParam(r, "slabID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid slabID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -976,11 +1195,13 @@ func (h *StatutoryProfileHandler) UpdateTaxSlab(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
 	var req updateTaxSlabRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+
 	input := &service.UpdateTaxSlabInput{
 		SlabID:        slabID,
 		MinAmount:     req.MinAmount,
@@ -995,14 +1216,17 @@ func (h *StatutoryProfileHandler) UpdateTaxSlab(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "tax slab updated",
+	})
 }
 
 func (h *StatutoryProfileHandler) DeleteTaxSlab(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	slabID, err := uuid.Parse(chi.URLParam(r, "slabID"))
+	slabID, err := parseUUIDParam(r, "slabID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid slabID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -1010,28 +1234,53 @@ func (h *StatutoryProfileHandler) DeleteTaxSlab(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	// Engine uses DeactivateTaxSlab for deletion
 	if err := h.engine.DeactivateTaxSlab(ctx, slabID, actorID); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "tax slab deactivated",
+	})
 }
 
-// ------------------------------
-// Deduction limit handlers
-// ------------------------------
+func (h *StatutoryProfileHandler) ListTaxSlabs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	statutoryCode := r.URL.Query().Get("statutory_code")
+	if statutoryCode == "" {
+		h.respondWithError(w, http.StatusBadRequest, "statutory_code query parameter is required")
+		return
+	}
+	slabs, err := h.engine.ListTaxSlabs(ctx, companyID, statutoryCode)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    slabs,
+	})
+}
+
+// ----------------------------------------------------------------------
+// Deduction Limit Handlers
+// ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateDeductionLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -1039,11 +1288,17 @@ func (h *StatutoryProfileHandler) CreateDeductionLimit(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
 	var req createDeductionLimitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	input := &service.CreateDeductionLimitInput{
 		CompanyID:  companyID,
 		RuleSetID:  ruleSetID,
@@ -1056,19 +1311,80 @@ func (h *StatutoryProfileHandler) CreateDeductionLimit(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": "deduction limit created",
+	})
+}
+
+func (h *StatutoryProfileHandler) UpdateDeductionLimit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	limitID, err := parseUUIDParam(r, "limitID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var req updateDeductionLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+
+	input := &service.UpdateDeductionLimitInput{
+		LimitID:    limitID,
+		LimitValue: req.LimitValue,
+		Metadata:   req.Metadata,
+		ActorID:    actorID,
+	}
+	if err := h.engine.UpdateDeductionLimit(ctx, input); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "deduction limit updated",
+	})
+}
+
+func (h *StatutoryProfileHandler) DeleteDeductionLimit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	limitID, err := parseUUIDParam(r, "limitID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err := h.engine.DeleteDeductionLimit(ctx, limitID, actorID); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "deduction limit deleted",
+	})
 }
 
 func (h *StatutoryProfileHandler) ListDeductionLimits(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var ruleSetID *uuid.UUID
 	if rs := chi.URLParam(r, "ruleSetID"); rs != "" {
-		if id, err := uuid.Parse(rs); err == nil {
+		id, err := uuid.Parse(rs)
+		if err == nil {
 			ruleSetID = &id
 		}
 	}
@@ -1083,69 +1399,20 @@ func (h *StatutoryProfileHandler) ListDeductionLimits(w http.ResponseWriter, r *
 	})
 }
 
-func (h *StatutoryProfileHandler) UpdateDeductionLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	limitID, err := uuid.Parse(chi.URLParam(r, "limitID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid limitID")
-		return
-	}
-	actorID, err := h.getAdminActor(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	var req updateDeductionLimitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	input := &service.UpdateDeductionLimitInput{
-		LimitID:    limitID,
-		LimitValue: req.LimitValue,
-		Metadata:   req.Metadata,
-		ActorID:    actorID,
-	}
-	if err := h.engine.UpdateDeductionLimit(ctx, input); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
-}
-
-func (h *StatutoryProfileHandler) DeleteDeductionLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	limitID, err := uuid.Parse(chi.URLParam(r, "limitID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid limitID")
-		return
-	}
-	actorID, err := h.getAdminActor(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	if err := h.engine.DeleteDeductionLimit(ctx, limitID, actorID); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
-}
-
-// ------------------------------
-// Component mapping handlers
-// ------------------------------
+// ----------------------------------------------------------------------
+// Component Mapping Handlers
+// ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) CreateComponentMapping(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ruleSetID, err := uuid.Parse(chi.URLParam(r, "ruleSetID"))
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid ruleSetID")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actorID, err := h.getAdminActor(ctx)
@@ -1153,11 +1420,17 @@ func (h *StatutoryProfileHandler) CreateComponentMapping(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
 	var req createComponentMappingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	input := &service.CreateComponentMappingInput{
 		CompanyID:     companyID,
 		StatutoryCode: req.StatutoryCode,
@@ -1170,14 +1443,75 @@ func (h *StatutoryProfileHandler) CreateComponentMapping(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{"success": true})
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": "component mapping created",
+	})
+}
+
+func (h *StatutoryProfileHandler) UpdateComponentMapping(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	mappingID, err := parseUUIDParam(r, "mappingID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var req updateComponentMappingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+
+	input := &service.UpdateComponentMappingInput{
+		MappingID:     mappingID,
+		ComponentCode: req.ComponentCode,
+		EffectiveFrom: req.EffectiveFrom,
+		Version:       req.Version,
+		ActorID:       actorID,
+	}
+	if err := h.engine.UpdateComponentMapping(ctx, input); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "component mapping updated",
+	})
+}
+
+func (h *StatutoryProfileHandler) DeleteComponentMapping(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	mappingID, err := parseUUIDParam(r, "mappingID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err := h.engine.DeactivateComponentMapping(ctx, mappingID, actorID); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "component mapping deactivated",
+	})
 }
 
 func (h *StatutoryProfileHandler) ListComponentMappings(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
+	companyID, err := parseUUIDParam(r, "companyID")
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var statutoryCode *string
@@ -1195,60 +1529,9 @@ func (h *StatutoryProfileHandler) ListComponentMappings(w http.ResponseWriter, r
 	})
 }
 
-func (h *StatutoryProfileHandler) UpdateComponentMapping(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	mappingID, err := uuid.Parse(chi.URLParam(r, "mappingID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid mappingID")
-		return
-	}
-	actorID, err := h.getAdminActor(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	var req updateComponentMappingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	input := &service.UpdateComponentMappingInput{
-		MappingID:     mappingID,
-		ComponentCode: req.ComponentCode,
-		EffectiveFrom: req.EffectiveFrom,
-		Version:       req.Version,
-		ActorID:       actorID,
-	}
-	if err := h.engine.UpdateComponentMapping(ctx, input); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
-}
-
-func (h *StatutoryProfileHandler) DeleteComponentMapping(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	mappingID, err := uuid.Parse(chi.URLParam(r, "mappingID"))
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid mappingID")
-		return
-	}
-	actorID, err := h.getAdminActor(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	// Engine uses DeactivateComponentMapping for deletion
-	if err := h.engine.DeactivateComponentMapping(ctx, mappingID, actorID); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{"success": true})
-}
-
-// ------------------------------
-// Helper functions
-// ------------------------------
+// ----------------------------------------------------------------------
+// Helper Functions
+// ----------------------------------------------------------------------
 
 func (h *StatutoryProfileHandler) getAdminActor(ctx context.Context) (uuid.UUID, error) {
 	userIDStr, ok := ctx.Value("user_id").(string)
@@ -1277,13 +1560,37 @@ func (h *StatutoryProfileHandler) respondWithError(w http.ResponseWriter, status
 	})
 }
 
+func parseUUIDParam(r *http.Request, key string) (uuid.UUID, error) {
+	val := chi.URLParam(r, key)
+	if val == "" {
+		return uuid.Nil, fmt.Errorf("missing %s", key)
+	}
+	id, err := uuid.Parse(val)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid %s: %v", key, err)
+	}
+	return id, nil
+}
+
+func parseTimeQuery(r *http.Request, key string, defaultValue time.Time) (time.Time, error) {
+	val := r.URL.Query().Get(key)
+	if val == "" {
+		return defaultValue, nil
+	}
+	t, err := time.Parse(time.RFC3339, val)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid %s format, use RFC3339", key)
+	}
+	return t, nil
+}
+
 func parseIntQuery(r *http.Request, key string, defaultValue int) int {
 	valStr := r.URL.Query().Get(key)
 	if valStr == "" {
 		return defaultValue
 	}
-	val, err := parseInt(valStr)
-	if err != nil {
+	var val int
+	if _, err := fmt.Sscanf(valStr, "%d", &val); err != nil {
 		return defaultValue
 	}
 	if val < 1 {
@@ -1292,8 +1599,73 @@ func parseIntQuery(r *http.Request, key string, defaultValue int) int {
 	return val
 }
 
-func parseInt(s string) (int, error) {
-	var i int
-	_, err := fmt.Sscanf(s, "%d", &i)
-	return i, err
+type bulkCreateComponentMappingRequest struct {
+	StatutoryCode  string    `json:"statutory_code"`
+	ComponentCodes []string  `json:"component_codes"`
+	EffectiveFrom  time.Time `json:"effective_from"`
+}
+
+func (r *bulkCreateComponentMappingRequest) validate() error {
+	if r.StatutoryCode == "" {
+		return errors.New("statutory_code is required")
+	}
+	if len(r.ComponentCodes) == 0 {
+		return errors.New("at least one component_code required")
+	}
+	if r.EffectiveFrom.IsZero() {
+		return errors.New("effective_from is required")
+	}
+	return nil
+}
+
+func (h *StatutoryProfileHandler) BulkCreateComponentMappings(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyID, err := parseUUIDParam(r, "companyID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ruleSetID, err := parseUUIDParam(r, "ruleSetID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	actorID, err := h.getAdminActor(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	var req bulkCreateComponentMappingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+
+	if err := req.validate(); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	input := &service.BulkCreateComponentMappingsInput{
+		CompanyID:      companyID,
+		StatutoryCode:  req.StatutoryCode,
+		ComponentCodes: req.ComponentCodes,
+		EffectiveFrom:  req.EffectiveFrom,
+		RuleSetID:      ruleSetID,
+		ActorID:        actorID,
+	}
+
+	if err := h.engine.BulkCreateComponentMappings(ctx, input); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("%d mappings processed", len(req.ComponentCodes)),
+	})
 }

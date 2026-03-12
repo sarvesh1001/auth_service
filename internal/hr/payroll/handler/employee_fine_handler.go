@@ -35,25 +35,28 @@ func NewEmployeeFineHandler(fineService service.EmployeeFineService, logger *zap
 // ---------------------------------------------------------------------
 
 type createFineRequest struct {
-	UserID     string    `json:"user_id"`
-	FineAmount float64   `json:"fine_amount"`
-	Reason     string    `json:"reason"`
-	FineDate   time.Time `json:"fine_date"`
-	Category   *string   `json:"category,omitempty"`
-	Reference  *string   `json:"reference,omitempty"`
+	UserID        string    `json:"user_id"`
+	FineAmount    float64   `json:"fine_amount"`
+	Reason        string    `json:"reason"`
+	FineDate      time.Time `json:"fine_date"`
+	ComponentCode *string   `json:"component_code,omitempty"` // added
+	Category      *string   `json:"category,omitempty"`
+	Reference     *string   `json:"reference,omitempty"`
 }
 
 type updateFineRequest struct {
-	FineAmount *float64   `json:"fine_amount,omitempty"`
-	Reason     *string    `json:"reason,omitempty"`
-	FineDate   *time.Time `json:"fine_date,omitempty"`
+	FineAmount    *float64   `json:"fine_amount,omitempty"`
+	Reason        *string    `json:"reason,omitempty"`
+	FineDate      *time.Time `json:"fine_date,omitempty"`
+	ComponentCode *string    `json:"component_code,omitempty"` // added
 }
 
 type bulkCreateFinesRequest struct {
-	UserIDs    []string  `json:"user_ids"`
-	FineAmount float64   `json:"fine_amount"`
-	Reason     string    `json:"reason"`
-	FineDate   time.Time `json:"fine_date"`
+	UserIDs       []string  `json:"user_ids"`
+	FineAmount    float64   `json:"fine_amount"`
+	Reason        string    `json:"reason"`
+	FineDate      time.Time `json:"fine_date"`
+	ComponentCode *string   `json:"component_code,omitempty"` // added
 }
 
 type bulkDeleteUnprocessedRequest struct {
@@ -102,14 +105,15 @@ func (h *EmployeeFineHandler) CreateFine(w http.ResponseWriter, r *http.Request)
 	}
 
 	input := service.CreateEmployeeFineInput{
-		CompanyID:  companyID,
-		UserID:     userID,
-		FineAmount: req.FineAmount,
-		Reason:     req.Reason,
-		FineDate:   req.FineDate,
-		Category:   req.Category,
-		Reference:  req.Reference,
-		CreatedBy:  actorID,
+		CompanyID:     companyID,
+		UserID:        userID,
+		FineAmount:    req.FineAmount,
+		Reason:        req.Reason,
+		FineDate:      req.FineDate,
+		ComponentCode: req.ComponentCode, // added
+		Category:      req.Category,
+		Reference:     req.Reference,
+		CreatedBy:     actorID,
 	}
 
 	fine, err := h.fineService.CreateFine(ctx, input)
@@ -154,18 +158,19 @@ func (h *EmployeeFineHandler) UpdateFine(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.FineAmount == nil && req.Reason == nil && req.FineDate == nil {
+	if req.FineAmount == nil && req.Reason == nil && req.FineDate == nil && req.ComponentCode == nil {
 		h.respondWithError(w, http.StatusBadRequest, "no fields to update")
 		return
 	}
 
 	input := service.UpdateEmployeeFineInput{
-		FineID:     fineID,
-		CompanyID:  companyID,
-		FineAmount: req.FineAmount,
-		Reason:     req.Reason,
-		FineDate:   req.FineDate,
-		UpdatedBy:  actorID,
+		FineID:        fineID,
+		CompanyID:     companyID,
+		FineAmount:    req.FineAmount,
+		Reason:        req.Reason,
+		FineDate:      req.FineDate,
+		ComponentCode: req.ComponentCode, // added
+		UpdatedBy:     actorID,
 	}
 
 	fine, err := h.fineService.UpdateFine(ctx, input)
@@ -257,12 +262,13 @@ func (h *EmployeeFineHandler) BulkCreateFines(w http.ResponseWriter, r *http.Req
 	}
 
 	input := service.BulkCreateEmployeeFineInput{
-		CompanyID:  companyID,
-		UserIDs:    userIDs,
-		FineAmount: req.FineAmount,
-		Reason:     req.Reason,
-		FineDate:   req.FineDate,
-		CreatedBy:  actorID,
+		CompanyID:     companyID,
+		UserIDs:       userIDs,
+		FineAmount:    req.FineAmount,
+		Reason:        req.Reason,
+		FineDate:      req.FineDate,
+		ComponentCode: req.ComponentCode, // added
+		CreatedBy:     actorID,
 	}
 
 	fines, err := h.fineService.BulkCreateFines(ctx, input)

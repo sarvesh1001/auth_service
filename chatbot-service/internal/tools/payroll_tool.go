@@ -170,7 +170,7 @@ type actionHandler struct {
 }
 
 var actionHandlers = map[string]actionHandler{
-	// ----- Runs -----
+	// ----- Runs (existing) -----
 	"list_runs": {
 		method:       "GET",
 		pathTemplate: "/runs",
@@ -243,7 +243,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"runID", "userID"},
 	},
 
-	// ----- Employee Payroll History / YTD -----
+	// ----- Employee Payroll History / YTD (existing) -----
 	"get_employee_history": {
 		method:       "GET",
 		pathTemplate: "/employee/{userID}/history",
@@ -268,7 +268,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"payrollItemID"},
 	},
 
-	// ----- Trends -----
+	// ----- Trends (existing) -----
 	"get_payroll_trend": {
 		method:       "GET",
 		pathTemplate: "/trend",
@@ -281,7 +281,7 @@ var actionHandlers = map[string]actionHandler{
 		queryParams:  []string{"from", "to"},
 	},
 
-	// ----- Fines -----
+	// ----- Fines (existing + new) -----
 	"list_fines": {
 		method:       "GET",
 		pathTemplate: "/fines",
@@ -335,8 +335,18 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"userID"},
 		queryParams:  []string{"from_date", "to_date"},
 	},
+	"create_fines_bulk": {
+		method:       "POST",
+		pathTemplate: "/fines/bulk",
+		requiredBody: []string{"user_ids", "fine_amount", "reason", "fine_date"},
+	},
+	"bulk_delete_unprocessed_fines": {
+		method:       "DELETE",
+		pathTemplate: "/fines/bulk/unprocessed",
+		requiredBody: []string{"fine_ids"},
+	},
 
-	// ----- Adjustments -----
+	// ----- Adjustments (existing + new) -----
 	"list_adjustments": {
 		method:       "GET",
 		pathTemplate: "/adjustments",
@@ -368,8 +378,13 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"userID"},
 		queryParams:  []string{"from", "to"},
 	},
+	"bulk_create_adjustments": {
+		method:       "POST",
+		pathTemplate: "/adjustments/bulk",
+		requiredBody: []string{"adjustments"}, // expects array in body
+	},
 
-	// ----- Salary Structures -----
+	// ----- Salary Structures (existing + new) -----
 	"list_structures": {
 		method:       "GET",
 		pathTemplate: "/structures",
@@ -406,8 +421,40 @@ var actionHandlers = map[string]actionHandler{
 		pathTemplate: "/structures/{structureID}/publish",
 		pathParams:   []string{"structureID"},
 	},
+	"update_structure": {
+		method:       "PUT",
+		pathTemplate: "/structures/{structureID}",
+		pathParams:   []string{"structureID"},
+	},
+	"update_structure_component": {
+		method:       "PUT",
+		pathTemplate: "/structures/{structureID}/components/{componentCode}",
+		pathParams:   []string{"structureID", "componentCode"},
+	},
+	"delete_structure_component": {
+		method:       "DELETE",
+		pathTemplate: "/structures/{structureID}/components/{componentCode}",
+		pathParams:   []string{"structureID", "componentCode"},
+	},
+	"reorder_structure_components": {
+		method:       "POST",
+		pathTemplate: "/structures/{structureID}/components/reorder",
+		pathParams:   []string{"structureID"},
+		requiredBody: []string{"component_codes"},
+	},
+	"clone_structure": {
+		method:       "POST",
+		pathTemplate: "/structures/{structureID}/clone",
+		pathParams:   []string{"structureID"},
+		requiredBody: []string{"effective_from"},
+	},
+	"deactivate_structure": {
+		method:       "DELETE",
+		pathTemplate: "/structures/{structureID}",
+		pathParams:   []string{"structureID"},
+	},
 
-	// ----- Statutory Profiles -----
+	// ----- Statutory Profiles (existing + new) -----
 	"list_statutory_profiles": {
 		method:       "GET",
 		pathTemplate: "/statutory-profiles",
@@ -440,8 +487,24 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"userID"},
 		requiredBody: []string{"tax_regime_code", "effective_from"},
 	},
+	"bulk_upsert_statutory_profiles": {
+		method:       "POST",
+		pathTemplate: "/statutory-profiles/bulk",
+		requiredBody: []string{"profiles"},
+	},
+	"get_employee_active_profile_for_code": {
+		method:       "GET",
+		pathTemplate: "/employee/{userID}/statutory-profiles/{statutoryCode}/active",
+		pathParams:   []string{"userID", "statutoryCode"},
+		queryParams:  []string{"asOf"},
+	},
+	"get_employee_profile_history": {
+		method:       "GET",
+		pathTemplate: "/employee/{userID}/statutory-profiles/{statutoryCode}/history",
+		pathParams:   []string{"userID", "statutoryCode"},
+	},
 
-	// ----- Attendance Rules -----
+	// ----- Attendance Rules (existing + new) -----
 	"list_attendance_rules": {
 		method:       "GET",
 		pathTemplate: "/attendance-rules",
@@ -473,8 +536,23 @@ var actionHandlers = map[string]actionHandler{
 		pathTemplate: "/attendance-rules/{ruleID}/deactivate",
 		pathParams:   []string{"ruleID"},
 	},
+	"bulk_deactivate_attendance_rules_by_type": {
+		method:       "POST",
+		pathTemplate: "/attendance-rules/bulk-deactivate-by-type",
+		requiredBody: []string{"rule_type"},
+	},
+	"check_active_rule_exists": {
+		method:       "GET",
+		pathTemplate: "/attendance-rules/exists-active",
+		queryParams:  []string{"rule_type"},
+	},
+	"get_active_attendance_rules": {
+		method:       "GET",
+		pathTemplate: "/attendance-rules/active",
+		queryParams:  []string{"as_of"},
+	},
 
-	// ----- Statutory Component Definitions -----
+	// ----- Statutory Component Definitions (existing) -----
 	"create_statutory_component": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/components",
@@ -497,7 +575,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"statutoryCode"},
 	},
 
-	// ----- Rule Sets -----
+	// ----- Rule Sets (existing) -----
 	"create_rule_set": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/rule-sets",
@@ -529,7 +607,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"ruleSetID"},
 	},
 
-	// ----- Contribution Rules -----
+	// ----- Contribution Rules (existing) -----
 	"create_contribution_rule": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/contributions",
@@ -554,7 +632,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"ruleSetID", "ruleID"},
 	},
 
-	// ----- Tax Slabs -----
+	// ----- Tax Slabs (existing) -----
 	"create_tax_slab": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/slabs",
@@ -579,7 +657,7 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"ruleSetID", "slabID"},
 	},
 
-	// ----- Deduction Limits -----
+	// ----- Deduction Limits (existing) -----
 	"create_deduction_limit": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/limits",
@@ -603,12 +681,305 @@ var actionHandlers = map[string]actionHandler{
 		pathParams:   []string{"ruleSetID", "limitID"},
 	},
 
-	// ----- Component Mappings -----
+	// ----- Component Mappings (existing + new) -----
 	"create_component_mapping": {
 		method:       "POST",
 		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/mappings",
 		pathParams:   []string{"ruleSetID"},
 		requiredBody: []string{"statutory_code", "component_code", "effective_from"},
+	},
+	"bulk_create_component_mappings": {
+		method:       "POST",
+		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/mappings/bulk",
+		pathParams:   []string{"ruleSetID"},
+		requiredBody: []string{"statutory_code", "component_codes", "effective_from"},
+	},
+	"list_component_mappings": {
+		method:       "GET",
+		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/mappings",
+		pathParams:   []string{"ruleSetID"},
+		queryParams:  []string{"statutory_code"},
+	},
+	"update_component_mapping": {
+		method:       "PUT",
+		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/mappings/{mappingId}",
+		pathParams:   []string{"ruleSetID", "mappingId"},
+		requiredBody: []string{"component_code", "effective_from", "version"},
+	},
+	"delete_component_mapping": {
+		method:       "DELETE",
+		pathTemplate: "/statutory-profiles/rule-sets/{ruleSetID}/mappings/{mappingId}",
+		pathParams:   []string{"ruleSetID", "mappingId"},
+	},
+
+	// ----- Payroll Locks (new) -----
+	"list_locks": {
+		method:       "GET",
+		pathTemplate: "/locks",
+	},
+	"create_lock": {
+		method:       "POST",
+		pathTemplate: "/locks",
+		requiredBody: []string{"period_start", "period_end", "reason"},
+	},
+	"delete_lock": {
+		method:       "DELETE",
+		pathTemplate: "/locks",
+		queryParams:  []string{"start", "end"},
+	},
+
+	// ----- Payroll Components (new) -----
+	"list_components": {
+		method:       "GET",
+		pathTemplate: "/components",
+	},
+	"get_component": {
+		method:       "GET",
+		pathTemplate: "/components/{componentCode}",
+		pathParams:   []string{"componentCode"},
+	},
+	"create_component": {
+		method:       "POST",
+		pathTemplate: "/components",
+		requiredBody: []string{"component_code", "component_type", "description", "is_taxable", "is_system", "is_active", "contribution_side"},
+	},
+	"update_component": {
+		method:       "PUT",
+		pathTemplate: "/components/{componentCode}",
+		pathParams:   []string{"componentCode"},
+	},
+	"get_default_component": {
+		method:       "GET",
+		pathTemplate: "/components/default",
+		queryParams:  []string{"purpose"},
+	},
+	"clear_component_cache": {
+		method:       "POST",
+		pathTemplate: "/components/clear-cache",
+	},
+
+	// ----- Company Payroll Settings (new) -----
+	"get_company_settings": {
+		method:       "GET",
+		pathTemplate: "/settings",
+	},
+	"update_company_settings": {
+		method:       "PUT",
+		pathTemplate: "/settings",
+		requiredBody: []string{"default_fine_component", "default_arrears_component", "default_loan_component", "default_basic_component"},
+	},
+
+	// ----- Loans (new) -----
+	"list_loans": {
+		method:       "GET",
+		pathTemplate: "/loans",
+		queryParams:  []string{"user_id", "include_closed"},
+	},
+	"list_active_loans": {
+		method:       "GET",
+		pathTemplate: "/loans/active",
+		queryParams:  []string{"as_of"},
+	},
+	"get_loan_pending_emis": {
+		method:       "GET",
+		pathTemplate: "/loans/{loanId}/pending-emis",
+		pathParams:   []string{"loanId"},
+	},
+	"close_loan": {
+		method:       "POST",
+		pathTemplate: "/loans/{loanId}/close",
+		pathParams:   []string{"loanId"},
+		requiredBody: []string{"closure_date"},
+	},
+	"preview_emi": {
+		method:       "POST",
+		pathTemplate: "/loans/preview-emi",
+		requiredBody: []string{"user_id", "principal", "total_emis"},
+	},
+	"get_loans_for_user": {
+		method:       "GET",
+		pathTemplate: "/loans/user/{userId}",
+		pathParams:   []string{"userId"},
+		queryParams:  []string{"includeClosed"},
+	},
+	"record_manual_loan_payment": {
+		method:       "POST",
+		pathTemplate: "/loans/{loanId}/manual-payment",
+		pathParams:   []string{"loanId"},
+		requiredBody: []string{"amount", "paid_at"},
+	},
+	"list_loan_payments": {
+		method:       "GET",
+		pathTemplate: "/loans/{loanId}/payments",
+		pathParams:   []string{"loanId"},
+	},
+	"get_pending_emis_for_run": {
+		method:       "GET",
+		pathTemplate: "/runs/{payrollRunId}/pending-emis",
+		pathParams:   []string{"payrollRunId"},
+	},
+	"mark_emi_paid": {
+		method:       "POST",
+		pathTemplate: "/emis/{emiId}/paid",
+		pathParams:   []string{"emiId"},
+		requiredBody: []string{"paid_date"},
+	},
+
+	// ----- Arrears (new) -----
+	"create_arrears": {
+		method:       "POST",
+		pathTemplate: "/arrears",
+		requiredBody: []string{"user_id", "effective_from", "effective_to", "amount", "reason"},
+	},
+	"get_employee_unprocessed_arrears": {
+		method:       "GET",
+		pathTemplate: "/employee/{userId}/arrears/unprocessed",
+		pathParams:   []string{"userId"},
+	},
+	"list_unprocessed_arrears": {
+		method:       "GET",
+		pathTemplate: "/arrears/unprocessed",
+		queryParams:  []string{"period_start", "period_end"},
+	},
+
+	// ----- Employee Payroll Queries (new) -----
+	"get_employee_salary": {
+		method:       "GET",
+		pathTemplate: "/employee/{userId}/salary",
+		pathParams:   []string{"userId"},
+		queryParams:  []string{"as_of"},
+	},
+	"get_employee_salary_snapshot": {
+		method:       "GET",
+		pathTemplate: "/employee/{userId}/salary/snapshot",
+		pathParams:   []string{"userId"},
+		queryParams:  []string{"as_of"},
+	},
+	"preview_earnings": {
+		method:       "POST",
+		pathTemplate: "/employee/{userId}/earnings/preview",
+		pathParams:   []string{"userId"},
+		requiredBody: []string{"period_start", "period_end"},
+	},
+
+	// ----- Payslips (new) -----
+	"generate_payslips_for_run": {
+		method:       "POST",
+		pathTemplate: "/payslips/runs/{runId}/generate",
+		pathParams:   []string{"runId"},
+		requiredBody: []string{}, // empty body
+	},
+	"download_payslip": {
+		method:       "GET",
+		pathTemplate: "/payslips/runs/{runId}/users/{userId}/download",
+		pathParams:   []string{"runId", "userId"},
+	},
+	"send_payslip_email": {
+		method:       "POST",
+		pathTemplate: "/payslips/runs/{runId}/users/{userId}/send-email",
+		pathParams:   []string{"runId", "userId"},
+		requiredBody: []string{},
+	},
+	"list_employee_payslips": {
+		method:       "GET",
+		pathTemplate: "/payslips/users/{userId}",
+		pathParams:   []string{"userId"},
+		queryParams:  []string{"from", "to"},
+	},
+
+	// ----- Reports (new) -----
+	"generate_statutory_challan": {
+		method:       "POST",
+		pathTemplate: "/reports/statutory-challan",
+		requiredBody: []string{"period_start", "period_end"},
+	},
+	"generate_payroll_register": {
+		method:       "POST",
+		pathTemplate: "/reports/payroll-register",
+		requiredBody: []string{"period_start", "period_end"},
+		queryParams:  []string{"group_by"},
+	},
+
+	// ----- Tax Declarations (new) -----
+	"create_declaration_type": {
+		method:       "POST",
+		pathTemplate: "/tax-declarations/types",
+		requiredBody: []string{"type_code", "description", "max_limit"},
+	},
+	"update_declaration_type": {
+		method:       "PUT",
+		pathTemplate: "/tax-declarations/types/{typeCode}",
+		pathParams:   []string{"typeCode"},
+	},
+	"list_declaration_types": {
+		method:       "GET",
+		pathTemplate: "/tax-declarations/types",
+	},
+	"get_declaration_type": {
+		method:       "GET",
+		pathTemplate: "/tax-declarations/types/{typeCode}",
+		pathParams:   []string{"typeCode"},
+	},
+	"create_declaration": {
+		method:       "POST",
+		pathTemplate: "/tax-declarations/declarations",
+		requiredBody: []string{"user_id", "financial_year", "declaration_type", "amount"},
+	},
+	"update_declaration": {
+		method:       "PUT",
+		pathTemplate: "/tax-declarations/declarations/{declarationId}",
+		pathParams:   []string{"declarationId"},
+	},
+	"verify_declaration": {
+		method:       "POST",
+		pathTemplate: "/tax-declarations/declarations/{declarationId}/verify",
+		pathParams:   []string{"declarationId"},
+		requiredBody: []string{"status"},
+	},
+	"list_user_declarations": {
+		method:       "GET",
+		pathTemplate: "/tax-declarations/declarations/user/{userId}",
+		pathParams:   []string{"userId"},
+		queryParams:  []string{"financial_year"},
+	},
+	"list_declarations": {
+		method:       "GET",
+		pathTemplate: "/tax-declarations/declarations",
+		queryParams:  []string{"financial_year", "status"},
+	},
+	"get_declaration_total": {
+		method:       "GET",
+		pathTemplate: "/tax-declarations/declarations/total",
+		queryParams:  []string{"user_id", "financial_year", "only_verified"},
+	},
+
+	// ----- Bank Export (new) -----
+	"export_bank_file": {
+		method:       "GET",
+		pathTemplate: "/runs/{runId}/bank-export",
+		pathParams:   []string{"runId"},
+		queryParams:  []string{"format"},
+	},
+
+	// ----- Component Management (new) -----
+	"list_component_management": {
+		method:       "GET",
+		pathTemplate: "/component-management",
+	},
+	"create_component_management": {
+		method:       "POST",
+		pathTemplate: "/component-management",
+		requiredBody: []string{"component_code", "component_type", "description", "is_taxable", "is_system", "is_active", "contribution_side"},
+	},
+	"update_component_management": {
+		method:       "PUT",
+		pathTemplate: "/component-management/{componentCode}",
+		pathParams:   []string{"componentCode"},
+	},
+	"delete_component_management": {
+		method:       "DELETE",
+		pathTemplate: "/component-management/{componentCode}",
+		pathParams:   []string{"componentCode"},
 	},
 }
 

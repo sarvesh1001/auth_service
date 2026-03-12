@@ -44,6 +44,7 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 		fine.CreatedAt = time.Now().UTC()
 	}
 
+	// ADDED: component_code column and value
 	query := `
 		INSERT INTO payroll.employee_fine (
 			fine_id,
@@ -55,8 +56,9 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 			is_processed,
 			payroll_run_id,
 			created_at,
-			created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			created_by,
+			component_code
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`
 	_, err := r.client.Exec(ctx, query,
 		fine.FineID,
@@ -69,12 +71,14 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 		fine.PayrollRunID,
 		fine.CreatedAt,
 		fine.CreatedBy,
+		fine.ComponentCode, // ADDED
 	)
 	if err != nil {
 		r.logger.Error("Failed to create employee fine",
 			util.String("fine_id", fine.FineID.String()),
 			util.String("company_id", fine.CompanyID.String()),
 			util.String("user_id", fine.UserID.String()),
+			util.String("component_code", fine.ComponentCode), // ADDED
 			util.ErrorField(err),
 		)
 		return fmt.Errorf("failed to create employee fine: %w", err)
@@ -83,7 +87,8 @@ func (r *employeeFineRepository) Create(ctx context.Context, fine *models.Employ
 }
 
 func (r *employeeFineRepository) Update(ctx context.Context, fine *models.EmployeeFine) error {
-	// Note: we do not update created_at, created_by
+	// Note: component_code is NOT updated because it is a fixed attribute of the fine.
+	// If you need to change the component, you should create a new fine or delete/unprocessed.
 	query := `
 		UPDATE payroll.employee_fine
 		SET
@@ -185,6 +190,7 @@ func (r *employeeFineRepository) GetByID(
 	ctx context.Context,
 	companyID, fineID uuid.UUID,
 ) (*models.EmployeeFine, error) {
+	// ADDED: component_code in SELECT
 	query := `
 		SELECT
 			fine_id,
@@ -196,7 +202,8 @@ func (r *employeeFineRepository) GetByID(
 			is_processed,
 			payroll_run_id,
 			created_at,
-			created_by
+			created_by,
+			component_code
 		FROM payroll.employee_fine
 		WHERE fine_id = $1 AND company_id = $2
 	`
@@ -213,6 +220,7 @@ func (r *employeeFineRepository) GetByID(
 		&fine.PayrollRunID,
 		&fine.CreatedAt,
 		&fine.CreatedBy,
+		&fine.ComponentCode, // ADDED
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -277,7 +285,7 @@ func (r *employeeFineRepository) GetByFilter(
 		return []models.EmployeeFine{}, 0, nil
 	}
 
-	// Fetch data
+	// Fetch data – ADDED component_code
 	query := `
 		SELECT
 			fine_id,
@@ -289,7 +297,8 @@ func (r *employeeFineRepository) GetByFilter(
 			is_processed,
 			payroll_run_id,
 			created_at,
-			created_by
+			created_by,
+			component_code
 		FROM payroll.employee_fine
 	` + whereClause + ` ORDER BY fine_date DESC`
 
@@ -327,6 +336,7 @@ func (r *employeeFineRepository) GetByFilter(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentCode, // ADDED
 		); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -344,6 +354,7 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 	userID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) ([]models.EmployeeFine, error) {
+	// ADDED component_code
 	query := `
 		SELECT
 			fine_id,
@@ -355,7 +366,8 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 			is_processed,
 			payroll_run_id,
 			created_at,
-			created_by
+			created_by,
+			component_code
 		FROM payroll.employee_fine
 		WHERE company_id = $1
 			AND user_id = $2
@@ -388,6 +400,7 @@ func (r *employeeFineRepository) GetUnprocessedByUserAndPeriod(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentCode, // ADDED
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -404,6 +417,7 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) ([]models.EmployeeFine, error) {
+	// ADDED component_code
 	query := `
 		SELECT
 			fine_id,
@@ -415,7 +429,8 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 			is_processed,
 			payroll_run_id,
 			created_at,
-			created_by
+			created_by,
+			component_code
 		FROM payroll.employee_fine
 		WHERE company_id = $1
 			AND is_processed = false
@@ -446,6 +461,7 @@ func (r *employeeFineRepository) GetUnprocessedByCompanyAndPeriod(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentCode, // ADDED
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}
@@ -469,6 +485,7 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 ) ([]models.EmployeeFine, error) {
 	// Atomically update and return the fines that become processed.
 	// This locks the rows and prevents double‑processing.
+	// ADDED component_code in RETURNING
 	query := `
 		UPDATE payroll.employee_fine
 		SET
@@ -487,7 +504,8 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			is_processed,
 			payroll_run_id,
 			created_at,
-			created_by
+			created_by,
+			component_code
 	`
 	rows, err := r.client.Query(ctx, query, payrollRunID, companyID, periodStart, periodEnd)
 	if err != nil {
@@ -514,6 +532,7 @@ func (r *employeeFineRepository) LockUnprocessedForPayrollRun(
 			&f.PayrollRunID,
 			&f.CreatedAt,
 			&f.CreatedBy,
+			&f.ComponentCode, // ADDED
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan employee fine: %w", err)
 		}

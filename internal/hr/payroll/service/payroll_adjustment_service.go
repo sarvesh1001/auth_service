@@ -102,8 +102,6 @@ func (s *payrollAdjustmentService) ValidateAllowed(
 }
 
 // Create adds a new payroll adjustment and audits the action.
-// Note: For true atomicity, the audit should be part of the same transaction.
-// This requires repository support for CreateAuditLogTx. Future improvement.
 func (s *payrollAdjustmentService) Create(
 	ctx context.Context,
 	input *models.CreatePayrollAdjustmentInput,
@@ -122,7 +120,8 @@ func (s *payrollAdjustmentService) Create(
 		return nil, err
 	}
 
-	component, err := s.repo.GetComponent(ctx, input.ComponentCode)
+	// ✅ FIX: pass companyID to GetComponent
+	component, err := s.repo.GetComponent(ctx, input.CompanyID, input.ComponentCode)
 	if err != nil {
 		return nil, err
 	}
@@ -180,8 +179,6 @@ func (s *payrollAdjustmentService) Create(
 }
 
 // BulkCreate creates multiple adjustments in a transaction.
-// Audit: For simplicity, no per‑record audit is added. In a production system,
-// you could use CreateAuditLogBatch to insert a batch of audit logs after commit.
 func (s *payrollAdjustmentService) BulkCreate(
 	ctx context.Context,
 	inputs []*models.CreatePayrollAdjustmentInput,
@@ -195,7 +192,7 @@ func (s *payrollAdjustmentService) BulkCreate(
 	}
 	defer func() {
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 		}
 	}()
 
@@ -211,7 +208,8 @@ func (s *payrollAdjustmentService) BulkCreate(
 		if err = s.ValidateAllowed(ctx, input.CompanyID, input.ApplicableMonth); err != nil {
 			return err
 		}
-		component, err2 := s.repo.GetComponent(ctx, input.ComponentCode)
+		// ✅ FIX: pass companyID to GetComponent
+		component, err2 := s.repo.GetComponent(ctx, input.CompanyID, input.ComponentCode)
 		if err2 != nil {
 			err = err2
 			return err
@@ -268,8 +266,7 @@ func (s *payrollAdjustmentService) BulkCreate(
 			return err
 		}
 	}
-	err = tx.Commit()
-	if err != nil {
+	if err = tx.Commit(); err != nil {
 		return err
 	}
 
@@ -279,7 +276,6 @@ func (s *payrollAdjustmentService) BulkCreate(
 }
 
 // Update modifies an existing adjustment and audits the change.
-// The actor making the change must be provided in input.UpdatedBy.
 func (s *payrollAdjustmentService) Update(
 	ctx context.Context,
 	input *models.UpdatePayrollAdjustmentInput,
@@ -331,7 +327,7 @@ func (s *payrollAdjustmentService) Update(
 		"payroll_adjustment",
 		&existing.AdjustmentID,
 		"admin",
-		&input.UpdatedBy, // ✅ correct actor
+		&input.UpdatedBy,
 		beforeState,
 		afterState,
 		nil,

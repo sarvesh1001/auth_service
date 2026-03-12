@@ -27,6 +27,8 @@ import (
 // ✅ Pagination for history
 // ✅ Correct overlapping date handling with exclusion
 // ✅ Clean separation: no business logic, only persistence
+// ✅ Global component support (company_id IS NULL)
+// ✅ Correct component resolution: company-specific overrides global
 // ---------------------------------------------------------------------
 
 type compensationRepository struct {
@@ -774,11 +776,33 @@ func (r *compensationRepository) IsSalaryStructureInUse(
 	return inUse, nil
 }
 
-// ENTERPRISE FIX: company validation added
-
 // ---------------------------------------------------------------------
 // SALARY STRUCTURE COMPONENTS
 // ---------------------------------------------------------------------
+
+// componentExistsForCompany checks whether a given component code exists and is active,
+// either as a company-specific component or as a global component.
+func (r *compensationRepository) componentExistsForCompany(
+	ctx context.Context,
+	companyID uuid.UUID,
+	componentCode string,
+) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM payroll.payroll_component
+			WHERE component_code = $2
+			  AND is_active = true
+			  AND (company_id = $1 OR company_id IS NULL)
+		)
+	`
+	var exists bool
+	err := r.client.QueryRow(ctx, query, companyID, componentCode).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check component existence: %w", err)
+	}
+	return exists, nil
+}
 
 func (r *compensationRepository) AddStructureComponent(
 	ctx context.Context,
@@ -791,6 +815,15 @@ func (r *compensationRepository) AddStructureComponent(
 	}
 	if !exists {
 		return fmt.Errorf("salary structure %s not found or not owned by company", component.SalaryStructureID)
+	}
+
+	// ENTERPRISE FIX: verify that the component code exists (company-specific or global)
+	compExists, err := r.componentExistsForCompany(ctx, component.CompanyID, component.ComponentCode)
+	if err != nil {
+		return err
+	}
+	if !compExists {
+		return fmt.Errorf("component %s does not exist or is inactive for company", component.ComponentCode)
 	}
 
 	query := `
@@ -837,6 +870,9 @@ func (r *compensationRepository) UpdateStructureComponent(
 	ctx context.Context,
 	component *models.SalaryStructureComponent,
 ) error {
+	// Note: We don't validate component existence on update because the mapping already exists.
+	// If the component code is changed, we should validate the new code, but that's a business decision.
+	// We'll assume component code is immutable or validated in service layer.
 	query := `
 		UPDATE payroll.salary_structure_component
 		SET
@@ -1031,6 +1067,17 @@ func (r *compensationRepository) ReplaceStructureComponents(
 		return fmt.Errorf("salary structure %s does not exist or not owned by company", structureID)
 	}
 
+	// Validate that all component codes belong to the company (either company-specific or global)
+	for _, comp := range components {
+		compExists, err := r.componentExistsForCompany(ctx, companyID, comp.ComponentCode)
+		if err != nil {
+			return err
+		}
+		if !compExists {
+			return fmt.Errorf("component %s does not exist or is inactive for company", comp.ComponentCode)
+		}
+	}
+
 	tx, err := r.client.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -1166,6 +1213,8 @@ func (r *compensationRepository) HasOverlappingSalaryAssignment(
 	return overlaps, nil
 }
 
+// ENTERPRISE FIX: company‑aware validation – ensure components are active and unique,
+// considering both company-specific and global components.
 func (r *compensationRepository) IsSalaryStructureValid(
 	ctx context.Context,
 	structureID uuid.UUID,
@@ -1174,17 +1223,26 @@ func (r *compensationRepository) IsSalaryStructureValid(
 		WITH comps AS (
 			SELECT
 				ssc.component_code,
-				pc.component_type,
-				pc.is_active AS component_active,
+				-- resolve component type from either company-specific or global version
+				COALESCE(
+					(SELECT component_type FROM payroll.payroll_component pc
+					 WHERE pc.component_code = ssc.component_code
+					   AND pc.company_id = ss.company_id
+					   AND pc.is_active = true),
+					(SELECT component_type FROM payroll.payroll_component pc
+					 WHERE pc.component_code = ssc.component_code
+					   AND pc.company_id IS NULL
+					   AND pc.is_active = true)
+				) AS component_type,
 				ssc.sequence_order,
 				COUNT(*) OVER (PARTITION BY ssc.component_code) AS code_dup
 			FROM payroll.salary_structure_component ssc
-			JOIN payroll.payroll_component pc ON ssc.component_code = pc.component_code
+			JOIN payroll.salary_structure ss ON ss.salary_structure_id = ssc.salary_structure_id
 			WHERE ssc.salary_structure_id = $1
 		)
 		SELECT
 			EXISTS (SELECT 1 FROM comps WHERE component_type = 'earning') AS has_earning,
-			NOT EXISTS (SELECT 1 FROM comps WHERE component_active = false) AS all_active,
+			NOT EXISTS (SELECT 1 FROM comps WHERE component_type IS NULL) AS all_active,
 			NOT EXISTS (SELECT 1 FROM comps WHERE code_dup > 1) AS no_dup_codes,
 			NOT EXISTS (
 				SELECT 1
@@ -1268,10 +1326,12 @@ func (r *compensationRepository) HealthCheck(ctx context.Context) error {
 // Component Metadata (from payroll.payroll_component)
 // ---------------------------------------------------------------------
 
-// GetComponent retrieves a single payroll component by its unique code.
-// Returns nil, nil if not found.
+// GetComponent retrieves a payroll component by code for a given company.
+// Returns the company-specific version if it exists, otherwise the global version.
+// Returns nil, nil if neither exists.
 func (r *compensationRepository) GetComponent(
 	ctx context.Context,
+	companyID uuid.UUID,
 	code string,
 ) (*models.PayrollComponent, error) {
 	const query = `
@@ -1281,12 +1341,18 @@ func (r *compensationRepository) GetComponent(
             description,
             is_taxable,
             is_system,
-            is_active
+            is_active,
+            company_id
         FROM payroll.payroll_component
-        WHERE component_code = $1
+        WHERE component_code = $2
+          AND is_active = true
+          AND (company_id = $1 OR company_id IS NULL)
+        ORDER BY (company_id IS NULL) ASC   -- company-specific first, global fallback
+        LIMIT 1
     `
-	row := r.client.QueryRow(ctx, query, code)
+	row := r.client.QueryRow(ctx, query, companyID, code)
 	var comp models.PayrollComponent
+	var cid *uuid.UUID
 	err := row.Scan(
 		&comp.ComponentCode,
 		&comp.ComponentType,
@@ -1294,6 +1360,7 @@ func (r *compensationRepository) GetComponent(
 		&comp.IsTaxable,
 		&comp.IsSystem,
 		&comp.IsActive,
+		&cid,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1301,25 +1368,32 @@ func (r *compensationRepository) GetComponent(
 		}
 		r.logger.Error("Failed to get payroll component",
 			util.String("code", code),
+			util.String("company_id", companyID.String()),
 			util.ErrorField(err),
 		)
 		return nil, fmt.Errorf("failed to get component: %w", err)
 	}
+	if cid != nil {
+		comp.CompanyID = *cid
+	}
 	return &comp, nil
 }
 
-// GetComponentsByCodes retrieves multiple payroll components in a single query.
-// This is critical for performance when resolving salary structures.
+// GetComponentsByCodes retrieves multiple payroll components for a given company.
+// For each code, returns the company-specific version if available, otherwise the global version.
 // Returns empty slice (not nil) if none found.
-
 func (r *compensationRepository) GetComponentsByCodes(
 	ctx context.Context,
+	companyID uuid.UUID,
 	codes []string,
 ) ([]*models.PayrollComponent, error) {
 
 	if len(codes) == 0 {
 		return []*models.PayrollComponent{}, nil
 	}
+
+	// Optional: deduplicate codes to avoid unnecessary rows
+	codes = util.UniqueStrings(codes)
 
 	query := `
         SELECT
@@ -1328,24 +1402,31 @@ func (r *compensationRepository) GetComponentsByCodes(
             description,
             is_taxable,
             is_system,
-            is_active
+            is_active,
+            company_id
         FROM payroll.payroll_component
-        WHERE component_code = ANY($1)
+        WHERE component_code = ANY($2)
+          AND is_active = true
+          AND (company_id = $1 OR company_id IS NULL)
     `
 
-	rows, err := r.client.Query(ctx, query, pq.Array(codes))
+	rows, err := r.client.Query(ctx, query, companyID, pq.Array(codes))
 	if err != nil {
 		r.logger.Error("Failed to get payroll components by codes",
 			util.Int("codes_count", len(codes)),
+			util.String("company_id", companyID.String()),
 			util.ErrorField(err),
 		)
 		return nil, fmt.Errorf("failed to get components by codes: %w", err)
 	}
 	defer rows.Close()
 
-	var components []*models.PayrollComponent
+	// Use a map to keep the best match: company-specific overrides global
+	metaMap := make(map[string]*models.PayrollComponent)
+
 	for rows.Next() {
 		var comp models.PayrollComponent
+		var cid *uuid.UUID
 		if err := rows.Scan(
 			&comp.ComponentCode,
 			&comp.ComponentType,
@@ -1353,22 +1434,34 @@ func (r *compensationRepository) GetComponentsByCodes(
 			&comp.IsTaxable,
 			&comp.IsSystem,
 			&comp.IsActive,
+			&cid,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan component: %w", err)
 		}
-		components = append(components, &comp)
+
+		if cid != nil {
+			comp.CompanyID = *cid
+		}
+
+		// Company-specific version always wins over global
+		_, ok := metaMap[comp.ComponentCode]
+		if !ok || comp.CompanyID == companyID {
+			metaMap[comp.ComponentCode] = &comp
+		}
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration error: %w", err)
 	}
 
-	return components, nil
+	result := make([]*models.PayrollComponent, 0, len(metaMap))
+	for _, v := range metaMap {
+		result = append(result, v)
+	}
+	return result, nil
 }
 
-// GetEmployeeSalaryHistoryInRange returns ALL salary assignments overlapping the given date range.
-// Ordered by effective_from ASC (oldest first) – critical for segment splitting.
-
+// GetSalaryStructureWithComponents returns a salary structure and its components (no effective date filtering).
 func (r *compensationRepository) GetSalaryStructureWithComponents(
 	ctx context.Context,
 	structureID uuid.UUID,
@@ -1467,6 +1560,8 @@ func (r *compensationRepository) GetSalaryStructureWithComponents(
 	return &structure, components, nil
 }
 
+// GetEmployeeSalaryHistoryInRange returns ALL salary assignments overlapping the given date range.
+// Ordered by effective_from ASC (oldest first) – critical for segment splitting.
 func (r *compensationRepository) GetEmployeeSalaryHistoryInRange(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1539,8 +1634,7 @@ func (r *compensationRepository) GetEmployeeSalaryHistoryInRange(
 	return salaries, nil
 }
 
-// GetComponentsByCodes retrieves multiple payroll components in a single query.
-// Returns empty slice (not nil) if none found.
+// GetActiveEmployeeSalaryForUpdate returns the active salary and locks the row for update.
 func (r *compensationRepository) GetActiveEmployeeSalaryForUpdate(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -1606,6 +1700,8 @@ func (r *compensationRepository) GetActiveEmployeeSalaryForUpdate(
 	}
 	return &salary, nil
 }
+
+// GetEmployeeSalaryHistoryInRangeForUpdate returns all salaries in range and locks them for update.
 func (r *compensationRepository) GetEmployeeSalaryHistoryInRangeForUpdate(
 	ctx context.Context,
 	companyID uuid.UUID,

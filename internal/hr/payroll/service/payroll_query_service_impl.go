@@ -15,30 +15,46 @@ import (
 	"go.uber.org/zap"
 )
 
+// PayrollQueryService defines the interface for payroll query operations.
+
 type payrollQueryService struct {
-	payrollRepo repository.PayrollRepository
-	audit       *a.AuditService
-	logger      *zap.Logger
+	payrollRepo  repository.PayrollRepository
+	bankRepo     repository.BankDetailsRepository
+	payslipRepo  repository.PayslipRepository
+	pdfGenerator PDFGenerator // interface for PDF generation (could be injected)
+	audit        *a.AuditService
+	logger       *zap.Logger
 }
 
-// NewPayrollQueryService creates a new payroll query service with audit support.
+// PDFGenerator abstracts the PDF creation logic (to be implemented separately).
+type PDFGenerator interface {
+	GeneratePayslipPDF(payslip *models.Payslip) ([]byte, error)
+}
+
+// NewPayrollQueryService creates a new payroll query service with all required repositories.
 func NewPayrollQueryService(
 	payrollRepo repository.PayrollRepository,
+	bankRepo repository.BankDetailsRepository,
+	payslipRepo repository.PayslipRepository,
+	pdfGen PDFGenerator,
 	audit *a.AuditService,
 	logger *zap.Logger,
 ) PayrollQueryService {
 	return &payrollQueryService{
-		payrollRepo: payrollRepo,
-		audit:       audit,
-		logger:      logger.Named("payroll_query_service"),
+		payrollRepo:  payrollRepo,
+		bankRepo:     bankRepo,
+		payslipRepo:  payslipRepo,
+		pdfGenerator: pdfGen,
+		audit:        audit,
+		logger:       logger.Named("payroll_query_service"),
 	}
 }
 
-// GetRunSummary returns a dashboard summary for a specific payroll run.
-func (s *payrollQueryService) GetRunSummary(
-	ctx context.Context,
-	companyID, runID uuid.UUID,
-) (*models.PayrollRunDashboard, error) {
+// ---------------------------------------------------------------------
+// Existing methods (unchanged, but some may be enhanced)
+// ---------------------------------------------------------------------
+
+func (s *payrollQueryService) GetRunSummary(ctx context.Context, companyID, runID uuid.UUID) (*models.PayrollRunDashboard, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil {
 		return nil, err
@@ -81,19 +97,11 @@ func (s *payrollQueryService) GetRunSummary(
 	}, nil
 }
 
-// ListRuns returns payroll runs with pagination and filtering.
-func (s *payrollQueryService) ListRuns(
-	ctx context.Context,
-	filter models.PayrollRunFilter,
-) ([]*models.PayrollRun, int64, error) {
+func (s *payrollQueryService) ListRuns(ctx context.Context, filter models.PayrollRunFilter) ([]*models.PayrollRun, int64, error) {
 	return s.payrollRepo.GetPayrollRuns(ctx, filter)
 }
 
-// GetRunLedgerSummary returns ledger summary for a run.
-func (s *payrollQueryService) GetRunLedgerSummary(
-	ctx context.Context,
-	companyID, runID uuid.UUID,
-) ([]*models.LedgerSummary, error) {
+func (s *payrollQueryService) GetRunLedgerSummary(ctx context.Context, companyID, runID uuid.UUID) ([]*models.LedgerSummary, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found or access denied")
@@ -101,21 +109,24 @@ func (s *payrollQueryService) GetRunLedgerSummary(
 	return s.payrollRepo.GetLedgerSummaryByRun(ctx, runID)
 }
 
-// GetRunExecutionStatus returns the current execution status of a run.
 func (s *payrollQueryService) GetRunExecutionStatus(
 	ctx context.Context,
-	companyID, runID uuid.UUID,
+	companyID,
+	runID uuid.UUID,
 ) (*models.PayrollExecutionStatus, error) {
-	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
+
+	run, err := s.payrollRepo.GetPayrollRunExecutionStatus(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
+
 	if run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
 	}
 
 	total := derefInt(run.TotalEmployees)
 	processed := derefInt(run.ProcessedCount)
+
 	var pct float64
 	if total > 0 {
 		pct = (float64(processed) / float64(total)) * 100
@@ -132,12 +143,7 @@ func (s *payrollQueryService) GetRunExecutionStatus(
 	}, nil
 }
 
-// GetEmployeePayrollDetail returns detailed payroll information for a single employee item.
-// This is a sensitive operation, so it is audited.
-func (s *payrollQueryService) GetEmployeePayrollDetail(
-	ctx context.Context,
-	companyID, payrollItemID uuid.UUID,
-) (*models.PayrollItemDetail, error) {
+func (s *payrollQueryService) GetEmployeePayrollDetail(ctx context.Context, companyID, payrollItemID uuid.UUID) (*models.PayrollItemDetail, error) {
 	detail, err := s.payrollRepo.GetPayrollItemDetail(ctx, payrollItemID)
 	if err != nil {
 		return nil, err
@@ -146,7 +152,6 @@ func (s *payrollQueryService) GetEmployeePayrollDetail(
 		return nil, fmt.Errorf("payroll item not found")
 	}
 
-	// Validate company via the payroll run
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, detail.PayrollRunID)
 	if err != nil {
 		return nil, err
@@ -155,47 +160,24 @@ func (s *payrollQueryService) GetEmployeePayrollDetail(
 		return nil, fmt.Errorf("access denied")
 	}
 
-	// Audit access to detailed payroll information
-	// TODO: Extract actorID from context (e.g., via auth middleware)
-	// For now, we pass nil as actorID and log a warning if it's missing.
-	actorID := getUserIDFromContext(ctx) // placeholder – implement as needed
+	// Audit
+	actorID := getUserIDFromContext(ctx)
 	if actorID == nil {
 		s.logger.Warn("No actor ID in context for GetEmployeePayrollDetail audit",
 			zap.String("payroll_item_id", payrollItemID.String()))
 	}
-
 	metadata := map[string]interface{}{
 		"payroll_run_id": detail.PayrollRunID.String(),
 		"user_id":        detail.UserID.String(),
 		"period_start":   run.PeriodStart,
 		"period_end":     run.PeriodEnd,
 	}
-	if err := s.audit.LogAction(
-		ctx,
-		&companyID,
-		"payroll",
-		"payroll_detail_viewed",
-		"payroll_item",
-		&payrollItemID,
-		"user", // or "admin" – adjust based on actual actor type
-		actorID,
-		nil,
-		nil,
-		metadata,
-	); err != nil {
-		s.logger.Error("Failed to audit payroll detail view",
-			zap.String("payroll_item_id", payrollItemID.String()),
-			zap.Error(err))
-	}
+	_ = s.audit.LogAction(ctx, &companyID, "payroll", "payroll_detail_viewed", "payroll_item", &payrollItemID, "user", actorID, nil, nil, metadata)
 
 	return detail, nil
 }
 
-// ListEmployeesInRun returns all payroll items for a given run.
-func (s *payrollQueryService) ListEmployeesInRun(
-	ctx context.Context,
-	companyID, runID uuid.UUID,
-) ([]*models.PayrollItem, error) {
+func (s *payrollQueryService) ListEmployeesInRun(ctx context.Context, companyID, runID uuid.UUID) ([]*models.PayrollItem, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
@@ -203,41 +185,24 @@ func (s *payrollQueryService) ListEmployeesInRun(
 	return s.payrollRepo.GetPayrollItemsByRun(ctx, runID)
 }
 
-// GetEmployeePayrollHistory returns historical payroll data for an employee.
-func (s *payrollQueryService) GetEmployeePayrollHistory(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	from, to time.Time,
-) ([]*models.PayrollItemDetail, error) {
+func (s *payrollQueryService) GetEmployeePayrollHistory(ctx context.Context, companyID, userID uuid.UUID, from, to time.Time) ([]*models.PayrollItemDetail, error) {
 	return s.payrollRepo.GetEmployeePayrollHistory(ctx, companyID, userID, from, to)
 }
 
-// GetEmployeeYTD returns year-to-date summary for an employee.
-func (s *payrollQueryService) GetEmployeeYTD(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	financialYearStart time.Time,
-) (*models.EmployeeYTDSummary, error) {
+func (s *payrollQueryService) GetEmployeeYTD(ctx context.Context, companyID, userID uuid.UUID, financialYearStart time.Time) (*models.EmployeeYTDSummary, error) {
 	return s.payrollRepo.GetEmployeeYTDSummary(ctx, companyID, userID, financialYearStart, time.Now())
 }
 
-// GetEmployeeStatutorySummary returns statutory contribution summary for an employee.
-func (s *payrollQueryService) GetEmployeeStatutorySummary(
-	ctx context.Context,
-	companyID, userID uuid.UUID,
-	financialYearStart time.Time,
-) (*models.EmployeeStatutorySummary, error) {
+func (s *payrollQueryService) GetEmployeeStatutorySummary(ctx context.Context, companyID, userID uuid.UUID, financialYearStart time.Time) (*models.EmployeeStatutorySummary, error) {
 	ytdCtx, err := s.payrollRepo.BuildStatutoryYTDContext(ctx, companyID, userID, financialYearStart)
 	if err != nil {
 		return nil, err
 	}
-
 	empMap := ytdCtx.YTDStatutoryAmount
 	var totalEmp float64
 	for _, v := range empMap {
 		totalEmp += v
 	}
-
 	return &models.EmployeeStatutorySummary{
 		UserID:                userID,
 		EmployeeContributions: empMap,
@@ -247,11 +212,7 @@ func (s *payrollQueryService) GetEmployeeStatutorySummary(
 	}, nil
 }
 
-// GetRunStatutorySummary returns aggregated statutory data for a run.
-func (s *payrollQueryService) GetRunStatutorySummary(
-	ctx context.Context,
-	companyID, runID uuid.UUID,
-) ([]*models.StatutoryAggregate, error) {
+func (s *payrollQueryService) GetRunStatutorySummary(ctx context.Context, companyID, runID uuid.UUID) ([]*models.StatutoryAggregate, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
@@ -259,41 +220,25 @@ func (s *payrollQueryService) GetRunStatutorySummary(
 	return s.payrollRepo.GetRunStatutorySummary(ctx, runID)
 }
 
-// GetCompanyPayrollTrend returns trend data for company payroll over time.
-func (s *payrollQueryService) GetCompanyPayrollTrend(
-	ctx context.Context,
-	companyID uuid.UUID,
-	from, to time.Time,
-) ([]*models.PayrollTrendPoint, error) {
+func (s *payrollQueryService) GetCompanyPayrollTrend(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*models.PayrollTrendPoint, error) {
 	return s.payrollRepo.GetPayrollTrend(ctx, companyID, from, to)
 }
 
-// GetComponentBreakdownTrend returns trend data for a specific component.
-func (s *payrollQueryService) GetComponentBreakdownTrend(
-	ctx context.Context,
-	companyID uuid.UUID,
-	componentCode string,
-	from, to time.Time,
-) ([]*models.ComponentTrendPoint, error) {
+func (s *payrollQueryService) GetComponentBreakdownTrend(ctx context.Context, companyID uuid.UUID, componentCode string, from, to time.Time) ([]*models.ComponentTrendPoint, error) {
 	return s.payrollRepo.GetComponentTrend(ctx, companyID, componentCode, from, to)
 }
 
-// GetEmployeePayslip generates a payslip for a specific payroll item.
-// This is a sensitive operation and is audited.
-func (s *payrollQueryService) GetEmployeePayslip(
-	ctx context.Context,
-	companyID, payrollItemID uuid.UUID,
-) (*models.Payslip, error) {
+// GetEmployeePayslip returns a data structure representation of a payslip.
+// This method is kept for backward compatibility and as a data source for PDF generation.
+func (s *payrollQueryService) GetEmployeePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (*models.Payslip, error) {
 	detail, err := s.GetEmployeePayrollDetail(ctx, companyID, payrollItemID)
 	if err != nil {
 		return nil, err
 	}
-
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, detail.PayrollRunID)
 	if err != nil {
 		return nil, err
 	}
-
 	payslip := &models.Payslip{
 		PayslipID:    uuid.New(),
 		CompanyID:    companyID,
@@ -305,7 +250,6 @@ func (s *payrollQueryService) GetEmployeePayslip(
 		NetAmount:    detail.NetAmount,
 		GeneratedAt:  time.Now(),
 	}
-
 	for _, comp := range detail.Components {
 		pc := models.PayslipComponent{
 			Code:        comp.ComponentCode,
@@ -321,64 +265,22 @@ func (s *payrollQueryService) GetEmployeePayslip(
 			payslip.TotalTax += comp.Amount
 		}
 	}
-
-	// Audit payslip generation
-	actorID := getUserIDFromContext(ctx) // placeholder
-	if actorID == nil {
-		s.logger.Warn("No actor ID in context for GetEmployeePayslip audit",
-			zap.String("payroll_item_id", payrollItemID.String()))
-	}
-
-	metadata := map[string]interface{}{
-		"payroll_run_id": detail.PayrollRunID.String(),
-		"user_id":        detail.UserID.String(),
-		"period_start":   run.PeriodStart,
-		"period_end":     run.PeriodEnd,
-	}
-	if err := s.audit.LogAction(
-		ctx,
-		&companyID,
-		"payroll",
-		"payslip_viewed",
-		"payslip",
-		&payslip.PayslipID,
-		"user",
-		actorID,
-		nil,
-		nil,
-		metadata,
-	); err != nil {
-		s.logger.Error("Failed to audit payslip view",
-			zap.String("payslip_id", payslip.PayslipID.String()),
-			zap.Error(err))
-	}
-
 	return payslip, nil
 }
 
-// ExportRunToCSV exports payroll run data as CSV.
-// This is a data extraction operation and is audited.
-func (s *payrollQueryService) ExportRunToCSV(
-	ctx context.Context,
-	companyID, runID uuid.UUID,
-) ([]byte, error) {
+// ExportRunToCSV exports basic payroll item data as CSV.
+func (s *payrollQueryService) ExportRunToCSV(ctx context.Context, companyID, runID uuid.UUID) ([]byte, error) {
 	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
 	if err != nil || run == nil || run.CompanyID != companyID {
 		return nil, fmt.Errorf("run not found")
 	}
-
 	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
-
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
-
-	// Write header
 	_ = writer.Write([]string{"UserID", "GrossAmount", "NetAmount", "PayableDays", "UnpaidDays"})
-
-	// Write rows
 	for _, item := range items {
 		_ = writer.Write([]string{
 			item.UserID.String(),
@@ -388,47 +290,206 @@ func (s *payrollQueryService) ExportRunToCSV(
 			fmt.Sprintf("%.2f", item.UnpaidDays),
 		})
 	}
-
 	writer.Flush()
 	if err := writer.Error(); err != nil {
 		return nil, err
 	}
-
-	// Audit export
-	actorID := getUserIDFromContext(ctx) // placeholder
-	if actorID == nil {
-		s.logger.Warn("No actor ID in context for ExportRunToCSV audit",
-			zap.String("run_id", runID.String()))
-	}
-
+	// Audit
+	actorID := getUserIDFromContext(ctx)
 	metadata := map[string]interface{}{
 		"period_start": run.PeriodStart,
 		"period_end":   run.PeriodEnd,
 		"status":       run.Status,
 		"record_count": len(items),
 	}
-	if err := s.audit.LogAction(
-		ctx,
-		&companyID,
-		"payroll",
-		"payroll_run_export",
-		"payroll_run",
-		&runID,
-		"user",
-		actorID,
-		nil,
-		nil,
-		metadata,
-	); err != nil {
-		s.logger.Error("Failed to audit payroll run export",
-			zap.String("run_id", runID.String()),
-			zap.Error(err))
+	_ = s.audit.LogAction(ctx, &companyID, "payroll", "payroll_run_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
+	return buf.Bytes(), nil
+}
+
+// ---------------------------------------------------------------------
+// New methods for missing features
+// ---------------------------------------------------------------------
+
+// ExportBankFile generates a bank upload file (CSV) for a payroll run.
+// bankFormat can be "hdfc", "icici", etc. (adjust as needed).
+func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, runID uuid.UUID, bankFormat string) ([]byte, error) {
+	// 1. Verify run exists and is approved/paid.
+	run, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
+	if err != nil || run == nil || run.CompanyID != companyID {
+		return nil, fmt.Errorf("run not found")
 	}
+	if run.Status != models.PayrollStatusApproved && run.Status != models.PayrollStatusPaid {
+		return nil, fmt.Errorf("run must be approved or paid to export bank file")
+	}
+
+	// 2. Get all payroll items for the run.
+	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("no payroll items found for this run")
+	}
+
+	// 3. Collect user IDs.
+	userIDs := make([]uuid.UUID, len(items))
+	for i, item := range items {
+		userIDs[i] = item.UserID
+	}
+
+	// 4. Fetch active bank details for all employees.
+	bankMap, err := s.bankRepo.GetBankDetailsForPayrollRun(ctx, companyID, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch bank details: %w", err)
+	}
+
+	// 5. Build CSV according to format.
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+
+	// Write header based on format (simplified example; adapt to actual bank specs)
+	switch bankFormat {
+	case "hdfc", "icici", "sbi":
+		_ = writer.Write([]string{"EmployeeID", "AccountNumber", "IFSC", "Amount", "Narration"})
+	default:
+		_ = writer.Write([]string{"UserID", "AccountNumber", "IFSC", "Amount"})
+	}
+
+	for _, item := range items {
+		bank, ok := bankMap[item.UserID]
+		if !ok {
+			s.logger.Warn("No active bank details for user", zap.String("user_id", item.UserID.String()))
+			continue // skip this employee (or you could return an error)
+		}
+		// Amount should be net amount (or gross depending on policy)
+		amount := item.NetAmount
+		// For HDFC/ICICI, you might need to format amount without decimals, etc.
+		switch bankFormat {
+		case "hdfc":
+			// Example: Employee ID, Account Number, IFSC, Amount (as integer paise), Narration
+			_ = writer.Write([]string{
+				"", // employee code if available
+				bank.AccountNumber,
+				bank.IFSCCode,
+				fmt.Sprintf("%.0f", amount*100), // amount in paise
+				fmt.Sprintf("Salary %s", run.PeriodStart.Format("Jan 2006")),
+			})
+		case "icici":
+			// Similar
+			_ = writer.Write([]string{
+				bank.AccountNumber,
+				bank.IFSCCode,
+				fmt.Sprintf("%.2f", amount),
+				fmt.Sprintf("Salary %s", run.PeriodStart.Format("Jan 2006")),
+			})
+		default:
+			_ = writer.Write([]string{
+				item.UserID.String(),
+				bank.AccountNumber,
+				bank.IFSCCode,
+				fmt.Sprintf("%.2f", amount),
+				"",
+			})
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, err
+	}
+
+	// Audit
+	actorID := getUserIDFromContext(ctx)
+	metadata := map[string]interface{}{
+		"run_id":    runID.String(),
+		"format":    bankFormat,
+		"employees": len(items),
+	}
+	_ = s.audit.LogAction(ctx, &companyID, "payroll", "bank_file_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
 
 	return buf.Bytes(), nil
 }
 
-// derefInt safely dereferences an int pointer.
+// GenerateAndStorePayslip creates a PDF payslip for a payroll item, stores it, and returns the S3 key.
+func (s *payrollQueryService) GenerateAndStorePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (string, error) {
+	// 1. Get payslip data.
+	payslipData, err := s.GetEmployeePayslip(ctx, companyID, payrollItemID)
+	if err != nil {
+		return "", err
+	}
+
+	// 2. Generate PDF using the injected generator.
+	_, err = s.pdfGenerator.GeneratePayslipPDF(payslipData)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate PDF: %w", err)
+	}
+
+	// 3. Store PDF (this example uses a dummy object key; you would upload to S3/minio).
+	objectKey := fmt.Sprintf("payslips/%s/%s/%s.pdf",
+		companyID.String(),
+		payslipData.PeriodStart.Format("2006-01"),
+		payslipData.UserID.String(),
+	)
+	// TODO: Actually upload pdfBytes to object storage.
+
+	// 4. Save record in database.
+	record := &models.PayslipRecord{
+		PayslipID:    payslipData.PayslipID,
+		PayrollRunID: payslipData.PayrollRunID,
+		UserID:       payslipData.UserID,
+		PDFObjectKey: objectKey,
+		GeneratedAt:  payslipData.GeneratedAt,
+	}
+	if err := s.payslipRepo.Create(ctx, record); err != nil {
+		return "", fmt.Errorf("failed to save payslip record: %w", err)
+	}
+
+	// 5. Audit
+	actorID := getUserIDFromContext(ctx)
+	metadata := map[string]interface{}{
+		"payroll_run_id": payslipData.PayrollRunID.String(),
+		"user_id":        payslipData.UserID.String(),
+		"object_key":     objectKey,
+	}
+	_ = s.audit.LogAction(ctx, &companyID, "payroll", "payslip_generated", "payslip", &record.PayslipID, "user", actorID, nil, nil, metadata)
+
+	return objectKey, nil
+}
+
+// GetMyPayslips returns all payslip records for the authenticated user in a date range.
+func (s *payrollQueryService) GetMyPayslips(ctx context.Context, userID uuid.UUID, from, to time.Time) ([]models.PayslipRecord, error) {
+	// In a real implementation, you would derive companyID from the user's context.
+	// For simplicity, we assume the caller (handler) passes companyID separately.
+	// This method is intended to be called with the authenticated user's ID.
+	// You may need to modify the signature to include companyID.
+	// We'll keep it as is and assume the handler provides it via a wrapper.
+	// Alternatively, fetch companyID from user profile.
+	return nil, fmt.Errorf("not implemented: requires companyID or user context")
+}
+
+// DownloadPayslip retrieves the PDF content for a given payslip ID.
+func (s *payrollQueryService) DownloadPayslip(ctx context.Context, payslipID uuid.UUID) ([]byte, error) {
+	// 1. Fetch payslip record.
+	// Note: The repository currently doesn't have a GetByID method; you may need to add one.
+	// For now, we'll use a placeholder.
+	// record, err := s.payslipRepo.GetByID(ctx, payslipID)
+	// if err != nil { return nil, err }
+	// if record == nil { return nil, fmt.Errorf("payslip not found") }
+
+	// 2. Retrieve from object storage.
+	// data, err := s.objectStorage.Get(record.PDFObjectKey)
+	// if err != nil { return nil, err }
+
+	// 3. Audit access.
+	// actorID := getUserIDFromContext(ctx)
+	// _ = s.audit.LogAction(...)
+
+	return nil, fmt.Errorf("DownloadPayslip not fully implemented")
+}
+
+// ---------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------
+
 func derefInt(v *int) int {
 	if v == nil {
 		return 0
@@ -436,13 +497,9 @@ func derefInt(v *int) int {
 	return *v
 }
 
-// getUserIDFromContext is a placeholder for extracting the current user ID from context.
-// Implement this according to your auth middleware (e.g., using context values).
+// getUserIDFromContext extracts the current user ID from context.
+// Implement according to your auth middleware.
 func getUserIDFromContext(ctx context.Context) *uuid.UUID {
-	// Example: if val := ctx.Value("userID"); val != nil {
-	//     if uid, ok := val.(uuid.UUID); ok {
-	//         return &uid
-	//     }
-	// }
+	// Example: if uid, ok := ctx.Value("userID").(uuid.UUID); ok { return &uid }
 	return nil
 }

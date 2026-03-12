@@ -9,7 +9,7 @@ import (
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	"auth-service/internal/hr/service" // import the audit package (adjust import path if needed)
+	"auth-service/internal/hr/service" // audit service (adjust path if needed)
 	"auth-service/internal/util"
 
 	"github.com/google/uuid"
@@ -66,6 +66,11 @@ type CompensationService interface {
 	//   - negative/zero CTC
 	//   - attendance days exceed segment calendar days
 	//   - component depends on missing component
+	GetCurrentSalary(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+	) (*models.EmployeeSalary, error)
 	ResolveEarnings(
 		ctx context.Context,
 		companyID uuid.UUID,
@@ -106,6 +111,13 @@ type CompensationService interface {
 		payableDays float64,
 		totalDays float64,
 	) float64
+
+	GetSalaryAssignmentsInRange(
+		ctx context.Context,
+		companyID uuid.UUID,
+		userID uuid.UUID,
+		startDate, endDate time.Time,
+	) ([]models.EmployeeSalary, error)
 }
 
 // ---------------------------------------------------------------------
@@ -113,8 +125,8 @@ type CompensationService interface {
 // ---------------------------------------------------------------------
 type compensationService struct {
 	compRepo    repository.CompensationRepository
-	payrollRepo repository.PayrollRepository // ONLY for component metadata
-	audit       *service.AuditService        // 🟢 Audit service injected (available for future compliance logging)
+	payrollRepo repository.PayrollRepository // ONLY for attendance and component metadata
+	audit       *service.AuditService
 	logger      *zap.Logger
 }
 
@@ -122,7 +134,7 @@ type compensationService struct {
 func NewCompensationService(
 	compRepo repository.CompensationRepository,
 	payrollRepo repository.PayrollRepository,
-	audit *service.AuditService, // 🟢 Audit injection
+	audit *service.AuditService,
 	logger *zap.Logger,
 ) CompensationService {
 	return &compensationService{
@@ -205,12 +217,11 @@ func (s *compensationService) ResolveEarnings(
 
 	for _, seg := range segments {
 		// 7a. Get structure + components – already fetched during segment building (cached in seg)
-		//     We stored seg.Structure and seg.Components to avoid duplicate DB calls.
 		structure := seg.Structure
 		components := seg.Components
 
-		// 7b. Pre‑fetch component metadata (via PayrollRepository)
-		compMetas, err := s.getComponentMetadata(ctx, components)
+		// 7b. Pre‑fetch component metadata (via PayrollRepository) – now with companyID
+		compMetas, err := s.getComponentMetadata(ctx, companyID, components)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get component metadata: %w", err)
 		}
@@ -252,17 +263,31 @@ func (s *compensationService) ResolveEarnings(
 			// MonthlyCTC now means per-day wage
 			total := seg.MonthlyCTC * seg.PayableDays
 
-			// Note: "DAILY_WAGE" is a synthetic component code. In a full enterprise
-			// implementation you might want to fetch metadata for it or make it
-			// configurable, but this simple form works for the initial version.
-			segmentProrated = map[string]*models.PayrollLedgerItem{
-				"DAILY_WAGE": {
-					ComponentCode: "DAILY_WAGE",
-					ComponentType: models.ComponentTypeEarning,
-					Description:   "Daily Wage",
-					Amount:        total,
-					IsTaxable:     true, // Typically daily wages are taxable
-				},
+			// Fetch metadata for DAILY_WAGE to ensure correct description and taxability
+			meta, ok := compMetas["DAILY_WAGE"]
+			if !ok {
+				// If not found (e.g., company deleted the system component), fallback to defaults
+				s.logger.Warn("DAILY_WAGE component not found in metadata, using defaults",
+					util.String("company_id", companyID.String()))
+				segmentProrated = map[string]*models.PayrollLedgerItem{
+					"DAILY_WAGE": {
+						ComponentCode: "DAILY_WAGE",
+						ComponentType: models.ComponentTypeEarning,
+						Description:   "Daily Wage",
+						Amount:        total,
+						IsTaxable:     true, // typical default
+					},
+				}
+			} else {
+				segmentProrated = map[string]*models.PayrollLedgerItem{
+					"DAILY_WAGE": {
+						ComponentCode: "DAILY_WAGE",
+						ComponentType: meta.ComponentType,
+						Description:   meta.Description,
+						Amount:        total,
+						IsTaxable:     meta.IsTaxable,
+					},
+				}
 			}
 
 		case models.PayTypeHourly:
@@ -346,7 +371,7 @@ func (s *compensationService) ResolveSalaryStructure(
 		ResolvedAt: time.Now().UTC(),
 		Currency:   structure.CurrencyCode,
 		MonthlyCTC: empSalary.MonthlyCTC,
-		PayType:    empSalary.PayType, // ⭐ NEW
+		PayType:    empSalary.PayType,
 		UserID:     userID,
 		CompanyID:  companyID,
 	}
@@ -400,7 +425,7 @@ func (s *compensationService) ProrateAmount(
 type salarySegment struct {
 	SalaryStructureID uuid.UUID
 	MonthlyCTC        float64
-	PayType           string // ⭐ NEW
+	PayType           string
 
 	EffectiveDate time.Time // date used to resolve the salary structure version
 	StartDate     time.Time
@@ -408,8 +433,8 @@ type salarySegment struct {
 	PayableDays   float64 // from attendance repo
 	TotalDays     float64 // calendar days in this segment
 	CurrencyCode  string
-	Structure     *models.SalaryStructure           // 🟢 CACHED
-	Components    []models.SalaryStructureComponent // 🟢 CACHED
+	Structure     *models.SalaryStructure           // CACHED
+	Components    []models.SalaryStructureComponent // CACHED
 }
 
 // validateAndSortSalaries sorts by EffectiveFrom and HARD FAILS on overlap.
@@ -516,7 +541,7 @@ func (s *compensationService) buildSalarySegments(
 		segments = append(segments, salarySegment{
 			SalaryStructureID: sal.SalaryStructureID,
 			MonthlyCTC:        sal.MonthlyCTC,
-			PayType:           sal.PayType, // ⭐ NEW
+			PayType:           sal.PayType,
 
 			EffectiveDate: segStart,
 			StartDate:     segStart,
@@ -577,9 +602,10 @@ func (s *compensationService) validateCurrencyConsistency(segments []salarySegme
 	return nil
 }
 
-// getComponentMetadata – unchanged, uses payrollRepo.
+// getComponentMetadata – now accepts companyID and passes it to the repository.
 func (s *compensationService) getComponentMetadata(
 	ctx context.Context,
+	companyID uuid.UUID,
 	components []models.SalaryStructureComponent,
 ) (map[string]*models.PayrollComponent, error) {
 	if len(components) == 0 {
@@ -589,7 +615,11 @@ func (s *compensationService) getComponentMetadata(
 	for _, comp := range components {
 		codes = append(codes, comp.ComponentCode)
 	}
-	metas, err := s.compRepo.GetComponentsByCodes(ctx, codes)
+	// Ensure DAILY_WAGE is included even if not in components, because daily wage may be used.
+	// But if pay type is daily wage, the component "DAILY_WAGE" is not in the components list,
+	// so we need to add it manually. However, this method is called only when we have components.
+	// For daily wage, we handle metadata separately. So no need to add here.
+	metas, err := s.compRepo.GetComponentsByCodes(ctx, companyID, codes)
 	if err != nil {
 		return nil, err
 	}
@@ -763,4 +793,27 @@ func (s *compensationService) detectCircularDependency(
 func (s *compensationService) roundFloat(val float64, precision uint) float64 {
 	ratio := math.Pow(10, float64(precision))
 	return math.Round(val*ratio) / ratio
+}
+func (s *compensationService) GetSalaryAssignmentsInRange(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+	startDate, endDate time.Time,
+) ([]models.EmployeeSalary, error) {
+	return s.compRepo.GetEmployeeSalaryHistoryInRange(ctx, companyID, userID, startDate, endDate)
+}
+func (s *compensationService) GetCurrentSalary(
+	ctx context.Context,
+	companyID uuid.UUID,
+	userID uuid.UUID,
+) (*models.EmployeeSalary, error) {
+
+	today := time.Now().UTC()
+
+	salary, err := s.compRepo.GetActiveEmployeeSalary(ctx, companyID, userID, today)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch active salary: %w", err)
+	}
+
+	return salary, nil
 }

@@ -36,7 +36,7 @@ func NewPayrollQueryHandler(
 func (h *PayrollQueryHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 
@@ -50,16 +50,21 @@ func (h *PayrollQueryHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	if periodStart := r.URL.Query().Get("period_start"); periodStart != "" {
 		t, err := time.Parse("2006-01-02", periodStart)
-		if err == nil {
-			filter.PeriodStart = &t
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid period_start format, use YYYY-MM-DD")
+			return
 		}
+		filter.PeriodStart = &t
 	}
 	if periodEnd := r.URL.Query().Get("period_end"); periodEnd != "" {
 		t, err := time.Parse("2006-01-02", periodEnd)
-		if err == nil {
-			filter.PeriodEnd = &t
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid period_end format, use YYYY-MM-DD")
+			return
 		}
+		filter.PeriodEnd = &t
 	}
+
 	// Pagination
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
@@ -74,8 +79,8 @@ func (h *PayrollQueryHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 
 	runs, total, err := h.queryService.ListRuns(r.Context(), filter)
 	if err != nil {
-		h.logger.Error("failed to list payroll runs", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to list payroll runs", zap.Error(err), zap.String("company_id", companyID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve payroll runs")
 		return
 	}
 
@@ -93,19 +98,19 @@ func (h *PayrollQueryHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 func (h *PayrollQueryHandler) GetRunSummary(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid run id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid run ID")
 		return
 	}
 
 	summary, err := h.queryService.GetRunSummary(r.Context(), companyID, runID)
 	if err != nil {
-		h.logger.Error("failed to get run summary", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get run summary", zap.Error(err), zap.String("run_id", runID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve run summary")
 		return
 	}
 
@@ -120,19 +125,19 @@ func (h *PayrollQueryHandler) GetRunSummary(w http.ResponseWriter, r *http.Reque
 func (h *PayrollQueryHandler) GetRunLedgerSummary(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid run id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid run ID")
 		return
 	}
 
 	summary, err := h.queryService.GetRunLedgerSummary(r.Context(), companyID, runID)
 	if err != nil {
-		h.logger.Error("failed to get run ledger summary", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get run ledger summary", zap.Error(err), zap.String("run_id", runID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve ledger summary")
 		return
 	}
 
@@ -147,19 +152,19 @@ func (h *PayrollQueryHandler) GetRunLedgerSummary(w http.ResponseWriter, r *http
 func (h *PayrollQueryHandler) GetRunExecutionStatus(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid run id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid run ID")
 		return
 	}
 
 	status, err := h.queryService.GetRunExecutionStatus(r.Context(), companyID, runID)
 	if err != nil {
-		h.logger.Error("failed to get run execution status", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get run execution status", zap.Error(err), zap.String("run_id", runID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve execution status")
 		return
 	}
 
@@ -174,19 +179,19 @@ func (h *PayrollQueryHandler) GetRunExecutionStatus(w http.ResponseWriter, r *ht
 func (h *PayrollQueryHandler) ListEmployeesInRun(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid run id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid run ID")
 		return
 	}
 
 	items, err := h.queryService.ListEmployeesInRun(r.Context(), companyID, runID)
 	if err != nil {
-		h.logger.Error("failed to list employees in run", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to list employees in run", zap.Error(err), zap.String("run_id", runID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve employees")
 		return
 	}
 
@@ -201,19 +206,19 @@ func (h *PayrollQueryHandler) ListEmployeesInRun(w http.ResponseWriter, r *http.
 func (h *PayrollQueryHandler) GetEmployeePayrollDetail(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	itemID, err := uuid.Parse(chi.URLParam(r, "payrollItemID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid payroll item id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid payroll item ID")
 		return
 	}
 
 	detail, err := h.queryService.GetEmployeePayrollDetail(r.Context(), companyID, itemID)
 	if err != nil {
-		h.logger.Error("failed to get payroll item detail", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get payroll item detail", zap.Error(err), zap.String("item_id", itemID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve payroll detail")
 		return
 	}
 
@@ -228,12 +233,12 @@ func (h *PayrollQueryHandler) GetEmployeePayrollDetail(w http.ResponseWriter, r 
 func (h *PayrollQueryHandler) GetEmployeePayrollHistory(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	}
 
@@ -243,22 +248,22 @@ func (h *PayrollQueryHandler) GetEmployeePayrollHistory(w http.ResponseWriter, r
 	if fromStr != "" {
 		from, err = time.Parse("2006-01-02", fromStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid from date format, use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid from date format, use YYYY-MM-DD")
 			return
 		}
 	}
 	if toStr != "" {
 		to, err = time.Parse("2006-01-02", toStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid to date format, use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid to date format, use YYYY-MM-DD")
 			return
 		}
 	}
 
 	history, err := h.queryService.GetEmployeePayrollHistory(r.Context(), companyID, userID, from, to)
 	if err != nil {
-		h.logger.Error("failed to get employee payroll history", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get employee payroll history", zap.Error(err), zap.String("user_id", userID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve payroll history")
 		return
 	}
 
@@ -273,12 +278,12 @@ func (h *PayrollQueryHandler) GetEmployeePayrollHistory(w http.ResponseWriter, r
 func (h *PayrollQueryHandler) GetEmployeeYTD(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	}
 
@@ -289,14 +294,14 @@ func (h *PayrollQueryHandler) GetEmployeeYTD(w http.ResponseWriter, r *http.Requ
 	}
 	finYearStart, err := time.Parse("2006-01-02", finYearStartStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid financial_year_start format, use YYYY-MM-DD")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid financial_year_start format, use YYYY-MM-DD")
 		return
 	}
 
 	ytd, err := h.queryService.GetEmployeeYTD(r.Context(), companyID, userID, finYearStart)
 	if err != nil {
-		h.logger.Error("failed to get employee YTD", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get employee YTD", zap.Error(err), zap.String("user_id", userID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve YTD summary")
 		return
 	}
 
@@ -311,12 +316,12 @@ func (h *PayrollQueryHandler) GetEmployeeYTD(w http.ResponseWriter, r *http.Requ
 func (h *PayrollQueryHandler) GetEmployeeStatutorySummary(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid user id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid user ID")
 		return
 	}
 
@@ -327,14 +332,14 @@ func (h *PayrollQueryHandler) GetEmployeeStatutorySummary(w http.ResponseWriter,
 	}
 	finYearStart, err := time.Parse("2006-01-02", finYearStartStr)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid financial_year_start format, use YYYY-MM-DD")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid financial_year_start format, use YYYY-MM-DD")
 		return
 	}
 
 	summary, err := h.queryService.GetEmployeeStatutorySummary(r.Context(), companyID, userID, finYearStart)
 	if err != nil {
-		h.logger.Error("failed to get employee statutory summary", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get employee statutory summary", zap.Error(err), zap.String("user_id", userID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve statutory summary")
 		return
 	}
 
@@ -349,19 +354,19 @@ func (h *PayrollQueryHandler) GetEmployeeStatutorySummary(w http.ResponseWriter,
 func (h *PayrollQueryHandler) GetRunStatutorySummary(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid run id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid run ID")
 		return
 	}
 
 	summary, err := h.queryService.GetRunStatutorySummary(r.Context(), companyID, runID)
 	if err != nil {
-		h.logger.Error("failed to get run statutory summary", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get run statutory summary", zap.Error(err), zap.String("run_id", runID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve statutory summary")
 		return
 	}
 
@@ -376,7 +381,7 @@ func (h *PayrollQueryHandler) GetRunStatutorySummary(w http.ResponseWriter, r *h
 func (h *PayrollQueryHandler) GetCompanyPayrollTrend(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 
@@ -386,22 +391,22 @@ func (h *PayrollQueryHandler) GetCompanyPayrollTrend(w http.ResponseWriter, r *h
 	if fromStr != "" {
 		from, err = time.Parse("2006-01-02", fromStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid from date format, use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid from date format, use YYYY-MM-DD")
 			return
 		}
 	}
 	if toStr != "" {
 		to, err = time.Parse("2006-01-02", toStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid to date format, use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid to date format, use YYYY-MM-DD")
 			return
 		}
 	}
 
 	trend, err := h.queryService.GetCompanyPayrollTrend(r.Context(), companyID, from, to)
 	if err != nil {
-		h.logger.Error("failed to get payroll trend", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get payroll trend", zap.Error(err), zap.String("company_id", companyID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve payroll trend")
 		return
 	}
 
@@ -416,12 +421,12 @@ func (h *PayrollQueryHandler) GetCompanyPayrollTrend(w http.ResponseWriter, r *h
 func (h *PayrollQueryHandler) GetComponentBreakdownTrend(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	componentCode := chi.URLParam(r, "componentCode")
 	if componentCode == "" {
-		h.respondWithError(w, http.StatusBadRequest, "component code is required")
+		h.respondWithError(w, http.StatusBadRequest, "Component code is required")
 		return
 	}
 
@@ -431,22 +436,22 @@ func (h *PayrollQueryHandler) GetComponentBreakdownTrend(w http.ResponseWriter, 
 	if fromStr != "" {
 		from, err = time.Parse("2006-01-02", fromStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid from date format, use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid from date format, use YYYY-MM-DD")
 			return
 		}
 	}
 	if toStr != "" {
 		to, err = time.Parse("2006-01-02", toStr)
 		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid to date format, use YYYY-MM-DD")
+			h.respondWithError(w, http.StatusBadRequest, "Invalid to date format, use YYYY-MM-DD")
 			return
 		}
 	}
 
 	trend, err := h.queryService.GetComponentBreakdownTrend(r.Context(), companyID, componentCode, from, to)
 	if err != nil {
-		h.logger.Error("failed to get component trend", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get component trend", zap.Error(err), zap.String("component", componentCode))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve component trend")
 		return
 	}
 
@@ -461,19 +466,19 @@ func (h *PayrollQueryHandler) GetComponentBreakdownTrend(w http.ResponseWriter, 
 func (h *PayrollQueryHandler) GetEmployeePayslip(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	itemID, err := uuid.Parse(chi.URLParam(r, "payrollItemID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid payroll item id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid payroll item ID")
 		return
 	}
 
 	payslip, err := h.queryService.GetEmployeePayslip(r.Context(), companyID, itemID)
 	if err != nil {
-		h.logger.Error("failed to get payslip", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to get payslip", zap.Error(err), zap.String("item_id", itemID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to retrieve payslip")
 		return
 	}
 
@@ -488,24 +493,25 @@ func (h *PayrollQueryHandler) GetEmployeePayslip(w http.ResponseWriter, r *http.
 func (h *PayrollQueryHandler) ExportRunToCSV(w http.ResponseWriter, r *http.Request) {
 	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID")
 		return
 	}
 	runID, err := uuid.Parse(chi.URLParam(r, "runID"))
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid run id")
+		h.respondWithError(w, http.StatusBadRequest, "Invalid run ID")
 		return
 	}
 
 	csvData, err := h.queryService.ExportRunToCSV(r.Context(), companyID, runID)
 	if err != nil {
-		h.logger.Error("failed to export run to CSV", zap.Error(err))
-		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		h.logger.Error("Failed to export run to CSV", zap.Error(err), zap.String("run_id", runID.String()))
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to export payroll run")
 		return
 	}
 
+	filename := "payroll_run_" + runID.String() + ".csv"
 	w.Header().Set("Content-Type", "text/csv")
-	w.Header().Set("Content-Disposition", "attachment; filename=payroll_run_"+runID.String()+".csv")
+	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(csvData)
 }

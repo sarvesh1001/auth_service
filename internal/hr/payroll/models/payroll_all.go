@@ -12,10 +12,13 @@ import (
 
 const (
 	// PayrollRun statuses
-	PayrollStatusDraft      = "draft"
-	PayrollStatusCalculated = "calculated"
-	PayrollStatusApproved   = "approved"
-	PayrollStatusPaid       = "paid"
+	PayrollStatusDraft              = "draft"
+	PayrollStatusProcessing         = "processing"
+	PayrollStatusCalculated         = "calculated"
+	PayrollStatusApproved           = "approved"
+	PayrollStatusPaid               = "paid"
+	PayrollStatusFailed             = "failed"
+	PayrollStatusPartiallyProcessed = "partially_processed"
 
 	// Component types
 	ComponentTypeEarning   = "earning"
@@ -34,20 +37,64 @@ const (
 	// Standard component codes (non‑statutory)
 	ComponentCodeBasic = "BASIC"
 	ComponentCodeHRA   = "HRA"
+
+	// Contribution sides
+	ContributionSideEmployee = "employee"
+	ContributionSideEmployer = "employer"
+	ContributionSideNone     = "none"
+
+	// Pay types
+	PayTypeMonthly   = "monthly"
+	PayTypeDailyWage = "daily_wage"
+	PayTypeHourly    = "hourly"
+
+	// Attendance rule types
+	RuleTypeOvertime = "overtime"
+	RuleTypeLate     = "late"
+	RuleTypeAbsent   = "absent"
+
+	CalculationTypeMultiplier = "multiplier"
+
+	BasedOnDaily  = "daily"
+	BasedOnHourly = "hourly"
+
+	// Statutory calculation bases
+	StatutoryCalculationBasisBasic         = "basic"
+	StatutoryCalculationBasisGross         = "gross"
+	StatutoryCalculationBasisCTC           = "ctc"
+	StatutoryCalculationBasisTaxableIncome = "taxable_income"
+
+	CalculationTypeSlab = "slab"
+
+	// Loan status
+	LoanStatusActive    = "active"
+	LoanStatusClosed    = "closed"
+	LoanStatusDefaulted = "defaulted"
+
+	// EMI status
+	EmiStatusPending = "pending"
+	EmiStatusPaid    = "paid"
+	EmiStatusWaived  = "waived"
+
+	// Tax declaration status
+	DeclarationStatusPending  = "pending"
+	DeclarationStatusVerified = "verified"
+	DeclarationStatusRejected = "rejected"
 )
 
 // ============================================================================
-// payroll_component
+// payroll_component (company‑specific)
 // ============================================================================
 
 type PayrollComponent struct {
-	ComponentCode    string `json:"component_code" db:"component_code"`
-	ComponentType    string `json:"component_type" db:"component_type"`
-	Description      string `json:"description,omitempty" db:"description"`
-	IsTaxable        bool   `json:"is_taxable" db:"is_taxable"`
-	IsSystem         bool   `json:"is_system" db:"is_system"`
-	IsActive         bool   `json:"is_active" db:"is_active"`
-	ContributionSide string `json:"contribution_side" db:"contribution_side"` // new
+	CompanyID        uuid.UUID `json:"company_id" db:"company_id"`
+	ComponentCode    string    `json:"component_code" db:"component_code"`
+	ComponentType    string    `json:"component_type" db:"component_type"`
+	Description      string    `json:"description,omitempty" db:"description"`
+	IsTaxable        bool      `json:"is_taxable" db:"is_taxable"`
+	IsSystem         bool      `json:"is_system" db:"is_system"`
+	IsActive         bool      `json:"is_active" db:"is_active"`
+	ContributionSide string    `json:"contribution_side" db:"contribution_side"`
 }
 
 type ComponentFilter struct {
@@ -94,7 +141,7 @@ type SalaryStructureSnapshot struct {
 	ResolvedAt time.Time                  `json:"resolved_at"`
 	Currency   string                     `json:"currency"`
 	MonthlyCTC float64                    `json:"monthly_ctc"`
-	PayType    string                     `json:"pay_type"` // ⭐ ADD THIS
+	PayType    string                     `json:"pay_type"`
 	UserID     uuid.UUID                  `json:"user_id,omitempty"`
 	CompanyID  uuid.UUID                  `json:"company_id,omitempty"`
 }
@@ -110,7 +157,7 @@ type EmployeeSalary struct {
 	SalaryStructureID uuid.UUID `json:"salary_structure_id" db:"salary_structure_id"`
 	MonthlyCTC        float64   `json:"monthly_ctc" db:"monthly_ctc"`
 
-	PayType string `json:"pay_type" db:"pay_type"` // ⭐ NEW FIELD
+	PayType string `json:"pay_type" db:"pay_type"`
 
 	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
@@ -217,7 +264,7 @@ type LedgerSummary struct {
 	Description      string  `json:"description"`
 	TotalAmount      float64 `json:"total_amount"`
 	IsTaxable        bool    `json:"is_taxable"`
-	ContributionSide string  `json:"contribution_side"` // new
+	ContributionSide string  `json:"contribution_side"`
 }
 
 // ============================================================================
@@ -236,6 +283,7 @@ type PayrollSnapshot struct {
 	RuleHash     *string    `json:"rule_hash,omitempty" db:"rule_hash"`
 }
 
+// Payslip is used for API responses (enriched with computed data).
 type Payslip struct {
 	PayslipID    uuid.UUID          `json:"payslip_id"`
 	CompanyID    uuid.UUID          `json:"company_id"`
@@ -255,6 +303,16 @@ type PayslipComponent struct {
 	Code        string  `json:"code"`
 	Description string  `json:"description"`
 	Amount      float64 `json:"amount"`
+}
+
+// PayslipRecord corresponds to the database table payroll.payslip.
+type PayslipRecord struct {
+	PayslipID    uuid.UUID  `json:"payslip_id" db:"payslip_id"`
+	PayrollRunID uuid.UUID  `json:"payroll_run_id" db:"payroll_run_id"`
+	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
+	PDFObjectKey string     `json:"pdf_object_key" db:"pdf_object_key"`
+	GeneratedAt  time.Time  `json:"generated_at" db:"generated_at"`
+	SentAt       *time.Time `json:"sent_at,omitempty" db:"sent_at"`
 }
 
 type PayslipTemplate struct {
@@ -303,10 +361,6 @@ type StatutoryComponentMapping struct {
 }
 
 // ============================================================================
-// statutory rate
-// ============================================================================
-
-// ============================================================================
 // statutory tax slab
 // ============================================================================
 
@@ -331,24 +385,17 @@ type StatutoryTaxSlab struct {
 }
 
 // ============================================================================
-// statutory threshold
-// ============================================================================
-
-// ============================================================================
-// statutory deduction limit (NEW)
+// statutory deduction limit (exactly as per SQL)
 // ============================================================================
 
 type StatutoryDeductionLimit struct {
-	LimitID       uuid.UUID  `db:"limit_id" json:"limit_id"`
-	CompanyID     uuid.UUID  `db:"company_id" json:"company_id"`
-	RuleSetID     uuid.UUID  `db:"rule_set_id" json:"rule_set_id"`
-	LimitCode     string     `db:"limit_code" json:"limit_code"`
-	LimitValue    float64    `db:"limit_value" json:"limit_value"`
-	Metadata      []byte     `db:"metadata" json:"metadata,omitempty"`
-	IsActive      bool       `db:"is_active" json:"is_active"`
-	DeactivatedAt *time.Time `db:"deactivated_at" json:"deactivated_at,omitempty"`
-	DeactivatedBy *uuid.UUID `db:"deactivated_by" json:"deactivated_by,omitempty"`
-	CreatedAt     time.Time  `db:"created_at" json:"created_at"`
+	LimitID    uuid.UUID `json:"limit_id" db:"limit_id"`
+	CompanyID  uuid.UUID `json:"company_id" db:"company_id"`
+	RuleSetID  uuid.UUID `json:"rule_set_id" db:"rule_set_id"`
+	LimitCode  string    `json:"limit_code" db:"limit_code"`
+	LimitValue float64   `json:"limit_value" db:"limit_value"`
+	Metadata   []byte    `json:"metadata,omitempty" db:"metadata"`
+	CreatedAt  time.Time `json:"created_at" db:"created_at"`
 }
 
 // ============================================================================
@@ -404,7 +451,7 @@ type StatutoryContributionSummary struct {
 }
 
 // ============================================================================
-// YTD statutory summary (NEW)
+// YTD statutory summary
 // ============================================================================
 
 type YTDStatutorySummary struct {
@@ -419,7 +466,7 @@ type YTDStatutorySummary struct {
 }
 
 // ============================================================================
-// statutory snapshot (NEW, audit‑safe)
+// statutory snapshot (audit‑safe)
 // ============================================================================
 
 type StatutoryBreakdownItem struct {
@@ -430,7 +477,7 @@ type StatutoryBreakdownItem struct {
 
 type StatutorySnapshot struct {
 	SnapshotID   uuid.UUID
-	PayrollRunID uuid.UUID // 🔥 ADD THIS
+	PayrollRunID uuid.UUID
 	CompanyID    uuid.UUID
 	UserID       uuid.UUID
 	RuleSetID    uuid.UUID
@@ -472,6 +519,7 @@ type PayrollAdjustment struct {
 // ============================================================================
 // (Deleted models: CompanyStatutoryConfig, CompanyTaxSlab, TaxProfile, TaxRule, CalculatedTax)
 // ============================================================================
+
 type StatutoryYTDContext struct {
 	FinancialYearStart time.Time
 	YTDStatutoryBase   map[string]float64
@@ -527,24 +575,27 @@ type StatutoryProfileVersion struct {
 	CreatedAt     time.Time
 	CreatedBy     uuid.UUID
 }
+
+// ============================================================================
+// Dashboard / Analytics structs
+// ============================================================================
+
 type PayrollRunDashboard struct {
-	RunID       uuid.UUID
-	CompanyID   uuid.UUID
-	PeriodStart time.Time
-	PeriodEnd   time.Time
-	Status      string
-
-	TotalEmployees int
-	ProcessedCount int
-	FailedCount    int
-
+	RunID           uuid.UUID
+	CompanyID       uuid.UUID
+	PeriodStart     time.Time
+	PeriodEnd       time.Time
+	Status          string
+	TotalEmployees  int
+	ProcessedCount  int
+	FailedCount     int
 	TotalGross      float64
 	TotalNet        float64
 	TotalDeductions float64
 	TotalEmployer   float64
-
-	CreatedAt time.Time
+	CreatedAt       time.Time
 }
+
 type PayrollExecutionStatus struct {
 	RunID          uuid.UUID
 	Status         string
@@ -554,50 +605,48 @@ type PayrollExecutionStatus struct {
 	ProgressPct    float64
 	LastUpdatedAt  *time.Time
 }
+
 type EmployeeYTDSummary struct {
-	UserID uuid.UUID
-
-	TotalGross      float64
-	TotalNet        float64
-	TotalDeductions float64
-	TotalTax        float64
-	TotalEmployer   float64
-
+	UserID             uuid.UUID
+	TotalGross         float64
+	TotalNet           float64
+	TotalDeductions    float64
+	TotalTax           float64
+	TotalEmployer      float64
 	ComponentBreakdown []LedgerSummary
 }
-type EmployeeStatutorySummary struct {
-	UserID uuid.UUID
 
+type EmployeeStatutorySummary struct {
+	UserID                uuid.UUID
 	EmployeeContributions map[string]float64
 	EmployerContributions map[string]float64
-
-	TotalEmployee float64
-	TotalEmployer float64
+	TotalEmployee         float64
+	TotalEmployer         float64
 }
+
 type StatutoryAggregate struct {
 	StatutoryCode string
 	EmployeeTotal float64
 	EmployerTotal float64
 	CombinedTotal float64
 }
+
 type PayrollTrendPoint struct {
 	PeriodStart time.Time
 	PeriodEnd   time.Time
-
-	TotalGross float64
-	TotalNet   float64
+	TotalGross  float64
+	TotalNet    float64
 }
+
 type ComponentTrendPoint struct {
 	PeriodStart   time.Time
 	ComponentCode string
 	TotalAmount   float64
 }
 
-const (
-	ContributionSideEmployee = "employee"
-	ContributionSideEmployer = "employer"
-	ContributionSideNone     = "none"
-)
+// ============================================================================
+// Payroll Adjustment Inputs
+// ============================================================================
 
 type CreatePayrollAdjustmentInput struct {
 	CompanyID       uuid.UUID
@@ -671,7 +720,6 @@ type UpdateSalaryStructureComponentInput struct {
 	MappingID     uuid.UUID
 	Value         float64
 	SequenceOrder int
-	// ComponentCode and CalculationType are usually immutable once added
 }
 
 type AssignSalaryStructureInput struct {
@@ -679,7 +727,7 @@ type AssignSalaryStructureInput struct {
 	UserID        uuid.UUID
 	StructureID   uuid.UUID
 	MonthlyCTC    float64
-	PayType       string // ⭐ NEW
+	PayType       string
 	EffectiveFrom time.Time
 	ActorID       uuid.UUID
 }
@@ -689,7 +737,7 @@ type BulkAssignSalaryStructureInput struct {
 	UserIDs       []uuid.UUID
 	StructureID   uuid.UUID
 	MonthlyCTC    float64
-	PayType       string // ⭐ NEW
+	PayType       string
 	EffectiveFrom time.Time
 	ActorID       uuid.UUID
 }
@@ -699,16 +747,15 @@ type ChangeSalaryStructureInput struct {
 	UserID         uuid.UUID
 	NewStructureID uuid.UUID
 	MonthlyCTC     float64
-	PayType        string // ⭐ NEW
+	PayType        string
 	EffectiveFrom  time.Time
 	ActorID        uuid.UUID
 }
 
 type EmployeeSalaryStructure struct {
 	EmployeeSalary
-	// optionally include structure snapshot
-	// Structure *SalaryStructureSnapshot `json:"structure,omitempty"`
 }
+
 type StructureStatus string
 
 const (
@@ -716,6 +763,10 @@ const (
 	StructurePublished StructureStatus = "published"
 	StructureArchived  StructureStatus = "archived"
 )
+
+// ============================================================================
+// Statutory Rule Set Inputs
+// ============================================================================
 
 type CreateStatutoryRuleSetInput struct {
 	CompanyID     uuid.UUID
@@ -734,32 +785,7 @@ type UpdateStatutoryRuleSetInput struct {
 }
 
 // ============================================================================
-// Pay Types (NEW)
-// ============================================================================
-
-const (
-	PayTypeMonthly   = "monthly"
-	PayTypeDailyWage = "daily_wage"
-	PayTypeHourly    = "hourly"
-)
-
-// ============================================================================
-// Attendance Rule Constants
-// ============================================================================
-
-const (
-	RuleTypeOvertime = "overtime"
-	RuleTypeLate     = "late"
-	RuleTypeAbsent   = "absent"
-
-	CalculationTypeMultiplier = "multiplier"
-
-	BasedOnDaily  = "daily"
-	BasedOnHourly = "hourly"
-)
-
-// ============================================================================
-// payroll.attendance_rule
+// Attendance Rule & Employee Fine (updated with ComponentCode)
 // ============================================================================
 
 type AttendanceRule struct {
@@ -770,6 +796,7 @@ type AttendanceRule struct {
 	Value            float64    `json:"value" db:"value"`                         // numeric(10,4)
 	BasedOn          *string    `json:"based_on,omitempty" db:"based_on"`         // daily | hourly (nullable)
 	ThresholdMinutes int        `json:"threshold_minutes" db:"threshold_minutes"` // default 0
+	ComponentCode    string     `json:"component_code" db:"component_code"`       // NEW: link to payroll_component
 	IsActive         bool       `json:"is_active" db:"is_active"`                 // default true
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`               // default now()
 	CreatedBy        *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
@@ -777,28 +804,19 @@ type AttendanceRule struct {
 	UpdatedBy        *uuid.UUID `json:"updated_by,omitempty" db:"updated_by"`
 }
 
-// ============================================================================
-// payroll.employee_fine
-// ============================================================================
-
 type EmployeeFine struct {
-	FineID       uuid.UUID  `json:"fine_id" db:"fine_id"`
-	CompanyID    uuid.UUID  `json:"company_id" db:"company_id"`
-	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
-	FineAmount   float64    `json:"fine_amount" db:"fine_amount"` // numeric(12,2)
-	Reason       string     `json:"reason" db:"reason"`
-	FineDate     time.Time  `json:"fine_date" db:"fine_date"`       // date
-	IsProcessed  bool       `json:"is_processed" db:"is_processed"` // default false
-	PayrollRunID *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
-	CreatedAt    time.Time  `json:"created_at" db:"created_at"` // default now()
-	CreatedBy    uuid.UUID  `json:"created_by" db:"created_by"` // NOT NULL
+	FineID        uuid.UUID  `json:"fine_id" db:"fine_id"`
+	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	ComponentCode string     `json:"component_code" db:"component_code"` // NEW
+	FineAmount    float64    `json:"fine_amount" db:"fine_amount"`       // numeric(12,2)
+	Reason        string     `json:"reason" db:"reason"`
+	FineDate      time.Time  `json:"fine_date" db:"fine_date"`       // date
+	IsProcessed   bool       `json:"is_processed" db:"is_processed"` // default false
+	PayrollRunID  *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"` // default now()
+	CreatedBy     uuid.UUID  `json:"created_by" db:"created_by"` // NOT NULL
 }
-
-// Optional: filter structs if needed (not requested, but can be added)
-
-// ============================================================================
-// AttendanceRuleFilter
-// ============================================================================
 
 type AttendanceRuleFilter struct {
 	CompanyID    uuid.UUID
@@ -806,13 +824,9 @@ type AttendanceRuleFilter struct {
 	IsActive     *bool
 	BasedOn      *string
 	MinThreshold *int
-	Page         int // <-- ADD THIS
-	PageSize     int // <-- ADD THIS
+	Page         int
+	PageSize     int
 }
-
-// ============================================================================
-// EmployeeFineFilter
-// ============================================================================
 
 type EmployeeFineFilter struct {
 	CompanyID    uuid.UUID
@@ -821,25 +835,25 @@ type EmployeeFineFilter struct {
 	PayrollRunID *uuid.UUID
 	FromDate     *time.Time
 	ToDate       *time.Time
-	Page         int // <-- ADD THIS
-	PageSize     int // <-- ADD THIS
+	Page         int
+	PageSize     int
 }
 
+// ============================================================================
+// Statutory Contribution Rule Inputs
+// ============================================================================
+
 type SetStatutoryContributionInput struct {
-	CompanyID     uuid.UUID
-	RuleSetID     uuid.UUID
-	StatutoryCode string
-
-	EmployeeRate *float64
-	EmployerRate *float64
-
+	CompanyID       uuid.UUID
+	RuleSetID       uuid.UUID
+	StatutoryCode   string
+	EmployeeRate    *float64
+	EmployerRate    *float64
 	CalculationType string // percentage | fixed
-
-	WageCeiling  *float64
-	MinThreshold *float64
-
-	EffectiveFrom time.Time
-	ActorID       uuid.UUID
+	WageCeiling     *float64
+	MinThreshold    *float64
+	EffectiveFrom   time.Time
+	ActorID         uuid.UUID
 }
 
 type CreateRuleSetInput struct {
@@ -860,60 +874,50 @@ type UpdateRuleSetInput struct {
 }
 
 // ============================================================================
-// Statutory Constants (NEW - SAP Style)
-// ============================================================================
-
-const (
-	CalculationTypeSlab = "slab"
-
-	StatutoryCalculationBasisBasic = "basic"
-	StatutoryCalculationBasisGross = "gross"
-	StatutoryCalculationBasisCTC   = "ctc"
-)
-
-// ============================================================================
-// statutory_component_definition (NEW)
+// statutory_component_definition (with soft‑delete)
 // ============================================================================
 
 type StatutoryComponentDefinition struct {
-	CompanyID               uuid.UUID `json:"company_id" db:"company_id"`
-	StatutoryCode           string    `json:"statutory_code" db:"statutory_code"`
-	Description             string    `json:"description" db:"description"`
-	CountryCode             string    `json:"country_code" db:"country_code"`
-	CalculationBasis        string    `json:"calculation_basis" db:"calculation_basis"`
-	HasEmployeeContribution bool      `json:"has_employee_contribution" db:"has_employee_contribution"`
-	HasEmployerContribution bool      `json:"has_employer_contribution" db:"has_employer_contribution"`
-	CreatedAt               time.Time `json:"created_at" db:"created_at"`
+	CompanyID               uuid.UUID  `json:"company_id" db:"company_id"`
+	StatutoryCode           string     `json:"statutory_code" db:"statutory_code"`
+	Description             string     `json:"description" db:"description"`
+	CountryCode             string     `json:"country_code" db:"country_code"`
+	CalculationBasis        string     `json:"calculation_basis" db:"calculation_basis"`
+	HasEmployeeContribution bool       `json:"has_employee_contribution" db:"has_employee_contribution"`
+	HasEmployerContribution bool       `json:"has_employer_contribution" db:"has_employer_contribution"`
+	IsActive                bool       `json:"is_active" db:"is_active"`
+	DeactivatedAt           *time.Time `json:"deactivated_at,omitempty" db:"deactivated_at"`
+	DeactivatedBy           *uuid.UUID `json:"deactivated_by,omitempty" db:"deactivated_by"`
+	CreatedAt               time.Time  `json:"created_at" db:"created_at"`
 }
 
 // ============================================================================
-// statutory_contribution_rule (NEW - CORE)
+// statutory_contribution_rule
 // ============================================================================
 
 type StatutoryContributionRule struct {
-	RuleID        uuid.UUID `json:"rule_id" db:"rule_id"`
-	CompanyID     uuid.UUID `json:"company_id" db:"company_id"`
-	RuleSetID     uuid.UUID `json:"rule_set_id" db:"rule_set_id"`
-	StatutoryCode string    `json:"statutory_code" db:"statutory_code"`
-
-	ContributionSide string   `json:"contribution_side" db:"contribution_side"`
-	CalculationType  string   `json:"calculation_type" db:"calculation_type"`
-	RateValue        *float64 `json:"rate_value,omitempty" db:"rate_value"`
-
-	WageCeiling  *float64 `json:"wage_ceiling,omitempty" db:"wage_ceiling"`
-	MinThreshold *float64 `json:"min_threshold,omitempty" db:"min_threshold"`
-
-	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
-	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
-
-	IsActive bool `json:"is_active" db:"is_active"`
-	Version  int  `json:"version" db:"version"`
-
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
-	CreatedBy     *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	DeactivatedAt *time.Time `json:"deactivated_at,omitempty" db:"deactivated_at"`
-	DeactivatedBy *uuid.UUID `json:"deactivated_by,omitempty" db:"deactivated_by"`
+	RuleID           uuid.UUID  `json:"rule_id" db:"rule_id"`
+	CompanyID        uuid.UUID  `json:"company_id" db:"company_id"`
+	RuleSetID        uuid.UUID  `json:"rule_set_id" db:"rule_set_id"`
+	StatutoryCode    string     `json:"statutory_code" db:"statutory_code"`
+	ContributionSide string     `json:"contribution_side" db:"contribution_side"`
+	CalculationType  string     `json:"calculation_type" db:"calculation_type"`
+	RateValue        *float64   `json:"rate_value,omitempty" db:"rate_value"`
+	WageCeiling      *float64   `json:"wage_ceiling,omitempty" db:"wage_ceiling"`
+	MinThreshold     *float64   `json:"min_threshold,omitempty" db:"min_threshold"`
+	EffectiveFrom    time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	IsActive         bool       `json:"is_active" db:"is_active"`
+	Version          int        `json:"version" db:"version"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy        *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	DeactivatedAt    *time.Time `json:"deactivated_at,omitempty" db:"deactivated_at"`
+	DeactivatedBy    *uuid.UUID `json:"deactivated_by,omitempty" db:"deactivated_by"`
 }
+
+// ============================================================================
+// Inputs for statutory components
+// ============================================================================
 
 type CreateStatutoryContributionRuleInput struct {
 	CompanyID        uuid.UUID
@@ -944,7 +948,10 @@ type StatutoryComponentDefinitionFilter struct {
 	CountryCode *string
 }
 
+// ============================================================================
 // Tax Slab inputs
+// ============================================================================
+
 type CreateTaxSlabInput struct {
 	CompanyID     uuid.UUID
 	StatutoryCode string
@@ -969,7 +976,10 @@ type UpdateTaxSlabInput struct {
 	UpdatedBy     uuid.UUID
 }
 
+// ============================================================================
 // Deduction Limit inputs
+// ============================================================================
+
 type CreateDeductionLimitInput struct {
 	CompanyID  uuid.UUID
 	RuleSetID  uuid.UUID
@@ -984,7 +994,10 @@ type UpdateDeductionLimitInput struct {
 	Metadata   map[string]interface{} // if nil, metadata is not updated; if non-nil, replaces existing
 }
 
+// ============================================================================
 // Component Mapping inputs
+// ============================================================================
+
 type CreateComponentMappingInput struct {
 	CompanyID     uuid.UUID
 	StatutoryCode string
@@ -1000,4 +1013,280 @@ type UpdateComponentMappingInput struct {
 	EffectiveFrom *time.Time
 	Version       int // current version for optimistic locking
 	UpdatedBy     uuid.UUID
+}
+
+// ============================================================================
+// New tables from SQL (already present above, but listed here for completeness)
+// ============================================================================
+
+// EmployeeBankDetails (payroll.employee_bank_details)
+type EmployeeBankDetails struct {
+	BankDetailID  uuid.UUID  `json:"bank_detail_id" db:"bank_detail_id"`
+	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	AccountHolder string     `json:"account_holder" db:"account_holder"`
+	AccountNumber string     `json:"account_number" db:"account_number"` // encrypted
+	IFSCCode      string     `json:"ifsc_code" db:"ifsc_code"`
+	BankName      string     `json:"bank_name,omitempty" db:"bank_name"`
+	Branch        string     `json:"branch,omitempty" db:"branch"`
+	AccountType   string     `json:"account_type,omitempty" db:"account_type"` // savings, current
+	IsActive      bool       `json:"is_active" db:"is_active"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty" db:"effective_to"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// EmployeeLoan (payroll.employee_loan) – updated with ComponentCode
+// EmployeeLoan (payroll.employee_loan)
+type EmployeeLoan struct {
+	LoanID    uuid.UUID `json:"loan_id" db:"loan_id"`
+	CompanyID uuid.UUID `json:"company_id" db:"company_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+
+	ComponentCode string `json:"component_code" db:"component_code"`
+
+	LoanType string `json:"loan_type" db:"loan_type"` // loan | advance
+
+	PrincipalAmount float64 `json:"principal_amount" db:"principal_amount"`
+
+	InterestRate *float64 `json:"interest_rate,omitempty" db:"interest_rate"`
+
+	InterestType *string `json:"interest_type,omitempty" db:"interest_type"` // flat | compound
+
+	TotalEmis int `json:"total_emis" db:"total_emis"`
+
+	EmiAmount float64 `json:"emi_amount" db:"emi_amount"`
+
+	OutstandingBalance float64 `json:"outstanding_balance" db:"outstanding_balance"`
+
+	EmisPaid   int `json:"emis_paid" db:"emis_paid"`
+	EmisMissed int `json:"emis_missed" db:"emis_missed"`
+
+	DisbursedAt  time.Time `json:"disbursed_at" db:"disbursed_at"`
+	FirstEmiDate time.Time `json:"first_emi_date" db:"first_emi_date"`
+
+	ClosureDate *time.Time `json:"closure_date,omitempty" db:"closure_date"`
+
+	Status string `json:"status" db:"status"` // active | closed | defaulted
+
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+}
+
+// EmiTransaction (payroll.emi_transaction)
+type EmiTransaction struct {
+	EmiID  uuid.UUID `json:"emi_id" db:"emi_id"`
+	LoanID uuid.UUID `json:"loan_id" db:"loan_id"`
+
+	DueDate time.Time `json:"due_date" db:"due_date"`
+
+	PaidDate *time.Time `json:"paid_date,omitempty" db:"paid_date"`
+
+	Amount float64 `json:"amount" db:"amount"`
+
+	PaidAmount float64 `json:"paid_amount" db:"paid_amount"`
+
+	PenaltyAmount float64 `json:"penalty_amount" db:"penalty_amount"`
+
+	OutstandingAmount float64 `json:"outstanding_amount" db:"outstanding_amount"`
+
+	PaymentStatus string `json:"payment_status" db:"payment_status"` // on_time | late
+
+	Status string `json:"status" db:"status"` // pending | paid | missed | partial | waived
+
+	PayrollRunID *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+// EmiTransaction (payroll.emi_transaction)
+
+// Arrears (payroll.arrears) – updated with ComponentCode
+type Arrears struct {
+	ArrearsID     uuid.UUID  `json:"arrears_id" db:"arrears_id"`
+	CompanyID     uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID        uuid.UUID  `json:"user_id" db:"user_id"`
+	ComponentCode string     `json:"component_code" db:"component_code"` // NEW
+	PayrollRunID  *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
+	EffectiveFrom time.Time  `json:"effective_from" db:"effective_from"`
+	EffectiveTo   time.Time  `json:"effective_to" db:"effective_to"`
+	Amount        float64    `json:"amount" db:"amount"`
+	Reason        *string    `json:"reason,omitempty" db:"reason"`
+	Processed     bool       `json:"processed" db:"processed"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+}
+
+// TaxDeclarationType (payroll.tax_declaration_type)
+type TaxDeclarationType struct {
+	CompanyID   uuid.UUID `json:"company_id" db:"company_id"`
+	TypeCode    string    `json:"type_code" db:"type_code"`
+	Description string    `json:"description" db:"description"`
+	MaxLimit    *float64  `json:"max_limit,omitempty" db:"max_limit"`
+	IsActive    bool      `json:"is_active" db:"is_active"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// TaxDeclaration (payroll.tax_declaration)
+type TaxDeclaration struct {
+	DeclarationID   uuid.UUID  `json:"declaration_id" db:"declaration_id"`
+	CompanyID       uuid.UUID  `json:"company_id" db:"company_id"`
+	UserID          uuid.UUID  `json:"user_id" db:"user_id"`
+	FinancialYear   string     `json:"financial_year" db:"financial_year"` // e.g., "2024-25"
+	DeclarationType string     `json:"declaration_type" db:"declaration_type"`
+	Amount          float64    `json:"amount" db:"amount"`
+	SupportingDocs  []string   `json:"supporting_docs,omitempty" db:"supporting_docs"` // array of object keys
+	Status          string     `json:"status" db:"status"`                             // pending, verified, rejected
+	SubmittedAt     time.Time  `json:"submitted_at" db:"submitted_at"`
+	VerifiedAt      *time.Time `json:"verified_at,omitempty" db:"verified_at"`
+	VerifiedBy      *uuid.UUID `json:"verified_by,omitempty" db:"verified_by"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// ============================================================================
+// NEW: CompanyPayrollSettings – company‑level default component codes
+// ============================================================================
+
+type CompanyPayrollSettings struct {
+	CompanyID               uuid.UUID `json:"company_id" db:"company_id"`
+	DefaultFineComponent    *string   `json:"default_fine_component" db:"default_fine_component"`
+	DefaultArrearsComponent *string   `json:"default_arrears_component" db:"default_arrears_component"`
+	DefaultLoanComponent    *string   `json:"default_loan_component" db:"default_loan_component"`
+	DefaultBasicComponent   *string   `json:"default_basic_component" db:"default_basic_component"`
+	CreatedAt               time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// Payroll Job statuses
+const (
+	PayrollJobStatusQueued     = "queued"
+	PayrollJobStatusProcessing = "processing"
+	PayrollJobStatusCompleted  = "completed"
+	PayrollJobStatusFailed     = "failed"
+)
+
+// ============================================================================
+// payroll_job (background payroll execution)
+// ============================================================================
+
+type PayrollJob struct {
+	JobID        uuid.UUID `json:"job_id" db:"job_id"`
+	CompanyID    uuid.UUID `json:"company_id" db:"company_id"`
+	PayrollRunID uuid.UUID `json:"payroll_run_id" db:"payroll_run_id"`
+
+	Status       string  `json:"status" db:"status"` // queued | processing | completed | failed
+	Attempts     int     `json:"attempts" db:"attempts"`
+	MaxAttempts  int     `json:"max_attempts" db:"max_attempts"`
+	Priority     int     `json:"priority" db:"priority"` // lower = higher priority
+	RetryCount   int     `json:"retry_count" db:"retry_count"`
+	MaxRetries   int     `json:"max_retries" db:"max_retries"`
+	ErrorMessage *string `json:"error_message,omitempty" db:"error_message"`
+
+	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+	StartedAt   *time.Time `json:"started_at,omitempty" db:"started_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty" db:"completed_at"`
+	NextRunAt   *time.Time `json:"next_run_at,omitempty" db:"next_run_at"`
+
+	LockedBy *string    `json:"locked_by,omitempty" db:"locked_by"`
+	LockedAt *time.Time `json:"locked_at,omitempty" db:"locked_at"`
+}
+
+type CreatePayrollJobInput struct {
+	CompanyID    uuid.UUID
+	PayrollRunID uuid.UUID
+
+	MaxAttempts int
+	MaxRetries  int
+	Priority    int
+}
+
+// ============================================================================
+// Payroll Component Inputs (for service methods)
+// ============================================================================
+
+type CreateComponentInput struct {
+	CompanyID        uuid.UUID
+	ComponentCode    string
+	ComponentType    string
+	Description      string
+	IsTaxable        bool
+	IsSystem         bool // will be rejected in service – system components cannot be created via API
+	ContributionSide string
+}
+
+type UpdateComponentInput struct {
+	CompanyID        uuid.UUID
+	ComponentCode    string
+	Description      string
+	IsTaxable        bool
+	IsActive         bool
+	ContributionSide string
+}
+
+// Loan interest types
+const (
+	LoanInterestTypeFlat     = "flat"
+	LoanInterestTypeCompound = "compound"
+)
+
+// EMI status
+const (
+	EmiStatusMissed  = "missed"
+	EmiStatusPartial = "partial"
+)
+
+// Loan payment status
+const (
+	LoanPaymentOnTime = "on_time"
+	LoanPaymentLate   = "late"
+)
+
+type LoanPayment struct {
+	PaymentID uuid.UUID `json:"payment_id" db:"payment_id"`
+
+	LoanID uuid.UUID `json:"loan_id" db:"loan_id"`
+
+	EmiID *uuid.UUID `json:"emi_id,omitempty" db:"emi_id"`
+
+	Amount float64 `json:"amount" db:"amount"`
+
+	Penalty float64 `json:"penalty" db:"penalty"`
+
+	PaidAt time.Time `json:"paid_at" db:"paid_at"`
+
+	Source string `json:"source" db:"source"` // payroll | manual
+
+	PayrollRunID *uuid.UUID `json:"payroll_run_id,omitempty" db:"payroll_run_id"`
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+// ============================================================================
+// payroll_employee_job
+// ============================================================================
+
+const (
+	EmployeeJobStatusPending    = "pending"
+	EmployeeJobStatusProcessing = "processing"
+	EmployeeJobStatusCompleted  = "completed"
+	EmployeeJobStatusFailed     = "failed"
+)
+
+type PayrollEmployeeJob struct {
+	JobID        uuid.UUID `json:"job_id" db:"job_id"`
+	PayrollRunID uuid.UUID `json:"payroll_run_id" db:"payroll_run_id"`
+	UserID       uuid.UUID `json:"user_id" db:"user_id"`
+
+	Status   string `json:"status" db:"status"`
+	Attempts int    `json:"attempts" db:"attempts"`
+
+	LockedBy *string    `json:"locked_by,omitempty" db:"locked_by"`
+	LockedAt *time.Time `json:"locked_at,omitempty" db:"locked_at"`
+
+	Error *string `json:"error,omitempty" db:"error"`
+
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }

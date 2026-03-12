@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -25,6 +26,9 @@ type CreateEmployeeFineInput struct {
 	Reason     string
 	FineDate   time.Time
 
+	// Optional component code. If not provided, company default is used.
+	ComponentCode *string
+
 	Category  *string // optional future extensibility
 	Reference *string // optional (attendance_id, incident_id)
 
@@ -39,6 +43,9 @@ type UpdateEmployeeFineInput struct {
 	Reason     *string
 	FineDate   *time.Time
 
+	// Component code can be updated, but only if fine is unprocessed.
+	ComponentCode *string
+
 	UpdatedBy uuid.UUID
 }
 
@@ -49,6 +56,9 @@ type BulkCreateEmployeeFineInput struct {
 	FineAmount float64
 	Reason     string
 	FineDate   time.Time
+
+	// Optional component code. If not provided, company default is used.
+	ComponentCode *string
 
 	CreatedBy uuid.UUID
 }
@@ -121,25 +131,74 @@ type EmployeeFineService interface {
 // ----------------------------------------------------------------------
 
 type employeeFineService struct {
-	fineRepo    repository.EmployeeFineRepository
-	payrollRepo repository.PayrollRepository // for period lock checks
-	audit       *hrservice.AuditService
-	logger      *zap.Logger
+	fineRepo      repository.EmployeeFineRepository
+	payrollRepo   repository.PayrollRepository         // for period lock checks
+	componentRepo repository.ComponentRepository       // to validate/fetch component metadata
+	settingsRepo  repository.CompanySettingsRepository // to get default component
+	audit         *hrservice.AuditService
+	logger        *zap.Logger
 }
 
 // NewEmployeeFineService creates a new instance of the service.
 func NewEmployeeFineService(
 	fineRepo repository.EmployeeFineRepository,
 	payrollRepo repository.PayrollRepository,
+	componentRepo repository.ComponentRepository,
+	settingsRepo repository.CompanySettingsRepository,
 	audit *hrservice.AuditService,
 	logger *zap.Logger,
 ) EmployeeFineService {
 	return &employeeFineService{
-		fineRepo:    fineRepo,
-		payrollRepo: payrollRepo,
-		audit:       audit,
-		logger:      logger,
+		fineRepo:      fineRepo,
+		payrollRepo:   payrollRepo,
+		componentRepo: componentRepo,
+		settingsRepo:  settingsRepo,
+		audit:         audit,
+		logger:        logger,
 	}
+}
+
+// ----------------------------------------------------------------------
+// Helper: resolve component code
+// ----------------------------------------------------------------------
+
+// resolveComponentCode returns the effective component code for a fine.
+// If input code is provided, it is validated and returned.
+// If not, the company default fine component is fetched from settings.
+// Returns error if code cannot be resolved or component is invalid.
+func (s *employeeFineService) resolveComponentCode(
+	ctx context.Context,
+	companyID uuid.UUID,
+	inputCode *string,
+) (string, error) {
+	var code string
+	if inputCode != nil && *inputCode != "" {
+		code = *inputCode
+	} else {
+		// fetch company default
+		settings, err := s.settingsRepo.GetPayrollSettings(ctx, companyID)
+		if err != nil {
+			return "", fmt.Errorf("failed to get company payroll settings: %w", err)
+		}
+		if settings == nil || settings.DefaultFineComponent == nil {
+			return "", errors.New("no component code provided and no default fine component configured for company")
+		}
+		code = *settings.DefaultFineComponent
+	}
+
+	// validate component exists and is active (and optionally type deduction)
+	comp, err := s.componentRepo.GetComponent(ctx, companyID, code)
+	if err != nil {
+		return "", fmt.Errorf("failed to validate component %s: %w", code, err)
+	}
+	if comp == nil {
+		return "", fmt.Errorf("component %s not found or inactive", code)
+	}
+	// optional: enforce component type deduction
+	if comp.ComponentType != models.ComponentTypeDeduction {
+		return "", fmt.Errorf("component %s is of type %s, but fine requires deduction type", code, comp.ComponentType)
+	}
+	return code, nil
 }
 
 // ----------------------------------------------------------------------
@@ -156,16 +215,23 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		return nil, fmt.Errorf("cannot create fine in a locked payroll period")
 	}
 
+	// Resolve component code
+	componentCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
+	if err != nil {
+		return nil, err
+	}
+
 	fine := &models.EmployeeFine{
-		FineID:      uuid.New(),
-		CompanyID:   input.CompanyID,
-		UserID:      input.UserID,
-		FineAmount:  input.FineAmount,
-		Reason:      input.Reason,
-		FineDate:    input.FineDate,
-		IsProcessed: false,
-		CreatedAt:   time.Now().UTC(),
-		CreatedBy:   input.CreatedBy,
+		FineID:        uuid.New(),
+		CompanyID:     input.CompanyID,
+		UserID:        input.UserID,
+		ComponentCode: componentCode,
+		FineAmount:    input.FineAmount,
+		Reason:        input.Reason,
+		FineDate:      input.FineDate,
+		IsProcessed:   false,
+		CreatedAt:     time.Now().UTC(),
+		CreatedBy:     input.CreatedBy,
 	}
 
 	if err := s.fineRepo.Create(ctx, fine); err != nil {
@@ -175,9 +241,10 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 	// Audit log
 	_ = s.audit.LogAction(ctx, &input.CompanyID, "payroll", "fine_created", "employee_fine",
 		&fine.FineID, "admin", &input.CreatedBy, nil, nil, map[string]interface{}{
-			"user_id":     input.UserID.String(),
-			"fine_amount": input.FineAmount,
-			"fine_date":   input.FineDate,
+			"user_id":        input.UserID.String(),
+			"fine_amount":    input.FineAmount,
+			"fine_date":      input.FineDate,
+			"component_code": componentCode,
 		})
 
 	return fine, nil
@@ -211,7 +278,16 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		return nil, fmt.Errorf("cannot update fine in a locked payroll period")
 	}
 
-	// Apply updates
+	// If component code is being updated, resolve and validate it
+	if input.ComponentCode != nil && *input.ComponentCode != fine.ComponentCode {
+		newCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
+		if err != nil {
+			return nil, err
+		}
+		fine.ComponentCode = newCode
+	}
+
+	// Apply other updates
 	if input.FineAmount != nil {
 		fine.FineAmount = *input.FineAmount
 	}
@@ -229,9 +305,10 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 	// Audit log
 	_ = s.audit.LogAction(ctx, &input.CompanyID, "payroll", "fine_updated", "employee_fine",
 		&fine.FineID, "admin", &input.UpdatedBy, nil, nil, map[string]interface{}{
-			"user_id":     fine.UserID.String(),
-			"fine_amount": fine.FineAmount,
-			"fine_date":   fine.FineDate,
+			"user_id":        fine.UserID.String(),
+			"fine_amount":    fine.FineAmount,
+			"fine_date":      fine.FineDate,
+			"component_code": fine.ComponentCode,
 		})
 
 	return fine, nil
@@ -279,7 +356,7 @@ func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID,
 // ----------------------------------------------------------------------
 
 func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCreateEmployeeFineInput) ([]*models.EmployeeFine, error) {
-	// Validate that the fine date is not locked for any user? We assume all users share the same lock period.
+	// Validate that the fine date is not locked
 	locked, err := s.payrollRepo.IsPayrollPeriodLockedRange(ctx, input.CompanyID, input.FineDate, input.FineDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check payroll lock: %w", err)
@@ -288,22 +365,27 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 		return nil, fmt.Errorf("cannot create fines in a locked payroll period")
 	}
 
+	// Resolve component code once for all fines in the batch
+	componentCode, err := s.resolveComponentCode(ctx, input.CompanyID, input.ComponentCode)
+	if err != nil {
+		return nil, err
+	}
+
 	var created []*models.EmployeeFine
 	for _, userID := range input.UserIDs {
 		fine := &models.EmployeeFine{
-			FineID:      uuid.New(),
-			CompanyID:   input.CompanyID,
-			UserID:      userID,
-			FineAmount:  input.FineAmount,
-			Reason:      input.Reason,
-			FineDate:    input.FineDate,
-			IsProcessed: false,
-			CreatedAt:   time.Now().UTC(),
-			CreatedBy:   input.CreatedBy,
+			FineID:        uuid.New(),
+			CompanyID:     input.CompanyID,
+			UserID:        userID,
+			ComponentCode: componentCode,
+			FineAmount:    input.FineAmount,
+			Reason:        input.Reason,
+			FineDate:      input.FineDate,
+			IsProcessed:   false,
+			CreatedAt:     time.Now().UTC(),
+			CreatedBy:     input.CreatedBy,
 		}
 		if err := s.fineRepo.Create(ctx, fine); err != nil {
-			// Log error but continue? In production we might want a transaction.
-			// For simplicity, we stop at first error.
 			return nil, fmt.Errorf("failed to create fine for user %s: %w", userID, err)
 		}
 		created = append(created, fine)
@@ -312,18 +394,17 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 	// Audit log (bulk action)
 	_ = s.audit.LogAction(ctx, &input.CompanyID, "payroll", "fines_bulk_created", "employee_fine",
 		nil, "admin", &input.CreatedBy, nil, nil, map[string]interface{}{
-			"user_count":  len(input.UserIDs),
-			"fine_amount": input.FineAmount,
-			"fine_date":   input.FineDate,
-			"created_ids": createdIDs(created),
+			"user_count":     len(input.UserIDs),
+			"fine_amount":    input.FineAmount,
+			"fine_date":      input.FineDate,
+			"component_code": componentCode,
+			"created_ids":    createdIDs(created),
 		})
 
 	return created, nil
 }
 
 func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, companyID uuid.UUID, fineIDs []uuid.UUID, actorID uuid.UUID) error {
-	// For each fine, check lock and delete. If any fail, we might want to rollback,
-	// but without transaction we just return the first error.
 	for _, fid := range fineIDs {
 		fine, err := s.fineRepo.GetByID(ctx, companyID, fid)
 		if err != nil {
@@ -348,7 +429,6 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 		}
 	}
 
-	// Audit log
 	_ = s.audit.LogAction(ctx, &companyID, "payroll", "fines_bulk_deleted", "employee_fine",
 		nil, "admin", &actorID, nil, nil, map[string]interface{}{
 			"fine_ids": fineIDs,
@@ -362,13 +442,10 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 // ----------------------------------------------------------------------
 
 func (s *employeeFineService) MarkFineAsProcessed(ctx context.Context, fineID uuid.UUID, payrollRunID uuid.UUID) error {
-	// We trust that the caller has already validated the payroll run and lock.
-	// The repository method checks is_processed = false.
 	err := s.fineRepo.MarkAsProcessed(ctx, fineID, payrollRunID)
 	if err != nil {
 		return err
 	}
-	// Audit is done inside the repository? We'll add here.
 	s.logger.Info("Fine marked as processed", zap.String("fine_id", fineID.String()), zap.String("payroll_run_id", payrollRunID.String()))
 	return nil
 }
@@ -379,7 +456,7 @@ func (s *employeeFineService) LockFinesForPayrollRun(
 	periodStart, periodEnd time.Time,
 	payrollRunID uuid.UUID,
 ) ([]models.EmployeeFine, error) {
-	// This method updates and returns the locked fines.
+	// The repository method should already return fines with component codes.
 	return s.fineRepo.LockUnprocessedForPayrollRun(ctx, companyID, periodStart, periodEnd, payrollRunID)
 }
 
@@ -414,14 +491,13 @@ func (s *employeeFineService) GetFineSummaryByEmployee(
 	userID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) (*EmployeeFineSummary, error) {
-	// Get all fines for the employee in the period (both processed and unprocessed)
 	filter := models.EmployeeFineFilter{
 		CompanyID: companyID,
 		UserID:    &userID,
 		FromDate:  &periodStart,
 		ToDate:    &periodEnd,
 		Page:      1,
-		PageSize:  10000, // large enough for summary; consider pagination if needed
+		PageSize:  10000,
 	}
 	fines, total, err := s.fineRepo.GetByFilter(ctx, filter)
 	if err != nil {
@@ -468,7 +544,6 @@ func (s *employeeFineService) GetCompanyFineSummary(
 	companyID uuid.UUID,
 	periodStart, periodEnd time.Time,
 ) (*CompanyFineSummary, error) {
-	// Fetch all fines for the company in the period
 	filter := models.EmployeeFineFilter{
 		CompanyID: companyID,
 		FromDate:  &periodStart,

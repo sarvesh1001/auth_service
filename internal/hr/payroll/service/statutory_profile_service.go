@@ -93,7 +93,36 @@ func (s *statutoryProfileService) CreateProfile(
 
 	err := s.repo.WithTx(ctx, func(tx repository.StatutoryProfileRepository) error {
 
-		// Close existing active version if overlapping
+		// ---------------------------------------------------
+		// CHECK EXACT DUPLICATE VERSION
+		// ---------------------------------------------------
+
+		existing, err := tx.GetActiveProfile(
+			ctx,
+			input.CompanyID,
+			input.UserID,
+			input.StatutoryCode,
+			input.EffectiveFrom,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		if existing != nil &&
+			existing.EffectiveFrom.Equal(input.EffectiveFrom) {
+
+			return fmt.Errorf(
+				"statutory profile already exists for %s with effective_from %s",
+				input.StatutoryCode,
+				input.EffectiveFrom.Format("2006-01-02"),
+			)
+		}
+
+		// ---------------------------------------------------
+		// CLOSE EXISTING ACTIVE PROFILE IF OVERLAPPING
+		// ---------------------------------------------------
+
 		overlap, err := tx.HasOverlappingActiveProfile(
 			ctx,
 			input.CompanyID,
@@ -119,6 +148,10 @@ func (s *statutoryProfileService) CreateProfile(
 			}
 		}
 
+		// ---------------------------------------------------
+		// CREATE NEW PROFILE VERSION
+		// ---------------------------------------------------
+
 		newProfile := &repository.EmployeeStatutoryProfile{
 			ProfileID:     uuid.New(),
 			CompanyID:     input.CompanyID,
@@ -135,6 +168,7 @@ func (s *statutoryProfileService) CreateProfile(
 		}
 
 		result = mapRepoToVersion(newProfile)
+
 		return nil
 	})
 
@@ -143,8 +177,18 @@ func (s *statutoryProfileService) CreateProfile(
 		return nil, err
 	}
 
-	// Audit successful creation (non‑blocking)
-	if err := s.auditProfileChange(ctx, result, nil, "statutory_profile_created", result.CreatedBy); err != nil {
+	// ---------------------------------------------------
+	// AUDIT
+	// ---------------------------------------------------
+
+	if err := s.auditProfileChange(
+		ctx,
+		result,
+		nil,
+		"statutory_profile_created",
+		result.CreatedBy,
+	); err != nil {
+
 		s.logger.Error("Failed to audit profile creation",
 			zap.String("profile_id", result.ProfileID.String()),
 			zap.Error(err))

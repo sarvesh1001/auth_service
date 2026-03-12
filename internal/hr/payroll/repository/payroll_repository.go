@@ -20,6 +20,7 @@ type PayrollRepository interface {
 	DeletePayrollRun(ctx context.Context, runID uuid.UUID) error
 	GetPayrollRunSummary(ctx context.Context, runID uuid.UUID) (*models.PayrollRunSummary, error)
 	CleanupFailedRun(ctx context.Context, runID uuid.UUID) error
+
 	// ==============================
 	// Payroll Items (versioned)
 	// ==============================
@@ -28,18 +29,16 @@ type PayrollRepository interface {
 	GetPayrollItemsByRun(ctx context.Context, runID uuid.UUID) ([]*models.PayrollItem, error)
 	GetPayrollItemDetail(ctx context.Context, itemID uuid.UUID) (*models.PayrollItemDetail, error)
 	BulkCreatePayrollItems(ctx context.Context, items []*models.PayrollItem) error
-	// SupersedePayrollItemTx marks the current active item as superseded inside a transaction.
-	// Returns the version number of the superseded item, or 0 if none existed.
 	SupersedePayrollItemTx(ctx context.Context, tx *sql.Tx, runID uuid.UUID, userID uuid.UUID, actorID uuid.UUID) (int, error)
 
 	// ==============================
-	// Payroll Components
+	// Payroll Components – now company‑specific
 	// ==============================
 	CreateComponent(ctx context.Context, component *models.PayrollComponent) error
-	GetComponent(ctx context.Context, code string) (*models.PayrollComponent, error)
-	GetComponents(ctx context.Context, filter models.ComponentFilter) ([]*models.PayrollComponent, error)
+	GetComponent(ctx context.Context, companyID uuid.UUID, code string) (*models.PayrollComponent, error)
+	GetComponents(ctx context.Context, companyID uuid.UUID, filter models.ComponentFilter) ([]*models.PayrollComponent, error)
 	UpdateComponent(ctx context.Context, component *models.PayrollComponent) error
-	DeactivateComponent(ctx context.Context, code string) error
+	DeactivateComponent(ctx context.Context, companyID uuid.UUID, code string) error
 
 	// ==============================
 	// Payroll Ledger
@@ -157,4 +156,15 @@ type PayrollRepository interface {
 		fromStatus string,
 		toStatus string,
 	) error
+	CountIncompleteEmployeeJobs(ctx context.Context, runID uuid.UUID) (int, error)
+	GetPayrollRunTx(
+		ctx context.Context,
+		tx *sql.Tx,
+		runID uuid.UUID,
+	) (*models.PayrollRun, error)
+	RecalculatePayrollItemNet(ctx context.Context, itemID uuid.UUID) error
+	GetPayrollRunExecutionStatus(
+		ctx context.Context,
+		runID uuid.UUID,
+	) (*models.PayrollRun, error)
 }
