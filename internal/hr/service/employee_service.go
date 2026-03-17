@@ -161,7 +161,7 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 	updatedProfile := *existingProfile
 	updatedProfile.UpdatedAt = time.Now().UTC()
 
-	// Update fields (simplified - in reality, you'd have validation for each field)
+	// Update fields (in real code you would validate each field)
 	for key, value := range updates {
 		switch key {
 		case "date_of_birth":
@@ -195,6 +195,22 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 		case "grade":
 			if grade, ok := value.(string); ok {
 				updatedProfile.Grade = &grade
+			}
+		case "cost_center":
+			if cc, ok := value.(string); ok {
+				updatedProfile.CostCenter = &cc
+			}
+		case "tax_id":
+			if taxID, ok := value.(string); ok {
+				updatedProfile.TaxID = &taxID
+			}
+		case "social_security_id":
+			if ssn, ok := value.(string); ok {
+				updatedProfile.SocialSecurityID = &ssn
+			}
+		case "email":
+			if email, ok := value.(string); ok {
+				updatedProfile.Email = &email
 			}
 		}
 	}

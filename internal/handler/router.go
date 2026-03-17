@@ -291,6 +291,39 @@ func NewRouter(
 				})
 
 				r.Route("/payroll", func(r chi.Router) {
+					// ==============================
+					// BANK DETAILS MANAGEMENT (NEW)
+					// ==============================
+					r.Route("/bank-details", func(r chi.Router) {
+						// Create bank details
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Post("/users/{userID}", bankExportHandler.CreateBankDetails)
+
+						// List user bank details
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/users/{userID}", bankExportHandler.ListUserBankDetails)
+
+						// Get active bank details
+						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+							Get("/users/{userID}/active", bankExportHandler.GetActiveBankDetails)
+
+						r.Route("/{bankDetailID}", func(r chi.Router) {
+
+							// Update bank details
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Put("/", bankExportHandler.UpdateBankDetails)
+
+							// Activate bank details
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Post("/activate", bankExportHandler.ActivateBankDetails)
+
+							// Deactivate bank details
+							r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.component.manage", logger)).
+								Delete("/", bankExportHandler.DeactivateBankDetails)
+
+						})
+					})
+
 					// Existing payroll routes
 					r.Route("/locks", func(r chi.Router) {
 						r.With(authMiddleware.BitmaskPermissionMiddleware("payroll.run.view", logger)).

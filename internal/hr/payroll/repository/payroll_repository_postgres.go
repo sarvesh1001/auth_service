@@ -3222,3 +3222,62 @@ func (r *payrollRepository) GetPayrollRunExecutionStatus(
 
 	return &run, nil
 }
+
+// ResetPayrollRunDataTx deletes all employee jobs, payroll items, ledger entries,
+// and snapshots for a given run, and resets its counters.
+func (r *payrollRepository) ResetPayrollRunDataTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	runID uuid.UUID,
+) error {
+
+	// Delete employee jobs
+	if _, err := tx.ExecContext(ctx, `
+        DELETE FROM payroll.payroll_employee_job
+        WHERE payroll_run_id = $1
+    `, runID); err != nil {
+		return fmt.Errorf("failed to delete employee jobs: %w", err)
+	}
+
+	// Delete ledger entries (via payroll items)
+	if _, err := tx.ExecContext(ctx, `
+        DELETE FROM payroll.payroll_ledger
+        WHERE payroll_item_id IN (
+            SELECT payroll_item_id
+            FROM payroll.payroll_item
+            WHERE payroll_run_id = $1
+        )
+    `, runID); err != nil {
+		return fmt.Errorf("failed to delete ledger entries: %w", err)
+	}
+
+	// Delete payroll items
+	if _, err := tx.ExecContext(ctx, `
+        DELETE FROM payroll.payroll_item
+        WHERE payroll_run_id = $1
+    `, runID); err != nil {
+		return fmt.Errorf("failed to delete payroll items: %w", err)
+	}
+
+	// Delete snapshots
+	if _, err := tx.ExecContext(ctx, `
+        DELETE FROM payroll.payroll_snapshot
+        WHERE payroll_run_id = $1
+    `, runID); err != nil {
+		return fmt.Errorf("failed to delete snapshots: %w", err)
+	}
+
+	// Reset run counters
+	if _, err := tx.ExecContext(ctx, `
+        UPDATE payroll.payroll_run
+        SET total_employees = NULL,
+            processed_count = 0,
+            failed_count = 0,
+            last_processed_at = NULL
+        WHERE payroll_run_id = $1
+    `, runID); err != nil {
+		return fmt.Errorf("failed to reset run counters: %w", err)
+	}
+
+	return nil
+}

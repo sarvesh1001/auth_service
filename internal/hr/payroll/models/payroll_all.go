@@ -299,31 +299,7 @@ type Payslip struct {
 	GeneratedAt  time.Time          `json:"generated_at"`
 }
 
-type PayslipComponent struct {
-	Code        string  `json:"code"`
-	Description string  `json:"description"`
-	Amount      float64 `json:"amount"`
-}
-
 // PayslipRecord corresponds to the database table payroll.payslip.
-type PayslipRecord struct {
-	PayslipID    uuid.UUID  `json:"payslip_id" db:"payslip_id"`
-	PayrollRunID uuid.UUID  `json:"payroll_run_id" db:"payroll_run_id"`
-	UserID       uuid.UUID  `json:"user_id" db:"user_id"`
-	PDFObjectKey string     `json:"pdf_object_key" db:"pdf_object_key"`
-	GeneratedAt  time.Time  `json:"generated_at" db:"generated_at"`
-	SentAt       *time.Time `json:"sent_at,omitempty" db:"sent_at"`
-}
-
-type PayslipTemplate struct {
-	TemplateID          uuid.UUID `json:"template_id" db:"template_id"`
-	CompanyID           uuid.UUID `json:"company_id" db:"company_id"`
-	TemplateName        string    `json:"template_name" db:"template_name"`
-	FooterDeclaration   *string   `json:"footer_declaration,omitempty" db:"footer_declaration"`
-	AuthorizedSignatory *string   `json:"authorized_signatory,omitempty" db:"authorized_signatory"`
-	CreatedAt           time.Time `json:"created_at" db:"created_at"`
-}
-
 // ============================================================================
 // statutory rule set
 // ============================================================================
@@ -1289,4 +1265,65 @@ type PayrollEmployeeJob struct {
 
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
+}
+
+type PayslipComponent struct {
+	Code        string  `json:"code"`
+	Description string  `json:"description"`
+	Amount      float64 `json:"amount"`
+}
+
+type PayslipData struct {
+	// Company
+	CompanyID   uuid.UUID
+	CompanyName string
+
+	// Employee
+	UserID       uuid.UUID
+	EmployeeName string
+	EmployeeID   string
+	Department   string
+	Position     string
+
+	// Payroll Run
+	PayrollRunID uuid.UUID
+	PeriodStart  time.Time
+	PeriodEnd    time.Time
+
+	// Financials
+	GrossAmount float64
+	NetAmount   float64
+	Earnings    []PayslipComponent
+	Deductions  []PayslipComponent
+
+	// Bank Details (optional)
+	BankDetails *struct {
+		AccountHolder string
+		AccountNumber string
+		IFSCCode      string
+		BankName      string
+	}
+
+	// Template
+	FooterDeclaration   string
+	AuthorizedSignatory string
+	GeneratedAt         time.Time
+}
+
+type PayslipRecord struct {
+	PayslipID    uuid.UUID  `db:"payslip_id"`
+	PayrollRunID uuid.UUID  `db:"payroll_run_id"`
+	UserID       uuid.UUID  `db:"user_id"`
+	PDFObjectKey string     `db:"pdf_object_key"`
+	GeneratedAt  time.Time  `db:"generated_at"`
+	SentAt       *time.Time `db:"sent_at"`
+}
+
+type PayslipTemplate struct {
+	TemplateID          uuid.UUID `db:"template_id"`
+	CompanyID           uuid.UUID `db:"company_id"`
+	TemplateName        string    `db:"template_name"`
+	FooterDeclaration   *string   `db:"footer_declaration"`
+	AuthorizedSignatory *string   `db:"authorized_signatory"`
+	CreatedAt           time.Time `db:"created_at"`
 }

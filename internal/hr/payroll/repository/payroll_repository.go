@@ -167,4 +167,9 @@ type PayrollRepository interface {
 		ctx context.Context,
 		runID uuid.UUID,
 	) (*models.PayrollRun, error)
+	ResetPayrollRunDataTx(
+		ctx context.Context,
+		tx *sql.Tx,
+		runID uuid.UUID,
+	) error
 }

@@ -2,222 +2,176 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/email" // add this import
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
+	"auth-service/internal/hr/payroll/service/pdf"
 )
 
-// PDFGenerator defines the interface for creating payslip PDFs.
-
-// ObjectStorage defines the interface for storing and retrieving files.
-type ObjectStorage interface {
-	Upload(ctx context.Context, key string, data []byte, contentType string) error
-	Download(ctx context.Context, key string) ([]byte, error)
-}
-
-// EmailSender defines the interface for sending emails with attachments.
-type EmailSender interface {
-	SendPayslipEmail(to, subject, body string, attachment []byte, attachmentName string) error
-}
-
-// PayslipService handles all payslip operations.
 type PayslipService interface {
-	// GeneratePayslipsForRun creates PDF payslips for all employees in a payroll run,
-	// uploads them to object storage, and stores records in the database.
-	GeneratePayslipsForRun(ctx context.Context, payrollRunID uuid.UUID, actorID uuid.UUID) error
+	// GeneratePayslipForEmployee generates a PDF payslip for a single employee.
+	GeneratePayslipForEmployee(ctx context.Context, runID, userID, actorID uuid.UUID) ([]byte, error)
 
-	// GetPayslip returns the PDF bytes of a specific payslip.
-	GetPayslip(ctx context.Context, userID uuid.UUID, payrollRunID uuid.UUID) ([]byte, error)
+	// GetPayslip returns the payslip PDF for a given run and user (generates on the fly).
+	GetPayslip(ctx context.Context, userID, runID uuid.UUID) ([]byte, error)
 
-	// SendPayslipEmail sends the payslip as an email attachment to the employee.
-	SendPayslipEmail(ctx context.Context, payslipID uuid.UUID) error
+	// SendPayslipEmail generates the payslip PDF and sends it to the employee's email address.
+	SendPayslipEmail(ctx context.Context, companyID, runID, userID uuid.UUID) error
 
-	// ListUserPayslips returns all payslip records for a given user within a date range.
-	ListUserPayslips(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, from, to time.Time) ([]models.PayslipRecord, error)
+	// ListUserPayslipSummaries returns summary information about all payslips available for a user.
+	ListUserPayslipSummaries(ctx context.Context, companyID, userID uuid.UUID, from, to time.Time) ([]models.PayrollRunSummary, error)
 }
 
 type payslipService struct {
 	payslipRepo repository.PayslipRepository
-	payrollRepo repository.PayrollRepository
-	bankRepo    repository.BankDetailsRepository // optional, for bank details on payslip
-	pdfGen      PDFGenerator
-	storage     ObjectStorage
-	emailSender EmailSender
+	emailSender email.Sender // added email sender
 	logger      *zap.Logger
 }
 
-// NewPayslipService creates a new payslip service.
+// NewPayslipService now expects an email.Sender.
 func NewPayslipService(
 	payslipRepo repository.PayslipRepository,
-	payrollRepo repository.PayrollRepository,
-	bankRepo repository.BankDetailsRepository,
-	pdfGen PDFGenerator,
-	storage ObjectStorage,
-	emailSender EmailSender,
+	emailSender email.Sender,
 	logger *zap.Logger,
 ) PayslipService {
 	return &payslipService{
 		payslipRepo: payslipRepo,
-		payrollRepo: payrollRepo,
-		bankRepo:    bankRepo,
-		pdfGen:      pdfGen,
-		storage:     storage,
 		emailSender: emailSender,
 		logger:      logger.Named("payslip_service"),
 	}
 }
 
-// GeneratePayslipsForRun generates payslips for all employees in a payroll run.
-// It is idempotent: if a payslip already exists for a user, it is skipped.
-func (s *payslipService) GeneratePayslipsForRun(ctx context.Context, payrollRunID uuid.UUID, actorID uuid.UUID) error {
-	// 1. Fetch payroll run and validate its status.
-	run, err := s.payrollRepo.GetPayrollRunByID(ctx, payrollRunID)
+func (s *payslipService) GeneratePayslipForEmployee(ctx context.Context, runID, userID, actorID uuid.UUID) ([]byte, error) {
+	// Fetch data
+	data, err := s.payslipRepo.GetPayslipData(ctx, runID, userID)
 	if err != nil {
-		return fmt.Errorf("failed to get payroll run: %w", err)
+		return nil, fmt.Errorf("get payslip data: %w", err)
 	}
-	if run == nil {
-		return errors.New("payroll run not found")
-	}
-	// Payslips should only be generated after approval (or payment).
-	if run.Status != models.PayrollStatusApproved && run.Status != models.PayrollStatusPaid {
-		return fmt.Errorf("cannot generate payslips for run in status %s", run.Status)
+	if data == nil {
+		return nil, fmt.Errorf("no payroll data found for run %s and user %s", runID, userID)
 	}
 
-	// 2. Get all payroll items (active) for this run.
-	items, err := s.payrollRepo.GetPayrollItemsByRun(ctx, payrollRunID)
+	// Generate PDF
+	pdfData, err := pdf.GeneratePayslip(data)
 	if err != nil {
-		return fmt.Errorf("failed to get payroll items: %w", err)
+		return nil, fmt.Errorf("generate PDF: %w", err)
 	}
 
-	var failures int
-	for _, item := range items {
-		// 3. Check if a payslip already exists for this user/run.
-		existing, _ := s.payslipRepo.GetByRunAndUser(ctx, payrollRunID, item.UserID)
-		if existing != nil {
-			s.logger.Debug("payslip already exists, skipping",
-				zap.String("user_id", item.UserID.String()))
-			continue
-		}
+	return pdfData, nil
+}
 
-		// 4. Get detailed payroll item (includes ledger components).
-		detail, err := s.payrollRepo.GetPayrollItemDetail(ctx, item.PayrollItemID)
-		if err != nil {
-			failures++
-			s.logger.Error("failed to get payroll item detail",
-				zap.Error(err),
-				zap.String("item_id", item.PayrollItemID.String()),
-				zap.String("user_id", item.UserID.String()))
-			continue
-		}
+func (s *payslipService) GetPayslip(ctx context.Context, userID, runID uuid.UUID) ([]byte, error) {
+	// Always generate on the fly. Use a system actor ID for generation (not stored).
+	systemActor := uuid.MustParse("00000000-0000-0000-0000-000000000000")
+	return s.GeneratePayslipForEmployee(ctx, runID, userID, systemActor)
+}
 
-		// 5. Build the payslip data model.
-		payslipData := &models.Payslip{
-			PayslipID:    uuid.New(),
-			CompanyID:    run.CompanyID,
-			UserID:       item.UserID,
-			PayrollRunID: payrollRunID,
-			PeriodStart:  run.PeriodStart,
-			PeriodEnd:    run.PeriodEnd,
-			Earnings:     []models.PayslipComponent{},
-			Deductions:   []models.PayslipComponent{},
-			GrossAmount:  item.GrossAmount,
-			NetAmount:    item.NetAmount,
-			GeneratedAt:  time.Now().UTC(),
-		}
+// SendPayslipEmail implements the email sending functionality.
+func (s *payslipService) SendPayslipEmail(ctx context.Context, companyID, runID, userID uuid.UUID) error {
+	logger := s.logger.With(
+		zap.String("method", "SendPayslipEmail"),
+		zap.String("company_id", companyID.String()),
+		zap.String("run_id", runID.String()),
+		zap.String("user_id", userID.String()),
+	)
 
-		// 6. Separate components into earnings and deductions, and compute total tax.
-		var totalTax float64
-		for _, comp := range detail.Components {
-			pc := models.PayslipComponent{
-				Code:        comp.ComponentCode,
-				Description: comp.Description,
-				Amount:      comp.Amount,
-			}
-			if comp.ComponentType == models.ComponentTypeEarning {
-				payslipData.Earnings = append(payslipData.Earnings, pc)
-			} else {
-				payslipData.Deductions = append(payslipData.Deductions, pc)
-				if comp.IsTaxable && (comp.ComponentCode == "TAX" || comp.ComponentCode == "TDS") {
-					totalTax += comp.Amount
-				}
-			}
-		}
-		payslipData.TotalTax = totalTax
+	logger.Debug("starting send payslip email process")
 
-		// 7. Generate PDF.
-		pdfBytes, err := s.pdfGen.GeneratePayslipPDF(payslipData)
-		if err != nil {
-			failures++
-			s.logger.Error("failed to generate payslip PDF",
-				zap.Error(err),
-				zap.String("user_id", item.UserID.String()))
-			continue
-		}
-
-		// 8. Upload to object storage.
-		objectKey := fmt.Sprintf("payslips/%s/%s/%s.pdf",
-			run.CompanyID.String(),
-			payrollRunID.String(),
-			item.UserID.String())
-		if err := s.storage.Upload(ctx, objectKey, pdfBytes, "application/pdf"); err != nil {
-			failures++
-			s.logger.Error("failed to upload payslip PDF",
-				zap.Error(err),
-				zap.String("user_id", item.UserID.String()))
-			continue
-		}
-
-		// 9. Save record in database.
-		record := &models.PayslipRecord{
-			PayslipID:    payslipData.PayslipID,
-			PayrollRunID: payrollRunID,
-			UserID:       item.UserID,
-			PDFObjectKey: objectKey,
-			GeneratedAt:  payslipData.GeneratedAt,
-		}
-		if err := s.payslipRepo.Create(ctx, record); err != nil {
-			failures++
-			s.logger.Error("failed to save payslip record",
-				zap.Error(err),
-				zap.String("user_id", item.UserID.String()))
-			// Optionally delete the uploaded file? Not necessary for now.
-			continue
-		}
+	// 1. Get employee email
+	emailAddr, err := s.payslipRepo.GetEmployeeEmail(ctx, companyID, userID)
+	if err != nil {
+		logger.Error("failed to get employee email", zap.Error(err))
+		return fmt.Errorf("get employee email: %w", err)
 	}
 
-	if failures > 0 {
-		return fmt.Errorf("payslip generation completed with %d failures", failures)
+	if emailAddr == "" {
+		logger.Error("employee email is empty")
+		return fmt.Errorf("employee email not found")
 	}
+
+	logger.Debug("employee email retrieved", zap.String("email", emailAddr))
+
+	// 2. Generate payslip PDF
+	pdfData, err := s.GetPayslip(ctx, userID, runID)
+	if err != nil {
+		logger.Error("failed to generate payslip PDF", zap.Error(err))
+		return fmt.Errorf("generate payslip PDF: %w", err)
+	}
+
+	logger.Debug("payslip PDF generated", zap.Int("size_bytes", len(pdfData)))
+
+	// 3. Fetch payslip data for email subject/body
+	data, err := s.payslipRepo.GetPayslipData(ctx, runID, userID)
+	if err != nil {
+		logger.Error("failed to get payslip data for email", zap.Error(err))
+		return fmt.Errorf("get payslip data for email: %w", err)
+	}
+
+	if data == nil {
+		logger.Error("payslip data not found")
+		return fmt.Errorf("no payslip data found for run %s user %s", runID, userID)
+	}
+
+	logger.Debug("payslip data retrieved",
+		zap.Time("period_start", data.PeriodStart),
+		zap.Time("period_end", data.PeriodEnd),
+	)
+
+	// 4. Prepare email content
+	periodStr := fmt.Sprintf("%s to %s",
+		data.PeriodStart.Format("02 Jan 2006"),
+		data.PeriodEnd.Format("02 Jan 2006"),
+	)
+
+	subject := fmt.Sprintf("Payslip for %s", periodStr)
+
+	body := fmt.Sprintf(`
+	<html>
+	<body>
+		<p>Dear %s,</p>
+		<p>Please find attached your payslip for the period <strong>%s</strong>.</p>
+		<p>Thank you,<br>HR Team</p>
+	</body>
+	</html>
+	`, data.EmployeeName, periodStr)
+
+	// 5. Prepare attachment
+	filename := fmt.Sprintf("payslip_%s_%s.pdf", runID.String()[:8], userID.String()[:8])
+
+	attachment := email.Attachment{
+		Filename: filename,
+		Data:     pdfData,
+	}
+
+	logger.Debug("email prepared",
+		zap.String("to", emailAddr),
+		zap.String("subject", subject),
+		zap.String("attachment", filename),
+	)
+
+	// 6. Send email
+	err = s.emailSender.Send(emailAddr, subject, body, attachment)
+	if err != nil {
+		logger.Error("failed to send email",
+			zap.String("email", emailAddr),
+			zap.Error(err),
+		)
+		return fmt.Errorf("send email: %w", err)
+	}
+
+	logger.Info("payslip email sent successfully",
+		zap.String("email", emailAddr),
+	)
+
 	return nil
 }
 
-// GetPayslip retrieves the PDF for a specific payslip.
-func (s *payslipService) GetPayslip(ctx context.Context, userID uuid.UUID, payrollRunID uuid.UUID) ([]byte, error) {
-	record, err := s.payslipRepo.GetByRunAndUser(ctx, payrollRunID, userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get payslip record: %w", err)
-	}
-	if record == nil {
-		return nil, errors.New("payslip not found")
-	}
-	return s.storage.Download(ctx, record.PDFObjectKey)
-}
-
-// SendPayslipEmail sends the payslip as an email attachment to the employee.
-// This implementation assumes the employee's email can be fetched from the user service.
-// For now, it returns a "not implemented" error.
-func (s *payslipService) SendPayslipEmail(ctx context.Context, payslipID uuid.UUID) error {
-	// TODO: Implement after adding GetByID to repository and fetching employee email.
-	return errors.New("SendPayslipEmail not yet implemented")
-}
-
-// ListUserPayslips returns all payslip records for a user within a date range.
-func (s *payslipService) ListUserPayslips(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, from, to time.Time) ([]models.PayslipRecord, error) {
-	return s.payslipRepo.ListByUser(ctx, companyID, userID, from, to)
+func (s *payslipService) ListUserPayslipSummaries(ctx context.Context, companyID, userID uuid.UUID, from, to time.Time) ([]models.PayrollRunSummary, error) {
+	return s.payslipRepo.ListPayrollRunsForUser(ctx, companyID, userID, from, to)
 }

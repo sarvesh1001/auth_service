@@ -32,6 +32,9 @@ type EmployeeProfile struct {
 	TaxID            *string `json:"tax_id" db:"tax_id"`
 	SocialSecurityID *string `json:"social_security_id" db:"social_security_id"`
 
+	// Contact
+	Email *string `json:"email" db:"email"` // <-- new field
+
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }

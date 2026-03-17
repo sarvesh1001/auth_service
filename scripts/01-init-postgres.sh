@@ -23,7 +23,7 @@ CREATE SCHEMA IF NOT EXISTS leave;
 CREATE SCHEMA IF NOT EXISTS payroll;
 CREATE SCHEMA IF NOT EXISTS audit;
 CREATE SCHEMA IF NOT EXISTS attendance;
-
+CREATE SCHEMA IF NOT EXISTS biometric;   
 -- =====================================================
 -- 3. CORE TABLES (all columns and constraints integrated)
 -- =====================================================
@@ -380,6 +380,7 @@ CREATE TABLE IF NOT EXISTS employee_profiles (
     cost_center         VARCHAR(50),
     tax_id              VARCHAR(50),
     social_security_id  VARCHAR(50),
+    email               VARCHAR(255),                     -- new column
     created_at          TIMESTAMPTZ DEFAULT NOW(),
     updated_at          TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (company_id, user_id),
@@ -1090,6 +1091,7 @@ CREATE TABLE IF NOT EXISTS leave.leave_policy_resolution (
 -- -----------------------------------------------------
 CREATE TABLE IF NOT EXISTS payroll.payroll_component (
     company_id        UUID,
+
     component_code    VARCHAR(50) NOT NULL,
     component_type    VARCHAR(40) NOT NULL 
         CHECK (component_type IN ('earning','deduction')),
@@ -1103,10 +1105,8 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_component (
     contribution_side VARCHAR(20) DEFAULT 'none'
         CHECK (contribution_side IN ('employee','employer','none')),
 
-    CONSTRAINT fk_payroll_component_company
-        FOREIGN KEY (company_id)
-        REFERENCES companies(company_id)
-        ON DELETE CASCADE
+    CONSTRAINT payroll_component_component_code_unique
+        UNIQUE (component_code)
 );
 -- -----------------------------------------------------
 -- payroll.payroll_tax_profile
@@ -1133,15 +1133,17 @@ CREATE TABLE IF NOT EXISTS payroll.attendance_rule (
     updated_by UUID,
     component_code VARCHAR(50),
 
-    CONSTRAINT attendance_rule_pkey PRIMARY KEY (rule_id),
+    CONSTRAINT attendance_rule_pkey
+        PRIMARY KEY (rule_id),
 
     CONSTRAINT fk_attendance_rule_company
         FOREIGN KEY (company_id)
-        REFERENCES public.companies(company_id),
+        REFERENCES public.companies(company_id)
+        ON DELETE CASCADE,
 
     CONSTRAINT fk_attendance_rule_component
-        FOREIGN KEY (company_id, component_code)
-        REFERENCES payroll.payroll_component( component_code),
+        FOREIGN KEY (component_code)
+        REFERENCES payroll.payroll_component(component_code),
 
     CONSTRAINT fk_attendance_rule_created_by
         FOREIGN KEY (created_by)
@@ -1160,7 +1162,7 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_run (
     period_start     DATE NOT NULL,
     period_end       DATE NOT NULL,
     status           VARCHAR(20) NOT NULL CHECK (
-        status IN ('draft','processing','executing',,'calculated','approved','paid','failed','partially_processed')
+        status IN ('draft','processing','executing','calculated','approved','paid','failed','partially_processed')
     ),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by       UUID,
@@ -1204,7 +1206,7 @@ CREATE TABLE IF NOT EXISTS payroll.employee_fine (
         REFERENCES payroll.payroll_run(payroll_run_id),
 
     CONSTRAINT fk_employee_fine_component
-        FOREIGN KEY (company_id, component_code)
+        FOREIGN KEY (component_code)
         REFERENCES payroll.payroll_component(component_code)
 );
 
@@ -1244,38 +1246,6 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_rule_set (
         daterange(effective_from, COALESCE(effective_to, 'infinity'), '[]') WITH &&
     )
 );
-
--- -----------------------------------------------------
--- payroll.statutory_component_mapping
--- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS payroll.statutory_component_mapping (
-    mapping_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    statutory_code   VARCHAR(50) NOT NULL,
-    component_code   VARCHAR(50) NOT NULL,
-    effective_from   DATE NOT NULL,
-    effective_to     DATE,
-    is_active        BOOLEAN NOT NULL DEFAULT true,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by       UUID,
-    deactivated_at   TIMESTAMPTZ,
-    deactivated_by   UUID,
-    version          INT NOT NULL DEFAULT 1,
-    rule_set_id      UUID,
-    CONSTRAINT fk_scm_company
-        FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_scm_component
-        FOREIGN KEY (company_id, component_code)
-        REFERENCES payroll.payroll_component(company_id, component_code),
-    CONSTRAINT fk_scm_ruleset
-        FOREIGN KEY (rule_set_id) REFERENCES payroll.statutory_rule_set(rule_set_id) ON DELETE CASCADE,
-    CONSTRAINT fk_scm_definition
-        FOREIGN KEY (company_id, statutory_code)
-        REFERENCES payroll.statutory_component_definition(company_id, statutory_code)
-        ON DELETE CASCADE,
-    UNIQUE (company_id, statutory_code, component_code, effective_from)
-);
-
 -- -----------------------------------------------------
 -- payroll.statutory_component_definition (added columns)
 -- -----------------------------------------------------
@@ -1299,6 +1269,45 @@ CREATE TABLE IF NOT EXISTS payroll.statutory_component_definition (
         ON DELETE CASCADE
 );
 
+
+-- -----------------------------------------------------
+-- payroll.statutory_component_mapping
+-- -----------------------------------------------------
+CREATE TABLE IF NOT EXISTS payroll.statutory_component_mapping (
+    mapping_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    statutory_code   VARCHAR(50) NOT NULL,
+    component_code   VARCHAR(50) NOT NULL,
+    effective_from   DATE NOT NULL,
+    effective_to     DATE,
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID,
+    deactivated_at   TIMESTAMPTZ,
+    deactivated_by   UUID,
+    version          INT NOT NULL DEFAULT 1,
+    rule_set_id      UUID,
+
+    CONSTRAINT fk_scm_company
+        FOREIGN KEY (company_id)
+        REFERENCES public.companies(company_id),
+
+    CONSTRAINT fk_scm_component
+        FOREIGN KEY (component_code)
+        REFERENCES payroll.payroll_component(component_code),
+
+    CONSTRAINT fk_scm_ruleset
+        FOREIGN KEY (rule_set_id)
+        REFERENCES payroll.statutory_rule_set(rule_set_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_scm_definition
+        FOREIGN KEY (company_id, statutory_code)
+        REFERENCES payroll.statutory_component_definition(company_id, statutory_code)
+        ON DELETE CASCADE,
+
+    UNIQUE (company_id, statutory_code, component_code, effective_from)
+);
 -- -----------------------------------------------------
 -- payroll.statutory_contribution_rule
 -- -----------------------------------------------------
@@ -1475,22 +1484,28 @@ CREATE TABLE IF NOT EXISTS payroll.salary_structure_component (
     salary_structure_id  UUID NOT NULL,
     company_id           UUID NOT NULL,
     component_code       VARCHAR(50) NOT NULL,
-    calculation_type     VARCHAR(20) NOT NULL CHECK (calculation_type IN ('fixed','percentage')),
+    calculation_type     VARCHAR(20) NOT NULL 
+        CHECK (calculation_type IN ('fixed','percentage')),
     value                NUMERIC(12,4) NOT NULL,
     based_on_component   VARCHAR(50),
     sequence_order       INTEGER DEFAULT 1,
     created_at           TIMESTAMPTZ DEFAULT NOW(),
+
     CONSTRAINT uq_structure_component
         UNIQUE (salary_structure_id, component_code),
+
     CONSTRAINT fk_ssc_structure
         FOREIGN KEY (salary_structure_id)
-        REFERENCES payroll.salary_structure(salary_structure_id) ON DELETE CASCADE,
+        REFERENCES payroll.salary_structure(salary_structure_id)
+        ON DELETE CASCADE,
+
     CONSTRAINT fk_ssc_component
-        FOREIGN KEY (company_id, component_code)
-        REFERENCES payroll.payroll_component(company_id, component_code),
+        FOREIGN KEY (component_code)
+        REFERENCES payroll.payroll_component(component_code),
+
     CONSTRAINT fk_ssc_based_on_component
-        FOREIGN KEY (company_id, based_on_component)
-        REFERENCES payroll.payroll_component(company_id, component_code)
+        FOREIGN KEY (based_on_component)
+        REFERENCES payroll.payroll_component(component_code)
 );
 
 -- -----------------------------------------------------
@@ -1570,9 +1585,18 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_ledger (
     component_code  VARCHAR(50) NOT NULL,
     amount          NUMERIC(12,2) NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_ledger_item FOREIGN KEY (payroll_item_id) REFERENCES payroll.payroll_item(payroll_item_id) ON DELETE CASCADE,
-    CONSTRAINT fk_ledger_component FOREIGN KEY (company_id, component_code) REFERENCES payroll.payroll_component(company_id, component_code),
-    CONSTRAINT uq_payroll_ledger_item_component UNIQUE (payroll_item_id, component_code)
+
+    CONSTRAINT fk_ledger_item
+        FOREIGN KEY (payroll_item_id)
+        REFERENCES payroll.payroll_item(payroll_item_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_ledger_component
+        FOREIGN KEY (component_code)
+        REFERENCES payroll.payroll_component(component_code),
+
+    CONSTRAINT uq_payroll_ledger_item_component
+        UNIQUE (payroll_item_id, component_code)
 );
 
 -- -----------------------------------------------------
@@ -1619,13 +1643,20 @@ CREATE TABLE IF NOT EXISTS payroll.payroll_adjustment (
     user_id         UUID NOT NULL,
     component_code  VARCHAR(50) NOT NULL,
     amount          NUMERIC(12,2) NOT NULL,
-    adjustment_type VARCHAR(20) CHECK (adjustment_type IN ('addition','deduction')),
+    adjustment_type VARCHAR(20)
+        CHECK (adjustment_type IN ('addition','deduction')),
     reason          TEXT,
     applicable_month DATE NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     created_by      UUID,
-    CONSTRAINT fk_adjust_company FOREIGN KEY (company_id) REFERENCES companies(company_id),
-    CONSTRAINT fk_adjust_component FOREIGN KEY (company_id, component_code) REFERENCES payroll.payroll_component(company_id, component_code)
+
+    CONSTRAINT fk_adjust_company
+        FOREIGN KEY (company_id)
+        REFERENCES public.companies(company_id),
+
+    CONSTRAINT fk_adjust_component
+        FOREIGN KEY (component_code)
+        REFERENCES payroll.payroll_component(component_code)
 );
 
 -- -----------------------------------------------------
@@ -1922,24 +1953,38 @@ CREATE TABLE IF NOT EXISTS attendance.attendance_batch_outbox (
 -- -----------------------------------------------------
 -- payroll.employee_bank_details (new)
 -- -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS payroll.employee_bank_details (
+CREATE TABLE payroll.employee_bank_details (
     bank_detail_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
     company_id       UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
     user_id          UUID NOT NULL REFERENCES users(user_id),
+
     account_holder   VARCHAR(255) NOT NULL,
-    account_number   TEXT NOT NULL,
-    ifsc_code        VARCHAR(20) NOT NULL,
+
+    -- encrypted bank account
+    account_number           TEXT NOT NULL,
+    account_number_dek       TEXT NOT NULL,
+    account_number_key_id    TEXT NOT NULL,
+
+    -- encrypted IFSC
+    ifsc_code                TEXT NOT NULL,
+    ifsc_code_dek            TEXT NOT NULL,
+    ifsc_code_key_id         TEXT NOT NULL,
+
     bank_name        VARCHAR(255),
     branch           VARCHAR(255),
     account_type     VARCHAR(20),
+
     is_active        BOOLEAN NOT NULL DEFAULT true,
+
     effective_from   DATE NOT NULL,
     effective_to     DATE,
+
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     updated_at       TIMESTAMPTZ DEFAULT NOW(),
+
     UNIQUE (company_id, user_id, effective_from)
 );
-
 -- -----------------------------------------------------
 -- payroll.payslip (new)
 -- -----------------------------------------------------
@@ -1978,7 +2023,7 @@ CREATE TABLE IF NOT EXISTS payroll.employee_loan (
     outstanding_balance NUMERIC(14,2),
     penalty_rate     NUMERIC(5,2) DEFAULT 0,
     allow_partial_payment BOOLEAN DEFAULT true,
-    CONSTRAINT fk_employee_loan_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(company_id, component_code)
+    CONSTRAINT fk_employee_loan_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
 
 -- -----------------------------------------------------
@@ -2013,7 +2058,7 @@ CREATE TABLE IF NOT EXISTS payroll.arrears (
     processed        BOOLEAN DEFAULT false,
     created_at       TIMESTAMPTZ DEFAULT NOW(),
     component_code   VARCHAR(50),
-    CONSTRAINT fk_arrears_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(company_id, component_code)
+    CONSTRAINT fk_arrears_component FOREIGN KEY (component_code) REFERENCES payroll.payroll_component(component_code)
 );
 
 -- -----------------------------------------------------
@@ -4685,5 +4730,16 @@ VALUES (
     true
 )
 ON CONFLICT (user_id) DO NOTHING;
+CREATE INDEX IF NOT EXISTS idx_employee_profiles_email
+ON employee_profiles (email)
+WHERE email IS NOT NULL;
+
+ALTER TABLE employee_profiles
+ADD CONSTRAINT uniq_employee_profiles_company_email UNIQUE (company_id, email);
+
+-- Run this migration
+CREATE UNIQUE INDEX IF NOT EXISTS uq_employee_bank_details_active
+    ON payroll.employee_bank_details (company_id, user_id)
+    WHERE is_active = true;
 EOSQL
 echo "🧬 Initializing biometric schema..."

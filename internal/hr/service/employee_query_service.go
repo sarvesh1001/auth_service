@@ -444,6 +444,7 @@ func (qs *EmployeeQueryService) ExportEmployeeData(
 
 	return data, contentType, nil
 }
+
 func (qs *EmployeeQueryService) HealthCheck(ctx context.Context) error {
 	if err := qs.employeeRepo.HealthCheck(ctx); err != nil {
 		return fmt.Errorf("employee repository health check failed: %w", err)
@@ -456,21 +457,21 @@ func (qs *EmployeeQueryService) HealthCheck(ctx context.Context) error {
 
 // convertToCSV converts employee profiles to CSV format
 func (qs *EmployeeQueryService) convertToCSV(profiles []*employee.EmployeeProfile) ([]byte, error) {
-	// Simple CSV conversion implementation
-	// For production, use a proper CSV library like encoding/csv
-	csvData := "Employee ID,User ID,Name,Employment Type,Employment Status,Job Title,Department,Join Date\n"
+	// Use proper CSV writing for production (here using simple string building for clarity)
+	// Headers: Employee ID, User ID, Email, Name, Employment Type, Employment Status, Job Title, Department, Join Date
+	csvData := "Employee Profile ID,User ID,Email,Employment Type,Employment Status,Job Title,Department,Join Date\n"
 
 	for _, profile := range profiles {
-		// Note: You would need to get user name from user service
-		// This is a simplified example
+		// Note: You would need to get user name and department from other services
+		// This is a simplified example; in real code you'd enrich the data.
 		row := fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%s\n",
 			profile.EmployeeProfileID,
 			profile.UserID,
-			"", // User name would go here
+			safeString(profile.Email), // <-- Email added here
 			safeString(profile.EmploymentType),
 			safeString(profile.EmploymentStatus),
 			safeString(profile.JobTitle),
-			"", // Department would need to be fetched
+			"", // Department would need to be fetched (e.g., from employee_department_history)
 			profile.CreatedAt.Format("2006-01-02"),
 		)
 		csvData += row

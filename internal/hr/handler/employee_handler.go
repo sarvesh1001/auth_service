@@ -53,7 +53,6 @@ func NewEmployeeHandler(
 // ============================================================================
 
 // CreateEmployeeProfileRequest represents the request to create an employee profile
-// CreateEmployeeProfileRequest represents the request to create an employee profile
 type CreateEmployeeProfileRequest struct {
 	UserID           uuid.UUID  `json:"user_id" validate:"required"`
 	DateOfBirth      *time.Time `json:"date_of_birth,omitempty"`
@@ -64,11 +63,11 @@ type CreateEmployeeProfileRequest struct {
 	EmploymentStatus *string    `json:"employment_status,omitempty"`
 	ProbationEndDate *time.Time `json:"probation_end_date,omitempty"`
 	ConfirmationDate *time.Time `json:"confirmation_date,omitempty"`
-	// JobTitle REMOVED - will be fetched from positions table
-	Grade            *string `json:"grade,omitempty"`
-	CostCenter       *string `json:"cost_center,omitempty"`
-	TaxID            *string `json:"tax_id,omitempty"`
-	SocialSecurityID *string `json:"social_security_id,omitempty"`
+	Grade            *string    `json:"grade,omitempty"`
+	CostCenter       *string    `json:"cost_center,omitempty"`
+	TaxID            *string    `json:"tax_id,omitempty"`
+	SocialSecurityID *string    `json:"social_security_id,omitempty"`
+	Email            *string    `json:"email,omitempty"` // <-- NEW FIELD
 }
 
 // CreateEmployeeProfile creates a new employee profile
@@ -117,13 +116,13 @@ func (h *EmployeeHandler) CreateEmployeeProfile(w http.ResponseWriter, r *http.R
 		EmploymentStatus:  req.EmploymentStatus,
 		ProbationEndDate:  req.ProbationEndDate,
 		ConfirmationDate:  req.ConfirmationDate,
-		// JobTitle NOT SET - will be fetched from positions table in repository
-		Grade:            req.Grade,
-		CostCenter:       req.CostCenter,
-		TaxID:            req.TaxID,
-		SocialSecurityID: req.SocialSecurityID,
-		CreatedAt:        time.Now().UTC(),
-		UpdatedAt:        time.Now().UTC(),
+		Grade:             req.Grade,
+		CostCenter:        req.CostCenter,
+		TaxID:             req.TaxID,
+		SocialSecurityID:  req.SocialSecurityID,
+		Email:             req.Email, // <-- NEW FIELD
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
 	}
 
 	// Prepare metadata for audit
@@ -269,6 +268,7 @@ type UpdateEmployeeProfileRequest struct {
 	CostCenter       *string    `json:"cost_center,omitempty"`
 	TaxID            *string    `json:"tax_id,omitempty"`
 	SocialSecurityID *string    `json:"social_security_id,omitempty"`
+	Email            *string    `json:"email,omitempty"` // <-- NEW FIELD
 }
 
 // UpdateEmployeeProfile updates an employee profile
@@ -346,6 +346,9 @@ func (h *EmployeeHandler) UpdateEmployeeProfile(w http.ResponseWriter, r *http.R
 	}
 	if req.SocialSecurityID != nil {
 		updates["social_security_id"] = *req.SocialSecurityID
+	}
+	if req.Email != nil { // <-- NEW FIELD
+		updates["email"] = *req.Email
 	}
 
 	if len(updates) == 0 {
@@ -552,6 +555,9 @@ func (h *EmployeeHandler) SearchEmployeeProfiles(w http.ResponseWriter, r *http.
 	}
 	if gender := r.URL.Query().Get("gender"); gender != "" {
 		filters["gender"] = gender
+	}
+	if email := r.URL.Query().Get("email"); email != "" { // <-- NEW FILTER
+		filters["email"] = email
 	}
 	if hireDateFrom := r.URL.Query().Get("hire_date_from"); hireDateFrom != "" {
 		if date, err := time.Parse(time.RFC3339, hireDateFrom); err == nil {

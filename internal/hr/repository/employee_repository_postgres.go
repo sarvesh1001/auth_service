@@ -40,6 +40,7 @@ func NewEmployeeRepository(postgresClient *client.PostgresClient, logger *zap.Lo
 // ============================================================================
 // EMPLOYEE PROFILE METHODS
 // ============================================================================
+
 func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, profile *employee.EmployeeProfile) error {
 	startTime := time.Now()
 
@@ -69,8 +70,8 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 			employee_profile_id, user_id, company_id, date_of_birth, gender, 
 			marital_status, nationality, employment_type, employment_status, 
 			probation_end_date, confirmation_date, job_title, grade, cost_center, 
-			tax_id, social_security_id, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+			tax_id, social_security_id, email, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
 	_, err = r.client.Exec(ctx, query,
 		profile.EmployeeProfileID,
@@ -89,6 +90,7 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 		profile.CostCenter,
 		profile.TaxID,
 		profile.SocialSecurityID,
+		profile.Email,
 		profile.CreatedAt,
 		profile.UpdatedAt,
 	)
@@ -109,6 +111,7 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfile(ctx context.Context, prof
 
 	return nil
 }
+
 func (r *EmployeeRepositoryImpl) GetEmployeeProfileByID(ctx context.Context, profileID uuid.UUID) (*employee.EmployeeProfile, error) {
 	stmt, ok := r.getStmt("get_employee_profile_by_id")
 	if !ok {
@@ -157,8 +160,8 @@ func (r *EmployeeRepositoryImpl) UpdateEmployeeProfile(ctx context.Context, prof
 			nationality = $4, employment_type = $5, employment_status = $6, 
 			probation_end_date = $7, confirmation_date = $8, job_title = $9, 
 			grade = $10, cost_center = $11, tax_id = $12, 
-			social_security_id = $13, updated_at = $14
-		WHERE employee_profile_id = $15`
+			social_security_id = $13, email = $14, updated_at = $15
+		WHERE employee_profile_id = $16`
 
 	result, err := r.client.Exec(ctx, query,
 		profile.DateOfBirth,
@@ -174,6 +177,7 @@ func (r *EmployeeRepositoryImpl) UpdateEmployeeProfile(ctx context.Context, prof
 		profile.CostCenter,
 		profile.TaxID,
 		profile.SocialSecurityID,
+		profile.Email,
 		profile.UpdatedAt,
 		profile.EmployeeProfileID,
 	)
@@ -227,7 +231,7 @@ func (r *EmployeeRepositoryImpl) ListEmployeeProfilesByCompany(ctx context.Conte
 			employee_profile_id, user_id, company_id, date_of_birth, gender, 
 			marital_status, nationality, employment_type, employment_status, 
 			probation_end_date, confirmation_date, job_title, grade, cost_center, 
-			tax_id, social_security_id, created_at, updated_at
+			tax_id, social_security_id, email, created_at, updated_at
 		FROM employee_profiles 
 		WHERE company_id = $1
 		ORDER BY created_at DESC
@@ -280,7 +284,6 @@ func (r *EmployeeRepositoryImpl) SearchEmployeeProfiles(ctx context.Context, com
 			paramCount++
 		case "department_id":
 			// Join with department history to filter by department
-			// This is a simplified version - you might need to adjust based on your exact needs
 			conditions = append(conditions, fmt.Sprintf(
 				"user_id IN (SELECT user_id FROM employee_department_history WHERE department_id = $%d AND end_date IS NULL)",
 				paramCount))
@@ -297,6 +300,10 @@ func (r *EmployeeRepositoryImpl) SearchEmployeeProfiles(ctx context.Context, com
 		case "hire_date_from":
 			conditions = append(conditions, fmt.Sprintf("created_at >= $%d", paramCount))
 			params = append(params, value)
+			paramCount++
+		case "email":
+			conditions = append(conditions, fmt.Sprintf("email ILIKE $%d", paramCount))
+			params = append(params, "%"+value.(string)+"%")
 			paramCount++
 		}
 	}
@@ -320,7 +327,7 @@ func (r *EmployeeRepositoryImpl) SearchEmployeeProfiles(ctx context.Context, com
 			employee_profile_id, user_id, company_id, date_of_birth, gender, 
 			marital_status, nationality, employment_type, employment_status, 
 			probation_end_date, confirmation_date, job_title, grade, cost_center, 
-			tax_id, social_security_id, created_at, updated_at
+			tax_id, social_security_id, email, created_at, updated_at
 		FROM employee_profiles %s
 		ORDER BY created_at DESC
 		LIMIT $%d OFFSET $%d`, whereClause, paramCount, paramCount+1)
@@ -628,6 +635,7 @@ func (r *EmployeeRepositoryImpl) DeleteEmployeeDocument(ctx context.Context, doc
 // ============================================================================
 // EMPLOYEE EXIT METHODS
 // ============================================================================
+
 func (r *EmployeeRepositoryImpl) CreateEmployeeExit(ctx context.Context, exit *employee.EmployeeExit) error {
 	query := `
 	INSERT INTO employee_exit (
@@ -692,6 +700,7 @@ func (r *EmployeeRepositoryImpl) GetEmployeeExitByID(
 
 	return nil, fmt.Errorf("employee exit record not found: %s", exitID)
 }
+
 func (r *EmployeeRepositoryImpl) GetEmployeeExitByUserID(
 	ctx context.Context,
 	userID, companyID uuid.UUID,
@@ -1041,8 +1050,8 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfilesBatch(ctx context.Context
 			employee_profile_id, user_id, company_id, date_of_birth, gender, 
 			marital_status, nationality, employment_type, employment_status, 
 			probation_end_date, confirmation_date, job_title, grade, cost_center, 
-			tax_id, social_security_id, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+			tax_id, social_security_id, email, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
 	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
@@ -1068,6 +1077,7 @@ func (r *EmployeeRepositoryImpl) CreateEmployeeProfilesBatch(ctx context.Context
 			profile.CostCenter,
 			profile.TaxID,
 			profile.SocialSecurityID,
+			profile.Email,
 			profile.CreatedAt,
 			profile.UpdatedAt,
 		)
@@ -1295,7 +1305,7 @@ func (r *EmployeeRepositoryImpl) GetActiveEmployeesByDateRange(ctx context.Conte
 			ep.employee_profile_id, ep.user_id, ep.company_id, ep.date_of_birth, ep.gender, 
 			ep.marital_status, ep.nationality, ep.employment_type, ep.employment_status, 
 			ep.probation_end_date, ep.confirmation_date, ep.job_title, ep.grade, ep.cost_center, 
-			ep.tax_id, ep.social_security_id, ep.created_at, ep.updated_at
+			ep.tax_id, ep.social_security_id, ep.email, ep.created_at, ep.updated_at
 		FROM employee_profiles ep
 		WHERE ep.company_id = $1 
 			AND ep.employment_status = 'active'
@@ -1333,7 +1343,7 @@ func (r *EmployeeRepositoryImpl) scanEmployeeProfile(rows *sql.Rows) (*employee.
 	var profile employee.EmployeeProfile
 	var dateOfBirth, probationEndDate, confirmationDate sql.NullTime
 	var gender, maritalStatus, nationality, employmentType, employmentStatus,
-		jobTitle, grade, costCenter, taxID, socialSecurityID sql.NullString
+		jobTitle, grade, costCenter, taxID, socialSecurityID, email sql.NullString
 
 	err := rows.Scan(
 		&profile.EmployeeProfileID,
@@ -1352,6 +1362,7 @@ func (r *EmployeeRepositoryImpl) scanEmployeeProfile(rows *sql.Rows) (*employee.
 		&costCenter,
 		&taxID,
 		&socialSecurityID,
+		&email,
 		&profile.CreatedAt,
 		&profile.UpdatedAt,
 	)
@@ -1399,6 +1410,9 @@ func (r *EmployeeRepositoryImpl) scanEmployeeProfile(rows *sql.Rows) (*employee.
 	}
 	if socialSecurityID.Valid {
 		profile.SocialSecurityID = &socialSecurityID.String
+	}
+	if email.Valid {
+		profile.Email = &email.String
 	}
 
 	return &profile, nil
@@ -1604,14 +1618,14 @@ func (r *EmployeeRepositoryImpl) initializePreparedStatements(ctx context.Contex
 			SELECT employee_profile_id, user_id, company_id, date_of_birth, gender, 
 			       marital_status, nationality, employment_type, employment_status, 
 			       probation_end_date, confirmation_date, job_title, grade, cost_center, 
-			       tax_id, social_security_id, created_at, updated_at
+			       tax_id, social_security_id, email, created_at, updated_at
 			FROM employee_profiles WHERE employee_profile_id = $1`,
 
 		"get_employee_profile_by_user_id": `
 			SELECT employee_profile_id, user_id, company_id, date_of_birth, gender, 
 			       marital_status, nationality, employment_type, employment_status, 
 			       probation_end_date, confirmation_date, job_title, grade, cost_center, 
-			       tax_id, social_security_id, created_at, updated_at
+			       tax_id, social_security_id, email, created_at, updated_at
 			FROM employee_profiles WHERE user_id = $1 AND company_id = $2`,
 
 		"get_department_history_by_user_id": `
@@ -1724,6 +1738,7 @@ func (r *EmployeeRepositoryImpl) IsUserEmployeeOfCompany(
 
 	return exists, nil
 }
+
 func (r *EmployeeRepositoryImpl) GetActiveDepartmentAssignment(
 	ctx context.Context,
 	userID uuid.UUID,

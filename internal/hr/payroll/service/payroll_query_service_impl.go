@@ -409,82 +409,9 @@ func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, run
 	return buf.Bytes(), nil
 }
 
-// GenerateAndStorePayslip creates a PDF payslip for a payroll item, stores it, and returns the S3 key.
-func (s *payrollQueryService) GenerateAndStorePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (string, error) {
-	// 1. Get payslip data.
-	payslipData, err := s.GetEmployeePayslip(ctx, companyID, payrollItemID)
-	if err != nil {
-		return "", err
-	}
-
-	// 2. Generate PDF using the injected generator.
-	_, err = s.pdfGenerator.GeneratePayslipPDF(payslipData)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate PDF: %w", err)
-	}
-
-	// 3. Store PDF (this example uses a dummy object key; you would upload to S3/minio).
-	objectKey := fmt.Sprintf("payslips/%s/%s/%s.pdf",
-		companyID.String(),
-		payslipData.PeriodStart.Format("2006-01"),
-		payslipData.UserID.String(),
-	)
-	// TODO: Actually upload pdfBytes to object storage.
-
-	// 4. Save record in database.
-	record := &models.PayslipRecord{
-		PayslipID:    payslipData.PayslipID,
-		PayrollRunID: payslipData.PayrollRunID,
-		UserID:       payslipData.UserID,
-		PDFObjectKey: objectKey,
-		GeneratedAt:  payslipData.GeneratedAt,
-	}
-	if err := s.payslipRepo.Create(ctx, record); err != nil {
-		return "", fmt.Errorf("failed to save payslip record: %w", err)
-	}
-
-	// 5. Audit
-	actorID := getUserIDFromContext(ctx)
-	metadata := map[string]interface{}{
-		"payroll_run_id": payslipData.PayrollRunID.String(),
-		"user_id":        payslipData.UserID.String(),
-		"object_key":     objectKey,
-	}
-	_ = s.audit.LogAction(ctx, &companyID, "payroll", "payslip_generated", "payslip", &record.PayslipID, "user", actorID, nil, nil, metadata)
-
-	return objectKey, nil
-}
-
 // GetMyPayslips returns all payslip records for the authenticated user in a date range.
-func (s *payrollQueryService) GetMyPayslips(ctx context.Context, userID uuid.UUID, from, to time.Time) ([]models.PayslipRecord, error) {
-	// In a real implementation, you would derive companyID from the user's context.
-	// For simplicity, we assume the caller (handler) passes companyID separately.
-	// This method is intended to be called with the authenticated user's ID.
-	// You may need to modify the signature to include companyID.
-	// We'll keep it as is and assume the handler provides it via a wrapper.
-	// Alternatively, fetch companyID from user profile.
-	return nil, fmt.Errorf("not implemented: requires companyID or user context")
-}
 
 // DownloadPayslip retrieves the PDF content for a given payslip ID.
-func (s *payrollQueryService) DownloadPayslip(ctx context.Context, payslipID uuid.UUID) ([]byte, error) {
-	// 1. Fetch payslip record.
-	// Note: The repository currently doesn't have a GetByID method; you may need to add one.
-	// For now, we'll use a placeholder.
-	// record, err := s.payslipRepo.GetByID(ctx, payslipID)
-	// if err != nil { return nil, err }
-	// if record == nil { return nil, fmt.Errorf("payslip not found") }
-
-	// 2. Retrieve from object storage.
-	// data, err := s.objectStorage.Get(record.PDFObjectKey)
-	// if err != nil { return nil, err }
-
-	// 3. Audit access.
-	// actorID := getUserIDFromContext(ctx)
-	// _ = s.audit.LogAction(...)
-
-	return nil, fmt.Errorf("DownloadPayslip not fully implemented")
-}
 
 // ---------------------------------------------------------------------
 // Helper functions

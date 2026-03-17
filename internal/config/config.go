@@ -42,6 +42,7 @@ type Config struct {
 	QR            QRConfig
 	WebSocket     WebSocketConfig
 	HR            HRConfig
+	Email         EmailConfig // ✅ NEW: SMTP email configuration
 }
 
 // ----------------------------
@@ -259,6 +260,15 @@ type WebSocketConfig struct {
 	EnableCompression bool          `mapstructure:"enable_compression"`
 }
 
+// ✅ NEW: Email (SMTP) configuration
+type EmailConfig struct {
+	SMTPHost     string
+	SMTPPort     int
+	SMTPUsername string
+	SMTPPassword string
+	FromAddress  string
+}
+
 var (
 	cfg       *Config
 	once      sync.Once
@@ -415,6 +425,15 @@ func LoadConfig() *Config {
 				KMSEnabled: getEnvAsBool("ENCRYPTION_KMS_ENABLED", false),
 				KEKEnabled: getEnvAsBool("ENCRYPTION_KEK_ENABLED", false),
 			},
+
+			// ✅ NEW: Email (SMTP) configuration
+			Email: EmailConfig{
+				SMTPHost:     getEnv("SMTP_HOST", ""),
+				SMTPPort:     getEnvAsInt("SMTP_PORT", 587),
+				SMTPUsername: getEnv("SMTP_USERNAME", ""),
+				SMTPPassword: getSecureEnv("SMTP_PASSWORD", ""),
+				FromAddress:  getEnv("SMTP_FROM_ADDRESS", ""),
+			},
 		}
 
 		if cfg.KMS.Enabled {
@@ -439,6 +458,9 @@ func LoadConfig() *Config {
 			zap.Bool("jwt_rotate_refresh", cfg.JWT.RotateRefreshTokens),
 			zap.Duration("qr_expiry", cfg.QR.Expiry),
 			zap.Int("websocket_max_connections", cfg.WebSocket.MaxConnections),
+			zap.String("smtp_host", cfg.Email.SMTPHost), // ✅ NEW: log SMTP host
+			zap.Int("smtp_port", cfg.Email.SMTPPort),
+			zap.String("smtp_from", cfg.Email.FromAddress),
 		)
 	})
 
@@ -754,6 +776,21 @@ func validateConfig(cfg *Config) {
 		}
 		if cfg.WebSocket.AllowedOrigins[0] == "*" {
 			util.Warn("WS_ALLOWED_ORIGINS is set to '*' - consider restricting in production")
+		}
+
+		// ✅ NEW: Email validation
+		if cfg.Email.SMTPHost == "" {
+			util.Warn("SMTP_HOST is not set - email sending will fail")
+		}
+		if cfg.Email.SMTPPort <= 0 {
+			util.Warn("SMTP_PORT is invalid - email sending will fail")
+		}
+		if cfg.Email.FromAddress == "" {
+			util.Warn("SMTP_FROM_ADDRESS is not set - emails may be rejected")
+		}
+		// Password may be optional if server does not require auth, but we warn if username is set but password missing
+		if cfg.Email.SMTPUsername != "" && cfg.Email.SMTPPassword == "" {
+			util.Warn("SMTP_USERNAME provided but SMTP_PASSWORD is empty - authentication may fail")
 		}
 	}
 

@@ -175,6 +175,38 @@ func (s *payrollEngineService) ExecuteRun(
 		zap.String("run_id", runID.String()),
 	)
 
+	// ---------------------------------------------------------------------
+	// 🔁 Unstick runs that are in 'executing' with no pending employee jobs
+	// ---------------------------------------------------------------------
+	runCheck, err := s.payrollRepo.GetPayrollRunByID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch run: %w", err)
+	}
+	if runCheck == nil {
+		return fmt.Errorf("run not found")
+	}
+
+	if runCheck.Status == "executing" {
+		incomplete, err := s.CountRemainingEmployeeJobs(ctx, runID)
+		if err != nil {
+			return fmt.Errorf("failed to count employee jobs: %w", err)
+		}
+		if incomplete == 0 {
+			s.logger.Info("Run stuck in executing with no pending jobs – finalizing",
+				zap.String("run_id", runID.String()))
+			// Finalize the run (executing → calculated)
+			if err := s.FinalizeRun(ctx, runID, actorID); err != nil {
+				return fmt.Errorf("failed to finalize stuck run: %w", err)
+			}
+			// Run is now 'calculated' – the rest of ExecuteRun will handle it
+		} else {
+			return fmt.Errorf("run is currently executing with %d pending employee jobs", incomplete)
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// Original transaction – now the run is either draft, failed, or calculated
+	// ---------------------------------------------------------------------
 	tx, err := s.payrollRepo.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -191,7 +223,6 @@ func (s *payrollEngineService) ExecuteRun(
 	if err != nil {
 		return err
 	}
-
 	if run == nil {
 		return fmt.Errorf("run not found")
 	}
@@ -201,8 +232,12 @@ func (s *payrollEngineService) ExecuteRun(
 		return fmt.Errorf("run cannot be executed in state: %s", run.Status)
 	}
 
-	// 3️⃣ If rerun from calculated
+	// 3️⃣ If rerun from calculated – reset all data and then transition to processing
 	if run.Status == "calculated" {
+		// 🔥 Reset all existing data for this run to ensure fresh calculation
+		if err := s.payrollRepo.ResetPayrollRunDataTx(ctx, tx, runID); err != nil {
+			return fmt.Errorf("failed to reset run data before recalc: %w", err)
+		}
 
 		ok, err := s.payrollRepo.UpdatePayrollRunStatusIfCurrentTx(
 			ctx,
@@ -214,20 +249,17 @@ func (s *payrollEngineService) ExecuteRun(
 		if err != nil {
 			return err
 		}
-
 		if !ok {
 			return fmt.Errorf("failed to transition run from calculated to processing")
 		}
 	}
 
-	// 4️⃣ If retrying failed run
+	// 4️⃣ If retrying failed run – cleanup and then transition to processing
 	if run.Status == "failed" {
-
 		err = s.payrollRepo.CleanupFailedRunTx(ctx, tx, runID)
 		if err != nil {
 			return fmt.Errorf("failed to cleanup previous failed run: %w", err)
 		}
-
 		ok, err := s.payrollRepo.UpdatePayrollRunStatusIfCurrentTx(
 			ctx,
 			tx,
@@ -238,7 +270,6 @@ func (s *payrollEngineService) ExecuteRun(
 		if err != nil {
 			return err
 		}
-
 		if !ok {
 			return fmt.Errorf("failed to transition run from failed to processing")
 		}
@@ -246,7 +277,6 @@ func (s *payrollEngineService) ExecuteRun(
 
 	// 5️⃣ First run: draft → processing
 	if run.Status == "draft" {
-
 		ok, err := s.payrollRepo.UpdatePayrollRunStatusIfCurrentTx(
 			ctx,
 			tx,
@@ -257,7 +287,6 @@ func (s *payrollEngineService) ExecuteRun(
 		if err != nil {
 			return err
 		}
-
 		if !ok {
 			return fmt.Errorf("failed to transition run from draft to processing")
 		}
@@ -288,14 +317,12 @@ func (s *payrollEngineService) ExecuteRun(
 	)
 
 	if len(employeeIDs) == 0 {
-
 		_ = s.payrollRepo.UpdatePayrollRunStatusIfCurrent(
 			ctx,
 			runID,
 			"processing",
 			"failed",
 		)
-
 		return fmt.Errorf("no eligible employees found")
 	}
 
@@ -329,19 +356,6 @@ func (s *payrollEngineService) ExecuteRun(
 	)
 
 	return nil
-}
-
-// splitIntoBatches splits a slice into batches of given size.
-func splitIntoBatches(ids []uuid.UUID, size int) [][]uuid.UUID {
-	if size <= 0 {
-		return [][]uuid.UUID{ids}
-	}
-	batches := make([][]uuid.UUID, 0, (len(ids)+size-1)/size)
-	for size < len(ids) {
-		ids, batches = ids[size:], append(batches, ids[0:size:size])
-	}
-	batches = append(batches, ids)
-	return batches
 }
 
 // ApproveRun locks the payroll period and marks the run as approved.

@@ -28,7 +28,4 @@ type PayrollQueryService interface {
 
 	// New methods for missing features
 	ExportBankFile(ctx context.Context, companyID, runID uuid.UUID, bankFormat string) ([]byte, error)
-	GenerateAndStorePayslip(ctx context.Context, companyID, payrollItemID uuid.UUID) (string, error)
-	GetMyPayslips(ctx context.Context, userID uuid.UUID, from, to time.Time) ([]models.PayslipRecord, error)
-	DownloadPayslip(ctx context.Context, payslipID uuid.UUID) ([]byte, error)
 }
