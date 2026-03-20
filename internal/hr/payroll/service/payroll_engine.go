@@ -8,12 +8,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"go.uber.org/zap"
-
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
 	hrservice "auth-service/internal/hr/service"
+	a "auth-service/internal/infrastructure/audit"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // PayrollEngineService defines the payroll engine operations.
@@ -82,7 +83,7 @@ type payrollEngineService struct {
 	compensationSvc    CompensationService
 	statutoryEngine    StatutoryEngine
 	attendanceBridge   hrservice.AttendancePayrollBridge
-	audit              *hrservice.AuditService
+	audit              *a.AuditService
 	attendanceRuleRepo repository.AttendanceRuleRepository
 	employeeFineRepo   repository.EmployeeFineRepository
 	arrearsRepo        repository.ArrearsRepository
@@ -99,7 +100,7 @@ func NewPayrollEngineService(
 	compensationSvc CompensationService,
 	statutoryEngine StatutoryEngine,
 	attendanceBridge hrservice.AttendancePayrollBridge,
-	audit *hrservice.AuditService,
+	audit *a.AuditService,
 	attendanceRuleRepo repository.AttendanceRuleRepository,
 	employeeFineRepo repository.EmployeeFineRepository,
 	arrearsRepo repository.ArrearsRepository,

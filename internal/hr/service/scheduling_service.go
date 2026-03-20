@@ -5,6 +5,7 @@ import (
 	leave "auth-service/internal/hr/leave/service" // Add this
 	"auth-service/internal/hr/models/scheduling"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"encoding/json"
@@ -157,7 +158,7 @@ type PositionBasedResolvedDay struct {
 type schedulingServiceImpl struct {
 	schedulingRepo repository.SchedulingRepository
 	leaveQuery     leave.LeaveQueryService // ✅ NEW
-	auditService   *AuditService
+	auditService   *a.AuditService
 	logger         *zap.Logger
 	mu             sync.RWMutex
 }
@@ -165,7 +166,7 @@ type schedulingServiceImpl struct {
 func NewSchedulingService(
 	schedulingRepo repository.SchedulingRepository,
 	leaveQuery leave.LeaveQueryService, // ✅ NEW
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) SchedulingService {
 	return &schedulingServiceImpl{

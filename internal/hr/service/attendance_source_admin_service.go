@@ -3,6 +3,7 @@ package service
 import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"errors"
 	"strings"
@@ -50,13 +51,13 @@ type AttendanceSourceAdminService interface {
 
 type attendanceSourceAdminService struct {
 	attendanceRepo repository.AttendanceRepository
-	auditService   *AuditService
+	auditService   *a.AuditService
 	logger         *zap.Logger
 }
 
 func NewAttendanceSourceAdminService(
 	attendanceRepo repository.AttendanceRepository,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) AttendanceSourceAdminService {
 	return &attendanceSourceAdminService{

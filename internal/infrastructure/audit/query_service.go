@@ -1,9 +1,6 @@
-package service
+package audit
 
 import (
-	"auth-service/internal/hr/models"
-	"auth-service/internal/hr/repository"
-	"auth-service/internal/util"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -16,28 +13,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// AuditService handles business logic for audit logging
-type AuditService struct {
-	repo   repository.AuditRepository
-	logger *zap.Logger
-}
-
 // AuditQueryService handles audit log queries and exports
 type AuditQueryService struct {
-	repo   repository.AuditRepository
+	repo   AuditRepository
 	logger *zap.Logger
-}
-
-// NewAuditService creates a new audit service
-func NewAuditService(repo repository.AuditRepository, logger *zap.Logger) *AuditService {
-	return &AuditService{
-		repo:   repo,
-		logger: logger,
-	}
 }
 
 // NewAuditQueryService creates a new audit query service
-func NewAuditQueryService(repo repository.AuditRepository, logger *zap.Logger) *AuditQueryService {
+func NewAuditQueryService(repo AuditRepository, logger *zap.Logger) *AuditQueryService {
 	return &AuditQueryService{
 		repo:   repo,
 		logger: logger,
@@ -45,63 +28,9 @@ func NewAuditQueryService(repo repository.AuditRepository, logger *zap.Logger) *
 }
 
 // ============================================================================
-// WRITE OPERATIONS (Service Layer)
-// ============================================================================
-
-// LogAction creates an audit log entry
-func (s *AuditService) LogAction(
-	ctx context.Context,
-	companyID *uuid.UUID,
-	module string,
-	action string,
-	entityType string,
-	entityID *uuid.UUID,
-	actorType string,
-	actorID *uuid.UUID,
-	beforeState []byte,
-	afterState []byte,
-	metadata map[string]interface{},
-) error {
-	// Business logic validation
-	if module == "" || action == "" || entityType == "" || actorType == "" {
-		return fmt.Errorf("missing required audit fields")
-	}
-
-	// Convert metadata to JSON
-	var metadataBytes []byte
-	if metadata != nil {
-		jsonBytes, err := json.Marshal(metadata)
-		if err != nil {
-			s.logger.Warn("Failed to marshal metadata", util.ErrorField(err))
-			// Continue without metadata rather than fail the audit
-		} else {
-			metadataBytes = jsonBytes
-		}
-	}
-
-	// Create audit log model
-	auditLog := &models.AuditLog{
-		AuditID:     uuid.New(),
-		CompanyID:   companyID,
-		Module:      module,
-		Action:      action,
-		EntityType:  entityType,
-		EntityID:    entityID,
-		ActorType:   actorType,
-		ActorID:     actorID,
-		BeforeState: beforeState,
-		AfterState:  afterState,
-		Metadata:    metadataBytes,
-		CreatedAt:   time.Now().UTC(),
-	}
-
-	// Store in repository
-	return s.repo.CreateAuditLog(ctx, auditLog)
-}
-
-// ============================================================================
 // QUERY OPERATIONS (Service Layer)
 // ============================================================================
+
 // GetCompanyAuditLogs retrieves audit logs for a company with full filtering support
 func (qs *AuditQueryService) GetCompanyAuditLogs(
 	ctx context.Context,
@@ -116,7 +45,7 @@ func (qs *AuditQueryService) GetCompanyAuditLogs(
 	endDate *time.Time,
 	page int,
 	pageSize int,
-) ([]*models.AuditLog, int, error) {
+) ([]*AuditLog, int, error) {
 
 	// Validation
 	if page < 1 {
@@ -129,7 +58,7 @@ func (qs *AuditQueryService) GetCompanyAuditLogs(
 	offset := (page - 1) * pageSize
 
 	// Build filter
-	filter := repository.AuditLogFilter{
+	filter := AuditLogFilter{
 		Limit:  pageSize,
 		Offset: offset,
 	}.WithCompanyID(companyID)
@@ -165,13 +94,13 @@ func (qs *AuditQueryService) GetEntityAuditHistory(
 	entityType string,
 	entityID uuid.UUID,
 	limit int,
-) ([]*models.AuditLog, error) {
+) ([]*AuditLog, error) {
 	// Service-level validation
 	if limit < 1 || limit > 1000 {
 		limit = 100
 	}
 
-	filter := repository.AuditLogFilter{
+	filter := AuditLogFilter{
 		Limit:  limit,
 		Offset: 0,
 	}.WithEntity(entityType, entityID)
@@ -186,13 +115,13 @@ func (qs *AuditQueryService) GetActorActivity(
 	actorType string,
 	actorID uuid.UUID,
 	days int,
-) ([]*models.AuditLog, error) {
+) ([]*AuditLog, error) {
 	// Default to last 30 days
 	if days < 1 || days > 365 {
 		days = 30
 	}
 
-	filter := repository.AuditLogFilter{
+	filter := AuditLogFilter{
 		Limit:  1000,
 		Offset: 0,
 	}.WithActor(actorType, actorID).WithLastNDays(days)
@@ -218,7 +147,7 @@ func (qs *AuditQueryService) ExportAuditLogs(
 	}
 
 	// Get logs for period
-	filter := repository.AuditLogFilter{
+	filter := AuditLogFilter{
 		Limit:  10000, // Export limit
 		Offset: 0,
 	}.WithCompanyID(companyID).WithTimeRange(startDate, endDate)
@@ -242,7 +171,7 @@ func (qs *AuditQueryService) ExportAuditLogs(
 }
 
 // exportAsJSON converts audit logs to JSON format
-func (qs *AuditQueryService) exportAsJSON(logs []*models.AuditLog) ([]byte, error) {
+func (qs *AuditQueryService) exportAsJSON(logs []*AuditLog) ([]byte, error) {
 	type exportLog struct {
 		ID         string                 `json:"id"`
 		Timestamp  time.Time              `json:"timestamp"`
@@ -315,7 +244,7 @@ func (qs *AuditQueryService) exportAsJSON(logs []*models.AuditLog) ([]byte, erro
 }
 
 // exportAsCSV converts audit logs to CSV format
-func (qs *AuditQueryService) exportAsCSV(logs []*models.AuditLog) ([]byte, error) {
+func (qs *AuditQueryService) exportAsCSV(logs []*AuditLog) ([]byte, error) {
 	var buf strings.Builder
 	writer := csv.NewWriter(&buf)
 
@@ -436,7 +365,7 @@ func (qs *AuditQueryService) GetAuditStats(
 	startDate, endDate time.Time,
 ) (*AuditStats, error) {
 	// Get all logs for the period
-	filter := repository.AuditLogFilter{
+	filter := AuditLogFilter{
 		Limit:  100000, // Large enough for stats
 		Offset: 0,
 	}.WithCompanyID(companyID).WithTimeRange(startDate, endDate)
@@ -522,67 +451,4 @@ func (qs *AuditQueryService) calculateTopActors(
 // HealthCheck performs a service-level health check
 func (qs *AuditQueryService) HealthCheck(ctx context.Context) error {
 	return qs.repo.HealthCheck(ctx)
-}
-
-// ===============================
-// DEVICE ENROLLMENT AUDIT HELPERS
-// ===============================
-
-func (s *AuditService) LogDeviceEnrollment(
-	ctx context.Context,
-	companyID uuid.UUID,
-	deviceID string,
-	deviceUserCode string,
-	userID uuid.UUID,
-	enrolledBy uuid.UUID,
-) error {
-
-	metadata := map[string]interface{}{
-		"device_id":        deviceID,
-		"device_user_code": deviceUserCode,
-	}
-
-	return s.LogAction(
-		ctx,
-		&companyID,
-		"attendance",
-		"device_enroll",
-		"device_enrollment",
-		nil,
-		"admin",
-		&enrolledBy,
-		nil,
-		nil,
-		metadata,
-	)
-}
-
-func (s *AuditService) LogDeviceEnrollmentRevocation(
-	ctx context.Context,
-	companyID uuid.UUID,
-	deviceID string,
-	deviceUserCode string,
-	reason string,
-	revokedBy uuid.UUID,
-) error {
-
-	metadata := map[string]interface{}{
-		"device_id":        deviceID,
-		"device_user_code": deviceUserCode,
-		"reason":           reason,
-	}
-
-	return s.LogAction(
-		ctx,
-		&companyID,
-		"attendance",
-		"device_revoke",
-		"device_enrollment",
-		nil,
-		"admin",
-		&revokedBy,
-		nil,
-		nil,
-		metadata,
-	)
 }

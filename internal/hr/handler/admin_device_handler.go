@@ -4,6 +4,7 @@ import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/repository"
 	"auth-service/internal/hr/service"
+	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,14 +22,14 @@ import (
 type DeviceHandler struct {
 	deviceService       service.AttendanceDeviceService
 	attendanceSourceSvc service.AttendanceSourceAdminService
-	auditService        *service.AuditService
+	auditService        *a.AuditService
 	logger              *zap.Logger
 }
 
 func NewDeviceHandler(
 	deviceService service.AttendanceDeviceService,
 	attendanceSourceSvc service.AttendanceSourceAdminService,
-	auditService *service.AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) *DeviceHandler {
 	return &DeviceHandler{

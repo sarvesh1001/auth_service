@@ -1,7 +1,6 @@
-package repository
+package audit
 
 import (
-	"auth-service/internal/hr/models"
 	"context"
 	"time"
 
@@ -17,18 +16,18 @@ type AuditRepository interface {
 
 	// CreateAuditLog creates a single audit log entry
 	// This is append-only - no updates or deletes allowed
-	CreateAuditLog(ctx context.Context, log *models.AuditLog) error
+	CreateAuditLog(ctx context.Context, log *AuditLog) error
 
 	// CreateAuditLogBatch creates multiple audit log entries in a single transaction
 	// Used for bulk operations or event sourcing
-	CreateAuditLogBatch(ctx context.Context, logs []*models.AuditLog) error
+	CreateAuditLogBatch(ctx context.Context, logs []*AuditLog) error
 
 	// ==============================================
 	// READ OPERATIONS (STORAGE-ONLY, NO BUSINESS LOGIC)
 	// ==============================================
 
 	// GetAuditLogByID retrieves a single audit log by its unique ID
-	GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*models.AuditLog, error)
+	GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*AuditLog, error)
 
 	// ListAuditLogs retrieves audit logs with filtering and pagination
 	// Returns: logs, total count, error
@@ -36,7 +35,7 @@ type AuditRepository interface {
 	ListAuditLogs(
 		ctx context.Context,
 		filter AuditLogFilter,
-	) ([]*models.AuditLog, int, error)
+	) ([]*AuditLog, int, error)
 
 	// ==============================================
 	// INFRASTRUCTURE METHODS

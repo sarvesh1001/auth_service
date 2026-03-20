@@ -1,11 +1,6 @@
 package factory
 
 import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
-
 	"auth-service/internal/bucketing"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
@@ -30,6 +25,7 @@ import (
 	"auth-service/internal/hr/payroll/service/pdf"
 	hrpostgres "auth-service/internal/hr/repository"
 	hrservice "auth-service/internal/hr/service"
+	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
@@ -37,6 +33,10 @@ import (
 	"auth-service/internal/sms"
 	"auth-service/internal/tls"
 	"auth-service/internal/util"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/kms"
 	"github.com/go-chi/chi/v5"
@@ -65,7 +65,7 @@ type Factory struct {
 	hrEmployeeRepository              hrpostgres.EmployeeRepository
 	attendanceRepository              hrpostgres.AttendanceRepository
 	schedulingRepository              hrpostgres.SchedulingRepository
-	auditRepository                   hrpostgres.AuditRepository
+	auditRepository                   audit.AuditRepository
 	workCenterRepository              hrpostgres.WorkCenterRepository
 	orgUnitRepository                 hrpostgres.OrgUnitRepository
 	attendanceIdentityRepository      hrpostgres.AttendanceIdentityRepository
@@ -96,7 +96,7 @@ type Factory struct {
 	attendanceCorrectionHandler       *hrhandler.AttendanceCorrectionHandler
 	workCenterHandler                 *hrhandler.WorkCenterHandler
 	orgUnitHandler                    *hrhandler.OrgUnitHandler
-	hrAuditHandler                    *hrhandler.AuditHandler
+	hrAuditHandler                    *audit.AuditHandler
 	hrEmployeeHandler                 *hrhandler.EmployeeHandler
 	hrSchedulingHandler               *hrhandler.SchedulingHandler
 	leaveAdminHandler                 *leavehandler.LeaveAdminHandler
@@ -111,8 +111,8 @@ type Factory struct {
 	workCenterQueryService            *hrservice.WorkCenterQueryService
 	orgUnitService                    *hrservice.OrgUnitService
 	orgUnitQueryService               *hrservice.OrgUnitQueryService
-	auditService                      *hrservice.AuditService
-	auditQueryService                 *hrservice.AuditQueryService
+	auditService                      *audit.AuditService
+	auditQueryService                 *audit.AuditQueryService
 	employeeQueryService              *hrservice.EmployeeQueryService
 	employeeService                   *hrservice.EmployeeService
 	schedulingService                 hrservice.SchedulingService
@@ -171,7 +171,7 @@ type Factory struct {
 	authHandler                       *handler.AuthHandler
 	router                            chi.Router
 	logger                            *zap.Logger
-	auditOutboxService                *service.AuditOutboxService
+	auditOutboxService                *audit.AuditOutboxService
 	auditOutboxCancel                 context.CancelFunc
 	once                              sync.Once
 	closeOnce                         sync.Once
@@ -1484,9 +1484,9 @@ func (f *Factory) GetSchedulingRepository() hrpostgres.SchedulingRepository {
 	return f.schedulingRepository
 }
 
-func (f *Factory) AuditRepository() hrpostgres.AuditRepository {
+func (f *Factory) AuditRepository() audit.AuditRepository {
 	if f.auditRepository == nil {
-		f.auditRepository = hrpostgres.NewAuditRepository(
+		f.auditRepository = audit.NewAuditRepository(
 			f.PostgresClient(),
 			f.logger,
 		)
@@ -1648,9 +1648,9 @@ func (f *Factory) GetOrgUnitQueryService() *hrservice.OrgUnitQueryService {
 	return f.orgUnitQueryService
 }
 
-func (f *Factory) GetAuditService() *hrservice.AuditService {
+func (f *Factory) GetAuditService() *audit.AuditService {
 	if f.auditService == nil {
-		f.auditService = hrservice.NewAuditService(
+		f.auditService = audit.NewAuditService(
 			f.AuditRepository(),
 			f.logger,
 		)
@@ -1668,9 +1668,9 @@ func (f *Factory) GetAttendanceBulkService() hrservice.AttendanceBulkService {
 	return f.attendanceBulkService
 }
 
-func (f *Factory) GetAuditQueryService() *hrservice.AuditQueryService {
+func (f *Factory) GetAuditQueryService() *audit.AuditQueryService {
 	if f.auditQueryService == nil {
-		f.auditQueryService = hrservice.NewAuditQueryService(
+		f.auditQueryService = audit.NewAuditQueryService(
 			f.AuditRepository(),
 			f.logger,
 		)
@@ -1722,9 +1722,9 @@ func (f *Factory) GetOrgUnitHandler() *hrhandler.OrgUnitHandler {
 	return f.orgUnitHandler
 }
 
-func (f *Factory) GetHRAuditHandler() *hrhandler.AuditHandler {
+func (f *Factory) GetHRAuditHandler() *audit.AuditHandler {
 	if f.hrAuditHandler == nil {
-		f.hrAuditHandler = hrhandler.NewAuditHandler(
+		f.hrAuditHandler = audit.NewAuditHandler(
 			f.GetAuditQueryService(),
 			f.logger,
 		)
@@ -1946,13 +1946,13 @@ func (f *Factory) InitializeKafkaLogging() (*KafkaLoggingManager, error) {
 	return mgr, nil
 }
 
-func (f *Factory) GetAuditOutboxService() *service.AuditOutboxService {
+func (f *Factory) GetAuditOutboxService() *audit.AuditOutboxService {
 	if f.auditOutboxService == nil {
 		if f.kafkaProducer == nil {
 			f.logger.Warn("Kafka producer not available, audit outbox disabled")
 			return nil
 		}
-		f.auditOutboxService = service.NewAuditOutboxService(
+		f.auditOutboxService = audit.NewAuditOutboxService(
 			f.PostgresClient(),
 			f.kafkaProducer,
 			500,

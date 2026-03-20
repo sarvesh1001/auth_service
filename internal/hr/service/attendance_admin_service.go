@@ -3,6 +3,7 @@ package service
 import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"encoding/json"
@@ -161,7 +162,7 @@ type attendanceAdminService struct {
 	resolutionService AttendanceResolutionService
 	omService         AttendanceOMService
 	logger            *zap.Logger
-	auditService      *AuditService
+	auditService      *a.AuditService
 }
 
 // NewAttendanceAdminService creates a new admin service
@@ -171,7 +172,7 @@ func NewAttendanceAdminService(
 	resolutionService AttendanceResolutionService,
 	omService AttendanceOMService, // 🔥 NEW
 	logger *zap.Logger,
-	auditService *AuditService,
+	auditService *a.AuditService,
 ) AttendanceAdminService {
 	return &attendanceAdminService{
 		attendanceRepo:    attendanceRepo,

@@ -3,6 +3,7 @@ package service
 import (
 	"auth-service/internal/hr/models/orgunit"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"fmt"
@@ -14,13 +15,13 @@ import (
 
 type OrgUnitService struct {
 	orgUnitRepo  repository.OrgUnitRepository
-	auditService *AuditService
+	auditService *a.AuditService
 	logger       *zap.Logger
 }
 
 func NewOrgUnitService(
 	orgUnitRepo repository.OrgUnitRepository,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) *OrgUnitService {
 	return &OrgUnitService{

@@ -9,7 +9,7 @@ import (
 
 	"auth-service/internal/hr/biometric/models"
 	"auth-service/internal/hr/biometric/repository"
-	auditservice "auth-service/internal/hr/service"
+	auditservice "auth-service/internal/infrastructure/audit"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"

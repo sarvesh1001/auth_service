@@ -2,6 +2,7 @@ package service
 
 import (
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"time"
 
@@ -49,7 +50,7 @@ type AttendanceOMService interface {
 
 type attendanceOMService struct {
 	orgUnitRepo  repository.OrgUnitRepository
-	auditService *AuditService
+	auditService *a.AuditService
 	logger       *zap.Logger
 }
 
@@ -61,7 +62,7 @@ type attendanceOMService struct {
 
 func NewAttendanceOMService(
 	orgUnitRepo repository.OrgUnitRepository,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) AttendanceOMService {
 	return &attendanceOMService{

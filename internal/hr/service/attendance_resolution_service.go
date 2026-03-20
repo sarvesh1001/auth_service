@@ -10,6 +10,7 @@ import (
 	"auth-service/internal/hr/repository"
 
 	attconstants "auth-service/internal/hr/models/attendance"
+	a "auth-service/internal/infrastructure/audit"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -89,7 +90,7 @@ type attendanceResolutionService struct {
 	attendanceRepo repository.AttendanceRepository
 	schedulingQS   SchedulingQueryService
 	schedulingQSA  SchedulingService
-	auditService   *AuditService
+	auditService   *a.AuditService
 	logger         *zap.Logger
 }
 
@@ -97,7 +98,7 @@ func NewAttendanceResolutionService(
 	attendanceRepo repository.AttendanceRepository,
 	schedulingQS SchedulingQueryService,
 	schedulingQSA SchedulingService,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) AttendanceResolutionService {
 	return &attendanceResolutionService{

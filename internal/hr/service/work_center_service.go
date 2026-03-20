@@ -4,6 +4,7 @@ package service
 import (
 	"auth-service/internal/hr/models/workcenter"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"fmt"
@@ -15,13 +16,13 @@ import (
 
 type WorkCenterService struct {
 	workCenterRepo repository.WorkCenterRepository
-	auditService   *AuditService
+	auditService   *a.AuditService
 	logger         *zap.Logger
 }
 
 func NewWorkCenterService(
 	workCenterRepo repository.WorkCenterRepository,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) *WorkCenterService {
 	if auditService == nil {

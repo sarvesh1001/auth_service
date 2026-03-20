@@ -1,8 +1,6 @@
-package handler
+package audit
 
 import (
-	"auth-service/internal/hr/service"
-	"auth-service/internal/util"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,17 +11,19 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/util"
 )
 
 // AuditHandler handles audit log related operations
 type AuditHandler struct {
-	auditQueryService *service.AuditQueryService
+	auditQueryService *AuditQueryService
 	logger            *zap.Logger
 }
 
 // NewAuditHandler creates a new audit handler
 func NewAuditHandler(
-	auditQueryService *service.AuditQueryService,
+	auditQueryService *AuditQueryService,
 	logger *zap.Logger,
 ) *AuditHandler {
 	return &AuditHandler{

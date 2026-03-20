@@ -1,6 +1,7 @@
 package service
 
 import (
+	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +12,6 @@ import (
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	hrservice "auth-service/internal/hr/service"
 )
 
 // ----------------------------------------------------------------------
@@ -135,7 +135,7 @@ type employeeFineService struct {
 	payrollRepo   repository.PayrollRepository         // for period lock checks
 	componentRepo repository.ComponentRepository       // to validate/fetch component metadata
 	settingsRepo  repository.CompanySettingsRepository // to get default component
-	audit         *hrservice.AuditService
+	audit         *a.AuditService
 	logger        *zap.Logger
 }
 
@@ -145,7 +145,7 @@ func NewEmployeeFineService(
 	payrollRepo repository.PayrollRepository,
 	componentRepo repository.ComponentRepository,
 	settingsRepo repository.CompanySettingsRepository,
-	audit *hrservice.AuditService,
+	audit *a.AuditService,
 	logger *zap.Logger,
 ) EmployeeFineService {
 	return &employeeFineService{

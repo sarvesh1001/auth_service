@@ -8,7 +8,7 @@ import (
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	a "auth-service/internal/hr/service" // audit service
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 
 	"github.com/google/uuid"

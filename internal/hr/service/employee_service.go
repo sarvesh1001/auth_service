@@ -3,6 +3,7 @@ package service
 import (
 	"auth-service/internal/hr/models/employee"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"fmt"
@@ -20,7 +21,7 @@ import (
 // EmployeeService handles employee write operations with audit logging
 type EmployeeService struct {
 	employeeRepo      repository.EmployeeRepository
-	auditService      *AuditService
+	auditService      *a.AuditService
 	documentStorage   DocumentStorage
 	logger            *zap.Logger
 	maxDocumentSizeMB int
@@ -34,7 +35,7 @@ type EmployeeServiceConfig struct {
 
 func NewEmployeeService(
 	employeeRepo repository.EmployeeRepository,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	config EmployeeServiceConfig,
 	logger *zap.Logger,
 ) *EmployeeService {

@@ -3,6 +3,7 @@ package service
 import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"errors"
@@ -99,7 +100,7 @@ type attendanceDeviceEnrollmentService struct {
 	enrollmentRepo repository.DeviceEnrollmentRepository
 	deviceRepo     repository.AttendanceDeviceRepository
 	attendanceRepo repository.AttendanceRepository
-	auditService   *AuditService
+	auditService   *a.AuditService
 	logger         *zap.Logger
 }
 
@@ -107,7 +108,7 @@ func NewAttendanceDeviceEnrollmentService(
 	enrollmentRepo repository.DeviceEnrollmentRepository,
 	deviceRepo repository.AttendanceDeviceRepository,
 	attendanceRepo repository.AttendanceRepository,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) AttendanceDeviceEnrollmentService {
 	return &attendanceDeviceEnrollmentService{

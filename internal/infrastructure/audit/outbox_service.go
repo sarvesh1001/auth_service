@@ -1,4 +1,4 @@
-package service
+package audit
 
 import (
 	"context"
@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"time"
 
-	"auth-service/internal/client"
-	"auth-service/internal/models"
-	"auth-service/internal/util"
-
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
 	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/util"
 )
 
 type AuditOutboxService struct {
@@ -127,7 +126,7 @@ func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
 			continue
 		}
 
-		auditEvent := models.AuditLogEvent{
+		auditEvent := AuditLogEvent{
 			EventID:     outboxID,
 			AuditID:     auditID,
 			Timestamp:   createdAt,

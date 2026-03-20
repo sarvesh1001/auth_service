@@ -4,6 +4,7 @@ package handler
 import (
 	"auth-service/internal/hr/models/workcenter"
 	"auth-service/internal/hr/service"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"encoding/json"
@@ -21,14 +22,14 @@ import (
 type WorkCenterHandler struct {
 	workCenterService      *service.WorkCenterService
 	workCenterQueryService *service.WorkCenterQueryService
-	auditService           *service.AuditService
+	auditService           *a.AuditService
 	logger                 *zap.Logger
 }
 
 func NewWorkCenterHandler(
 	workCenterService *service.WorkCenterService,
 	workCenterQueryService *service.WorkCenterQueryService,
-	auditService *service.AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) *WorkCenterHandler {
 	return &WorkCenterHandler{

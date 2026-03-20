@@ -3,6 +3,7 @@ package handler
 import (
 	"auth-service/internal/hr/models/employee"
 	"auth-service/internal/hr/service"
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 	"context"
 	"encoding/json"
@@ -22,7 +23,7 @@ import (
 type EmployeeHandler struct {
 	employeeService      *service.EmployeeService
 	employeeQueryService *service.EmployeeQueryService
-	auditService         *service.AuditService
+	auditService         *a.AuditService
 	logger               *zap.Logger
 	maxDocumentSizeMB    int
 }
@@ -31,7 +32,7 @@ type EmployeeHandler struct {
 func NewEmployeeHandler(
 	employeeService *service.EmployeeService,
 	employeeQueryService *service.EmployeeQueryService,
-	auditService *service.AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 	maxDocumentSizeMB int,
 ) *EmployeeHandler {

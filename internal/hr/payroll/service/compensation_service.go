@@ -9,7 +9,7 @@ import (
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
-	"auth-service/internal/hr/service" // audit service (adjust path if needed)
+	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/util"
 
 	"github.com/google/uuid"
@@ -126,7 +126,7 @@ type CompensationService interface {
 type compensationService struct {
 	compRepo    repository.CompensationRepository
 	payrollRepo repository.PayrollRepository // ONLY for attendance and component metadata
-	audit       *service.AuditService
+	audit       *a.AuditService
 	logger      *zap.Logger
 }
 
@@ -134,7 +134,7 @@ type compensationService struct {
 func NewCompensationService(
 	compRepo repository.CompensationRepository,
 	payrollRepo repository.PayrollRepository,
-	audit *service.AuditService,
+	audit *a.AuditService,
 	logger *zap.Logger,
 ) CompensationService {
 	return &compensationService{

@@ -3,6 +3,7 @@ package handler
 import (
 	"auth-service/internal/hr/models/attendance"
 	"auth-service/internal/hr/service"
+	"auth-service/internal/infrastructure/audit"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,14 +19,14 @@ import (
 type AttendanceAdminHandler struct {
 	adminService service.AttendanceAdminService
 	queryService service.AttendanceQueryService
-	auditService *service.AuditService
+	auditService *audit.AuditService
 	logger       *zap.Logger
 }
 
 func NewAttendanceAdminHandler(
 	adminService service.AttendanceAdminService,
 	queryService service.AttendanceQueryService,
-	auditService *service.AuditService,
+	auditService *audit.AuditService,
 	logger *zap.Logger,
 ) *AttendanceAdminHandler {
 	return &AttendanceAdminHandler{

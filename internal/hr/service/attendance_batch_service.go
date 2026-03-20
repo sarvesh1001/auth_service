@@ -1,6 +1,7 @@
 package service
 
 import (
+	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"time"
 
@@ -38,7 +39,7 @@ type attendanceBatchService struct {
 	attendanceAdmin AttendanceAdminService
 	omService       AttendanceOMService
 	resolution      AttendanceResolutionService
-	auditService    *AuditService
+	auditService    *a.AuditService
 	logger          *zap.Logger
 }
 
@@ -46,7 +47,7 @@ func NewAttendanceBatchService(
 	attendanceAdmin AttendanceAdminService,
 	omService AttendanceOMService,
 	resolution AttendanceResolutionService,
-	auditService *AuditService,
+	auditService *a.AuditService,
 	logger *zap.Logger,
 ) AttendanceBatchService {
 	return &attendanceBatchService{

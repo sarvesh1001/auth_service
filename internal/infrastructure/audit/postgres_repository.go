@@ -1,9 +1,6 @@
-package repository
+package audit
 
 import (
-	"auth-service/internal/client"
-	"auth-service/internal/hr/models"
-	"auth-service/internal/util"
 	"context"
 	"database/sql"
 	"fmt"
@@ -13,6 +10,9 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/util"
 )
 
 // AuditRepositoryImpl handles PostgreSQL audit log operations
@@ -42,7 +42,7 @@ func NewAuditRepository(postgresClient *client.PostgresClient, logger *zap.Logge
 
 // CreateAuditLog creates a single audit log entry
 // IMPORTANT: This is append-only. Once created, logs cannot be modified.
-func (r *AuditRepositoryImpl) CreateAuditLog(ctx context.Context, log *models.AuditLog) error {
+func (r *AuditRepositoryImpl) CreateAuditLog(ctx context.Context, log *AuditLog) error {
 	startTime := time.Now()
 
 	query := `
@@ -106,7 +106,7 @@ func (r *AuditRepositoryImpl) CreateAuditLog(ctx context.Context, log *models.Au
 }
 
 // CreateAuditLogBatch creates multiple audit log entries in a single transaction
-func (r *AuditRepositoryImpl) CreateAuditLogBatch(ctx context.Context, logs []*models.AuditLog) error {
+func (r *AuditRepositoryImpl) CreateAuditLogBatch(ctx context.Context, logs []*AuditLog) error {
 	if len(logs) == 0 {
 		return nil
 	}
@@ -185,7 +185,7 @@ func (r *AuditRepositoryImpl) CreateAuditLogBatch(ctx context.Context, logs []*m
 // ============================================================================
 
 // GetAuditLogByID retrieves a single audit log by its unique ID
-func (r *AuditRepositoryImpl) GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*models.AuditLog, error) {
+func (r *AuditRepositoryImpl) GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*AuditLog, error) {
 	stmt, ok := r.getStmt("get_audit_log_by_id")
 	if !ok {
 		return nil, fmt.Errorf("prepared statement not found: get_audit_log_by_id")
@@ -208,7 +208,7 @@ func (r *AuditRepositoryImpl) GetAuditLogByID(ctx context.Context, auditID uuid.
 func (r *AuditRepositoryImpl) ListAuditLogs(
 	ctx context.Context,
 	filter AuditLogFilter,
-) ([]*models.AuditLog, int, error) {
+) ([]*AuditLog, int, error) {
 	// Build WHERE clause and parameters
 	conditions := []string{}
 	params := []interface{}{}
@@ -259,7 +259,7 @@ func (r *AuditRepositoryImpl) ListAuditLogs(
 
 	// If no records match, return early
 	if totalCount == 0 {
-		return []*models.AuditLog{}, 0, nil
+		return []*AuditLog{}, 0, nil
 	}
 
 	// Fetch data with pagination
@@ -279,7 +279,7 @@ func (r *AuditRepositoryImpl) ListAuditLogs(
 	}
 	defer rows.Close()
 
-	logs := make([]*models.AuditLog, 0, filter.Limit)
+	logs := make([]*AuditLog, 0, filter.Limit)
 	for rows.Next() {
 		auditLog, err := r.scanAuditLog(rows)
 		if err != nil {
@@ -315,8 +315,8 @@ func (r *AuditRepositoryImpl) HealthCheck(ctx context.Context) error {
 // ============================================================================
 
 // scanAuditLog scans a row from the database into an AuditLog struct
-func (r *AuditRepositoryImpl) scanAuditLog(rows *sql.Rows) (*models.AuditLog, error) {
-	var log models.AuditLog
+func (r *AuditRepositoryImpl) scanAuditLog(rows *sql.Rows) (*AuditLog, error) {
+	var log AuditLog
 	var companyID, entityID, actorID sql.NullString
 	var beforeState, afterState, metadata []byte
 

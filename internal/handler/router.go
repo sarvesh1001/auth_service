@@ -1,19 +1,19 @@
 package handler
 
 import (
-	"context"
-	"encoding/json"
-	"net/http"
-	"strings"
-	"time"
-
 	biometricHandler "auth-service/internal/hr/biometric/handler"
 	hrHandler "auth-service/internal/hr/handler"
 	leavehandler "auth-service/internal/hr/leave/handler"
 	middle "auth-service/internal/hr/middleware"
 	payrollhandler "auth-service/internal/hr/payroll/handler"
+	a "auth-service/internal/infrastructure/audit"
 	authMiddleware "auth-service/internal/middleware"
 	"auth-service/internal/service"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
@@ -27,7 +27,7 @@ func NewRouter(
 	adminHandler *AdminHandler,
 	authHandler *AuthHandler,
 	rbacHandler *RBACHandler,
-	auditHandler *hrHandler.AuditHandler,
+	auditHandler *a.AuditHandler,
 	employeeHandler *hrHandler.EmployeeHandler,
 	schedulingHandler *hrHandler.SchedulingHandler,
 	attendanceIngestHandler *hrHandler.AttendanceIngestHandler,
