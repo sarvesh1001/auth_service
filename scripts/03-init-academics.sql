@@ -1,10 +1,10 @@
 -- =====================================================
--- ACADEMICS SCHEMA (FIXED & OPTIMIZED)
+-- ACADEMICS SCHEMA (FULLY AUDITED & SOFT‑DELETED)
 -- =====================================================
 CREATE SCHEMA IF NOT EXISTS academics;
 
 -- =====================================================
--- ACADEMIC STRUCTURE
+-- ACADEMIC STRUCTURE (MUST HAVE: ALL 3 COLUMNS)
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS academics.academic_year (
@@ -16,10 +16,19 @@ CREATE TABLE IF NOT EXISTS academics.academic_year (
     is_current       BOOLEAN NOT NULL DEFAULT false,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, name),
-    UNIQUE (company_id, start_date, end_date),
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ,
     CONSTRAINT check_academic_year_dates CHECK (start_date < end_date)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_academic_year_unique_active 
+    ON academics.academic_year(company_id, name) 
+    WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_academic_year_dates_active 
+    ON academics.academic_year(company_id, start_date, end_date) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.term (
     term_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -30,9 +39,15 @@ CREATE TABLE IF NOT EXISTS academics.term (
     is_current       BOOLEAN NOT NULL DEFAULT false,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (academic_year_id, name),
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ,
     CONSTRAINT check_term_dates CHECK (start_date < end_date)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_term_unique_active 
+    ON academics.term(academic_year_id, name) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.course (
     course_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -44,8 +59,14 @@ CREATE TABLE IF NOT EXISTS academics.course (
     is_active   BOOLEAN NOT NULL DEFAULT true,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, code)
+    created_by  UUID REFERENCES users(user_id),
+    updated_by  UUID REFERENCES users(user_id),
+    deleted_at  TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_course_code_active 
+    ON academics.course(company_id, code) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.section (
     section_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -56,8 +77,14 @@ CREATE TABLE IF NOT EXISTS academics.section (
     is_active       BOOLEAN NOT NULL DEFAULT true,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (course_id, term_id, name)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_section_unique_active 
+    ON academics.section(course_id, term_id, name) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.subject (
     subject_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -69,14 +96,21 @@ CREATE TABLE IF NOT EXISTS academics.subject (
     is_active       BOOLEAN NOT NULL DEFAULT true,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, code)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subject_code_active 
+    ON academics.subject(company_id, code) 
+    WHERE deleted_at IS NULL;
+
+-- subject_course_mapping (NO AUDIT COLUMNS)
 CREATE TABLE IF NOT EXISTS academics.subject_course_mapping (
     mapping_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     course_id       UUID NOT NULL REFERENCES academics.course(course_id) ON DELETE CASCADE,
     subject_id      UUID NOT NULL REFERENCES academics.subject(subject_id) ON DELETE CASCADE,
-    term_number     INTEGER, -- e.g., semester 1,2,3...
+    term_number     INTEGER,
     is_compulsory   BOOLEAN NOT NULL DEFAULT true,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -87,26 +121,69 @@ CREATE TABLE IF NOT EXISTS academics.subject_course_mapping (
 -- STUDENT DOMAIN
 -- =====================================================
 
+-- UPDATED students table with encrypted fields
 CREATE TABLE IF NOT EXISTS academics.students (
     student_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id      UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
-    user_id         UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+
+    first_name      VARCHAR(100) NOT NULL,
+    last_name       VARCHAR(100),
+
     admission_no    VARCHAR(50),
+
+    -- Email (encrypted)
+    email                TEXT,
+    email_dek            TEXT,
+    email_key_id         TEXT,
+
+    -- Student's own phone (encrypted)
+    phone                TEXT,
+    phone_dek            TEXT,
+    phone_key_id         TEXT,
+
     date_of_birth   DATE,
     gender          VARCHAR(20),
     blood_group     VARCHAR(5),
     nationality     VARCHAR(50),
     religion        VARCHAR(50),
     category        VARCHAR(50),
-    aadhar_no       VARCHAR(20),
-    emergency_contact_name VARCHAR(100),
-    emergency_contact_phone VARCHAR(20),
-    medical_conditions TEXT,
-    status          VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive','alumni','transferred')),
+
+    -- Aadhar (encrypted)
+    aadhar_no            TEXT,
+    aadhar_no_dek        TEXT,
+    aadhar_no_key_id     TEXT,
+
+    -- Emergency contact (encrypted)
+    emergency_contact_name  VARCHAR(100),
+    emergency_contact_phone TEXT,
+    emergency_contact_phone_dek TEXT,
+    emergency_contact_phone_key_id TEXT,
+
+    medical_conditions      TEXT,
+
+    status          VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','inactive','alumni','transferred')),
+
+    version         INT NOT NULL DEFAULT 0,
+
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, admission_no)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
+
+-- Indexes for students (new and updated)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_admission_no_active 
+    ON academics.students(company_id, admission_no) 
+    WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_email_active
+    ON academics.students(company_id, email)
+    WHERE deleted_at IS NULL AND email IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_students_company ON academics.students(company_id);
+CREATE INDEX IF NOT EXISTS idx_students_not_deleted ON academics.students(deleted_at) WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.student_guardians (
     guardian_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -128,11 +205,12 @@ CREATE TABLE IF NOT EXISTS academics.admissions (
     student_id      UUID NOT NULL REFERENCES academics.students(student_id) ON DELETE CASCADE,
     academic_year_id UUID NOT NULL REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
     admission_date  DATE NOT NULL,
-    class_applied_for VARCHAR(50), -- could be course_id but maybe text
+    class_applied_for VARCHAR(50),
     admission_status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (admission_status IN ('pending','approved','rejected')),
     remarks         TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.enrollments (
@@ -145,6 +223,7 @@ CREATE TABLE IF NOT EXISTS academics.enrollments (
     status          VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','withdrawn')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     UNIQUE (student_id, academic_year_id)
 );
 
@@ -158,7 +237,8 @@ CREATE TABLE IF NOT EXISTS academics.student_documents (
     verified        BOOLEAN DEFAULT false,
     verified_by     UUID REFERENCES users(user_id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.student_previous_education (
@@ -190,8 +270,14 @@ CREATE TABLE IF NOT EXISTS academics.teachers (
     status          VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive','resigned')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, employee_code)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_teachers_employee_code_active 
+    ON academics.teachers(company_id, employee_code) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.teacher_subjects (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -214,11 +300,12 @@ CREATE TABLE IF NOT EXISTS academics.teacher_sections (
 CREATE TABLE IF NOT EXISTS academics.teacher_schedule_preferences (
     preference_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     teacher_id      UUID NOT NULL REFERENCES academics.teachers(teacher_id) ON DELETE CASCADE,
-    day_of_week     INTEGER NOT NULL CHECK (day_of_week BETWEEN 0 AND 6), -- 0=Sunday,6=Saturday
+    day_of_week     INTEGER NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
     preferred_start_time TIME,
     preferred_end_time TIME,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id)
 );
 
 -- =====================================================
@@ -236,8 +323,14 @@ CREATE TABLE IF NOT EXISTS academics.rooms (
     is_active       BOOLEAN NOT NULL DEFAULT true,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, room_code)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_code_active 
+    ON academics.rooms(company_id, room_code) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.timetables (
     timetable_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -250,8 +343,14 @@ CREATE TABLE IF NOT EXISTS academics.timetables (
     is_active       BOOLEAN NOT NULL DEFAULT true,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (term_id, section_id, version)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_timetables_unique_active 
+    ON academics.timetables(term_id, section_id, version) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.timetable_slots (
     slot_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -262,6 +361,7 @@ CREATE TABLE IF NOT EXISTS academics.timetable_slots (
     slot_number     INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     UNIQUE (timetable_id, day_of_week, start_time)
 );
 
@@ -272,7 +372,8 @@ CREATE TABLE IF NOT EXISTS academics.timetable_entries (
     teacher_id      UUID NOT NULL REFERENCES academics.teachers(teacher_id) ON DELETE CASCADE,
     room_id         UUID REFERENCES academics.rooms(room_id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.timetable_changes (
@@ -287,7 +388,7 @@ CREATE TABLE IF NOT EXISTS academics.timetable_changes (
 );
 
 -- =====================================================
--- ATTENDANCE (using enrollment_id)
+-- ATTENDANCE
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS academics.student_attendance (
@@ -299,6 +400,7 @@ CREATE TABLE IF NOT EXISTS academics.student_attendance (
     remarks         TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     UNIQUE (enrollment_id, attendance_date)
 );
 
@@ -332,6 +434,7 @@ CREATE TABLE IF NOT EXISTS academics.student_attendance_exemptions (
     approved_by     UUID REFERENCES users(user_id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     CONSTRAINT check_dates CHECK (from_date <= to_date)
 );
 
@@ -351,7 +454,10 @@ CREATE TABLE IF NOT EXISTS academics.assignments (
     attachment_url  TEXT,
     is_published    BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS academics.assignment_submissions (
@@ -368,6 +474,7 @@ CREATE TABLE IF NOT EXISTS academics.assignment_submissions (
     graded_at       TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     UNIQUE (assignment_id, student_id)
 );
 
@@ -378,7 +485,8 @@ CREATE TABLE IF NOT EXISTS academics.assignment_grades (
     graded_by       UUID NOT NULL REFERENCES users(user_id),
     graded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     remarks         TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.assignment_comments (
@@ -386,11 +494,12 @@ CREATE TABLE IF NOT EXISTS academics.assignment_comments (
     submission_id   UUID NOT NULL REFERENCES academics.assignment_submissions(submission_id) ON DELETE CASCADE,
     comment_by      UUID NOT NULL REFERENCES users(user_id),
     comment         TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id)
 );
 
 -- =====================================================
--- EXAMS (using enrollment_id)
+-- EXAMS
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS academics.exams (
@@ -403,7 +512,10 @@ CREATE TABLE IF NOT EXISTS academics.exams (
     description     TEXT,
     is_active       BOOLEAN NOT NULL DEFAULT true,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS academics.exam_schedules (
@@ -418,6 +530,7 @@ CREATE TABLE IF NOT EXISTS academics.exam_schedules (
     passing_marks   NUMERIC(6,2),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     UNIQUE (exam_id, subject_id)
 );
 
@@ -433,6 +546,7 @@ CREATE TABLE IF NOT EXISTS academics.exam_results (
     entered_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID REFERENCES users(user_id),
     UNIQUE (exam_id, enrollment_id, subject_id)
 );
 
@@ -455,8 +569,14 @@ CREATE TABLE IF NOT EXISTS academics.grading_policies (
     is_default      BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, policy_name)
+    created_by      UUID REFERENCES users(user_id),
+    updated_by      UUID REFERENCES users(user_id),
+    deleted_at      TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grading_policies_name_active 
+    ON academics.grading_policies(company_id, policy_name) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.grade_boundaries (
     boundary_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -483,6 +603,9 @@ CREATE TABLE IF NOT EXISTS academics.fee_structures (
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ,
     UNIQUE (academic_year_id, course_id, section_id, fee_structure_name)
 );
 
@@ -494,7 +617,8 @@ CREATE TABLE IF NOT EXISTS academics.fee_structure_items (
     is_mandatory     BOOLEAN NOT NULL DEFAULT true,
     description      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.student_fee_invoices (
@@ -508,7 +632,8 @@ CREATE TABLE IF NOT EXISTS academics.student_fee_invoices (
     balance          NUMERIC(12,2) GENERATED ALWAYS AS (total_amount - paid_amount) STORED,
     status           VARCHAR(20) NOT NULL DEFAULT 'unpaid' CHECK (status IN ('unpaid','partial','paid','overdue','cancelled')),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.student_fee_invoice_items (
@@ -517,7 +642,8 @@ CREATE TABLE IF NOT EXISTS academics.student_fee_invoice_items (
     fee_head         VARCHAR(100) NOT NULL,
     amount           NUMERIC(12,2) NOT NULL,
     is_mandatory     BOOLEAN NOT NULL DEFAULT true,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.student_fee_payments (
@@ -530,7 +656,8 @@ CREATE TABLE IF NOT EXISTS academics.student_fee_payments (
     receipt_no       VARCHAR(50),
     remarks          TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.fee_discounts (
@@ -543,7 +670,8 @@ CREATE TABLE IF NOT EXISTS academics.fee_discounts (
     valid_from       DATE,
     valid_until      DATE,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.fee_penalties (
@@ -555,16 +683,18 @@ CREATE TABLE IF NOT EXISTS academics.fee_penalties (
     waived           BOOLEAN NOT NULL DEFAULT false,
     waived_by        UUID REFERENCES users(user_id),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.fee_receipts (
     receipt_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payment_id       UUID NOT NULL REFERENCES academics.student_fee_payments(payment_id) ON DELETE CASCADE,
     receipt_no       VARCHAR(50) UNIQUE NOT NULL,
-    receipt_data     JSONB, -- store receipt details as JSON
+    receipt_data     JSONB,
     generated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 -- =====================================================
@@ -578,8 +708,14 @@ CREATE TABLE IF NOT EXISTS academics.library_categories (
     description      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, category_name)
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lib_categories_name_active 
+    ON academics.library_categories(company_id, category_name) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.library_books (
     book_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -587,7 +723,7 @@ CREATE TABLE IF NOT EXISTS academics.library_books (
     category_id      UUID REFERENCES academics.library_categories(category_id) ON DELETE SET NULL,
     title            VARCHAR(255) NOT NULL,
     author           VARCHAR(255),
-    isbn             VARCHAR(20) UNIQUE,
+    isbn             VARCHAR(20),
     publisher        VARCHAR(255),
     edition          VARCHAR(50),
     language         VARCHAR(50),
@@ -595,8 +731,15 @@ CREATE TABLE IF NOT EXISTS academics.library_books (
     publication_year INTEGER,
     description      TEXT,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_lib_books_isbn_active 
+    ON academics.library_books(isbn) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.library_book_copies (
     copy_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -607,7 +750,8 @@ CREATE TABLE IF NOT EXISTS academics.library_book_copies (
     cost             NUMERIC(10,2),
     shelf_location   VARCHAR(50),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.library_issues (
@@ -620,7 +764,8 @@ CREATE TABLE IF NOT EXISTS academics.library_issues (
     status           VARCHAR(20) NOT NULL DEFAULT 'issued' CHECK (status IN ('issued','returned','overdue','lost')),
     issued_by        UUID REFERENCES users(user_id),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.library_returns (
@@ -630,7 +775,8 @@ CREATE TABLE IF NOT EXISTS academics.library_returns (
     fine_amount      NUMERIC(10,2) DEFAULT 0,
     remarks          TEXT,
     received_by      UUID REFERENCES users(user_id),
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.library_fines (
@@ -641,7 +787,8 @@ CREATE TABLE IF NOT EXISTS academics.library_fines (
     paid_date        DATE,
     payment_mode     VARCHAR(50),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 -- =====================================================
@@ -658,8 +805,14 @@ CREATE TABLE IF NOT EXISTS academics.transport_routes (
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (company_id, route_name)
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routes_name_active 
+    ON academics.transport_routes(company_id, route_name) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.transport_stops (
     stop_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -672,21 +825,29 @@ CREATE TABLE IF NOT EXISTS academics.transport_stops (
     drop_time        TIME,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
     UNIQUE (route_id, stop_order)
 );
 
 CREATE TABLE IF NOT EXISTS academics.transport_vehicles (
     vehicle_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id       UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
-    vehicle_no       VARCHAR(50) UNIQUE NOT NULL,
+    vehicle_no       VARCHAR(50) NOT NULL,
     vehicle_type     VARCHAR(50),
     capacity         INTEGER,
     insurance_expiry DATE,
     fitness_expiry   DATE,
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
+    deleted_at       TIMESTAMPTZ
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vehicles_no_active 
+    ON academics.transport_vehicles(company_id, vehicle_no) 
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.transport_driver_assignments (
     assignment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -698,7 +859,8 @@ CREATE TABLE IF NOT EXISTS academics.transport_driver_assignments (
     end_date         DATE,
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.student_transport_assignments (
@@ -713,11 +875,12 @@ CREATE TABLE IF NOT EXISTS academics.student_transport_assignments (
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
     UNIQUE (student_id, effective_from)
 );
 
 -- =====================================================
--- NOTIFICATIONS (FIXED)
+-- NOTIFICATIONS
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS academics.notifications (
@@ -728,8 +891,10 @@ CREATE TABLE IF NOT EXISTS academics.notifications (
     type             VARCHAR(50) NOT NULL CHECK (type IN ('info','warning','alert','event','announcement')),
     priority         VARCHAR(20) NOT NULL DEFAULT 'normal' CHECK (priority IN ('low','normal','high','urgent')),
     created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at       TIMESTAMPTZ
+    expires_at       TIMESTAMPTZ,
+    deleted_at       TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS academics.notification_targets (
@@ -737,7 +902,8 @@ CREATE TABLE IF NOT EXISTS academics.notification_targets (
     notification_id  UUID NOT NULL REFERENCES academics.notifications(notification_id) ON DELETE CASCADE,
     target_type      VARCHAR(50) NOT NULL CHECK (target_type IN ('student','teacher','section','course','company','user')),
     target_entity_id UUID NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS academics.notification_reads (
@@ -745,11 +911,13 @@ CREATE TABLE IF NOT EXISTS academics.notification_reads (
     notification_id  UUID NOT NULL REFERENCES academics.notifications(notification_id) ON DELETE CASCADE,
     user_id          UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
     read_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
     UNIQUE (notification_id, user_id)
 );
 
 -- =====================================================
--- ANALYTICS / REPORTING
+-- ANALYTICS / REPORTING (NO AUDIT COLUMNS)
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS academics.student_performance_summary (
@@ -836,39 +1004,46 @@ CREATE TABLE IF NOT EXISTS academics.fee_transaction_audit (
 );
 
 -- =====================================================
--- INDEXES (including new ones)
+-- INDEXES (including original ones and new soft‑delete filters)
 -- =====================================================
 
 -- academic_year
 CREATE INDEX IF NOT EXISTS idx_academic_year_company ON academics.academic_year(company_id);
 CREATE INDEX IF NOT EXISTS idx_academic_year_current ON academics.academic_year(is_current) WHERE is_current = true;
+CREATE INDEX IF NOT EXISTS idx_academic_year_not_deleted ON academics.academic_year(deleted_at) WHERE deleted_at IS NULL;
 
 -- term
 CREATE INDEX IF NOT EXISTS idx_term_academic_year ON academics.term(academic_year_id);
 CREATE INDEX IF NOT EXISTS idx_term_current ON academics.term(is_current) WHERE is_current = true;
+CREATE INDEX IF NOT EXISTS idx_term_not_deleted ON academics.term(deleted_at) WHERE deleted_at IS NULL;
 
 -- course
 CREATE INDEX IF NOT EXISTS idx_course_company ON academics.course(company_id);
 CREATE INDEX IF NOT EXISTS idx_course_code ON academics.course(code);
+CREATE INDEX IF NOT EXISTS idx_course_not_deleted ON academics.course(deleted_at) WHERE deleted_at IS NULL;
 
 -- section
 CREATE INDEX IF NOT EXISTS idx_section_course ON academics.section(course_id);
 CREATE INDEX IF NOT EXISTS idx_section_term ON academics.section(term_id);
 CREATE INDEX IF NOT EXISTS idx_section_active ON academics.section(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_section_not_deleted ON academics.section(deleted_at) WHERE deleted_at IS NULL;
 
 -- subject
 CREATE INDEX IF NOT EXISTS idx_subject_company ON academics.subject(company_id);
 CREATE INDEX IF NOT EXISTS idx_subject_code ON academics.subject(code);
+CREATE INDEX IF NOT EXISTS idx_subject_not_deleted ON academics.subject(deleted_at) WHERE deleted_at IS NULL;
 
 -- subject_course_mapping
 CREATE INDEX IF NOT EXISTS idx_scm_course ON academics.subject_course_mapping(course_id);
 CREATE INDEX IF NOT EXISTS idx_scm_subject ON academics.subject_course_mapping(subject_id);
 
--- students
+-- students (updated indexes: added unique filtered indexes, removed plain admission_no index)
 CREATE INDEX IF NOT EXISTS idx_students_company ON academics.students(company_id);
-CREATE INDEX IF NOT EXISTS idx_students_user ON academics.students(user_id);
-CREATE INDEX IF NOT EXISTS idx_students_admission_no ON academics.students(admission_no);
-CREATE INDEX IF NOT EXISTS idx_students_status ON academics.students(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_admission_no_active ON academics.students(company_id, admission_no) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_email_active ON academics.students(company_id, email) WHERE deleted_at IS NULL AND email IS NOT NULL;
+CREATE INDEX idx_students_status ON academics.students(company_id, status) WHERE deleted_at IS NULL;
+CREATE INDEX idx_students_name ON academics.students(company_id, first_name, last_name) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_students_not_deleted ON academics.students(deleted_at) WHERE deleted_at IS NULL;
 
 -- student_guardians
 CREATE INDEX IF NOT EXISTS idx_guardians_student ON academics.student_guardians(student_id);
@@ -899,6 +1074,7 @@ CREATE INDEX IF NOT EXISTS idx_teachers_company ON academics.teachers(company_id
 CREATE INDEX IF NOT EXISTS idx_teachers_user ON academics.teachers(user_id);
 CREATE INDEX IF NOT EXISTS idx_teachers_employee_code ON academics.teachers(employee_code);
 CREATE INDEX IF NOT EXISTS idx_teachers_status ON academics.teachers(status);
+CREATE INDEX IF NOT EXISTS idx_teachers_not_deleted ON academics.teachers(deleted_at) WHERE deleted_at IS NULL;
 
 -- teacher_subjects
 CREATE INDEX IF NOT EXISTS idx_teacher_subjects_teacher ON academics.teacher_subjects(teacher_id);
@@ -916,11 +1092,13 @@ CREATE INDEX IF NOT EXISTS idx_teacher_preferences_teacher ON academics.teacher_
 CREATE INDEX IF NOT EXISTS idx_rooms_company ON academics.rooms(company_id);
 CREATE INDEX IF NOT EXISTS idx_rooms_code ON academics.rooms(room_code);
 CREATE INDEX IF NOT EXISTS idx_rooms_active ON academics.rooms(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_rooms_not_deleted ON academics.rooms(deleted_at) WHERE deleted_at IS NULL;
 
 -- timetables
 CREATE INDEX IF NOT EXISTS idx_timetables_term ON academics.timetables(term_id);
 CREATE INDEX IF NOT EXISTS idx_timetables_section ON academics.timetables(section_id);
 CREATE INDEX IF NOT EXISTS idx_timetables_active ON academics.timetables(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_timetables_not_deleted ON academics.timetables(deleted_at) WHERE deleted_at IS NULL;
 
 -- timetable_slots
 CREATE INDEX IF NOT EXISTS idx_slots_timetable ON academics.timetable_slots(timetable_id);
@@ -955,6 +1133,7 @@ CREATE INDEX IF NOT EXISTS idx_assignments_section ON academics.assignments(sect
 CREATE INDEX IF NOT EXISTS idx_assignments_subject ON academics.assignments(subject_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_teacher ON academics.assignments(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_due_date ON academics.assignments(due_date);
+CREATE INDEX IF NOT EXISTS idx_assignments_not_deleted ON academics.assignments(deleted_at) WHERE deleted_at IS NULL;
 
 -- assignment_submissions
 CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON academics.assignment_submissions(assignment_id);
@@ -973,6 +1152,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_comment_by ON academics.assignment_comme
 CREATE INDEX IF NOT EXISTS idx_exams_year ON academics.exams(academic_year_id);
 CREATE INDEX IF NOT EXISTS idx_exams_term ON academics.exams(term_id);
 CREATE INDEX IF NOT EXISTS idx_exams_active ON academics.exams(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_exams_not_deleted ON academics.exams(deleted_at) WHERE deleted_at IS NULL;
 
 -- exam_schedules
 CREATE INDEX IF NOT EXISTS idx_schedules_exam ON academics.exam_schedules(exam_id);
@@ -992,6 +1172,7 @@ CREATE INDEX IF NOT EXISTS idx_exam_grades_exam ON academics.exam_grades(exam_id
 -- grading_policies
 CREATE INDEX IF NOT EXISTS idx_grading_policies_company ON academics.grading_policies(company_id);
 CREATE INDEX IF NOT EXISTS idx_grading_policies_default ON academics.grading_policies(is_default) WHERE is_default = true;
+CREATE INDEX IF NOT EXISTS idx_grading_policies_not_deleted ON academics.grading_policies(deleted_at) WHERE deleted_at IS NULL;
 
 -- grade_boundaries
 CREATE INDEX IF NOT EXISTS idx_boundaries_policy ON academics.grade_boundaries(policy_id);
@@ -1001,6 +1182,7 @@ CREATE INDEX IF NOT EXISTS idx_fee_structures_year ON academics.fee_structures(a
 CREATE INDEX IF NOT EXISTS idx_fee_structures_course ON academics.fee_structures(course_id);
 CREATE INDEX IF NOT EXISTS idx_fee_structures_section ON academics.fee_structures(section_id);
 CREATE INDEX IF NOT EXISTS idx_fee_structures_active ON academics.fee_structures(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_fee_structures_not_deleted ON academics.fee_structures(deleted_at) WHERE deleted_at IS NULL;
 
 -- fee_structure_items
 CREATE INDEX IF NOT EXISTS idx_fee_items_structure ON academics.fee_structure_items(fee_structure_id);
@@ -1032,6 +1214,7 @@ CREATE INDEX IF NOT EXISTS idx_receipts_no ON academics.fee_receipts(receipt_no)
 
 -- library_categories
 CREATE INDEX IF NOT EXISTS idx_lib_categories_company ON academics.library_categories(company_id);
+CREATE INDEX IF NOT EXISTS idx_lib_categories_not_deleted ON academics.library_categories(deleted_at) WHERE deleted_at IS NULL;
 
 -- library_books
 CREATE INDEX IF NOT EXISTS idx_lib_books_company ON academics.library_books(company_id);
@@ -1039,6 +1222,7 @@ CREATE INDEX IF NOT EXISTS idx_lib_books_category ON academics.library_books(cat
 CREATE INDEX IF NOT EXISTS idx_lib_books_title ON academics.library_books(title);
 CREATE INDEX IF NOT EXISTS idx_lib_books_author ON academics.library_books(author);
 CREATE INDEX IF NOT EXISTS idx_lib_books_isbn ON academics.library_books(isbn);
+CREATE INDEX IF NOT EXISTS idx_lib_books_not_deleted ON academics.library_books(deleted_at) WHERE deleted_at IS NULL;
 
 -- library_book_copies
 CREATE INDEX IF NOT EXISTS idx_lib_copies_book ON academics.library_book_copies(book_id);
@@ -1061,6 +1245,7 @@ CREATE INDEX IF NOT EXISTS idx_fines_paid ON academics.library_fines(paid) WHERE
 -- transport_routes
 CREATE INDEX IF NOT EXISTS idx_routes_company ON academics.transport_routes(company_id);
 CREATE INDEX IF NOT EXISTS idx_routes_active ON academics.transport_routes(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_routes_not_deleted ON academics.transport_routes(deleted_at) WHERE deleted_at IS NULL;
 
 -- transport_stops
 CREATE INDEX IF NOT EXISTS idx_stops_route ON academics.transport_stops(route_id);
@@ -1070,6 +1255,7 @@ CREATE INDEX IF NOT EXISTS idx_stops_order ON academics.transport_stops(route_id
 CREATE INDEX IF NOT EXISTS idx_vehicles_company ON academics.transport_vehicles(company_id);
 CREATE INDEX IF NOT EXISTS idx_vehicles_no ON academics.transport_vehicles(vehicle_no);
 CREATE INDEX IF NOT EXISTS idx_vehicles_active ON academics.transport_vehicles(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_vehicles_not_deleted ON academics.transport_vehicles(deleted_at) WHERE deleted_at IS NULL;
 
 -- transport_driver_assignments
 CREATE INDEX IF NOT EXISTS idx_driver_assignments_vehicle ON academics.transport_driver_assignments(vehicle_id);
@@ -1086,6 +1272,7 @@ CREATE INDEX IF NOT EXISTS idx_notifications_company ON academics.notifications(
 CREATE INDEX IF NOT EXISTS idx_notifications_type ON academics.notifications(type);
 CREATE INDEX IF NOT EXISTS idx_notifications_priority ON academics.notifications(priority);
 CREATE INDEX IF NOT EXISTS idx_notifications_created ON academics.notifications(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_not_deleted ON academics.notifications(deleted_at) WHERE deleted_at IS NULL;
 
 -- notification_targets
 CREATE INDEX IF NOT EXISTS idx_targets_notification ON academics.notification_targets(notification_id);
@@ -1126,3 +1313,115 @@ CREATE INDEX IF NOT EXISTS idx_result_audit_changed_by ON academics.exam_result_
 -- fee_transaction_audit
 CREATE INDEX IF NOT EXISTS idx_fee_audit_payment ON academics.fee_transaction_audit(payment_id);
 CREATE INDEX IF NOT EXISTS idx_fee_audit_changed_by ON academics.fee_transaction_audit(changed_by);
+
+CREATE INDEX idx_academic_year_company_dates ON academics.academic_year(company_id, start_date, end_date) WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS academics.idempotency_keys (
+    key          VARCHAR(255) PRIMARY KEY,
+    response     JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION academics.student_search(
+    search_query TEXT,
+    company_id_param UUID,
+    search_type TEXT DEFAULT 'autocomplete',
+    filter_status TEXT DEFAULT NULL,
+    limit_count INTEGER DEFAULT 50,
+    offset_count INTEGER DEFAULT 0
+)
+RETURNS TABLE(
+    student_id UUID,
+    first_name VARCHAR,
+    last_name VARCHAR,
+    admission_no VARCHAR,
+    status VARCHAR,
+    date_of_birth DATE,
+    created_at TIMESTAMPTZ,
+    relevance_score FLOAT,
+    match_type TEXT
+) AS $$
+BEGIN
+
+    -- 🔹 AUTOCOMPLETE / SHORT SEARCH
+    IF search_type = 'autocomplete' OR LENGTH(search_query) < 3 THEN
+        RETURN QUERY
+        SELECT
+            s.student_id,
+            s.first_name,
+            s.last_name,
+            s.admission_no,
+            s.status,
+            s.date_of_birth,
+            s.created_at,
+            GREATEST(
+                similarity(s.first_name, search_query),
+                similarity(s.last_name, search_query),
+                similarity(s.admission_no, search_query)
+            )::FLOAT AS relevance_score,
+            'autocomplete'::TEXT AS match_type
+        FROM academics.students s
+        WHERE s.company_id = company_id_param
+          AND s.deleted_at IS NULL
+          AND (filter_status IS NULL OR s.status = filter_status)
+          AND (
+                s.first_name ILIKE '%' || search_query || '%'
+             OR s.last_name ILIKE '%' || search_query || '%'
+             OR s.admission_no ILIKE '%' || search_query || '%'
+          )
+        ORDER BY relevance_score DESC, s.first_name ASC
+        LIMIT limit_count OFFSET offset_count;
+
+    -- 🔹 FULL TEXT (ADVANCED)
+    ELSE
+        RETURN QUERY
+        SELECT
+            s.student_id,
+            s.first_name,
+            s.last_name,
+            s.admission_no,
+            s.status,
+            s.date_of_birth,
+            s.created_at,
+            ts_rank(
+                to_tsvector('simple', s.first_name || ' ' || s.last_name || ' ' || COALESCE(s.admission_no,'')),
+                plainto_tsquery('simple', search_query)
+            )::FLOAT AS relevance_score,
+            'fulltext'::TEXT AS match_type
+        FROM academics.students s
+        WHERE s.company_id = company_id_param
+          AND s.deleted_at IS NULL
+          AND (filter_status IS NULL OR s.status = filter_status)
+          AND to_tsvector('simple', s.first_name || ' ' || s.last_name || ' ' || COALESCE(s.admission_no,'')) 
+              @@ plainto_tsquery('simple', search_query)
+        ORDER BY relevance_score DESC
+        LIMIT limit_count OFFSET offset_count;
+    END IF;
+
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE INDEX idx_students_search_tsv
+ON academics.students
+USING GIN (
+    to_tsvector('simple', first_name || ' ' || last_name || ' ' || COALESCE(admission_no,''))
+)
+WHERE deleted_at IS NULL;
+
+CREATE INDEX idx_students_name_trgm ON academics.students USING GIN (first_name gin_trgm_ops, last_name gin_trgm_ops);
+
+CREATE TABLE IF NOT EXISTS outbox.events (
+    event_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type VARCHAR(100) NOT NULL,
+    aggregate_id   UUID,
+    event_type     VARCHAR(100) NOT NULL,
+    payload        JSONB NOT NULL,
+    headers        JSONB,
+    status         VARCHAR(20) NOT NULL DEFAULT 'pending',
+    retry_count    INT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at   TIMESTAMPTZ
+);
+
+CREATE INDEX idx_outbox_status ON outbox.events(status);
+CREATE INDEX idx_outbox_created ON outbox.events(created_at);

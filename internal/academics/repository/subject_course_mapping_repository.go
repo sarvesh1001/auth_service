@@ -5,50 +5,50 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"auth-service/internal/academics/models"
-	"auth-service/internal/client"
 	"auth-service/internal/util"
 )
 
 // SubjectCourseMappingRepository defines methods for subject_course_mapping table.
+// This table does not have audit or soft delete columns, so no changes for those.
 type SubjectCourseMappingRepository interface {
-	Create(ctx context.Context, e *models.SubjectCourseMapping) error
-	BulkCreate(ctx context.Context, e []*models.SubjectCourseMapping) error
-	GetByID(ctx context.Context, id uuid.UUID) (*models.SubjectCourseMapping, error)
-	ListByCourse(ctx context.Context, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error)
-	ListBySubject(ctx context.Context, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error)
-	ListByCourseAndTerm(ctx context.Context, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error)
-	Exists(ctx context.Context, courseID, subjectID uuid.UUID, termNumber int) (bool, error)
-	Delete(ctx context.Context, id uuid.UUID) error
-	DeleteByCourse(ctx context.Context, courseID uuid.UUID) error
+	Create(ctx context.Context, db DBTX, e *models.SubjectCourseMapping) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.SubjectCourseMapping) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error)
+	ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error)
+	ListBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error)
+	ListByCourseAndTerm(ctx context.Context, db DBTX, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error)
+	Exists(ctx context.Context, db DBTX, courseID, subjectID uuid.UUID, termNumber int) (bool, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID) error
+	DeleteByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) error
+	ListByCourseIDsAndTermNumbers(ctx context.Context, db DBTX, courseIDs []uuid.UUID, termNumbers []int) ([]*models.SubjectCourseMapping, error)
 }
 
 type subjectCourseMappingRepository struct {
-	db     *client.PostgresClient
 	logger *zap.Logger
 }
 
 // NewSubjectCourseMappingRepository creates a new mapping repository.
-func NewSubjectCourseMappingRepository(db *client.PostgresClient, logger *zap.Logger) SubjectCourseMappingRepository {
+func NewSubjectCourseMappingRepository(logger *zap.Logger) SubjectCourseMappingRepository {
 	return &subjectCourseMappingRepository{
-		db:     db,
 		logger: logger.Named("subject_course_mapping_repo"),
 	}
 }
 
 // Create inserts a new mapping.
-func (r *subjectCourseMappingRepository) Create(ctx context.Context, e *models.SubjectCourseMapping) error {
+func (r *subjectCourseMappingRepository) Create(ctx context.Context, db DBTX, e *models.SubjectCourseMapping) error {
 	query := `
 		INSERT INTO academics.subject_course_mapping (
 			course_id, subject_id, term_number, is_compulsory, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, NOW(), NOW())
 		RETURNING mapping_id, created_at, updated_at
 	`
-	err := r.db.QueryRow(ctx, query,
+	err := db.QueryRowContext(ctx, query,
 		e.CourseID, e.SubjectID, e.TermNumber, e.IsCompulsory,
 	).Scan(&e.MappingID, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
@@ -61,16 +61,22 @@ func (r *subjectCourseMappingRepository) Create(ctx context.Context, e *models.S
 	return nil
 }
 
-// BulkCreate inserts multiple mappings.
-func (r *subjectCourseMappingRepository) BulkCreate(ctx context.Context, e []*models.SubjectCourseMapping) error {
+// BulkCreate inserts multiple mappings with proper transaction handling.
+func (r *subjectCourseMappingRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.SubjectCourseMapping) error {
 	if len(e) == 0 {
 		return nil
 	}
-	tx, err := r.db.BeginTx(ctx, nil)
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return err
 	}
-	defer tx.Rollback()
+	needRollback := isOwner
+	defer func() {
+		if needRollback {
+			_ = tx.Rollback()
+		}
+	}()
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO academics.subject_course_mapping (
@@ -95,14 +101,18 @@ func (r *subjectCourseMappingRepository) BulkCreate(ctx context.Context, e []*mo
 			return fmt.Errorf("bulk create mapping row: %w", err)
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
+
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		needRollback = false
 	}
 	return nil
 }
 
 // GetByID retrieves a mapping by its ID.
-func (r *subjectCourseMappingRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.SubjectCourseMapping, error) {
+func (r *subjectCourseMappingRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error) {
 	query := `
 		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
 		FROM academics.subject_course_mapping
@@ -110,7 +120,7 @@ func (r *subjectCourseMappingRepository) GetByID(ctx context.Context, id uuid.UU
 	`
 	var m models.SubjectCourseMapping
 	var termNumber sql.NullInt64
-	err := r.db.QueryRow(ctx, query, id).Scan(
+	err := db.QueryRowContext(ctx, query, id).Scan(
 		&m.MappingID, &m.CourseID, &m.SubjectID, &termNumber,
 		&m.IsCompulsory, &m.CreatedAt, &m.UpdatedAt,
 	)
@@ -130,14 +140,14 @@ func (r *subjectCourseMappingRepository) GetByID(ctx context.Context, id uuid.UU
 }
 
 // ListByCourse returns all mappings for a given course.
-func (r *subjectCourseMappingRepository) ListByCourse(ctx context.Context, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error) {
+func (r *subjectCourseMappingRepository) ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error) {
 	query := `
 		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
 		FROM academics.subject_course_mapping
 		WHERE course_id = $1
 		ORDER BY term_number NULLS LAST, created_at
 	`
-	rows, err := r.db.Query(ctx, query, courseID)
+	rows, err := db.QueryContext(ctx, query, courseID)
 	if err != nil {
 		r.logger.Error("failed to list mappings by course",
 			util.String("course_id", courseID.String()),
@@ -149,14 +159,14 @@ func (r *subjectCourseMappingRepository) ListByCourse(ctx context.Context, cours
 }
 
 // ListBySubject returns all mappings for a given subject.
-func (r *subjectCourseMappingRepository) ListBySubject(ctx context.Context, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error) {
+func (r *subjectCourseMappingRepository) ListBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error) {
 	query := `
 		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
 		FROM academics.subject_course_mapping
 		WHERE subject_id = $1
 		ORDER BY term_number NULLS LAST, created_at
 	`
-	rows, err := r.db.Query(ctx, query, subjectID)
+	rows, err := db.QueryContext(ctx, query, subjectID)
 	if err != nil {
 		r.logger.Error("failed to list mappings by subject",
 			util.String("subject_id", subjectID.String()),
@@ -168,14 +178,14 @@ func (r *subjectCourseMappingRepository) ListBySubject(ctx context.Context, subj
 }
 
 // ListByCourseAndTerm returns mappings for a course and specific term.
-func (r *subjectCourseMappingRepository) ListByCourseAndTerm(ctx context.Context, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error) {
+func (r *subjectCourseMappingRepository) ListByCourseAndTerm(ctx context.Context, db DBTX, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error) {
 	query := `
 		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
 		FROM academics.subject_course_mapping
 		WHERE course_id = $1 AND term_number = $2
 		ORDER BY created_at
 	`
-	rows, err := r.db.Query(ctx, query, courseID, termNumber)
+	rows, err := db.QueryContext(ctx, query, courseID, termNumber)
 	if err != nil {
 		r.logger.Error("failed to list mappings by course and term",
 			util.String("course_id", courseID.String()),
@@ -188,10 +198,10 @@ func (r *subjectCourseMappingRepository) ListByCourseAndTerm(ctx context.Context
 }
 
 // Exists checks if a mapping exists.
-func (r *subjectCourseMappingRepository) Exists(ctx context.Context, courseID, subjectID uuid.UUID, termNumber int) (bool, error) {
+func (r *subjectCourseMappingRepository) Exists(ctx context.Context, db DBTX, courseID, subjectID uuid.UUID, termNumber int) (bool, error) {
 	query := `SELECT EXISTS(SELECT 1 FROM academics.subject_course_mapping WHERE course_id = $1 AND subject_id = $2 AND term_number = $3)`
 	var exists bool
-	err := r.db.QueryRow(ctx, query, courseID, subjectID, termNumber).Scan(&exists)
+	err := db.QueryRowContext(ctx, query, courseID, subjectID, termNumber).Scan(&exists)
 	if err != nil {
 		r.logger.Error("failed to check mapping existence",
 			util.String("course_id", courseID.String()),
@@ -204,22 +214,26 @@ func (r *subjectCourseMappingRepository) Exists(ctx context.Context, courseID, s
 }
 
 // Delete removes a mapping.
-func (r *subjectCourseMappingRepository) Delete(ctx context.Context, id uuid.UUID) error {
+func (r *subjectCourseMappingRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID) error {
 	query := `DELETE FROM academics.subject_course_mapping WHERE mapping_id = $1`
-	_, err := r.db.Exec(ctx, query, id)
+	result, err := db.ExecContext(ctx, query, id)
 	if err != nil {
 		r.logger.Error("failed to delete mapping",
 			util.String("id", id.String()),
 			util.ErrorField(err))
 		return fmt.Errorf("delete mapping: %w", err)
 	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("mapping %s not found", id)
+	}
 	return nil
 }
 
 // DeleteByCourse removes all mappings for a course.
-func (r *subjectCourseMappingRepository) DeleteByCourse(ctx context.Context, courseID uuid.UUID) error {
+func (r *subjectCourseMappingRepository) DeleteByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) error {
 	query := `DELETE FROM academics.subject_course_mapping WHERE course_id = $1`
-	_, err := r.db.Exec(ctx, query, courseID)
+	_, err := db.ExecContext(ctx, query, courseID)
 	if err != nil {
 		r.logger.Error("failed to delete mappings by course",
 			util.String("course_id", courseID.String()),
@@ -250,4 +264,42 @@ func (r *subjectCourseMappingRepository) scanMappings(rows *sql.Rows) ([]*models
 		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
 	return result, nil
+}
+
+// ListByCourseIDsAndTermNumbers retrieves all mappings for the given course IDs and term numbers.
+func (r *subjectCourseMappingRepository) ListByCourseIDsAndTermNumbers(ctx context.Context, db DBTX, courseIDs []uuid.UUID, termNumbers []int) ([]*models.SubjectCourseMapping, error) {
+	if len(courseIDs) == 0 || len(termNumbers) == 0 {
+		return []*models.SubjectCourseMapping{}, nil
+	}
+	// Build placeholders for course IDs and term numbers
+	coursePlaceholders := make([]string, len(courseIDs))
+	courseArgs := make([]interface{}, len(courseIDs))
+	for i, id := range courseIDs {
+		coursePlaceholders[i] = fmt.Sprintf("$%d", i+1)
+		courseArgs[i] = id
+	}
+	termPlaceholders := make([]string, len(termNumbers))
+	termArgs := make([]interface{}, len(termNumbers))
+	for i, tn := range termNumbers {
+		termPlaceholders[i] = fmt.Sprintf("$%d", i+len(courseIDs)+1)
+		termArgs[i] = tn
+	}
+	allArgs := append(courseArgs, termArgs...)
+
+	query := fmt.Sprintf(`
+        SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+        FROM academics.subject_course_mapping
+        WHERE course_id IN (%s) AND term_number IN (%s)
+    `, strings.Join(coursePlaceholders, ","), strings.Join(termPlaceholders, ","))
+
+	rows, err := db.QueryContext(ctx, query, allArgs...)
+	if err != nil {
+		r.logger.Error("failed to list mappings by course IDs and term numbers",
+			zap.Any("course_ids", courseIDs),
+			zap.Any("term_numbers", termNumbers),
+			zap.Error(err))
+		return nil, fmt.Errorf("list by course IDs and term numbers: %w", err)
+	}
+	defer rows.Close()
+	return r.scanMappings(rows)
 }

@@ -1,0 +1,210 @@
+
+================================================================================
+FILE: ./models/course.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Course represents a course of study.
+type Course struct {
+	CourseID    uuid.UUID  `json:"course_id"`
+	CompanyID   uuid.UUID  `json:"company_id"`
+	Code        string     `json:"code"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Credits     int        `json:"credits,omitempty"`
+	IsActive    bool       `json:"is_active"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/subject_course_mapping.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// SubjectCourseMapping links a subject to a course for a specific term number.
+// Note: This table does not have audit or soft delete columns as per schema.
+type SubjectCourseMapping struct {
+	MappingID    uuid.UUID `json:"mapping_id"`
+	CourseID     uuid.UUID `json:"course_id"`
+	SubjectID    uuid.UUID `json:"subject_id"`
+	TermNumber   int       `json:"term_number,omitempty"`
+	IsCompulsory bool      `json:"is_compulsory"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/section.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Section represents a class section for a course in a term.
+type Section struct {
+	SectionID uuid.UUID  `json:"section_id"`
+	CourseID  uuid.UUID  `json:"course_id"`
+	TermID    uuid.UUID  `json:"term_id"`
+	Name      string     `json:"name"`
+	Capacity  int        `json:"capacity,omitempty"`
+	IsActive  bool       `json:"is_active"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/academic_year.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AcademicYear represents an academic year in the system.
+type AcademicYear struct {
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	CompanyID      uuid.UUID  `json:"company_id"`
+	Name           string     `json:"name"`
+	StartDate      time.Time  `json:"start_date"`
+	EndDate        time.Time  `json:"end_date"`
+	IsCurrent      bool       `json:"is_current"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/subject.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Subject represents a subject that can be taught.
+type Subject struct {
+	SubjectID   uuid.UUID  `json:"subject_id"`
+	CompanyID   uuid.UUID  `json:"company_id"`
+	Code        string     `json:"code"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Credits     int        `json:"credits,omitempty"`
+	IsActive    bool       `json:"is_active"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/term.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Term represents a term within an academic year.
+type Term struct {
+	TermID         uuid.UUID  `json:"term_id"`
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	Name           string     `json:"name"`
+	StartDate      time.Time  `json:"start_date"`
+	EndDate        time.Time  `json:"end_date"`
+	IsCurrent      bool       `json:"is_current"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/student.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Student represents a student in the system.
+type Student struct {
+	StudentID             uuid.UUID  `json:"student_id"`
+	CompanyID             uuid.UUID  `json:"company_id"`
+	AdmissionNo           string     `json:"admission_no,omitempty"`
+	DateOfBirth           *time.Time `json:"date_of_birth,omitempty"`
+	Gender                string     `json:"gender,omitempty"`
+	BloodGroup            string     `json:"blood_group,omitempty"`
+	Nationality           string     `json:"nationality,omitempty"`
+	Religion              string     `json:"religion,omitempty"`
+	Category              string     `json:"category,omitempty"`
+	AadharNo              string     `json:"aadhar_no,omitempty"`
+	EmergencyContactName  string     `json:"emergency_contact_name,omitempty"`
+	EmergencyContactPhone string     `json:"emergency_contact_phone,omitempty"`
+	MedicalConditions     string     `json:"medical_conditions,omitempty"`
+	Status                string     `json:"status"` // active, inactive, alumni, transferred
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
+	CreatedBy             *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy             *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt             *time.Time `json:"deleted_at,omitempty"`
+}
+
+

@@ -1,0 +1,3249 @@
+
+================================================================================
+FILE: ./repository/course_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/academics/models"
+	"auth-service/internal/util"
+)
+
+// DBTX is the interface that both *sql.DB and *sql.Tx satisfy.
+// It is assumed to be defined elsewhere (e.g., in a common internal package).
+type DBTX interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
+// CourseRepository defines methods for course table.
+type CourseRepository interface {
+	Create(ctx context.Context, db DBTX, e *models.Course) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.Course) error
+	Upsert(ctx context.Context, db DBTX, e *models.Course) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Course, error)
+	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Course, error)
+	List(ctx context.Context, db DBTX, filter CourseFilter, p Pagination, s Sort) ([]*models.Course, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Course, error)
+	Count(ctx context.Context, db DBTX, filter CourseFilter) (int64, error)
+	Exists(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error)
+	Update(ctx context.Context, db DBTX, e *models.Course) error
+	Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
+	Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
+	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Course, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+}
+
+type courseRepository struct {
+	logger *zap.Logger
+}
+
+// NewCourseRepository creates a new course repository.
+func NewCourseRepository(logger *zap.Logger) CourseRepository {
+	return &courseRepository{
+		logger: logger.Named("course_repo"),
+	}
+}
+
+// --- helper methods for sorting and pagination ---
+
+var allowedCourseSortFields = map[string]bool{
+	"created_at": true,
+	"name":       true,
+	"code":       true,
+	"credits":    true,
+	"is_active":  true,
+	"company_id": true,
+}
+
+func (r *courseRepository) validateSort(s Sort) (string, error) {
+	field := s.Field
+	if field == "" {
+		field = "created_at"
+	}
+	if !allowedCourseSortFields[field] {
+		return "", fmt.Errorf("invalid sort field: %s", field)
+	}
+
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "DESC"
+	}
+
+	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
+}
+
+func (r *courseRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	return limit, offset
+}
+
+// --- filter builder (without deleted_at) ---
+
+func (r *courseRepository) buildCourseFilter(filter CourseFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.IsActive != nil {
+		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
+		args = append(args, *filter.IsActive)
+		idx++
+	}
+	if filter.Code != "" {
+		conditions = append(conditions, fmt.Sprintf("code = $%d", idx))
+		args = append(args, filter.Code)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("(name ILIKE $%d OR code ILIKE $%d)", idx, idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+// --- repository methods ---
+
+// Create inserts a new course.
+func (r *courseRepository) Create(ctx context.Context, db DBTX, e *models.Course) error {
+	query := `
+		INSERT INTO academics.course (
+			company_id, code, name, description, credits, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+		RETURNING course_id, created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.CompanyID, e.Code, e.Name, e.Description, e.Credits, e.IsActive,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.CourseID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create course",
+			util.String("company_id", e.CompanyID.String()),
+			util.String("code", e.Code),
+			util.ErrorField(err))
+		return fmt.Errorf("create course: %w", err)
+	}
+	return nil
+}
+
+// BulkCreate inserts multiple courses, handling transaction ownership.
+func (r *courseRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.Course) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	// If we are the owner, ensure rollback on failure
+	if isOwner {
+		defer func() {
+			if isOwner {
+				_ = tx.Rollback()
+			}
+		}()
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO academics.course (
+			company_id, code, name, description, credits, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+		RETURNING course_id, created_at, updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, c := range e {
+		err = stmt.QueryRowContext(ctx,
+			c.CompanyID, c.Code, c.Name, c.Description, c.Credits, c.IsActive,
+			c.CreatedBy, c.UpdatedBy,
+		).Scan(&c.CourseID, &c.CreatedAt, &c.UpdatedAt)
+		if err != nil {
+			r.logger.Error("bulk create course failed",
+				util.String("company_id", c.CompanyID.String()),
+				util.String("code", c.Code),
+				util.ErrorField(err))
+			return fmt.Errorf("bulk create course row: %w", err)
+		}
+	}
+
+	// Commit only if we started the transaction
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+	}
+	return nil
+}
+
+// Upsert inserts or updates on conflict (company_id, code) where deleted_at IS NULL.
+// Assumes a partial unique index exists: UNIQUE (company_id, code) WHERE deleted_at IS NULL.
+// Upsert inserts or updates on conflict (company_id, code) where deleted_at IS NULL.
+// Assumes a partial unique index exists: UNIQUE (company_id, code) WHERE deleted_at IS NULL.
+func (r *courseRepository) Upsert(ctx context.Context, db DBTX, e *models.Course) error {
+	query := `
+        INSERT INTO academics.course (
+            company_id, code, name, description, credits, is_active,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+        ON CONFLICT (company_id, code) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            credits = EXCLUDED.credits,
+            is_active = EXCLUDED.is_active,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW()
+        RETURNING course_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		e.CompanyID, e.Code, e.Name, e.Description, e.Credits, e.IsActive,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.CourseID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to upsert course",
+			zap.String("company_id", e.CompanyID.String()),
+			zap.String("code", e.Code),
+			zap.Error(err))
+		return fmt.Errorf("upsert course: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves a course by its ID (only if not deleted).
+func (r *courseRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Course, error) {
+	query := `
+		SELECT course_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.course
+		WHERE course_id = $1 AND deleted_at IS NULL
+	`
+	var c models.Course
+	var description sql.NullString
+	var credits sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&c.CourseID, &c.CompanyID, &c.Code, &c.Name, &description, &credits,
+		&c.IsActive, &c.CreatedAt, &c.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get course by ID",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get course by ID: %w", err)
+	}
+	if description.Valid {
+		c.Description = description.String
+	}
+	if credits.Valid {
+		c.Credits = int(credits.Int64)
+	}
+	if createdBy.Valid {
+		c.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		c.UpdatedBy = &updatedBy.UUID
+	}
+	return &c, nil
+}
+
+// GetByCode retrieves a course by company and code (only if not deleted).
+func (r *courseRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Course, error) {
+	query := `
+		SELECT course_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.course
+		WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL
+	`
+	var c models.Course
+	var description sql.NullString
+	var credits sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, companyID, code).Scan(
+		&c.CourseID, &c.CompanyID, &c.Code, &c.Name, &description, &credits,
+		&c.IsActive, &c.CreatedAt, &c.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get course by code",
+			util.String("company_id", companyID.String()),
+			util.String("code", code),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get course by code: %w", err)
+	}
+	if description.Valid {
+		c.Description = description.String
+	}
+	if credits.Valid {
+		c.Credits = int(credits.Int64)
+	}
+	if createdBy.Valid {
+		c.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		c.UpdatedBy = &updatedBy.UUID
+	}
+	return &c, nil
+}
+
+// List returns courses matching the filter with pagination and sorting (only non-deleted).
+func (r *courseRepository) List(ctx context.Context, db DBTX, filter CourseFilter, p Pagination, s Sort) ([]*models.Course, error) {
+	where, args := r.buildCourseFilter(filter)
+	orderBy, err := r.validateSort(s)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+
+	// Handle WHERE clause for deleted_at properly
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT course_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.course
+		%s %s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to list courses",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list courses: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Course
+	for rows.Next() {
+		var c models.Course
+		var description sql.NullString
+		var credits sql.NullInt64
+		var createdBy, updatedBy uuid.NullUUID
+		if err := rows.Scan(
+			&c.CourseID, &c.CompanyID, &c.Code, &c.Name, &description, &credits,
+			&c.IsActive, &c.CreatedAt, &c.UpdatedAt, &createdBy, &updatedBy,
+		); err != nil {
+			return nil, fmt.Errorf("scan course: %w", err)
+		}
+		if description.Valid {
+			c.Description = description.String
+		}
+		if credits.Valid {
+			c.Credits = int(credits.Int64)
+		}
+		if createdBy.Valid {
+			c.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			c.UpdatedBy = &updatedBy.UUID
+		}
+		result = append(result, &c)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ListActive returns all active courses for a company.
+func (r *courseRepository) ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Course, error) {
+	active := true
+	return r.List(ctx, db, CourseFilter{CompanyID: companyID, IsActive: &active}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
+}
+
+// Count returns the number of courses matching the filter (only non-deleted).
+func (r *courseRepository) Count(ctx context.Context, db DBTX, filter CourseFilter) (int64, error) {
+	where, args := r.buildCourseFilter(filter)
+	// Add deleted_at condition
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM academics.course %s`, where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count courses",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count courses: %w", err)
+	}
+	return count, nil
+}
+
+// Exists checks if an active (non-deleted) course with given company and code exists.
+func (r *courseRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.course WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, code).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check course existence",
+			util.String("company_id", companyID.String()),
+			util.String("code", code),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists course: %w", err)
+	}
+	return exists, nil
+}
+
+// Update modifies an existing course (only if not deleted).
+func (r *courseRepository) Update(ctx context.Context, db DBTX, e *models.Course) error {
+	query := `
+		UPDATE academics.course
+		SET code = $2, name = $3, description = $4, credits = $5,
+		    is_active = $6, updated_by = $7, updated_at = NOW()
+		WHERE course_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.CourseID, e.Code, e.Name, e.Description, e.Credits, e.IsActive, e.UpdatedBy,
+	).Scan(&e.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("course %s not found or deleted", e.CourseID)
+		}
+		r.logger.Error("failed to update course",
+			util.String("id", e.CourseID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update course: %w", err)
+	}
+	return nil
+}
+
+// Activate sets is_active to true (only if not deleted).
+func (r *courseRepository) Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.course SET is_active = true, updated_by = $2, updated_at = NOW() WHERE course_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to activate course",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("activate course: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("course %s not found or deleted", id)
+	}
+	return nil
+}
+
+// Deactivate sets is_active to false (only if not deleted).
+func (r *courseRepository) Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.course SET is_active = false, updated_by = $2, updated_at = NOW() WHERE course_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to deactivate course",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("deactivate course: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("course %s not found or deleted", id)
+	}
+	return nil
+}
+
+// GetByIDForUpdate retrieves a course with row lock (only if not deleted).
+func (r *courseRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Course, error) {
+	query := `
+		SELECT course_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.course
+		WHERE course_id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	var c models.Course
+	var description sql.NullString
+	var credits sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&c.CourseID, &c.CompanyID, &c.Code, &c.Name, &description, &credits,
+		&c.IsActive, &c.CreatedAt, &c.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get course for update",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get course for update: %w", err)
+	}
+	if description.Valid {
+		c.Description = description.String
+	}
+	if credits.Valid {
+		c.Credits = int(credits.Int64)
+	}
+	if createdBy.Valid {
+		c.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		c.UpdatedBy = &updatedBy.UUID
+	}
+	return &c, nil
+}
+
+// Delete soft-deletes a course.
+func (r *courseRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
+	query := `UPDATE academics.course SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE course_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	if err != nil {
+		r.logger.Error("failed to delete course",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete course: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("course %s not found or already deleted", id)
+	}
+	return nil
+}
+
+
+
+================================================================================
+FILE: ./repository/tx_helper.go
+================================================================================
+
+// tx_helper.go
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+func beginTxIfNotTx(ctx context.Context, db DBTX) (*sql.Tx, bool, error) {
+	switch t := db.(type) {
+
+	case *sql.Tx:
+		// already in transaction → not owner
+		return t, false, nil
+
+	case *sql.DB:
+		tx, err := t.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("begin tx: %w", err)
+		}
+		return tx, true, nil
+
+	default:
+		return nil, false, fmt.Errorf("unsupported DBTX type")
+	}
+}
+
+
+
+================================================================================
+FILE: ./repository/subject_course_mapping_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/academics/models"
+	"auth-service/internal/util"
+)
+
+// SubjectCourseMappingRepository defines methods for subject_course_mapping table.
+// This table does not have audit or soft delete columns, so no changes for those.
+type SubjectCourseMappingRepository interface {
+	Create(ctx context.Context, db DBTX, e *models.SubjectCourseMapping) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.SubjectCourseMapping) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error)
+	ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error)
+	ListBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error)
+	ListByCourseAndTerm(ctx context.Context, db DBTX, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error)
+	Exists(ctx context.Context, db DBTX, courseID, subjectID uuid.UUID, termNumber int) (bool, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID) error
+	DeleteByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) error
+}
+
+type subjectCourseMappingRepository struct {
+	logger *zap.Logger
+}
+
+// NewSubjectCourseMappingRepository creates a new mapping repository.
+func NewSubjectCourseMappingRepository(logger *zap.Logger) SubjectCourseMappingRepository {
+	return &subjectCourseMappingRepository{
+		logger: logger.Named("subject_course_mapping_repo"),
+	}
+}
+
+// Create inserts a new mapping.
+func (r *subjectCourseMappingRepository) Create(ctx context.Context, db DBTX, e *models.SubjectCourseMapping) error {
+	query := `
+		INSERT INTO academics.subject_course_mapping (
+			course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, NOW(), NOW())
+		RETURNING mapping_id, created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.CourseID, e.SubjectID, e.TermNumber, e.IsCompulsory,
+	).Scan(&e.MappingID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create subject course mapping",
+			util.String("course_id", e.CourseID.String()),
+			util.String("subject_id", e.SubjectID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("create mapping: %w", err)
+	}
+	return nil
+}
+
+// BulkCreate inserts multiple mappings with proper transaction handling.
+func (r *subjectCourseMappingRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.SubjectCourseMapping) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	needRollback := isOwner
+	defer func() {
+		if needRollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO academics.subject_course_mapping (
+			course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, NOW(), NOW())
+		RETURNING mapping_id, created_at, updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, m := range e {
+		err = stmt.QueryRowContext(ctx,
+			m.CourseID, m.SubjectID, m.TermNumber, m.IsCompulsory,
+		).Scan(&m.MappingID, &m.CreatedAt, &m.UpdatedAt)
+		if err != nil {
+			r.logger.Error("bulk create mapping failed",
+				util.String("course_id", m.CourseID.String()),
+				util.String("subject_id", m.SubjectID.String()),
+				util.ErrorField(err))
+			return fmt.Errorf("bulk create mapping row: %w", err)
+		}
+	}
+
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		needRollback = false
+	}
+	return nil
+}
+
+// GetByID retrieves a mapping by its ID.
+func (r *subjectCourseMappingRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error) {
+	query := `
+		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		FROM academics.subject_course_mapping
+		WHERE mapping_id = $1
+	`
+	var m models.SubjectCourseMapping
+	var termNumber sql.NullInt64
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&m.MappingID, &m.CourseID, &m.SubjectID, &termNumber,
+		&m.IsCompulsory, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get mapping by ID",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get mapping by ID: %w", err)
+	}
+	if termNumber.Valid {
+		m.TermNumber = int(termNumber.Int64)
+	}
+	return &m, nil
+}
+
+// ListByCourse returns all mappings for a given course.
+func (r *subjectCourseMappingRepository) ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error) {
+	query := `
+		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		FROM academics.subject_course_mapping
+		WHERE course_id = $1
+		ORDER BY term_number NULLS LAST, created_at
+	`
+	rows, err := db.QueryContext(ctx, query, courseID)
+	if err != nil {
+		r.logger.Error("failed to list mappings by course",
+			util.String("course_id", courseID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list by course: %w", err)
+	}
+	defer rows.Close()
+	return r.scanMappings(rows)
+}
+
+// ListBySubject returns all mappings for a given subject.
+func (r *subjectCourseMappingRepository) ListBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error) {
+	query := `
+		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		FROM academics.subject_course_mapping
+		WHERE subject_id = $1
+		ORDER BY term_number NULLS LAST, created_at
+	`
+	rows, err := db.QueryContext(ctx, query, subjectID)
+	if err != nil {
+		r.logger.Error("failed to list mappings by subject",
+			util.String("subject_id", subjectID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list by subject: %w", err)
+	}
+	defer rows.Close()
+	return r.scanMappings(rows)
+}
+
+// ListByCourseAndTerm returns mappings for a course and specific term.
+func (r *subjectCourseMappingRepository) ListByCourseAndTerm(ctx context.Context, db DBTX, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error) {
+	query := `
+		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		FROM academics.subject_course_mapping
+		WHERE course_id = $1 AND term_number = $2
+		ORDER BY created_at
+	`
+	rows, err := db.QueryContext(ctx, query, courseID, termNumber)
+	if err != nil {
+		r.logger.Error("failed to list mappings by course and term",
+			util.String("course_id", courseID.String()),
+			util.Int("term", termNumber),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list by course and term: %w", err)
+	}
+	defer rows.Close()
+	return r.scanMappings(rows)
+}
+
+// Exists checks if a mapping exists.
+func (r *subjectCourseMappingRepository) Exists(ctx context.Context, db DBTX, courseID, subjectID uuid.UUID, termNumber int) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.subject_course_mapping WHERE course_id = $1 AND subject_id = $2 AND term_number = $3)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, courseID, subjectID, termNumber).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check mapping existence",
+			util.String("course_id", courseID.String()),
+			util.String("subject_id", subjectID.String()),
+			util.Int("term", termNumber),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists mapping: %w", err)
+	}
+	return exists, nil
+}
+
+// Delete removes a mapping.
+func (r *subjectCourseMappingRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID) error {
+	query := `DELETE FROM academics.subject_course_mapping WHERE mapping_id = $1`
+	result, err := db.ExecContext(ctx, query, id)
+	if err != nil {
+		r.logger.Error("failed to delete mapping",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete mapping: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("mapping %s not found", id)
+	}
+	return nil
+}
+
+// DeleteByCourse removes all mappings for a course.
+func (r *subjectCourseMappingRepository) DeleteByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) error {
+	query := `DELETE FROM academics.subject_course_mapping WHERE course_id = $1`
+	_, err := db.ExecContext(ctx, query, courseID)
+	if err != nil {
+		r.logger.Error("failed to delete mappings by course",
+			util.String("course_id", courseID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete by course: %w", err)
+	}
+	return nil
+}
+
+// scanMappings helper to scan rows into mapping slice.
+func (r *subjectCourseMappingRepository) scanMappings(rows *sql.Rows) ([]*models.SubjectCourseMapping, error) {
+	var result []*models.SubjectCourseMapping
+	for rows.Next() {
+		var m models.SubjectCourseMapping
+		var termNumber sql.NullInt64
+		if err := rows.Scan(
+			&m.MappingID, &m.CourseID, &m.SubjectID, &termNumber,
+			&m.IsCompulsory, &m.CreatedAt, &m.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan mapping: %w", err)
+		}
+		if termNumber.Valid {
+			m.TermNumber = int(termNumber.Int64)
+		}
+		result = append(result, &m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+
+
+================================================================================
+FILE: ./repository/academic_year_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/academics/models"
+	"auth-service/internal/util"
+)
+
+// AcademicYearRepository defines methods for academic_year table.
+type AcademicYearRepository interface {
+	Create(ctx context.Context, db DBTX, e *models.AcademicYear) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.AcademicYear) error
+	Upsert(ctx context.Context, db DBTX, e *models.AcademicYear) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error)
+	GetCurrent(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.AcademicYear, error)
+	GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.AcademicYear, error)
+	List(ctx context.Context, db DBTX, filter AcademicYearFilter, p Pagination, s Sort) ([]*models.AcademicYear, error)
+	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.AcademicYear, error)
+	Count(ctx context.Context, db DBTX, filter AcademicYearFilter) (int64, error)
+	Exists(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error)
+	Update(ctx context.Context, db DBTX, e *models.AcademicYear) error
+	UpdateDates(ctx context.Context, db DBTX, id uuid.UUID, start, end time.Time, updatedBy *uuid.UUID) error
+	SetCurrent(ctx context.Context, db DBTX, companyID, academicYearID uuid.UUID, updatedBy *uuid.UUID) error
+	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+}
+
+type academicYearRepository struct {
+	logger *zap.Logger
+}
+
+// NewAcademicYearRepository creates a new academic year repository.
+func NewAcademicYearRepository(logger *zap.Logger) AcademicYearRepository {
+	return &academicYearRepository{
+		logger: logger.Named("academic_year_repo"),
+	}
+}
+
+// Allowed sort fields for academic years
+var allowedAcademicYearSortFields = map[string]bool{
+	"created_at": true,
+	"name":       true,
+	"start_date": true,
+	"end_date":   true,
+	"is_current": true,
+}
+
+func (r *academicYearRepository) validateSort(s Sort) (string, error) {
+	field := s.Field
+	if field == "" {
+		field = "created_at"
+	}
+	if !allowedAcademicYearSortFields[field] {
+		return "", fmt.Errorf("invalid sort field: %s", field)
+	}
+
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "DESC"
+	}
+
+	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
+}
+
+func (r *academicYearRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// Create inserts a new academic year.
+func (r *academicYearRepository) Create(ctx context.Context, db DBTX, e *models.AcademicYear) error {
+	query := `
+		INSERT INTO academics.academic_year (
+			company_id, name, start_date, end_date, is_current,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		RETURNING academic_year_id, created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.CompanyID, e.Name, e.StartDate, e.EndDate, e.IsCurrent,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.AcademicYearID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create academic year",
+			util.String("company_id", e.CompanyID.String()),
+			util.String("name", e.Name),
+			util.ErrorField(err))
+		return fmt.Errorf("create academic year: %w", err)
+	}
+	return nil
+}
+
+// BulkCreate inserts multiple academic years with proper transaction handling.
+func (r *academicYearRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.AcademicYear) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	needRollback := isOwner
+	defer func() {
+		if needRollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO academics.academic_year (
+			company_id, name, start_date, end_date, is_current,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		RETURNING academic_year_id, created_at, updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, ay := range e {
+		err = stmt.QueryRowContext(ctx,
+			ay.CompanyID, ay.Name, ay.StartDate, ay.EndDate, ay.IsCurrent,
+			ay.CreatedBy, ay.UpdatedBy,
+		).Scan(&ay.AcademicYearID, &ay.CreatedAt, &ay.UpdatedAt)
+		if err != nil {
+			r.logger.Error("bulk create failed",
+				util.String("company_id", ay.CompanyID.String()),
+				util.String("name", ay.Name),
+				util.ErrorField(err))
+			return fmt.Errorf("bulk create row: %w", err)
+		}
+	}
+
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		needRollback = false
+	}
+	return nil
+}
+
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+func (r *academicYearRepository) Upsert(ctx context.Context, db DBTX, e *models.AcademicYear) error {
+	query := `
+        INSERT INTO academics.academic_year (
+            company_id, name, start_date, end_date, is_current,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        ON CONFLICT (company_id, name) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            is_current = EXCLUDED.is_current,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW()
+        RETURNING academic_year_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		e.CompanyID, e.Name, e.StartDate, e.EndDate, e.IsCurrent,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.AcademicYearID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to upsert academic year",
+			zap.String("company_id", e.CompanyID.String()),
+			zap.String("name", e.Name),
+			zap.Error(err))
+		return fmt.Errorf("upsert academic year: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves an academic year by its ID (only if not deleted).
+func (r *academicYearRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error) {
+	query := `
+		SELECT academic_year_id, company_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.academic_year
+		WHERE academic_year_id = $1 AND deleted_at IS NULL
+	`
+	var ay models.AcademicYear
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&ay.AcademicYearID, &ay.CompanyID, &ay.Name, &ay.StartDate, &ay.EndDate,
+		&ay.IsCurrent, &ay.CreatedAt, &ay.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get academic year by ID",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get academic year by ID: %w", err)
+	}
+	if createdBy.Valid {
+		ay.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		ay.UpdatedBy = &updatedBy.UUID
+	}
+	return &ay, nil
+}
+
+// GetCurrent returns the current academic year for a company (only if not deleted).
+func (r *academicYearRepository) GetCurrent(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.AcademicYear, error) {
+	query := `
+		SELECT academic_year_id, company_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.academic_year
+		WHERE company_id = $1 AND is_current = true AND deleted_at IS NULL
+		LIMIT 1
+	`
+	var ay models.AcademicYear
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, companyID).Scan(
+		&ay.AcademicYearID, &ay.CompanyID, &ay.Name, &ay.StartDate, &ay.EndDate,
+		&ay.IsCurrent, &ay.CreatedAt, &ay.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get current academic year",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get current academic year: %w", err)
+	}
+	if createdBy.Valid {
+		ay.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		ay.UpdatedBy = &updatedBy.UUID
+	}
+	return &ay, nil
+}
+
+// GetByName retrieves an academic year by company and name (only if not deleted).
+func (r *academicYearRepository) GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.AcademicYear, error) {
+	query := `
+		SELECT academic_year_id, company_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.academic_year
+		WHERE company_id = $1 AND name = $2 AND deleted_at IS NULL
+	`
+	var ay models.AcademicYear
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, companyID, name).Scan(
+		&ay.AcademicYearID, &ay.CompanyID, &ay.Name, &ay.StartDate, &ay.EndDate,
+		&ay.IsCurrent, &ay.CreatedAt, &ay.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get academic year by name",
+			util.String("company_id", companyID.String()),
+			util.String("name", name),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get academic year by name: %w", err)
+	}
+	if createdBy.Valid {
+		ay.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		ay.UpdatedBy = &updatedBy.UUID
+	}
+	return &ay, nil
+}
+
+// List returns academic years matching the filter with pagination and sorting (only non-deleted).
+func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter AcademicYearFilter, p Pagination, s Sort) ([]*models.AcademicYear, error) {
+	where, args := r.buildAcademicYearFilter(filter)
+	orderBy, err := r.validateSort(s)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT academic_year_id, company_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.academic_year
+		%s %s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to list academic years",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list academic years: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.AcademicYear
+	for rows.Next() {
+		var ay models.AcademicYear
+		var createdBy, updatedBy uuid.NullUUID
+		if err := rows.Scan(
+			&ay.AcademicYearID, &ay.CompanyID, &ay.Name, &ay.StartDate, &ay.EndDate,
+			&ay.IsCurrent, &ay.CreatedAt, &ay.UpdatedAt, &createdBy, &updatedBy,
+		); err != nil {
+			return nil, fmt.Errorf("scan academic year: %w", err)
+		}
+		if createdBy.Valid {
+			ay.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			ay.UpdatedBy = &updatedBy.UUID
+		}
+		result = append(result, &ay)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ListByCompany returns all academic years for a company.
+func (r *academicYearRepository) ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.AcademicYear, error) {
+	return r.List(ctx, db, AcademicYearFilter{CompanyID: companyID}, Pagination{Limit: 1000}, Sort{Field: "start_date", Direction: "DESC"})
+}
+
+// Count returns the number of academic years matching the filter (only non-deleted).
+func (r *academicYearRepository) Count(ctx context.Context, db DBTX, filter AcademicYearFilter) (int64, error) {
+	where, args := r.buildAcademicYearFilter(filter)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM academics.academic_year %s`, where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count academic years",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count academic years: %w", err)
+	}
+	return count, nil
+}
+
+// Exists checks if an active (non-deleted) academic year with given company and name exists.
+func (r *academicYearRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.academic_year WHERE company_id = $1 AND name = $2 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, name).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check existence of academic year",
+			util.String("company_id", companyID.String()),
+			util.String("name", name),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists academic year: %w", err)
+	}
+	return exists, nil
+}
+
+// Update modifies an existing academic year (only if not deleted).
+func (r *academicYearRepository) Update(ctx context.Context, db DBTX, e *models.AcademicYear) error {
+	query := `
+		UPDATE academics.academic_year
+		SET name = $2, start_date = $3, end_date = $4, is_current = $5,
+		    updated_by = $6, updated_at = NOW()
+		WHERE academic_year_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.AcademicYearID, e.Name, e.StartDate, e.EndDate, e.IsCurrent, e.UpdatedBy,
+	).Scan(&e.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("academic year %s not found or deleted", e.AcademicYearID)
+		}
+		r.logger.Error("failed to update academic year",
+			util.String("id", e.AcademicYearID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update academic year: %w", err)
+	}
+	return nil
+}
+
+// UpdateDates updates only start and end dates (only if not deleted).
+func (r *academicYearRepository) UpdateDates(ctx context.Context, db DBTX, id uuid.UUID, start, end time.Time, updatedBy *uuid.UUID) error {
+	query := `
+		UPDATE academics.academic_year
+		SET start_date = $2, end_date = $3, updated_by = $4, updated_at = NOW()
+		WHERE academic_year_id = $1 AND deleted_at IS NULL
+	`
+	result, err := db.ExecContext(ctx, query, id, start, end, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to update academic year dates",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update academic year dates: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("academic year %s not found or deleted", id)
+	}
+	return nil
+}
+
+// SetCurrent marks the given academic year as current and unsets others for the company.
+// Uses SELECT FOR UPDATE to prevent race conditions. Assumes caller manages transaction.
+// SetCurrent marks the given academic year as current and unsets others for the company.
+// Uses SELECT FOR UPDATE to prevent race conditions. Must be called within a transaction.
+func (r *academicYearRepository) SetCurrent(ctx context.Context, db DBTX, companyID, academicYearID uuid.UUID, updatedBy *uuid.UUID) error {
+	// Ensure we are in a transaction
+	if _, ok := db.(*sql.Tx); !ok {
+		return fmt.Errorf("SetCurrent must be called within a transaction")
+	}
+
+	// Lock all rows for this company to prevent concurrent updates
+	_, err := db.ExecContext(ctx, `SELECT 1 FROM academics.academic_year WHERE company_id = $1 FOR UPDATE`, companyID)
+	if err != nil {
+		r.logger.Error("failed to lock academic years",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err))
+		return fmt.Errorf("lock academic years: %w", err)
+	}
+
+	// Unset all current for company (only non-deleted)
+	_, err = db.ExecContext(ctx, `UPDATE academics.academic_year SET is_current = false, updated_by = $2, updated_at = NOW() WHERE company_id = $1 AND deleted_at IS NULL`, companyID, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to unset current academic years",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err))
+		return fmt.Errorf("unset current: %w", err)
+	}
+
+	// Set the new current (only if not deleted)
+	res, err := db.ExecContext(ctx, `UPDATE academics.academic_year SET is_current = true, updated_by = $2, updated_at = NOW() WHERE academic_year_id = $1 AND deleted_at IS NULL`, academicYearID, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to set current academic year",
+			zap.String("id", academicYearID.String()),
+			zap.Error(err))
+		return fmt.Errorf("set current: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("academic year %s not found or deleted", academicYearID)
+	}
+	return nil
+}
+
+// GetByIDForUpdate retrieves an academic year with a row lock (only if not deleted).
+func (r *academicYearRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error) {
+	query := `
+		SELECT academic_year_id, company_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.academic_year
+		WHERE academic_year_id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	var ay models.AcademicYear
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&ay.AcademicYearID, &ay.CompanyID, &ay.Name, &ay.StartDate, &ay.EndDate,
+		&ay.IsCurrent, &ay.CreatedAt, &ay.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get academic year for update",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get academic year for update: %w", err)
+	}
+	if createdBy.Valid {
+		ay.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		ay.UpdatedBy = &updatedBy.UUID
+	}
+	return &ay, nil
+}
+
+// Delete soft-deletes an academic year.
+func (r *academicYearRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
+	query := `UPDATE academics.academic_year SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE academic_year_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	if err != nil {
+		r.logger.Error("failed to delete academic year",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete academic year: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("academic year %s not found or already deleted", id)
+	}
+	return nil
+}
+
+// buildAcademicYearFilter constructs the WHERE clause and arguments for AcademicYearFilter.
+// Note: It does NOT include deleted_at; caller must add that.
+func (r *academicYearRepository) buildAcademicYearFilter(filter AcademicYearFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.IsCurrent != nil {
+		conditions = append(conditions, fmt.Sprintf("is_current = $%d", idx))
+		args = append(args, *filter.IsCurrent)
+		idx++
+	}
+	if filter.StartFrom != nil {
+		conditions = append(conditions, fmt.Sprintf("start_date >= $%d", idx))
+		args = append(args, *filter.StartFrom)
+		idx++
+	}
+	if filter.EndTo != nil {
+		conditions = append(conditions, fmt.Sprintf("end_date <= $%d", idx))
+		args = append(args, *filter.EndTo)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("name ILIKE $%d", idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+
+
+================================================================================
+FILE: ./repository/section_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/academics/models"
+	"auth-service/internal/util"
+)
+
+// SectionRepository defines methods for section table.
+type SectionRepository interface {
+	Create(ctx context.Context, db DBTX, e *models.Section) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.Section) error
+	Upsert(ctx context.Context, db DBTX, e *models.Section) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Section, error)
+	List(ctx context.Context, db DBTX, filter SectionFilter, p Pagination, s Sort) ([]*models.Section, error)
+	ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.Section, error)
+	ListByTerm(ctx context.Context, db DBTX, termID uuid.UUID) ([]*models.Section, error)
+	Count(ctx context.Context, db DBTX, filter SectionFilter) (int64, error)
+	Exists(ctx context.Context, db DBTX, courseID, termID uuid.UUID, name string) (bool, error)
+	Update(ctx context.Context, db DBTX, e *models.Section) error
+	UpdateCapacity(ctx context.Context, db DBTX, sectionID uuid.UUID, capacity int, updatedBy *uuid.UUID) error
+	Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
+	Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
+	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Section, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+}
+
+type sectionRepository struct {
+	logger *zap.Logger
+}
+
+// NewSectionRepository creates a new section repository.
+func NewSectionRepository(logger *zap.Logger) SectionRepository {
+	return &sectionRepository{
+		logger: logger.Named("section_repo"),
+	}
+}
+
+// Allowed sort fields for sections
+var allowedSectionSortFields = map[string]bool{
+	"created_at": true,
+	"name":       true,
+	"capacity":   true,
+	"is_active":  true,
+}
+
+func (r *sectionRepository) validateSort(s Sort) (string, error) {
+	field := s.Field
+	if field == "" {
+		field = "created_at"
+	}
+	if !allowedSectionSortFields[field] {
+		return "", fmt.Errorf("invalid sort field: %s", field)
+	}
+
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "DESC"
+	}
+
+	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
+}
+
+func (r *sectionRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// Create inserts a new section.
+func (r *sectionRepository) Create(ctx context.Context, db DBTX, e *models.Section) error {
+	query := `
+		INSERT INTO academics.section (
+			course_id, term_id, name, capacity, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		RETURNING section_id, created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.CourseID, e.TermID, e.Name, e.Capacity, e.IsActive,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.SectionID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create section",
+			util.String("course_id", e.CourseID.String()),
+			util.String("term_id", e.TermID.String()),
+			util.String("name", e.Name),
+			util.ErrorField(err))
+		return fmt.Errorf("create section: %w", err)
+	}
+	return nil
+}
+
+// BulkCreate inserts multiple sections with proper transaction handling.
+func (r *sectionRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.Section) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	needRollback := isOwner
+	defer func() {
+		if needRollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO academics.section (
+			course_id, term_id, name, capacity, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		RETURNING section_id, created_at, updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, s := range e {
+		err = stmt.QueryRowContext(ctx,
+			s.CourseID, s.TermID, s.Name, s.Capacity, s.IsActive,
+			s.CreatedBy, s.UpdatedBy,
+		).Scan(&s.SectionID, &s.CreatedAt, &s.UpdatedAt)
+		if err != nil {
+			r.logger.Error("bulk create section failed",
+				util.String("course_id", s.CourseID.String()),
+				util.String("term_id", s.TermID.String()),
+				util.String("name", s.Name),
+				util.ErrorField(err))
+			return fmt.Errorf("bulk create section row: %w", err)
+		}
+	}
+
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		needRollback = false
+	}
+	return nil
+}
+
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+func (r *sectionRepository) Upsert(ctx context.Context, db DBTX, e *models.Section) error {
+	query := `
+        INSERT INTO academics.section (
+            course_id, term_id, name, capacity, is_active,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        ON CONFLICT (course_id, term_id, name) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            capacity = EXCLUDED.capacity,
+            is_active = EXCLUDED.is_active,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW()
+        RETURNING section_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		e.CourseID, e.TermID, e.Name, e.Capacity, e.IsActive,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.SectionID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to upsert section",
+			zap.String("course_id", e.CourseID.String()),
+			zap.String("term_id", e.TermID.String()),
+			zap.String("name", e.Name),
+			zap.Error(err))
+		return fmt.Errorf("upsert section: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves a section by its ID (only if not deleted).
+func (r *sectionRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Section, error) {
+	query := `
+		SELECT section_id, course_id, term_id, name, capacity,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.section
+		WHERE section_id = $1 AND deleted_at IS NULL
+	`
+	var s models.Section
+	var capacity sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&s.SectionID, &s.CourseID, &s.TermID, &s.Name, &capacity,
+		&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get section by ID",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get section by ID: %w", err)
+	}
+	if capacity.Valid {
+		s.Capacity = int(capacity.Int64)
+	}
+	if createdBy.Valid {
+		s.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		s.UpdatedBy = &updatedBy.UUID
+	}
+	return &s, nil
+}
+
+// List returns sections matching the filter with pagination and sorting (only non-deleted).
+func (r *sectionRepository) List(ctx context.Context, db DBTX, filter SectionFilter, p Pagination, s Sort) ([]*models.Section, error) {
+	where, args := r.buildSectionFilter(filter)
+	orderBy, err := r.validateSort(s)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT section_id, course_id, term_id, name, capacity,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.section
+		%s %s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to list sections",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list sections: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Section
+	for rows.Next() {
+		var s models.Section
+		var capacity sql.NullInt64
+		var createdBy, updatedBy uuid.NullUUID
+		if err := rows.Scan(
+			&s.SectionID, &s.CourseID, &s.TermID, &s.Name, &capacity,
+			&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+		); err != nil {
+			return nil, fmt.Errorf("scan section: %w", err)
+		}
+		if capacity.Valid {
+			s.Capacity = int(capacity.Int64)
+		}
+		if createdBy.Valid {
+			s.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			s.UpdatedBy = &updatedBy.UUID
+		}
+		result = append(result, &s)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ListByCourse returns all sections for a given course.
+func (r *sectionRepository) ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.Section, error) {
+	return r.List(ctx, db, SectionFilter{CourseID: courseID}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
+}
+
+// ListByTerm returns all sections for a given term.
+func (r *sectionRepository) ListByTerm(ctx context.Context, db DBTX, termID uuid.UUID) ([]*models.Section, error) {
+	return r.List(ctx, db, SectionFilter{TermID: termID}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
+}
+
+// Count returns the number of sections matching the filter (only non-deleted).
+func (r *sectionRepository) Count(ctx context.Context, db DBTX, filter SectionFilter) (int64, error) {
+	where, args := r.buildSectionFilter(filter)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM academics.section %s`, where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count sections",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count sections: %w", err)
+	}
+	return count, nil
+}
+
+// Exists checks if an active (non-deleted) section with given course, term, and name exists.
+func (r *sectionRepository) Exists(ctx context.Context, db DBTX, courseID, termID uuid.UUID, name string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.section WHERE course_id = $1 AND term_id = $2 AND name = $3 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, courseID, termID, name).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check section existence",
+			util.String("course_id", courseID.String()),
+			util.String("term_id", termID.String()),
+			util.String("name", name),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists section: %w", err)
+	}
+	return exists, nil
+}
+
+// Update modifies an existing section (only if not deleted).
+func (r *sectionRepository) Update(ctx context.Context, db DBTX, e *models.Section) error {
+	query := `
+		UPDATE academics.section
+		SET name = $2, capacity = $3, is_active = $4, updated_by = $5, updated_at = NOW()
+		WHERE section_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.SectionID, e.Name, e.Capacity, e.IsActive, e.UpdatedBy,
+	).Scan(&e.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("section %s not found or deleted", e.SectionID)
+		}
+		r.logger.Error("failed to update section",
+			util.String("id", e.SectionID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update section: %w", err)
+	}
+	return nil
+}
+
+// UpdateCapacity updates only the capacity of a section (only if not deleted).
+func (r *sectionRepository) UpdateCapacity(ctx context.Context, db DBTX, sectionID uuid.UUID, capacity int, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.section SET capacity = $2, updated_by = $3, updated_at = NOW() WHERE section_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, sectionID, capacity, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to update section capacity",
+			util.String("section_id", sectionID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update capacity: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("section %s not found or deleted", sectionID)
+	}
+	return nil
+}
+
+// Activate sets is_active to true (only if not deleted).
+func (r *sectionRepository) Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.section SET is_active = true, updated_by = $2, updated_at = NOW() WHERE section_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to activate section",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("activate section: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("section %s not found or deleted", id)
+	}
+	return nil
+}
+
+// Deactivate sets is_active to false (only if not deleted).
+func (r *sectionRepository) Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.section SET is_active = false, updated_by = $2, updated_at = NOW() WHERE section_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to deactivate section",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("deactivate section: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("section %s not found or deleted", id)
+	}
+	return nil
+}
+
+// GetByIDForUpdate retrieves a section with row lock (only if not deleted).
+func (r *sectionRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Section, error) {
+	query := `
+		SELECT section_id, course_id, term_id, name, capacity,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.section
+		WHERE section_id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	var s models.Section
+	var capacity sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&s.SectionID, &s.CourseID, &s.TermID, &s.Name, &capacity,
+		&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get section for update",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get section for update: %w", err)
+	}
+	if capacity.Valid {
+		s.Capacity = int(capacity.Int64)
+	}
+	if createdBy.Valid {
+		s.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		s.UpdatedBy = &updatedBy.UUID
+	}
+	return &s, nil
+}
+
+// Delete soft-deletes a section.
+func (r *sectionRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
+	query := `UPDATE academics.section SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE section_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	if err != nil {
+		r.logger.Error("failed to delete section",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete section: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("section %s not found or already deleted", id)
+	}
+	return nil
+}
+
+// buildSectionFilter constructs WHERE clause and arguments for SectionFilter.
+// Note: Does NOT include deleted_at; caller must add that.
+func (r *sectionRepository) buildSectionFilter(filter SectionFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CourseID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("course_id = $%d", idx))
+		args = append(args, filter.CourseID)
+		idx++
+	}
+	if filter.TermID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("term_id = $%d", idx))
+		args = append(args, filter.TermID)
+		idx++
+	}
+	if filter.IsActive != nil {
+		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
+		args = append(args, *filter.IsActive)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("name ILIKE $%d", idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+
+
+================================================================================
+FILE: ./repository/term_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/academics/models"
+	"auth-service/internal/util"
+)
+
+// TermRepository defines methods for term table.
+type TermRepository interface {
+	Create(ctx context.Context, db DBTX, e *models.Term) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.Term) error
+	Upsert(ctx context.Context, db DBTX, e *models.Term) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Term, error)
+	GetCurrent(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.Term, error)
+	List(ctx context.Context, db DBTX, filter TermFilter, p Pagination, s Sort) ([]*models.Term, error)
+	ListByAcademicYear(ctx context.Context, db DBTX, academicYearID uuid.UUID) ([]*models.Term, error)
+	Count(ctx context.Context, db DBTX, filter TermFilter) (int64, error)
+	Exists(ctx context.Context, db DBTX, academicYearID uuid.UUID, name string) (bool, error)
+	Update(ctx context.Context, db DBTX, e *models.Term) error
+	SetCurrent(ctx context.Context, db DBTX, academicYearID, termID uuid.UUID, updatedBy *uuid.UUID) error
+	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Term, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+}
+
+type termRepository struct {
+	logger *zap.Logger
+}
+
+// NewTermRepository creates a new term repository.
+func NewTermRepository(logger *zap.Logger) TermRepository {
+	return &termRepository{
+		logger: logger.Named("term_repo"),
+	}
+}
+
+// Allowed sort fields for terms
+var allowedTermSortFields = map[string]bool{
+	"created_at": true,
+	"name":       true,
+	"start_date": true,
+	"end_date":   true,
+	"is_current": true,
+}
+
+func (r *termRepository) validateSort(s Sort) (string, error) {
+	field := s.Field
+	if field == "" {
+		field = "created_at"
+	}
+	if !allowedTermSortFields[field] {
+		return "", fmt.Errorf("invalid sort field: %s", field)
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "DESC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
+}
+
+func (r *termRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// Create inserts a new term.
+func (r *termRepository) Create(ctx context.Context, db DBTX, e *models.Term) error {
+	query := `
+		INSERT INTO academics.term (
+			academic_year_id, name, start_date, end_date, is_current,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		RETURNING term_id, created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.AcademicYearID, e.Name, e.StartDate, e.EndDate, e.IsCurrent,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.TermID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create term",
+			util.String("academic_year_id", e.AcademicYearID.String()),
+			util.String("name", e.Name),
+			util.ErrorField(err))
+		return fmt.Errorf("create term: %w", err)
+	}
+	return nil
+}
+
+// BulkCreate inserts multiple terms with proper transaction handling.
+func (r *termRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.Term) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	needRollback := isOwner
+	defer func() {
+		if needRollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO academics.term (
+			academic_year_id, name, start_date, end_date, is_current,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		RETURNING term_id, created_at, updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, t := range e {
+		err = stmt.QueryRowContext(ctx,
+			t.AcademicYearID, t.Name, t.StartDate, t.EndDate, t.IsCurrent,
+			t.CreatedBy, t.UpdatedBy,
+		).Scan(&t.TermID, &t.CreatedAt, &t.UpdatedAt)
+		if err != nil {
+			r.logger.Error("bulk create term failed",
+				util.String("academic_year_id", t.AcademicYearID.String()),
+				util.String("name", t.Name),
+				util.ErrorField(err))
+			return fmt.Errorf("bulk create term row: %w", err)
+		}
+	}
+
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		needRollback = false
+	}
+	return nil
+}
+
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+func (r *termRepository) Upsert(ctx context.Context, db DBTX, e *models.Term) error {
+	query := `
+        INSERT INTO academics.term (
+            academic_year_id, name, start_date, end_date, is_current,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        ON CONFLICT (academic_year_id, name) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            start_date = EXCLUDED.start_date,
+            end_date = EXCLUDED.end_date,
+            is_current = EXCLUDED.is_current,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW()
+        RETURNING term_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		e.AcademicYearID, e.Name, e.StartDate, e.EndDate, e.IsCurrent,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.TermID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to upsert term",
+			zap.String("academic_year_id", e.AcademicYearID.String()),
+			zap.String("name", e.Name),
+			zap.Error(err))
+		return fmt.Errorf("upsert term: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves a term by its ID (only if not deleted).
+func (r *termRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Term, error) {
+	query := `
+		SELECT term_id, academic_year_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.term
+		WHERE term_id = $1 AND deleted_at IS NULL
+	`
+	var t models.Term
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&t.TermID, &t.AcademicYearID, &t.Name, &t.StartDate, &t.EndDate,
+		&t.IsCurrent, &t.CreatedAt, &t.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get term by ID",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get term by ID: %w", err)
+	}
+	if createdBy.Valid {
+		t.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		t.UpdatedBy = &updatedBy.UUID
+	}
+	return &t, nil
+}
+
+// GetCurrent returns the current term for an academic year (only if not deleted).
+func (r *termRepository) GetCurrent(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.Term, error) {
+	query := `
+		SELECT term_id, academic_year_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.term
+		WHERE academic_year_id = $1 AND is_current = true AND deleted_at IS NULL
+		LIMIT 1
+	`
+	var t models.Term
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
+		&t.TermID, &t.AcademicYearID, &t.Name, &t.StartDate, &t.EndDate,
+		&t.IsCurrent, &t.CreatedAt, &t.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get current term",
+			util.String("academic_year_id", academicYearID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get current term: %w", err)
+	}
+	if createdBy.Valid {
+		t.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		t.UpdatedBy = &updatedBy.UUID
+	}
+	return &t, nil
+}
+
+// List returns terms matching the filter with pagination and sorting (only non-deleted).
+func (r *termRepository) List(ctx context.Context, db DBTX, filter TermFilter, p Pagination, s Sort) ([]*models.Term, error) {
+	where, args := r.buildTermFilter(filter)
+	orderBy, err := r.validateSort(s)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT term_id, academic_year_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.term
+		%s %s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to list terms",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list terms: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Term
+	for rows.Next() {
+		var t models.Term
+		var createdBy, updatedBy uuid.NullUUID
+		if err := rows.Scan(
+			&t.TermID, &t.AcademicYearID, &t.Name, &t.StartDate, &t.EndDate,
+			&t.IsCurrent, &t.CreatedAt, &t.UpdatedAt, &createdBy, &updatedBy,
+		); err != nil {
+			return nil, fmt.Errorf("scan term: %w", err)
+		}
+		if createdBy.Valid {
+			t.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			t.UpdatedBy = &updatedBy.UUID
+		}
+		result = append(result, &t)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ListByAcademicYear returns all terms for a given academic year.
+func (r *termRepository) ListByAcademicYear(ctx context.Context, db DBTX, academicYearID uuid.UUID) ([]*models.Term, error) {
+	return r.List(ctx, db, TermFilter{AcademicYearID: academicYearID}, Pagination{Limit: 1000}, Sort{Field: "start_date", Direction: "ASC"})
+}
+
+// Count returns the number of terms matching the filter (only non-deleted).
+func (r *termRepository) Count(ctx context.Context, db DBTX, filter TermFilter) (int64, error) {
+	where, args := r.buildTermFilter(filter)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM academics.term %s`, where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count terms",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count terms: %w", err)
+	}
+	return count, nil
+}
+
+// Exists checks if an active (non-deleted) term with given academic year and name exists.
+func (r *termRepository) Exists(ctx context.Context, db DBTX, academicYearID uuid.UUID, name string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.term WHERE academic_year_id = $1 AND name = $2 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, academicYearID, name).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check term existence",
+			util.String("academic_year_id", academicYearID.String()),
+			util.String("name", name),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists term: %w", err)
+	}
+	return exists, nil
+}
+
+// Update modifies an existing term (only if not deleted).
+func (r *termRepository) Update(ctx context.Context, db DBTX, e *models.Term) error {
+	query := `
+		UPDATE academics.term
+		SET name = $2, start_date = $3, end_date = $4, is_current = $5,
+		    updated_by = $6, updated_at = NOW()
+		WHERE term_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.TermID, e.Name, e.StartDate, e.EndDate, e.IsCurrent, e.UpdatedBy,
+	).Scan(&e.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("term %s not found or deleted", e.TermID)
+		}
+		r.logger.Error("failed to update term",
+			util.String("id", e.TermID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update term: %w", err)
+	}
+	return nil
+}
+
+// SetCurrent marks the given term as current and unsets others for the academic year.
+// Uses SELECT FOR UPDATE to prevent race conditions. Assumes caller manages transaction.
+// SetCurrent marks the given term as current and unsets others for the academic year.
+// Uses SELECT FOR UPDATE to prevent race conditions. Must be called within a transaction.
+func (r *termRepository) SetCurrent(ctx context.Context, db DBTX, academicYearID, termID uuid.UUID, updatedBy *uuid.UUID) error {
+	// Ensure we are in a transaction
+	if _, ok := db.(*sql.Tx); !ok {
+		return fmt.Errorf("SetCurrent must be called within a transaction")
+	}
+
+	// Lock all rows for this academic year (only non-deleted)
+	_, err := db.ExecContext(ctx, `SELECT 1 FROM academics.term WHERE academic_year_id = $1 AND deleted_at IS NULL FOR UPDATE`, academicYearID)
+	if err != nil {
+		r.logger.Error("failed to lock terms",
+			zap.String("academic_year_id", academicYearID.String()),
+			zap.Error(err))
+		return fmt.Errorf("lock terms: %w", err)
+	}
+
+	// Unset all current for academic year (only non-deleted)
+	_, err = db.ExecContext(ctx, `UPDATE academics.term SET is_current = false, updated_by = $2, updated_at = NOW() WHERE academic_year_id = $1 AND deleted_at IS NULL`, academicYearID, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to unset current terms",
+			zap.String("academic_year_id", academicYearID.String()),
+			zap.Error(err))
+		return fmt.Errorf("unset current: %w", err)
+	}
+
+	// Set the new current (only if not deleted)
+	res, err := db.ExecContext(ctx, `UPDATE academics.term SET is_current = true, updated_by = $2, updated_at = NOW() WHERE term_id = $1 AND deleted_at IS NULL`, termID, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to set current term",
+			zap.String("id", termID.String()),
+			zap.Error(err))
+		return fmt.Errorf("set current: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("term %s not found or deleted", termID)
+	}
+	return nil
+}
+
+// GetByIDForUpdate retrieves a term with a row lock (only if not deleted).
+func (r *termRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Term, error) {
+	query := `
+		SELECT term_id, academic_year_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.term
+		WHERE term_id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	var t models.Term
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&t.TermID, &t.AcademicYearID, &t.Name, &t.StartDate, &t.EndDate,
+		&t.IsCurrent, &t.CreatedAt, &t.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get term for update",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get term for update: %w", err)
+	}
+	if createdBy.Valid {
+		t.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		t.UpdatedBy = &updatedBy.UUID
+	}
+	return &t, nil
+}
+
+// Delete soft-deletes a term.
+func (r *termRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
+	query := `UPDATE academics.term SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE term_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	if err != nil {
+		r.logger.Error("failed to delete term",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete term: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("term %s not found or already deleted", id)
+	}
+	return nil
+}
+
+// buildTermFilter constructs WHERE clause and arguments for TermFilter.
+// Note: Does NOT include deleted_at; caller must add that.
+func (r *termRepository) buildTermFilter(filter TermFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.AcademicYearID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("academic_year_id = $%d", idx))
+		args = append(args, filter.AcademicYearID)
+		idx++
+	}
+	if filter.IsCurrent != nil {
+		conditions = append(conditions, fmt.Sprintf("is_current = $%d", idx))
+		args = append(args, *filter.IsCurrent)
+		idx++
+	}
+	if filter.StartFrom != nil {
+		conditions = append(conditions, fmt.Sprintf("start_date >= $%d", idx))
+		args = append(args, *filter.StartFrom)
+		idx++
+	}
+	if filter.EndTo != nil {
+		conditions = append(conditions, fmt.Sprintf("end_date <= $%d", idx))
+		args = append(args, *filter.EndTo)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("name ILIKE $%d", idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+
+
+================================================================================
+FILE: ./repository/filters.go
+================================================================================
+
+package repository
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Pagination holds pagination parameters.
+type Pagination struct {
+	Limit  int
+	Offset int
+}
+
+// Sort holds sorting parameters.
+type Sort struct {
+	Field     string
+	Direction string
+}
+
+// AcademicYearFilter represents filtering options for academic years.
+type AcademicYearFilter struct {
+	CompanyID uuid.UUID
+	IsCurrent *bool
+	StartFrom *time.Time
+	EndTo     *time.Time
+	Search    string
+}
+
+// TermFilter represents filtering options for terms.
+type TermFilter struct {
+	AcademicYearID uuid.UUID
+	IsCurrent      *bool
+	StartFrom      *time.Time
+	EndTo          *time.Time
+	Search         string
+}
+
+// CourseFilter represents filtering options for courses.
+type CourseFilter struct {
+	CompanyID uuid.UUID
+	IsActive  *bool
+	Search    string
+	Code      string
+}
+
+// SectionFilter represents filtering options for sections.
+type SectionFilter struct {
+	CourseID uuid.UUID
+	TermID   uuid.UUID
+	IsActive *bool
+	Search   string
+}
+
+// SubjectFilter represents filtering options for subjects.
+type SubjectFilter struct {
+	CompanyID uuid.UUID
+	IsActive  *bool
+	Search    string
+	Code      string
+}
+
+// SubjectCourseMappingFilter represents filtering options for subject-course mappings.
+type SubjectCourseMappingFilter struct {
+	CourseID   uuid.UUID
+	SubjectID  uuid.UUID
+	TermNumber *int
+}
+
+
+
+================================================================================
+FILE: ./repository/subject_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/academics/models"
+	"auth-service/internal/util"
+)
+
+// SubjectRepository defines methods for subject table.
+type SubjectRepository interface {
+	Create(ctx context.Context, db DBTX, e *models.Subject) error
+	BulkCreate(ctx context.Context, db DBTX, e []*models.Subject) error
+	Upsert(ctx context.Context, db DBTX, e *models.Subject) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error)
+	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Subject, error)
+	List(ctx context.Context, db DBTX, filter SubjectFilter, p Pagination, s Sort) ([]*models.Subject, error)
+	ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Subject, error)
+	Count(ctx context.Context, db DBTX, filter SubjectFilter) (int64, error)
+	Exists(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error)
+	Update(ctx context.Context, db DBTX, e *models.Subject) error
+	Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
+	Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
+	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error)
+	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+}
+
+type subjectRepository struct {
+	logger *zap.Logger
+}
+
+// NewSubjectRepository creates a new subject repository.
+func NewSubjectRepository(logger *zap.Logger) SubjectRepository {
+	return &subjectRepository{
+		logger: logger.Named("subject_repo"),
+	}
+}
+
+// Allowed sort fields for subjects
+var allowedSubjectSortFields = map[string]bool{
+	"created_at": true,
+	"name":       true,
+	"code":       true,
+	"credits":    true,
+	"is_active":  true,
+	"company_id": true,
+}
+
+func (r *subjectRepository) validateSort(s Sort) (string, error) {
+	field := s.Field
+	if field == "" {
+		field = "created_at"
+	}
+	if !allowedSubjectSortFields[field] {
+		return "", fmt.Errorf("invalid sort field: %s", field)
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "DESC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
+}
+
+func (r *subjectRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// Create inserts a new subject.
+func (r *subjectRepository) Create(ctx context.Context, db DBTX, e *models.Subject) error {
+	query := `
+		INSERT INTO academics.subject (
+			company_id, code, name, description, credits, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+		RETURNING subject_id, created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.CompanyID, e.Code, e.Name, e.Description, e.Credits, e.IsActive,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.SubjectID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create subject",
+			util.String("company_id", e.CompanyID.String()),
+			util.String("code", e.Code),
+			util.ErrorField(err))
+		return fmt.Errorf("create subject: %w", err)
+	}
+	return nil
+}
+
+// BulkCreate inserts multiple subjects with proper transaction handling.
+func (r *subjectRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.Subject) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	tx, isOwner, err := beginTxIfNotTx(ctx, db)
+	if err != nil {
+		return err
+	}
+	needRollback := isOwner
+	defer func() {
+		if needRollback {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO academics.subject (
+			company_id, code, name, description, credits, is_active,
+			created_by, updated_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+		RETURNING subject_id, created_at, updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, s := range e {
+		err = stmt.QueryRowContext(ctx,
+			s.CompanyID, s.Code, s.Name, s.Description, s.Credits, s.IsActive,
+			s.CreatedBy, s.UpdatedBy,
+		).Scan(&s.SubjectID, &s.CreatedAt, &s.UpdatedAt)
+		if err != nil {
+			r.logger.Error("bulk create subject failed",
+				util.String("company_id", s.CompanyID.String()),
+				util.String("code", s.Code),
+				util.ErrorField(err))
+			return fmt.Errorf("bulk create subject row: %w", err)
+		}
+	}
+
+	if isOwner {
+		if err = tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+		needRollback = false
+	}
+	return nil
+}
+
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+// Upsert inserts or updates using the unique constraint (enterprise pattern).
+func (r *subjectRepository) Upsert(ctx context.Context, db DBTX, e *models.Subject) error {
+	query := `
+        INSERT INTO academics.subject (
+            company_id, code, name, description, credits, is_active,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+        ON CONFLICT (company_id, code) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            credits = EXCLUDED.credits,
+            is_active = EXCLUDED.is_active,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = NOW()
+        RETURNING subject_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		e.CompanyID, e.Code, e.Name, e.Description, e.Credits, e.IsActive,
+		e.CreatedBy, e.UpdatedBy,
+	).Scan(&e.SubjectID, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to upsert subject",
+			zap.String("company_id", e.CompanyID.String()),
+			zap.String("code", e.Code),
+			zap.Error(err))
+		return fmt.Errorf("upsert subject: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves a subject by its ID (only if not deleted).
+func (r *subjectRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error) {
+	query := `
+		SELECT subject_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.subject
+		WHERE subject_id = $1 AND deleted_at IS NULL
+	`
+	var s models.Subject
+	var description sql.NullString
+	var credits sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&s.SubjectID, &s.CompanyID, &s.Code, &s.Name, &description, &credits,
+		&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get subject by ID",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get subject by ID: %w", err)
+	}
+	if description.Valid {
+		s.Description = description.String
+	}
+	if credits.Valid {
+		s.Credits = int(credits.Int64)
+	}
+	if createdBy.Valid {
+		s.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		s.UpdatedBy = &updatedBy.UUID
+	}
+	return &s, nil
+}
+
+// GetByCode retrieves a subject by company and code (only if not deleted).
+func (r *subjectRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Subject, error) {
+	query := `
+		SELECT subject_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.subject
+		WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL
+	`
+	var s models.Subject
+	var description sql.NullString
+	var credits sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, companyID, code).Scan(
+		&s.SubjectID, &s.CompanyID, &s.Code, &s.Name, &description, &credits,
+		&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get subject by code",
+			util.String("company_id", companyID.String()),
+			util.String("code", code),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get subject by code: %w", err)
+	}
+	if description.Valid {
+		s.Description = description.String
+	}
+	if credits.Valid {
+		s.Credits = int(credits.Int64)
+	}
+	if createdBy.Valid {
+		s.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		s.UpdatedBy = &updatedBy.UUID
+	}
+	return &s, nil
+}
+
+// List returns subjects matching the filter with pagination and sorting (only non-deleted).
+func (r *subjectRepository) List(ctx context.Context, db DBTX, filter SubjectFilter, p Pagination, s Sort) ([]*models.Subject, error) {
+	where, args := r.buildSubjectFilter(filter)
+	orderBy, err := r.validateSort(s)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT subject_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.subject
+		%s %s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to list subjects",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list subjects: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Subject
+	for rows.Next() {
+		var s models.Subject
+		var description sql.NullString
+		var credits sql.NullInt64
+		var createdBy, updatedBy uuid.NullUUID
+		if err := rows.Scan(
+			&s.SubjectID, &s.CompanyID, &s.Code, &s.Name, &description, &credits,
+			&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+		); err != nil {
+			return nil, fmt.Errorf("scan subject: %w", err)
+		}
+		if description.Valid {
+			s.Description = description.String
+		}
+		if credits.Valid {
+			s.Credits = int(credits.Int64)
+		}
+		if createdBy.Valid {
+			s.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			s.UpdatedBy = &updatedBy.UUID
+		}
+		result = append(result, &s)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ListActive returns all active subjects for a company.
+func (r *subjectRepository) ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Subject, error) {
+	active := true
+	return r.List(ctx, db, SubjectFilter{CompanyID: companyID, IsActive: &active}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
+}
+
+// Count returns the number of subjects matching the filter (only non-deleted).
+func (r *subjectRepository) Count(ctx context.Context, db DBTX, filter SubjectFilter) (int64, error) {
+	where, args := r.buildSubjectFilter(filter)
+
+	// Fix WHERE clause: ensure deleted_at IS NULL is always present
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+
+	query := fmt.Sprintf(`SELECT COUNT(*) FROM academics.subject %s`, where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count subjects",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count subjects: %w", err)
+	}
+	return count, nil
+}
+
+// Exists checks if an active (non-deleted) subject with given company and code exists.
+func (r *subjectRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.subject WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, code).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check subject existence",
+			util.String("company_id", companyID.String()),
+			util.String("code", code),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists subject: %w", err)
+	}
+	return exists, nil
+}
+
+// Update modifies an existing subject (only if not deleted).
+func (r *subjectRepository) Update(ctx context.Context, db DBTX, e *models.Subject) error {
+	query := `
+		UPDATE academics.subject
+		SET code = $2, name = $3, description = $4, credits = $5,
+		    is_active = $6, updated_by = $7, updated_at = NOW()
+		WHERE subject_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		e.SubjectID, e.Code, e.Name, e.Description, e.Credits, e.IsActive, e.UpdatedBy,
+	).Scan(&e.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("subject %s not found or deleted", e.SubjectID)
+		}
+		r.logger.Error("failed to update subject",
+			util.String("id", e.SubjectID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update subject: %w", err)
+	}
+	return nil
+}
+
+// Activate sets is_active to true (only if not deleted).
+func (r *subjectRepository) Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.subject SET is_active = true, updated_by = $2, updated_at = NOW() WHERE subject_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to activate subject",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("activate subject: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("subject %s not found or deleted", id)
+	}
+	return nil
+}
+
+// Deactivate sets is_active to false (only if not deleted).
+func (r *subjectRepository) Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
+	query := `UPDATE academics.subject SET is_active = false, updated_by = $2, updated_at = NOW() WHERE subject_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to deactivate subject",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("deactivate subject: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("subject %s not found or deleted", id)
+	}
+	return nil
+}
+
+// GetByIDForUpdate retrieves a subject with row lock (only if not deleted).
+func (r *subjectRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error) {
+	query := `
+		SELECT subject_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.subject
+		WHERE subject_id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	var s models.Subject
+	var description sql.NullString
+	var credits sql.NullInt64
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&s.SubjectID, &s.CompanyID, &s.Code, &s.Name, &description, &credits,
+		&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get subject for update",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get subject for update: %w", err)
+	}
+	if description.Valid {
+		s.Description = description.String
+	}
+	if credits.Valid {
+		s.Credits = int(credits.Int64)
+	}
+	if createdBy.Valid {
+		s.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		s.UpdatedBy = &updatedBy.UUID
+	}
+	return &s, nil
+}
+
+// Delete soft-deletes a subject.
+func (r *subjectRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
+	query := `UPDATE academics.subject SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE subject_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	if err != nil {
+		r.logger.Error("failed to delete subject",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete subject: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("subject %s not found or already deleted", id)
+	}
+	return nil
+}
+
+// buildSubjectFilter constructs WHERE clause and arguments for SubjectFilter.
+// Note: Does NOT include deleted_at; caller must add that.
+func (r *subjectRepository) buildSubjectFilter(filter SubjectFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.IsActive != nil {
+		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
+		args = append(args, *filter.IsActive)
+		idx++
+	}
+	if filter.Code != "" {
+		conditions = append(conditions, fmt.Sprintf("code = $%d", idx))
+		args = append(args, filter.Code)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("(name ILIKE $%d OR code ILIKE $%d)", idx, idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+
+
+================================================================================
+FILE: ./models/course.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Course represents a course of study.
+type Course struct {
+	CourseID    uuid.UUID  `json:"course_id"`
+	CompanyID   uuid.UUID  `json:"company_id"`
+	Code        string     `json:"code"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Credits     int        `json:"credits,omitempty"`
+	IsActive    bool       `json:"is_active"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/subject_course_mapping.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// SubjectCourseMapping links a subject to a course for a specific term number.
+// Note: This table does not have audit or soft delete columns as per schema.
+type SubjectCourseMapping struct {
+	MappingID    uuid.UUID `json:"mapping_id"`
+	CourseID     uuid.UUID `json:"course_id"`
+	SubjectID    uuid.UUID `json:"subject_id"`
+	TermNumber   int       `json:"term_number,omitempty"`
+	IsCompulsory bool      `json:"is_compulsory"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/section.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Section represents a class section for a course in a term.
+type Section struct {
+	SectionID uuid.UUID  `json:"section_id"`
+	CourseID  uuid.UUID  `json:"course_id"`
+	TermID    uuid.UUID  `json:"term_id"`
+	Name      string     `json:"name"`
+	Capacity  int        `json:"capacity,omitempty"`
+	IsActive  bool       `json:"is_active"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/academic_year.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AcademicYear represents an academic year in the system.
+type AcademicYear struct {
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	CompanyID      uuid.UUID  `json:"company_id"`
+	Name           string     `json:"name"`
+	StartDate      time.Time  `json:"start_date"`
+	EndDate        time.Time  `json:"end_date"`
+	IsCurrent      bool       `json:"is_current"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/subject.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Subject represents a subject that can be taught.
+type Subject struct {
+	SubjectID   uuid.UUID  `json:"subject_id"`
+	CompanyID   uuid.UUID  `json:"company_id"`
+	Code        string     `json:"code"`
+	Name        string     `json:"name"`
+	Description string     `json:"description,omitempty"`
+	Credits     int        `json:"credits,omitempty"`
+	IsActive    bool       `json:"is_active"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/term.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Term represents a term within an academic year.
+type Term struct {
+	TermID         uuid.UUID  `json:"term_id"`
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	Name           string     `json:"name"`
+	StartDate      time.Time  `json:"start_date"`
+	EndDate        time.Time  `json:"end_date"`
+	IsCurrent      bool       `json:"is_current"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
