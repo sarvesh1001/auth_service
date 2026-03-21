@@ -131,7 +131,8 @@ func (s *attendanceResolutionService) ResolveEvent(
 		if s.auditService != nil {
 			auditMetadata["error"] = err.Error()
 			s.auditService.LogAction(ctx,
-				nil,
+				nil, // ✅ tx
+				nil, // companyID
 				"attendance",
 				"resolution.event.invalid",
 				"attendance_event",
@@ -152,7 +153,8 @@ func (s *attendanceResolutionService) ResolveEvent(
 		if s.auditService != nil {
 			auditMetadata["error"] = err.Error()
 			s.auditService.LogAction(ctx,
-				nil,
+				nil, // ✅ tx
+				nil, // companyID
 				"attendance",
 				"resolution.event.load_failed",
 				"attendance_event",
@@ -171,7 +173,8 @@ func (s *attendanceResolutionService) ResolveEvent(
 		if s.auditService != nil {
 			auditMetadata["error"] = err.Error()
 			s.auditService.LogAction(ctx,
-				nil,
+				nil, // ✅ tx
+				nil, // companyID
 				"attendance",
 				"resolution.event.not_found",
 				"attendance_event",
@@ -192,6 +195,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 		auditMetadata["company_id"] = event.CompanyID.String()
 		auditMetadata["event_type"] = event.EventType
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&event.CompanyID,
 			"attendance",
 			"resolution.event.loaded",
@@ -224,6 +228,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 			auditMetadata["shift_resolution_error"] = err.Error()
 			auditMetadata["timezone_fallback"] = "UTC"
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&event.CompanyID,
 				"attendance",
 				"resolution.event.shift_fallback",
@@ -251,6 +256,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 		if s.auditService != nil {
 			auditMetadata["timezone_load_error"] = err.Error()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&event.CompanyID,
 				"attendance",
 				"resolution.event.timezone_fallback",
@@ -291,6 +297,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 			auditMetadata["summary_id"] = existingSummary.AttendanceSummaryID.String()
 			auditMetadata["business_date"] = businessDate.Format("2006-01-02")
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&event.CompanyID,
 				"attendance",
 				"resolution.event.payroll_locked",
@@ -319,6 +326,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 			auditMetadata["already_resolved"] = true
 			auditMetadata["summary_id"] = existingSummary.AttendanceSummaryID.String()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&event.CompanyID,
 				"attendance",
 				"resolution.event.already_resolved",
@@ -349,6 +357,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 		if s.auditService != nil {
 			auditMetadata["error"] = err.Error()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&event.CompanyID,
 				"attendance",
 				"resolution.event.fetch_events_failed",
@@ -370,6 +379,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 		auditMetadata["fetch_window_start"] = fetchStart.Format(time.RFC3339)
 		auditMetadata["fetch_window_end"] = fetchEnd.Format(time.RFC3339)
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&event.CompanyID,
 			"attendance",
 			"resolution.event.fetched",
@@ -390,6 +400,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&event.CompanyID,
 				"attendance",
 				"resolution.event.rules_failed",
@@ -409,6 +420,7 @@ func (s *attendanceResolutionService) ResolveEvent(
 	if s.auditService != nil {
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&event.CompanyID,
 			"attendance",
 			"resolution.event.completed",
@@ -466,6 +478,7 @@ func (s *attendanceResolutionService) ResolveDay(
 		if s.auditService != nil {
 			auditMetadata["shift_resolution_error"] = err.Error()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"resolution.day.shift_fallback",
@@ -488,6 +501,7 @@ func (s *attendanceResolutionService) ResolveDay(
 		if s.auditService != nil {
 			auditMetadata["timezone_load_error"] = err.Error()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"resolution.day.timezone_fallback",
@@ -527,6 +541,7 @@ func (s *attendanceResolutionService) ResolveDay(
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"resolution.day.fetch_events_failed",
@@ -546,6 +561,7 @@ func (s *attendanceResolutionService) ResolveDay(
 	if s.auditService != nil {
 		auditMetadata["total_events"] = len(events)
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"resolution.day.events_loaded",
@@ -566,6 +582,7 @@ func (s *attendanceResolutionService) ResolveDay(
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"resolution.day.rules_failed",
@@ -585,6 +602,7 @@ func (s *attendanceResolutionService) ResolveDay(
 	if s.auditService != nil {
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"resolution.day.completed",
@@ -618,7 +636,8 @@ func (s *attendanceResolutionService) BatchResolveEvents(
 	}
 	if s.auditService != nil {
 		s.auditService.LogAction(ctx,
-			nil,
+			nil, // ✅ tx
+			nil, // companyID
 			"attendance",
 			"resolution.batch.start",
 			"batch_operation",
@@ -723,7 +742,8 @@ func (s *attendanceResolutionService) BatchResolveEvents(
 		auditMetadata["skipped_days"] = skippedCount
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 		s.auditService.LogAction(ctx,
-			nil,
+			nil, // ✅ tx
+			nil, // companyID
 			"attendance",
 			"resolution.batch.completed",
 			"batch_operation",
@@ -763,6 +783,7 @@ func (s *attendanceResolutionService) RecalculateDay(
 		if s.auditService != nil {
 			auditMetadata["shift_resolution_error"] = err.Error()
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"recalculation.day.shift_fallback",
@@ -807,6 +828,7 @@ func (s *attendanceResolutionService) RecalculateDay(
 				auditMetadata["summary_id"] = existingSummary.AttendanceSummaryID.String()
 				auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"recalculation.day.payroll_locked",
@@ -833,6 +855,7 @@ func (s *attendanceResolutionService) RecalculateDay(
 			if s.auditService != nil {
 				auditMetadata["delete_summary_error"] = err.Error()
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"recalculation.day.delete_failed",
@@ -850,6 +873,7 @@ func (s *attendanceResolutionService) RecalculateDay(
 			if s.auditService != nil {
 				auditMetadata["summary_deleted"] = true
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"recalculation.day.deleted",
@@ -868,6 +892,7 @@ func (s *attendanceResolutionService) RecalculateDay(
 	// 🎯 Log recalculation start
 	if s.auditService != nil {
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"recalculation.day.start",
@@ -891,6 +916,7 @@ func (s *attendanceResolutionService) RecalculateDay(
 		}
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"recalculation.day.completed",
@@ -907,9 +933,6 @@ func (s *attendanceResolutionService) RecalculateDay(
 	return err
 }
 
-// ============================================
-// CORE LOGIC - applyAttendanceRules WITH AUDIT LOGS (CORRECTED ORDER)
-// ============================================
 // ============================================
 // CORE LOGIC - applyAttendanceRules WITH AUDIT LOGS (CORRECTED ORDER)
 // ============================================
@@ -933,6 +956,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 	// 🎯 Log rule application start
 	if s.auditService != nil {
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"rules.apply.start",
@@ -990,6 +1014,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 				"is_payable":    isPayable,
 			}
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"rules.upsert.before",
@@ -1020,6 +1045,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 				upsertMetadata["error"] = err.Error()
 			}
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"rules.upsert.after",
@@ -1090,6 +1116,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 						"event_type":      event.EventType,
 					}
 					s.auditService.LogAction(ctx,
+						nil, // ✅ tx
 						&companyID,
 						"attendance",
 						"rules.manual_override.detected",
@@ -1129,6 +1156,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 					"result_status": status,
 				}
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"rules.schedule_override.leave",
@@ -1155,6 +1183,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 					"resulting_status": attconstants.StatusWeeklyOff,
 				}
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"rules.schedule_override",
@@ -1178,6 +1207,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 					"resulting_status": attconstants.StatusHoliday,
 				}
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"rules.schedule_override",
@@ -1208,6 +1238,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 					"resulting_status": status,
 				}
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"rules.schedule_override",
@@ -1231,6 +1262,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 					"resulting_status": attconstants.StatusNotScheduled,
 				}
 				s.auditService.LogAction(ctx,
+					nil, // ✅ tx
 					&companyID,
 					"attendance",
 					"rules.schedule_override",
@@ -1252,6 +1284,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 		// 🎯 Log no events scenario
 		if s.auditService != nil {
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"rules.no_events",
@@ -1279,6 +1312,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 			"anomaly_count": len(anomalies),
 		}
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"rules.anomalies.detected",
@@ -1315,6 +1349,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 				"error":         err.Error(),
 			}
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"rules.policy.resolution_failed",
@@ -1338,6 +1373,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 				"policy_type":   policy.PolicyType,
 			}
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"rules.policy.resolved",
@@ -1371,6 +1407,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 			"paired_events":  len(dayPairs),
 		}
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"rules.status.determined",
@@ -1443,6 +1480,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 				"error":         err.Error(),
 			}
 			s.auditService.LogAction(ctx,
+				nil, // ✅ tx
 				&companyID,
 				"attendance",
 				"rules.summary.save_failed",
@@ -1477,6 +1515,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 			"is_leave_paid":    shift.IsLeavePaid,
 		}
 		s.auditService.LogAction(ctx,
+			nil, // ✅ tx
 			&companyID,
 			"attendance",
 			"rules.summary.saved",
@@ -1508,7 +1547,7 @@ func (s *attendanceResolutionService) applyAttendanceRules(
 }
 
 // ============================================
-// HELPER METHODS
+// HELPER METHODS (unchanged, except for added imports)
 // ============================================
 
 func (s *attendanceResolutionService) resolveShift(
@@ -1516,6 +1555,7 @@ func (s *attendanceResolutionService) resolveShift(
 	companyID, userID uuid.UUID,
 	date time.Time,
 ) (*ShiftContext, error) {
+	// ... (same as original) ...
 	// Call scheduling service to resolve the day
 	resolvedDay, err := s.schedulingQSA.ResolveUserDay(ctx, companyID, userID, date)
 	if err != nil {
@@ -1560,11 +1600,9 @@ func (s *attendanceResolutionService) resolveShift(
 	return shiftCtx, nil
 }
 
-// detectAnomaliesFromPairs analyzes paired events for common anomalies.
 func (s *attendanceResolutionService) detectAnomaliesFromPairs(
 	pairs []PairedEvent,
 ) []string {
-
 	var anomalies []string
 	checkIns := 0
 	checkOuts := 0
@@ -1610,7 +1648,6 @@ func (s *attendanceResolutionService) detectAnomaliesFromPairs(
 func (s *attendanceResolutionService) detectAnomalies(
 	events []*attendance.AttendanceEvent,
 ) []string {
-
 	var anomalies []string
 
 	checkIns := 0
@@ -1618,36 +1655,29 @@ func (s *attendanceResolutionService) detectAnomalies(
 	var lastEventType string
 
 	for i, event := range events {
-
-		// 🔥 normalize here too
 		eventType := s.normalizeEventType(event.EventType)
 
 		switch eventType {
-
 		case "check_in", "shift_start":
 			checkIns++
 			if i > 0 && (lastEventType == "check_in" || lastEventType == "shift_start") {
 				anomalies = append(anomalies, "duplicate_checkin")
 			}
-
 		case "check_out", "shift_end":
 			checkOuts++
 			if checkIns == 0 || (i > 0 && lastEventType == "check_out") {
 				anomalies = append(anomalies, "orphan_checkout")
 			}
 		}
-
 		lastEventType = eventType
 	}
 
 	if checkIns > 0 && checkOuts == 0 {
 		anomalies = append(anomalies, "missing_checkout")
 	}
-
 	if checkIns == 0 && checkOuts > 0 {
 		anomalies = append(anomalies, "missing_checkin")
 	}
-
 	if checkIns > 1 || checkOuts > 1 {
 		anomalies = append(anomalies, "multiple_pairs")
 	}
@@ -1658,13 +1688,11 @@ func (s *attendanceResolutionService) detectAnomalies(
 func (s *attendanceResolutionService) pairCheckInCheckOut(
 	events []*attendance.AttendanceEvent,
 ) []PairedEvent {
-
 	// 1️⃣ Sort events
 	sort.Slice(events, func(i, j int) bool {
 		if !events[i].EventTime.Equal(events[j].EventTime) {
 			return events[i].EventTime.Before(events[j].EventTime)
 		}
-
 		priorityI := s.getSourcePriority(
 			events[i].SourceType,
 			events[i].Metadata.IsCorrection,
@@ -1673,7 +1701,6 @@ func (s *attendanceResolutionService) pairCheckInCheckOut(
 			events[j].SourceType,
 			events[j].Metadata.IsCorrection,
 		)
-
 		return priorityI > priorityJ
 	})
 
@@ -1681,27 +1708,19 @@ func (s *attendanceResolutionService) pairCheckInCheckOut(
 	var currentPair *PairedEvent
 
 	for _, event := range events {
-
 		eventTime := event.EventTime
-
-		// 🔥 CRITICAL FIX — normalize event type
 		eventType := s.normalizeEventType(event.EventType)
 
 		switch eventType {
-
 		case "check_in", "shift_start":
-
 			if currentPair != nil && currentPair.CheckOut == nil {
 				paired = append(paired, *currentPair)
 			}
-
 			currentPair = &PairedEvent{
 				CheckIn:     event,
 				CheckInTime: &eventTime,
 			}
-
 		case "check_out", "shift_end":
-
 			if currentPair != nil && currentPair.CheckOut == nil {
 				currentPair.CheckOut = event
 				currentPair.CheckOutTime = &eventTime
@@ -1713,12 +1732,10 @@ func (s *attendanceResolutionService) pairCheckInCheckOut(
 					CheckOutTime: &eventTime,
 				})
 			}
-
 		case "break_start":
 			if currentPair != nil {
 				currentPair.BreakStart = &eventTime
 			}
-
 		case "break_end":
 			if currentPair != nil && currentPair.BreakStart != nil {
 				currentPair.BreakEnd = &eventTime
@@ -1734,11 +1751,9 @@ func (s *attendanceResolutionService) pairCheckInCheckOut(
 }
 
 func (s *attendanceResolutionService) getSourcePriority(sourceType string, isCorrection *bool) int {
-	// Corrections always win
 	if isCorrection != nil && *isCorrection {
 		return 100
 	}
-
 	priorityMap := map[string]int{
 		"manual":    90,
 		"biometric": 80,
@@ -1749,11 +1764,9 @@ func (s *attendanceResolutionService) getSourcePriority(sourceType string, isCor
 		"system":    20,
 		"import":    10,
 	}
-
 	if p, ok := priorityMap[sourceType]; ok {
 		return p
 	}
-
 	return 0
 }
 
@@ -1783,7 +1796,6 @@ func (s *attendanceResolutionService) calculateMetrics(
 		start := shift.ExpectedStart.In(loc)
 		expectedStartLocal = &start
 	}
-
 	if shift.ExpectedEnd != nil {
 		end := shift.ExpectedEnd.In(loc)
 		expectedEndLocal = &end
@@ -1798,29 +1810,21 @@ func (s *attendanceResolutionService) calculateMetrics(
 		}
 	}
 
-	// Process each pair
 	for _, pair := range pairedEvents {
 		if pair.CheckIn != nil {
 			metrics.CheckIns++
-
-			// Track first check-in
 			if metrics.FirstCheckIn == nil || pair.CheckInTime.Before(*metrics.FirstCheckIn) {
 				metrics.FirstCheckIn = pair.CheckInTime
 			}
-
 			// Calculate late minutes
 			if pair.CheckInTime != nil && expectedStartLocal != nil {
 				checkInLocal := pair.CheckInTime.In(loc)
-
 				if checkInLocal.After(*expectedStartLocal) {
 					lateSeconds := checkInLocal.Sub(*expectedStartLocal).Seconds()
 					lateMinutes := int(lateSeconds / 60)
-
-					// Apply grace period
 					if policy != nil && policy.Rules.GracePeriod != nil && lateMinutes <= *policy.Rules.GracePeriod {
 						lateMinutes = 0
 					}
-
 					if lateMinutes > 0 {
 						metrics.LateMinutes = &lateMinutes
 					}
@@ -1830,53 +1834,31 @@ func (s *attendanceResolutionService) calculateMetrics(
 
 		if pair.CheckOut != nil {
 			metrics.CheckOuts++
-
-			// Track last check-out
 			if metrics.LastCheckOut == nil || pair.CheckOutTime.After(*metrics.LastCheckOut) {
 				metrics.LastCheckOut = pair.CheckOutTime
 			}
-
-			// Calculate worked time
 			if pair.CheckInTime != nil && pair.CheckOutTime != nil {
 				workedDuration := pair.CheckOutTime.Sub(*pair.CheckInTime)
-
-				// 🔥 MAX SHIFT DURATION PROTECTION
 				maxHours := defaultMaxShiftDurationHours
-
-				// If policy later supports it, override here
-				// Example:
-				// if policy != nil && policy.Rules.MaxShiftDurationHours != nil {
-				//     maxHours = *policy.Rules.MaxShiftDurationHours
-				// }
-
 				maxDuration := time.Duration(maxHours) * time.Hour
-
 				if workedDuration > maxDuration {
-					// 🔥 Anomaly is now detected in detectAnomaliesFromPairs; only cap here
 					workedDuration = maxDuration
 				}
-
 				totalWorkedSeconds += int64(workedDuration.Seconds())
 
-				// Deduct break time if present
 				if pair.BreakStart != nil && pair.BreakEnd != nil {
 					breakDuration := pair.BreakEnd.Sub(*pair.BreakStart)
 					totalBreakSeconds += int64(breakDuration.Seconds())
 				}
 
-				// Calculate overtime
 				if expectedEndLocal != nil {
 					checkOutLocal := pair.CheckOutTime.In(loc)
-
 					if checkOutLocal.After(*expectedEndLocal) {
 						overtimeSeconds := checkOutLocal.Sub(*expectedEndLocal).Seconds()
 						overtimeMinutes := int(overtimeSeconds / 60)
-
-						// Apply overtime threshold
 						if policy != nil && policy.Rules.OvertimeThreshold != nil && overtimeMinutes < *policy.Rules.OvertimeThreshold {
 							overtimeMinutes = 0
 						}
-
 						if overtimeMinutes > 0 {
 							if metrics.OvertimeMinutes == nil {
 								metrics.OvertimeMinutes = &overtimeMinutes
@@ -1890,20 +1872,16 @@ func (s *attendanceResolutionService) calculateMetrics(
 		}
 	}
 
-	// Calculate net worked minutes (minus breaks)
 	netWorkedSeconds := totalWorkedSeconds - totalBreakSeconds
 	if netWorkedSeconds > 0 {
 		workedMinutes := int(netWorkedSeconds / 60)
 		metrics.WorkedMinutes = &workedMinutes
 	}
-
-	// Calculate break minutes
 	if totalBreakSeconds > 0 {
 		breakMinutes := int(totalBreakSeconds / 60)
 		metrics.BreakMinutes = &breakMinutes
 	}
 
-	// ✅ Normalize nil late/overtime to 0 when schedule exists
 	if metrics.ExpectedMinutes != nil {
 		if metrics.LateMinutes == nil {
 			zero := 0
@@ -1923,7 +1901,6 @@ func (s *attendanceResolutionService) determineStatus(
 	shift *ShiftContext,
 	policy *attendance.AttendancePolicy,
 ) string {
-	// ✅ FIX 2: Don't overwrite schedule statuses blindly
 	if shift != nil && shift.ScheduleStatus != "" {
 		switch shift.ScheduleStatus {
 		case "weekly_off":
@@ -1935,66 +1912,49 @@ func (s *attendanceResolutionService) determineStatus(
 				return attconstants.StatusLeavePaid
 			}
 			return attconstants.StatusLeaveUnpaid
-			// For "active", "scheduled", or any other status, continue with normal flow
 		}
 	}
 
-	// No check-ins at all
 	if metrics.CheckIns == 0 {
-		// ✅ FIX 1: Use status constant
 		return attconstants.StatusAbsent
 	}
 
-	// Late arrival handling
 	if metrics.LateMinutes != nil && *metrics.LateMinutes > 0 {
 		if policy != nil && policy.Rules.MaxLateAllowed != nil &&
 			*metrics.LateMinutes > *policy.Rules.MaxLateAllowed {
-			// ✅ FIX 1: Use status constant
 			return attconstants.StatusAbsent
 		}
-		// ✅ FIX 1: Use status constant
 		return attconstants.StatusLate
 	}
 
-	// Half day check
 	if metrics.WorkedMinutes != nil && policy != nil && policy.Rules.HalfDayAfter != nil {
 		if *metrics.WorkedMinutes < *policy.Rules.HalfDayAfter {
-			// ✅ FIX 1: Use status constant
 			return attconstants.StatusHalfDay
 		}
 	}
 
-	// Check-in without check-out
 	if metrics.CheckIns > 0 && metrics.CheckOuts == 0 {
 		if policy != nil && policy.Rules.AutoCheckout != nil && *policy.Rules.AutoCheckout {
-			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 { // 4 hours
-				// ✅ FIX 1: Use status constant
+			if metrics.WorkedMinutes != nil && *metrics.WorkedMinutes >= 240 {
 				return attconstants.StatusPresent
 			}
 		}
-		// No constant for "incomplete" - using string literal
 		return "incomplete"
 	}
 
-	// Check-out without check-in
 	if metrics.CheckIns == 0 && metrics.CheckOuts > 0 {
-		// No constant for "incomplete" - using string literal
 		return "incomplete"
 	}
 
-	// Default to present
-	// ✅ FIX 1: Use status constant
 	return attconstants.StatusPresent
 }
 
-// ✅ UPDATED: resolvePolicy with work center and position hierarchy
 func (s *attendanceResolutionService) resolvePolicy(
 	ctx context.Context,
 	companyID, userID uuid.UUID,
 	date time.Time,
 	shift *ShiftContext,
 ) (*attendance.AttendancePolicy, error) {
-
 	// 1️⃣ USER-LEVEL OVERRIDE (temporary)
 	userPolicy, err := s.attendanceRepo.GetUserActiveAttendancePolicy(ctx, userID, date)
 	if err == nil && userPolicy != nil {
@@ -2068,41 +2028,33 @@ func uuidToString(id *uuid.UUID) string {
 func convertPairedEvents(
 	pairs []PairedEvent,
 ) []attendance.PairedEvent {
-
 	result := make([]attendance.PairedEvent, 0, len(pairs))
-
 	for _, p := range pairs {
-
 		var checkIn time.Time
 		if p.CheckInTime != nil {
 			checkIn = *p.CheckInTime
 		}
-
 		var checkOut *time.Time
 		if p.CheckOutTime != nil {
 			t := *p.CheckOutTime
 			checkOut = &t
 		}
-
 		pe := attendance.PairedEvent{
 			CheckInTime:  checkIn,
 			CheckOutTime: checkOut,
 		}
-
 		if p.CheckIn != nil {
 			pe.CheckInEventID = p.CheckIn.AttendanceEventID
 		}
-
 		if p.CheckOut != nil {
 			id := p.CheckOut.AttendanceEventID
 			pe.CheckOutEventID = &id
 		}
-
 		result = append(result, pe)
 	}
-
 	return result
 }
+
 func (s *attendanceResolutionService) ResolvePeriod(
 	ctx context.Context,
 	companyID uuid.UUID,
@@ -2110,7 +2062,6 @@ func (s *attendanceResolutionService) ResolvePeriod(
 	startDate, endDate time.Time,
 	recalculate bool,
 ) error {
-
 	// Normalize start & end to midnight UTC (important)
 	start := time.Date(
 		startDate.Year(),
@@ -2119,7 +2070,6 @@ func (s *attendanceResolutionService) ResolvePeriod(
 		0, 0, 0, 0,
 		time.UTC,
 	)
-
 	end := time.Date(
 		endDate.Year(),
 		endDate.Month(),
@@ -2129,44 +2079,29 @@ func (s *attendanceResolutionService) ResolvePeriod(
 	)
 
 	for _, userID := range userIDs {
-
 		current := start
-
 		for !current.After(end) {
-
 			var err error
-
-			// -----------------------------
-			// 1️⃣ Resolve / Recalculate
-			// -----------------------------
 			if recalculate {
 				err = s.RecalculateDay(ctx, companyID, userID, current)
 			} else {
 				err = s.ResolveDay(ctx, companyID, userID, current)
 			}
-
 			if err != nil {
 				s.logger.Error("Failed to resolve day",
 					zap.String("user_id", userID.String()),
 					zap.Time("date", current),
 					zap.Error(err),
 				)
-
-				// ❌ Do NOT finalize if resolve failed
 				current = current.AddDate(0, 0, 1)
 				continue
 			}
-
-			// -----------------------------
-			// 2️⃣ Finalize Day
-			// -----------------------------
 			err = s.attendanceRepo.MarkAttendanceFinalized(
 				ctx,
 				companyID,
 				userID,
 				current,
 			)
-
 			if err != nil {
 				s.logger.Error("Failed to finalize attendance day",
 					zap.String("user_id", userID.String()),
@@ -2179,11 +2114,9 @@ func (s *attendanceResolutionService) ResolvePeriod(
 					zap.Time("date", current),
 				)
 			}
-
 			current = current.AddDate(0, 0, 1)
 		}
 	}
-
 	return nil
 }
 

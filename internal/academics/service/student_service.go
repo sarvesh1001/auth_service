@@ -16,21 +16,17 @@ import (
 )
 
 // ---------------------------------------------------------------------
-// Request DTOs
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// Enterprise interfaces (updated for transactional idempotency)
+// Interfaces (updated with tx-aware methods)
 // ---------------------------------------------------------------------
 
 type IdempotencyStore interface {
 	Exists(ctx context.Context, tx *sql.Tx, key string) (bool, error)
 	Store(ctx context.Context, tx *sql.Tx, key string, response interface{}) error
-	Get(ctx context.Context, key string, target interface{}) error // now accepts a target to unmarshal into
+	Get(ctx context.Context, tx *sql.Tx, key string, target interface{}) error // now accepts tx
 }
 
 type AuditLogger interface {
-	Log(ctx context.Context, action string, entityID uuid.UUID, old, new interface{}, userID *uuid.UUID) error
+	Log(ctx context.Context, tx *sql.Tx, action string, entityID uuid.UUID, old, new interface{}, userID *uuid.UUID) error // now accepts tx
 }
 
 type OutboxStore interface {
@@ -38,7 +34,7 @@ type OutboxStore interface {
 }
 
 // ---------------------------------------------------------------------
-// StudentService interface
+// StudentService interface (unchanged)
 // ---------------------------------------------------------------------
 
 type StudentService interface {
@@ -93,7 +89,6 @@ type studentService struct {
 	logger           *zap.Logger
 }
 
-// NewStudentService creates a new student service.
 func NewStudentService(
 	repo repository.StudentRepository,
 	enrollmentRepo repository.EnrollmentRepository,
@@ -125,26 +120,25 @@ func NewStudentService(
 }
 
 // ---------------------------------------------------------------------
-// Input sanitization helpers
+// Sanitization helpers (unchanged)
 // ---------------------------------------------------------------------
 
 func (s *studentService) sanitizeCreate(req *CreateStudentRequest) {
 	req.FirstName = strings.TrimSpace(req.FirstName)
 	req.LastName = strings.TrimSpace(req.LastName)
-	req.AdmissionNo = strings.TrimSpace(strings.ToUpper(req.AdmissionNo)) // normalize
-	req.Email = strings.TrimSpace(req.Email)                              // NEW
-	req.Phone = strings.TrimSpace(req.Phone)                              // NEW
-	// other fields could be trimmed as needed
+	req.AdmissionNo = strings.TrimSpace(strings.ToUpper(req.AdmissionNo))
+	req.Email = strings.TrimSpace(req.Email)
+	req.Phone = strings.TrimSpace(req.Phone)
 }
 
 func (s *studentService) sanitizeUpdate(req *UpdateStudentRequest) {
 	req.AdmissionNo = strings.TrimSpace(strings.ToUpper(req.AdmissionNo))
-	req.Email = strings.TrimSpace(req.Email) // NEW
-	req.Phone = strings.TrimSpace(req.Phone) // NEW
+	req.Email = strings.TrimSpace(req.Email)
+	req.Phone = strings.TrimSpace(req.Phone)
 }
 
 // ---------------------------------------------------------------------
-// Validation helpers (using models enums)
+// Validation helpers (unchanged)
 // ---------------------------------------------------------------------
 
 func (s *studentService) validateCreateInput(req CreateStudentRequest) error {
@@ -193,14 +187,12 @@ func (s *studentService) Create(ctx context.Context, req CreateStudentRequest, i
 
 	s.sanitizeCreate(&req)
 
-	// Start transaction early – idempotency check must be inside the same TX
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Idempotency check – now race‑safe
 	if idempotencyKey != "" {
 		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
 		if err != nil {
@@ -208,7 +200,8 @@ func (s *studentService) Create(ctx context.Context, req CreateStudentRequest, i
 		}
 		if exists {
 			var student models.Student
-			if err := s.idempotencyStore.Get(ctx, idempotencyKey, &student); err != nil {
+			// ✅ pass tx to Get
+			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &student); err != nil {
 				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
 			}
 			logger.Info("returning idempotent response")
@@ -220,7 +213,6 @@ func (s *studentService) Create(ctx context.Context, req CreateStudentRequest, i
 		return nil, err
 	}
 
-	// Uniqueness check
 	exists, err := s.repo.ExistsByAdmissionNumber(ctx, tx, req.CompanyID, req.AdmissionNo)
 	if err != nil {
 		return nil, err
@@ -234,8 +226,8 @@ func (s *studentService) Create(ctx context.Context, req CreateStudentRequest, i
 		FirstName:             req.FirstName,
 		LastName:              req.LastName,
 		AdmissionNo:           req.AdmissionNo,
-		Email:                 req.Email, // NEW
-		Phone:                 req.Phone, // NEW
+		Email:                 req.Email,
+		Phone:                 req.Phone,
 		DateOfBirth:           req.DateOfBirth,
 		Gender:                req.Gender,
 		BloodGroup:            req.BloodGroup,
@@ -255,7 +247,6 @@ func (s *studentService) Create(ctx context.Context, req CreateStudentRequest, i
 		return nil, err
 	}
 
-	// Store idempotency key within the same transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, student); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
@@ -263,12 +254,11 @@ func (s *studentService) Create(ctx context.Context, req CreateStudentRequest, i
 		}
 	}
 
-	// Audit log (currently not TX‑aware – consider improving later)
-	if err := s.auditLogger.Log(ctx, "CREATE", student.StudentID, nil, student, req.CreatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "CREATE", student.StudentID, nil, student, req.CreatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
-	// Outbox event (payload could be slimmed down in future)
 	if err := s.outboxStore.Store(ctx, tx, string(EventStudentCreated), student); err != nil {
 		logger.Error("failed to store outbox event", zap.Error(err))
 		return nil, fmt.Errorf("failed to store outbox event: %w", err)
@@ -288,12 +278,10 @@ func (s *studentService) BulkCreate(ctx context.Context, reqs []CreateStudentReq
 	}
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
 
-	// Sanitize all
 	for i := range reqs {
 		s.sanitizeCreate(&reqs[i])
 	}
 
-	// Pre‑check duplicate admission numbers in batch
 	type key struct {
 		companyID uuid.UUID
 		admission string
@@ -316,7 +304,6 @@ func (s *studentService) BulkCreate(ctx context.Context, reqs []CreateStudentReq
 	}
 	defer tx.Rollback()
 
-	// Check DB for existing admission numbers
 	for k := range batchKeys {
 		exists, err := s.repo.ExistsByAdmissionNumber(ctx, tx, k.companyID, k.admission)
 		if err != nil {
@@ -334,8 +321,8 @@ func (s *studentService) BulkCreate(ctx context.Context, reqs []CreateStudentReq
 			FirstName:             req.FirstName,
 			LastName:              req.LastName,
 			AdmissionNo:           req.AdmissionNo,
-			Email:                 req.Email, // NEW
-			Phone:                 req.Phone, // NEW
+			Email:                 req.Email,
+			Phone:                 req.Phone,
 			DateOfBirth:           req.DateOfBirth,
 			Gender:                req.Gender,
 			BloodGroup:            req.BloodGroup,
@@ -356,9 +343,9 @@ func (s *studentService) BulkCreate(ctx context.Context, reqs []CreateStudentReq
 		return nil, err
 	}
 
-	// Audit and outbox for each student – inside transaction
 	for _, stu := range students {
-		if err := s.auditLogger.Log(ctx, "CREATE", stu.StudentID, nil, stu, stu.CreatedBy); err != nil {
+		// ✅ pass tx to audit logger
+		if err := s.auditLogger.Log(ctx, tx, "CREATE", stu.StudentID, nil, stu, stu.CreatedBy); err != nil {
 			logger.Error("audit log failed", zap.String("student_id", stu.StudentID.String()), zap.Error(err))
 		}
 		if err := s.outboxStore.Store(ctx, tx, string(EventStudentCreated), stu); err != nil {
@@ -393,7 +380,6 @@ func (s *studentService) Upsert(ctx context.Context, req CreateStudentRequest) (
 	}
 	defer tx.Rollback()
 
-	// ✅ Fix: handle error from GetByAdmissionNumber
 	existing, err := s.repo.GetByAdmissionNumber(ctx, tx, req.CompanyID, req.AdmissionNo)
 	if err != nil {
 		return nil, err
@@ -404,8 +390,8 @@ func (s *studentService) Upsert(ctx context.Context, req CreateStudentRequest) (
 		FirstName:             req.FirstName,
 		LastName:              req.LastName,
 		AdmissionNo:           req.AdmissionNo,
-		Email:                 req.Email, // NEW
-		Phone:                 req.Phone, // NEW
+		Email:                 req.Email,
+		Phone:                 req.Phone,
 		DateOfBirth:           req.DateOfBirth,
 		Gender:                req.Gender,
 		BloodGroup:            req.BloodGroup,
@@ -436,12 +422,11 @@ func (s *studentService) Upsert(ctx context.Context, req CreateStudentRequest) (
 		}
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, "UPSERT", student.StudentID, existing, student, req.UpdatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "UPSERT", student.StudentID, existing, student, req.UpdatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
-	// Outbox
 	if err := s.outboxStore.Store(ctx, tx, string(eventType), student); err != nil {
 		logger.Error("failed to store outbox event", zap.Error(err))
 		return nil, fmt.Errorf("failed to store outbox event: %w", err)
@@ -455,7 +440,7 @@ func (s *studentService) Upsert(ctx context.Context, req CreateStudentRequest) (
 	return student, nil
 }
 
-// GetByID, GetByAdmissionNumber, List, ListActive, Count, Exists – unchanged except no UserID.
+// GetByID, GetByAdmissionNumber, List, ListActive, Count, Exists – unchanged (they don't use tx)
 func (s *studentService) GetByID(ctx context.Context, id uuid.UUID) (*models.Student, error) {
 	stu, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -530,7 +515,6 @@ func (s *studentService) Update(ctx context.Context, req UpdateStudentRequest) (
 		return nil, fmt.Errorf("%w: student %s", ErrNotFound, req.StudentID)
 	}
 
-	// Check admission number uniqueness if changed
 	if req.AdmissionNo != student.AdmissionNo {
 		exists, err := s.repo.ExistsByAdmissionNumber(ctx, tx, student.CompanyID, req.AdmissionNo)
 		if err != nil {
@@ -543,8 +527,8 @@ func (s *studentService) Update(ctx context.Context, req UpdateStudentRequest) (
 
 	oldStudent := *student
 	student.AdmissionNo = req.AdmissionNo
-	student.Email = req.Email // NEW
-	student.Phone = req.Phone // NEW
+	student.Email = req.Email
+	student.Phone = req.Phone
 	student.DateOfBirth = req.DateOfBirth
 	student.Gender = req.Gender
 	student.BloodGroup = req.BloodGroup
@@ -556,23 +540,22 @@ func (s *studentService) Update(ctx context.Context, req UpdateStudentRequest) (
 	student.EmergencyContactPhone = req.EmergencyContactPhone
 	student.MedicalConditions = req.MedicalConditions
 	if req.Status != "" {
-		student.Status = models.StudentStatus(req.Status) // ✅ enum
+		student.Status = models.StudentStatus(req.Status)
 	}
 	student.UpdatedBy = req.UpdatedBy
 
 	if err := s.repo.Update(ctx, tx, student); err != nil {
-		if errors.Is(err, repository.ErrNotFound) {
+		if errors.Is(err, repository.ErrVersionConflict) {
 			return nil, fmt.Errorf("%w: student was modified concurrently", ErrConcurrentUpdate)
 		}
 		return nil, err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, "UPDATE", student.StudentID, oldStudent, student, req.UpdatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "UPDATE", student.StudentID, oldStudent, student, req.UpdatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
-	// Outbox
 	if err := s.outboxStore.Store(ctx, tx, string(EventStudentUpdated), map[string]interface{}{
 		"old": oldStudent,
 		"new": student,
@@ -601,12 +584,11 @@ func (s *studentService) UpdateContactInfo(ctx context.Context, studentID uuid.U
 		return err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, "UPDATE_CONTACT", studentID, nil, map[string]string{"phone": phone}, updatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "UPDATE_CONTACT", studentID, nil, map[string]string{"phone": phone}, updatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
-	// Outbox
 	if err := s.outboxStore.Store(ctx, tx, string(EventStudentContactUpdated), map[string]interface{}{
 		"student_id": studentID,
 		"phone":      phone,
@@ -635,7 +617,8 @@ func (s *studentService) Activate(ctx context.Context, id uuid.UUID, updatedBy *
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, "ACTIVATE", id, nil, nil, updatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "ACTIVATE", id, nil, nil, updatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 	if err := s.outboxStore.Store(ctx, tx, string(EventStudentActivated), map[string]interface{}{
@@ -665,7 +648,8 @@ func (s *studentService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, "DEACTIVATE", id, nil, nil, updatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "DEACTIVATE", id, nil, nil, updatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 	if err := s.outboxStore.Store(ctx, tx, string(EventStudentDeactivated), map[string]interface{}{
@@ -684,7 +668,7 @@ func (s *studentService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 }
 
 // ---------------------------------------------------------------------
-// Business operations
+// Business operations (Promote, Graduate, Dropout, etc.)
 // ---------------------------------------------------------------------
 
 func (s *studentService) Promote(ctx context.Context, studentID uuid.UUID, newCourseID, newSectionID uuid.UUID, updatedBy *uuid.UUID) error {
@@ -736,46 +720,26 @@ func (s *studentService) Promote(ctx context.Context, studentID uuid.UUID, newCo
 		return fmt.Errorf("academic year for term %s not found", section.TermID)
 	}
 
-	var oldEnrollmentID uuid.UUID
-	err = tx.QueryRowContext(ctx, `
-		SELECT enrollment_id FROM academics.enrollments
-		WHERE student_id = $1 AND academic_year_id = $2 AND status = 'active' AND deleted_at IS NULL
-	`, studentID, ay.AcademicYearID).Scan(&oldEnrollmentID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to check active enrollment: %w", err)
-	}
-	if err == nil {
-		_, err = tx.ExecContext(ctx, `
-			UPDATE academics.enrollments
-			SET status = 'completed', updated_at = NOW(), updated_by = $2
-			WHERE enrollment_id = $1 AND deleted_at IS NULL
-		`, oldEnrollmentID, updatedBy)
-		if err != nil {
-			return fmt.Errorf("failed to update previous enrollment to completed: %w", err)
-		}
+	// ✅ Use repository to complete active enrollment if exists
+	if err := s.enrollmentRepo.CompleteActiveEnrollment(ctx, tx, studentID, ay.AcademicYearID, updatedBy); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to complete previous enrollment: %w", err)
 	}
 
-	var newEnrollmentID uuid.UUID
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO academics.enrollments (
-			student_id, academic_year_id, section_id, enrollment_date, status,
-			created_by, updated_by, created_at, updated_at
-		) VALUES ($1, $2, $3, NOW(), 'active', $4, $5, NOW(), NOW())
-		RETURNING enrollment_id
-	`, studentID, ay.AcademicYearID, newSectionID, updatedBy, updatedBy).Scan(&newEnrollmentID)
+	// ✅ Create new enrollment
+	newEnrollmentID, err := s.enrollmentRepo.CreateEnrollment(ctx, tx, studentID, ay.AcademicYearID, newSectionID, updatedBy, updatedBy)
 	if err != nil {
 		return fmt.Errorf("failed to create new enrollment: %w", err)
 	}
 
-	// ✅ enum comparison
 	if student.Status != models.StudentActive {
 		if err := s.repo.UpdateStatus(ctx, tx, studentID, string(models.StudentActive), updatedBy); err != nil {
 			return err
 		}
 	}
 
-	if err := s.auditLogger.Log(ctx, "PROMOTE", studentID,
-		map[string]interface{}{"old_enrollment": oldEnrollmentID},
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "PROMOTE", studentID,
+		map[string]interface{}{"old_enrollment": "completed"},
 		map[string]interface{}{"new_enrollment": newEnrollmentID, "new_course": newCourseID, "new_section": newSectionID},
 		updatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
@@ -816,12 +780,8 @@ func (s *studentService) Graduate(ctx context.Context, studentID uuid.UUID, upda
 		return fmt.Errorf("%w: student %s", ErrNotFound, studentID)
 	}
 
-	_, err = tx.ExecContext(ctx, `
-		UPDATE academics.enrollments
-		SET status = 'completed', updated_at = NOW(), updated_by = $2
-		WHERE student_id = $1 AND status = 'active' AND deleted_at IS NULL
-	`, studentID, updatedBy)
-	if err != nil {
+	// ✅ Use repository to complete all active enrollments for this student
+	if err := s.enrollmentRepo.CompleteAllActiveEnrollments(ctx, tx, studentID, updatedBy); err != nil {
 		return fmt.Errorf("failed to complete enrollments: %w", err)
 	}
 
@@ -829,7 +789,8 @@ func (s *studentService) Graduate(ctx context.Context, studentID uuid.UUID, upda
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, "GRADUATE", studentID, student, &models.Student{Status: models.StudentAlumni}, updatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "GRADUATE", studentID, student, &models.Student{Status: models.StudentAlumni}, updatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
@@ -864,12 +825,8 @@ func (s *studentService) Dropout(ctx context.Context, studentID uuid.UUID, reaso
 		return fmt.Errorf("%w: student %s", ErrNotFound, studentID)
 	}
 
-	_, err = tx.ExecContext(ctx, `
-		UPDATE academics.enrollments
-		SET status = 'withdrawn', updated_at = NOW(), updated_by = $2
-		WHERE student_id = $1 AND status = 'active' AND deleted_at IS NULL
-	`, studentID, updatedBy)
-	if err != nil {
+	// ✅ Use repository to withdraw all active enrollments
+	if err := s.enrollmentRepo.WithdrawAllActiveEnrollments(ctx, tx, studentID, updatedBy); err != nil {
 		return fmt.Errorf("failed to withdraw enrollments: %w", err)
 	}
 
@@ -877,7 +834,8 @@ func (s *studentService) Dropout(ctx context.Context, studentID uuid.UUID, reaso
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, "DROPOUT", studentID, student, &models.Student{Status: models.StudentTransferred}, updatedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "DROPOUT", studentID, student, &models.Student{Status: models.StudentTransferred}, updatedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
@@ -973,32 +931,13 @@ func (s *studentService) promoteSingle(ctx context.Context, tx *sql.Tx, studentI
 		return fmt.Errorf("%w: student %s", ErrNotFound, studentID)
 	}
 
-	var oldEnrollmentID uuid.UUID
-	err = tx.QueryRowContext(ctx, `
-		SELECT enrollment_id FROM academics.enrollments
-		WHERE student_id = $1 AND academic_year_id = $2 AND status = 'active' AND deleted_at IS NULL
-	`, studentID, academicYearID).Scan(&oldEnrollmentID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to check active enrollment: %w", err)
-	}
-	if err == nil {
-		_, err = tx.ExecContext(ctx, `
-			UPDATE academics.enrollments
-			SET status = 'completed', updated_at = NOW(), updated_by = $2
-			WHERE enrollment_id = $1 AND deleted_at IS NULL
-		`, oldEnrollmentID, updatedBy)
-		if err != nil {
-			return fmt.Errorf("failed to update previous enrollment: %w", err)
-		}
+	// Complete active enrollment if exists
+	if err := s.enrollmentRepo.CompleteActiveEnrollment(ctx, tx, studentID, academicYearID, updatedBy); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to complete previous enrollment: %w", err)
 	}
 
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO academics.enrollments (
-			student_id, academic_year_id, section_id, enrollment_date, status,
-			created_by, updated_by, created_at, updated_at
-		) VALUES ($1, $2, $3, NOW(), 'active', $4, $5, NOW(), NOW())
-	`, studentID, academicYearID, newSectionID, updatedBy, updatedBy)
-	if err != nil {
+	// Create new enrollment
+	if _, err := s.enrollmentRepo.CreateEnrollment(ctx, tx, studentID, academicYearID, newSectionID, updatedBy, updatedBy); err != nil {
 		return fmt.Errorf("failed to create new enrollment: %w", err)
 	}
 
@@ -1049,7 +988,6 @@ func (s *studentService) BulkUpdateStatus(ctx context.Context, studentIDs []uuid
 func (s *studentService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("student_id", id.String()))
 
-	// CountActiveByStudent must be implemented in enrollmentRepo
 	count, err := s.enrollmentRepo.CountActiveByStudent(ctx, s.pgClient.DB, id)
 	if err != nil {
 		return err
@@ -1068,7 +1006,8 @@ func (s *studentService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, "DELETE", id, nil, nil, deletedBy); err != nil {
+	// ✅ pass tx to audit logger
+	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, nil, nil, deletedBy); err != nil {
 		logger.Error("audit log failed", zap.Error(err))
 	}
 
@@ -1120,7 +1059,7 @@ func (s *studentService) ValidateStudentPromotion(ctx context.Context, studentID
 }
 
 // ---------------------------------------------------------------------
-// Search
+// Search (unchanged)
 // ---------------------------------------------------------------------
 
 func (s *studentService) Search(ctx context.Context, companyID uuid.UUID, query string, limit int) ([]*models.Student, error) {
@@ -1138,7 +1077,7 @@ func (s *studentService) Search(ctx context.Context, companyID uuid.UUID, query 
 		limit = 20
 	}
 	if limit > 50 {
-		limit = 50 // prevent abuse
+		limit = 50
 	}
 
 	students, err := s.repo.Search(ctx, s.pgClient.DB, companyID, query, limit)

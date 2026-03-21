@@ -359,7 +359,7 @@ func (s *loanService) CreateLoan(
 	// Audit log – MODIFIED to include interest fields
 	if s.audit != nil {
 		after, _ := json.Marshal(loan)
-		_ = s.audit.LogAction(ctx, &loan.CompanyID, "loan", "loan_created",
+		_ = s.audit.LogAction(ctx, nil, &loan.CompanyID, "loan", "loan_created",
 			"employee_loan", &loan.LoanID, "admin", loan.CreatedBy,
 			nil, after, map[string]interface{}{
 				"loan_type":       loan.LoanType,
@@ -517,6 +517,7 @@ func (s *loanService) MarkEMIAsPaid(
 		if loan != nil {
 			_ = s.audit.LogAction(
 				ctx,
+				nil,
 				&loan.CompanyID,
 				"loan",
 				"emi_paid",
@@ -566,7 +567,7 @@ func (s *loanService) CloseLoan(ctx context.Context, loanID uuid.UUID, closureDa
 	}
 
 	if s.audit != nil {
-		_ = s.audit.LogAction(ctx, &loan.CompanyID, "loan", "loan_closed",
+		_ = s.audit.LogAction(ctx, nil, &loan.CompanyID, "loan", "loan_closed",
 			"employee_loan", &loanID, "system", nil, nil, nil,
 			map[string]interface{}{"closure_date": closureDate})
 	}
@@ -609,6 +610,7 @@ func (s *loanService) RecordManualPayment(
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil,
 			&loan.CompanyID,
 			"loan",
 			"manual_payment",

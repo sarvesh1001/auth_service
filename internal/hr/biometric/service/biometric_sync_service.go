@@ -236,17 +236,19 @@ func (s *biometricSyncService) ForceDeviceResync(ctx context.Context, companyID 
 	metadata := map[string]interface{}{
 		"device_id": deviceID,
 	}
+	// ✅ Add nil transaction argument
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		ModuleBiometricSync,
 		ActionDeviceResync,
 		EntityTypeDeviceSync,
-		nil,
+		nil, // entity_id (no specific entity)
 		ActorTypeDevice,
-		nil,
-		nil,
-		nil,
+		nil, // actor_id (device is not a user)
+		nil, // before_state
+		nil, // after_state
 		metadata,
 	)
 

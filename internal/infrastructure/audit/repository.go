@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,9 +15,13 @@ type AuditRepository interface {
 	// APPEND-ONLY WRITE OPERATIONS
 	// ==============================================
 
-	// CreateAuditLog creates a single audit log entry
+	// CreateAuditLog creates a single audit log entry using its own transaction
 	// This is append-only - no updates or deletes allowed
 	CreateAuditLog(ctx context.Context, log *AuditLog) error
+
+	// CreateAuditLogWithTx creates a single audit log entry within an existing transaction
+	// Use this when the audit must be part of a larger transaction (e.g., with business logic)
+	CreateAuditLogWithTx(ctx context.Context, tx *sql.Tx, log *AuditLog) error
 
 	// CreateAuditLogBatch creates multiple audit log entries in a single transaction
 	// Used for bulk operations or event sourcing

@@ -156,6 +156,7 @@ func (s *payrollAdjustmentService) Create(
 	afterState, _ := json.Marshal(adj)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&adj.CompanyID,
 		"payroll",
 		"adjustment_created",
@@ -321,6 +322,7 @@ func (s *payrollAdjustmentService) Update(
 	afterState, _ := json.Marshal(existing)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&existing.CompanyID,
 		"payroll",
 		"adjustment_updated",
@@ -371,6 +373,7 @@ func (s *payrollAdjustmentService) Delete(
 	// Audit successful deletion (non‑blocking)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&existing.CompanyID,
 		"payroll",
 		"adjustment_deleted",

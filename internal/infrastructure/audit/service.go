@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -12,13 +13,11 @@ import (
 	"auth-service/internal/util"
 )
 
-// AuditService handles business logic for audit logging
 type AuditService struct {
 	repo   AuditRepository
 	logger *zap.Logger
 }
 
-// NewAuditService creates a new audit service
 func NewAuditService(repo AuditRepository, logger *zap.Logger) *AuditService {
 	return &AuditService{
 		repo:   repo,
@@ -26,13 +25,10 @@ func NewAuditService(repo AuditRepository, logger *zap.Logger) *AuditService {
 	}
 }
 
-// ============================================================================
-// WRITE OPERATIONS (Service Layer)
-// ============================================================================
-
-// LogAction creates an audit log entry
+// ✅ LogAction now accepts a transaction pointer
 func (s *AuditService) LogAction(
 	ctx context.Context,
+	tx *sql.Tx,
 	companyID *uuid.UUID,
 	module string,
 	action string,
@@ -44,24 +40,20 @@ func (s *AuditService) LogAction(
 	afterState []byte,
 	metadata map[string]interface{},
 ) error {
-	// Business logic validation
 	if module == "" || action == "" || entityType == "" || actorType == "" {
 		return fmt.Errorf("missing required audit fields")
 	}
 
-	// Convert metadata to JSON
 	var metadataBytes []byte
 	if metadata != nil {
 		jsonBytes, err := json.Marshal(metadata)
 		if err != nil {
 			s.logger.Warn("Failed to marshal metadata", util.ErrorField(err))
-			// Continue without metadata rather than fail the audit
 		} else {
 			metadataBytes = jsonBytes
 		}
 	}
 
-	// Create audit log model
 	auditLog := &AuditLog{
 		AuditID:     uuid.New(),
 		CompanyID:   companyID,
@@ -77,30 +69,30 @@ func (s *AuditService) LogAction(
 		CreatedAt:   time.Now().UTC(),
 	}
 
-	// Store in repository
-	return s.repo.CreateAuditLog(ctx, auditLog)
+	// ✅ Use transaction‑aware repository method
+	if tx == nil {
+		// Fallback to non‑transactional (e.g., for background jobs)
+		return s.repo.CreateAuditLog(ctx, auditLog)
+	}
+	return s.repo.CreateAuditLogWithTx(ctx, tx, auditLog)
 }
 
-// ===============================
-// DEVICE ENROLLMENT AUDIT HELPERS
-// ===============================
-
+// Helper methods also updated to accept tx
 func (s *AuditService) LogDeviceEnrollment(
 	ctx context.Context,
+	tx *sql.Tx,
 	companyID uuid.UUID,
 	deviceID string,
 	deviceUserCode string,
 	userID uuid.UUID,
 	enrolledBy uuid.UUID,
 ) error {
-
 	metadata := map[string]interface{}{
 		"device_id":        deviceID,
 		"device_user_code": deviceUserCode,
 	}
-
 	return s.LogAction(
-		ctx,
+		ctx, tx,
 		&companyID,
 		"attendance",
 		"device_enroll",
@@ -116,21 +108,20 @@ func (s *AuditService) LogDeviceEnrollment(
 
 func (s *AuditService) LogDeviceEnrollmentRevocation(
 	ctx context.Context,
+	tx *sql.Tx,
 	companyID uuid.UUID,
 	deviceID string,
 	deviceUserCode string,
 	reason string,
 	revokedBy uuid.UUID,
 ) error {
-
 	metadata := map[string]interface{}{
 		"device_id":        deviceID,
 		"device_user_code": deviceUserCode,
 		"reason":           reason,
 	}
-
 	return s.LogAction(
-		ctx,
+		ctx, tx,
 		&companyID,
 		"attendance",
 		"device_revoke",

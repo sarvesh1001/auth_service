@@ -172,7 +172,7 @@ func (s *payrollQueryService) GetEmployeePayrollDetail(ctx context.Context, comp
 		"period_start":   run.PeriodStart,
 		"period_end":     run.PeriodEnd,
 	}
-	_ = s.audit.LogAction(ctx, &companyID, "payroll", "payroll_detail_viewed", "payroll_item", &payrollItemID, "user", actorID, nil, nil, metadata)
+	_ = s.audit.LogAction(ctx, nil, &companyID, "payroll", "payroll_detail_viewed", "payroll_item", &payrollItemID, "user", actorID, nil, nil, metadata)
 
 	return detail, nil
 }
@@ -302,7 +302,7 @@ func (s *payrollQueryService) ExportRunToCSV(ctx context.Context, companyID, run
 		"status":       run.Status,
 		"record_count": len(items),
 	}
-	_ = s.audit.LogAction(ctx, &companyID, "payroll", "payroll_run_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
+	_ = s.audit.LogAction(ctx, nil, &companyID, "payroll", "payroll_run_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
 	return buf.Bytes(), nil
 }
 
@@ -404,7 +404,7 @@ func (s *payrollQueryService) ExportBankFile(ctx context.Context, companyID, run
 		"format":    bankFormat,
 		"employees": len(items),
 	}
-	_ = s.audit.LogAction(ctx, &companyID, "payroll", "bank_file_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
+	_ = s.audit.LogAction(ctx, nil, &companyID, "payroll", "bank_file_export", "payroll_run", &runID, "user", actorID, nil, nil, metadata)
 
 	return buf.Bytes(), nil
 }

@@ -110,6 +110,7 @@ func (s *EmployeeService) CreateEmployeeProfile(
 	// Log audit entry
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&profile.CompanyID,
 		"hr",
 		"employee.profile.create",
@@ -227,6 +228,7 @@ func (s *EmployeeService) UpdateEmployeeProfile(
 
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&updatedProfile.CompanyID,
 		"hr",
 		"employee.profile.update",
@@ -282,6 +284,7 @@ func (s *EmployeeService) DeleteEmployeeProfile(
 	// Log audit
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&profile.CompanyID,
 		"hr",
 		"employee.profile.delete",
@@ -384,6 +387,7 @@ func (s *EmployeeService) UploadEmployeeDocument(
 
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"employee.document.upload",
@@ -451,6 +455,7 @@ func (s *EmployeeService) DeleteEmployeeDocument(
 	// Audit log
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&document.CompanyID,
 		"hr",
 		"employee.document.delete",
@@ -535,6 +540,7 @@ func (s *EmployeeService) CreateDepartmentAssignment(
 
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"employee.department.assign",
@@ -601,6 +607,7 @@ func (s *EmployeeService) CreateEmployeeExit(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"employee.exit.schedule",
@@ -648,6 +655,7 @@ func (s *EmployeeService) CreatePosition(
 
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&position.CompanyID,
 		"hr",
 		"position.create",
@@ -755,6 +763,7 @@ func (s *EmployeeService) RehireEmployee(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"employee.rehire",

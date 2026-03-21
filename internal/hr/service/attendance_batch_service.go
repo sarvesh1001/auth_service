@@ -122,8 +122,10 @@ func (s *attendanceBatchService) Apply(
 			meta["org_unit_id"] = req.OrgUnitID.String()
 		}
 
+		// ✅ Updated: added nil transaction as first argument
 		s.auditService.LogAction(
 			ctx,
+			nil, // tx
 			&req.CompanyID,
 			"attendance",
 			"batch.apply.completed",

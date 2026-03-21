@@ -1425,3 +1425,8 @@ CREATE TABLE IF NOT EXISTS outbox.events (
 
 CREATE INDEX idx_outbox_status ON outbox.events(status);
 CREATE INDEX idx_outbox_created ON outbox.events(created_at);
+
+-- academics.sql (add after table creation)
+CREATE UNIQUE INDEX idx_academic_year_one_current
+ON academics.academic_year(company_id)
+WHERE is_current = true AND deleted_at IS NULL;

@@ -175,6 +175,7 @@ func (s *statutoryEngine) CreateRuleSet(ctx context.Context, input *models.Creat
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&input.CompanyID,
 			"statutory",
 			"rule_set_created",
@@ -302,6 +303,7 @@ func (s *statutoryEngine) CreateComponentDefinition(
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&input.CompanyID,
 			"statutory",
 			"component_definition_created",
@@ -339,6 +341,7 @@ func (s *statutoryEngine) UpdateComponentDefinition(ctx context.Context, input *
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&input.CompanyID,
 			"statutory",
 			"component_definition_updated",
@@ -483,8 +486,8 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 		zap.Time("as_of", input.AsOf),
 		zap.Time("period_start", input.PeriodStart),
 		zap.Time("period_end", input.PeriodEnd),
-		zap.Float64("tax_exempt_amount", input.TaxExemptAmount), // NEW
-		zap.String("tax_regime", input.TaxRegime),               // NEW
+		zap.Float64("tax_exempt_amount", input.TaxExemptAmount),
+		zap.String("tax_regime", input.TaxRegime),
 		zap.Int("earnings_count", len(input.Earnings)),
 	)
 
@@ -706,7 +709,7 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 			continue
 		}
 
-		// For tax codes, base = totalGross - preTaxDeductions - TaxExemptAmount (NEW)
+		// For tax codes, base = totalGross - preTaxDeductions - TaxExemptAmount
 		taxBase := totalGross - preTaxDeductions - input.TaxExemptAmount
 		if taxBase < 0 {
 			taxBase = 0
@@ -723,7 +726,6 @@ func (s *statutoryEngine) run(ctx context.Context, input *StatutoryExecutionInpu
 			if !r.IsActive {
 				continue
 			}
-			// For tax, we still apply wage ceiling/min threshold if defined
 			calcBase := taxBase
 			if r.WageCeiling != nil && calcBase > *r.WageCeiling {
 				calcBase = *r.WageCeiling
@@ -998,8 +1000,8 @@ type StatutoryExecutionInput struct {
 	AsOf            time.Time
 	Earnings        []*models.PayrollLedgerItem
 	YTDContext      *models.StatutoryYTDContext
-	TaxExemptAmount float64 // NEW: total verified tax-exempt declarations for this period
-	TaxRegime       string  // NEW: 'old' or 'new' (can be used for future enhancements)
+	TaxExemptAmount float64
+	TaxRegime       string
 	ActorID         uuid.UUID
 }
 
@@ -1050,6 +1052,7 @@ func (s *statutoryEngine) DeleteComponentDefinition(ctx context.Context, company
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&companyID,
 			"statutory",
 			"component_definition_deleted",
@@ -1162,6 +1165,7 @@ func (s *statutoryEngine) CreateTaxSlab(ctx context.Context, input *CreateTaxSla
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&input.CompanyID,
 			"statutory",
 			"tax_slab_created",
@@ -1203,6 +1207,7 @@ func (s *statutoryEngine) UpdateTaxSlab(ctx context.Context, input *UpdateTaxSla
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			nil,
 			"statutory",
 			"tax_slab_updated",
@@ -1228,6 +1233,7 @@ func (s *statutoryEngine) DeactivateTaxSlab(ctx context.Context, slabID uuid.UUI
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			nil,
 			"statutory",
 			"tax_slab_deactivated",
@@ -1283,6 +1289,7 @@ func (s *statutoryEngine) CreateDeductionLimit(ctx context.Context, input *Creat
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&input.CompanyID,
 			"statutory",
 			"deduction_limit_created",
@@ -1317,6 +1324,7 @@ func (s *statutoryEngine) UpdateDeductionLimit(ctx context.Context, input *Updat
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			nil,
 			"statutory",
 			"deduction_limit_updated",
@@ -1342,6 +1350,7 @@ func (s *statutoryEngine) DeleteDeductionLimit(ctx context.Context, limitID uuid
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			nil,
 			"statutory",
 			"deduction_limit_deleted",
@@ -1405,6 +1414,7 @@ func (s *statutoryEngine) CreateComponentMapping(ctx context.Context, input *Cre
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			&input.CompanyID,
 			"statutory",
 			"component_mapping_created",
@@ -1441,6 +1451,7 @@ func (s *statutoryEngine) UpdateComponentMapping(ctx context.Context, input *Upd
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			nil,
 			"statutory",
 			"component_mapping_updated",
@@ -1466,6 +1477,7 @@ func (s *statutoryEngine) DeactivateComponentMapping(ctx context.Context, mappin
 	if s.audit != nil {
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction
 			nil,
 			"statutory",
 			"component_mapping_deactivated",
@@ -1597,6 +1609,7 @@ func (s *statutoryEngine) ExecuteTx(
 		}
 		_ = s.audit.LogAction(
 			ctx,
+			nil, // no transaction (snapshot is already committed)
 			&input.CompanyID,
 			"payroll",
 			"statutory_execution_completed",

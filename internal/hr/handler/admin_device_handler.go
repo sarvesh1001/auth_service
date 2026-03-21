@@ -244,16 +244,18 @@ func (h *DeviceHandler) CreateDevice(w http.ResponseWriter, r *http.Request) {
 	// ------------------------------
 
 	if h.auditService != nil {
+		// ✅ Pass nil for transaction
 		_ = h.auditService.LogAction(
 			ctx,
+			nil, // tx
 			&companyID,
 			"device",
 			"create",
 			"device",
-			nil,
+			nil, // entityID not applicable at creation
 			actorType,
 			&actorID,
-			nil,
+			nil, // before state
 			afterState,
 			metadata,
 		)
@@ -481,8 +483,10 @@ func (h *DeviceHandler) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entityUUID := uuid.Nil
+	// ✅ Pass nil for transaction
 	err = h.auditService.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"device",
 		"update",
@@ -601,8 +605,10 @@ func (h *DeviceHandler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entityUUID := uuid.Nil
+	// ✅ Pass nil for transaction
 	err = h.auditService.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"device",
 		"delete",
@@ -835,8 +841,10 @@ func (h *DeviceHandler) ActivateDevice(w http.ResponseWriter, r *http.Request) {
 
 	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
+	// ✅ Pass nil for transaction
 	err = h.auditService.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"device",
 		"activate",
@@ -955,8 +963,10 @@ func (h *DeviceHandler) DeactivateDevice(w http.ResponseWriter, r *http.Request)
 
 	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
+	// ✅ Pass nil for transaction
 	err = h.auditService.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"device",
 		"deactivate",
@@ -1075,8 +1085,10 @@ func (h *DeviceHandler) MarkAsTrusted(w http.ResponseWriter, r *http.Request) {
 
 	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
+	// ✅ Pass nil for transaction
 	err = h.auditService.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"device",
 		"mark_trusted",
@@ -1195,8 +1207,10 @@ func (h *DeviceHandler) RevokeTrust(w http.ResponseWriter, r *http.Request) {
 
 	afterState, _ := json.Marshal(updatedDevice)
 	entityUUID := uuid.Nil
+	// ✅ Pass nil for transaction
 	err = h.auditService.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"device",
 		"revoke_trust",

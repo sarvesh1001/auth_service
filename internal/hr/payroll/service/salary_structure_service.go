@@ -19,22 +19,14 @@ import (
 // ArrearsService interface – to be implemented elsewhere
 // ---------------------------------------------------------------------
 type ArrearsService interface {
-	// GenerateArrearsForSalaryChange creates arrears records for the period
-	// between effectiveFrom and now, comparing what was paid under the
-	// previous salary with what should have been paid under the new salary.
 	GenerateArrearsForSalaryChange(ctx context.Context, companyID, userID uuid.UUID, previousSalaryID, newSalaryID uuid.UUID, effectiveFrom time.Time) error
-
-	// GenerateArrearsForSalaryEnd creates arrears records for the period
-	// after the end date (if it is in the past), typically to recover
-	// overpayments made after an employee left.
 	GenerateArrearsForSalaryEnd(ctx context.Context, companyID, userID uuid.UUID, salaryID uuid.UUID, endDate time.Time) error
 }
 
 // ---------------------------------------------------------------------
-// SalaryStructureService interface
+// SalaryStructureService interface (unchanged)
 // ---------------------------------------------------------------------
 type SalaryStructureService interface {
-	// Structure lifecycle
 	CreateStructure(ctx context.Context, input *models.CreateSalaryStructureInput) (*models.SalaryStructure, error)
 	UpdateStructure(ctx context.Context, input *models.UpdateSalaryStructureInput) (*models.SalaryStructure, error)
 	CloneStructure(ctx context.Context, companyID uuid.UUID, structureID uuid.UUID, effectiveFrom time.Time, createdBy uuid.UUID) (*models.SalaryStructure, error)
@@ -43,14 +35,12 @@ type SalaryStructureService interface {
 	GetStructure(ctx context.Context, companyID uuid.UUID, structureID uuid.UUID) (*models.SalaryStructureDetail, error)
 	ListStructures(ctx context.Context, filter models.SalaryStructureFilter) ([]*models.SalaryStructure, int64, error)
 
-	// Component management
 	AddComponent(ctx context.Context, input *models.AddSalaryStructureComponentInput, actorID uuid.UUID) error
 	UpdateComponent(ctx context.Context, input *models.UpdateSalaryStructureComponentInput, actorID uuid.UUID) error
 	RemoveComponent(ctx context.Context, companyID uuid.UUID, structureID uuid.UUID, componentCode string, actorID uuid.UUID) error
 	ReorderComponents(ctx context.Context, companyID uuid.UUID, structureID uuid.UUID, componentCodes []string, actorID uuid.UUID) error
 	GetStructureComponents(ctx context.Context, companyID uuid.UUID, structureID uuid.UUID) ([]*models.SalaryStructureComponent, error)
 
-	// Employee assignment
 	AssignToEmployee(ctx context.Context, input *models.AssignSalaryStructureInput) error
 	BulkAssignToEmployees(ctx context.Context, input *models.BulkAssignSalaryStructureInput) error
 	ChangeEmployeeStructure(ctx context.Context, input *models.ChangeSalaryStructureInput) error
@@ -58,12 +48,10 @@ type SalaryStructureService interface {
 	GetActiveStructureForEmployee(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time) (*models.EmployeeSalaryStructure, error)
 	GetEmployeeStructureHistory(ctx context.Context, companyID uuid.UUID, userID uuid.UUID) ([]*models.EmployeeSalaryStructure, error)
 
-	// Validation & governance
 	ValidateStructureMutationAllowed(ctx context.Context, companyID uuid.UUID, effectiveFrom time.Time) error
 	ValidateAssignmentAllowed(ctx context.Context, companyID uuid.UUID, effectiveFrom time.Time) error
 	CanDeactivateStructure(ctx context.Context, structureID uuid.UUID) (bool, error)
 
-	// Snapshot
 	BuildStructureSnapshot(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, asOf time.Time) (*models.SalaryStructureSnapshot, error)
 }
 
@@ -71,17 +59,16 @@ type salaryStructureService struct {
 	repo            repository.CompensationRepository
 	lockService     PayrollLockService
 	compensationSvc CompensationService
-	arrearsSvc      ArrearsService // NEW
+	arrearsSvc      ArrearsService
 	audit           *a.AuditService
 	logger          *zap.Logger
 }
 
-// NewSalaryStructureService now accepts an ArrearsService.
 func NewSalaryStructureService(
 	repo repository.CompensationRepository,
 	lockService PayrollLockService,
 	compensationSvc CompensationService,
-	arrearsSvc ArrearsService, // NEW
+	arrearsSvc ArrearsService,
 	audit *a.AuditService,
 	logger *zap.Logger,
 ) SalaryStructureService {
@@ -96,7 +83,7 @@ func NewSalaryStructureService(
 }
 
 // ---------------------------------------------------------------------
-// STRUCTURE LIFECYCLE (unchanged)
+// STRUCTURE LIFECYCLE
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) CreateStructure(
@@ -108,27 +95,15 @@ func (s *salaryStructureService) CreateStructure(
 		return nil, errors.New("invalid company id")
 	}
 
-	// -------------------------------------------------------
-	// CHECK DUPLICATE STRUCTURE NAME
-	// -------------------------------------------------------
-
 	existing, err := s.repo.GetSalaryStructuresByCompany(ctx, input.CompanyID, true)
 	if err != nil {
 		return nil, err
 	}
-
 	for _, st := range existing {
 		if st.StructureName == input.StructureName {
-			return nil, fmt.Errorf(
-				"salary structure '%s' already exists for this company",
-				input.StructureName,
-			)
+			return nil, fmt.Errorf("salary structure '%s' already exists for this company", input.StructureName)
 		}
 	}
-
-	// -------------------------------------------------------
-	// CREATE STRUCTURE
-	// -------------------------------------------------------
 
 	structure := &models.SalaryStructure{
 		SalaryStructureID: uuid.New(),
@@ -143,14 +118,10 @@ func (s *salaryStructureService) CreateStructure(
 		return nil, err
 	}
 
-	// -------------------------------------------------------
-	// AUDIT
-	// -------------------------------------------------------
-
 	afterState, _ := json.Marshal(structure)
-
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_created",
@@ -173,7 +144,6 @@ func (s *salaryStructureService) UpdateStructure(
 	ctx context.Context,
 	input *models.UpdateSalaryStructureInput,
 ) (*models.SalaryStructure, error) {
-	// ... existing code ...
 	structure, err := s.repo.GetSalaryStructure(ctx, input.StructureID, input.CompanyID)
 	if err != nil || structure == nil {
 		return nil, fmt.Errorf("structure not found")
@@ -195,6 +165,7 @@ func (s *salaryStructureService) UpdateStructure(
 	afterState, _ := json.Marshal(structure)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_updated",
@@ -217,7 +188,6 @@ func (s *salaryStructureService) CloneStructure(
 	effectiveFrom time.Time,
 	createdBy uuid.UUID,
 ) (*models.SalaryStructure, error) {
-	// ... existing code ...
 	orig, err := s.repo.GetSalaryStructure(ctx, structureID, companyID)
 	if err != nil || orig == nil {
 		return nil, fmt.Errorf("original structure not found")
@@ -239,6 +209,7 @@ func (s *salaryStructureService) CloneStructure(
 	afterState, _ := json.Marshal(newStructure)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&newStructure.CompanyID,
 		"payroll",
 		"salary_structure_cloned",
@@ -262,7 +233,6 @@ func (s *salaryStructureService) PublishStructure(
 	structureID uuid.UUID,
 	actorID uuid.UUID,
 ) error {
-	// ... existing code ...
 	structure, err := s.repo.GetSalaryStructure(ctx, structureID, companyID)
 	if err != nil || structure == nil {
 		return fmt.Errorf("structure not found")
@@ -283,6 +253,7 @@ func (s *salaryStructureService) PublishStructure(
 	afterState, _ := json.Marshal(structure)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_published",
@@ -304,7 +275,6 @@ func (s *salaryStructureService) DeactivateStructure(
 	structureID uuid.UUID,
 	actorID uuid.UUID,
 ) error {
-	// ... existing code ...
 	inUse, err := s.repo.IsSalaryStructureInUse(ctx, structureID)
 	if err != nil {
 		return err
@@ -326,6 +296,7 @@ func (s *salaryStructureService) DeactivateStructure(
 
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&structure.CompanyID,
 		"payroll",
 		"salary_structure_deactivated",
@@ -346,7 +317,6 @@ func (s *salaryStructureService) GetStructure(
 	companyID uuid.UUID,
 	structureID uuid.UUID,
 ) (*models.SalaryStructureDetail, error) {
-	// ... existing code ...
 	structure, err := s.repo.GetSalaryStructure(ctx, structureID, companyID)
 	if err != nil || structure == nil {
 		return nil, fmt.Errorf("structure not found")
@@ -367,7 +337,6 @@ func (s *salaryStructureService) ListStructures(
 	ctx context.Context,
 	filter models.SalaryStructureFilter,
 ) ([]*models.SalaryStructure, int64, error) {
-	// ... existing code ...
 	list, err := s.repo.GetSalaryStructuresByCompany(ctx, filter.CompanyID, filter.IncludeInactive)
 	if err != nil {
 		return nil, 0, err
@@ -380,7 +349,7 @@ func (s *salaryStructureService) ListStructures(
 }
 
 // ---------------------------------------------------------------------
-// COMPONENT MANAGEMENT (unchanged)
+// COMPONENT MANAGEMENT
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) AddComponent(
@@ -388,7 +357,6 @@ func (s *salaryStructureService) AddComponent(
 	input *models.AddSalaryStructureComponentInput,
 	actorID uuid.UUID,
 ) error {
-	// ... existing code ...
 	component := &models.SalaryStructureComponent{
 		MappingID:         uuid.New(),
 		SalaryStructureID: input.StructureID,
@@ -407,6 +375,7 @@ func (s *salaryStructureService) AddComponent(
 	afterState, _ := json.Marshal(component)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&input.CompanyID,
 		"payroll",
 		"salary_structure_component_added",
@@ -430,7 +399,6 @@ func (s *salaryStructureService) UpdateComponent(
 	input *models.UpdateSalaryStructureComponentInput,
 	actorID uuid.UUID,
 ) error {
-	// ... existing code ...
 	component, err := s.repo.GetStructureComponentByID(ctx, input.MappingID)
 	if err != nil || component == nil {
 		return fmt.Errorf("component not found")
@@ -448,6 +416,7 @@ func (s *salaryStructureService) UpdateComponent(
 	afterState, _ := json.Marshal(component)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&component.CompanyID,
 		"payroll",
 		"salary_structure_component_updated",
@@ -470,7 +439,6 @@ func (s *salaryStructureService) RemoveComponent(
 	componentCode string,
 	actorID uuid.UUID,
 ) error {
-	// ... existing code ...
 	comps, err := s.repo.GetStructureComponents(ctx, structureID, companyID)
 	if err != nil {
 		return err
@@ -499,6 +467,7 @@ func (s *salaryStructureService) RemoveComponent(
 
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&companyID,
 		"payroll",
 		"salary_structure_component_removed",
@@ -524,7 +493,6 @@ func (s *salaryStructureService) ReorderComponents(
 	componentCodes []string,
 	actorID uuid.UUID,
 ) error {
-	// ... existing code ...
 	comps, err := s.repo.GetStructureComponents(ctx, structureID, companyID)
 	if err != nil {
 		return err
@@ -552,6 +520,7 @@ func (s *salaryStructureService) ReorderComponents(
 	afterState, _ := json.Marshal(comps)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&companyID,
 		"payroll",
 		"salary_structure_components_reordered",
@@ -574,7 +543,6 @@ func (s *salaryStructureService) GetStructureComponents(
 	companyID uuid.UUID,
 	structureID uuid.UUID,
 ) ([]*models.SalaryStructureComponent, error) {
-	// ... existing code ...
 	comps, err := s.repo.GetStructureComponentsOrdered(ctx, structureID, companyID)
 	if err != nil {
 		return nil, err
@@ -587,7 +555,7 @@ func (s *salaryStructureService) GetStructureComponents(
 }
 
 // ---------------------------------------------------------------------
-// EMPLOYEE ASSIGNMENT (UPDATED with arrears logic)
+// EMPLOYEE ASSIGNMENT
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) AssignToEmployee(
@@ -598,15 +566,13 @@ func (s *salaryStructureService) AssignToEmployee(
 		return err
 	}
 
-	// Check if there is an existing active salary that would overlap.
-	// The repo will reject overlap, but we can proactively detect and return a friendly error.
 	overlap, err := s.repo.HasOverlappingSalaryAssignment(
 		ctx,
 		input.CompanyID,
 		input.UserID,
 		input.EffectiveFrom,
-		nil, // no end date, open-ended
-		nil, // no excludeID
+		nil,
+		nil,
 	)
 	if err != nil {
 		return err
@@ -631,10 +597,8 @@ func (s *salaryStructureService) AssignToEmployee(
 		return err
 	}
 
-	// After creation, if effectiveFrom is in the past, trigger arrears generation.
 	today := time.Now().Truncate(24 * time.Hour)
 	if input.EffectiveFrom.Before(today) {
-		// Get the previous salary that was active just before effectiveFrom.
 		prev, err := s.repo.GetActiveEmployeeSalary(ctx, input.CompanyID, input.UserID, input.EffectiveFrom.Add(-time.Nanosecond))
 		if err != nil {
 			s.logger.Error("Failed to fetch previous salary for arrears calculation",
@@ -642,7 +606,6 @@ func (s *salaryStructureService) AssignToEmployee(
 				zap.String("user_id", input.UserID.String()),
 				zap.Error(err))
 		} else if prev != nil {
-			// Call arrears service
 			if err := s.arrearsSvc.GenerateArrearsForSalaryChange(
 				ctx,
 				input.CompanyID,
@@ -654,8 +617,6 @@ func (s *salaryStructureService) AssignToEmployee(
 				s.logger.Error("Failed to generate arrears for salary change",
 					zap.String("salary_id", salary.EmployeeSalaryID.String()),
 					zap.Error(err))
-				// Do not fail the assignment because arrears generation is a secondary concern.
-				// Return the error only if you want to rollback; here we log and continue.
 			}
 		}
 	}
@@ -663,6 +624,7 @@ func (s *salaryStructureService) AssignToEmployee(
 	afterState, _ := json.Marshal(salary)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&input.CompanyID,
 		"payroll",
 		"salary_structure_assigned",
@@ -685,7 +647,6 @@ func (s *salaryStructureService) BulkAssignToEmployees(
 	ctx context.Context,
 	input *models.BulkAssignSalaryStructureInput,
 ) error {
-	// ... existing code ...
 	for _, userID := range input.UserIDs {
 		err := s.AssignToEmployee(ctx, &models.AssignSalaryStructureInput{
 			CompanyID:     input.CompanyID,
@@ -707,24 +668,18 @@ func (s *salaryStructureService) ChangeEmployeeStructure(
 	ctx context.Context,
 	input *models.ChangeSalaryStructureInput,
 ) error {
-	// 1. Validate the new effective date is not locked.
 	if err := s.ValidateAssignmentAllowed(ctx, input.CompanyID, input.EffectiveFrom); err != nil {
 		return err
 	}
 
-	// 2. End the current active salary as of the day before the new effective date.
-	//    This ensures no overlap and closes the previous assignment.
 	endDate := input.EffectiveFrom.AddDate(0, 0, -1)
 	if err := s.EndEmployeeStructure(ctx, input.CompanyID, input.UserID, endDate, input.ActorID); err != nil {
-		// If there is no active salary to end, we can still proceed (e.g., first assignment).
-		// Check the error type; we'll log and continue.
 		s.logger.Warn("Could not end previous salary during change; continuing with new assignment",
 			zap.String("company_id", input.CompanyID.String()),
 			zap.String("user_id", input.UserID.String()),
 			zap.Error(err))
 	}
 
-	// 3. Assign the new structure.
 	if err := s.AssignToEmployee(ctx, &models.AssignSalaryStructureInput{
 		CompanyID:     input.CompanyID,
 		UserID:        input.UserID,
@@ -747,7 +702,6 @@ func (s *salaryStructureService) EndEmployeeStructure(
 	endDate time.Time,
 	actorID uuid.UUID,
 ) error {
-	// Fetch the active salary as of the end date (the one that will be ended).
 	active, err := s.repo.GetActiveEmployeeSalary(ctx, companyID, userID, endDate)
 	if err != nil || active == nil {
 		return fmt.Errorf("no active salary found on %s", endDate.Format("2006-01-02"))
@@ -763,7 +717,6 @@ func (s *salaryStructureService) EndEmployeeStructure(
 		return err
 	}
 
-	// If endDate is in the past, generate arrears for the period after endDate.
 	today := time.Now().Truncate(24 * time.Hour)
 	if endDate.Before(today) {
 		if err := s.arrearsSvc.GenerateArrearsForSalaryEnd(
@@ -776,13 +729,13 @@ func (s *salaryStructureService) EndEmployeeStructure(
 			s.logger.Error("Failed to generate arrears for salary end",
 				zap.String("salary_id", active.EmployeeSalaryID.String()),
 				zap.Error(err))
-			// Continue – we don't want to fail the ending operation.
 		}
 	}
 
 	afterState, _ := json.Marshal(active)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // ✅ added transaction argument
 		&companyID,
 		"payroll",
 		"salary_structure_ended",
@@ -808,7 +761,6 @@ func (s *salaryStructureService) GetActiveStructureForEmployee(
 	userID uuid.UUID,
 	asOf time.Time,
 ) (*models.EmployeeSalaryStructure, error) {
-	// ... existing code ...
 	salary, err := s.repo.GetActiveEmployeeSalary(ctx, companyID, userID, asOf)
 	if err != nil || salary == nil {
 		return nil, err
@@ -823,7 +775,6 @@ func (s *salaryStructureService) GetEmployeeStructureHistory(
 	companyID uuid.UUID,
 	userID uuid.UUID,
 ) ([]*models.EmployeeSalaryStructure, error) {
-	// ... existing code ...
 	history, err := s.repo.GetEmployeeSalaryHistory(ctx, companyID, userID, 1, 1000)
 	if err != nil {
 		return nil, err
@@ -838,7 +789,7 @@ func (s *salaryStructureService) GetEmployeeStructureHistory(
 }
 
 // ---------------------------------------------------------------------
-// VALIDATION & GOVERNANCE (unchanged)
+// VALIDATION & GOVERNANCE
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) ValidateStructureMutationAllowed(
@@ -865,7 +816,7 @@ func (s *salaryStructureService) CanDeactivateStructure(
 }
 
 // ---------------------------------------------------------------------
-// SNAPSHOT (unchanged)
+// SNAPSHOT
 // ---------------------------------------------------------------------
 
 func (s *salaryStructureService) BuildStructureSnapshot(

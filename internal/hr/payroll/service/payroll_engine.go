@@ -1432,6 +1432,7 @@ func (s *payrollEngineService) CreateRun(
 	}
 	_ = s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"payroll_run_created",
@@ -1483,6 +1484,7 @@ func (s *payrollEngineService) CreateComponent(
 
 	_ = s.audit.LogAction(
 		ctx,
+		nil,
 		&input.CompanyID,
 		"payroll",
 		"component_created",
@@ -1533,6 +1535,7 @@ func (s *payrollEngineService) UpdateComponent(
 
 	_ = s.audit.LogAction(
 		ctx,
+		nil,
 		&input.CompanyID,
 		"payroll",
 		"component_updated",
@@ -1576,6 +1579,7 @@ func (s *payrollEngineService) DeactivateComponent(
 
 	_ = s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"component_deactivated",
@@ -1621,6 +1625,7 @@ func (s *payrollEngineService) auditRunStateChange(
 	}
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"run_state_changed",
@@ -1656,6 +1661,7 @@ func (s *payrollEngineService) auditEmployeeProcessed(
 	}
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"employee_processed",
@@ -1687,6 +1693,7 @@ func (s *payrollEngineService) auditEmployeeReprocess(
 	}
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"employee_reprocessed",

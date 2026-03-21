@@ -97,6 +97,7 @@ func (s *taxDeclarationService) CreateDeclarationType(
 
 	// Audit
 	if err := s.audit.LogAction(ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"tax_declaration_type_created",
@@ -159,6 +160,7 @@ func (s *taxDeclarationService) UpdateDeclarationType(
 
 	// Audit
 	if err := s.audit.LogAction(ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"tax_declaration_type_updated",
@@ -238,6 +240,7 @@ func (s *taxDeclarationService) CreateDeclaration(ctx context.Context, input *mo
 
 	// Audit
 	if err := s.audit.LogAction(ctx,
+		nil,
 		&input.CompanyID,
 		"payroll",
 		"tax_declaration_created",
@@ -302,6 +305,7 @@ func (s *taxDeclarationService) UpdateDeclaration(ctx context.Context, input *mo
 
 	// Audit
 	if err := s.audit.LogAction(ctx,
+		nil,
 		&existing.CompanyID,
 		"payroll",
 		"tax_declaration_updated",
@@ -362,6 +366,7 @@ func (s *taxDeclarationService) VerifyDeclaration(ctx context.Context, declarati
 
 	// Audit
 	if err := s.audit.LogAction(ctx,
+		nil,
 		&existing.CompanyID,
 		"payroll",
 		"tax_declaration_verified",

@@ -240,6 +240,7 @@ func (s *schedulingServiceImpl) CreateWorkCalendar(
 			calendarJSON, _ := json.Marshal(calendar)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&calendar.CompanyID,
 				"scheduling",
 				"work_calendar.create",
@@ -362,6 +363,7 @@ func (s *schedulingServiceImpl) UpdateWorkCalendar(
 			afterState, _ := json.Marshal(calendar)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&calendar.CompanyID,
 				"scheduling",
 				"work_calendar.update",
@@ -420,6 +422,7 @@ func (s *schedulingServiceImpl) DeleteWorkCalendar(
 			auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			s.auditService.LogAction(auditCtx,
+				nil,
 				&calendar.CompanyID,
 				"scheduling",
 				"work_calendar.delete",
@@ -507,6 +510,7 @@ func (s *schedulingServiceImpl) CreateScheduleTemplate(
 			defer cancel()
 			templateJSON, _ := json.Marshal(template)
 			s.auditService.LogAction(auditCtx,
+				nil,
 				&template.CompanyID,
 				"scheduling",
 				"schedule_template.create",
@@ -609,6 +613,7 @@ func (s *schedulingServiceImpl) UpdateScheduleTemplate(
 			defer cancel()
 			afterState, _ := json.Marshal(template)
 			s.auditService.LogAction(auditCtx,
+				nil,
 				&template.CompanyID,
 				"scheduling",
 				"schedule_template.update",
@@ -674,6 +679,7 @@ func (s *schedulingServiceImpl) DeleteScheduleTemplate(
 			auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			s.auditService.LogAction(auditCtx,
+				nil,
 				&template.CompanyID,
 				"scheduling",
 				"schedule_template.delete",
@@ -1456,6 +1462,7 @@ func (s *schedulingServiceImpl) CreateWorkCenterShiftMapping(
 			mappingJSON, _ := json.Marshal(mapping)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&companyID,
 				"scheduling",
 				"work_center_shift_mapping.create",
@@ -1535,6 +1542,7 @@ func (s *schedulingServiceImpl) UpdateWorkCenterShiftMapping(
 			afterState, _ := json.Marshal(mapping)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&mapping.CompanyID,
 				"scheduling",
 				"work_center_shift_mapping.update",
@@ -1602,6 +1610,7 @@ func (s *schedulingServiceImpl) AssignUserToWorkCenter(
 				currentJSON, _ := json.Marshal(current)
 				s.auditService.LogAction(
 					auditCtx,
+					nil,
 					&companyID,
 					"scheduling",
 					"user_work_center_assignment.end",
@@ -1652,6 +1661,7 @@ func (s *schedulingServiceImpl) AssignUserToWorkCenter(
 			assignmentJSON, _ := json.Marshal(assignment)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&companyID,
 				"scheduling",
 				"user_work_center_assignment.create",
@@ -1714,6 +1724,7 @@ func (s *schedulingServiceImpl) EndUserWorkCenterAssignment(
 			})
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				nil,
 				"scheduling",
 				"user_work_center_assignment.end",
@@ -1803,6 +1814,7 @@ func (s *schedulingServiceImpl) CreateScheduleInstance(
 			instanceJSON, _ := json.Marshal(instance)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&instance.CompanyID,
 				"scheduling",
 				"schedule_instance.create",
@@ -1902,6 +1914,7 @@ func (s *schedulingServiceImpl) DeleteScheduleInstance(
 			defer cancel()
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&instance.CompanyID,
 				"scheduling",
 				"schedule_instance.delete",
@@ -2240,6 +2253,7 @@ func (s *schedulingServiceImpl) logAuditAction(
 				entityType = "work_calendar"
 			}
 			s.auditService.LogAction(auditCtx,
+				nil,
 				&companyID,
 				"scheduling",
 				action,
@@ -2931,6 +2945,7 @@ func (s *schedulingServiceImpl) UpdateWorkCenterShiftMappingByKey(
 			afterState, _ := json.Marshal(mapping)
 			s.auditService.LogAction(
 				auditCtx,
+				nil,
 				&companyID,
 				"scheduling",
 				"work_center_shift_mapping.update_by_key",

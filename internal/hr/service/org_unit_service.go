@@ -84,6 +84,7 @@ func (s *OrgUnitService) CreateOrgUnit(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.create",
@@ -178,6 +179,7 @@ func (s *OrgUnitService) UpdateOrgUnit(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.update",
@@ -231,6 +233,7 @@ func (s *OrgUnitService) DeleteOrgUnit(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.delete",
@@ -326,6 +329,7 @@ func (s *OrgUnitService) AddMember(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.member.add",
@@ -388,6 +392,7 @@ func (s *OrgUnitService) RemoveMember(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.member.remove",
@@ -468,6 +473,7 @@ func (s *OrgUnitService) AssignRole(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.role.assign",
@@ -529,6 +535,7 @@ func (s *OrgUnitService) RemoveRole(
 
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.role.remove",
@@ -686,6 +693,7 @@ func (s *OrgUnitService) UpdateMember(
 	// 5️⃣ Audit
 	_ = s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"hr",
 		"org_unit.member.update",

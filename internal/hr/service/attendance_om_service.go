@@ -1,13 +1,14 @@
 package service
 
 import (
-	"auth-service/internal/hr/repository"
-	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/hr/repository"
+	a "auth-service/internal/infrastructure/audit"
 )
 
 //
@@ -101,7 +102,9 @@ func (s *attendanceOMService) CanMarkAttendance(
 			auditMetadata["result"] = "allowed"
 			auditMetadata["reason"] = "self"
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.authorization.self",
@@ -125,7 +128,9 @@ func (s *attendanceOMService) CanMarkAttendance(
 			auditMetadata["reason"] = "failed_actor_membership"
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.authorization.failed",
@@ -149,7 +154,9 @@ func (s *attendanceOMService) CanMarkAttendance(
 			auditMetadata["reason"] = "failed_target_membership"
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.authorization.failed",
@@ -177,7 +184,9 @@ func (s *attendanceOMService) CanMarkAttendance(
 						auditMetadata["org_unit_id"] = a.OrgUnitID.String()
 						auditMetadata["actor_role"] = *a.Role
 						auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+						// ✅ Added tx = nil
 						s.auditService.LogAction(ctx,
+							nil, // tx
 							&companyID,
 							"attendance",
 							"om.authorization.success",
@@ -203,7 +212,9 @@ func (s *attendanceOMService) CanMarkAttendance(
 		auditMetadata["actor_memberships"] = len(actorMemberships)
 		auditMetadata["target_memberships"] = len(targetMemberships)
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		// ✅ Added tx = nil
 		s.auditService.LogAction(ctx,
+			nil, // tx
 			&companyID,
 			"attendance",
 			"om.authorization.denied",
@@ -242,7 +253,9 @@ func (s *attendanceOMService) CanCorrectAttendance(
 			auditMetadata["result"] = "allowed"
 			auditMetadata["reason"] = "self"
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.correction_authorization.self",
@@ -266,7 +279,9 @@ func (s *attendanceOMService) CanCorrectAttendance(
 			auditMetadata["reason"] = "failed_actor_membership"
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.correction_authorization.failed",
@@ -290,7 +305,9 @@ func (s *attendanceOMService) CanCorrectAttendance(
 			auditMetadata["reason"] = "failed_target_membership"
 			auditMetadata["error"] = err.Error()
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.correction_authorization.failed",
@@ -318,7 +335,9 @@ func (s *attendanceOMService) CanCorrectAttendance(
 						auditMetadata["org_unit_id"] = a.OrgUnitID.String()
 						auditMetadata["actor_role"] = *a.Role
 						auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+						// ✅ Added tx = nil
 						s.auditService.LogAction(ctx,
+							nil, // tx
 							&companyID,
 							"attendance",
 							"om.correction_authorization.success",
@@ -344,7 +363,9 @@ func (s *attendanceOMService) CanCorrectAttendance(
 		auditMetadata["actor_memberships"] = len(actorMemberships)
 		auditMetadata["target_memberships"] = len(targetMemberships)
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		// ✅ Added tx = nil
 		s.auditService.LogAction(ctx,
+			nil, // tx
 			&companyID,
 			"attendance",
 			"om.correction_authorization.denied",
@@ -404,7 +425,9 @@ func (s *attendanceOMService) CanPunchAttendance(
 				auditMetadata["result"] = "denied"
 				auditMetadata["reason"] = "work_center_required_for_device"
 				auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+				// ✅ Added tx = nil
 				s.auditService.LogAction(ctx,
+					nil, // tx
 					&companyID,
 					"attendance",
 					"om.device_punch.work_center_required",
@@ -427,7 +450,9 @@ func (s *attendanceOMService) CanPunchAttendance(
 			auditMetadata["result"] = "allowed"
 			auditMetadata["reason"] = "device_punch_allowed"
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.device_punch.allowed",
@@ -455,7 +480,9 @@ func (s *attendanceOMService) CanPunchAttendance(
 			auditMetadata["result"] = "denied"
 			auditMetadata["reason"] = "human_cannot_use_device_source"
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.human_punch.invalid_source",
@@ -483,7 +510,9 @@ func (s *attendanceOMService) CanPunchAttendance(
 			auditMetadata["result"] = "denied"
 			auditMetadata["reason"] = reason
 			auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+			// ✅ Added tx = nil
 			s.auditService.LogAction(ctx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				"om.human_punch.denied",
@@ -504,7 +533,9 @@ func (s *attendanceOMService) CanPunchAttendance(
 		auditMetadata["result"] = "allowed"
 		auditMetadata["reason"] = "human_punch_allowed"
 		auditMetadata["duration_ms"] = time.Since(startTime).Milliseconds()
+		// ✅ Added tx = nil
 		s.auditService.LogAction(ctx,
+			nil, // tx
 			&companyID,
 			"attendance",
 			"om.human_punch.allowed",

@@ -49,7 +49,8 @@ type studentRepository struct {
 }
 
 var (
-	ErrNotFound = errors.New("resource not found")
+	ErrNotFound        = errors.New("resource not found")
+	ErrVersionConflict = errors.New("version conflict") // Added for optimistic locking
 )
 
 // NewStudentRepository creates a new student repository with encryption support.
@@ -617,7 +618,16 @@ func (r *studentRepository) Update(ctx context.Context, db DBTX, s *models.Stude
 
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: student %s (version mismatch or deleted)", ErrNotFound, s.StudentID)
+			// Check if the record exists (not deleted) to distinguish between not found and version conflict
+			var exists bool
+			checkQuery := `SELECT EXISTS(SELECT 1 FROM academics.students WHERE student_id = $1 AND deleted_at IS NULL)`
+			_ = db.QueryRowContext(ctx, checkQuery, s.StudentID).Scan(&exists)
+			if exists {
+				// Record exists, so version must have been mismatched
+				return fmt.Errorf("%w: student %s version mismatch", ErrVersionConflict, s.StudentID)
+			}
+			// Record does not exist or is deleted
+			return fmt.Errorf("%w: student %s", ErrNotFound, s.StudentID)
 		}
 		r.logger.Error("failed to update student",
 			util.String("id", s.StudentID.String()),

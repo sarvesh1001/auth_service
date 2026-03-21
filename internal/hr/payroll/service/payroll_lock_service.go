@@ -187,6 +187,7 @@ func (s *payrollLockService) LockPeriod(
 	afterState, _ := json.Marshal(lock)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"lock_created",
@@ -281,6 +282,7 @@ func (s *payrollLockService) UnlockPeriod(
 	// Audit successful unlock (non‑blocking)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"payroll",
 		"lock_deleted",

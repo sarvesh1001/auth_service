@@ -115,6 +115,7 @@ func (s *WorkCenterService) CreateWorkCenter(
 	// but include the code in metadata
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"operations",
 		"work_center.create",
@@ -205,6 +206,7 @@ func (s *WorkCenterService) UpdateWorkCenter(
 
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"operations",
 		"work_center.update",
@@ -263,6 +265,7 @@ func (s *WorkCenterService) DeleteWorkCenter(
 
 	auditErr := s.auditService.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"operations",
 		"work_center.delete",

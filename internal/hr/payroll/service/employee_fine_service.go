@@ -1,7 +1,6 @@
 package service
 
 import (
-	a "auth-service/internal/infrastructure/audit"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 
 	"auth-service/internal/hr/payroll/models"
 	"auth-service/internal/hr/payroll/repository"
+	a "auth-service/internal/infrastructure/audit"
 )
 
 // ----------------------------------------------------------------------
@@ -238,14 +238,26 @@ func (s *employeeFineService) CreateFine(ctx context.Context, input CreateEmploy
 		return nil, err
 	}
 
-	// Audit log
-	_ = s.audit.LogAction(ctx, &input.CompanyID, "payroll", "fine_created", "employee_fine",
-		&fine.FineID, "admin", &input.CreatedBy, nil, nil, map[string]interface{}{
+	// Audit log (transaction nil)
+	_ = s.audit.LogAction(
+		ctx,
+		nil, // tx
+		&input.CompanyID,
+		"payroll",
+		"fine_created",
+		"employee_fine",
+		&fine.FineID,
+		"admin",
+		&input.CreatedBy,
+		nil,
+		nil,
+		map[string]interface{}{
 			"user_id":        input.UserID.String(),
 			"fine_amount":    input.FineAmount,
 			"fine_date":      input.FineDate,
 			"component_code": componentCode,
-		})
+		},
+	)
 
 	return fine, nil
 }
@@ -302,14 +314,26 @@ func (s *employeeFineService) UpdateFine(ctx context.Context, input UpdateEmploy
 		return nil, err
 	}
 
-	// Audit log
-	_ = s.audit.LogAction(ctx, &input.CompanyID, "payroll", "fine_updated", "employee_fine",
-		&fine.FineID, "admin", &input.UpdatedBy, nil, nil, map[string]interface{}{
+	// Audit log (transaction nil)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"payroll",
+		"fine_updated",
+		"employee_fine",
+		&fine.FineID,
+		"admin",
+		&input.UpdatedBy,
+		nil,
+		nil,
+		map[string]interface{}{
 			"user_id":        fine.UserID.String(),
 			"fine_amount":    fine.FineAmount,
 			"fine_date":      fine.FineDate,
 			"component_code": fine.ComponentCode,
-		})
+		},
+	)
 
 	return fine, nil
 }
@@ -340,13 +364,25 @@ func (s *employeeFineService) DeleteFine(ctx context.Context, companyID, fineID,
 		return err
 	}
 
-	// Audit log
-	_ = s.audit.LogAction(ctx, &companyID, "payroll", "fine_deleted", "employee_fine",
-		&fineID, "admin", &actorID, nil, nil, map[string]interface{}{
+	// Audit log (transaction nil)
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"payroll",
+		"fine_deleted",
+		"employee_fine",
+		&fineID,
+		"admin",
+		&actorID,
+		nil,
+		nil,
+		map[string]interface{}{
 			"user_id":     fine.UserID.String(),
 			"fine_amount": fine.FineAmount,
 			"fine_date":   fine.FineDate,
-		})
+		},
+	)
 
 	return nil
 }
@@ -392,14 +428,26 @@ func (s *employeeFineService) BulkCreateFines(ctx context.Context, input BulkCre
 	}
 
 	// Audit log (bulk action)
-	_ = s.audit.LogAction(ctx, &input.CompanyID, "payroll", "fines_bulk_created", "employee_fine",
-		nil, "admin", &input.CreatedBy, nil, nil, map[string]interface{}{
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&input.CompanyID,
+		"payroll",
+		"fines_bulk_created",
+		"employee_fine",
+		nil,
+		"admin",
+		&input.CreatedBy,
+		nil,
+		nil,
+		map[string]interface{}{
 			"user_count":     len(input.UserIDs),
 			"fine_amount":    input.FineAmount,
 			"fine_date":      input.FineDate,
 			"component_code": componentCode,
 			"created_ids":    createdIDs(created),
-		})
+		},
+	)
 
 	return created, nil
 }
@@ -429,10 +477,22 @@ func (s *employeeFineService) BulkDeleteUnprocessed(ctx context.Context, company
 		}
 	}
 
-	_ = s.audit.LogAction(ctx, &companyID, "payroll", "fines_bulk_deleted", "employee_fine",
-		nil, "admin", &actorID, nil, nil, map[string]interface{}{
+	_ = s.audit.LogAction(
+		ctx,
+		nil,
+		&companyID,
+		"payroll",
+		"fines_bulk_deleted",
+		"employee_fine",
+		nil,
+		"admin",
+		&actorID,
+		nil,
+		nil,
+		map[string]interface{}{
 			"fine_ids": fineIDs,
-		})
+		},
+	)
 
 	return nil
 }

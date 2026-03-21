@@ -130,6 +130,7 @@ func (s *attendanceSourceAdminService) CreateSource(
 	if s.auditService != nil && actor != nil {
 		_ = s.auditService.LogAction(
 			ctx,
+			nil,
 			&companyID,
 			"attendance",
 			"attendance_source_created",
@@ -188,6 +189,7 @@ func (s *attendanceSourceAdminService) UpdateSourceStatus(
 
 		_ = s.auditService.LogAction(
 			ctx,
+			nil,
 			&companyID,
 			"attendance",
 			action,

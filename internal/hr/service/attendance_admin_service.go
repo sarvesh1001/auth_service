@@ -974,7 +974,9 @@ func (s *attendanceAdminService) logAuditAction(
 				}
 			}
 
+			// ✅ Pass nil for transaction (no active transaction)
 			s.auditService.LogAction(auditCtx,
+				nil, // tx
 				&companyID,
 				"attendance",
 				action,

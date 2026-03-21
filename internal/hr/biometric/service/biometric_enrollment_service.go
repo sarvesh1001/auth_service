@@ -155,7 +155,6 @@ func (s *biometricEnrollmentService) EnrollFace(ctx context.Context, input *mode
 		EmbeddingDim:    len(input.EmbeddingVector),
 		IsActive:        true,
 		CreatedBy:       input.CreatedBy,
-		// ID, CreatedAt, UpdatedAt will be set by the repository if zero.
 	}
 
 	// 5. Persist
@@ -165,8 +164,10 @@ func (s *biometricEnrollmentService) EnrollFace(ctx context.Context, input *mode
 
 	// 6. Global audit
 	afterState, _ := json.Marshal(embedding)
+	// ✅ Pass nil for transaction (no active transaction)
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // tx
 		&input.CompanyID,
 		ModuleBiometric,
 		ActionEnrolled,
@@ -174,7 +175,7 @@ func (s *biometricEnrollmentService) EnrollFace(ctx context.Context, input *mode
 		&embedding.UserID,
 		ActorTypeAdmin,
 		&input.CreatedBy,
-		nil, // no before state
+		nil, // before state
 		afterState,
 		map[string]interface{}{
 			"model_version": input.ModelVersion,
@@ -223,8 +224,10 @@ func (s *biometricEnrollmentService) ReEnrollFace(ctx context.Context, input *mo
 	// 6. Global audit
 	beforeState, _ := json.Marshal(before)
 	afterState, _ := json.Marshal(embedding)
+	// ✅ Pass nil for transaction
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // tx
 		&input.CompanyID,
 		ModuleBiometric,
 		ActionReEnrolled,
@@ -263,8 +266,10 @@ func (s *biometricEnrollmentService) DeactivateFace(ctx context.Context, company
 	// 4. Global audit
 	beforeState, _ := json.Marshal(before)
 	afterState, _ := json.Marshal(after)
+	// ✅ Pass nil for transaction
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		ModuleBiometric,
 		ActionDeactivated,
@@ -323,17 +328,19 @@ func (s *biometricEnrollmentService) RotateModelVersion(ctx context.Context, com
 	}
 
 	// 3. Global audit for the whole rotation
+	// ✅ Pass nil for transaction
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		ModuleBiometric,
 		ActionModelRotated,
 		EntityTypeEmbedding,
-		nil, // no specific user for the rotation event
+		nil, // no specific user
 		ActorTypeAdmin,
 		&actedBy,
-		nil, // no before state
-		nil, // no after state
+		nil, // before state
+		nil, // after state
 		map[string]interface{}{
 			"old_version":       oldVersion,
 			"new_version":       newVersion,
@@ -343,6 +350,7 @@ func (s *biometricEnrollmentService) RotateModelVersion(ctx context.Context, com
 
 	return nil
 }
+
 func (s *biometricEnrollmentService) ActivateFace(
 	ctx context.Context,
 	companyID, userID, actorID uuid.UUID,
@@ -354,14 +362,15 @@ func (s *biometricEnrollmentService) ActivateFace(
 		return err
 	}
 
-	// Optional: Audit log
 	metadata := map[string]interface{}{
 		"user_id": userID,
 		"reason":  reason,
 	}
 
+	// ✅ Pass nil for transaction
 	_ = s.audit.LogAction(
 		ctx,
+		nil, // tx
 		&companyID,
 		"biometric",
 		"activate_face",
@@ -376,6 +385,7 @@ func (s *biometricEnrollmentService) ActivateFace(
 
 	return nil
 }
+
 func (s *biometricEnrollmentService) RotateEmbeddingModel(
 	ctx context.Context,
 	companyID, embeddingID uuid.UUID,

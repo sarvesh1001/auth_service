@@ -276,6 +276,7 @@ func (s *statutoryProfileService) UpdateProfile(
 	afterState, _ := json.Marshal(result)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&result.CompanyID,
 		"statutory",
 		"statutory_profile_updated",
@@ -355,6 +356,7 @@ func (s *statutoryProfileService) DeactivateProfile(
 	// Audit deactivation (non‑blocking)
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		companyID,
 		"statutory",
 		"statutory_profile_deactivated",
@@ -479,6 +481,7 @@ func (s *statutoryProfileService) BulkUpsertProfiles(
 	// Audit a single summary entry for the bulk operation
 	if err := s.audit.LogAction(
 		ctx,
+		nil,
 		&companyID,
 		"statutory",
 		"statutory_profile_bulk_upsert",
@@ -635,6 +638,7 @@ func (s *statutoryProfileService) auditProfileChange(
 	afterState, _ := json.Marshal(profile)
 	return s.audit.LogAction(
 		ctx,
+		nil,
 		&profile.CompanyID,
 		"statutory",
 		action,
