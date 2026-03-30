@@ -161,26 +161,14 @@ func (r *courseRepository) Create(ctx context.Context, db DBTX, e *models.Course
 	return nil
 }
 
-// BulkCreate inserts multiple courses, handling transaction ownership.
+// BulkCreate inserts multiple courses.
+// db must be a transaction (service manages it).
 func (r *courseRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.Course) error {
 	if len(e) == 0 {
 		return nil
 	}
 
-	tx, isOwner, err := beginTxIfNotTx(ctx, db)
-	if err != nil {
-		return err
-	}
-	// If we are the owner, ensure rollback on failure
-	if isOwner {
-		defer func() {
-			if isOwner {
-				_ = tx.Rollback()
-			}
-		}()
-	}
-
-	stmt, err := tx.PrepareContext(ctx, `
+	stmt, err := db.PrepareContext(ctx, `
 		INSERT INTO academics.course (
 			company_id, code, name, description, credits, is_active,
 			created_by, updated_by, created_at, updated_at
@@ -205,18 +193,9 @@ func (r *courseRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.
 			return fmt.Errorf("bulk create course row: %w", err)
 		}
 	}
-
-	// Commit only if we started the transaction
-	if isOwner {
-		if err = tx.Commit(); err != nil {
-			return fmt.Errorf("commit tx: %w", err)
-		}
-	}
 	return nil
 }
 
-// Upsert inserts or updates on conflict (company_id, code) where deleted_at IS NULL.
-// Assumes a partial unique index exists: UNIQUE (company_id, code) WHERE deleted_at IS NULL.
 // Upsert inserts or updates on conflict (company_id, code) where deleted_at IS NULL.
 // Assumes a partial unique index exists: UNIQUE (company_id, code) WHERE deleted_at IS NULL.
 func (r *courseRepository) Upsert(ctx context.Context, db DBTX, e *models.Course) error {

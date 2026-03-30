@@ -31,6 +31,9 @@ type SectionRepository interface {
 	Deactivate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error
 	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Section, error)
 	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+	// New method for capacity control
+	CountByTerm(ctx context.Context, db DBTX, termID uuid.UUID) (int64, error)
+	GetCapacityForUpdate(ctx context.Context, db DBTX, sectionID uuid.UUID) (int, error)
 }
 
 type sectionRepository struct {
@@ -161,7 +164,7 @@ func (r *sectionRepository) BulkCreate(ctx context.Context, db DBTX, e []*models
 	return nil
 }
 
-// Upsert inserts or updates using the unique constraint (enterprise pattern).
+// Upsert inserts or updates using the unique constraint.
 func (r *sectionRepository) Upsert(ctx context.Context, db DBTX, e *models.Section) error {
 	query := `
         INSERT INTO academics.section (
@@ -236,7 +239,6 @@ func (r *sectionRepository) List(ctx context.Context, db DBTX, filter SectionFil
 	}
 	limit, offset := r.validatePagination(p)
 
-	// Fix WHERE clause: ensure deleted_at IS NULL is always present
 	if where == "" {
 		where = "WHERE deleted_at IS NULL"
 	} else {
@@ -292,14 +294,14 @@ func (r *sectionRepository) List(ctx context.Context, db DBTX, filter SectionFil
 // ListByCourse returns all sections for a given course.
 func (r *sectionRepository) ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.Section, error) {
 	return r.List(ctx, db, SectionFilter{
-		CourseIDs: []uuid.UUID{courseID}, // updated to slice
+		CourseIDs: []uuid.UUID{courseID},
 	}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
 }
 
 // ListByTerm returns all sections for a given term.
 func (r *sectionRepository) ListByTerm(ctx context.Context, db DBTX, termID uuid.UUID) ([]*models.Section, error) {
 	return r.List(ctx, db, SectionFilter{
-		TermIDs: []uuid.UUID{termID}, // updated to slice
+		TermIDs: []uuid.UUID{termID},
 	}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
 }
 
@@ -307,7 +309,6 @@ func (r *sectionRepository) ListByTerm(ctx context.Context, db DBTX, termID uuid
 func (r *sectionRepository) Count(ctx context.Context, db DBTX, filter SectionFilter) (int64, error) {
 	where, args := r.buildSectionFilter(filter)
 
-	// Fix WHERE clause: ensure deleted_at IS NULL is always present
 	if where == "" {
 		where = "WHERE deleted_at IS NULL"
 	} else {
@@ -453,6 +454,31 @@ func (r *sectionRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	return &s, nil
 }
 
+// GetCapacityForUpdate returns the capacity of a section with row lock.
+func (r *sectionRepository) GetCapacityForUpdate(ctx context.Context, db DBTX, sectionID uuid.UUID) (int, error) {
+	query := `
+		SELECT capacity
+		FROM academics.section
+		WHERE section_id = $1 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	var capacity sql.NullInt64
+	err := db.QueryRowContext(ctx, query, sectionID).Scan(&capacity)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("section %s not found or deleted", sectionID)
+		}
+		r.logger.Error("failed to get capacity for update",
+			util.String("section_id", sectionID.String()),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("get capacity for update: %w", err)
+	}
+	if !capacity.Valid {
+		return 0, nil // no capacity limit
+	}
+	return int(capacity.Int64), nil
+}
+
 // Delete soft-deletes a section.
 func (r *sectionRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
 	query := `UPDATE academics.section SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE section_id = $1 AND deleted_at IS NULL`
@@ -477,7 +503,6 @@ func (r *sectionRepository) buildSectionFilter(filter SectionFilter) (string, []
 	var args []interface{}
 	idx := 1
 
-	// Handle multiple course IDs
 	if len(filter.CourseIDs) > 0 {
 		placeholders := make([]string, len(filter.CourseIDs))
 		for i, id := range filter.CourseIDs {
@@ -488,7 +513,6 @@ func (r *sectionRepository) buildSectionFilter(filter SectionFilter) (string, []
 		conditions = append(conditions, fmt.Sprintf("course_id IN (%s)", strings.Join(placeholders, ",")))
 	}
 
-	// Handle multiple term IDs
 	if len(filter.TermIDs) > 0 {
 		placeholders := make([]string, len(filter.TermIDs))
 		for i, id := range filter.TermIDs {
@@ -513,4 +537,16 @@ func (r *sectionRepository) buildSectionFilter(filter SectionFilter) (string, []
 		return "", args
 	}
 	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+func (r *sectionRepository) CountByTerm(ctx context.Context, db DBTX, termID uuid.UUID) (int64, error) {
+	query := `SELECT COUNT(*) FROM academics.section WHERE term_id = $1 AND deleted_at IS NULL`
+	var count int64
+	err := db.QueryRowContext(ctx, query, termID).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count sections by term",
+			util.String("term_id", termID.String()),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count sections by term: %w", err)
+	}
+	return count, nil
 }

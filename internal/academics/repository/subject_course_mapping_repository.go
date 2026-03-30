@@ -15,11 +15,11 @@ import (
 )
 
 // SubjectCourseMappingRepository defines methods for subject_course_mapping table.
-// This table does not have audit or soft delete columns, so no changes for those.
 type SubjectCourseMappingRepository interface {
 	Create(ctx context.Context, db DBTX, e *models.SubjectCourseMapping) error
 	BulkCreate(ctx context.Context, db DBTX, e []*models.SubjectCourseMapping) error
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error) // new
 	ListByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error)
 	ListBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error)
 	ListByCourseAndTerm(ctx context.Context, db DBTX, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error)
@@ -33,7 +33,6 @@ type subjectCourseMappingRepository struct {
 	logger *zap.Logger
 }
 
-// NewSubjectCourseMappingRepository creates a new mapping repository.
 func NewSubjectCourseMappingRepository(logger *zap.Logger) SubjectCourseMappingRepository {
 	return &subjectCourseMappingRepository{
 		logger: logger.Named("subject_course_mapping_repo"),
@@ -132,6 +131,35 @@ func (r *subjectCourseMappingRepository) GetByID(ctx context.Context, db DBTX, i
 			util.String("id", id.String()),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get mapping by ID: %w", err)
+	}
+	if termNumber.Valid {
+		m.TermNumber = int(termNumber.Int64)
+	}
+	return &m, nil
+}
+
+// GetByIDForUpdate retrieves a mapping by ID with a row lock.
+func (r *subjectCourseMappingRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.SubjectCourseMapping, error) {
+	query := `
+		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		FROM academics.subject_course_mapping
+		WHERE mapping_id = $1
+		FOR UPDATE
+	`
+	var m models.SubjectCourseMapping
+	var termNumber sql.NullInt64
+	err := db.QueryRowContext(ctx, query, id).Scan(
+		&m.MappingID, &m.CourseID, &m.SubjectID, &termNumber,
+		&m.IsCompulsory, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get mapping for update",
+			util.String("id", id.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get mapping for update: %w", err)
 	}
 	if termNumber.Valid {
 		m.TermNumber = int(termNumber.Int64)
@@ -267,32 +295,42 @@ func (r *subjectCourseMappingRepository) scanMappings(rows *sql.Rows) ([]*models
 }
 
 // ListByCourseIDsAndTermNumbers retrieves all mappings for the given course IDs and term numbers.
+// If termNumbers is empty, it returns all mappings for those courses (ignoring term filter).
 func (r *subjectCourseMappingRepository) ListByCourseIDsAndTermNumbers(ctx context.Context, db DBTX, courseIDs []uuid.UUID, termNumbers []int) ([]*models.SubjectCourseMapping, error) {
-	if len(courseIDs) == 0 || len(termNumbers) == 0 {
+	if len(courseIDs) == 0 {
 		return []*models.SubjectCourseMapping{}, nil
 	}
-	// Build placeholders for course IDs and term numbers
+
+	// Build placeholders for course IDs
 	coursePlaceholders := make([]string, len(courseIDs))
 	courseArgs := make([]interface{}, len(courseIDs))
 	for i, id := range courseIDs {
 		coursePlaceholders[i] = fmt.Sprintf("$%d", i+1)
 		courseArgs[i] = id
 	}
-	termPlaceholders := make([]string, len(termNumbers))
-	termArgs := make([]interface{}, len(termNumbers))
-	for i, tn := range termNumbers {
-		termPlaceholders[i] = fmt.Sprintf("$%d", i+len(courseIDs)+1)
-		termArgs[i] = tn
-	}
-	allArgs := append(courseArgs, termArgs...)
 
 	query := fmt.Sprintf(`
-        SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
-        FROM academics.subject_course_mapping
-        WHERE course_id IN (%s) AND term_number IN (%s)
-    `, strings.Join(coursePlaceholders, ","), strings.Join(termPlaceholders, ","))
+		SELECT mapping_id, course_id, subject_id, term_number, is_compulsory, created_at, updated_at
+		FROM academics.subject_course_mapping
+		WHERE course_id IN (%s)
+	`, strings.Join(coursePlaceholders, ","))
 
-	rows, err := db.QueryContext(ctx, query, allArgs...)
+	var args []interface{}
+	args = append(args, courseArgs...)
+
+	// Add term filter only if termNumbers provided
+	if len(termNumbers) > 0 {
+		termPlaceholders := make([]string, len(termNumbers))
+		termArgs := make([]interface{}, len(termNumbers))
+		for i, tn := range termNumbers {
+			termPlaceholders[i] = fmt.Sprintf("$%d", len(args)+i+1)
+			termArgs[i] = tn
+		}
+		query += fmt.Sprintf(" AND term_number IN (%s)", strings.Join(termPlaceholders, ","))
+		args = append(args, termArgs...)
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to list mappings by course IDs and term numbers",
 			zap.Any("course_ids", courseIDs),

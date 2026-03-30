@@ -1,5 +1,172 @@
 
 ================================================================================
+FILE: ./models/student_document.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentDocument represents a document uploaded for a student.
+type StudentDocument struct {
+	DocumentID   uuid.UUID  `json:"document_id"`
+	StudentID    uuid.UUID  `json:"student_id"`
+	DocumentType string     `json:"document_type"`
+	DocumentName string     `json:"document_name,omitempty"`
+	FileURL      string     `json:"file_url"`
+	UploadedAt   time.Time  `json:"uploaded_at"`
+	Verified     bool       `json:"verified"`
+	VerifiedBy   *uuid.UUID `json:"verified_by,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_ranking.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentRanking stores rank of a student within an academic year and term.
+type StudentRanking struct {
+	RankingID      uuid.UUID  `json:"ranking_id"`
+	StudentID      uuid.UUID  `json:"student_id"`
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	TermID         *uuid.UUID `json:"term_id,omitempty"`
+	Rank           int        `json:"rank"`
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/academic_event.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AcademicEvent represents a scheduled event (holiday, exam, etc.).
+type AcademicEvent struct {
+	EventID     uuid.UUID  `json:"event_id"`
+	CompanyID   uuid.UUID  `json:"company_id"`
+	EventName   string     `json:"event_name"`
+	EventDate   time.Time  `json:"event_date"`
+	StartTime   *time.Time `json:"start_time,omitempty"`
+	EndTime     *time.Time `json:"end_time,omitempty"`
+	Location    string     `json:"location,omitempty"`
+	Description string     `json:"description,omitempty"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_performance_summary.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentPerformanceSummary stores aggregated performance data for a student.
+type StudentPerformanceSummary struct {
+	SummaryID         uuid.UUID  `json:"summary_id"`
+	StudentID         uuid.UUID  `json:"student_id"`
+	AcademicYearID    uuid.UUID  `json:"academic_year_id"`
+	TermID            *uuid.UUID `json:"term_id,omitempty"`
+	OverallPercentage *float64   `json:"overall_percentage,omitempty"`
+	Grade             string     `json:"grade,omitempty"`
+	Rank              int        `json:"rank,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/teacher_section.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// TeacherSection links a teacher to a section.
+type TeacherSection struct {
+	ID             uuid.UUID `json:"id"`
+	TeacherID      uuid.UUID `json:"teacher_id"`
+	SectionID      uuid.UUID `json:"section_id"`
+	IsClassTeacher bool      `json:"is_class_teacher"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/grading_policy.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type GradingScale string
+
+const (
+	GradingScalePercentage  GradingScale = "percentage"
+	GradingScaleGradePoint  GradingScale = "grade_point"
+	GradingScaleLetterGrade GradingScale = "letter_grade"
+)
+
+type GradingPolicy struct {
+	PolicyID     uuid.UUID    `json:"policy_id"`
+	CompanyID    uuid.UUID    `json:"company_id"`
+	PolicyName   string       `json:"policy_name"`
+	GradingScale GradingScale `json:"grading_scale"`
+	IsDefault    bool         `json:"is_default"`
+	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
+	CreatedBy    *uuid.UUID   `json:"created_by,omitempty"`
+	UpdatedBy    *uuid.UUID   `json:"updated_by,omitempty"`
+	DeletedAt    *time.Time   `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
 FILE: ./models/course.go
 ================================================================================
 
@@ -30,6 +197,221 @@ type Course struct {
 
 
 ================================================================================
+FILE: ./models/fee_payment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StudentFeePayment struct {
+	PaymentID     uuid.UUID  `json:"payment_id"`
+	InvoiceID     uuid.UUID  `json:"invoice_id"`
+	PaymentDate   time.Time  `json:"payment_date"`
+	Amount        float64    `json:"amount"`
+	PaymentMode   string     `json:"payment_mode"` // cash, cheque, online, bank_transfer, card, other
+	TransactionID string     `json:"transaction_id,omitempty"`
+	ReceiptNo     string     `json:"receipt_no,omitempty"`
+	Remarks       string     `json:"remarks,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type FeeDiscount struct {
+	DiscountID    uuid.UUID  `json:"discount_id"`
+	StudentID     uuid.UUID  `json:"student_id"`
+	DiscountType  string     `json:"discount_type"` // percentage, fixed
+	DiscountValue float64    `json:"discount_value"`
+	Reason        string     `json:"reason,omitempty"`
+	ApprovedBy    *uuid.UUID `json:"approved_by,omitempty"`
+	ValidFrom     *time.Time `json:"valid_from,omitempty"`
+	ValidUntil    *time.Time `json:"valid_until,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type FeePenalty struct {
+	PenaltyID   uuid.UUID  `json:"penalty_id"`
+	InvoiceID   uuid.UUID  `json:"invoice_id"`
+	PenaltyDate time.Time  `json:"penalty_date"`
+	Amount      float64    `json:"amount"`
+	Reason      string     `json:"reason,omitempty"`
+	Waived      bool       `json:"waived"`
+	WaivedBy    *uuid.UUID `json:"waived_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type FeeReceipt struct {
+	ReceiptID   uuid.UUID              `json:"receipt_id"`
+	PaymentID   uuid.UUID              `json:"payment_id"`
+	ReceiptNo   string                 `json:"receipt_no"`
+	ReceiptData map[string]interface{} `json:"receipt_data"` // JSONB
+	GeneratedAt time.Time              `json:"generated_at"`
+	CreatedAt   time.Time              `json:"created_at"`
+	CreatedBy   *uuid.UUID             `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/transport_driver_assignment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TransportDriverAssignment struct {
+	AssignmentID   uuid.UUID  `json:"assignment_id"`
+	VehicleID      uuid.UUID  `json:"vehicle_id"`
+	DriverName     string     `json:"driver_name"`
+	DriverPhone    string     `json:"driver_phone,omitempty"`
+	DriverLicense  string     `json:"driver_license,omitempty"`
+	AssignmentDate time.Time  `json:"assignment_date"`
+	EndDate        *time.Time `json:"end_date,omitempty"`
+	IsActive       bool       `json:"is_active"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/teacher.go
+================================================================================
+
+// File: internal/academics/models/teacher.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TeacherStatus string
+
+const (
+	TeacherActive   TeacherStatus = "active"
+	TeacherInactive TeacherStatus = "inactive"
+	TeacherResigned TeacherStatus = "resigned"
+)
+
+func IsValidTeacherStatus(s string) bool {
+	switch TeacherStatus(s) {
+	case TeacherActive, TeacherInactive, TeacherResigned:
+		return true
+	default:
+		return false
+	}
+}
+
+// Teacher represents a teacher record.
+type Teacher struct {
+	TeacherID      uuid.UUID     `json:"teacher_id"`
+	CompanyID      uuid.UUID     `json:"company_id"`
+	UserID         uuid.UUID     `json:"user_id"`
+	EmployeeCode   string        `json:"employee_code,omitempty"`
+	Qualification  string        `json:"qualification,omitempty"`
+	Specialization string        `json:"specialization,omitempty"`
+	JoiningDate    *time.Time    `json:"joining_date,omitempty"`
+	Status         TeacherStatus `json:"status"`
+
+	Version   int        `json:"version"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/exam.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Exam represents an examination.
+type Exam struct {
+	ExamID         uuid.UUID  `json:"exam_id"`
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	TermID         uuid.UUID  `json:"term_id"`
+	ExamName       string     `json:"exam_name"`
+	StartDate      time.Time  `json:"start_date"`
+	EndDate        time.Time  `json:"end_date"`
+	Description    string     `json:"description,omitempty"`
+	IsActive       bool       `json:"is_active"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/fee_invoice.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StudentFeeInvoice struct {
+	InvoiceID      uuid.UUID  `json:"invoice_id"`
+	StudentID      uuid.UUID  `json:"student_id"`
+	FeeStructureID uuid.UUID  `json:"fee_structure_id"`
+	InvoiceNo      string     `json:"invoice_no"`
+	DueDate        time.Time  `json:"due_date"`
+	TotalAmount    float64    `json:"total_amount"`
+	PaidAmount     float64    `json:"paid_amount"`
+	Balance        float64    `json:"balance"` // generated column
+	Status         string     `json:"status"`  // unpaid, partial, paid, overdue, cancelled
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type StudentFeeInvoiceItem struct {
+	InvoiceItemID uuid.UUID  `json:"invoice_item_id"`
+	InvoiceID     uuid.UUID  `json:"invoice_id"`
+	FeeHead       string     `json:"fee_head"`
+	Amount        float64    `json:"amount"`
+	IsMandatory   bool       `json:"is_mandatory"`
+	CreatedAt     time.Time  `json:"created_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
 FILE: ./models/subject_course_mapping.go
 ================================================================================
 
@@ -51,6 +433,111 @@ type SubjectCourseMapping struct {
 	IsCompulsory bool      `json:"is_compulsory"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_previous_education.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentPreviousEducation represents a student's prior educational record.
+type StudentPreviousEducation struct {
+	PrevEduID     uuid.UUID `json:"prev_edu_id"`
+	StudentID     uuid.UUID `json:"student_id"`
+	SchoolName    string    `json:"school_name,omitempty"`
+	Board         string    `json:"board,omitempty"`
+	YearOfPassing int       `json:"year_of_passing,omitempty"`
+	Percentage    *float64  `json:"percentage,omitempty"`
+	Grade         string    `json:"grade,omitempty"`
+	Qualification string    `json:"qualification,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/transport_vehicle.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TransportVehicle struct {
+	VehicleID       uuid.UUID  `json:"vehicle_id"`
+	CompanyID       uuid.UUID  `json:"company_id"`
+	VehicleNo       string     `json:"vehicle_no"`
+	VehicleType     string     `json:"vehicle_type,omitempty"`
+	Capacity        *int       `json:"capacity,omitempty"`
+	InsuranceExpiry *time.Time `json:"insurance_expiry,omitempty"`
+	FitnessExpiry   *time.Time `json:"fitness_expiry,omitempty"`
+	IsActive        bool       `json:"is_active"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy       *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/teacher_subject.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// TeacherSubject links a teacher to a subject.
+type TeacherSubject struct {
+	ID        uuid.UUID `json:"id"`
+	TeacherID uuid.UUID `json:"teacher_id"`
+	SubjectID uuid.UUID `json:"subject_id"`
+	IsPrimary bool      `json:"is_primary"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/notification_read.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// NotificationRead tracks which users have read which notifications.
+type NotificationRead struct {
+	ReadID         uuid.UUID  `json:"read_id"`
+	NotificationID uuid.UUID  `json:"notification_id"`
+	UserID         uuid.UUID  `json:"user_id"`
+	ReadAt         time.Time  `json:"read_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
 }
 
 
@@ -114,6 +601,354 @@ type AcademicYear struct {
 
 
 ================================================================================
+FILE: ./models/library_fine.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LibraryFine struct {
+	FineID      uuid.UUID  `json:"fine_id"`
+	IssueID     uuid.UUID  `json:"issue_id"`
+	FineAmount  float64    `json:"fine_amount"`
+	Paid        bool       `json:"paid"`
+	PaidDate    *time.Time `json:"paid_date,omitempty"`
+	PaymentMode string     `json:"payment_mode,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/assignment_submission.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type SubmissionStatus string
+
+const (
+	SubmissionSubmitted SubmissionStatus = "submitted"
+	SubmissionLate      SubmissionStatus = "late"
+	SubmissionGraded    SubmissionStatus = "graded"
+	SubmissionReturned  SubmissionStatus = "returned"
+)
+
+type AssignmentSubmission struct {
+	SubmissionID   uuid.UUID        `json:"submission_id"`
+	AssignmentID   uuid.UUID        `json:"assignment_id"`
+	StudentID      uuid.UUID        `json:"student_id"`
+	SubmissionDate time.Time        `json:"submission_date"`
+	FileURL        string           `json:"file_url,omitempty"`
+	Remarks        string           `json:"remarks,omitempty"`
+	Status         SubmissionStatus `json:"status"`
+	MarksObtained  *float64         `json:"marks_obtained,omitempty"`
+	Feedback       string           `json:"feedback,omitempty"`
+	GradedBy       *uuid.UUID       `json:"graded_by,omitempty"`
+	GradedAt       *time.Time       `json:"graded_at,omitempty"`
+	CreatedAt      time.Time        `json:"created_at"`
+	UpdatedAt      time.Time        `json:"updated_at"`
+	CreatedBy      *uuid.UUID       `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/library_book.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LibraryBook struct {
+	BookID          uuid.UUID  `json:"book_id"`
+	CompanyID       uuid.UUID  `json:"company_id"`
+	CategoryID      *uuid.UUID `json:"category_id,omitempty"`
+	Title           string     `json:"title"`
+	Author          string     `json:"author,omitempty"`
+	ISBN            string     `json:"isbn,omitempty"`
+	Publisher       string     `json:"publisher,omitempty"`
+	Edition         string     `json:"edition,omitempty"`
+	Language        string     `json:"language,omitempty"`
+	Pages           int        `json:"pages,omitempty"`
+	PublicationYear int        `json:"publication_year,omitempty"`
+	Description     string     `json:"description,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy       *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/class_performance_summary.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ClassPerformanceSummary stores aggregated performance data for a section.
+type ClassPerformanceSummary struct {
+	ClassSummaryID    uuid.UUID  `json:"class_summary_id"`
+	SectionID         uuid.UUID  `json:"section_id"`
+	AcademicYearID    uuid.UUID  `json:"academic_year_id"`
+	TermID            *uuid.UUID `json:"term_id,omitempty"`
+	AveragePercentage float64    `json:"average_percentage"`
+	PassPercentage    float64    `json:"pass_percentage"`
+	TotalStudents     int        `json:"total_students"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/fee_audit.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type FeeTransactionAudit struct {
+	AuditID   uuid.UUID              `json:"audit_id"`
+	PaymentID uuid.UUID              `json:"payment_id"`
+	Action    string                 `json:"action"` // created, updated, deleted, refunded
+	OldData   map[string]interface{} `json:"old_data"`
+	NewData   map[string]interface{} `json:"new_data"`
+	ChangedBy *uuid.UUID             `json:"changed_by,omitempty"`
+	ChangedAt time.Time              `json:"changed_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/notification.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// NotificationType defines the type of notification.
+type NotificationType string
+
+const (
+	NotificationTypeInfo         NotificationType = "info"
+	NotificationTypeWarning      NotificationType = "warning"
+	NotificationTypeAlert        NotificationType = "alert"
+	NotificationTypeEvent        NotificationType = "event"
+	NotificationTypeAnnouncement NotificationType = "announcement"
+)
+
+// NotificationPriority defines the priority level.
+type NotificationPriority string
+
+const (
+	PriorityLow    NotificationPriority = "low"
+	PriorityNormal NotificationPriority = "normal"
+	PriorityHigh   NotificationPriority = "high"
+	PriorityUrgent NotificationPriority = "urgent"
+)
+
+// Notification represents a system notification.
+type Notification struct {
+	NotificationID uuid.UUID            `json:"notification_id"`
+	CompanyID      uuid.UUID            `json:"company_id"`
+	Title          string               `json:"title"`
+	Message        string               `json:"message"`
+	Type           NotificationType     `json:"type"`
+	Priority       NotificationPriority `json:"priority"`
+	CreatedBy      *uuid.UUID           `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID           `json:"updated_by,omitempty"`
+	CreatedAt      time.Time            `json:"created_at"`
+	ExpiresAt      *time.Time           `json:"expires_at,omitempty"`
+	DeletedAt      *time.Time           `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/attendance.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AttendanceStatus string
+
+const (
+	StatusPresent  AttendanceStatus = "present"
+	StatusAbsent   AttendanceStatus = "absent"
+	StatusLate     AttendanceStatus = "late"
+	StatusHalfDay  AttendanceStatus = "half-day"
+	StatusHoliday  AttendanceStatus = "holiday"
+	StatusExempted AttendanceStatus = "exempted"
+)
+
+func IsValidAttendanceStatus(s string) bool {
+	switch AttendanceStatus(s) {
+	case StatusPresent, StatusAbsent, StatusLate, StatusHalfDay, StatusHoliday, StatusExempted:
+		return true
+	default:
+		return false
+	}
+}
+
+// StudentAttendance represents daily attendance record for a student in a section.
+type StudentAttendance struct {
+	AttendanceID   uuid.UUID        `json:"attendance_id"`
+	EnrollmentID   uuid.UUID        `json:"enrollment_id"`
+	AttendanceDate time.Time        `json:"attendance_date"`
+	Status         AttendanceStatus `json:"status"`
+	MarkedBy       *uuid.UUID       `json:"marked_by,omitempty"`
+	Remarks        string           `json:"remarks,omitempty"`
+	CreatedAt      time.Time        `json:"created_at"`
+	UpdatedAt      time.Time        `json:"updated_at"`
+	CreatedBy      *uuid.UUID       `json:"created_by,omitempty"`
+}
+
+// StudentAttendanceSummary represents aggregated attendance summary.
+type StudentAttendanceSummary struct {
+	SummaryID            uuid.UUID  `json:"summary_id"`
+	StudentID            uuid.UUID  `json:"student_id"`
+	AcademicYearID       uuid.UUID  `json:"academic_year_id"`
+	TermID               *uuid.UUID `json:"term_id,omitempty"`
+	TotalPresent         int        `json:"total_present"`
+	TotalAbsent          int        `json:"total_absent"`
+	TotalLate            int        `json:"total_late"`
+	TotalHalfDay         int        `json:"total_half_day"`
+	TotalWorkingDays     int        `json:"total_working_days"`
+	AttendancePercentage float64    `json:"attendance_percentage"` // read‑only (computed)
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
+}
+
+// StudentAttendanceExemption represents leave/exemption from attendance.
+type StudentAttendanceExemption struct {
+	ExemptionID uuid.UUID  `json:"exemption_id"`
+	StudentID   uuid.UUID  `json:"student_id"`
+	FromDate    time.Time  `json:"from_date"`
+	ToDate      time.Time  `json:"to_date"`
+	Reason      string     `json:"reason,omitempty"`
+	ApprovedBy  *uuid.UUID `json:"approved_by,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/library_issue.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type IssueStatus string
+
+const (
+	IssueStatusIssued   IssueStatus = "issued"
+	IssueStatusReturned IssueStatus = "returned"
+	IssueStatusOverdue  IssueStatus = "overdue"
+	IssueStatusLost     IssueStatus = "lost"
+)
+
+func IsValidIssueStatus(s string) bool {
+	switch IssueStatus(s) {
+	case IssueStatusIssued, IssueStatusReturned, IssueStatusOverdue, IssueStatusLost:
+		return true
+	default:
+		return false
+	}
+}
+
+type LibraryIssue struct {
+	IssueID      uuid.UUID   `json:"issue_id"`
+	CopyID       uuid.UUID   `json:"copy_id"`
+	StudentID    uuid.UUID   `json:"student_id"`
+	IssueDate    time.Time   `json:"issue_date"`
+	DueDate      time.Time   `json:"due_date"`
+	ReturnedDate *time.Time  `json:"returned_date,omitempty"`
+	Status       IssueStatus `json:"status"`
+	IssuedBy     *uuid.UUID  `json:"issued_by,omitempty"`
+	CreatedAt    time.Time   `json:"created_at"`
+	UpdatedAt    time.Time   `json:"updated_at"`
+	CreatedBy    *uuid.UUID  `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/exam_grade.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ExamGrade defines grade boundaries for a specific exam.
+type ExamGrade struct {
+	GradeID    uuid.UUID `json:"grade_id"`
+	ExamID     uuid.UUID `json:"exam_id"`
+	GradeName  string    `json:"grade_name"`
+	MinMarks   float64   `json:"min_marks"`
+	MaxMarks   float64   `json:"max_marks"`
+	GradePoint float64   `json:"grade_point,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+
+
+================================================================================
 FILE: ./models/subject.go
 ================================================================================
 
@@ -144,6 +979,30 @@ type Subject struct {
 
 
 ================================================================================
+FILE: ./models/grade_boundary.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type GradeBoundary struct {
+	BoundaryID    uuid.UUID `json:"boundary_id"`
+	PolicyID      uuid.UUID `json:"policy_id"`
+	Grade         string    `json:"grade"`
+	MinPercentage float64   `json:"min_percentage"`
+	MaxPercentage float64   `json:"max_percentage"`
+	GradePoint    *float64  `json:"grade_point,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+
+
+================================================================================
 FILE: ./models/term.go
 ================================================================================
 
@@ -168,6 +1027,517 @@ type Term struct {
 	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
 	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
 	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/enrollment.go
+================================================================================
+
+// File: internal/academics/models/enrollment.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Enrollment represents a student's enrollment in a section for an academic year.
+type Enrollment struct {
+	EnrollmentID   uuid.UUID  `json:"enrollment_id"`
+	StudentID      uuid.UUID  `json:"student_id"`
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	SectionID      uuid.UUID  `json:"section_id"`
+	EnrollmentDate time.Time  `json:"enrollment_date"`
+	RollNumber     string     `json:"roll_number,omitempty"`
+	Status         string     `json:"status"` // active, completed, withdrawn
+	Version        int        `json:"version"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/timetable.go
+================================================================================
+
+// File: internal/academics/models/timetable.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Timetable represents a timetable version for a section in a term.
+type Timetable struct {
+	TimetableID    uuid.UUID  `json:"timetable_id"`
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	TermID         uuid.UUID  `json:"term_id"`
+	SectionID      uuid.UUID  `json:"section_id"`
+	Version        int        `json:"version"`
+	EffectiveFrom  time.Time  `json:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty"`
+	IsActive       bool       `json:"is_active"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+}
+
+// TimetableSlot represents a time slot in a timetable.
+type TimetableSlot struct {
+	SlotID      uuid.UUID  `json:"slot_id"`
+	TimetableID uuid.UUID  `json:"timetable_id"`
+	DayOfWeek   int        `json:"day_of_week"` // 0=Monday .. 6=Sunday (or 0-6)
+	StartTime   time.Time  `json:"start_time"`  // only time part matters
+	EndTime     time.Time  `json:"end_time"`
+	SlotNumber  int        `json:"slot_number,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	CreatedBy   *uuid.UUID `json:"created_by,omitempty"`
+}
+
+// TimetableEntry links a subject, teacher, and room to a slot.
+type TimetableEntry struct {
+	EntryID   uuid.UUID  `json:"entry_id"`
+	SlotID    uuid.UUID  `json:"slot_id"`
+	SubjectID uuid.UUID  `json:"subject_id"`
+	TeacherID uuid.UUID  `json:"teacher_id"`
+	RoomID    *uuid.UUID `json:"room_id,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+}
+
+// TimetableChange records temporary changes to a timetable entry.
+type TimetableChange struct {
+	ChangeID     uuid.UUID  `json:"change_id"`
+	EntryID      uuid.UUID  `json:"entry_id"`
+	ChangeDate   time.Time  `json:"change_date"`
+	NewTeacherID *uuid.UUID `json:"new_teacher_id,omitempty"`
+	NewRoomID    *uuid.UUID `json:"new_room_id,omitempty"`
+	Reason       string     `json:"reason,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_activity_log.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentActivityLog records significant student actions (e.g., enrollment, fee payment).
+type StudentActivityLog struct {
+	LogID        uuid.UUID              `json:"log_id"`
+	StudentID    uuid.UUID              `json:"student_id"`
+	ActivityType string                 `json:"activity_type"`
+	Description  string                 `json:"description"`
+	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+	CreatedAt    time.Time              `json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/assignment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Assignment struct {
+	AssignmentID  uuid.UUID  `json:"assignment_id"`
+	SectionID     uuid.UUID  `json:"section_id"`
+	SubjectID     uuid.UUID  `json:"subject_id"`
+	TeacherID     uuid.UUID  `json:"teacher_id"`
+	Title         string     `json:"title"`
+	Description   string     `json:"description,omitempty"`
+	DueDate       time.Time  `json:"due_date"`
+	MaxMarks      *float64   `json:"max_marks,omitempty"`
+	AttachmentURL string     `json:"attachment_url,omitempty"`
+	IsPublished   bool       `json:"is_published"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy     *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/teacher_schedule_preference.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// TeacherSchedulePreference stores a teacher's preferred teaching times.
+type TeacherSchedulePreference struct {
+	PreferenceID       uuid.UUID  `json:"preference_id"`
+	TeacherID          uuid.UUID  `json:"teacher_id"`
+	DayOfWeek          int        `json:"day_of_week"` // 0-6 (Sunday to Saturday, or Monday to Sunday depending on implementation)
+	PreferredStartTime *time.Time `json:"preferred_start_time,omitempty"`
+	PreferredEndTime   *time.Time `json:"preferred_end_time,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	CreatedBy          *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/assignment_grade.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AssignmentGrade struct {
+	GradeID      uuid.UUID  `json:"grade_id"`
+	SubmissionID uuid.UUID  `json:"submission_id"`
+	Marks        float64    `json:"marks"`
+	GradedBy     uuid.UUID  `json:"graded_by"`
+	GradedAt     time.Time  `json:"graded_at"`
+	Remarks      string     `json:"remarks,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/library_return.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LibraryReturn struct {
+	ReturnID   uuid.UUID  `json:"return_id"`
+	IssueID    uuid.UUID  `json:"issue_id"`
+	ReturnDate time.Time  `json:"return_date"`
+	FineAmount *float64   `json:"fine_amount,omitempty"`
+	Remarks    string     `json:"remarks,omitempty"`
+	ReceivedBy *uuid.UUID `json:"received_by,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	CreatedBy  *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/guardian.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Guardian represents a student's guardian.
+type Guardian struct {
+	GuardianID   uuid.UUID `json:"guardian_id"`
+	StudentID    uuid.UUID `json:"student_id"`
+	GuardianName string    `json:"guardian_name"`
+	Relation     string    `json:"relation"`
+
+	// Encrypted fields (plaintext in model)
+	Phone string `json:"phone,omitempty"`
+	Email string `json:"email,omitempty"`
+
+	Address    string   `json:"address,omitempty"`
+	IsPrimary  bool     `json:"is_primary"`
+	Occupation string   `json:"occupation,omitempty"`
+	Income     *float64 `json:"income,omitempty"` // use pointer for optional
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/exam_result_audit.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ChangeType defines the type of change made to an exam result.
+type ChangeType string
+
+const (
+	ChangeInsert ChangeType = "insert"
+	ChangeUpdate ChangeType = "update"
+	ChangeDelete ChangeType = "delete"
+)
+
+// ExamResultAudit tracks changes to exam results.
+type ExamResultAudit struct {
+	AuditID    uuid.UUID  `json:"audit_id"`
+	ResultID   uuid.UUID  `json:"result_id"`
+	ChangedBy  uuid.UUID  `json:"changed_by"`
+	ChangeType ChangeType `json:"change_type"`
+	OldMarks   *float64   `json:"old_marks,omitempty"`
+	NewMarks   *float64   `json:"new_marks,omitempty"`
+	ChangedAt  time.Time  `json:"changed_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/exam_schedule.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ExamSchedule represents a subject schedule within an exam.
+type ExamSchedule struct {
+	ScheduleID   uuid.UUID  `json:"schedule_id"`
+	ExamID       uuid.UUID  `json:"exam_id"`
+	SubjectID    uuid.UUID  `json:"subject_id"`
+	Date         time.Time  `json:"date"`
+	StartTime    *time.Time `json:"start_time,omitempty"`
+	EndTime      *time.Time `json:"end_time,omitempty"`
+	RoomID       *uuid.UUID `json:"room_id,omitempty"`
+	MaxMarks     float64    `json:"max_marks,omitempty"`
+	PassingMarks float64    `json:"passing_marks,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy    *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/exam_result.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ExamResult represents a student's result for a specific subject in an exam.
+type ExamResult struct {
+	ResultID      uuid.UUID  `json:"result_id"`
+	ExamID        uuid.UUID  `json:"exam_id"`
+	EnrollmentID  uuid.UUID  `json:"enrollment_id"`
+	SubjectID     uuid.UUID  `json:"subject_id"`
+	MarksObtained *float64   `json:"marks_obtained,omitempty"`
+	Grade         string     `json:"grade,omitempty"`
+	Remarks       string     `json:"remarks,omitempty"`
+	EnteredBy     *uuid.UUID `json:"entered_by,omitempty"`
+	EnteredAt     time.Time  `json:"entered_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/room.go
+================================================================================
+
+// File: internal/academics/models/room.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Room struct {
+	RoomID    uuid.UUID  `json:"room_id"`
+	CompanyID uuid.UUID  `json:"company_id"`
+	RoomCode  string     `json:"room_code"`
+	RoomName  string     `json:"room_name,omitempty"`
+	Capacity  int        `json:"capacity,omitempty"`
+	Building  string     `json:"building,omitempty"`
+	Floor     int        `json:"floor,omitempty"`
+	IsActive  bool       `json:"is_active"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/assignment_comment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AssignmentComment struct {
+	CommentID    uuid.UUID  `json:"comment_id"`
+	SubmissionID uuid.UUID  `json:"submission_id"`
+	CommentBy    uuid.UUID  `json:"comment_by"`
+	Comment      string     `json:"comment"`
+	CreatedAt    time.Time  `json:"created_at"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/notification_target.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// TargetType defines the type of entity that can receive a notification.
+type TargetType string
+
+const (
+	TargetStudent TargetType = "student"
+	TargetTeacher TargetType = "teacher"
+	TargetSection TargetType = "section"
+	TargetCourse  TargetType = "course"
+	TargetCompany TargetType = "company"
+	TargetUser    TargetType = "user"
+)
+
+// NotificationTarget specifies the recipients of a notification.
+type NotificationTarget struct {
+	NotificationTargetID uuid.UUID  `json:"notification_target_id"`
+	NotificationID       uuid.UUID  `json:"notification_id"`
+	TargetType           TargetType `json:"target_type"`
+	TargetEntityID       uuid.UUID  `json:"target_entity_id"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedBy            *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_transport_assignment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StudentTransportAssignment struct {
+	AssignmentID  uuid.UUID  `json:"assignment_id"`
+	StudentID     uuid.UUID  `json:"student_id"`
+	RouteID       uuid.UUID  `json:"route_id"`
+	StopID        uuid.UUID  `json:"stop_id"`
+	PickupPoint   string     `json:"pickup_point,omitempty"`
+	DropPoint     string     `json:"drop_point,omitempty"`
+	EffectiveFrom time.Time  `json:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+	IsActive      bool       `json:"is_active"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy     *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/transport_stop.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TransportStop struct {
+	StopID     uuid.UUID  `json:"stop_id"`
+	RouteID    uuid.UUID  `json:"route_id"`
+	StopName   string     `json:"stop_name"`
+	StopOrder  int        `json:"stop_order"`
+	Latitude   *float64   `json:"latitude,omitempty"`
+	Longitude  *float64   `json:"longitude,omitempty"`
+	PickupTime *time.Time `json:"pickup_time,omitempty"`
+	DropTime   *time.Time `json:"drop_time,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	CreatedBy  *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy  *uuid.UUID `json:"updated_by,omitempty"`
 }
 
 
@@ -237,6 +1607,543 @@ type Student struct {
 	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
 	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
 	DeletedAt *time.Time `json:"delete"`
+}
+
+
+
+================================================================================
+FILE: ./models/library_category.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type LibraryCategory struct {
+	CategoryID   uuid.UUID  `json:"category_id"`
+	CompanyID    uuid.UUID  `json:"company_id"`
+	CategoryName string     `json:"category_name"`
+	Description  string     `json:"description,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy    *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt    *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/fee_structure.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type FeeStructure struct {
+	FeeStructureID   uuid.UUID  `json:"fee_structure_id"`
+	AcademicYearID   uuid.UUID  `json:"academic_year_id"`
+	CourseID         uuid.UUID  `json:"course_id"`
+	SectionID        *uuid.UUID `json:"section_id,omitempty"`
+	FeeStructureName string     `json:"fee_structure_name"`
+	TotalAmount      float64    `json:"total_amount"` // numeric(12,2)
+	IsActive         bool       `json:"is_active"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+	CreatedBy        *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy        *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt        *time.Time `json:"deleted_at,omitempty"`
+}
+
+type FeeStructureItem struct {
+	ItemID         uuid.UUID  `json:"item_id"`
+	FeeStructureID uuid.UUID  `json:"fee_structure_id"`
+	FeeHead        string     `json:"fee_head"`
+	Amount         float64    `json:"amount"`
+	IsMandatory    bool       `json:"is_mandatory"`
+	Description    string     `json:"description,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/transport_route.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TransportRoute struct {
+	RouteID    uuid.UUID  `json:"route_id"`
+	CompanyID  uuid.UUID  `json:"company_id"`
+	RouteName  string     `json:"route_name"`
+	StartPoint string     `json:"start_point,omitempty"`
+	EndPoint   string     `json:"end_point,omitempty"`
+	DistanceKm *float64   `json:"distance_km,omitempty"`
+	IsActive   bool       `json:"is_active"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	CreatedBy  *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy  *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/admission.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AdmissionStatus string
+
+const (
+	AdmissionStatusPending  AdmissionStatus = "pending"
+	AdmissionStatusApproved AdmissionStatus = "approved"
+	AdmissionStatusRejected AdmissionStatus = "rejected"
+)
+
+// IsValidAdmissionStatus checks if a string is a valid admission status.
+func IsValidAdmissionStatus(s string) bool {
+	switch AdmissionStatus(s) {
+	case AdmissionStatusPending, AdmissionStatusApproved, AdmissionStatusRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+type Admission struct {
+	AdmissionID     uuid.UUID       `json:"admission_id"`
+	StudentID       uuid.UUID       `json:"student_id"`
+	AcademicYearID  uuid.UUID       `json:"academic_year_id"`
+	AdmissionDate   time.Time       `json:"admission_date"`
+	ClassAppliedFor string          `json:"class_applied_for,omitempty"`
+	AdmissionStatus AdmissionStatus `json:"admission_status"`
+	Remarks         string          `json:"remarks,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	UpdatedAt       time.Time       `json:"updated_at"`
+	CreatedBy       *uuid.UUID      `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/library_book_copy.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type CopyStatus string
+
+const (
+	CopyStatusAvailable CopyStatus = "available"
+	CopyStatusIssued    CopyStatus = "issued"
+	CopyStatusLost      CopyStatus = "lost"
+	CopyStatusDamaged   CopyStatus = "damaged"
+	CopyStatusReserved  CopyStatus = "reserved"
+)
+
+func IsValidCopyStatus(s string) bool {
+	switch CopyStatus(s) {
+	case CopyStatusAvailable, CopyStatusIssued, CopyStatusLost, CopyStatusDamaged, CopyStatusReserved:
+		return true
+	default:
+		return false
+	}
+}
+
+type LibraryBookCopy struct {
+	CopyID        uuid.UUID  `json:"copy_id"`
+	BookID        uuid.UUID  `json:"book_id"`
+	AccessionNo   string     `json:"accession_no"`
+	Status        CopyStatus `json:"status"`
+	PurchaseDate  *time.Time `json:"purchase_date,omitempty"`
+	Cost          *float64   `json:"cost,omitempty"`
+	ShelfLocation string     `json:"shelf_location,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// -----------------------------------------------------------------------------
+// Academic Year Metrics (aggregated across various domains)
+// -----------------------------------------------------------------------------
+
+type AcademicYearMetrics struct {
+	AcademicYearID         uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalStudents          int       `db:"total_students" json:"total_students"`
+	ActiveStudents         int       `db:"active_students" json:"active_students"`
+	TotalTerms             int       `db:"total_terms" json:"total_terms"`
+	TotalSections          int       `db:"total_sections" json:"total_sections"`
+	TotalCourses           int       `db:"total_courses" json:"total_courses"`
+	TotalSubjects          int       `db:"total_subjects" json:"total_subjects"`
+	TotalAdmissions        int       `db:"total_admissions" json:"total_admissions"`
+	ApprovedAdmissions     int       `db:"approved_admissions" json:"approved_admissions"`
+	PendingAdmissions      int       `db:"pending_admissions" json:"pending_admissions"`
+	RejectedAdmissions     int       `db:"rejected_admissions" json:"rejected_admissions"`
+	TotalAssignments       int       `db:"total_assignments" json:"total_assignments"`
+	PublishedAssignments   int       `db:"published_assignments" json:"published_assignments"`
+	TotalAttendanceRecords int       `db:"total_attendance_records" json:"total_attendance_records"`
+	TotalAbsentRecords     int       `db:"total_absent_records" json:"total_absent_records"`
+	TotalLateRecords       int       `db:"total_late_records" json:"total_late_records"`
+	TotalHalfDayRecords    int       `db:"total_half_day_records" json:"total_half_day_records"`
+	TotalExemptions        int       `db:"total_exemptions" json:"total_exemptions"`
+	TotalSubjectMappings   int       `db:"total_subject_mappings" json:"total_subject_mappings"`
+	CoursesWithCurriculum  int       `db:"courses_with_curriculum" json:"courses_with_curriculum"`
+	TotalEnrollments       int       `db:"total_enrollments" json:"total_enrollments"`
+	ActiveEnrollments      int       `db:"active_enrollments" json:"active_enrollments"`
+	CompletedEnrollments   int       `db:"completed_enrollments" json:"completed_enrollments"`
+	WithdrawnEnrollments   int       `db:"withdrawn_enrollments" json:"withdrawn_enrollments"`
+	LastUpdated            time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type AcademicYearMetricsUpdate struct {
+	AcademicYearID             uuid.UUID
+	DeltaStudents              int
+	DeltaActive                int
+	DeltaTerms                 int
+	DeltaSections              int
+	DeltaCourses               int
+	DeltaSubjects              int
+	DeltaTotalAdm              int
+	DeltaApprovedAdm           int
+	DeltaPendingAdm            int
+	DeltaRejectedAdm           int
+	DeltaTotalAssignments      int
+	DeltaPublishedAssignments  int
+	DeltaAttendanceRecords     int
+	DeltaAbsentRecords         int
+	DeltaLateRecords           int
+	DeltaHalfDayRecords        int
+	DeltaExemptions            int
+	DeltaTotalSubjectMappings  int
+	DeltaCoursesWithCurriculum int
+	DeltaTotalEnrollments      int
+	DeltaActiveEnrollments     int
+	DeltaCompletedEnrollments  int
+	DeltaWithdrawnEnrollments  int
+}
+
+// -----------------------------------------------------------------------------
+// Exam Metrics
+// -----------------------------------------------------------------------------
+
+type ExamMetrics struct {
+	AcademicYearID uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalExams     int       `db:"total_exams" json:"total_exams"`
+	TotalSchedules int       `db:"total_schedules" json:"total_schedules"`
+	TotalResults   int       `db:"total_results" json:"total_results"`
+	TotalGrades    int       `db:"total_grades" json:"total_grades"`
+	LastUpdated    time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type ExamMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaExams     int
+	DeltaSchedules int
+	DeltaResults   int
+	DeltaGrades    int
+}
+
+// -----------------------------------------------------------------------------
+// Fee Metrics
+// -----------------------------------------------------------------------------
+
+type FeeMetrics struct {
+	AcademicYearID      uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalFeeStructures  int       `db:"total_fee_structures" json:"total_fee_structures"`
+	TotalInvoices       int       `db:"total_invoices" json:"total_invoices"`
+	TotalPayments       int       `db:"total_payments" json:"total_payments"`
+	TotalDiscounts      int       `db:"total_discounts" json:"total_discounts"`
+	TotalPenalties      int       `db:"total_penalties" json:"total_penalties"`
+	TotalReceipts       int       `db:"total_receipts" json:"total_receipts"`
+	TotalInvoiceAmount  float64   `db:"total_invoice_amount" json:"total_invoice_amount"`
+	TotalPaidAmount     float64   `db:"total_paid_amount" json:"total_paid_amount"`
+	TotalDiscountAmount float64   `db:"total_discount_amount" json:"total_discount_amount"`
+	TotalPenaltyAmount  float64   `db:"total_penalty_amount" json:"total_penalty_amount"`
+	LastUpdated         time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type FeeMetricsUpdate struct {
+	AcademicYearID      uuid.UUID
+	DeltaFeeStructures  int
+	DeltaInvoices       int
+	DeltaPayments       int
+	DeltaDiscounts      int
+	DeltaPenalties      int
+	DeltaReceipts       int
+	DeltaInvoiceAmount  float64
+	DeltaPaidAmount     float64
+	DeltaDiscountAmount float64
+	DeltaPenaltyAmount  float64
+}
+
+// -----------------------------------------------------------------------------
+// Grading Metrics
+// -----------------------------------------------------------------------------
+
+type GradingMetrics struct {
+	AcademicYearID  uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalPolicies   int       `db:"total_policies" json:"total_policies"`
+	TotalBoundaries int       `db:"total_boundaries" json:"total_boundaries"`
+	LastUpdated     time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type GradingMetricsUpdate struct {
+	AcademicYearID  uuid.UUID
+	DeltaPolicies   int
+	DeltaBoundaries int
+}
+
+// -----------------------------------------------------------------------------
+// Guardian Metrics
+// -----------------------------------------------------------------------------
+
+type GuardianMetrics struct {
+	AcademicYearID        uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalGuardians        int       `db:"total_guardians" json:"total_guardians"`
+	TotalPrimaryGuardians int       `db:"total_primary_guardians" json:"total_primary_guardians"`
+	LastUpdated           time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type GuardianMetricsUpdate struct {
+	AcademicYearID        uuid.UUID
+	DeltaGuardians        int
+	DeltaPrimaryGuardians int
+}
+
+// -----------------------------------------------------------------------------
+// Library Metrics
+// -----------------------------------------------------------------------------
+
+type LibraryMetrics struct {
+	AcademicYearID  uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalCategories int       `db:"total_categories" json:"total_categories"`
+	TotalBooks      int       `db:"total_books" json:"total_books"`
+	TotalCopies     int       `db:"total_copies" json:"total_copies"`
+	TotalIssues     int       `db:"total_issues" json:"total_issues"`
+	TotalReturns    int       `db:"total_returns" json:"total_returns"`
+	TotalFines      int       `db:"total_fines" json:"total_fines"`
+	TotalFineAmount float64   `db:"total_fine_amount" json:"total_fine_amount"`
+	LastUpdated     time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type LibraryMetricsUpdate struct {
+	AcademicYearID  uuid.UUID
+	DeltaCategories int
+	DeltaBooks      int
+	DeltaCopies     int
+	DeltaIssues     int
+	DeltaReturns    int
+	DeltaFines      int
+	DeltaFineAmount float64
+}
+
+// -----------------------------------------------------------------------------
+// Room Metrics
+// -----------------------------------------------------------------------------
+
+type RoomMetrics struct {
+	AcademicYearID uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalRooms     int       `db:"total_rooms" json:"total_rooms"`
+	ActiveRooms    int       `db:"active_rooms" json:"active_rooms"`
+	LastUpdated    time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type RoomMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaRooms     int
+	DeltaActive    int
+}
+
+// -----------------------------------------------------------------------------
+// Section Metrics
+// -----------------------------------------------------------------------------
+
+type SectionMetrics struct {
+	AcademicYearID uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalSections  int       `db:"total_sections" json:"total_sections"`
+	ActiveSections int       `db:"active_sections" json:"active_sections"`
+	TotalCapacity  int       `db:"total_capacity" json:"total_capacity"`
+	UsedCapacity   int       `db:"used_capacity" json:"used_capacity"`
+	LastUpdated    time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type SectionMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaSections  int
+	DeltaActive    int
+	DeltaTotalCap  int
+	DeltaUsedCap   int
+}
+
+// -----------------------------------------------------------------------------
+// Student Metrics
+// -----------------------------------------------------------------------------
+
+type StudentMetrics struct {
+	AcademicYearID uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalStudents  int       `db:"total_students" json:"total_students"`
+	ActiveStudents int       `db:"active_students" json:"active_students"`
+	MaleStudents   int       `db:"male_students" json:"male_students"`
+	FemaleStudents int       `db:"female_students" json:"female_students"`
+	LastUpdated    time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type StudentMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaTotal     int
+	DeltaActive    int
+	DeltaMale      int
+	DeltaFemale    int
+}
+
+// -----------------------------------------------------------------------------
+// Subject Metrics
+// -----------------------------------------------------------------------------
+
+type SubjectMetrics struct {
+	AcademicYearID uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalSubjects  int       `db:"total_subjects" json:"total_subjects"`
+	ActiveSubjects int       `db:"active_subjects" json:"active_subjects"`
+	TotalCredits   int       `db:"total_credits" json:"total_credits"`
+	LastUpdated    time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type SubjectMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaTotal     int
+	DeltaActive    int
+	DeltaCredits   int
+}
+
+// -----------------------------------------------------------------------------
+// Submission Metrics
+// -----------------------------------------------------------------------------
+
+type SubmissionMetrics struct {
+	AcademicYearID    uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalSubmissions  int       `db:"total_submissions" json:"total_submissions"`
+	LateSubmissions   int       `db:"late_submissions" json:"late_submissions"`
+	GradedSubmissions int       `db:"graded_submissions" json:"graded_submissions"`
+	LastUpdated       time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type SubmissionMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaTotal     int
+	DeltaLate      int
+	DeltaGraded    int
+}
+
+// -----------------------------------------------------------------------------
+// Teacher Metrics
+// -----------------------------------------------------------------------------
+
+type TeacherMetrics struct {
+	AcademicYearID uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalTeachers  int       `db:"total_teachers" json:"total_teachers"`
+	ActiveTeachers int       `db:"active_teachers" json:"active_teachers"`
+	LastUpdated    time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type TeacherMetricsUpdate struct {
+	AcademicYearID uuid.UUID
+	DeltaTotal     int
+	DeltaActive    int
+}
+
+// -----------------------------------------------------------------------------
+// Timetable Metrics
+// -----------------------------------------------------------------------------
+
+type TimetableMetrics struct {
+	AcademicYearID   uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalTimetables  int       `db:"total_timetables" json:"total_timetables"`
+	ActiveTimetables int       `db:"active_timetables" json:"active_timetables"`
+	TotalSlots       int       `db:"total_slots" json:"total_slots"`
+	TotalEntries     int       `db:"total_entries" json:"total_entries"`
+	TotalChanges     int       `db:"total_changes" json:"total_changes"`
+	LastUpdated      time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type TimetableMetricsUpdate struct {
+	AcademicYearID  uuid.UUID
+	DeltaTimetables int
+	DeltaActive     int
+	DeltaSlots      int
+	DeltaEntries    int
+	DeltaChanges    int
+}
+
+// -----------------------------------------------------------------------------
+// Transport Metrics
+// -----------------------------------------------------------------------------
+
+type TransportMetrics struct {
+	AcademicYearID          uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalRoutes             int       `db:"total_routes" json:"total_routes"`
+	TotalStops              int       `db:"total_stops" json:"total_stops"`
+	TotalVehicles           int       `db:"total_vehicles" json:"total_vehicles"`
+	ActiveVehicles          int       `db:"active_vehicles" json:"active_vehicles"`
+	TotalDriverAssignments  int       `db:"total_driver_assignments" json:"total_driver_assignments"`
+	TotalStudentAssignments int       `db:"total_student_assignments" json:"total_student_assignments"`
+	LastUpdated             time.Time `db:"last_updated" json:"last_updated"`
+}
+
+type TransportMetricsUpdate struct {
+	AcademicYearID          uuid.UUID
+	DeltaRoutes             int
+	DeltaStops              int
+	DeltaVehicles           int
+	DeltaActiveVehicles     int
+	DeltaDriverAssignments  int
+	DeltaStudentAssignments int
 }
 
 

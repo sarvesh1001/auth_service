@@ -60,3 +60,25 @@ type Student struct {
 	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
 	DeletedAt *time.Time `json:"delete"`
 }
+
+type StudentAuth struct {
+	StudentAuthID uuid.UUID `json:"student_auth_id"`
+	StudentID     uuid.UUID `json:"student_id"`
+
+	// Encrypted password fields (stored as ciphertext)
+	Password      *string `json:"password,omitempty"`        // encrypted password
+	PasswordDEK   *string `json:"password_dek,omitempty"`    // data encryption key
+	PasswordKeyID *string `json:"password_key_id,omitempty"` // key identifier
+
+	// Security tracking
+	LastLoginAt   *time.Time `json:"last_login_at,omitempty"`
+	LoginAttempts int        `json:"login_attempts"`
+	LockedUntil   *time.Time `json:"locked_until,omitempty"`
+
+	// Audit fields
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}

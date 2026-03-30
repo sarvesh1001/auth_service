@@ -41,6 +41,20 @@ type StudentRepository interface {
 	CountBySection(ctx context.Context, db DBTX, sectionID uuid.UUID) (int64, error)
 	BulkUpdateStatus(ctx context.Context, db DBTX, ids []uuid.UUID, status string, updatedBy *uuid.UUID) error
 	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit int) ([]*models.Student, error)
+	AddDocument(ctx context.Context, db DBTX, doc *models.StudentDocument) error
+	GetDocuments(ctx context.Context, db DBTX, studentID uuid.UUID) ([]*models.StudentDocument, error)
+	GetDocumentByID(ctx context.Context, db DBTX, documentID uuid.UUID) (*models.StudentDocument, error)
+	UpdateDocument(ctx context.Context, db DBTX, doc *models.StudentDocument) error
+	DeleteDocument(ctx context.Context, db DBTX, documentID uuid.UUID, deletedBy *uuid.UUID) error
+	GetDocumentsByType(ctx context.Context, db DBTX, studentID uuid.UUID, docType string) ([]*models.StudentDocument, error)
+	GetByEmail(ctx context.Context, db DBTX, companyID uuid.UUID, email string) (*models.Student, error)
+	GetByPhone(ctx context.Context, db DBTX, companyID uuid.UUID, phone string) (*models.Student, error)
+	// Previous Education methods
+	AddPreviousEducation(ctx context.Context, db DBTX, prev *models.StudentPreviousEducation) error
+	GetPreviousEducation(ctx context.Context, db DBTX, studentID uuid.UUID) ([]*models.StudentPreviousEducation, error)
+	GetPreviousEducationByID(ctx context.Context, db DBTX, prevEduID uuid.UUID) (*models.StudentPreviousEducation, error)
+	UpdatePreviousEducation(ctx context.Context, db DBTX, prev *models.StudentPreviousEducation) error
+	DeletePreviousEducation(ctx context.Context, db DBTX, prevEduID uuid.UUID) error
 }
 
 type studentRepository struct {
@@ -50,7 +64,7 @@ type studentRepository struct {
 
 var (
 	ErrNotFound        = errors.New("resource not found")
-	ErrVersionConflict = errors.New("version conflict") // Added for optimistic locking
+	ErrVersionConflict = errors.New("version conflict")
 )
 
 // NewStudentRepository creates a new student repository with encryption support.
@@ -164,11 +178,13 @@ func (r *studentRepository) buildStudentFilter(filter StudentFilter) (string, []
 		idx++
 	}
 
-	// Join-related conditions
+	// Join-related conditions (must be added only after ensuring the necessary joins)
+	// The actual joins are handled in List/Count; here we just build the WHERE clause.
 	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil || filter.JoinedFrom != nil || filter.JoinedTo != nil
 	if needEnrollments {
+		// These conditions reference tables that will be joined (e, sec)
 		if filter.CourseID != nil {
-			conditions = append(conditions, fmt.Sprintf("e.course_id = $%d", idx))
+			conditions = append(conditions, fmt.Sprintf("sec.course_id = $%d", idx))
 			args = append(args, *filter.CourseID)
 			idx++
 		}
@@ -448,10 +464,9 @@ func (r *studentRepository) List(ctx context.Context, db DBTX, filter StudentFil
 	fromClause := "FROM academics.students s"
 	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil || filter.JoinedFrom != nil || filter.JoinedTo != nil
 	if needEnrollments {
+		// Always join enrollments and section when any enrollment-related filter is present
 		fromClause += " LEFT JOIN academics.enrollments e ON s.student_id = e.student_id AND e.deleted_at IS NULL"
-		if filter.TermID != nil {
-			fromClause += " LEFT JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
-		}
+		fromClause += " LEFT JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
 	}
 
 	query := fmt.Sprintf(`
@@ -503,9 +518,7 @@ func (r *studentRepository) Count(ctx context.Context, db DBTX, filter StudentFi
 	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil || filter.JoinedFrom != nil || filter.JoinedTo != nil
 	if needEnrollments {
 		fromClause += " LEFT JOIN academics.enrollments e ON s.student_id = e.student_id AND e.deleted_at IS NULL"
-		if filter.TermID != nil {
-			fromClause += " LEFT JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
-		}
+		fromClause += " LEFT JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
 	}
 
 	query := fmt.Sprintf("SELECT COUNT(DISTINCT s.student_id) %s %s", fromClause, where)
@@ -623,10 +636,8 @@ func (r *studentRepository) Update(ctx context.Context, db DBTX, s *models.Stude
 			checkQuery := `SELECT EXISTS(SELECT 1 FROM academics.students WHERE student_id = $1 AND deleted_at IS NULL)`
 			_ = db.QueryRowContext(ctx, checkQuery, s.StudentID).Scan(&exists)
 			if exists {
-				// Record exists, so version must have been mismatched
 				return fmt.Errorf("%w: student %s version mismatch", ErrVersionConflict, s.StudentID)
 			}
-			// Record does not exist or is deleted
 			return fmt.Errorf("%w: student %s", ErrNotFound, s.StudentID)
 		}
 		r.logger.Error("failed to update student",
@@ -670,7 +681,10 @@ func (r *studentRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.U
 			util.ErrorField(err))
 		return fmt.Errorf("update student status: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
 	if rows == 0 {
 		return fmt.Errorf("student %s not found or deleted", id)
 	}
@@ -698,7 +712,10 @@ func (r *studentRepository) UpdateContactInfo(ctx context.Context, db DBTX, id u
 			util.ErrorField(err))
 		return fmt.Errorf("update student contact info: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
 	if rows == 0 {
 		return fmt.Errorf("student %s not found or deleted", id)
 	}
@@ -726,7 +743,10 @@ func (r *studentRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, d
 			util.ErrorField(err))
 		return fmt.Errorf("delete student: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
 	if rows == 0 {
 		return fmt.Errorf("student %s not found or already deleted", id)
 	}
@@ -740,7 +760,8 @@ func (r *studentRepository) CountByCourse(ctx context.Context, db DBTX, courseID
 		SELECT COUNT(DISTINCT s.student_id)
 		FROM academics.students s
 		JOIN academics.enrollments e ON s.student_id = e.student_id
-		WHERE e.course_id = $1 AND e.status = 'active' AND e.deleted_at IS NULL
+		JOIN academics.section sec ON e.section_id = sec.section_id
+		WHERE sec.course_id = $1 AND e.status = 'active' AND e.deleted_at IS NULL
 		  AND s.deleted_at IS NULL
 	`
 	var count int64
@@ -814,7 +835,10 @@ func (r *studentRepository) BulkUpdateStatus(ctx context.Context, db DBTX, ids [
 			util.ErrorField(err))
 		return fmt.Errorf("bulk update status: %w", err)
 	}
-	rows, _ := result.RowsAffected()
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
 	if rows == 0 {
 		return fmt.Errorf("no students updated")
 	}
@@ -999,4 +1023,371 @@ func (r *studentRepository) scanStudent(ctx context.Context, row scanner) (*mode
 	}
 
 	return &s, nil
+}
+
+// --- Document methods -------------------------------------------------
+
+func (r *studentRepository) AddDocument(ctx context.Context, db DBTX, doc *models.StudentDocument) error {
+	query := `
+        INSERT INTO academics.student_documents (
+            student_id, document_type, document_name, file_url,
+            uploaded_at, verified, verified_by, created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, NOW(), NOW())
+        RETURNING document_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		doc.StudentID, doc.DocumentType, doc.DocumentName, doc.FileURL,
+		doc.Verified, doc.VerifiedBy, doc.CreatedBy,
+	).Scan(&doc.DocumentID, &doc.CreatedAt, &doc.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to add student document",
+			util.String("student_id", doc.StudentID.String()),
+			util.String("document_type", doc.DocumentType),
+			util.ErrorField(err))
+		return fmt.Errorf("add student document: %w", err)
+	}
+	return nil
+}
+
+func (r *studentRepository) GetDocuments(ctx context.Context, db DBTX, studentID uuid.UUID) ([]*models.StudentDocument, error) {
+	query := `
+        SELECT document_id, student_id, document_type, document_name, file_url,
+               uploaded_at, verified, verified_by, created_at, updated_at, created_by
+        FROM academics.student_documents
+        WHERE student_id = $1
+        ORDER BY created_at DESC
+    `
+	rows, err := db.QueryContext(ctx, query, studentID)
+	if err != nil {
+		r.logger.Error("failed to get student documents",
+			util.String("student_id", studentID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get student documents: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.StudentDocument
+	for rows.Next() {
+		doc := &models.StudentDocument{}
+		var createdBy uuid.NullUUID
+		var verifiedBy uuid.NullUUID
+		err := rows.Scan(
+			&doc.DocumentID, &doc.StudentID, &doc.DocumentType, &doc.DocumentName, &doc.FileURL,
+			&doc.UploadedAt, &doc.Verified, &verifiedBy, &doc.CreatedAt, &doc.UpdatedAt, &createdBy,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan document: %w", err)
+		}
+		if verifiedBy.Valid {
+			doc.VerifiedBy = &verifiedBy.UUID
+		}
+		if createdBy.Valid {
+			doc.CreatedBy = &createdBy.UUID
+		}
+		result = append(result, doc)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+func (r *studentRepository) GetDocumentByID(ctx context.Context, db DBTX, documentID uuid.UUID) (*models.StudentDocument, error) {
+	query := `
+        SELECT document_id, student_id, document_type, document_name, file_url,
+               uploaded_at, verified, verified_by, created_at, updated_at, created_by
+        FROM academics.student_documents
+        WHERE document_id = $1
+    `
+	row := db.QueryRowContext(ctx, query, documentID)
+	doc := &models.StudentDocument{}
+	var createdBy uuid.NullUUID
+	var verifiedBy uuid.NullUUID
+	err := row.Scan(
+		&doc.DocumentID, &doc.StudentID, &doc.DocumentType, &doc.DocumentName, &doc.FileURL,
+		&doc.UploadedAt, &doc.Verified, &verifiedBy, &doc.CreatedAt, &doc.UpdatedAt, &createdBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get document by ID: %w", err)
+	}
+	if verifiedBy.Valid {
+		doc.VerifiedBy = &verifiedBy.UUID
+	}
+	if createdBy.Valid {
+		doc.CreatedBy = &createdBy.UUID
+	}
+	return doc, nil
+}
+
+func (r *studentRepository) UpdateDocument(ctx context.Context, db DBTX, doc *models.StudentDocument) error {
+	query := `
+        UPDATE academics.student_documents
+        SET
+            document_type = $2,
+            document_name = $3,
+            file_url = $4,
+            verified = $5,
+            verified_by = $6,
+            updated_at = NOW()
+        WHERE document_id = $1
+        RETURNING updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		doc.DocumentID, doc.DocumentType, doc.DocumentName, doc.FileURL,
+		doc.Verified, doc.VerifiedBy,
+	).Scan(&doc.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: document %s", ErrNotFound, doc.DocumentID)
+		}
+		r.logger.Error("failed to update student document",
+			util.String("document_id", doc.DocumentID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update student document: %w", err)
+	}
+	return nil
+}
+
+func (r *studentRepository) DeleteDocument(ctx context.Context, db DBTX, documentID uuid.UUID, deletedBy *uuid.UUID) error {
+	// Soft delete? The table has no deleted_at column per schema, so we'll do a physical delete.
+	// If you prefer soft delete, you'd need to add deleted_at to the table.
+	query := `DELETE FROM academics.student_documents WHERE document_id = $1`
+	result, err := db.ExecContext(ctx, query, documentID)
+	if err != nil {
+		r.logger.Error("failed to delete student document",
+			util.String("document_id", documentID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete student document: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("document %s not found", documentID)
+	}
+	return nil
+}
+
+func (r *studentRepository) GetDocumentsByType(ctx context.Context, db DBTX, studentID uuid.UUID, docType string) ([]*models.StudentDocument, error) {
+	query := `
+        SELECT document_id, student_id, document_type, document_name, file_url,
+               uploaded_at, verified, verified_by, created_at, updated_at, created_by
+        FROM academics.student_documents
+        WHERE student_id = $1 AND document_type = $2
+        ORDER BY created_at DESC
+    `
+	rows, err := db.QueryContext(ctx, query, studentID, docType)
+	if err != nil {
+		r.logger.Error("failed to get student documents by type",
+			util.String("student_id", studentID.String()),
+			util.String("document_type", docType),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get documents by type: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.StudentDocument
+	for rows.Next() {
+		doc := &models.StudentDocument{}
+		var createdBy uuid.NullUUID
+		var verifiedBy uuid.NullUUID
+		err := rows.Scan(
+			&doc.DocumentID, &doc.StudentID, &doc.DocumentType, &doc.DocumentName, &doc.FileURL,
+			&doc.UploadedAt, &doc.Verified, &verifiedBy, &doc.CreatedAt, &doc.UpdatedAt, &createdBy,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan document: %w", err)
+		}
+		if verifiedBy.Valid {
+			doc.VerifiedBy = &verifiedBy.UUID
+		}
+		if createdBy.Valid {
+			doc.CreatedBy = &createdBy.UUID
+		}
+		result = append(result, doc)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// --- Previous Education methods -----------------------------------------
+
+func (r *studentRepository) AddPreviousEducation(ctx context.Context, db DBTX, prev *models.StudentPreviousEducation) error {
+	query := `
+        INSERT INTO academics.student_previous_education (
+            student_id, school_name, board, year_of_passing, percentage, grade, qualification,
+            created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        RETURNING prev_edu_id, created_at, updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		prev.StudentID, prev.SchoolName, prev.Board, prev.YearOfPassing,
+		prev.Percentage, prev.Grade, prev.Qualification,
+	).Scan(&prev.PrevEduID, &prev.CreatedAt, &prev.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to add previous education",
+			util.String("student_id", prev.StudentID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("add previous education: %w", err)
+	}
+	return nil
+}
+
+func (r *studentRepository) GetPreviousEducation(ctx context.Context, db DBTX, studentID uuid.UUID) ([]*models.StudentPreviousEducation, error) {
+	query := `
+        SELECT prev_edu_id, student_id, school_name, board, year_of_passing,
+               percentage, grade, qualification, created_at, updated_at
+        FROM academics.student_previous_education
+        WHERE student_id = $1
+        ORDER BY year_of_passing DESC
+    `
+	rows, err := db.QueryContext(ctx, query, studentID)
+	if err != nil {
+		r.logger.Error("failed to get previous education",
+			util.String("student_id", studentID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get previous education: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.StudentPreviousEducation
+	for rows.Next() {
+		prev := &models.StudentPreviousEducation{}
+		err := rows.Scan(
+			&prev.PrevEduID, &prev.StudentID, &prev.SchoolName, &prev.Board, &prev.YearOfPassing,
+			&prev.Percentage, &prev.Grade, &prev.Qualification, &prev.CreatedAt, &prev.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan previous education: %w", err)
+		}
+		result = append(result, prev)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+func (r *studentRepository) GetPreviousEducationByID(ctx context.Context, db DBTX, prevEduID uuid.UUID) (*models.StudentPreviousEducation, error) {
+	query := `
+        SELECT prev_edu_id, student_id, school_name, board, year_of_passing,
+               percentage, grade, qualification, created_at, updated_at
+        FROM academics.student_previous_education
+        WHERE prev_edu_id = $1
+    `
+	row := db.QueryRowContext(ctx, query, prevEduID)
+	prev := &models.StudentPreviousEducation{}
+	err := row.Scan(
+		&prev.PrevEduID, &prev.StudentID, &prev.SchoolName, &prev.Board, &prev.YearOfPassing,
+		&prev.Percentage, &prev.Grade, &prev.Qualification, &prev.CreatedAt, &prev.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get previous education by ID: %w", err)
+	}
+	return prev, nil
+}
+
+func (r *studentRepository) UpdatePreviousEducation(ctx context.Context, db DBTX, prev *models.StudentPreviousEducation) error {
+	query := `
+        UPDATE academics.student_previous_education
+        SET
+            school_name = $2,
+            board = $3,
+            year_of_passing = $4,
+            percentage = $5,
+            grade = $6,
+            qualification = $7,
+            updated_at = NOW()
+        WHERE prev_edu_id = $1
+        RETURNING updated_at
+    `
+	err := db.QueryRowContext(ctx, query,
+		prev.PrevEduID, prev.SchoolName, prev.Board, prev.YearOfPassing,
+		prev.Percentage, prev.Grade, prev.Qualification,
+	).Scan(&prev.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: previous education %s", ErrNotFound, prev.PrevEduID)
+		}
+		r.logger.Error("failed to update previous education",
+			util.String("prev_edu_id", prev.PrevEduID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("update previous education: %w", err)
+	}
+	return nil
+}
+
+func (r *studentRepository) DeletePreviousEducation(ctx context.Context, db DBTX, prevEduID uuid.UUID) error {
+	// Physical delete (no soft delete column)
+	query := `DELETE FROM academics.student_previous_education WHERE prev_edu_id = $1`
+	result, err := db.ExecContext(ctx, query, prevEduID)
+	if err != nil {
+		r.logger.Error("failed to delete previous education",
+			util.String("prev_edu_id", prevEduID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("delete previous education: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("previous education %s not found", prevEduID)
+	}
+	return nil
+}
+
+func (r *studentRepository) GetByEmail(ctx context.Context, db DBTX, companyID uuid.UUID, email string) (*models.Student, error) {
+	enc, err := r.encryptField(ctx, email, "student_email")
+	if err != nil {
+		return nil, fmt.Errorf("encrypt email: %w", err)
+	}
+
+	query := `
+        SELECT
+            student_id, company_id, first_name, last_name, admission_no,
+            email, email_dek, email_key_id,
+            phone, phone_dek, phone_key_id,
+            date_of_birth, gender, blood_group, nationality, religion, category,
+            aadhar_no, aadhar_no_dek, aadhar_no_key_id,
+            emergency_contact_name, emergency_contact_phone, emergency_contact_phone_dek, emergency_contact_phone_key_id,
+            medical_conditions, status, version,
+            created_at, updated_at, created_by, updated_by
+        FROM academics.students
+        WHERE company_id = $1 AND email = $2 AND deleted_at IS NULL
+    `
+	row := db.QueryRowContext(ctx, query, companyID, enc.EncryptedValue)
+	return r.scanStudent(ctx, row)
+}
+
+func (r *studentRepository) GetByPhone(ctx context.Context, db DBTX, companyID uuid.UUID, phone string) (*models.Student, error) {
+	enc, err := r.encryptField(ctx, phone, "student_phone")
+	if err != nil {
+		return nil, fmt.Errorf("encrypt phone: %w", err)
+	}
+
+	query := `
+        SELECT
+            student_id, company_id, first_name, last_name, admission_no,
+            email, email_dek, email_key_id,
+            phone, phone_dek, phone_key_id,
+            date_of_birth, gender, blood_group, nationality, religion, category,
+            aadhar_no, aadhar_no_dek, aadhar_no_key_id,
+            emergency_contact_name, emergency_contact_phone, emergency_contact_phone_dek, emergency_contact_phone_key_id,
+            medical_conditions, status, version,
+            created_at, updated_at, created_by, updated_by
+        FROM academics.students
+        WHERE company_id = $1 AND phone = $2 AND deleted_at IS NULL
+    `
+	row := db.QueryRowContext(ctx, query, companyID, enc.EncryptedValue)
+	return r.scanStudent(ctx, row)
 }

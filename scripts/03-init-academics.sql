@@ -172,7 +172,6 @@ CREATE TABLE IF NOT EXISTS academics.students (
     updated_by      UUID REFERENCES users(user_id),
     deleted_at      TIMESTAMPTZ
 );
-
 -- Indexes for students (new and updated)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_students_admission_no_active 
     ON academics.students(company_id, admission_no) 
@@ -185,13 +184,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_students_email_active
 CREATE INDEX IF NOT EXISTS idx_students_company ON academics.students(company_id);
 CREATE INDEX IF NOT EXISTS idx_students_not_deleted ON academics.students(deleted_at) WHERE deleted_at IS NULL;
 
+
 CREATE TABLE IF NOT EXISTS academics.student_guardians (
     guardian_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     student_id      UUID NOT NULL REFERENCES academics.students(student_id) ON DELETE CASCADE,
     guardian_name   VARCHAR(255) NOT NULL,
     relation        VARCHAR(50) NOT NULL,
-    phone           VARCHAR(20),
-    email           VARCHAR(255),
+    
+    -- Phone (encrypted)
+    phone                TEXT,
+    phone_dek            TEXT,
+    phone_key_id         TEXT,
+    
+    -- Email (encrypted)
+    email                TEXT,
+    email_dek            TEXT,
+    email_key_id         TEXT,
+    
     address         TEXT,
     is_primary      BOOLEAN NOT NULL DEFAULT false,
     occupation      VARCHAR(100),
@@ -199,6 +208,7 @@ CREATE TABLE IF NOT EXISTS academics.student_guardians (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
 
 CREATE TABLE IF NOT EXISTS academics.admissions (
     admission_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -266,7 +276,6 @@ CREATE TABLE IF NOT EXISTS academics.teachers (
     qualification   TEXT,
     specialization  VARCHAR(255),
     joining_date    DATE,
-    emergency_contact VARCHAR(20),
     status          VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active','inactive','resigned')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1430,3 +1439,213 @@ CREATE INDEX idx_outbox_created ON outbox.events(created_at);
 CREATE UNIQUE INDEX idx_academic_year_one_current
 ON academics.academic_year(company_id)
 WHERE is_current = true AND deleted_at IS NULL;
+
+-- 1. Unique active enrollment per student & academic year
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_active_enrollment
+ON academics.enrollments (student_id, academic_year_id)
+WHERE status = 'active' AND deleted_at IS NULL;
+
+-- 2. Performance indexes
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_enrollment_student_active
+ON academics.enrollments(student_id)
+WHERE status = 'active' AND deleted_at IS NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_enrollment_section_active
+ON academics.enrollments(section_id)
+WHERE status = 'active' AND deleted_at IS NULL;
+
+
+
+
+
+
+CREATE SCHEMA IF NOT EXISTS analytics;
+
+-- Fact table: aggregated counts per academic year
+-- Includes metrics for attendance, curriculum, and enrollment
+CREATE TABLE IF NOT EXISTS analytics.academic_year_metrics (
+    academic_year_id            UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_students              INTEGER NOT NULL DEFAULT 0,
+    active_students             INTEGER NOT NULL DEFAULT 0,
+    total_terms                 INTEGER NOT NULL DEFAULT 0,
+    total_sections              INTEGER NOT NULL DEFAULT 0,
+    total_courses               INTEGER NOT NULL DEFAULT 0,
+    total_subjects              INTEGER NOT NULL DEFAULT 0,
+    total_admissions            INTEGER NOT NULL DEFAULT 0,
+    approved_admissions         INTEGER NOT NULL DEFAULT 0,
+    pending_admissions          INTEGER NOT NULL DEFAULT 0,
+    rejected_admissions         INTEGER NOT NULL DEFAULT 0,
+    total_assignments           INTEGER NOT NULL DEFAULT 0,
+    published_assignments       INTEGER NOT NULL DEFAULT 0,
+    total_attendance_records    INTEGER NOT NULL DEFAULT 0,
+    total_absent_records        INTEGER NOT NULL DEFAULT 0,
+    total_late_records          INTEGER NOT NULL DEFAULT 0,
+    total_half_day_records      INTEGER NOT NULL DEFAULT 0,
+    total_exemptions            INTEGER NOT NULL DEFAULT 0,
+    total_subject_mappings      INTEGER NOT NULL DEFAULT 0,
+    courses_with_curriculum     INTEGER NOT NULL DEFAULT 0,
+    total_enrollments           INTEGER NOT NULL DEFAULT 0,
+    active_enrollments          INTEGER NOT NULL DEFAULT 0,
+    completed_enrollments       INTEGER NOT NULL DEFAULT 0,
+    withdrawn_enrollments       INTEGER NOT NULL DEFAULT 0,
+    last_updated                TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_academic_year_metrics_last_updated 
+    ON analytics.academic_year_metrics(last_updated);
+
+-- Exam metrics
+CREATE TABLE IF NOT EXISTS analytics.exam_metrics (
+    academic_year_id UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_exams      INTEGER NOT NULL DEFAULT 0,
+    total_schedules  INTEGER NOT NULL DEFAULT 0,
+    total_results    INTEGER NOT NULL DEFAULT 0,
+    total_grades     INTEGER NOT NULL DEFAULT 0,
+    last_updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Fee metrics
+CREATE TABLE IF NOT EXISTS analytics.fee_metrics (
+    academic_year_id      UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_fee_structures  INTEGER NOT NULL DEFAULT 0,
+    total_invoices        INTEGER NOT NULL DEFAULT 0,
+    total_payments        INTEGER NOT NULL DEFAULT 0,
+    total_discounts       INTEGER NOT NULL DEFAULT 0,
+    total_penalties       INTEGER NOT NULL DEFAULT 0,
+    total_receipts        INTEGER NOT NULL DEFAULT 0,
+    total_invoice_amount  NUMERIC(15,2) NOT NULL DEFAULT 0,
+    total_paid_amount     NUMERIC(15,2) NOT NULL DEFAULT 0,
+    total_discount_amount NUMERIC(15,2) NOT NULL DEFAULT 0,
+    total_penalty_amount  NUMERIC(15,2) NOT NULL DEFAULT 0,
+    last_updated          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Grading metrics
+CREATE TABLE IF NOT EXISTS analytics.grading_metrics (
+    academic_year_id UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_policies   INTEGER NOT NULL DEFAULT 0,
+    total_boundaries INTEGER NOT NULL DEFAULT 0,
+    last_updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Guardian metrics (per academic year)
+CREATE TABLE IF NOT EXISTS analytics.guardian_metrics (
+    academic_year_id        UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_guardians         INTEGER NOT NULL DEFAULT 0,
+    total_primary_guardians INTEGER NOT NULL DEFAULT 0,
+    last_updated            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Library metrics
+CREATE TABLE IF NOT EXISTS analytics.library_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_categories   INTEGER NOT NULL DEFAULT 0,
+    total_books        INTEGER NOT NULL DEFAULT 0,
+    total_copies       INTEGER NOT NULL DEFAULT 0,
+    total_issues       INTEGER NOT NULL DEFAULT 0,
+    total_returns      INTEGER NOT NULL DEFAULT 0,
+    total_fines        INTEGER NOT NULL DEFAULT 0,
+    total_fine_amount  NUMERIC(12,2) NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);    
+
+
+CREATE TABLE IF NOT EXISTS analytics.room_metrics (
+    academic_year_id UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_rooms      INTEGER NOT NULL DEFAULT 0,
+    active_rooms     INTEGER NOT NULL DEFAULT 0,
+    last_updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.section_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_sections     INTEGER NOT NULL DEFAULT 0,
+    active_sections    INTEGER NOT NULL DEFAULT 0,
+    total_capacity     INTEGER NOT NULL DEFAULT 0,
+    used_capacity      INTEGER NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.student_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_students     INTEGER NOT NULL DEFAULT 0,
+    active_students    INTEGER NOT NULL DEFAULT 0,
+    male_students      INTEGER NOT NULL DEFAULT 0,
+    female_students    INTEGER NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.subject_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_subjects     INTEGER NOT NULL DEFAULT 0,
+    active_subjects    INTEGER NOT NULL DEFAULT 0,
+    total_credits      INTEGER NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.submission_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_submissions  INTEGER NOT NULL DEFAULT 0,
+    late_submissions   INTEGER NOT NULL DEFAULT 0,
+    graded_submissions INTEGER NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.teacher_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_teachers     INTEGER NOT NULL DEFAULT 0,
+    active_teachers    INTEGER NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.timetable_metrics (
+    academic_year_id   UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_timetables   INTEGER NOT NULL DEFAULT 0,
+    active_timetables  INTEGER NOT NULL DEFAULT 0,
+    total_slots        INTEGER NOT NULL DEFAULT 0,
+    total_entries      INTEGER NOT NULL DEFAULT 0,
+    total_changes      INTEGER NOT NULL DEFAULT 0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS analytics.transport_metrics (
+    academic_year_id           UUID PRIMARY KEY REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
+    total_routes               INTEGER NOT NULL DEFAULT 0,
+    total_stops                INTEGER NOT NULL DEFAULT 0,
+    total_vehicles             INTEGER NOT NULL DEFAULT 0,
+    active_vehicles            INTEGER NOT NULL DEFAULT 0,
+    total_driver_assignments   INTEGER NOT NULL DEFAULT 0,
+    total_student_assignments  INTEGER NOT NULL DEFAULT 0,
+    last_updated               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE TABLE IF NOT EXISTS academics.student_auth (
+    student_auth_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id        UUID NOT NULL REFERENCES academics.students(student_id) ON DELETE CASCADE,
+    
+    -- Encrypted password fields
+    password          TEXT,
+    password_dek      TEXT,
+    password_key_id   TEXT,
+    
+    -- Optional: last login, security fields
+    last_login_at     TIMESTAMPTZ,
+    login_attempts    INT NOT NULL DEFAULT 0,
+    locked_until      TIMESTAMPTZ,
+    
+    -- Audit columns (consistent with other tables)
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by        UUID REFERENCES users(user_id),
+    updated_by        UUID REFERENCES users(user_id),
+    deleted_at        TIMESTAMPTZ,
+    
+    -- Enforce one‑to‑one relationship
+    CONSTRAINT uniq_student_auth UNIQUE (student_id)
+);
+
+-- Index for fast lookups
+CREATE INDEX IF NOT EXISTS idx_student_auth_student_id 
+    ON academics.student_auth(student_id) 
+    WHERE deleted_at IS NULL;

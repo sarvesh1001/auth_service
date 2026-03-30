@@ -8,16 +8,18 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 
 	"auth-service/internal/academics/models"
 	"auth-service/internal/util"
 )
 
+// SubjectRepository defines all database operations for subjects.
 type SubjectRepository interface {
 	Create(ctx context.Context, db DBTX, e *models.Subject) error
 	BulkCreate(ctx context.Context, db DBTX, e []*models.Subject) error
-	Upsert(ctx context.Context, db DBTX, e *models.Subject) error
+	Upsert(ctx context.Context, db DBTX, e *models.Subject) (inserted bool, err error) // now returns inserted flag
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error)
 	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Subject, error)
 	List(ctx context.Context, db DBTX, filter SubjectFilter, p Pagination, s Sort) ([]*models.Subject, error)
@@ -30,7 +32,6 @@ type SubjectRepository interface {
 	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error)
 	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
 	GetByIDs(ctx context.Context, db DBTX, ids []uuid.UUID) (map[uuid.UUID]*models.Subject, error)
-	// NEW METHODS
 	FindByCompanyAndCodes(ctx context.Context, db DBTX, companyID uuid.UUID, codes []string) ([]*models.Subject, error)
 	IsAssignedToAnyCourse(ctx context.Context, db DBTX, subjectID uuid.UUID) (bool, error)
 }
@@ -45,6 +46,7 @@ func NewSubjectRepository(logger *zap.Logger) SubjectRepository {
 	}
 }
 
+// allowedSubjectSortFields defines which columns can be used in ORDER BY.
 var allowedSubjectSortFields = map[string]bool{
 	"created_at": true,
 	"name":       true,
@@ -54,6 +56,9 @@ var allowedSubjectSortFields = map[string]bool{
 	"company_id": true,
 }
 
+// ---------------------------------------------------------------------
+// Helpers (pagination, sorting, filter)
+// ---------------------------------------------------------------------
 func (r *subjectRepository) validateSort(s Sort) (string, error) {
 	field := s.Field
 	if field == "" {
@@ -84,6 +89,41 @@ func (r *subjectRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
+func (r *subjectRepository) buildSubjectFilter(filter SubjectFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.IsActive != nil {
+		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
+		args = append(args, *filter.IsActive)
+		idx++
+	}
+	if filter.Code != "" {
+		conditions = append(conditions, fmt.Sprintf("code = $%d", idx))
+		args = append(args, filter.Code)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("(name ILIKE $%d OR code ILIKE $%d)", idx, idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+// ---------------------------------------------------------------------
+// Create
+// ---------------------------------------------------------------------
 func (r *subjectRepository) Create(ctx context.Context, db DBTX, e *models.Subject) error {
 	query := `
 		INSERT INTO academics.subject (
@@ -106,22 +146,16 @@ func (r *subjectRepository) Create(ctx context.Context, db DBTX, e *models.Subje
 	return nil
 }
 
+// ---------------------------------------------------------------------
+// BulkCreate (no transaction handling – service provides tx)
+// ---------------------------------------------------------------------
 func (r *subjectRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.Subject) error {
 	if len(e) == 0 {
 		return nil
 	}
-	tx, isOwner, err := beginTxIfNotTx(ctx, db)
-	if err != nil {
-		return err
-	}
-	needRollback := isOwner
-	defer func() {
-		if needRollback {
-			_ = tx.Rollback()
-		}
-	}()
 
-	stmt, err := tx.PrepareContext(ctx, `
+	// Use a prepared statement for performance
+	stmt, err := db.PrepareContext(ctx, `
 		INSERT INTO academics.subject (
 			company_id, code, name, description, credits, is_active,
 			created_by, updated_by, created_at, updated_at
@@ -146,46 +180,51 @@ func (r *subjectRepository) BulkCreate(ctx context.Context, db DBTX, e []*models
 			return fmt.Errorf("bulk create subject row: %w", err)
 		}
 	}
-
-	if isOwner {
-		if err = tx.Commit(); err != nil {
-			return fmt.Errorf("commit tx: %w", err)
-		}
-		needRollback = false
-	}
 	return nil
 }
 
-func (r *subjectRepository) Upsert(ctx context.Context, db DBTX, e *models.Subject) error {
+// ---------------------------------------------------------------------
+// Upsert (returns inserted flag)
+// ---------------------------------------------------------------------
+func (r *subjectRepository) Upsert(ctx context.Context, db DBTX, e *models.Subject) (bool, error) {
+	// Use a CTE to detect whether an insert or update happened.
+	// The CTE returns a flag 'inserted' along with the subject fields.
 	query := `
-        INSERT INTO academics.subject (
-            company_id, code, name, description, credits, is_active,
-            created_by, updated_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-        ON CONFLICT (company_id, code) WHERE deleted_at IS NULL
-        DO UPDATE SET
-            name = EXCLUDED.name,
-            description = EXCLUDED.description,
-            credits = EXCLUDED.credits,
-            is_active = EXCLUDED.is_active,
-            updated_by = EXCLUDED.updated_by,
-            updated_at = NOW()
-        RETURNING subject_id, created_at, updated_at
-    `
+		WITH upsert AS (
+			INSERT INTO academics.subject (
+				company_id, code, name, description, credits, is_active,
+				created_by, updated_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+			ON CONFLICT (company_id, code) WHERE deleted_at IS NULL
+			DO UPDATE SET
+				name = EXCLUDED.name,
+				description = EXCLUDED.description,
+				credits = EXCLUDED.credits,
+				is_active = EXCLUDED.is_active,
+				updated_by = EXCLUDED.updated_by,
+				updated_at = NOW()
+			RETURNING subject_id, created_at, updated_at, (xmax = 0) AS inserted
+		)
+		SELECT subject_id, created_at, updated_at, inserted FROM upsert
+	`
+	var inserted bool
 	err := db.QueryRowContext(ctx, query,
 		e.CompanyID, e.Code, e.Name, e.Description, e.Credits, e.IsActive,
 		e.CreatedBy, e.UpdatedBy,
-	).Scan(&e.SubjectID, &e.CreatedAt, &e.UpdatedAt)
+	).Scan(&e.SubjectID, &e.CreatedAt, &e.UpdatedAt, &inserted)
 	if err != nil {
 		r.logger.Error("failed to upsert subject",
 			zap.String("company_id", e.CompanyID.String()),
 			zap.String("code", e.Code),
 			zap.Error(err))
-		return fmt.Errorf("upsert subject: %w", err)
+		return false, fmt.Errorf("upsert subject: %w", err)
 	}
-	return nil
+	return inserted, nil
 }
 
+// ---------------------------------------------------------------------
+// GetByID
+// ---------------------------------------------------------------------
 func (r *subjectRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error) {
 	query := `
 		SELECT subject_id, company_id, code, name, description, credits,
@@ -225,6 +264,9 @@ func (r *subjectRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	return &s, nil
 }
 
+// ---------------------------------------------------------------------
+// GetByCode
+// ---------------------------------------------------------------------
 func (r *subjectRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Subject, error) {
 	query := `
 		SELECT subject_id, company_id, code, name, description, credits,
@@ -265,6 +307,9 @@ func (r *subjectRepository) GetByCode(ctx context.Context, db DBTX, companyID uu
 	return &s, nil
 }
 
+// ---------------------------------------------------------------------
+// List
+// ---------------------------------------------------------------------
 func (r *subjectRepository) List(ctx context.Context, db DBTX, filter SubjectFilter, p Pagination, s Sort) ([]*models.Subject, error) {
 	where, args := r.buildSubjectFilter(filter)
 	orderBy, err := r.validateSort(s)
@@ -327,11 +372,17 @@ func (r *subjectRepository) List(ctx context.Context, db DBTX, filter SubjectFil
 	return result, nil
 }
 
+// ---------------------------------------------------------------------
+// ListActive
+// ---------------------------------------------------------------------
 func (r *subjectRepository) ListActive(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Subject, error) {
 	active := true
 	return r.List(ctx, db, SubjectFilter{CompanyID: companyID, IsActive: &active}, Pagination{Limit: 1000}, Sort{Field: "name", Direction: "ASC"})
 }
 
+// ---------------------------------------------------------------------
+// Count
+// ---------------------------------------------------------------------
 func (r *subjectRepository) Count(ctx context.Context, db DBTX, filter SubjectFilter) (int64, error) {
 	where, args := r.buildSubjectFilter(filter)
 	if where == "" {
@@ -351,6 +402,9 @@ func (r *subjectRepository) Count(ctx context.Context, db DBTX, filter SubjectFi
 	return count, nil
 }
 
+// ---------------------------------------------------------------------
+// Exists
+// ---------------------------------------------------------------------
 func (r *subjectRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error) {
 	query := `SELECT EXISTS(SELECT 1 FROM academics.subject WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL)`
 	var exists bool
@@ -365,6 +419,9 @@ func (r *subjectRepository) Exists(ctx context.Context, db DBTX, companyID uuid.
 	return exists, nil
 }
 
+// ---------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------
 func (r *subjectRepository) Update(ctx context.Context, db DBTX, e *models.Subject) error {
 	query := `
 		UPDATE academics.subject
@@ -388,6 +445,9 @@ func (r *subjectRepository) Update(ctx context.Context, db DBTX, e *models.Subje
 	return nil
 }
 
+// ---------------------------------------------------------------------
+// Activate / Deactivate
+// ---------------------------------------------------------------------
 func (r *subjectRepository) Activate(ctx context.Context, db DBTX, id uuid.UUID, updatedBy *uuid.UUID) error {
 	query := `UPDATE academics.subject SET is_active = true, updated_by = $2, updated_at = NOW() WHERE subject_id = $1 AND deleted_at IS NULL`
 	result, err := db.ExecContext(ctx, query, id, updatedBy)
@@ -420,6 +480,9 @@ func (r *subjectRepository) Deactivate(ctx context.Context, db DBTX, id uuid.UUI
 	return nil
 }
 
+// ---------------------------------------------------------------------
+// GetByIDForUpdate (with row lock)
+// ---------------------------------------------------------------------
 func (r *subjectRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.Subject, error) {
 	query := `
 		SELECT subject_id, company_id, code, name, description, credits,
@@ -460,6 +523,9 @@ func (r *subjectRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	return &s, nil
 }
 
+// ---------------------------------------------------------------------
+// Delete (soft delete)
+// ---------------------------------------------------------------------
 func (r *subjectRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
 	query := `UPDATE academics.subject SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE subject_id = $1 AND deleted_at IS NULL`
 	result, err := db.ExecContext(ctx, query, id, deletedBy)
@@ -476,108 +542,9 @@ func (r *subjectRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, d
 	return nil
 }
 
-// NEW METHOD: FindByCompanyAndCodes retrieves all subjects for a given company whose codes are in the provided slice.
-func (r *subjectRepository) FindByCompanyAndCodes(ctx context.Context, db DBTX, companyID uuid.UUID, codes []string) ([]*models.Subject, error) {
-	if len(codes) == 0 {
-		return []*models.Subject{}, nil
-	}
-
-	query := `
-		SELECT subject_id, company_id, code, name, description, credits,
-		       is_active, created_at, updated_at, created_by, updated_by
-		FROM academics.subject
-		WHERE company_id = $1 AND code = ANY($2) AND deleted_at IS NULL
-	`
-
-	rows, err := db.QueryContext(ctx, query, companyID, codes)
-	if err != nil {
-		r.logger.Error("failed to find subjects by codes",
-			util.String("company_id", companyID.String()),
-			util.Any("codes", codes),
-			util.ErrorField(err))
-		return nil, fmt.Errorf("find subjects by codes: %w", err)
-	}
-	defer rows.Close()
-
-	var result []*models.Subject
-	for rows.Next() {
-		var s models.Subject
-		var description sql.NullString
-		var credits sql.NullInt64
-		var createdBy, updatedBy uuid.NullUUID
-		if err := rows.Scan(
-			&s.SubjectID, &s.CompanyID, &s.Code, &s.Name, &description, &credits,
-			&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
-		); err != nil {
-			return nil, fmt.Errorf("scan subject: %w", err)
-		}
-		if description.Valid {
-			s.Description = description.String
-		}
-		if credits.Valid {
-			s.Credits = int(credits.Int64)
-		}
-		if createdBy.Valid {
-			s.CreatedBy = &createdBy.UUID
-		}
-		if updatedBy.Valid {
-			s.UpdatedBy = &updatedBy.UUID
-		}
-		result = append(result, &s)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration: %w", err)
-	}
-	return result, nil
-}
-
-// NEW METHOD: IsAssignedToAnyCourse returns true if the subject is referenced in any subject_course_mapping.
-func (r *subjectRepository) IsAssignedToAnyCourse(ctx context.Context, db DBTX, subjectID uuid.UUID) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM academics.subject_course_mapping WHERE subject_id = $1)`
-	var exists bool
-	err := db.QueryRowContext(ctx, query, subjectID).Scan(&exists)
-	if err != nil {
-		r.logger.Error("failed to check subject course assignments",
-			util.String("subject_id", subjectID.String()),
-			util.ErrorField(err))
-		return false, fmt.Errorf("check subject assignments: %w", err)
-	}
-	return exists, nil
-}
-
-func (r *subjectRepository) buildSubjectFilter(filter SubjectFilter) (string, []interface{}) {
-	var conditions []string
-	var args []interface{}
-	idx := 1
-
-	if filter.CompanyID != uuid.Nil {
-		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
-		args = append(args, filter.CompanyID)
-		idx++
-	}
-	if filter.IsActive != nil {
-		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
-		args = append(args, *filter.IsActive)
-		idx++
-	}
-	if filter.Code != "" {
-		conditions = append(conditions, fmt.Sprintf("code = $%d", idx))
-		args = append(args, filter.Code)
-		idx++
-	}
-	if filter.Search != "" {
-		conditions = append(conditions, fmt.Sprintf("(name ILIKE $%d OR code ILIKE $%d)", idx, idx))
-		args = append(args, "%"+filter.Search+"%")
-		idx++
-	}
-
-	if len(conditions) == 0 {
-		return "", args
-	}
-	return "WHERE " + strings.Join(conditions, " AND "), args
-}
-
-// GetByIDs returns a map of subjects keyed by ID for the given IDs.
+// ---------------------------------------------------------------------
+// GetByIDs
+// ---------------------------------------------------------------------
 func (r *subjectRepository) GetByIDs(ctx context.Context, db DBTX, ids []uuid.UUID) (map[uuid.UUID]*models.Subject, error) {
 	if len(ids) == 0 {
 		return map[uuid.UUID]*models.Subject{}, nil
@@ -629,4 +596,75 @@ func (r *subjectRepository) GetByIDs(ctx context.Context, db DBTX, ids []uuid.UU
 		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
 	return result, nil
+}
+
+// ---------------------------------------------------------------------
+// FindByCompanyAndCodes
+// ---------------------------------------------------------------------
+func (r *subjectRepository) FindByCompanyAndCodes(ctx context.Context, db DBTX, companyID uuid.UUID, codes []string) ([]*models.Subject, error) {
+	if len(codes) == 0 {
+		return []*models.Subject{}, nil
+	}
+	query := `
+		SELECT subject_id, company_id, code, name, description, credits,
+		       is_active, created_at, updated_at, created_by, updated_by
+		FROM academics.subject
+		WHERE company_id = $1 AND code = ANY($2) AND deleted_at IS NULL
+	`
+	rows, err := db.QueryContext(ctx, query, companyID, pq.Array(codes))
+	if err != nil {
+		r.logger.Error("failed to find subjects by codes",
+			util.String("company_id", companyID.String()),
+			util.Any("codes", codes),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("find subjects by codes: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Subject
+	for rows.Next() {
+		var s models.Subject
+		var description sql.NullString
+		var credits sql.NullInt64
+		var createdBy, updatedBy uuid.NullUUID
+		if err := rows.Scan(
+			&s.SubjectID, &s.CompanyID, &s.Code, &s.Name, &description, &credits,
+			&s.IsActive, &s.CreatedAt, &s.UpdatedAt, &createdBy, &updatedBy,
+		); err != nil {
+			return nil, fmt.Errorf("scan subject: %w", err)
+		}
+		if description.Valid {
+			s.Description = description.String
+		}
+		if credits.Valid {
+			s.Credits = int(credits.Int64)
+		}
+		if createdBy.Valid {
+			s.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			s.UpdatedBy = &updatedBy.UUID
+		}
+		result = append(result, &s)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ---------------------------------------------------------------------
+// IsAssignedToAnyCourse
+// ---------------------------------------------------------------------
+func (r *subjectRepository) IsAssignedToAnyCourse(ctx context.Context, db DBTX, subjectID uuid.UUID) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM academics.subject_course_mapping WHERE subject_id = $1)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, subjectID).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check subject course assignments",
+			util.String("subject_id", subjectID.String()),
+			util.ErrorField(err))
+		return false, fmt.Errorf("check subject assignments: %w", err)
+	}
+	return exists, nil
 }

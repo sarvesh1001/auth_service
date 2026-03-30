@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 
 	"auth-service/internal/academics/models"
@@ -13,6 +15,18 @@ import (
 	"auth-service/internal/client"
 )
 
+// ---------------------------------------------------------------------
+// Timeout constants
+// ---------------------------------------------------------------------
+const (
+	writeTimeout  = 5 * time.Second
+	readTimeout   = 2 * time.Second
+	deleteTimeout = 5 * time.Second
+)
+
+// ---------------------------------------------------------------------
+// SubjectService interface
+// ---------------------------------------------------------------------
 type SubjectService interface {
 	Create(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error)
 	BulkCreate(ctx context.Context, req []CreateSubjectRequest) ([]*models.Subject, error)
@@ -38,29 +52,62 @@ type SubjectService interface {
 	ValidateUniqueCode(ctx context.Context, companyID uuid.UUID, code string) error
 }
 
+// ---------------------------------------------------------------------
+// subjectService struct
+// ---------------------------------------------------------------------
 type subjectService struct {
-	repo           repository.SubjectRepository
-	eventPublisher EventPublisher
-	pgClient       *client.PostgresClient
-	logger         *zap.Logger
+	repo        repository.SubjectRepository
+	auditLogger AuditLogger
+	outboxStore OutboxStore
+	pgClient    *client.PostgresClient
+	logger      *zap.Logger
 }
 
+// ---------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------
 func NewSubjectService(
 	repo repository.SubjectRepository,
-	eventPublisher EventPublisher,
+	auditLogger AuditLogger,
+	outboxStore OutboxStore,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 ) SubjectService {
 	return &subjectService{
-		repo:           repo,
-		eventPublisher: eventPublisher,
-		pgClient:       pgClient,
-		logger:         logger.Named("subject_service"),
+		repo:        repo,
+		auditLogger: auditLogger,
+		outboxStore: outboxStore,
+		pgClient:    pgClient,
+		logger:      logger.Named("subject_service"),
 	}
 }
 
-// Create inserts a new subject.
+// ---------------------------------------------------------------------
+// Validation helper
+// ---------------------------------------------------------------------
+func (s *subjectService) validateInput(req CreateSubjectRequest) error {
+	if req.CompanyID == uuid.Nil {
+		return fmt.Errorf("%w: company_id is required", ErrInvalidInput)
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		return fmt.Errorf("%w: code is required", ErrInvalidInput)
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return fmt.Errorf("%w: name is required", ErrInvalidInput)
+	}
+	if req.Credits < 0 {
+		return fmt.Errorf("%w: credits cannot be negative", ErrInvalidInput)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// Create
+// ---------------------------------------------------------------------
 func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error) {
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+
 	logger := s.logger.With(
 		zap.String("method", "Create"),
 		zap.String("company_id", req.CompanyID.String()),
@@ -79,6 +126,7 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 	}
 	defer tx.Rollback()
 
+	// Check uniqueness (application‑level check, but DB constraint is the final guard)
 	exists, err := s.repo.Exists(ctx, tx, req.CompanyID, req.Code)
 	if err != nil {
 		logger.Error("failed to check existence", zap.Error(err))
@@ -101,8 +149,24 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 	}
 
 	if err := s.repo.Create(ctx, tx, subject); err != nil {
+		// Check for unique violation from DB (e.g., if race condition bypassed application check)
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" { // unique_violation
+			logger.Warn("duplicate key violation", zap.Error(err))
+			return nil, fmt.Errorf("%w: subject code %s already exists", ErrDuplicate, req.Code)
+		}
 		logger.Error("failed to create subject", zap.Error(err))
 		return nil, err
+	}
+
+	// Audit log (non‑critical – we log error but don’t fail the operation)
+	if err := s.auditLogger.Log(ctx, tx, "SUBJECT_CREATE", subject.SubjectID, nil, subject, req.CreatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+
+	// Outbox event
+	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectCreated), subject); err != nil {
+		logger.Error("failed to store outbox event", zap.Error(err))
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -110,28 +174,23 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("subject created", zap.String("id", subject.SubjectID.String()))
-
-	// Publish event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSubjectCreated,
-		Data: subject,
-	}); err != nil {
-		logger.Error("failed to publish subject.created event", zap.Error(err))
-	}
-
+	logger.Info("subject created", zap.String("subject_id", subject.SubjectID.String()))
 	return subject, nil
 }
 
-// BulkCreate inserts multiple subjects in a transaction with optimised validation.
+// ---------------------------------------------------------------------
+// BulkCreate
+// ---------------------------------------------------------------------
 func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectRequest) ([]*models.Subject, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
 
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
 
-	// 1. Basic input validation and collect unique keys per company
+	// Basic input validation and collect unique keys per company
 	type key struct {
 		companyID uuid.UUID
 		code      string
@@ -160,7 +219,7 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 	}
 	defer tx.Rollback()
 
-	// 2. Pre‑load existing subjects for each company
+	// Pre‑load existing subjects for each company to reduce DB duplicate checks
 	existingMap := make(map[key]*models.Subject) // key -> existing subject
 	for companyID, codes := range keysByCompany {
 		existing, err := s.repo.FindByCompanyAndCodes(ctx, tx, companyID, codes)
@@ -173,7 +232,7 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 		}
 	}
 
-	// 3. Validate uniqueness against existing data and prepare final slice
+	// Build subjects, checking duplicates against existing data
 	subjects := make([]*models.Subject, 0, len(reqs))
 	for i, req := range reqs {
 		k := key{companyID: req.CompanyID, code: req.Code}
@@ -193,9 +252,25 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 		})
 	}
 
+	// Execute bulk insert – DB unique constraint will catch any race condition
 	if err := s.repo.BulkCreate(ctx, tx, subjects); err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			logger.Warn("duplicate key violation during bulk create", zap.Error(err))
+			return nil, fmt.Errorf("%w: one or more subject codes already exist", ErrDuplicate)
+		}
 		logger.Error("failed to bulk create", zap.Error(err))
 		return nil, err
+	}
+
+	// Audit and outbox for each created subject
+	for _, subj := range subjects {
+		if err := s.auditLogger.Log(ctx, tx, "SUBJECT_BULK_CREATE", subj.SubjectID, nil, subj, subj.CreatedBy); err != nil {
+			logger.Error("audit log failed", zap.String("subject_id", subj.SubjectID.String()), zap.Error(err))
+		}
+		if err := s.outboxStore.Store(ctx, tx, string(EventSubjectCreated), subj); err != nil {
+			logger.Error("failed to store outbox event", zap.String("subject_id", subj.SubjectID.String()), zap.Error(err))
+			return nil, fmt.Errorf("store outbox event for subject %s: %w", subj.SubjectID, err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -203,23 +278,17 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("bulk created subjects")
-
-	// Publish events for each created subject
-	for _, subj := range subjects {
-		if err := s.eventPublisher.Publish(ctx, Event{
-			Type: EventSubjectCreated,
-			Data: subj,
-		}); err != nil {
-			logger.Error("failed to publish subject.created event", zap.String("subject_id", subj.SubjectID.String()), zap.Error(err))
-		}
-	}
-
+	logger.Info("bulk created subjects", zap.Int("count", len(subjects)))
 	return subjects, nil
 }
 
-// Upsert creates or updates a subject based on unique (company_id, code) where deleted_at is null.
+// ---------------------------------------------------------------------
+// Upsert (with correct event type)
+// ---------------------------------------------------------------------
 func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error) {
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+
 	logger := s.logger.With(
 		zap.String("method", "Upsert"),
 		zap.String("company_id", req.CompanyID.String()),
@@ -249,9 +318,35 @@ func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (
 		UpdatedBy:   req.UpdatedBy,
 	}
 
-	if err := s.repo.Upsert(ctx, tx, subject); err != nil {
+	// Upsert returns true if a new record was inserted
+	inserted, err := s.repo.Upsert(ctx, tx, subject)
+	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			logger.Warn("duplicate key violation", zap.Error(err))
+			return nil, fmt.Errorf("%w: subject code %s already exists", ErrDuplicate, req.Code)
+		}
 		logger.Error("failed to upsert subject", zap.Error(err))
 		return nil, err
+	}
+
+	// Choose correct event type
+	eventType := EventSubjectUpdated
+	if inserted {
+		eventType = EventSubjectCreated
+	}
+
+	// Audit log (treat upsert as create/update accordingly)
+	auditAction := "SUBJECT_UPSERT"
+	if inserted {
+		auditAction = "SUBJECT_CREATE"
+	}
+	if err := s.auditLogger.Log(ctx, tx, auditAction, subject.SubjectID, nil, subject, req.UpdatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox event
+	if err := s.outboxStore.Store(ctx, tx, string(eventType), subject); err != nil {
+		logger.Error("failed to store outbox event", zap.Error(err))
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -259,66 +354,57 @@ func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("subject upserted", zap.String("id", subject.SubjectID.String()))
-	// We skip event for upsert to avoid duplicate/ambiguous events.
+	logger.Info("subject upserted", zap.String("subject_id", subject.SubjectID.String()), zap.Bool("inserted", inserted))
 	return subject, nil
 }
 
-// GetByID retrieves a subject by ID.
+// ---------------------------------------------------------------------
+// Read‑only operations (with timeouts)
+// ---------------------------------------------------------------------
 func (s *subjectService) GetByID(ctx context.Context, id uuid.UUID) (*models.Subject, error) {
-	logger := s.logger.With(zap.String("method", "GetByID"), zap.String("id", id.String()))
-
-	subject, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
-	if err != nil {
-		logger.Error("failed to get subject", zap.Error(err))
-		return nil, err
-	}
-	if subject == nil {
-		logger.Warn("subject not found")
-		return nil, fmt.Errorf("%w: subject %s", ErrNotFound, id)
-	}
-	return subject, nil
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+	return s.repo.GetByID(ctx, s.pgClient.DB, id)
 }
 
-// GetByCode retrieves a subject by company and code.
 func (s *subjectService) GetByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Subject, error) {
-	logger := s.logger.With(zap.String("method", "GetByCode"), zap.String("company_id", companyID.String()), zap.String("code", code))
-
-	subject, err := s.repo.GetByCode(ctx, s.pgClient.DB, companyID, code)
-	if err != nil {
-		logger.Error("failed to get subject by code", zap.Error(err))
-		return nil, err
-	}
-	if subject == nil {
-		logger.Warn("subject not found")
-		return nil, fmt.Errorf("%w: subject code %s for company %s", ErrNotFound, code, companyID)
-	}
-	return subject, nil
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+	return s.repo.GetByCode(ctx, s.pgClient.DB, companyID, code)
 }
 
-// List returns subjects matching the filter.
 func (s *subjectService) List(ctx context.Context, filter repository.SubjectFilter, p repository.Pagination, srt repository.Sort) ([]*models.Subject, error) {
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
-// ListActive returns all active subjects for a company.
 func (s *subjectService) ListActive(ctx context.Context, companyID uuid.UUID) ([]*models.Subject, error) {
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
 	return s.repo.ListActive(ctx, s.pgClient.DB, companyID)
 }
 
-// Count returns the number of subjects matching the filter.
 func (s *subjectService) Count(ctx context.Context, filter repository.SubjectFilter) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
-// Exists checks if a subject with given company and code exists.
 func (s *subjectService) Exists(ctx context.Context, companyID uuid.UUID, code string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
 	return s.repo.Exists(ctx, s.pgClient.DB, companyID, code)
 }
 
-// Update modifies an existing subject.
+// ---------------------------------------------------------------------
+// Update (with locking, audit, outbox)
+// ---------------------------------------------------------------------
 func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (*models.Subject, error) {
-	logger := s.logger.With(zap.String("method", "Update"), zap.String("id", req.SubjectID.String()))
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+
+	logger := s.logger.With(zap.String("method", "Update"), zap.String("subject_id", req.SubjectID.String()))
 
 	if req.SubjectID == uuid.Nil {
 		return nil, fmt.Errorf("%w: subject_id is required", ErrInvalidInput)
@@ -349,8 +435,6 @@ func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (
 		logger.Warn("subject not found")
 		return nil, fmt.Errorf("%w: subject %s", ErrNotFound, req.SubjectID)
 	}
-
-	// Capture old state for event
 	oldSubject := *subject
 
 	// If code changed, check uniqueness
@@ -378,60 +462,48 @@ func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (
 		return nil, err
 	}
 
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SUBJECT_UPDATE", req.SubjectID, &oldSubject, subject, req.UpdatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectUpdated), map[string]interface{}{
+		"old": oldSubject,
+		"new": subject,
+	}); err != nil {
+		logger.Error("failed to store outbox event", zap.Error(err))
+		return nil, fmt.Errorf("store outbox event: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		logger.Error("failed to commit transaction", zap.Error(err))
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("subject updated")
-
-	// Publish event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSubjectUpdated,
-		Data: map[string]interface{}{
-			"old": oldSubject,
-			"new": subject,
-		},
-	}); err != nil {
-		logger.Error("failed to publish subject.updated event", zap.Error(err))
-	}
-
 	return subject, nil
 }
 
-// Activate sets is_active to true.
+// ---------------------------------------------------------------------
+// Activate / Deactivate
+// ---------------------------------------------------------------------
 func (s *subjectService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Activate"), zap.String("id", id.String()))
-
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		logger.Error("failed to begin transaction", zap.Error(err))
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	if err := s.repo.Activate(ctx, tx, id, updatedBy); err != nil {
-		logger.Error("failed to activate subject", zap.Error(err))
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		logger.Error("failed to commit transaction", zap.Error(err))
-		return fmt.Errorf("commit tx: %w", err)
-	}
-
-	logger.Info("subject activated")
-
-	// Optionally publish an event
-	// We'll treat activation as an update; can add EventSubjectActivated if needed
-	// For now, skip.
-
-	return nil
+	return s.toggleActive(ctx, id, updatedBy, true)
 }
 
-// Deactivate sets is_active to false.
 func (s *subjectService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Deactivate"), zap.String("id", id.String()))
+	return s.toggleActive(ctx, id, updatedBy, false)
+}
+
+func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, active bool) error {
+	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
+	defer cancel()
+
+	logger := s.logger.With(
+		zap.String("method", "toggleActive"),
+		zap.String("subject_id", id.String()),
+		zap.Bool("active", active),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -440,9 +512,42 @@ func (s *subjectService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 	}
 	defer tx.Rollback()
 
-	if err := s.repo.Deactivate(ctx, tx, id, updatedBy); err != nil {
-		logger.Error("failed to deactivate subject", zap.Error(err))
+	subject, err := s.repo.GetByIDForUpdate(ctx, tx, id)
+	if err != nil {
 		return err
+	}
+	if subject == nil {
+		return fmt.Errorf("%w: subject %s", ErrNotFound, id)
+	}
+	oldActive := subject.IsActive
+
+	var updateErr error
+	if active {
+		updateErr = s.repo.Activate(ctx, tx, id, updatedBy)
+	} else {
+		updateErr = s.repo.Deactivate(ctx, tx, id, updatedBy)
+	}
+	if updateErr != nil {
+		logger.Error("failed to toggle active", zap.Error(updateErr))
+		return updateErr
+	}
+
+	// Audit
+	auditAction := "SUBJECT_ACTIVATE"
+	if !active {
+		auditAction = "SUBJECT_DEACTIVATE"
+	}
+	if err := s.auditLogger.Log(ctx, tx, auditAction, id, map[string]interface{}{"is_active": oldActive}, map[string]interface{}{"is_active": active}, updatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectUpdated), map[string]interface{}{
+		"subject_id": id,
+		"old":        map[string]interface{}{"is_active": oldActive},
+		"new":        map[string]interface{}{"is_active": active},
+	}); err != nil {
+		logger.Error("failed to store outbox event", zap.Error(err))
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -450,13 +555,18 @@ func (s *subjectService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("subject deactivated")
+	logger.Info("subject status toggled")
 	return nil
 }
 
-// Delete soft-deletes a subject after ensuring no active dependencies.
+// ---------------------------------------------------------------------
+// Delete (idempotent, with assignment check)
+// ---------------------------------------------------------------------
 func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Delete"), zap.String("id", id.String()))
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+
+	logger := s.logger.With(zap.String("method", "Delete"), zap.String("subject_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -464,6 +574,17 @@ func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Lock the subject
+	subject, err := s.repo.GetByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if subject == nil {
+		// Idempotent: already deleted
+		logger.Info("subject already deleted (idempotent)")
+		return nil
+	}
 
 	// Check if the subject is assigned to any course
 	assigned, err := s.repo.IsAssignedToAnyCourse(ctx, tx, id)
@@ -481,56 +602,41 @@ func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return err
 	}
 
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SUBJECT_DELETE", id, subject, nil, deletedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectDeleted), map[string]interface{}{
+		"subject_id": id,
+		"deleted_by": deletedBy,
+	}); err != nil {
+		logger.Error("failed to store outbox event", zap.Error(err))
+		return fmt.Errorf("store outbox event: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		logger.Error("failed to commit transaction", zap.Error(err))
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("subject deleted")
-
-	// Publish event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSubjectDeleted,
-		Data: map[string]interface{}{
-			"subject_id": id,
-			"deleted_by": deletedBy,
-		},
-	}); err != nil {
-		logger.Error("failed to publish subject.deleted event", zap.Error(err))
-	}
-
 	return nil
 }
 
-// ValidateUniqueCode checks if a subject code is unique for the company.
+// ---------------------------------------------------------------------
+// ValidateUniqueCode
+// ---------------------------------------------------------------------
 func (s *subjectService) ValidateUniqueCode(ctx context.Context, companyID uuid.UUID, code string) error {
-	logger := s.logger.With(zap.String("method", "ValidateUniqueCode"), zap.String("company_id", companyID.String()), zap.String("code", code))
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
 
 	exists, err := s.repo.Exists(ctx, s.pgClient.DB, companyID, code)
 	if err != nil {
-		logger.Error("failed to check existence", zap.Error(err))
 		return err
 	}
 	if exists {
-		logger.Warn("code already exists")
 		return fmt.Errorf("%w: code %s", ErrDuplicate, code)
-	}
-	return nil
-}
-
-// validateInput performs basic validation on create/upsert requests.
-func (s *subjectService) validateInput(req CreateSubjectRequest) error {
-	if req.CompanyID == uuid.Nil {
-		return fmt.Errorf("%w: company_id is required", ErrInvalidInput)
-	}
-	if strings.TrimSpace(req.Code) == "" {
-		return fmt.Errorf("%w: code is required", ErrInvalidInput)
-	}
-	if strings.TrimSpace(req.Name) == "" {
-		return fmt.Errorf("%w: name is required", ErrInvalidInput)
-	}
-	if req.Credits < 0 {
-		return fmt.Errorf("%w: credits cannot be negative", ErrInvalidInput)
 	}
 	return nil
 }

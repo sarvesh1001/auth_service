@@ -15,7 +15,6 @@ import (
 	"auth-service/internal/util"
 )
 
-// AcademicYearRepository defines methods for academic_year table.
 type AcademicYearRepository interface {
 	Create(ctx context.Context, db DBTX, e *models.AcademicYear) error
 	BulkCreate(ctx context.Context, db DBTX, e []*models.AcademicYear) error
@@ -30,6 +29,7 @@ type AcademicYearRepository interface {
 	Update(ctx context.Context, db DBTX, e *models.AcademicYear) error
 	UpdateDates(ctx context.Context, db DBTX, id uuid.UUID, start, end time.Time, updatedBy *uuid.UUID) error
 	SetCurrent(ctx context.Context, db DBTX, companyID, academicYearID uuid.UUID, updatedBy *uuid.UUID) error
+	UnsetCurrent(ctx context.Context, db DBTX, companyID uuid.UUID, updatedBy *uuid.UUID) error
 	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error)
 	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
 	CheckOverlap(ctx context.Context, db DBTX, companyID uuid.UUID, start, end time.Time, excludeID uuid.UUID) (bool, error)
@@ -39,14 +39,12 @@ type academicYearRepository struct {
 	logger *zap.Logger
 }
 
-// NewAcademicYearRepository creates a new academic year repository.
 func NewAcademicYearRepository(logger *zap.Logger) AcademicYearRepository {
 	return &academicYearRepository{
 		logger: logger.Named("academic_year_repo"),
 	}
 }
 
-// Allowed sort fields for academic years
 var allowedAcademicYearSortFields = map[string]bool{
 	"created_at": true,
 	"name":       true,
@@ -63,12 +61,10 @@ func (r *academicYearRepository) validateSort(s Sort) (string, error) {
 	if !allowedAcademicYearSortFields[field] {
 		return "", fmt.Errorf("invalid sort field: %s", field)
 	}
-
 	dir := strings.ToUpper(s.Direction)
 	if dir != "ASC" && dir != "DESC" {
 		dir = "DESC"
 	}
-
 	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
 }
 
@@ -87,7 +83,6 @@ func (r *academicYearRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// Create inserts a new academic year.
 func (r *academicYearRepository) Create(ctx context.Context, db DBTX, e *models.AcademicYear) error {
 	query := `
 		INSERT INTO academics.academic_year (
@@ -110,24 +105,13 @@ func (r *academicYearRepository) Create(ctx context.Context, db DBTX, e *models.
 	return nil
 }
 
-// BulkCreate inserts multiple academic years with proper transaction handling.
 func (r *academicYearRepository) BulkCreate(ctx context.Context, db DBTX, e []*models.AcademicYear) error {
 	if len(e) == 0 {
 		return nil
 	}
 
-	tx, isOwner, err := beginTxIfNotTx(ctx, db)
-	if err != nil {
-		return err
-	}
-	needRollback := isOwner
-	defer func() {
-		if needRollback {
-			_ = tx.Rollback()
-		}
-	}()
-
-	stmt, err := tx.PrepareContext(ctx, `
+	// db must be a transaction when called from service
+	stmt, err := db.PrepareContext(ctx, `
 		INSERT INTO academics.academic_year (
 			company_id, name, start_date, end_date, is_current,
 			created_by, updated_by, created_at, updated_at
@@ -152,19 +136,9 @@ func (r *academicYearRepository) BulkCreate(ctx context.Context, db DBTX, e []*m
 			return fmt.Errorf("bulk create row: %w", err)
 		}
 	}
-
-	if isOwner {
-		if err = tx.Commit(); err != nil {
-			return fmt.Errorf("commit tx: %w", err)
-		}
-		needRollback = false
-	}
 	return nil
 }
 
-// Upsert inserts or updates using the unique constraint (enterprise pattern).
-
-// Upsert inserts or updates using the unique constraint (enterprise pattern).
 func (r *academicYearRepository) Upsert(ctx context.Context, db DBTX, e *models.AcademicYear) error {
 	query := `
         INSERT INTO academics.academic_year (
@@ -194,7 +168,6 @@ func (r *academicYearRepository) Upsert(ctx context.Context, db DBTX, e *models.
 	return nil
 }
 
-// GetByID retrieves an academic year by its ID (only if not deleted).
 func (r *academicYearRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error) {
 	query := `
 		SELECT academic_year_id, company_id, name, start_date, end_date,
@@ -226,7 +199,6 @@ func (r *academicYearRepository) GetByID(ctx context.Context, db DBTX, id uuid.U
 	return &ay, nil
 }
 
-// GetCurrent returns the current academic year for a company (only if not deleted).
 func (r *academicYearRepository) GetCurrent(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.AcademicYear, error) {
 	query := `
 		SELECT academic_year_id, company_id, name, start_date, end_date,
@@ -259,7 +231,6 @@ func (r *academicYearRepository) GetCurrent(ctx context.Context, db DBTX, compan
 	return &ay, nil
 }
 
-// GetByName retrieves an academic year by company and name (only if not deleted).
 func (r *academicYearRepository) GetByName(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (*models.AcademicYear, error) {
 	query := `
 		SELECT academic_year_id, company_id, name, start_date, end_date,
@@ -292,7 +263,6 @@ func (r *academicYearRepository) GetByName(ctx context.Context, db DBTX, company
 	return &ay, nil
 }
 
-// List returns academic years matching the filter with pagination and sorting (only non-deleted).
 func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter AcademicYearFilter, p Pagination, s Sort) ([]*models.AcademicYear, error) {
 	where, args := r.buildAcademicYearFilter(filter)
 	orderBy, err := r.validateSort(s)
@@ -300,14 +270,11 @@ func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter Acade
 		return nil, err
 	}
 	limit, offset := r.validatePagination(p)
-
-	// Fix WHERE clause: ensure deleted_at IS NULL is always present
 	if where == "" {
 		where = "WHERE deleted_at IS NULL"
 	} else {
 		where += " AND deleted_at IS NULL"
 	}
-
 	query := fmt.Sprintf(`
 		SELECT academic_year_id, company_id, name, start_date, end_date,
 		       is_current, created_at, updated_at, created_by, updated_by
@@ -315,7 +282,6 @@ func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter Acade
 		%s %s
 		LIMIT $%d OFFSET $%d
 	`, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -325,7 +291,6 @@ func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter Acade
 		return nil, fmt.Errorf("list academic years: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.AcademicYear
 	for rows.Next() {
 		var ay models.AcademicYear
@@ -350,22 +315,17 @@ func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter Acade
 	return result, nil
 }
 
-// ListByCompany returns all academic years for a company.
 func (r *academicYearRepository) ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.AcademicYear, error) {
 	return r.List(ctx, db, AcademicYearFilter{CompanyID: companyID}, Pagination{Limit: 1000}, Sort{Field: "start_date", Direction: "DESC"})
 }
 
-// Count returns the number of academic years matching the filter (only non-deleted).
 func (r *academicYearRepository) Count(ctx context.Context, db DBTX, filter AcademicYearFilter) (int64, error) {
 	where, args := r.buildAcademicYearFilter(filter)
-
-	// Fix WHERE clause: ensure deleted_at IS NULL is always present
 	if where == "" {
 		where = "WHERE deleted_at IS NULL"
 	} else {
 		where += " AND deleted_at IS NULL"
 	}
-
 	query := fmt.Sprintf(`SELECT COUNT(*) FROM academics.academic_year %s`, where)
 	var count int64
 	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
@@ -378,7 +338,6 @@ func (r *academicYearRepository) Count(ctx context.Context, db DBTX, filter Acad
 	return count, nil
 }
 
-// Exists checks if an active (non-deleted) academic year with given company and name exists.
 func (r *academicYearRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, name string) (bool, error) {
 	query := `SELECT EXISTS(SELECT 1 FROM academics.academic_year WHERE company_id = $1 AND name = $2 AND deleted_at IS NULL)`
 	var exists bool
@@ -393,7 +352,6 @@ func (r *academicYearRepository) Exists(ctx context.Context, db DBTX, companyID 
 	return exists, nil
 }
 
-// Update modifies an existing academic year (only if not deleted).
 func (r *academicYearRepository) Update(ctx context.Context, db DBTX, e *models.AcademicYear) error {
 	query := `
 		UPDATE academics.academic_year
@@ -417,7 +375,6 @@ func (r *academicYearRepository) Update(ctx context.Context, db DBTX, e *models.
 	return nil
 }
 
-// UpdateDates updates only start and end dates (only if not deleted).
 func (r *academicYearRepository) UpdateDates(ctx context.Context, db DBTX, id uuid.UUID, start, end time.Time, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE academics.academic_year
@@ -438,17 +395,8 @@ func (r *academicYearRepository) UpdateDates(ctx context.Context, db DBTX, id uu
 	return nil
 }
 
-// SetCurrent marks the given academic year as current and unsets others for the company.
-// Uses SELECT FOR UPDATE to prevent race conditions. Assumes caller manages transaction.
-// SetCurrent marks the given academic year as current and unsets others for the company.
-// Uses SELECT FOR UPDATE to prevent race conditions. Must be called within a transaction.
 func (r *academicYearRepository) SetCurrent(ctx context.Context, db DBTX, companyID, academicYearID uuid.UUID, updatedBy *uuid.UUID) error {
-	// Ensure we are in a transaction
-	if _, ok := db.(*sql.Tx); !ok {
-		return fmt.Errorf("SetCurrent must be called within a transaction")
-	}
-
-	// Lock all rows for this company to prevent concurrent updates
+	// lock the company's rows
 	_, err := db.ExecContext(ctx, `SELECT 1 FROM academics.academic_year WHERE company_id = $1 FOR UPDATE`, companyID)
 	if err != nil {
 		r.logger.Error("failed to lock academic years",
@@ -456,8 +404,7 @@ func (r *academicYearRepository) SetCurrent(ctx context.Context, db DBTX, compan
 			zap.Error(err))
 		return fmt.Errorf("lock academic years: %w", err)
 	}
-
-	// Unset all current for company (only non-deleted)
+	// unset any current
 	_, err = db.ExecContext(ctx, `UPDATE academics.academic_year SET is_current = false, updated_by = $2, updated_at = NOW() WHERE company_id = $1 AND deleted_at IS NULL`, companyID, updatedBy)
 	if err != nil {
 		r.logger.Error("failed to unset current academic years",
@@ -465,8 +412,7 @@ func (r *academicYearRepository) SetCurrent(ctx context.Context, db DBTX, compan
 			zap.Error(err))
 		return fmt.Errorf("unset current: %w", err)
 	}
-
-	// Set the new current (only if not deleted)
+	// set the new current
 	res, err := db.ExecContext(ctx, `UPDATE academics.academic_year SET is_current = true, updated_by = $2, updated_at = NOW() WHERE academic_year_id = $1 AND deleted_at IS NULL`, academicYearID, updatedBy)
 	if err != nil {
 		r.logger.Error("failed to set current academic year",
@@ -481,7 +427,21 @@ func (r *academicYearRepository) SetCurrent(ctx context.Context, db DBTX, compan
 	return nil
 }
 
-// GetByIDForUpdate retrieves an academic year with a row lock (only if not deleted).
+func (r *academicYearRepository) UnsetCurrent(ctx context.Context, db DBTX, companyID uuid.UUID, updatedBy *uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE academics.academic_year
+		SET is_current = false, updated_by = $2, updated_at = NOW()
+		WHERE company_id = $1 AND deleted_at IS NULL
+	`, companyID, updatedBy)
+	if err != nil {
+		r.logger.Error("failed to unset current academic years",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err))
+		return fmt.Errorf("unset current: %w", err)
+	}
+	return nil
+}
+
 func (r *academicYearRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.AcademicYear, error) {
 	query := `
 		SELECT academic_year_id, company_id, name, start_date, end_date,
@@ -514,7 +474,6 @@ func (r *academicYearRepository) GetByIDForUpdate(ctx context.Context, db DBTX, 
 	return &ay, nil
 }
 
-// Delete soft-deletes an academic year.
 func (r *academicYearRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
 	query := `UPDATE academics.academic_year SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE academic_year_id = $1 AND deleted_at IS NULL`
 	result, err := db.ExecContext(ctx, query, id, deletedBy)
@@ -531,13 +490,10 @@ func (r *academicYearRepository) Delete(ctx context.Context, db DBTX, id uuid.UU
 	return nil
 }
 
-// buildAcademicYearFilter constructs the WHERE clause and arguments for AcademicYearFilter.
-// Note: It does NOT include deleted_at; caller must add that.
 func (r *academicYearRepository) buildAcademicYearFilter(filter AcademicYearFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
 	idx := 1
-
 	if filter.CompanyID != uuid.Nil {
 		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
 		args = append(args, filter.CompanyID)
@@ -569,34 +525,26 @@ func (r *academicYearRepository) buildAcademicYearFilter(filter AcademicYearFilt
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// CheckOverlap returns true if there exists an academic year for the given company
-// whose date range overlaps with [start, end], excluding the year with excludeID (if not nil).
-// Overlap is defined as sharing any day: two intervals overlap if they are not completely disjoint.
 func (r *academicYearRepository) CheckOverlap(ctx context.Context, db DBTX, companyID uuid.UUID, start, end time.Time, excludeID uuid.UUID) (bool, error) {
-	// Ensure start <= end (should be validated earlier, but safe)
 	if start.After(end) {
 		return false, fmt.Errorf("start date must be before or equal to end date")
 	}
-
 	query := `
 		SELECT EXISTS(
 			SELECT 1
 			FROM academics.academic_year
 			WHERE company_id = $1
 			  AND deleted_at IS NULL
-			  AND start_date <= $3  -- end of new range
-			  AND end_date >= $2     -- start of new range
+			  AND start_date <= $3
+			  AND end_date >= $2
 	`
-
 	args := []interface{}{companyID, start, end}
 	argPos := 4
-
 	if excludeID != uuid.Nil {
 		query += fmt.Sprintf(" AND academic_year_id != $%d", argPos)
 		args = append(args, excludeID)
 		argPos++
 	}
-
 	query += ")"
 	var exists bool
 	err := db.QueryRowContext(ctx, query, args...).Scan(&exists)

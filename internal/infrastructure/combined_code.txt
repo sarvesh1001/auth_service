@@ -1,0 +1,2383 @@
+package outbox
+
+import (
+	"context"
+	"time"
+
+	"auth-service/internal/client"
+
+	"go.uber.org/zap"
+)
+
+type Processor struct {
+	repo      Repository
+	producer  *client.KafkaProducer
+	logger    *zap.Logger
+	batchSize int
+	topic     string // single topic for all events
+}
+
+// NewProcessor creates a new outbox processor.
+// topic: the Kafka topic to publish all events to (e.g., "academics-events").
+func NewProcessor(repo Repository, producer *client.KafkaProducer, logger *zap.Logger, topic string) *Processor {
+	return &Processor{
+		repo:      repo,
+		producer:  producer,
+		logger:    logger,
+		batchSize: 50,
+		topic:     topic,
+	}
+}
+
+// Start begins polling the outbox table and publishing events.
+func (p *Processor) Start(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.processBatch(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *Processor) processBatch(ctx context.Context) {
+	events, err := p.repo.FetchPending(ctx, p.batchSize)
+	if err != nil {
+		p.logger.Error("failed to fetch outbox events", zap.Error(err))
+		return
+	}
+
+	for _, e := range events {
+		// Prepare headers: include event type, aggregate type, etc.
+		headers := make(map[string]string)
+		if e.Headers != nil {
+			// Copy existing headers if any
+			for k, v := range e.Headers {
+				headers[k] = v
+			}
+		}
+		// Add event type header (required by consumer)
+		headers["event_type"] = e.EventType
+		if e.AggregateType != "" {
+			headers["aggregate_type"] = e.AggregateType
+		}
+		if e.AggregateID != "" {
+			headers["aggregate_id"] = e.AggregateID
+		}
+
+		err := p.producer.ProduceMessage(
+			ctx,
+			p.topic,               // single topic
+			[]byte(e.AggregateID), // message key (optional)
+			e.Payload,
+			headers,
+		)
+
+		if err != nil {
+			p.logger.Error("failed to publish event",
+				zap.String("event_id", e.EventID),
+				zap.String("event_type", e.EventType),
+				zap.Error(err),
+			)
+			// Increment retry count
+			_ = p.repo.MarkFailed(ctx, e.EventID, e.RetryCount+1)
+			continue
+		}
+
+		// Mark as processed
+		_ = p.repo.MarkProcessed(ctx, e.EventID)
+	}
+}
+
+package outbox
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+)
+
+type PostgresRepository struct {
+	db *sql.DB
+}
+
+func NewPostgresRepository(db *sql.DB) *PostgresRepository {
+	return &PostgresRepository{db: db}
+}
+
+// Store inside TX
+func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event) error {
+	headers, _ := json.Marshal(event.Headers)
+
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox.events (
+			event_id, aggregate_type, aggregate_id,
+			event_type, payload, headers
+		) VALUES ($1,$2,$3,$4,$5,$6)
+	`,
+		event.EventID,
+		event.AggregateType,
+		event.AggregateID,
+		event.EventType,
+		event.Payload,
+		headers,
+	)
+
+	return err
+}
+
+// Fetch pending events
+func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Event, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT event_id, aggregate_type, aggregate_id,
+		       event_type, payload, headers, retry_count
+		FROM outbox.events
+		WHERE status = 'pending'
+		ORDER BY created_at
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []*Event
+
+	for rows.Next() {
+		var e Event
+		var headers []byte
+
+		if err := rows.Scan(
+			&e.EventID,
+			&e.AggregateType,
+			&e.AggregateID,
+			&e.EventType,
+			&e.Payload,
+			&headers,
+			&e.RetryCount,
+		); err != nil {
+			return nil, err
+		}
+
+		json.Unmarshal(headers, &e.Headers)
+
+		events = append(events, &e)
+	}
+
+	return events, nil
+}
+
+// Mark processed
+func (r *PostgresRepository) MarkProcessed(ctx context.Context, eventID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE outbox.events
+		SET status = 'processed', processed_at = NOW()
+		WHERE event_id = $1
+	`, eventID)
+
+	return err
+}
+
+// Mark failed
+func (r *PostgresRepository) MarkFailed(ctx context.Context, eventID string, retryCount int) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE outbox.events
+		SET retry_count = $2
+		WHERE event_id = $1
+	`, eventID, retryCount)
+
+	return err
+}
+
+package outbox
+
+import "time"
+
+type Event struct {
+	EventID       string
+	AggregateType string
+	AggregateID   string
+	EventType     string
+	Payload       []byte
+	Headers       map[string]string
+	Status        string
+	RetryCount    int
+	CreatedAt     time.Time
+	ProcessedAt   *time.Time
+}
+
+package outbox
+
+import (
+	"context"
+	"database/sql"
+)
+
+type Repository interface {
+	Store(ctx context.Context, tx *sql.Tx, event *Event) error
+
+	FetchPending(ctx context.Context, limit int) ([]*Event, error)
+
+	MarkProcessed(ctx context.Context, eventID string) error
+
+	MarkFailed(ctx context.Context, eventID string, retryCount int) error
+}
+
+package idempotency
+
+import (
+	"context"
+	"database/sql"
+)
+
+type Store interface {
+	Exists(ctx context.Context, tx *sql.Tx, key string) (bool, error)
+	Store(ctx context.Context, tx *sql.Tx, key string, response interface{}) error
+	Get(ctx context.Context, tx *sql.Tx, key string, target interface{}) error // ✅ now accepts tx
+}
+
+package idempotency
+
+import (
+	"context"
+	"database/sql"
+)
+
+type HybridStore struct {
+	dbStore *PostgresStore
+	cache   *RedisCache
+}
+
+func NewHybridStore(db *PostgresStore, cache *RedisCache) *HybridStore {
+	return &HybridStore{
+		dbStore: db,
+		cache:   cache,
+	}
+}
+
+// ✅ Get now accepts tx and passes it to dbStore
+func (h *HybridStore) Get(ctx context.Context, tx *sql.Tx, key string, target interface{}) error {
+	// 1. Try Redis
+	found, err := h.cache.Get(ctx, key, target)
+	if err == nil && found {
+		return nil
+	}
+	// 2. Fallback to DB with transaction
+	if err := h.dbStore.Get(ctx, tx, key, target); err != nil {
+		return err
+	}
+	// 3. Backfill Redis (non‑blocking)
+	go h.cache.Set(context.Background(), key, target)
+	return nil
+}
+
+func (h *HybridStore) Exists(ctx context.Context, tx *sql.Tx, key string) (bool, error) {
+	return h.dbStore.Exists(ctx, tx, key)
+}
+
+func (h *HybridStore) Store(ctx context.Context, tx *sql.Tx, key string, response interface{}) error {
+	if err := h.dbStore.Store(ctx, tx, key, response); err != nil {
+		return err
+	}
+	go h.cache.Set(context.Background(), key, response)
+	return nil
+}
+
+package idempotency
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+)
+
+type PostgresStore struct {
+	db *sql.DB
+}
+
+func NewPostgresStore(db *sql.DB) *PostgresStore {
+	return &PostgresStore{db: db}
+}
+
+func (s *PostgresStore) Exists(ctx context.Context, tx *sql.Tx, key string) (bool, error) {
+	query := `SELECT 1 FROM academics.idempotency_keys WHERE key = $1`
+	var row *sql.Row
+	if tx != nil {
+		row = tx.QueryRowContext(ctx, query, key)
+	} else {
+		row = s.db.QueryRowContext(ctx, query, key)
+	}
+	var tmp int
+	err := row.Scan(&tmp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *PostgresStore) Store(ctx context.Context, tx *sql.Tx, key string, response interface{}) error {
+	if tx == nil {
+		return errors.New("transaction required for idempotency store")
+	}
+	data, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO academics.idempotency_keys (key, response)
+		VALUES ($1, $2)
+		ON CONFLICT (key) DO NOTHING
+	`, key, data)
+	return err
+}
+
+// ✅ Get now uses transaction if provided
+func (s *PostgresStore) Get(ctx context.Context, tx *sql.Tx, key string, target interface{}) error {
+	var data []byte
+	var err error
+	if tx != nil {
+		err = tx.QueryRowContext(ctx, `SELECT response FROM academics.idempotency_keys WHERE key = $1`, key).Scan(&data)
+	} else {
+		err = s.db.QueryRowContext(ctx, `SELECT response FROM academics.idempotency_keys WHERE key = $1`, key).Scan(&data)
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
+}
+
+package idempotency
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"auth-service/internal/client"
+)
+
+type RedisCache struct {
+	client *client.RedisClient
+	ttl    time.Duration
+}
+
+func NewRedisCache(client *client.RedisClient, ttl time.Duration) *RedisCache {
+	return &RedisCache{
+		client: client,
+		ttl:    ttl,
+	}
+}
+
+// Get from Redis
+func (r *RedisCache) Get(ctx context.Context, key string, target interface{}) (bool, error) {
+	val, err := r.client.Get(ctx, key)
+	if err != nil {
+		return false, nil // cache miss
+	}
+
+	if err := json.Unmarshal([]byte(val), target); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// Set in Redis
+func (r *RedisCache) Set(ctx context.Context, key string, value interface{}) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+
+	return r.client.Set(ctx, key, data, r.ttl)
+}
+
+package audit
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/util"
+)
+
+// AuditHandler handles audit log related operations
+type AuditHandler struct {
+	auditQueryService *AuditQueryService
+	logger            *zap.Logger
+}
+
+// NewAuditHandler creates a new audit handler
+func NewAuditHandler(
+	auditQueryService *AuditQueryService,
+	logger *zap.Logger,
+) *AuditHandler {
+	return &AuditHandler{
+		auditQueryService: auditQueryService,
+		logger:            logger,
+	}
+}
+
+// ============================================================================
+// COMPANY AUDIT ENDPOINTS (NON-ADMIN)
+// ============================================================================
+
+// GetCompanyAuditLogs retrieves audit logs for a specific company
+func (h *AuditHandler) GetCompanyAuditLogs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		return
+	}
+
+	// Get current user ID from context
+	currentUserID, ok := ctx.Value("current_user_id").(uuid.UUID)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "User not authenticated")
+		return
+	}
+
+	// Parse query parameters
+	query := r.URL.Query()
+
+	// Filters
+	var (
+		module     *string
+		action     *string
+		entityType *string
+		entityID   *uuid.UUID
+		actorType  *string
+		actorID    *uuid.UUID
+		startDate  *time.Time
+		endDate    *time.Time
+	)
+
+	if v := query.Get("module"); v != "" {
+		module = &v
+	}
+
+	if v := query.Get("action"); v != "" {
+		action = &v
+	}
+
+	if v := query.Get("entity_type"); v != "" {
+		entityType = &v
+	}
+
+	if v := query.Get("entity_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid entity ID format")
+			return
+		}
+		entityID = &id
+	}
+
+	if v := query.Get("actor_type"); v != "" {
+		actorType = &v
+	}
+
+	if v := query.Get("actor_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid actor ID format")
+			return
+		}
+		actorID = &id
+	}
+
+	if v := query.Get("start_date"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format")
+			return
+		}
+		startDate = &t
+	}
+
+	if v := query.Get("end_date"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format")
+			return
+		}
+		endDate = &t
+	}
+
+	// Pagination
+	page, err := strconv.Atoi(query.Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+
+	pageSize, err := strconv.Atoi(query.Get("page_size"))
+	if err != nil || pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+
+	// Log request
+	h.logger.Info("Fetching company audit logs",
+		util.String("company_id", companyID.String()),
+		util.String("requested_by", currentUserID.String()),
+		zap.String("module", h.getPointerValue(module)),
+		zap.String("action", h.getPointerValue(action)),
+		zap.String("entity_type", h.getPointerValue(entityType)),
+		zap.String("actor_type", h.getPointerValue(actorType)),
+	)
+
+	// ✅ Call service WITH ALL FILTERS
+	logs, total, err := h.auditQueryService.GetCompanyAuditLogs(
+		ctx,
+		companyID,
+		module,
+		action,
+		entityType,
+		entityID,
+		actorType,
+		actorID,
+		startDate,
+		endDate,
+		page,
+		pageSize,
+	)
+
+	if err != nil {
+		h.logger.Error("Failed to fetch company audit logs",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to fetch audit logs")
+		return
+	}
+
+	totalPages := (total + pageSize - 1) / pageSize
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"logs": logs,
+			"pagination": map[string]interface{}{
+				"page":         page,
+				"page_size":    pageSize,
+				"total":        total,
+				"total_pages":  totalPages,
+				"has_next":     page < totalPages,
+				"has_previous": page > 1,
+			},
+		},
+	})
+}
+
+// GetEntityAuditHistory retrieves complete audit history for a specific entity
+func (h *AuditHandler) GetEntityAuditHistory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		return
+	}
+
+	// Get entity type and ID from query params
+	query := r.URL.Query()
+	entityType := query.Get("entity_type")
+	if entityType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type is required")
+		return
+	}
+
+	entityIDStr := query.Get("entity_id")
+	if entityIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_id is required")
+		return
+	}
+
+	entityID, err := uuid.Parse(entityIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid entity ID format")
+		return
+	}
+
+	// Limit
+	limit, err := strconv.Atoi(query.Get("limit"))
+	if err != nil || limit < 1 || limit > 1000 {
+		limit = 100
+	}
+
+	// Get current user ID from context
+	currentUserID, ok := ctx.Value("current_user_id").(uuid.UUID)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "User not authenticated")
+		return
+	}
+
+	h.logger.Info("Fetching entity audit history",
+		util.String("company_id", companyID.String()),
+		util.String("entity_type", entityType),
+		util.String("entity_id", entityID.String()),
+		util.String("requested_by", currentUserID.String()),
+	)
+
+	// Get entity audit history
+	logs, err := h.auditQueryService.GetEntityAuditHistory(
+		ctx,
+		entityType,
+		entityID,
+		limit,
+	)
+
+	if err != nil {
+		h.logger.Error("Failed to fetch entity audit history",
+			util.String("company_id", companyID.String()),
+			util.String("entity_type", entityType),
+			util.String("entity_id", entityID.String()),
+			util.ErrorField(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to fetch entity audit history")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"logs": logs,
+			"entity": map[string]interface{}{
+				"type": entityType,
+				"id":   entityID,
+			},
+			"total": len(logs),
+		},
+	})
+}
+
+// ExportCompanyAuditLogs exports audit logs for a company
+func (h *AuditHandler) ExportCompanyAuditLogs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		return
+	}
+
+	// Parse query parameters
+	query := r.URL.Query()
+
+	// Format (default: json)
+	format := strings.ToLower(query.Get("format"))
+	if format == "" {
+		format = "json"
+	}
+
+	if format != "json" && format != "csv" {
+		h.respondWithError(w, http.StatusBadRequest, "Unsupported format. Use 'json' or 'csv'")
+		return
+	}
+
+	// Date range (required for export)
+	startDateParam := query.Get("start_date")
+	endDateParam := query.Get("end_date")
+
+	if startDateParam == "" || endDateParam == "" {
+		h.respondWithError(w, http.StatusBadRequest, "start_date and end_date are required for export")
+		return
+	}
+
+	startDate, err := time.Parse(time.RFC3339, startDateParam)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use RFC3339 format")
+		return
+	}
+
+	endDate, err := time.Parse(time.RFC3339, endDateParam)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use RFC3339 format")
+		return
+	}
+
+	// Get current user ID from context
+	currentUserID, ok := ctx.Value("current_user_id").(uuid.UUID)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "User not authenticated")
+		return
+	}
+
+	h.logger.Info("Exporting company audit logs",
+		util.String("company_id", companyID.String()),
+		util.String("requested_by", currentUserID.String()),
+		zap.String("format", format),
+		zap.Time("start_date", startDate),
+		zap.Time("end_date", endDate),
+	)
+
+	// Export logs
+	data, contentType, err := h.auditQueryService.ExportAuditLogs(
+		ctx,
+		companyID,
+		startDate,
+		endDate,
+		format,
+	)
+
+	if err != nil {
+		h.logger.Error("Failed to export audit logs",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err),
+		)
+
+		if strings.Contains(err.Error(), "export period cannot exceed") {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+		} else {
+			h.respondWithError(w, http.StatusInternalServerError, "Failed to export audit logs")
+		}
+		return
+	}
+
+	// Generate filename
+	filename := fmt.Sprintf("audit-logs_%s_%s_%s.%s",
+		companyID.String(),
+		startDate.Format("2006-01-02"),
+		endDate.Format("2006-01-02"),
+		format,
+	)
+
+	// Set response headers
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+
+	// Write data
+	if _, err := w.Write(data); err != nil {
+		h.logger.Error("Failed to write export data",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err),
+		)
+	}
+}
+
+// GetCompanyAuditStats retrieves audit statistics for a company
+func (h *AuditHandler) GetCompanyAuditStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+		return
+	}
+
+	// Parse query parameters
+	query := r.URL.Query()
+
+	// Date range (default: last 30 days)
+	startDateParam := query.Get("start_date")
+	endDateParam := query.Get("end_date")
+
+	var startDate, endDate time.Time
+	if startDateParam == "" || endDateParam == "" {
+		// Default to last 30 days
+		endDate = time.Now().UTC()
+		startDate = endDate.AddDate(0, 0, -30)
+	} else {
+		startDate, err = time.Parse(time.RFC3339, startDateParam)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid start_date format. Use RFC3339 format")
+			return
+		}
+
+		endDate, err = time.Parse(time.RFC3339, endDateParam)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid end_date format. Use RFC3339 format")
+			return
+		}
+	}
+
+	// Get current user ID from context
+	currentUserID, ok := ctx.Value("current_user_id").(uuid.UUID)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "User not authenticated")
+		return
+	}
+
+	h.logger.Info("Fetching company audit stats",
+		util.String("company_id", companyID.String()),
+		util.String("requested_by", currentUserID.String()),
+		zap.Time("start_date", startDate),
+		zap.Time("end_date", endDate),
+	)
+
+	// Get statistics
+	stats, err := h.auditQueryService.GetAuditStats(
+		ctx,
+		companyID,
+		startDate,
+		endDate,
+	)
+
+	if err != nil {
+		h.logger.Error("Failed to fetch audit stats",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err),
+		)
+		h.respondWithError(w, http.StatusInternalServerError, "Failed to fetch audit statistics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"stats": stats,
+			"period": map[string]interface{}{
+				"start_date": startDate,
+				"end_date":   endDate,
+			},
+			"company_id": companyID,
+		},
+	})
+}
+
+// ============================================================================
+// ADMIN AUDIT ENDPOINTS
+// ============================================================================
+
+// GetSystemAuditLogs retrieves system-wide audit logs (admin only)
+func (h *AuditHandler) GetSystemAuditLogs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parse query parameters
+	query := r.URL.Query()
+
+	// Company filter (optional for admin)
+	var companyID *uuid.UUID
+	if companyIDParam := query.Get("company_id"); companyIDParam != "" {
+		parsedCompanyID, err := uuid.Parse(companyIDParam)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "Invalid company ID format")
+			return
+		}
+		companyID = &parsedCompanyID
+	}
+
+	// Module filter
+	var module *string
+	if moduleParam := query.Get("module"); moduleParam != "" {
+		module = &moduleParam
+	}
+
+	// Other filters...
+	// Similar to GetCompanyAuditLogs but with companyID as optional
+
+	// Pagination
+	page, err := strconv.Atoi(query.Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+
+	pageSize, err := strconv.Atoi(query.Get("page_size"))
+	if err != nil || pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+
+	// Get admin ID from context
+	adminID, ok := ctx.Value("user_id").(string)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "Admin not authenticated")
+		return
+	}
+
+	h.logger.Info("Admin fetching system audit logs",
+		zap.String("admin_id", adminID),
+		zap.Any("company_id", companyID),
+		zap.String("module", h.getPointerValue(module)),
+	)
+
+	// TODO: Implement system-wide audit log retrieval
+	// This would require a new method in the service layer
+	// For now, return placeholder response
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"message": "System audit logs endpoint (admin only)",
+			"filters": map[string]interface{}{
+				"company_id": companyID,
+				"module":     module,
+				"page":       page,
+				"page_size":  pageSize,
+			},
+		},
+	})
+}
+
+// ExportSystemAuditLogs exports system-wide audit logs (admin only)
+func (h *AuditHandler) ExportSystemAuditLogs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Similar to ExportCompanyAuditLogs but with optional company filter
+
+	// Get admin ID from context
+	adminID, ok := ctx.Value("user_id").(string)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "Admin not authenticated")
+		return
+	}
+
+	h.logger.Info("Admin exporting system audit logs",
+		zap.String("admin_id", adminID),
+	)
+
+	// TODO: Implement system-wide audit export
+	// This would require a new method in the service layer
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"message": "System audit export endpoint (admin only)",
+		},
+	})
+}
+
+// GetSystemAuditStats retrieves system-wide audit statistics (admin only)
+func (h *AuditHandler) GetSystemAuditStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get admin ID from context
+	adminID, ok := ctx.Value("user_id").(string)
+	if !ok {
+		h.respondWithError(w, http.StatusUnauthorized, "Admin not authenticated")
+		return
+	}
+
+	h.logger.Info("Admin fetching system audit stats",
+		zap.String("admin_id", adminID),
+	)
+
+	// TODO: Implement system-wide audit statistics
+	// This would require a new method in the service layer
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"message": "System audit stats endpoint (admin only)",
+		},
+	})
+}
+
+// ============================================================================
+// AUDIT HEALTH CHECK
+// ============================================================================
+
+// AuditHealthCheck checks the health of the audit system
+func (h *AuditHandler) AuditHealthCheck(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	err := h.auditQueryService.HealthCheck(ctx)
+	if err != nil {
+		h.logger.Error("Audit health check failed", util.ErrorField(err))
+		h.respondWithJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"success": false,
+			"status":  "unhealthy",
+			"service": "audit",
+			"error":   err.Error(),
+			"time":    time.Now().UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"status":  "healthy",
+		"service": "audit",
+		"time":    time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
+
+func (h *AuditHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("Failed to encode JSON response", util.ErrorField(err))
+	}
+}
+
+func (h *AuditHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+		"message": message,
+		"code":    status,
+	})
+}
+
+func (h *AuditHandler) getPointerValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+package audit
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/util"
+)
+
+type AuditOutboxService struct {
+	postgresClient *client.PostgresClient
+	kafkaProducer  *client.KafkaProducer
+	logger         *zap.Logger
+	batchSize      int
+	pollInterval   time.Duration
+	stopChan       chan struct{}
+	isRunning      bool
+	topicName      string
+}
+
+func NewAuditOutboxService(
+	postgresClient *client.PostgresClient,
+	kafkaProducer *client.KafkaProducer,
+	batchSize int,
+	pollInterval time.Duration,
+	topicName string,
+) *AuditOutboxService {
+	logger := util.Get()
+	return &AuditOutboxService{
+		postgresClient: postgresClient,
+		kafkaProducer:  kafkaProducer,
+		logger:         logger,
+		batchSize:      batchSize,
+		pollInterval:   pollInterval,
+		stopChan:       make(chan struct{}),
+		isRunning:      false,
+		topicName:      topicName,
+	}
+}
+
+func (s *AuditOutboxService) Start(ctx context.Context) error {
+	s.logger.Info("Starting audit outbox service",
+		zap.String("topic", s.topicName),
+		zap.Int("batch_size", s.batchSize),
+		zap.Duration("poll_interval", s.pollInterval),
+	)
+
+	s.isRunning = true
+	ticker := time.NewTicker(s.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("Audit outbox service stopped via context")
+			s.isRunning = false
+			return nil
+		case <-s.stopChan:
+			s.logger.Info("Audit outbox service stopped")
+			s.isRunning = false
+			return nil
+		case <-ticker.C:
+			if err := s.processOutboxBatch(ctx); err != nil {
+				s.logger.Error("Failed to process outbox batch", zap.Error(err))
+			}
+		}
+	}
+}
+
+func (s *AuditOutboxService) processOutboxBatch(ctx context.Context) error {
+	db := s.postgresClient.DB
+	if db == nil {
+		return fmt.Errorf("postgres client not initialized")
+	}
+
+	sqlxDB := sqlx.NewDb(db, "postgres")
+	tx, err := sqlxDB.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var lastProcessedID *string
+	err = tx.GetContext(ctx, &lastProcessedID, `
+		SELECT last_processed_id::text
+		FROM audit.outbox_debounce
+		ORDER BY last_processed_at DESC
+		LIMIT 1
+	`)
+	if err != nil {
+		s.logger.Warn("No debounce record found, starting from beginning")
+	}
+
+	query := `
+		SELECT outbox_id, audit_id, operation, payload, created_at
+		FROM audit.audit_logs_outbox
+		WHERE processed_at IS NULL
+		AND ($1::uuid IS NULL OR outbox_id > $1::uuid)
+		ORDER BY outbox_id ASC
+		LIMIT $2
+		FOR UPDATE SKIP LOCKED
+	`
+	rows, err := tx.QueryxContext(ctx, query, lastProcessedID, s.batchSize)
+	if err != nil {
+		return fmt.Errorf("failed to query outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var processedIDs []string
+	var lastID string
+	for rows.Next() {
+		var outboxID, auditID string
+		var operation string
+		var payloadBytes []byte
+		var createdAt time.Time
+
+		if err := rows.Scan(&outboxID, &auditID, &operation, &payloadBytes, &createdAt); err != nil {
+			s.logger.Error("Failed to scan outbox row", zap.Error(err))
+			continue
+		}
+
+		auditEvent := AuditLogEvent{
+			EventID:     outboxID,
+			AuditID:     auditID,
+			Timestamp:   createdAt,
+			EventType:   "audit",
+			CompanyID:   nil,
+			Module:      "",
+			Action:      "",
+			EntityType:  "",
+			EntityID:    nil,
+			ActorType:   "",
+			ActorID:     nil,
+			BeforeState: nil,
+			AfterState:  nil,
+			Metadata:    nil,
+		}
+
+		var payload map[string]interface{}
+		if err := json.Unmarshal(payloadBytes, &payload); err == nil {
+			if companyID, ok := payload["company_id"].(string); ok && companyID != "" {
+				auditEvent.CompanyID = &companyID
+			}
+			if module, ok := payload["module"].(string); ok {
+				auditEvent.Module = module
+			}
+			if action, ok := payload["action"].(string); ok {
+				auditEvent.Action = action
+			}
+			if entityType, ok := payload["entity_type"].(string); ok {
+				auditEvent.EntityType = entityType
+			}
+			if entityID, ok := payload["entity_id"].(string); ok && entityID != "" {
+				auditEvent.EntityID = &entityID
+			}
+			if actorType, ok := payload["actor_type"].(string); ok {
+				auditEvent.ActorType = actorType
+			}
+			if actorID, ok := payload["actor_id"].(string); ok && actorID != "" {
+				auditEvent.ActorID = &actorID
+			}
+			auditEvent.BeforeState = payload["before_state"]
+			auditEvent.AfterState = payload["after_state"]
+			auditEvent.Metadata = payload["metadata"]
+		}
+
+		messageBytes, err := json.Marshal(auditEvent)
+		if err != nil {
+			s.logger.Error("Failed to marshal audit event", zap.Error(err))
+			continue
+		}
+
+		if err := s.kafkaProducer.ProduceMessage(ctx, s.topicName, []byte(auditEvent.EventID), messageBytes, nil); err != nil {
+			s.logger.Error("Failed to produce audit event to Kafka",
+				zap.String("outbox_id", outboxID),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		processedIDs = append(processedIDs, outboxID)
+		lastID = outboxID
+	}
+
+	if len(processedIDs) == 0 {
+		return nil
+	}
+
+	// FIX: Use pq.Array for PostgreSQL array conversion
+	updateQuery := `
+		UPDATE audit.audit_logs_outbox
+		SET processed_at = NOW()
+		WHERE outbox_id = ANY($1::uuid[])
+	`
+	_, err = tx.ExecContext(ctx, updateQuery, pq.Array(processedIDs))
+	if err != nil {
+		return fmt.Errorf("failed to mark records as processed: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO audit.outbox_debounce (last_processed_id, last_processed_at, batch_size)
+		VALUES ($1, NOW(), $2)
+	`, lastID, len(processedIDs))
+	if err != nil {
+		return fmt.Errorf("failed to update debounce table: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	s.logger.Info("Processed audit outbox batch",
+		zap.Int("count", len(processedIDs)),
+		zap.String("last_id", lastID),
+	)
+	return nil
+}
+
+func (s *AuditOutboxService) Stop() {
+	if s.isRunning {
+		close(s.stopChan)
+		s.isRunning = false
+		s.logger.Info("Audit outbox service stopping...")
+	}
+}
+
+func (s *AuditOutboxService) HealthCheck(ctx context.Context) error {
+	if err := s.postgresClient.HealthCheck(ctx); err != nil {
+		return fmt.Errorf("postgres health check failed: %w", err)
+	}
+
+	if s.kafkaProducer == nil {
+		return fmt.Errorf("kafka producer not initialized")
+	}
+
+	db := s.postgresClient.DB
+	sqlxDB := sqlx.NewDb(db, "postgres")
+	var count int
+	err := sqlxDB.GetContext(ctx, &count, `
+		SELECT COUNT(*)
+		FROM audit.audit_logs_outbox
+		WHERE processed_at IS NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to check unprocessed records: %w", err)
+	}
+
+	s.logger.Debug("Audit outbox health check", zap.Int("pending_records", count))
+	return nil
+}
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/util"
+)
+
+type AuditService struct {
+	repo   AuditRepository
+	logger *zap.Logger
+}
+
+func NewAuditService(repo AuditRepository, logger *zap.Logger) *AuditService {
+	return &AuditService{
+		repo:   repo,
+		logger: logger,
+	}
+}
+
+// ✅ LogAction now accepts a transaction pointer
+func (s *AuditService) LogAction(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID *uuid.UUID,
+	module string,
+	action string,
+	entityType string,
+	entityID *uuid.UUID,
+	actorType string,
+	actorID *uuid.UUID,
+	beforeState []byte,
+	afterState []byte,
+	metadata map[string]interface{},
+) error {
+	if module == "" || action == "" || entityType == "" || actorType == "" {
+		return fmt.Errorf("missing required audit fields")
+	}
+
+	var metadataBytes []byte
+	if metadata != nil {
+		jsonBytes, err := json.Marshal(metadata)
+		if err != nil {
+			s.logger.Warn("Failed to marshal metadata", util.ErrorField(err))
+		} else {
+			metadataBytes = jsonBytes
+		}
+	}
+
+	auditLog := &AuditLog{
+		AuditID:     uuid.New(),
+		CompanyID:   companyID,
+		Module:      module,
+		Action:      action,
+		EntityType:  entityType,
+		EntityID:    entityID,
+		ActorType:   actorType,
+		ActorID:     actorID,
+		BeforeState: beforeState,
+		AfterState:  afterState,
+		Metadata:    metadataBytes,
+		CreatedAt:   time.Now().UTC(),
+	}
+
+	// ✅ Use transaction‑aware repository method
+	if tx == nil {
+		// Fallback to non‑transactional (e.g., for background jobs)
+		return s.repo.CreateAuditLog(ctx, auditLog)
+	}
+	return s.repo.CreateAuditLogWithTx(ctx, tx, auditLog)
+}
+
+// Helper methods also updated to accept tx
+func (s *AuditService) LogDeviceEnrollment(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID uuid.UUID,
+	deviceID string,
+	deviceUserCode string,
+	userID uuid.UUID,
+	enrolledBy uuid.UUID,
+) error {
+	metadata := map[string]interface{}{
+		"device_id":        deviceID,
+		"device_user_code": deviceUserCode,
+	}
+	return s.LogAction(
+		ctx, tx,
+		&companyID,
+		"attendance",
+		"device_enroll",
+		"device_enrollment",
+		nil,
+		"admin",
+		&enrolledBy,
+		nil,
+		nil,
+		metadata,
+	)
+}
+
+func (s *AuditService) LogDeviceEnrollmentRevocation(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID uuid.UUID,
+	deviceID string,
+	deviceUserCode string,
+	reason string,
+	revokedBy uuid.UUID,
+) error {
+	metadata := map[string]interface{}{
+		"device_id":        deviceID,
+		"device_user_code": deviceUserCode,
+		"reason":           reason,
+	}
+	return s.LogAction(
+		ctx, tx,
+		&companyID,
+		"attendance",
+		"device_revoke",
+		"device_enrollment",
+		nil,
+		"admin",
+		&revokedBy,
+		nil,
+		nil,
+		metadata,
+	)
+}
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/util"
+)
+
+type AuditRepositoryImpl struct {
+	client    *client.PostgresClient
+	logger    *zap.Logger
+	stmtCache map[string]*sql.Stmt
+	stmtMutex sync.RWMutex
+}
+
+func NewAuditRepository(postgresClient *client.PostgresClient, logger *zap.Logger) AuditRepository {
+	repo := &AuditRepositoryImpl{
+		client:    postgresClient,
+		logger:    logger,
+		stmtCache: make(map[string]*sql.Stmt),
+	}
+	go repo.initializePreparedStatements(context.Background())
+	return repo
+}
+
+// ============================================================================
+// APPEND-ONLY WRITE OPERATIONS (non‑transactional)
+// ============================================================================
+
+func (r *AuditRepositoryImpl) CreateAuditLog(ctx context.Context, log *AuditLog) error {
+	startTime := time.Now()
+	query := `
+		INSERT INTO audit.audit_logs (
+			audit_id, company_id, module, action, entity_type, entity_id,
+			actor_type, actor_id, before_state, after_state, metadata, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+
+	_, err := r.client.Exec(ctx, query,
+		log.AuditID, log.CompanyID, log.Module, log.Action, log.EntityType, log.EntityID,
+		log.ActorType, log.ActorID, log.BeforeState, log.AfterState, log.Metadata, log.CreatedAt,
+	)
+	if err != nil {
+		r.logger.Error("Failed to create audit log",
+			util.String("module", log.Module),
+			util.String("action", log.Action),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to create audit log: %w", err)
+	}
+	r.logger.Debug("Audit log created",
+		util.String("audit_id", log.AuditID.String()),
+		util.Duration("duration", time.Since(startTime)))
+	return nil
+}
+
+func (r *AuditRepositoryImpl) CreateAuditLogBatch(ctx context.Context, logs []*AuditLog) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	tx, err := r.client.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	query := `
+		INSERT INTO audit.audit_logs (
+			audit_id, company_id, module, action, entity_type, entity_id,
+			actor_type, actor_id, before_state, after_state, metadata, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to prepare batch statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, log := range logs {
+		_, err := stmt.ExecContext(ctx,
+			log.AuditID, log.CompanyID, log.Module, log.Action, log.EntityType, log.EntityID,
+			log.ActorType, log.ActorID, log.BeforeState, log.AfterState, log.Metadata, log.CreatedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert audit log %s: %w", log.AuditID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit batch transaction: %w", err)
+	}
+	r.logger.Info("Batch audit logs creation completed", util.Int("logs_created", len(logs)))
+	return nil
+}
+
+// ✅ NEW: Transaction‑aware create
+func (r *AuditRepositoryImpl) CreateAuditLogWithTx(ctx context.Context, tx *sql.Tx, log *AuditLog) error {
+	query := `
+		INSERT INTO audit.audit_logs (
+			audit_id, company_id, module, action, entity_type, entity_id,
+			actor_type, actor_id, before_state, after_state, metadata, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+
+	_, err := tx.ExecContext(ctx, query,
+		log.AuditID, log.CompanyID, log.Module, log.Action, log.EntityType, log.EntityID,
+		log.ActorType, log.ActorID, log.BeforeState, log.AfterState, log.Metadata, log.CreatedAt,
+	)
+	if err != nil {
+		r.logger.Error("Failed to create audit log (with tx)",
+			util.String("module", log.Module),
+			util.String("action", log.Action),
+			util.ErrorField(err))
+		return fmt.Errorf("failed to create audit log with tx: %w", err)
+	}
+	return nil
+}
+
+// ============================================================================
+// READ OPERATIONS (unchanged)
+// ============================================================================
+
+func (r *AuditRepositoryImpl) GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*AuditLog, error) {
+	stmt, ok := r.getStmt("get_audit_log_by_id")
+	if !ok {
+		return nil, fmt.Errorf("prepared statement not found: get_audit_log_by_id")
+	}
+	rows, err := stmt.QueryContext(ctx, auditID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get audit log by ID: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return r.scanAuditLog(rows)
+	}
+	return nil, fmt.Errorf("audit log not found: %s", auditID)
+}
+
+func (r *AuditRepositoryImpl) ListAuditLogs(ctx context.Context, filter AuditLogFilter) ([]*AuditLog, int, error) {
+	conditions := []string{}
+	params := []interface{}{}
+	paramCount := 1
+
+	addCondition := func(field string, value interface{}, isPointer bool) {
+		if !isPointer || value != nil {
+			conditions = append(conditions, fmt.Sprintf("%s = $%d", field, paramCount))
+			params = append(params, value)
+			paramCount++
+		}
+	}
+	addCondition("company_id", filter.CompanyID, true)
+	addCondition("module", filter.Module, true)
+	addCondition("action", filter.Action, true)
+	addCondition("entity_type", filter.EntityType, true)
+	addCondition("entity_id", filter.EntityID, true)
+	addCondition("actor_type", filter.ActorType, true)
+	addCondition("actor_id", filter.ActorID, true)
+
+	if filter.StartDate != nil {
+		conditions = append(conditions, fmt.Sprintf("created_at >= $%d", paramCount))
+		params = append(params, *filter.StartDate)
+		paramCount++
+	}
+	if filter.EndDate != nil {
+		conditions = append(conditions, fmt.Sprintf("created_at <= $%d", paramCount))
+		params = append(params, *filter.EndDate)
+		paramCount++
+	}
+
+	whereClause := ""
+	if len(conditions) > 0 {
+		whereClause = "WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM audit.audit_logs %s", whereClause)
+	var totalCount int
+	err := r.client.QueryRow(ctx, countQuery, params...).Scan(&totalCount)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count audit logs: %w", err)
+	}
+	if totalCount == 0 {
+		return []*AuditLog{}, 0, nil
+	}
+
+	dataQuery := fmt.Sprintf(`
+		SELECT audit_id, company_id, module, action, entity_type, entity_id,
+		       actor_type, actor_id, before_state, after_state, metadata, created_at
+		FROM audit.audit_logs %s
+		ORDER BY created_at DESC
+		LIMIT $%d OFFSET $%d`, whereClause, paramCount, paramCount+1)
+	params = append(params, filter.Limit, filter.Offset)
+
+	rows, err := r.client.Query(ctx, dataQuery, params...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to list audit logs: %w", err)
+	}
+	defer rows.Close()
+
+	logs := make([]*AuditLog, 0, filter.Limit)
+	for rows.Next() {
+		auditLog, err := r.scanAuditLog(rows)
+		if err != nil {
+			r.logger.Warn("Failed to scan audit log", util.ErrorField(err))
+			continue
+		}
+		logs = append(logs, auditLog)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating audit logs: %w", err)
+	}
+	return logs, totalCount, nil
+}
+
+// ============================================================================
+// INFRASTRUCTURE (unchanged)
+// ============================================================================
+
+func (r *AuditRepositoryImpl) HealthCheck(ctx context.Context) error {
+	_, err := r.client.Exec(ctx, "SELECT 1 FROM audit.audit_logs LIMIT 1")
+	if err != nil {
+		return fmt.Errorf("audit repository health check failed: %w", err)
+	}
+	return nil
+}
+
+// ============================================================================
+// HELPER METHODS (unchanged)
+// ============================================================================
+
+func (r *AuditRepositoryImpl) scanAuditLog(rows *sql.Rows) (*AuditLog, error) {
+	var log AuditLog
+	var companyID, entityID, actorID sql.NullString
+	var beforeState, afterState, metadata []byte
+
+	err := rows.Scan(
+		&log.AuditID, &companyID, &log.Module, &log.Action, &log.EntityType, &entityID,
+		&log.ActorType, &actorID, &beforeState, &afterState, &metadata, &log.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan audit log: %w", err)
+	}
+	log.CompanyID = r.parseNullableUUID(companyID)
+	log.EntityID = r.parseNullableUUID(entityID)
+	log.ActorID = r.parseNullableUUID(actorID)
+	if beforeState != nil {
+		log.BeforeState = make([]byte, len(beforeState))
+		copy(log.BeforeState, beforeState)
+	}
+	if afterState != nil {
+		log.AfterState = make([]byte, len(afterState))
+		copy(log.AfterState, afterState)
+	}
+	if metadata != nil {
+		log.Metadata = make([]byte, len(metadata))
+		copy(log.Metadata, metadata)
+	}
+	return &log, nil
+}
+
+func (r *AuditRepositoryImpl) parseNullableUUID(ns sql.NullString) *uuid.UUID {
+	if !ns.Valid || ns.String == "" {
+		return nil
+	}
+	parsedUUID, err := uuid.Parse(ns.String)
+	if err != nil {
+		r.logger.Warn("Failed to parse UUID",
+			util.String("uuid_string", ns.String),
+			util.ErrorField(err))
+		return nil
+	}
+	return &parsedUUID
+}
+
+func (r *AuditRepositoryImpl) initializePreparedStatements(ctx context.Context) {
+	statements := map[string]string{
+		"get_audit_log_by_id": `
+			SELECT audit_id, company_id, module, action, entity_type, entity_id,
+			       actor_type, actor_id, before_state, after_state, metadata, created_at
+			FROM audit.audit_logs
+			WHERE audit_id = $1`,
+	}
+	for name, query := range statements {
+		stmt, err := r.client.DB.PrepareContext(ctx, query)
+		if err != nil {
+			r.logger.Warn("Failed to prepare statement",
+				util.String("statement", name),
+				util.ErrorField(err))
+			continue
+		}
+		r.stmtMutex.Lock()
+		r.stmtCache[name] = stmt
+		r.stmtMutex.Unlock()
+	}
+	r.logger.Info("Audit repository prepared statements initialized",
+		util.Int("statements", len(r.stmtCache)))
+}
+
+func (r *AuditRepositoryImpl) getStmt(name string) (*sql.Stmt, bool) {
+	r.stmtMutex.RLock()
+	defer r.stmtMutex.RUnlock()
+	stmt, exists := r.stmtCache[name]
+	return stmt, exists
+}
+
+package audit
+
+import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+// AuditQueryService handles audit log queries and exports
+type AuditQueryService struct {
+	repo   AuditRepository
+	logger *zap.Logger
+}
+
+// NewAuditQueryService creates a new audit query service
+func NewAuditQueryService(repo AuditRepository, logger *zap.Logger) *AuditQueryService {
+	return &AuditQueryService{
+		repo:   repo,
+		logger: logger,
+	}
+}
+
+// ============================================================================
+// QUERY OPERATIONS (Service Layer)
+// ============================================================================
+
+// GetCompanyAuditLogs retrieves audit logs for a company with full filtering support
+func (qs *AuditQueryService) GetCompanyAuditLogs(
+	ctx context.Context,
+	companyID uuid.UUID,
+	module *string,
+	action *string,
+	entityType *string,
+	entityID *uuid.UUID,
+	actorType *string,
+	actorID *uuid.UUID,
+	startDate *time.Time,
+	endDate *time.Time,
+	page int,
+	pageSize int,
+) ([]*AuditLog, int, error) {
+
+	// Validation
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+
+	offset := (page - 1) * pageSize
+
+	// Build filter
+	filter := AuditLogFilter{
+		Limit:  pageSize,
+		Offset: offset,
+	}.WithCompanyID(companyID)
+
+	if module != nil {
+		filter = filter.WithModule(*module)
+	}
+
+	if action != nil {
+		filter = filter.WithAction(*action)
+	}
+
+	if entityType != nil && entityID != nil {
+		filter = filter.WithEntity(*entityType, *entityID)
+	}
+
+	if actorType != nil && actorID != nil {
+		filter = filter.WithActor(*actorType, *actorID)
+	}
+
+	// ✅ Correct time filtering (repository supports ONLY this)
+	if startDate != nil && endDate != nil {
+		filter = filter.WithTimeRange(*startDate, *endDate)
+	}
+
+	// Call repository
+	return qs.repo.ListAuditLogs(ctx, filter)
+}
+
+// GetEntityAuditHistory retrieves complete audit history for an entity
+func (qs *AuditQueryService) GetEntityAuditHistory(
+	ctx context.Context,
+	entityType string,
+	entityID uuid.UUID,
+	limit int,
+) ([]*AuditLog, error) {
+	// Service-level validation
+	if limit < 1 || limit > 1000 {
+		limit = 100
+	}
+
+	filter := AuditLogFilter{
+		Limit:  limit,
+		Offset: 0,
+	}.WithEntity(entityType, entityID)
+
+	logs, _, err := qs.repo.ListAuditLogs(ctx, filter)
+	return logs, err
+}
+
+// GetActorActivity retrieves all actions performed by an actor
+func (qs *AuditQueryService) GetActorActivity(
+	ctx context.Context,
+	actorType string,
+	actorID uuid.UUID,
+	days int,
+) ([]*AuditLog, error) {
+	// Default to last 30 days
+	if days < 1 || days > 365 {
+		days = 30
+	}
+
+	filter := AuditLogFilter{
+		Limit:  1000,
+		Offset: 0,
+	}.WithActor(actorType, actorID).WithLastNDays(days)
+
+	logs, _, err := qs.repo.ListAuditLogs(ctx, filter)
+	return logs, err
+}
+
+// ============================================================================
+// EXPORT OPERATIONS (Service Layer)
+// ============================================================================
+
+// ExportAuditLogs exports audit logs in requested format
+func (qs *AuditQueryService) ExportAuditLogs(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+	format string,
+) ([]byte, string, error) {
+	// Business logic: limit exports to 90 days max
+	if endDate.Sub(startDate) > 90*24*time.Hour {
+		return nil, "", fmt.Errorf("export period cannot exceed 90 days")
+	}
+
+	// Get logs for period
+	filter := AuditLogFilter{
+		Limit:  10000, // Export limit
+		Offset: 0,
+	}.WithCompanyID(companyID).WithTimeRange(startDate, endDate)
+
+	logs, _, err := qs.repo.ListAuditLogs(ctx, filter)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to fetch audit logs: %w", err)
+	}
+
+	// Export based on format
+	switch strings.ToLower(format) {
+	case "json":
+		data, err := qs.exportAsJSON(logs)
+		return data, "application/json", err
+	case "csv":
+		data, err := qs.exportAsCSV(logs)
+		return data, "text/csv", err
+	default:
+		return nil, "", fmt.Errorf("unsupported format: %s", format)
+	}
+}
+
+// exportAsJSON converts audit logs to JSON format
+func (qs *AuditQueryService) exportAsJSON(logs []*AuditLog) ([]byte, error) {
+	type exportLog struct {
+		ID         string                 `json:"id"`
+		Timestamp  time.Time              `json:"timestamp"`
+		Module     string                 `json:"module"`
+		Action     string                 `json:"action"`
+		EntityType string                 `json:"entity_type"`
+		EntityID   *string                `json:"entity_id,omitempty"`
+		ActorType  string                 `json:"actor_type"`
+		ActorID    *string                `json:"actor_id,omitempty"`
+		Changes    map[string]interface{} `json:"changes,omitempty"`
+		Metadata   map[string]interface{} `json:"metadata,omitempty"`
+	}
+
+	var exportLogs []exportLog
+	for _, log := range logs {
+		el := exportLog{
+			ID:         log.AuditID.String(),
+			Timestamp:  log.CreatedAt,
+			Module:     log.Module,
+			Action:     log.Action,
+			EntityType: log.EntityType,
+			ActorType:  log.ActorType,
+		}
+
+		if log.EntityID != nil {
+			entityID := log.EntityID.String()
+			el.EntityID = &entityID
+		}
+
+		if log.ActorID != nil {
+			actorID := log.ActorID.String()
+			el.ActorID = &actorID
+		}
+
+		// Parse before/after state if available
+		if len(log.BeforeState) > 0 && len(log.AfterState) > 0 {
+			var before, after map[string]interface{}
+			if err := json.Unmarshal(log.BeforeState, &before); err == nil {
+				if err := json.Unmarshal(log.AfterState, &after); err == nil {
+					// Calculate changes
+					changes := make(map[string]interface{})
+					for key, newVal := range after {
+						oldVal, exists := before[key]
+						if !exists || oldVal != newVal {
+							changes[key] = map[string]interface{}{
+								"old": oldVal,
+								"new": newVal,
+							}
+						}
+					}
+					if len(changes) > 0 {
+						el.Changes = changes
+					}
+				}
+			}
+		}
+
+		// Parse metadata if available
+		if len(log.Metadata) > 0 {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(log.Metadata, &metadata); err == nil {
+				el.Metadata = metadata
+			}
+		}
+
+		exportLogs = append(exportLogs, el)
+	}
+
+	return json.MarshalIndent(exportLogs, "", "  ")
+}
+
+// exportAsCSV converts audit logs to CSV format
+func (qs *AuditQueryService) exportAsCSV(logs []*AuditLog) ([]byte, error) {
+	var buf strings.Builder
+	writer := csv.NewWriter(&buf)
+
+	// Write header
+	header := []string{
+		"Timestamp (UTC)",
+		"Module",
+		"Action",
+		"Entity Type",
+		"Entity ID",
+		"Actor Type",
+		"Actor ID",
+		"Changes Summary",
+		"IP Address",
+		"User Agent",
+	}
+
+	if err := writer.Write(header); err != nil {
+		return nil, fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	// Write data rows
+	for _, log := range logs {
+		entityID := ""
+		if log.EntityID != nil {
+			entityID = log.EntityID.String()
+		}
+
+		actorID := ""
+		if log.ActorID != nil {
+			actorID = log.ActorID.String()
+		}
+
+		// Extract metadata for CSV
+		var ipAddress, userAgent, changesSummary string
+		if len(log.Metadata) > 0 {
+			var metadata map[string]interface{}
+			if err := json.Unmarshal(log.Metadata, &metadata); err == nil {
+				if ip, ok := metadata["ip"].(string); ok {
+					ipAddress = ip
+				}
+				if ua, ok := metadata["user_agent"].(string); ok {
+					userAgent = ua
+				}
+			}
+		}
+
+		// Calculate changes summary
+		if len(log.BeforeState) > 0 && len(log.AfterState) > 0 {
+			var before, after map[string]interface{}
+			if err := json.Unmarshal(log.BeforeState, &before); err == nil {
+				if err := json.Unmarshal(log.AfterState, &after); err == nil {
+					changedFields := 0
+					for key := range after {
+						if before[key] != after[key] {
+							changedFields++
+						}
+					}
+					if changedFields > 0 {
+						changesSummary = fmt.Sprintf("%d fields changed", changedFields)
+					}
+				}
+			}
+		}
+
+		row := []string{
+			log.CreatedAt.Format(time.RFC3339),
+			log.Module,
+			log.Action,
+			log.EntityType,
+			entityID,
+			log.ActorType,
+			actorID,
+			changesSummary,
+			ipAddress,
+			userAgent,
+		}
+
+		if err := writer.Write(row); err != nil {
+			return nil, fmt.Errorf("failed to write CSV row: %w", err)
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, fmt.Errorf("CSV flush error: %w", err)
+	}
+
+	return []byte(buf.String()), nil
+}
+
+// ============================================================================
+// ANALYTICS OPERATIONS (Service Layer)
+// ============================================================================
+
+// AuditStats represents audit statistics
+type AuditStats struct {
+	TotalLogs     int64            `json:"total_logs"`
+	ByModule      map[string]int64 `json:"by_module"`
+	ByAction      map[string]int64 `json:"by_action"`
+	ByEntityType  map[string]int64 `json:"by_entity_type"`
+	ByActorType   map[string]int64 `json:"by_actor_type"`
+	DailyActivity map[string]int64 `json:"daily_activity"` // date -> count
+	TopActors     []ActorActivity  `json:"top_actors"`
+}
+
+// ActorActivity represents actor-level activity
+type ActorActivity struct {
+	ActorID   string `json:"actor_id"`
+	ActorType string `json:"actor_type"`
+	Count     int64  `json:"count"`
+}
+
+// GetAuditStats calculates audit statistics for a period
+func (qs *AuditQueryService) GetAuditStats(
+	ctx context.Context,
+	companyID uuid.UUID,
+	startDate, endDate time.Time,
+) (*AuditStats, error) {
+	// Get all logs for the period
+	filter := AuditLogFilter{
+		Limit:  100000, // Large enough for stats
+		Offset: 0,
+	}.WithCompanyID(companyID).WithTimeRange(startDate, endDate)
+
+	logs, _, err := qs.repo.ListAuditLogs(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch logs for stats: %w", err)
+	}
+
+	// Calculate statistics
+	stats := &AuditStats{
+		TotalLogs:     int64(len(logs)),
+		ByModule:      make(map[string]int64),
+		ByAction:      make(map[string]int64),
+		ByEntityType:  make(map[string]int64),
+		ByActorType:   make(map[string]int64),
+		DailyActivity: make(map[string]int64),
+	}
+
+	// Actor activity tracking
+	actorCounts := make(map[string]int64)
+
+	for _, log := range logs {
+		// Count by module
+		stats.ByModule[log.Module]++
+
+		// Count by action
+		stats.ByAction[log.Action]++
+
+		// Count by entity type
+		stats.ByEntityType[log.EntityType]++
+
+		// Count by actor type
+		stats.ByActorType[log.ActorType]++
+
+		// Count daily activity
+		dateKey := log.CreatedAt.Format("2006-01-02")
+		stats.DailyActivity[dateKey]++
+
+		// Track actor activity
+		if log.ActorID != nil {
+			actorKey := fmt.Sprintf("%s:%s", log.ActorType, log.ActorID.String())
+			actorCounts[actorKey]++
+		}
+	}
+
+	// Calculate top actors
+	stats.TopActors = qs.calculateTopActors(actorCounts, 10)
+
+	return stats, nil
+}
+
+// calculateTopActors identifies the most active actors
+func (qs *AuditQueryService) calculateTopActors(
+	actorCounts map[string]int64,
+	topN int,
+) []ActorActivity {
+	var activities []ActorActivity
+	for key, count := range actorCounts {
+		parts := strings.Split(key, ":")
+		if len(parts) != 2 {
+			continue
+		}
+		activities = append(activities, ActorActivity{
+			ActorType: parts[0],
+			ActorID:   parts[1],
+			Count:     count,
+		})
+	}
+
+	// Sort by count (descending)
+	sort.Slice(activities, func(i, j int) bool {
+		return activities[i].Count > activities[j].Count
+	})
+
+	// Return top N
+	if len(activities) > topN {
+		return activities[:topN]
+	}
+	return activities
+}
+
+// HealthCheck performs a service-level health check
+func (qs *AuditQueryService) HealthCheck(ctx context.Context) error {
+	return qs.repo.HealthCheck(ctx)
+}
+
+package audit
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AuditLog struct {
+	AuditID     uuid.UUID  `db:"audit_id"`
+	CompanyID   *uuid.UUID `db:"company_id"`
+	Module      string     `db:"module"`
+	Action      string     `db:"action"`
+	EntityType  string     `db:"entity_type"`
+	EntityID    *uuid.UUID `db:"entity_id"`
+	ActorType   string     `db:"actor_type"`
+	ActorID     *uuid.UUID `db:"actor_id"`
+	BeforeState []byte     `db:"before_state"` // JSONB
+	AfterState  []byte     `db:"after_state"`  // JSONB
+	Metadata    []byte     `db:"metadata"`     // JSONB
+	CreatedAt   time.Time  `db:"created_at"`
+}
+type AuditLogEvent struct {
+	EventID     string      `json:"event_id"`
+	AuditID     string      `json:"audit_id"`
+	Timestamp   time.Time   `json:"timestamp"`
+	EventType   string      `json:"event_type"` // Always "audit"
+	CompanyID   *string     `json:"company_id,omitempty"`
+	Module      string      `json:"module"`      // hr, attendance, leave, payroll, admin, system
+	Action      string      `json:"action"`      // leave.approve, attendance.manual_add, etc.
+	EntityType  string      `json:"entity_type"` // leave_request, attendance_event, etc.
+	EntityID    *string     `json:"entity_id,omitempty"`
+	ActorType   string      `json:"actor_type"` // user, admin, system
+	ActorID     *string     `json:"actor_id,omitempty"`
+	BeforeState interface{} `json:"before_state,omitempty"`
+	AfterState  interface{} `json:"after_state,omitempty"`
+	Metadata    interface{} `json:"metadata,omitempty"`
+	Environment string      `json:"environment"`
+	Version     string      `json:"version"`
+	Message     string      `json:"message"`
+	ServiceName string      `json:"service_name"`
+}
+
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AuditRepository defines the interface for audit logging storage operations
+// This is a BORING, STORAGE-ONLY interface. No business logic here.
+type AuditRepository interface {
+	// ==============================================
+	// APPEND-ONLY WRITE OPERATIONS
+	// ==============================================
+
+	// CreateAuditLog creates a single audit log entry using its own transaction
+	// This is append-only - no updates or deletes allowed
+	CreateAuditLog(ctx context.Context, log *AuditLog) error
+
+	// CreateAuditLogWithTx creates a single audit log entry within an existing transaction
+	// Use this when the audit must be part of a larger transaction (e.g., with business logic)
+	CreateAuditLogWithTx(ctx context.Context, tx *sql.Tx, log *AuditLog) error
+
+	// CreateAuditLogBatch creates multiple audit log entries in a single transaction
+	// Used for bulk operations or event sourcing
+	CreateAuditLogBatch(ctx context.Context, logs []*AuditLog) error
+
+	// ==============================================
+	// READ OPERATIONS (STORAGE-ONLY, NO BUSINESS LOGIC)
+	// ==============================================
+
+	// GetAuditLogByID retrieves a single audit log by its unique ID
+	GetAuditLogByID(ctx context.Context, auditID uuid.UUID) (*AuditLog, error)
+
+	// ListAuditLogs retrieves audit logs with filtering and pagination
+	// Returns: logs, total count, error
+	// Total count is for ALL matching records (not just current page)
+	ListAuditLogs(
+		ctx context.Context,
+		filter AuditLogFilter,
+	) ([]*AuditLog, int, error)
+
+	// ==============================================
+	// INFRASTRUCTURE METHODS
+	// ==============================================
+
+	// HealthCheck verifies repository connectivity
+	HealthCheck(ctx context.Context) error
+}
+
+// AuditLogFilter represents filtering criteria for audit logs
+// All optional fields are pointers - nil means "don't filter by this"
+type AuditLogFilter struct {
+	// Optional: Filter by company
+	CompanyID *uuid.UUID `json:"company_id,omitempty"`
+
+	// Optional: Module-level filtering
+	Module *string `json:"module,omitempty"` // e.g., "hr", "attendance"
+	Action *string `json:"action,omitempty"` // e.g., "create", "update"
+
+	// Optional: Entity filtering
+	EntityType *string    `json:"entity_type,omitempty"` // e.g., "employee", "leave_request"
+	EntityID   *uuid.UUID `json:"entity_id,omitempty"`
+
+	// Optional: Actor filtering
+	ActorType *string    `json:"actor_type,omitempty"` // "user", "admin", "system"
+	ActorID   *uuid.UUID `json:"actor_id,omitempty"`
+
+	// Optional: Time range filtering
+	StartDate *time.Time `json:"start_date,omitempty"`
+	EndDate   *time.Time `json:"end_date,omitempty"`
+
+	// Pagination (required for ListAuditLogs)
+	Limit  int `json:"limit"`  // Required, max 1000
+	Offset int `json:"offset"` // Required, min 0
+}
+
+// ============================================================================
+// BUILDER PATTERN METHODS
+// ============================================================================
+
+// WithCompanyID creates a copy of filter with company ID set
+func (f AuditLogFilter) WithCompanyID(companyID uuid.UUID) AuditLogFilter {
+	f.CompanyID = &companyID
+	return f
+}
+
+// WithModule creates a copy of filter with module set
+func (f AuditLogFilter) WithModule(module string) AuditLogFilter {
+	f.Module = &module
+	return f
+}
+
+// WithAction creates a copy of filter with action set
+func (f AuditLogFilter) WithAction(action string) AuditLogFilter {
+	f.Action = &action
+	return f
+}
+
+// WithEntity creates a copy of filter with entity filters set
+func (f AuditLogFilter) WithEntity(entityType string, entityID uuid.UUID) AuditLogFilter {
+	f.EntityType = &entityType
+	f.EntityID = &entityID
+	return f
+}
+
+// WithActor creates a copy of filter with actor filters set
+func (f AuditLogFilter) WithActor(actorType string, actorID uuid.UUID) AuditLogFilter {
+	f.ActorType = &actorType
+	f.ActorID = &actorID
+	return f
+}
+
+// WithTimeRange creates a copy of filter with time range set
+// Automatically converts to UTC to prevent timezone bugs
+func (f AuditLogFilter) WithTimeRange(start, end time.Time) AuditLogFilter {
+	startUTC := start.UTC()
+	endUTC := end.UTC()
+	f.StartDate = &startUTC
+	f.EndDate = &endUTC
+	return f
+}
+
+// WithLastNDays creates a copy of filter for last N days
+func (f AuditLogFilter) WithLastNDays(days int) AuditLogFilter {
+	end := time.Now().UTC()
+	start := end.AddDate(0, 0, -days)
+	f.StartDate = &start
+	f.EndDate = &end
+	return f
+}
+

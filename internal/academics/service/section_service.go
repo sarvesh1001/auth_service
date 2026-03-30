@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -12,6 +13,10 @@ import (
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
 )
+
+// ---------------------------------------------------------------------
+// SectionService interface (unchanged)
+// ---------------------------------------------------------------------
 
 type SectionService interface {
 	Create(ctx context.Context, req CreateSectionRequest) (*models.Section, error)
@@ -31,22 +36,34 @@ type SectionService interface {
 	ValidateCapacity(ctx context.Context, sectionID uuid.UUID) error
 }
 
+// ---------------------------------------------------------------------
+// sectionService struct (updated with audit/outbox)
+// ---------------------------------------------------------------------
+
 type sectionService struct {
 	repo           repository.SectionRepository
 	courseRepo     repository.CourseRepository
 	termRepo       repository.TermRepository
-	enrollmentRepo repository.EnrollmentRepository // added for dependency checks
-	eventPublisher EventPublisher
-	pgClient       *client.PostgresClient
-	logger         *zap.Logger
+	enrollmentRepo repository.EnrollmentRepository
+
+	auditLogger AuditLogger
+	outboxStore OutboxStore
+
+	pgClient *client.PostgresClient
+	logger   *zap.Logger
 }
+
+// ---------------------------------------------------------------------
+// Constructor (updated)
+// ---------------------------------------------------------------------
 
 func NewSectionService(
 	repo repository.SectionRepository,
 	courseRepo repository.CourseRepository,
 	termRepo repository.TermRepository,
 	enrollmentRepo repository.EnrollmentRepository,
-	eventPublisher EventPublisher,
+	auditLogger AuditLogger,
+	outboxStore OutboxStore,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 ) SectionService {
@@ -55,13 +72,17 @@ func NewSectionService(
 		courseRepo:     courseRepo,
 		termRepo:       termRepo,
 		enrollmentRepo: enrollmentRepo,
-		eventPublisher: eventPublisher,
+		auditLogger:    auditLogger,
+		outboxStore:    outboxStore,
 		pgClient:       pgClient,
 		logger:         logger.Named("section_service"),
 	}
 }
 
-// validateInput performs basic validation for CreateSectionRequest.
+// ---------------------------------------------------------------------
+// Validation helpers (reusable)
+// ---------------------------------------------------------------------
+
 func (s *sectionService) validateInput(req CreateSectionRequest) error {
 	if req.CourseID == uuid.Nil {
 		return fmt.Errorf("%w: course_id is required", ErrInvalidInput)
@@ -78,8 +99,47 @@ func (s *sectionService) validateInput(req CreateSectionRequest) error {
 	return nil
 }
 
-// Create inserts a new section.
+// validateDomain ensures course exists, term exists, and term belongs to the same company as course.
+// Returns the course and term for reuse.
+func (s *sectionService) validateDomain(ctx context.Context, tx repository.DBTX, courseID, termID uuid.UUID) (*models.Course, *models.Term, error) {
+	course, err := s.courseRepo.GetByID(ctx, tx, courseID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if course == nil {
+		return nil, nil, fmt.Errorf("%w: course %s", ErrNotFound, courseID)
+	}
+
+	term, err := s.termRepo.GetByID(ctx, tx, termID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if term == nil {
+		return nil, nil, fmt.Errorf("%w: term %s", ErrNotFound, termID)
+	}
+
+	ay, err := s.termRepo.GetAcademicYearByTerm(ctx, tx, termID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ay == nil {
+		return nil, nil, fmt.Errorf("academic year for term %s not found", termID)
+	}
+	if course.CompanyID != ay.CompanyID {
+		return nil, nil, fmt.Errorf("%w: term belongs to different company", ErrInvalidInput)
+	}
+	return course, term, nil
+}
+
+// ---------------------------------------------------------------------
+// Core CRUD (upgraded with outbox, audit, locking)
+// ---------------------------------------------------------------------
+
 func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (*models.Section, error) {
+	// Add timeout for safety
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(
 		zap.String("method", "Create"),
 		zap.String("course_id", req.CourseID.String()),
@@ -97,30 +157,13 @@ func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (
 	}
 	defer tx.Rollback()
 
-	// Verify course exists (not deleted)
-	course, err := s.courseRepo.GetByID(ctx, tx, req.CourseID)
+	// Validate domain (course, term, company consistency)
+	_, _, err = s.validateDomain(ctx, tx, req.CourseID, req.TermID)
 	if err != nil {
 		return nil, err
 	}
-	if course == nil {
-		return nil, fmt.Errorf("%w: course %s", ErrNotFound, req.CourseID)
-	}
 
-	// Verify term exists (not deleted)
-	term, err := s.termRepo.GetByID(ctx, tx, req.TermID)
-	if err != nil {
-		return nil, err
-	}
-	if term == nil {
-		return nil, fmt.Errorf("%w: term %s", ErrNotFound, req.TermID)
-	}
-
-	// Domain rule: term must belong to the same company as course
-	if err := s.validateTermBelongsToCompany(ctx, tx, term.TermID, course.CompanyID); err != nil {
-		return nil, err
-	}
-
-	// Check uniqueness of (course_id, term_id, name)
+	// Check uniqueness
 	exists, err := s.repo.Exists(ctx, tx, req.CourseID, req.TermID, req.Name)
 	if err != nil {
 		return nil, err
@@ -143,37 +186,32 @@ func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (
 		return nil, err
 	}
 
+	// Audit log
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_CREATE", section.SectionID, nil, section, req.CreatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+
+	// Outbox event
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionCreated), section); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("section created", zap.String("id", section.SectionID.String()))
-
-	// Publish event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSectionCreated,
-		Data: section,
-	}); err != nil {
-		logger.Error("failed to publish section.created event", zap.Error(err))
-	}
-
+	logger.Info("section created", zap.String("section_id", section.SectionID.String()))
 	return section, nil
 }
 
-// BulkCreate inserts multiple sections in a single transaction with optimised validation.
 func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionRequest) ([]*models.Section, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
-	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	// Collect all course and term IDs
-	courseIDs := make(map[uuid.UUID]struct{})
-	termIDs := make(map[uuid.UUID]struct{})
-	for _, req := range reqs {
-		courseIDs[req.CourseID] = struct{}{}
-		termIDs[req.TermID] = struct{}{}
-	}
+	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -181,38 +219,44 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 	}
 	defer tx.Rollback()
 
-	// Preload courses
-	courseList := keysToSlice(courseIDs)
-	coursesMap, err := s.courseRepo.GetByIDs(ctx, tx, courseList)
-	if err != nil {
-		return nil, fmt.Errorf("failed to preload courses: %w", err)
+	// Collect unique course and term IDs
+	courseIDs := make(map[uuid.UUID]struct{})
+	termIDs := make(map[uuid.UUID]struct{})
+	for _, req := range reqs {
+		courseIDs[req.CourseID] = struct{}{}
+		termIDs[req.TermID] = struct{}{}
 	}
-	if len(coursesMap) != len(courseList) {
-		for _, cid := range courseList {
-			if _, ok := coursesMap[cid]; !ok {
-				return nil, fmt.Errorf("%w: course %s", ErrNotFound, cid)
-			}
+	courseList := keysToSlice(courseIDs)
+	termList := keysToSlice(termIDs)
+
+	// Preload and lock courses (optional: lock only if needed)
+	coursesMap := make(map[uuid.UUID]*models.Course)
+	for _, cid := range courseList {
+		course, err := s.courseRepo.GetByIDForUpdate(ctx, tx, cid)
+		if err != nil {
+			return nil, err
 		}
+		if course == nil {
+			return nil, fmt.Errorf("%w: course %s", ErrNotFound, cid)
+		}
+		coursesMap[cid] = course
 	}
 
 	// Preload terms
-	termList := keysToSlice(termIDs)
 	termsMap, err := s.termRepo.GetByIDs(ctx, tx, termList)
 	if err != nil {
-		return nil, fmt.Errorf("failed to preload terms: %w", err)
+		return nil, fmt.Errorf("preload terms: %w", err)
 	}
-	if len(termsMap) != len(termList) {
-		for _, tid := range termList {
-			if _, ok := termsMap[tid]; !ok {
-				return nil, fmt.Errorf("%w: term %s", ErrNotFound, tid)
-			}
+	for _, tid := range termList {
+		if _, ok := termsMap[tid]; !ok {
+			return nil, fmt.Errorf("%w: term %s", ErrNotFound, tid)
 		}
 	}
 
 	// Preload academic years for terms (to validate company)
 	termToAYMap, err := s.termRepo.GetAcademicYearsByTermIDs(ctx, tx, termList)
 	if err != nil {
-		return nil, fmt.Errorf("failed to preload academic years for terms: %w", err)
+		return nil, fmt.Errorf("preload academic years: %w", err)
 	}
 
 	// Preload existing sections
@@ -221,12 +265,12 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		TermIDs:   termList,
 	}, repository.Pagination{Limit: 10000}, repository.Sort{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to pre‑load existing sections: %w", err)
+		return nil, fmt.Errorf("preload existing sections: %w", err)
 	}
-	existingKeys := make(map[string]bool)
+	existingKeyMap := make(map[string]bool)
 	for _, sec := range existingSections {
 		key := sec.CourseID.String() + ":" + sec.TermID.String() + ":" + sec.Name
-		existingKeys[key] = true
+		existingKeyMap[key] = true
 	}
 
 	seen := make(map[string]bool)
@@ -235,27 +279,26 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		if err := s.validateInput(req); err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
-
 		key := req.CourseID.String() + ":" + req.TermID.String() + ":" + req.Name
 		if seen[key] {
-			return nil, fmt.Errorf("item %d: %w: duplicate section name %s in batch", i, ErrDuplicate, req.Name)
+			return nil, fmt.Errorf("item %d: %w: duplicate in batch", i, ErrDuplicate)
 		}
 		seen[key] = true
-
-		if existingKeys[key] {
-			return nil, fmt.Errorf("item %d: %w: section name %s already exists for this course and term", i, ErrDuplicate, req.Name)
+		if existingKeyMap[key] {
+			return nil, fmt.Errorf("item %d: %w: already exists", i, ErrDuplicate)
 		}
 
-		course, ok := coursesMap[req.CourseID]
-		if !ok {
+		// Validate company consistency
+		course := coursesMap[req.CourseID]
+		ay := termToAYMap[req.TermID]
+		if course == nil {
 			return nil, fmt.Errorf("item %d: course %s not found", i, req.CourseID)
 		}
-		ay, ok := termToAYMap[req.TermID]
-		if !ok {
-			return nil, fmt.Errorf("item %d: term %s academic year not found", i, req.TermID)
+		if ay == nil {
+			return nil, fmt.Errorf("item %d: academic year for term %s not found", i, req.TermID)
 		}
 		if course.CompanyID != ay.CompanyID {
-			return nil, fmt.Errorf("item %d: term %s does not belong to the same company as course %s", i, req.TermID, req.CourseID)
+			return nil, fmt.Errorf("item %d: term does not belong to same company as course", i)
 		}
 
 		toCreate = append(toCreate, &models.Section{
@@ -273,27 +316,28 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		return nil, err
 	}
 
+	// Audit and outbox for each created section
+	for _, sec := range toCreate {
+		if err := s.auditLogger.Log(ctx, tx, "SECTION_BULK_CREATE", sec.SectionID, nil, sec, sec.CreatedBy); err != nil {
+			logger.Error("audit failed", zap.String("section_id", sec.SectionID.String()), zap.Error(err))
+		}
+		if err := s.outboxStore.Store(ctx, tx, string(EventSectionCreated), sec); err != nil {
+			return nil, fmt.Errorf("outbox store for section %s: %w", sec.SectionID, err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("bulk created sections", zap.Int("count", len(toCreate)))
-
-	// Publish events for each created section
-	for _, sec := range toCreate {
-		if err := s.eventPublisher.Publish(ctx, Event{
-			Type: EventSectionCreated,
-			Data: sec,
-		}); err != nil {
-			logger.Error("failed to publish section.created event", zap.String("section_id", sec.SectionID.String()), zap.Error(err))
-		}
-	}
-
 	return toCreate, nil
 }
 
-// Upsert creates or updates a section based on unique (course_id, term_id, name).
 func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (*models.Section, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(
 		zap.String("method", "Upsert"),
 		zap.String("course_id", req.CourseID.String()),
@@ -311,26 +355,9 @@ func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (
 	}
 	defer tx.Rollback()
 
-	// Verify course exists
-	course, err := s.courseRepo.GetByID(ctx, tx, req.CourseID)
+	// Validate domain
+	_, _, err = s.validateDomain(ctx, tx, req.CourseID, req.TermID)
 	if err != nil {
-		return nil, err
-	}
-	if course == nil {
-		return nil, fmt.Errorf("%w: course %s", ErrNotFound, req.CourseID)
-	}
-
-	// Verify term exists
-	term, err := s.termRepo.GetByID(ctx, tx, req.TermID)
-	if err != nil {
-		return nil, err
-	}
-	if term == nil {
-		return nil, fmt.Errorf("%w: term %s", ErrNotFound, req.TermID)
-	}
-
-	// Domain rule: term must belong to the same company as course
-	if err := s.validateTermBelongsToCompany(ctx, tx, term.TermID, course.CompanyID); err != nil {
 		return nil, err
 	}
 
@@ -348,17 +375,30 @@ func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (
 		return nil, err
 	}
 
+	// For upsert, we don't know if it was insert or update. We'll publish a generic event.
+	// If you need to differentiate, you could fetch before and after.
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_UPSERT", section.SectionID, nil, section, req.UpdatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), section); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("section upserted", zap.String("id", section.SectionID.String()))
-	// No event for upsert (or could detect create/update and publish accordingly)
+	logger.Info("section upserted", zap.String("section_id", section.SectionID.String()))
 	return section, nil
 }
 
-// GetByID retrieves a section by ID.
+// ---------------------------------------------------------------------
+// Read‑only operations (unchanged, no transaction needed)
+// ---------------------------------------------------------------------
+
 func (s *sectionService) GetByID(ctx context.Context, id uuid.UUID) (*models.Section, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	sec, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
 		return nil, err
@@ -369,33 +409,44 @@ func (s *sectionService) GetByID(ctx context.Context, id uuid.UUID) (*models.Sec
 	return sec, nil
 }
 
-// List returns sections matching the filter with pagination and sorting.
 func (s *sectionService) List(ctx context.Context, filter repository.SectionFilter, p repository.Pagination, srt repository.Sort) ([]*models.Section, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
-// ListByCourse returns all sections for a given course.
 func (s *sectionService) ListByCourse(ctx context.Context, courseID uuid.UUID) ([]*models.Section, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	return s.repo.ListByCourse(ctx, s.pgClient.DB, courseID)
 }
 
-// ListByTerm returns all sections for a given term.
 func (s *sectionService) ListByTerm(ctx context.Context, termID uuid.UUID) ([]*models.Section, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	return s.repo.ListByTerm(ctx, s.pgClient.DB, termID)
 }
 
-// Count returns the number of sections matching the filter.
 func (s *sectionService) Count(ctx context.Context, filter repository.SectionFilter) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
-// Exists checks if a section with given course, term, and name exists.
 func (s *sectionService) Exists(ctx context.Context, courseID, termID uuid.UUID, name string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	return s.repo.Exists(ctx, s.pgClient.DB, courseID, termID, name)
 }
 
-// Update modifies an existing section.
+// ---------------------------------------------------------------------
+// Update operations (with locking, audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (*models.Section, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("section_id", req.SectionID.String()))
 
 	if req.SectionID == uuid.Nil {
@@ -421,18 +472,16 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 	if section == nil {
 		return nil, fmt.Errorf("%w: section %s", ErrNotFound, req.SectionID)
 	}
-
-	// Capture old state for event
 	oldSection := *section
 
-	// If name changed, check uniqueness within same course and term
+	// If name changed, check uniqueness
 	if req.Name != section.Name {
 		exists, err := s.repo.Exists(ctx, tx, section.CourseID, section.TermID, req.Name)
 		if err != nil {
 			return nil, err
 		}
 		if exists {
-			return nil, fmt.Errorf("%w: section name %s already exists for this course and term", ErrDuplicate, req.Name)
+			return nil, fmt.Errorf("%w: section name %s already exists", ErrDuplicate, req.Name)
 		}
 	}
 
@@ -445,28 +494,30 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 		return nil, err
 	}
 
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_UPDATE", req.SectionID, &oldSection, section, req.UpdatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+		"old": oldSection,
+		"new": section,
+	}); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("section updated")
-
-	// Publish event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSectionUpdated,
-		Data: map[string]interface{}{
-			"old": oldSection,
-			"new": section,
-		},
-	}); err != nil {
-		logger.Error("failed to publish section.updated event", zap.Error(err))
-	}
-
 	return section, nil
 }
 
-// UpdateCapacity updates only the capacity of a section.
 func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID, capacity int, updatedBy *uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(zap.String("method", "UpdateCapacity"), zap.String("section_id", sectionID.String()))
 
 	if capacity < 0 {
@@ -479,7 +530,6 @@ func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID
 	}
 	defer tx.Rollback()
 
-	// Fetch current state for event
 	section, err := s.repo.GetByIDForUpdate(ctx, tx, sectionID)
 	if err != nil {
 		return err
@@ -493,29 +543,31 @@ func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID
 		return err
 	}
 
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_CAPACITY_UPDATE", sectionID, map[string]interface{}{"capacity": oldCapacity}, map[string]interface{}{"capacity": capacity}, updatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+		"section_id": sectionID,
+		"old":        map[string]interface{}{"capacity": oldCapacity},
+		"new":        map[string]interface{}{"capacity": capacity},
+	}); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("section capacity updated", zap.Int("capacity", capacity))
-
-	// Publish update event with capacity change
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSectionUpdated,
-		Data: map[string]interface{}{
-			"old":        map[string]interface{}{"capacity": oldCapacity},
-			"new":        map[string]interface{}{"capacity": capacity},
-			"section_id": sectionID,
-		},
-	}); err != nil {
-		logger.Error("failed to publish section.updated event", zap.Error(err))
-	}
-
 	return nil
 }
 
-// Activate sets is_active to true.
 func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(zap.String("method", "Activate"), zap.String("section_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -524,7 +576,6 @@ func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *
 	}
 	defer tx.Rollback()
 
-	// Fetch current state for event
 	section, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
 		return err
@@ -538,29 +589,31 @@ func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *
 		return err
 	}
 
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_ACTIVATE", id, map[string]interface{}{"is_active": oldActive}, map[string]interface{}{"is_active": true}, updatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+		"section_id": id,
+		"old":        map[string]interface{}{"is_active": oldActive},
+		"new":        map[string]interface{}{"is_active": true},
+	}); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("section activated")
-
-	// Publish update event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSectionUpdated,
-		Data: map[string]interface{}{
-			"old":        map[string]interface{}{"is_active": oldActive},
-			"new":        map[string]interface{}{"is_active": true},
-			"section_id": id,
-		},
-	}); err != nil {
-		logger.Error("failed to publish section.updated event", zap.Error(err))
-	}
-
 	return nil
 }
 
-// Deactivate sets is_active to false.
 func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(zap.String("method", "Deactivate"), zap.String("section_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -569,7 +622,6 @@ func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 	}
 	defer tx.Rollback()
 
-	// Fetch current state for event
 	section, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
 		return err
@@ -583,29 +635,31 @@ func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 		return err
 	}
 
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_DEACTIVATE", id, map[string]interface{}{"is_active": oldActive}, map[string]interface{}{"is_active": false}, updatedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+		"section_id": id,
+		"old":        map[string]interface{}{"is_active": oldActive},
+		"new":        map[string]interface{}{"is_active": false},
+	}); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("section deactivated")
-
-	// Publish update event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSectionUpdated,
-		Data: map[string]interface{}{
-			"old":        map[string]interface{}{"is_active": oldActive},
-			"new":        map[string]interface{}{"is_active": false},
-			"section_id": id,
-		},
-	}); err != nil {
-		logger.Error("failed to publish section.updated event", zap.Error(err))
-	}
-
 	return nil
 }
 
-// Delete soft-deletes a section.
 func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("section_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -614,7 +668,18 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	}
 	defer tx.Rollback()
 
-	// Check for dependent records (enrollments)
+	// Lock the section to prevent concurrent deletes
+	section, err := s.repo.GetByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if section == nil {
+		// Idempotent: already deleted
+		logger.Info("section already deleted (idempotent)")
+		return nil
+	}
+
+	// Check for dependent enrollments
 	count, err := s.enrollmentRepo.CountBySection(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("failed to check enrollments: %w", err)
@@ -623,10 +688,20 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return fmt.Errorf("%w: section has %d active enrollments", ErrDependencyExists, count)
 	}
 
-	// Additional dependency checks (timetable entries, etc.) can be added here.
-
 	if err := s.repo.Delete(ctx, tx, id, deletedBy); err != nil {
 		return err
+	}
+
+	// Audit
+	if err := s.auditLogger.Log(ctx, tx, "SECTION_DELETE", id, section, nil, deletedBy); err != nil {
+		logger.Error("audit log failed", zap.Error(err))
+	}
+	// Outbox
+	if err := s.outboxStore.Store(ctx, tx, string(EventSectionDeleted), map[string]interface{}{
+		"section_id": id,
+		"deleted_by": deletedBy,
+	}); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -634,26 +709,20 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	}
 
 	logger.Info("section deleted")
-
-	// Publish event
-	if err := s.eventPublisher.Publish(ctx, Event{
-		Type: EventSectionDeleted,
-		Data: map[string]interface{}{
-			"section_id": id,
-			"deleted_by": deletedBy,
-		},
-	}); err != nil {
-		logger.Error("failed to publish section.deleted event", zap.Error(err))
-	}
-
 	return nil
 }
 
-// ValidateCapacity checks if the current enrollment count exceeds capacity.
-func (s *sectionService) ValidateCapacity(ctx context.Context, sectionID uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "ValidateCapacity"), zap.String("section_id", sectionID.String()))
+// ---------------------------------------------------------------------
+// Validation (read-only, but should be done within transaction if used in critical path)
+// ---------------------------------------------------------------------
 
-	// Get section and its capacity
+func (s *sectionService) ValidateCapacity(ctx context.Context, sectionID uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// For validation, we don't need a transaction unless we intend to lock.
+	// But to avoid race conditions, we should use a row lock when the caller is about to enroll.
+	// This method is read-only; we'll rely on caller to lock if needed.
 	section, err := s.repo.GetByID(ctx, s.pgClient.DB, sectionID)
 	if err != nil {
 		return err
@@ -662,44 +731,25 @@ func (s *sectionService) ValidateCapacity(ctx context.Context, sectionID uuid.UU
 		return fmt.Errorf("%w: section %s", ErrNotFound, sectionID)
 	}
 	if section.Capacity <= 0 {
-		// No capacity limit
 		return nil
 	}
 
-	// Count active enrollments in this section
 	enrolled, err := s.enrollmentRepo.CountActiveBySection(ctx, s.pgClient.DB, sectionID)
 	if err != nil {
 		return fmt.Errorf("failed to count enrollments: %w", err)
 	}
 
 	if enrolled >= int64(section.Capacity) {
-		logger.Warn("section capacity exceeded",
-			zap.Int("capacity", section.Capacity),
-			zap.Int64("enrolled", enrolled))
 		return fmt.Errorf("%w: section capacity %d exceeded (enrolled: %d)", ErrCapacityExceeded, section.Capacity, enrolled)
 	}
-
-	logger.Info("section capacity valid", zap.Int("capacity", section.Capacity), zap.Int64("enrolled", enrolled))
 	return nil
 }
 
-// validateTermBelongsToCompany checks that the term's academic year belongs to the given company.
-func (s *sectionService) validateTermBelongsToCompany(ctx context.Context, db repository.DBTX, termID, expectedCompanyID uuid.UUID) error {
-	// This requires a new repo method: TermRepository.GetAcademicYearByTerm
-	ay, err := s.termRepo.GetAcademicYearByTerm(ctx, db, termID)
-	if err != nil {
-		return err
-	}
-	if ay == nil {
-		return fmt.Errorf("academic year for term %s not found", termID)
-	}
-	if ay.CompanyID != expectedCompanyID {
-		return fmt.Errorf("%w: term belongs to a different company (expected %s, got %s)", ErrInvalidInput, expectedCompanyID, ay.CompanyID)
-	}
-	return nil
-}
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
 
-// Helper to convert map keys to slice (used in BulkCreate)
+// keysToSlice converts a map of UUIDs to a slice (reused from earlier)
 func keysToSlice(m map[uuid.UUID]struct{}) []uuid.UUID {
 	s := make([]uuid.UUID, 0, len(m))
 	for k := range m {
