@@ -24,6 +24,8 @@ CREATE SCHEMA IF NOT EXISTS payroll;
 CREATE SCHEMA IF NOT EXISTS audit;
 CREATE SCHEMA IF NOT EXISTS attendance;
 CREATE SCHEMA IF NOT EXISTS biometric;   
+CREATE SCHEMA IF NOT EXISTS outbox;
+
 -- =====================================================
 -- 3. CORE TABLES (all columns and constraints integrated)
 -- =====================================================
@@ -4324,8 +4326,12 @@ INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
     ('Payroll', 'payroll', 'Payroll management and processing', 1 << 21)
 ON CONFLICT (name) DO NOTHING;
 
--- Permissions (abbreviated for brevity; full list is assumed to be present)
+
+-- =====================================================
+-- FULL PERMISSIONS (including Academics)
+-- =====================================================
 INSERT INTO permissions (permission_name, description, category, module, scope, requires_tier, bit_index) VALUES
+    -- hr & employee
     ('hr.employee.create', 'Create employees', 'employee', 'hr', 'user', 'basic', 0),
     ('hr.employee.update', 'Update employees', 'employee', 'hr', 'user', 'basic', 1),
     ('hr.employee.delete', 'Delete employees', 'employee', 'hr', 'user', 'basic', 2),
@@ -4346,6 +4352,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('hr.leave.view', 'View leave', 'leave', 'hr', 'user', 'basic', 17),
     ('hr.attendance.view', 'View attendance', 'attendance', 'hr', 'user', 'basic', 18),
     ('hr.attendance.update', 'Update attendance', 'attendance', 'hr', 'user', 'basic', 19),
+
+    -- finance
     ('finance.invoice.create', 'Create invoices', 'invoice', 'finance', 'user', 'basic', 20),
     ('finance.invoice.update', 'Update invoices', 'invoice', 'finance', 'user', 'basic', 21),
     ('finance.invoice.delete', 'Delete invoices', 'invoice', 'finance', 'user', 'basic', 22),
@@ -4365,6 +4373,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('finance.budget.update', 'Update budgets', 'budget', 'finance', 'user', 'basic', 36),
     ('finance.budget.delete', 'Delete budgets', 'budget', 'finance', 'user', 'basic', 37),
     ('finance.budget.view', 'View budgets', 'budget', 'finance', 'user', 'basic', 38),
+
+    -- accounting
     ('accounting.ledger.view', 'View ledger', 'ledger', 'accounting', 'user', 'basic', 39),
     ('accounting.journal.create', 'Create journal entries', 'journal', 'accounting', 'user', 'basic', 40),
     ('accounting.journal.update', 'Update journal entries', 'journal', 'accounting', 'user', 'basic', 41),
@@ -4375,6 +4385,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('accounting.cashflow.view', 'View cash flow', 'cashflow', 'accounting', 'user', 'basic', 46),
     ('accounting.reconcile', 'Reconcile accounts', 'reconcile', 'accounting', 'user', 'basic', 47),
     ('accounting.report.export', 'Export reports', 'report', 'accounting', 'user', 'basic', 48),
+
+    -- procurement
     ('procurement.po.create', 'Create purchase orders', 'po', 'procurement', 'user', 'basic', 49),
     ('procurement.po.update', 'Update purchase orders', 'po', 'procurement', 'user', 'basic', 50),
     ('procurement.po.approve', 'Approve purchase orders', 'po', 'procurement', 'user', 'basic', 51),
@@ -4390,6 +4402,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('procurement.request.update', 'Update procurement requests', 'request', 'procurement', 'user', 'basic', 61),
     ('procurement.request.delete', 'Delete procurement requests', 'request', 'procurement', 'user', 'basic', 62),
     ('procurement.request.view', 'View procurement requests', 'request', 'procurement', 'user', 'basic', 63),
+
+    -- inventory
     ('inventory.item.create', 'Create items', 'item', 'inventory', 'user', 'basic', 64),
     ('inventory.item.update', 'Update items', 'item', 'inventory', 'user', 'basic', 65),
     ('inventory.item.delete', 'Delete items', 'item', 'inventory', 'user', 'basic', 66),
@@ -4408,6 +4422,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('inventory.warehouse.update', 'Update warehouses', 'warehouse', 'inventory', 'user', 'basic', 79),
     ('inventory.warehouse.delete', 'Delete warehouses', 'warehouse', 'inventory', 'user', 'basic', 80),
     ('inventory.warehouse.view', 'View warehouses', 'warehouse', 'inventory', 'user', 'basic', 81),
+
+    -- logistics
     ('logistics.shipment.create', 'Create shipments', 'shipment', 'logistics', 'user', 'basic', 82),
     ('logistics.shipment.update', 'Update shipments', 'shipment', 'logistics', 'user', 'basic', 83),
     ('logistics.shipment.delete', 'Delete shipments', 'shipment', 'logistics', 'user', 'basic', 84),
@@ -4420,6 +4436,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('logistics.vehicle.assign', 'Assign vehicles', 'vehicle', 'logistics', 'user', 'basic', 91),
     ('logistics.vehicle.update', 'Update vehicles', 'vehicle', 'logistics', 'user', 'basic', 92),
     ('logistics.vehicle.view', 'View vehicles', 'vehicle', 'logistics', 'user', 'basic', 93),
+
+    -- sales
     ('sales.lead.create', 'Create sales leads', 'lead', 'sales', 'user', 'basic', 94),
     ('sales.lead.update', 'Update sales leads', 'lead', 'sales', 'user', 'basic', 95),
     ('sales.lead.delete', 'Delete sales leads', 'lead', 'sales', 'user', 'basic', 96),
@@ -4436,6 +4454,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('sales.target.create', 'Create sales targets', 'target', 'sales', 'user', 'basic', 107),
     ('sales.target.update', 'Update sales targets', 'target', 'sales', 'user', 'basic', 108),
     ('sales.target.view', 'View sales targets', 'target', 'sales', 'user', 'basic', 109),
+
+    -- marketing
     ('marketing.campaign.create', 'Create campaigns', 'campaign', 'marketing', 'user', 'basic', 110),
     ('marketing.campaign.update', 'Update campaigns', 'campaign', 'marketing', 'user', 'basic', 111),
     ('marketing.campaign.delete', 'Delete campaigns', 'campaign', 'marketing', 'user', 'basic', 112),
@@ -4448,6 +4468,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('marketing.budget.create', 'Create marketing budgets', 'budget', 'marketing', 'user', 'basic', 119),
     ('marketing.budget.update', 'Update marketing budgets', 'budget', 'marketing', 'user', 'basic', 120),
     ('marketing.budget.view', 'View marketing budgets', 'budget', 'marketing', 'user', 'basic', 121),
+
+    -- support
     ('support.ticket.create', 'Create support tickets', 'ticket', 'support', 'user', 'basic', 122),
     ('support.ticket.update', 'Update support tickets', 'ticket', 'support', 'user', 'basic', 123),
     ('support.ticket.assign', 'Assign support tickets', 'ticket', 'support', 'user', 'basic', 124),
@@ -4459,6 +4481,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('support.faq.delete', 'Delete FAQs', 'faq', 'support', 'user', 'basic', 130),
     ('support.faq.view', 'View FAQs', 'faq', 'support', 'user', 'basic', 131),
     ('support.report.view', 'View support reports', 'report', 'support', 'user', 'basic', 132),
+
+    -- operations
     ('operations.task.create', 'Create tasks', 'task', 'operations', 'user', 'basic', 133),
     ('operations.task.update', 'Update tasks', 'task', 'operations', 'user', 'basic', 134),
     ('operations.task.delete', 'Delete tasks', 'task', 'operations', 'user', 'basic', 135),
@@ -4473,6 +4497,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('operations.workflow.update', 'Update workflows', 'workflow', 'operations', 'user', 'basic', 144),
     ('operations.workflow.delete', 'Delete workflows', 'workflow', 'operations', 'user', 'basic', 145),
     ('operations.workflow.view', 'View workflows', 'workflow', 'operations', 'user', 'basic', 146),
+
+    -- IT
     ('it.asset.create', 'Create IT assets', 'asset', 'it', 'user', 'basic', 147),
     ('it.asset.update', 'Update IT assets', 'asset', 'it', 'user', 'basic', 148),
     ('it.asset.delete', 'Delete IT assets', 'asset', 'it', 'user', 'basic', 149),
@@ -4487,6 +4513,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('it.access.revoke', 'Revoke access', 'access', 'it', 'user', 'basic', 158),
     ('it.system.config.update', 'Update system config', 'system', 'it', 'user', 'basic', 159),
     ('it.system.config.view', 'View system config', 'system', 'it', 'user', 'basic', 160),
+
+    -- production
     ('production.order.create', 'Create production orders', 'order', 'production', 'user', 'basic', 161),
     ('production.order.update', 'Update production orders', 'order', 'production', 'user', 'basic', 162),
     ('production.order.start', 'Start production orders', 'order', 'production', 'user', 'basic', 163),
@@ -4503,6 +4531,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('production.route.update', 'Update routes', 'route', 'production', 'user', 'basic', 174),
     ('production.route.view', 'View routes', 'route', 'production', 'user', 'basic', 175),
     ('production.route.delete', 'Delete routes', 'route', 'production', 'user', 'basic', 176),
+
+    -- quality control
     ('qc.inspection.create', 'Create inspections', 'inspection', 'qc', 'user', 'basic', 177),
     ('qc.inspection.update', 'Update inspections', 'inspection', 'qc', 'user', 'basic', 178),
     ('qc.inspection.approve', 'Approve inspections', 'inspection', 'qc', 'user', 'basic', 179),
@@ -4513,6 +4543,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('qc.batch.release', 'Release batches', 'batch', 'qc', 'user', 'basic', 184),
     ('qc.report.generate', 'Generate QC reports', 'report', 'qc', 'user', 'basic', 185),
     ('qc.report.view', 'View QC reports', 'report', 'qc', 'user', 'basic', 186),
+
+    -- quality assurance
     ('qa.test.create', 'Create tests', 'test', 'qa', 'user', 'basic', 187),
     ('qa.test.update', 'Update tests', 'test', 'qa', 'user', 'basic', 188),
     ('qa.test.delete', 'Delete tests', 'test', 'qa', 'user', 'basic', 189),
@@ -4523,6 +4555,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('qa.audit.view', 'View audits', 'audit', 'qa', 'user', 'basic', 194),
     ('qa.report.generate', 'Generate QA reports', 'report', 'qa', 'user', 'basic', 195),
     ('qa.report.view', 'View QA reports', 'report', 'qa', 'user', 'basic', 196),
+
+    -- R&D
     ('rnd.experiment.create', 'Create experiments', 'experiment', 'rnd', 'user', 'basic', 197),
     ('rnd.experiment.update', 'Update experiments', 'experiment', 'rnd', 'user', 'basic', 198),
     ('rnd.experiment.delete', 'Delete experiments', 'experiment', 'rnd', 'user', 'basic', 199),
@@ -4535,6 +4569,8 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('rnd.document.update', 'Update R&D documents', 'document', 'rnd', 'user', 'basic', 206),
     ('rnd.document.view', 'View R&D documents', 'document', 'rnd', 'user', 'basic', 207),
     ('rnd.document.delete', 'Delete R&D documents', 'document', 'rnd', 'user', 'basic', 208),
+
+    -- administration (note gap at 209)
     ('administration.company.view', 'View company administration settings', 'company', 'administration', 'user', 'basic', 210),
     ('administration.company.update', 'Update company administration settings', 'company', 'administration', 'user', 'basic', 211),
     ('administration.policy.create', 'Create company policies', 'policy', 'administration', 'user', 'basic', 212),
@@ -4548,10 +4584,14 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('administration.audit.view', 'View company audit logs', 'audit', 'administration', 'user', 'basic', 220),
     ('administration.security.view', 'View company security settings', 'security', 'administration', 'user', 'basic', 221),
     ('administration.security.update', 'Update company security settings', 'security', 'administration', 'user', 'basic', 222),
+
+    -- attendance (self service)
     ('attendance.self.punch', 'Allow user to punch their own attendance (check-in/check-out)', 'attendance', 'attendance', 'user', 'basic', 223),
     ('attendance.team.punch', 'Allow manager/lead to punch attendance for team members', 'attendance', 'attendance', 'user', 'basic', 224),
     ('attendance.correct', 'Allow correction or adjustment of attendance records', 'attendance', 'attendance', 'user', 'basic', 225),
     ('attendance.configure', 'Configure attendance rules, sources, and policies', 'attendance', 'attendance', 'user', 'basic', 226),
+
+    -- payroll
     ('payroll.run.create', 'Create payroll runs', 'payroll', 'payroll', 'user', 'basic', 227),
     ('payroll.run.update', 'Update payroll runs', 'payroll', 'payroll', 'user', 'basic', 228),
     ('payroll.run.view', 'View payroll runs', 'payroll', 'payroll', 'user', 'basic', 229),
@@ -4560,28 +4600,299 @@ INSERT INTO permissions (permission_name, description, category, module, scope, 
     ('payroll.run.process', 'Process payroll runs', 'payroll', 'payroll', 'user', 'basic', 232),
     ('payroll.component.manage', 'Manage payroll components', 'payroll', 'payroll', 'user', 'basic', 233),
     ('payroll.tax.manage', 'Manage tax rules and profiles', 'payroll', 'payroll', 'user', 'basic', 234),
+
+    -- admin employees (admin scope)
     ('admin.employee.create', 'Create admin employees', 'employee', 'employee_management', 'admin', 'admin', 235),
     ('admin.employee.update', 'Update admin employees', 'employee', 'employee_management', 'admin', 'admin', 236),
     ('admin.employee.view', 'View admin employees', 'employee', 'employee_management', 'admin', 'admin', 237),
     ('admin.employee.delete', 'Delete admin employees', 'employee', 'employee_management', 'admin', 'admin', 238),
     ('admin.employee.assign', 'Assign admin employees to departments', 'employee', 'employee_management', 'admin', 'admin', 239),
+
+    -- admin managers
     ('admin.manager.create', 'Create admin managers', 'manager', 'manager_management', 'admin', 'admin', 240),
     ('admin.manager.update', 'Update admin managers', 'manager', 'manager_management', 'admin', 'admin', 241),
     ('admin.manager.view', 'View admin managers', 'manager', 'manager_management', 'admin', 'admin', 242),
     ('admin.manager.delete', 'Delete admin managers', 'manager', 'manager_management', 'admin', 'admin', 243),
     ('admin.manager.assign', 'Assign admin managers to departments', 'manager', 'manager_management', 'admin', 'admin', 244),
+
+    -- admin company management
     ('admin.company.create', 'Create companies', 'company', 'company_management', 'admin', 'admin', 245),
     ('admin.company.update', 'Update companies', 'company', 'company_management', 'admin', 'admin', 246),
     ('admin.company.view', 'View companies', 'company', 'company_management', 'admin', 'admin', 247),
     ('admin.company.delete', 'Delete companies', 'company', 'company_management', 'admin', 'admin', 248),
     ('admin.company.suspend', 'Suspend companies', 'company', 'company_management', 'admin', 'admin', 249),
+
+    -- super admin
     ('admin.super.manage_roles', 'Manage all admin roles', 'role', 'super_admin', 'admin', 'super_admin', 250),
     ('admin.super.manage_permissions', 'Manage all permissions', 'permission', 'super_admin', 'admin', 'super_admin', 251),
     ('admin.super.manage_departments', 'Manage all departments', 'department', 'super_admin', 'admin', 'super_admin', 252),
     ('admin.super.system_config', 'Configure system settings', 'system', 'super_admin', 'admin', 'super_admin', 253),
-    ('admin.super.audit_logs', 'View audit logs', 'audit', 'super_admin', 'admin', 'super_admin', 254)
-ON CONFLICT (permission_name) DO NOTHING;
+    ('admin.super.audit_logs', 'View audit logs', 'audit', 'super_admin', 'admin', 'super_admin', 254),
 
+    -- =====================================================
+    -- Academics Permissions (bit_index 255–467)
+    -- =====================================================
+
+    -- Academic Years
+    ('academics.academic_year.read', 'View academic years', 'academics', 'academics', 'user', 'basic', 255),
+    ('academics.academic_year.create', 'Create academic years', 'academics', 'academics', 'user', 'basic', 256),
+    ('academics.academic_year.update', 'Update academic years', 'academics', 'academics', 'user', 'basic', 257),
+    ('academics.academic_year.delete', 'Delete academic years', 'academics', 'academics', 'user', 'basic', 258),
+    ('academics.academic_year.set_current', 'Set current academic year', 'academics', 'academics', 'user', 'basic', 259),
+    ('academics.academic_year.bulk_create', 'Bulk create academic years', 'academics', 'academics', 'user', 'basic', 260),
+    ('academics.academic_year.upsert', 'Upsert academic years', 'academics', 'academics', 'user', 'basic', 261),
+
+    -- Admissions
+    ('academics.admission.read', 'View admissions', 'academics', 'academics', 'user', 'basic', 262),
+    ('academics.admission.create', 'Create admissions', 'academics', 'academics', 'user', 'basic', 263),
+    ('academics.admission.update', 'Update admissions', 'academics', 'academics', 'user', 'basic', 264),
+    ('academics.admission.delete', 'Delete admissions', 'academics', 'academics', 'user', 'basic', 265),
+    ('academics.admission.update_status', 'Update admission status', 'academics', 'academics', 'user', 'basic', 266),
+    ('academics.admission.bulk_create', 'Bulk create admissions', 'academics', 'academics', 'user', 'basic', 267),
+
+    -- Assignments
+    ('academics.assignment.read', 'View assignments', 'academics', 'academics', 'user', 'basic', 268),
+    ('academics.assignment.create', 'Create assignments', 'academics', 'academics', 'user', 'basic', 269),
+    ('academics.assignment.update', 'Update assignments', 'academics', 'academics', 'user', 'basic', 270),
+    ('academics.assignment.delete', 'Delete assignments', 'academics', 'academics', 'user', 'basic', 271),
+    ('academics.assignment.publish', 'Publish assignments', 'academics', 'academics', 'user', 'basic', 272),
+    ('academics.assignment.bulk_create', 'Bulk create assignments', 'academics', 'academics', 'user', 'basic', 273),
+
+    -- Attendance (Academics)
+    ('academics.attendance.mark', 'Mark student attendance', 'academics', 'academics', 'user', 'basic', 274),
+    ('academics.attendance.bulk_mark', 'Bulk mark attendance', 'academics', 'academics', 'user', 'basic', 275),
+    ('academics.attendance.read', 'View attendance records', 'academics', 'academics', 'user', 'basic', 276),
+    ('academics.attendance.delete', 'Delete attendance record', 'academics', 'academics', 'user', 'basic', 277),
+    ('academics.attendance.recalculate', 'Recalculate attendance summary', 'academics', 'academics', 'user', 'basic', 278),
+    ('academics.attendance.manage_exemptions', 'Manage attendance exemptions', 'academics', 'academics', 'user', 'basic', 279),
+
+    -- Courses
+    ('academics.course.read', 'View courses', 'academics', 'academics', 'user', 'basic', 280),
+    ('academics.course.create', 'Create courses', 'academics', 'academics', 'user', 'basic', 281),
+    ('academics.course.update', 'Update courses', 'academics', 'academics', 'user', 'basic', 282),
+    ('academics.course.delete', 'Delete courses', 'academics', 'academics', 'user', 'basic', 283),
+    ('academics.course.activate', 'Activate course', 'academics', 'academics', 'user', 'basic', 284),
+    ('academics.course.deactivate', 'Deactivate course', 'academics', 'academics', 'user', 'basic', 285),
+    ('academics.course.bulk_create', 'Bulk create courses', 'academics', 'academics', 'user', 'basic', 286),
+
+    -- Curriculum (Subject-Course mapping)
+    ('academics.curriculum.assign', 'Assign subject to course', 'academics', 'academics', 'user', 'basic', 287),
+    ('academics.curriculum.bulk_assign', 'Bulk assign subjects', 'academics', 'academics', 'user', 'basic', 288),
+    ('academics.curriculum.read', 'View curriculum', 'academics', 'academics', 'user', 'basic', 289),
+    ('academics.curriculum.remove', 'Remove subject mapping', 'academics', 'academics', 'user', 'basic', 290),
+    ('academics.curriculum.remove_all', 'Remove all mappings for course', 'academics', 'academics', 'user', 'basic', 291),
+    ('academics.curriculum.validate', 'Validate curriculum', 'academics', 'academics', 'user', 'basic', 292),
+
+    -- Enrollments
+    ('academics.enrollment.read', 'View enrollments', 'academics', 'academics', 'user', 'basic', 293),
+    ('academics.enrollment.create', 'Create enrollment', 'academics', 'academics', 'user', 'basic', 294),
+    ('academics.enrollment.update', 'Update enrollment', 'academics', 'academics', 'user', 'basic', 295),
+    ('academics.enrollment.delete', 'Delete enrollment', 'academics', 'academics', 'user', 'basic', 296),
+    ('academics.enrollment.bulk_create', 'Bulk enroll students', 'academics', 'academics', 'user', 'basic', 297),
+    ('academics.enrollment.upsert', 'Upsert enrollment', 'academics', 'academics', 'user', 'basic', 298),
+    ('academics.enrollment.transfer', 'Transfer section', 'academics', 'academics', 'user', 'basic', 299),
+    ('academics.enrollment.bulk_transfer', 'Bulk transfer sections', 'academics', 'academics', 'user', 'basic', 300),
+    ('academics.enrollment.swap', 'Swap sections', 'academics', 'academics', 'user', 'basic', 301),
+    ('academics.enrollment.promote', 'Promote student', 'academics', 'academics', 'user', 'basic', 302),
+    ('academics.enrollment.bulk_promote', 'Bulk promote students', 'academics', 'academics', 'user', 'basic', 303),
+    ('academics.enrollment.promote_section', 'Promote whole section', 'academics', 'academics', 'user', 'basic', 304),
+    ('academics.enrollment.graduate', 'Mark student as graduated', 'academics', 'academics', 'user', 'basic', 305),
+    ('academics.enrollment.mark_alumni', 'Mark as alumni', 'academics', 'academics', 'user', 'basic', 306),
+    ('academics.enrollment.bulk_update_status', 'Bulk update enrollment status', 'academics', 'academics', 'user', 'basic', 307),
+    ('academics.enrollment.bulk_assign_roll_numbers', 'Bulk assign roll numbers', 'academics', 'academics', 'user', 'basic', 308),
+    ('academics.enrollment.search', 'Search enrollments', 'academics', 'academics', 'user', 'basic', 309),
+    ('academics.enrollment.update_status', 'Update enrollment status', 'academics', 'academics', 'user', 'basic', 310),
+
+    -- Exams
+    ('academics.exam.read', 'View exams', 'academics', 'academics', 'user', 'basic', 311),
+    ('academics.exam.create', 'Create exam', 'academics', 'academics', 'user', 'basic', 312),
+    ('academics.exam.update', 'Update exam', 'academics', 'academics', 'user', 'basic', 313),
+    ('academics.exam.delete', 'Delete exam', 'academics', 'academics', 'user', 'basic', 314),
+    ('academics.exam.schedule.create', 'Create exam schedule', 'academics', 'academics', 'user', 'basic', 315),
+    ('academics.exam.schedule.read', 'View exam schedules', 'academics', 'academics', 'user', 'basic', 316),
+    ('academics.exam.schedule.update', 'Update exam schedule', 'academics', 'academics', 'user', 'basic', 317),
+    ('academics.exam.schedule.delete', 'Delete exam schedule', 'academics', 'academics', 'user', 'basic', 318),
+    ('academics.exam.result.create', 'Create exam result', 'academics', 'academics', 'user', 'basic', 319),
+    ('academics.exam.result.bulk_create', 'Bulk create exam results', 'academics', 'academics', 'user', 'basic', 320),
+    ('academics.exam.result.read', 'View exam results', 'academics', 'academics', 'user', 'basic', 321),
+    ('academics.exam.result.update', 'Update exam result', 'academics', 'academics', 'user', 'basic', 322),
+    ('academics.exam.result.delete', 'Delete exam result', 'academics', 'academics', 'user', 'basic', 323),
+    ('academics.exam.grade.create', 'Create exam grade', 'academics', 'academics', 'user', 'basic', 324),
+    ('academics.exam.grade.read', 'View exam grades', 'academics', 'academics', 'user', 'basic', 325),
+    ('academics.exam.grade.update', 'Update exam grade', 'academics', 'academics', 'user', 'basic', 326),
+    ('academics.exam.grade.delete', 'Delete exam grade', 'academics', 'academics', 'user', 'basic', 327),
+
+    -- Fees
+    ('academics.fee.structure.create', 'Create fee structure', 'academics', 'academics', 'user', 'basic', 328),
+    ('academics.fee.structure.read', 'View fee structures', 'academics', 'academics', 'user', 'basic', 329),
+    ('academics.fee.structure.update', 'Update fee structure', 'academics', 'academics', 'user', 'basic', 330),
+    ('academics.fee.structure.delete', 'Delete fee structure', 'academics', 'academics', 'user', 'basic', 331),
+    ('academics.fee.invoice.create', 'Create fee invoice', 'academics', 'academics', 'user', 'basic', 332),
+    ('academics.fee.invoice.read', 'View fee invoices', 'academics', 'academics', 'user', 'basic', 333),
+    ('academics.fee.invoice.update', 'Update fee invoice', 'academics', 'academics', 'user', 'basic', 334),
+    ('academics.fee.payment.create', 'Create fee payment', 'academics', 'academics', 'user', 'basic', 335),
+    ('academics.fee.payment.read', 'View fee payments', 'academics', 'academics', 'user', 'basic', 336),
+    ('academics.fee.discount.create', 'Create fee discount', 'academics', 'academics', 'user', 'basic', 337),
+    ('academics.fee.discount.update', 'Update fee discount', 'academics', 'academics', 'user', 'basic', 338),
+    ('academics.fee.discount.delete', 'Delete fee discount', 'academics', 'academics', 'user', 'basic', 339),
+    ('academics.fee.penalty.create', 'Create fee penalty', 'academics', 'academics', 'user', 'basic', 340),
+    ('academics.fee.penalty.update', 'Update fee penalty', 'academics', 'academics', 'user', 'basic', 341),
+    ('academics.fee.receipt.generate', 'Generate fee receipt', 'academics', 'academics', 'user', 'basic', 342),
+    ('academics.fee.receipt.read', 'View fee receipt', 'academics', 'academics', 'user', 'basic', 343),
+
+    -- Grading
+    ('academics.grading.policy.create', 'Create grading policy', 'academics', 'academics', 'user', 'basic', 344),
+    ('academics.grading.policy.read', 'View grading policies', 'academics', 'academics', 'user', 'basic', 345),
+    ('academics.grading.policy.update', 'Update grading policy', 'academics', 'academics', 'user', 'basic', 346),
+    ('academics.grading.policy.delete', 'Delete grading policy', 'academics', 'academics', 'user', 'basic', 347),
+    ('academics.grading.boundary.create', 'Create grade boundary', 'academics', 'academics', 'user', 'basic', 348),
+    ('academics.grading.boundary.bulk_create', 'Bulk create grade boundaries', 'academics', 'academics', 'user', 'basic', 349),
+    ('academics.grading.boundary.read', 'View grade boundaries', 'academics', 'academics', 'user', 'basic', 350),
+    ('academics.grading.boundary.update', 'Update grade boundary', 'academics', 'academics', 'user', 'basic', 351),
+    ('academics.grading.boundary.delete', 'Delete grade boundary', 'academics', 'academics', 'user', 'basic', 352),
+    ('academics.grading.boundary.delete_all', 'Delete all grade boundaries for policy', 'academics', 'academics', 'user', 'basic', 353),
+
+    -- Guardians
+    ('academics.guardian.create', 'Create guardian', 'academics', 'academics', 'user', 'basic', 354),
+    ('academics.guardian.bulk_create', 'Bulk create guardians', 'academics', 'academics', 'user', 'basic', 355),
+    ('academics.guardian.read', 'View guardians', 'academics', 'academics', 'user', 'basic', 356),
+    ('academics.guardian.update', 'Update guardian', 'academics', 'academics', 'user', 'basic', 357),
+    ('academics.guardian.delete', 'Delete guardian', 'academics', 'academics', 'user', 'basic', 358),
+    ('academics.guardian.set_primary', 'Set primary guardian', 'academics', 'academics', 'user', 'basic', 359),
+
+    -- Library
+    ('academics.library.category.create', 'Create library category', 'academics', 'academics', 'user', 'basic', 360),
+    ('academics.library.category.read', 'View library categories', 'academics', 'academics', 'user', 'basic', 361),
+    ('academics.library.category.update', 'Update library category', 'academics', 'academics', 'user', 'basic', 362),
+    ('academics.library.category.delete', 'Delete library category', 'academics', 'academics', 'user', 'basic', 363),
+    ('academics.library.book.create', 'Create library book', 'academics', 'academics', 'user', 'basic', 364),
+    ('academics.library.book.read', 'View library books', 'academics', 'academics', 'user', 'basic', 365),
+    ('academics.library.book.update', 'Update library book', 'academics', 'academics', 'user', 'basic', 366),
+    ('academics.library.book.delete', 'Delete library book', 'academics', 'academics', 'user', 'basic', 367),
+    ('academics.library.copy.create', 'Create book copy', 'academics', 'academics', 'user', 'basic', 368),
+    ('academics.library.copy.read', 'View book copies', 'academics', 'academics', 'user', 'basic', 369),
+    ('academics.library.copy.update', 'Update book copy', 'academics', 'academics', 'user', 'basic', 370),
+    ('academics.library.copy.delete', 'Delete book copy', 'academics', 'academics', 'user', 'basic', 371),
+    ('academics.library.issue.create', 'Issue book', 'academics', 'academics', 'user', 'basic', 372),
+    ('academics.library.issue.read', 'View book issues', 'academics', 'academics', 'user', 'basic', 373),
+    ('academics.library.return.create', 'Return book', 'academics', 'academics', 'user', 'basic', 374),
+    ('academics.library.fine.create', 'Create fine', 'academics', 'academics', 'user', 'basic', 375),
+    ('academics.library.fine.update', 'Update fine payment', 'academics', 'academics', 'user', 'basic', 376),
+    ('academics.library.fine.read', 'View fines', 'academics', 'academics', 'user', 'basic', 377),
+
+    -- Notifications
+    ('academics.notification.create', 'Create notification', 'academics', 'academics', 'user', 'basic', 378),
+    ('academics.notification.read', 'View notifications', 'academics', 'academics', 'user', 'basic', 379),
+    ('academics.notification.update', 'Update notification', 'academics', 'academics', 'user', 'basic', 380),
+    ('academics.notification.delete', 'Delete notification', 'academics', 'academics', 'user', 'basic', 381),
+
+    -- Rooms
+    ('academics.room.create', 'Create room', 'academics', 'academics', 'user', 'basic', 382),
+    ('academics.room.bulk_create', 'Bulk create rooms', 'academics', 'academics', 'user', 'basic', 383),
+    ('academics.room.read', 'View rooms', 'academics', 'academics', 'user', 'basic', 384),
+    ('academics.room.update', 'Update room', 'academics', 'academics', 'user', 'basic', 385),
+    ('academics.room.delete', 'Delete room', 'academics', 'academics', 'user', 'basic', 386),
+    ('academics.room.activate', 'Activate room', 'academics', 'academics', 'user', 'basic', 387),
+    ('academics.room.deactivate', 'Deactivate room', 'academics', 'academics', 'user', 'basic', 388),
+
+    -- Sections
+    ('academics.section.create', 'Create section', 'academics', 'academics', 'user', 'basic', 389),
+    ('academics.section.bulk_create', 'Bulk create sections', 'academics', 'academics', 'user', 'basic', 390),
+    ('academics.section.upsert', 'Upsert section', 'academics', 'academics', 'user', 'basic', 391),
+    ('academics.section.read', 'View sections', 'academics', 'academics', 'user', 'basic', 392),
+    ('academics.section.update', 'Update section', 'academics', 'academics', 'user', 'basic', 393),
+    ('academics.section.delete', 'Delete section', 'academics', 'academics', 'user', 'basic', 394),
+
+    -- Students
+    ('student.create', 'Create student', 'academics', 'academics', 'user', 'basic', 395),
+    ('student.bulk_create', 'Bulk create students', 'academics', 'academics', 'user', 'basic', 396),
+    ('student.read', 'View student details', 'academics', 'academics', 'user', 'basic', 397),
+    ('student.update', 'Update student', 'academics', 'academics', 'user', 'basic', 398),
+    ('student.delete', 'Delete student', 'academics', 'academics', 'user', 'basic', 399),
+    ('student.activate', 'Activate student', 'academics', 'academics', 'user', 'basic', 400),
+    ('student.deactivate', 'Deactivate student', 'academics', 'academics', 'user', 'basic', 401),
+    ('student.promote', 'Promote student', 'academics', 'academics', 'user', 'basic', 402),
+    ('student.graduate', 'Graduate student', 'academics', 'academics', 'user', 'basic', 403),
+    ('student.dropout', 'Mark student as dropout', 'academics', 'academics', 'user', 'basic', 404),
+    ('student.bulk_promote', 'Bulk promote students', 'academics', 'academics', 'user', 'basic', 405),
+    ('student.bulk_update_status', 'Bulk update student status', 'academics', 'academics', 'user', 'basic', 406),
+    ('student.set_password', 'Set student password', 'academics', 'academics', 'user', 'basic', 407),
+    ('student.reset_password', 'Reset student password', 'academics', 'academics', 'user', 'basic', 408),
+    ('student.change_password', 'Change own password', 'academics', 'academics', 'user', 'basic', 409),
+
+    -- Subjects
+    ('subject.create', 'Create subject', 'academics', 'academics', 'user', 'basic', 410),
+    ('subject.bulk_create', 'Bulk create subjects', 'academics', 'academics', 'user', 'basic', 411),
+    ('subject.read', 'View subjects', 'academics', 'academics', 'user', 'basic', 412),
+    ('subject.update', 'Update subject', 'academics', 'academics', 'user', 'basic', 413),
+    ('subject.delete', 'Delete subject', 'academics', 'academics', 'user', 'basic', 414),
+    ('subject.activate', 'Activate subject', 'academics', 'academics', 'user', 'basic', 415),
+    ('subject.deactivate', 'Deactivate subject', 'academics', 'academics', 'user', 'basic', 416),
+
+    -- Submissions
+    ('submission.create', 'Create submission', 'academics', 'academics', 'user', 'basic', 417),
+    ('submission.read', 'View submissions', 'academics', 'academics', 'user', 'basic', 418),
+    ('submission.update', 'Update submission', 'academics', 'academics', 'user', 'basic', 419),
+    ('submission.delete', 'Delete submission', 'academics', 'academics', 'user', 'basic', 420),
+    ('submission.grade', 'Grade submission', 'academics', 'academics', 'user', 'basic', 421),
+    ('submission.comment', 'Comment on submission', 'academics', 'academics', 'user', 'basic', 422),
+
+    -- Teachers
+    ('teacher.create', 'Create teacher', 'academics', 'academics', 'user', 'basic', 423),
+    ('teacher.bulk_create', 'Bulk create teachers', 'academics', 'academics', 'user', 'basic', 424),
+    ('teacher.read', 'View teacher details', 'academics', 'academics', 'user', 'basic', 425),
+    ('teacher.update', 'Update teacher', 'academics', 'academics', 'user', 'basic', 426),
+    ('teacher.update_status', 'Update teacher status', 'academics', 'academics', 'user', 'basic', 427),
+    ('teacher.delete', 'Delete teacher', 'academics', 'academics', 'user', 'basic', 428),
+    ('teacher.bulk_update_status', 'Bulk update teacher status', 'academics', 'academics', 'user', 'basic', 429),
+    ('teacher.manage_subjects', 'Manage teacher subjects', 'academics', 'academics', 'user', 'basic', 430),
+    ('teacher.manage_sections', 'Manage teacher sections', 'academics', 'academics', 'user', 'basic', 431),
+    ('teacher.manage_preferences', 'Manage teacher schedule preferences', 'academics', 'academics', 'user', 'basic', 432),
+
+    -- Terms
+    ('term.create', 'Create term', 'academics', 'academics', 'user', 'basic', 433),
+    ('term.bulk_create', 'Bulk create terms', 'academics', 'academics', 'user', 'basic', 434),
+    ('term.read', 'View terms', 'academics', 'academics', 'user', 'basic', 435),
+    ('term.update', 'Update term', 'academics', 'academics', 'user', 'basic', 436),
+    ('term.delete', 'Delete term', 'academics', 'academics', 'user', 'basic', 437),
+    ('term.set_current', 'Set current term', 'academics', 'academics', 'user', 'basic', 438),
+
+    -- Timetable
+    ('timetable.create', 'Create timetable', 'academics', 'academics', 'user', 'basic', 439),
+    ('timetable.read', 'View timetables', 'academics', 'academics', 'user', 'basic', 440),
+    ('timetable.update', 'Update timetable', 'academics', 'academics', 'user', 'basic', 441),
+    ('timetable.delete', 'Delete timetable', 'academics', 'academics', 'user', 'basic', 442),
+    ('timetable.manage_slots', 'Manage timetable slots', 'academics', 'academics', 'user', 'basic', 443),
+    ('timetable.manage_entries', 'Manage timetable entries', 'academics', 'academics', 'user', 'basic', 444),
+    ('timetable.manage_changes', 'Manage timetable changes', 'academics', 'academics', 'user', 'basic', 445),
+
+    -- Transport
+    ('transport.route.create', 'Create transport route', 'academics', 'academics', 'user', 'basic', 446),
+    ('transport.route.read', 'View transport routes', 'academics', 'academics', 'user', 'basic', 447),
+    ('transport.route.update', 'Update transport route', 'academics', 'academics', 'user', 'basic', 448),
+    ('transport.route.delete', 'Delete transport route', 'academics', 'academics', 'user', 'basic', 449),
+    ('transport.stop.create', 'Create transport stop', 'academics', 'academics', 'user', 'basic', 450),
+    ('transport.stop.read', 'View transport stops', 'academics', 'academics', 'user', 'basic', 451),
+    ('transport.stop.update', 'Update transport stop', 'academics', 'academics', 'user', 'basic', 452),
+    ('transport.stop.delete', 'Delete transport stop', 'academics', 'academics', 'user', 'basic', 453),
+    ('transport.vehicle.create', 'Create transport vehicle', 'academics', 'academics', 'user', 'basic', 454),
+    ('transport.vehicle.read', 'View transport vehicles', 'academics', 'academics', 'user', 'basic', 455),
+    ('transport.vehicle.update', 'Update transport vehicle', 'academics', 'academics', 'user', 'basic', 456),
+    ('transport.vehicle.delete', 'Delete transport vehicle', 'academics', 'academics', 'user', 'basic', 457),
+    ('transport.driver.create', 'Create driver assignment', 'academics', 'academics', 'user', 'basic', 458),
+    ('transport.driver.read', 'View driver assignments', 'academics', 'academics', 'user', 'basic', 459),
+    ('transport.driver.update', 'Update driver assignment', 'academics', 'academics', 'user', 'basic', 460),
+    ('transport.driver.delete', 'Delete driver assignment', 'academics', 'academics', 'user', 'basic', 461),
+    ('transport.student_assignment.create', 'Create student transport assignment', 'academics', 'academics', 'user', 'basic', 462),
+    ('transport.student_assignment.read', 'View student transport assignments', 'academics', 'academics', 'user', 'basic', 463),
+    ('transport.student_assignment.update', 'Update student transport assignment', 'academics', 'academics', 'user', 'basic', 464),
+    ('transport.student_assignment.delete', 'Delete student transport assignment', 'academics', 'academics', 'user', 'basic', 465),
+
+    -- Analytics
+    ('academics.analytics.read', 'View academic analytics', 'academics', 'academics', 'user', 'basic', 466),
+    ('academics.analytics.write', 'Refresh analytics metrics', 'academics', 'academics', 'user', 'basic', 467)
+
+ON CONFLICT (permission_name) DO NOTHING;
 -- Outbox debounce
 INSERT INTO audit.outbox_debounce (last_processed_id, last_processed_at, batch_size)
 VALUES (NULL, NOW() - INTERVAL '1 hour', 0);

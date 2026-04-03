@@ -230,7 +230,8 @@ type Factory struct {
 	payslipHandler                    *payrollhandler.PayslipHandler
 	reportingHandler                  *payrollhandler.ReportingHandler
 	taxDeclarationHandler             *payrollhandler.TaxDeclarationHandler
-
+	academicsInfra                    *AcademicsInfraFactory // <-- new
+	
 	// Email sender for notifications
 	emailSender email.Sender
 }
@@ -313,6 +314,25 @@ func NewFactory() (*Factory, error) {
 
 	f.initializeManagers()
 
+	// ============================================================
+	// NEW: Initialize Academics + Infrastructure Factory
+	// ============================================================
+	academicsInfra, err := NewAcademicsInfraFactory(
+		f.postgresClient,
+		f.redisClient,
+		f.kafkaProducer,
+		f.encryptionManager,
+		&kafkaEventPublisher{producer: f.kafkaProducer}, // EventPublisher
+		f.GetAuditService(),                             // *audit.AuditService
+		f.emailSender,                                   // email.Sender
+		f.GetSessionService(),                           // *mainservice.SessionService
+		f.logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize academics/infra factory: %w", err)
+	}
+	f.academicsInfra = academicsInfra
+
 	// Initialize email sender
 	f.emailSender = email.NewSMTPSender(email.SMTPConfig{
 		Host:     f.config.Email.SMTPHost,
@@ -340,6 +360,7 @@ func NewFactory() (*Factory, error) {
 		return nil, err
 	}
 
+	// OLD AUDIT OUTBOX – kept unchanged
 	if outbox := f.GetAuditOutboxService(); outbox != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		f.auditOutboxCancel = cancel
@@ -2644,7 +2665,32 @@ func (f *Factory) InitializeHandlers() error {
 	payslipHandler := f.GetPayslipHandler()
 	reportingHandler := f.GetReportingHandler()
 	taxDeclarationHandler := f.GetTaxDeclarationHandler()
-
+	// Build academic handlers struct
+	academicHandlers := &handler.AcademicHandlers{
+		AcademicYearHandler: f.academicsInfra.AcademicYearHandler(),
+		AdmissionHandler:    f.academicsInfra.AdmissionHandler(),
+		AnalyticsHandler:    f.academicsInfra.AnalyticsHandler(),
+		AssignmentHandler:   f.academicsInfra.AssignmentHandler(),
+		AttendanceHandler:   f.academicsInfra.AttendanceHandler(),
+		CourseHandler:       f.academicsInfra.CourseHandler(),
+		CurriculumHandler:   f.academicsInfra.CurriculumHandler(),
+		EnrollmentHandler:   f.academicsInfra.EnrollmentHandler(),
+		ExamHandler:         f.academicsInfra.ExamHandler(),
+		FeeHandler:          f.academicsInfra.FeeHandler(),
+		GradingHandler:      f.academicsInfra.GradingHandler(),
+		GuardianHandler:     f.academicsInfra.GuardianHandler(),
+		LibraryHandler:      f.academicsInfra.LibraryHandler(),
+		NotificationHandler: f.academicsInfra.NotificationHandler(),
+		RoomHandler:         f.academicsInfra.RoomHandler(),
+		SectionHandler:      f.academicsInfra.SectionHandler(),
+		StudentHandler:      f.academicsInfra.StudentHandler(),
+		SubjectHandler:      f.academicsInfra.SubjectHandler(),
+		SubmissionHandler:   f.academicsInfra.SubmissionHandler(),
+		TeacherHandler:      f.academicsInfra.TeacherHandler(),
+		TermHandler:         f.academicsInfra.TermHandler(),
+		TimetableHandler:    f.academicsInfra.TimetableHandler(),
+		TransportHandler:    f.academicsInfra.TransportHandler(),
+	}
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
@@ -2697,6 +2743,7 @@ func (f *Factory) InitializeHandlers() error {
 		payslipHandler,
 		reportingHandler,
 		taxDeclarationHandler,
+		academicHandlers,   // <-- added
 	)
 
 	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, and biometric systems")

@@ -1441,20 +1441,17 @@ ON academics.academic_year(company_id)
 WHERE is_current = true AND deleted_at IS NULL;
 
 -- 1. Unique active enrollment per student & academic year
-CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_active_enrollment
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_enrollment
 ON academics.enrollments (student_id, academic_year_id)
-WHERE status = 'active' AND deleted_at IS NULL;
+WHERE status = 'active';
 
--- 2. Performance indexes
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_enrollment_student_active
+CREATE INDEX IF NOT EXISTS idx_enrollment_student_active
 ON academics.enrollments(student_id)
-WHERE status = 'active' AND deleted_at IS NULL;
+WHERE status = 'active';
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_enrollment_section_active
+CREATE INDEX IF NOT EXISTS idx_enrollment_section_active
 ON academics.enrollments(section_id)
-WHERE status = 'active' AND deleted_at IS NULL;
-
-
+WHERE status = 'active';
 
 
 

@@ -1,4 +1,3 @@
-// internal/middleware/session_validation.go
 package middleware
 
 import (
@@ -43,8 +42,9 @@ func SessionValidationMiddleware(sessionService *service.SessionService, logger 
 			}
 
 			sessionType, ok := ctx.Value("session_type").(string)
-			if !ok || (sessionType != "user" && sessionType != "admin") {
-				logger.Warn("SessionValidationMiddleware: Invalid session type in context", 
+			// ✅ Allow student sessions alongside user and admin
+			if !ok || (sessionType != "user" && sessionType != "admin" && sessionType != "student") {
+				logger.Warn("SessionValidationMiddleware: Invalid session type in context",
 					zap.String("session_type", sessionType))
 				util.JSONError(w, http.StatusUnauthorized, "Invalid session type")
 				return
@@ -107,9 +107,9 @@ func SessionValidationMiddleware(sessionService *service.SessionService, logger 
 				return
 			}
 
-			// 3️⃣ Compare JWT.company_id vs Redis.company_id (only for users)
-			if sessionType == "user" && jwtCompanyID != redisCompanyID {
-				logger.Warn("SessionValidationMiddleware: JWT company ID does not match Redis company ID for user session",
+			// 3️⃣ Compare JWT.company_id vs Redis.company_id (only for users and students)
+			if (sessionType == "user" || sessionType == "student") && jwtCompanyID != redisCompanyID {
+				logger.Warn("SessionValidationMiddleware: JWT company ID does not match Redis company ID for user/student session",
 					zap.String("jwt_company_id", jwtCompanyID),
 					zap.String("redis_company_id", redisCompanyID),
 					zap.String("jti", jwtJTI))
@@ -117,9 +117,9 @@ func SessionValidationMiddleware(sessionService *service.SessionService, logger 
 				return
 			}
 
-			// 4️⃣ Compare Client.company_id vs JWT.company_id (only for users)
-			if sessionType == "user" && clientCompanyID != jwtCompanyID {
-				logger.Warn("SessionValidationMiddleware: Client company ID does not match JWT company ID for user session",
+			// 4️⃣ Compare Client.company_id vs JWT.company_id (only for users and students)
+			if (sessionType == "user" || sessionType == "student") && clientCompanyID != jwtCompanyID {
+				logger.Warn("SessionValidationMiddleware: Client company ID does not match JWT company ID for user/student session",
 					zap.String("client_company_id", clientCompanyID),
 					zap.String("jwt_company_id", jwtCompanyID),
 					zap.String("jti", jwtJTI))
@@ -165,8 +165,8 @@ func SessionValidationMiddleware(sessionService *service.SessionService, logger 
 			// Add validated session info to context
 			ctx = context.WithValue(ctx, "validated_session", true)
 			ctx = context.WithValue(ctx, "validated_device_id", clientDeviceID)
-			
-			if sessionType == "user" && clientCompanyID != "" {
+
+			if (sessionType == "user" || sessionType == "student") && clientCompanyID != "" {
 				ctx = context.WithValue(ctx, "validated_company_id", clientCompanyID)
 			}
 
