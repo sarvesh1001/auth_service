@@ -26,7 +26,6 @@ func NewAttendanceHandler(attendanceService service.AttendanceService, logger *z
 	}
 }
 
-// MarkAttendance handles POST /api/v1/companies/{companyID}/attendance
 func (h *AttendanceHandler) MarkAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -53,7 +52,6 @@ func (h *AttendanceHandler) MarkAttendance(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Set creator/updater if not provided
 	if req.CreatedBy == nil {
 		req.CreatedBy = &userID
 	}
@@ -61,7 +59,8 @@ func (h *AttendanceHandler) MarkAttendance(w http.ResponseWriter, r *http.Reques
 		req.MarkedBy = &userID
 	}
 
-	idempotencyKey := r.URL.Query().Get("idempotency_key")
+	// Read idempotency key from header (standard practice)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
 
 	attendance, err := h.attendanceService.MarkAttendance(ctx, req, idempotencyKey)
 	if err != nil {
@@ -81,7 +80,6 @@ func (h *AttendanceHandler) MarkAttendance(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// BulkMarkAttendance handles POST /api/v1/companies/{companyID}/attendance/bulk
 func (h *AttendanceHandler) BulkMarkAttendance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -108,7 +106,6 @@ func (h *AttendanceHandler) BulkMarkAttendance(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Set creator for each if not set
 	if req.CreatedBy == nil {
 		req.CreatedBy = &userID
 	}
@@ -137,7 +134,6 @@ func (h *AttendanceHandler) BulkMarkAttendance(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// GetByID handles GET /api/v1/companies/{companyID}/attendance/{attendanceID}
 func (h *AttendanceHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -174,7 +170,6 @@ func (h *AttendanceHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// List handles GET /api/v1/companies/{companyID}/attendance
 func (h *AttendanceHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -189,7 +184,6 @@ func (h *AttendanceHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build filter from query params
 	filter := service.ListAttendanceRequest{}
 
 	if enrollmentIDStr := r.URL.Query().Get("enrollment_id"); enrollmentIDStr != "" {
@@ -242,7 +236,6 @@ func (h *AttendanceHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Pagination
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 || limit > 1000 {
 		limit = 50
@@ -255,7 +248,6 @@ func (h *AttendanceHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	filter.Offset = offset
 
-	// Sorting
 	filter.SortField = r.URL.Query().Get("sort_field")
 	if filter.SortField == "" {
 		filter.SortField = "attendance_date"
@@ -285,7 +277,6 @@ func (h *AttendanceHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Delete handles DELETE /api/v1/companies/{companyID}/attendance/{attendanceID}
 func (h *AttendanceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -307,7 +298,7 @@ func (h *AttendanceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.attendanceService.DeleteAttendance(ctx, attendanceID, nil) // pass nil or userID?
+	err = h.attendanceService.DeleteAttendance(ctx, attendanceID, nil)
 	if err != nil {
 		h.logger.Error("Failed to delete attendance",
 			zap.String("attendance_id", attendanceID.String()),
@@ -322,7 +313,6 @@ func (h *AttendanceHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetSummary handles GET /api/v1/companies/{companyID}/students/{studentID}/academic-years/{academicYearID}/attendance-summary
 func (h *AttendanceHandler) GetSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -375,7 +365,8 @@ func (h *AttendanceHandler) GetSummary(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// RecalculateSummary handles POST /api/v1/companies/{companyID}/attendance/summary/recalculate
+// RecalculateSummary recalculates attendance summary for a specific student and academic year.
+// studentID and academicYearID are taken from URL parameters, term_id is optional from JSON body.
 func (h *AttendanceHandler) RecalculateSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -385,31 +376,44 @@ func (h *AttendanceHandler) RecalculateSummary(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Extract student ID from URL
+	studentIDStr := chi.URLParam(r, "studentID")
+	studentID, err := uuid.Parse(studentIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid student ID")
+		return
+	}
+
+	// Extract academic year ID from URL
+	academicYearIDStr := chi.URLParam(r, "academicYearID")
+	academicYearID, err := uuid.Parse(academicYearIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid academic year ID")
+		return
+	}
+
 	if !h.hasPermission(ctx, companyID, "attendance:recalculate") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
+	// Read optional term_id from request body
 	var req struct {
-		StudentID      uuid.UUID  `json:"student_id"`
-		AcademicYearID uuid.UUID  `json:"academic_year_id"`
-		TermID         *uuid.UUID `json:"term_id,omitempty"`
+		TermID *uuid.UUID `json:"term_id,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if req.StudentID == uuid.Nil || req.AcademicYearID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "student_id and academic_year_id are required")
-		return
+	// Only decode if there is a body
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
 	}
 
-	err = h.attendanceService.RecalculateSummary(ctx, req.StudentID, req.AcademicYearID, req.TermID)
+	err = h.attendanceService.RecalculateSummary(ctx, studentID, academicYearID, req.TermID)
 	if err != nil {
 		h.logger.Error("Failed to recalculate summary",
-			zap.String("student_id", req.StudentID.String()),
-			zap.String("academic_year_id", req.AcademicYearID.String()),
+			zap.String("student_id", studentID.String()),
+			zap.String("academic_year_id", academicYearID.String()),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -420,8 +424,6 @@ func (h *AttendanceHandler) RecalculateSummary(w http.ResponseWriter, r *http.Re
 		"message": "Attendance summary recalculated successfully",
 	})
 }
-
-// BulkRecalcSummaries handles POST /api/v1/companies/{companyID}/attendance/summary/bulk-recalculate
 func (h *AttendanceHandler) BulkRecalcSummaries(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -467,7 +469,6 @@ func (h *AttendanceHandler) BulkRecalcSummaries(w http.ResponseWriter, r *http.R
 	})
 }
 
-// CreateExemption handles POST /api/v1/companies/{companyID}/attendance/exemptions
 func (h *AttendanceHandler) CreateExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -498,7 +499,8 @@ func (h *AttendanceHandler) CreateExemption(w http.ResponseWriter, r *http.Reque
 		req.CreatedBy = &userID
 	}
 
-	idempotencyKey := r.URL.Query().Get("idempotency_key")
+	// Read idempotency key from header for exemptions as well
+	idempotencyKey := r.Header.Get("Idempotency-Key")
 
 	exemption, err := h.attendanceService.CreateExemption(ctx, req, idempotencyKey)
 	if err != nil {
@@ -518,7 +520,6 @@ func (h *AttendanceHandler) CreateExemption(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// UpdateExemption handles PUT /api/v1/companies/{companyID}/attendance/exemptions/{exemptionID}
 func (h *AttendanceHandler) UpdateExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -551,7 +552,6 @@ func (h *AttendanceHandler) UpdateExemption(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	req.ExemptionID = exemptionID
 	req.UpdatedBy = &userID
 
@@ -571,7 +571,6 @@ func (h *AttendanceHandler) UpdateExemption(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// DeleteExemption handles DELETE /api/v1/companies/{companyID}/attendance/exemptions/{exemptionID}
 func (h *AttendanceHandler) DeleteExemption(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -608,7 +607,6 @@ func (h *AttendanceHandler) DeleteExemption(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// ListExemptions handles GET /api/v1/companies/{companyID}/attendance/exemptions
 func (h *AttendanceHandler) ListExemptions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -672,16 +670,18 @@ func (h *AttendanceHandler) ListExemptions(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// Helper methods
+// hasPermission is a placeholder – integrate with your actual permission system.
 func (h *AttendanceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
-	// Placeholder – implement actual permission check
+	// TODO: Replace with real permission check (e.g., using context values or RBAC).
 	return true
 }
 
 func (h *AttendanceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("Failed to encode JSON response", zap.Error(err))
+	}
 }
 
 func (h *AttendanceHandler) respondWithError(w http.ResponseWriter, status int, message string) {

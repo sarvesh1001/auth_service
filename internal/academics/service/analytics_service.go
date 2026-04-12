@@ -1371,8 +1371,10 @@ func (s *analyticsService) ProcessGradingPolicyCreated(ctx context.Context, payl
 		return fmt.Errorf("unmarshal grading policy: %w", err)
 	}
 	academicYearID, err := s.getAcademicYearForGradingPolicy(ctx, policy.PolicyID)
-	if err != nil {
-		// If cannot find, skip (policy not yet used)
+	if err != nil || academicYearID == uuid.Nil {
+		// No academic year associated – nothing to update
+		s.logger.Debug("skipping grading policy metrics: no academic year found",
+			zap.String("policy_id", policy.PolicyID.String()))
 		return nil
 	}
 	update := &models.GradingMetricsUpdate{
@@ -1390,8 +1392,8 @@ func (s *analyticsService) ProcessGradingPolicyDeleted(ctx context.Context, payl
 		return fmt.Errorf("unmarshal policy delete: %w", err)
 	}
 	academicYearID, err := s.getAcademicYearForGradingPolicy(ctx, data.PolicyID)
-	if err != nil {
-		return nil
+	if err != nil || academicYearID == uuid.Nil {
+		return nil // skip
 	}
 	update := &models.GradingMetricsUpdate{
 		AcademicYearID: academicYearID,
@@ -1399,7 +1401,6 @@ func (s *analyticsService) ProcessGradingPolicyDeleted(ctx context.Context, payl
 	}
 	return s.applyGradingUpdate(ctx, update, "grading_policy.deleted", data.PolicyID)
 }
-
 func (s *analyticsService) ProcessGradeBoundaryCreated(ctx context.Context, payload []byte) error {
 	var boundary models.GradeBoundary
 	if err := json.Unmarshal(payload, &boundary); err != nil {
@@ -1769,7 +1770,7 @@ func (s *analyticsService) getAcademicYearIDFromEnrollment(ctx context.Context, 
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
 		SELECT academic_year_id FROM academics.enrollments
-		WHERE enrollment_id = $1 AND deleted_at IS NULL
+		WHERE enrollment_id = $1
 	`, enrollmentID).Scan(&academicYearID)
 	return academicYearID, err
 }
@@ -1845,27 +1846,30 @@ func (s *analyticsService) getFeeStructureByID(ctx context.Context, id uuid.UUID
 }
 
 func (s *analyticsService) getAcademicYearForGradingPolicy(ctx context.Context, policyID uuid.UUID) (uuid.UUID, error) {
-	// Grading policies are company‑wide, but we associate them with academic years via sections that use them.
-	// For metrics, we'll look for any section using this policy and return its academic year.
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
-		SELECT t.academic_year_id
-		FROM academics.grading_policies p
-		LEFT JOIN academics.course c ON c.company_id = p.company_id
-		LEFT JOIN academics.section s ON s.course_id = c.course_id
-		LEFT JOIN academics.term t ON t.term_id = s.term_id
-		WHERE p.policy_id = $1
-		LIMIT 1
-	`, policyID).Scan(&academicYearID)
-	return academicYearID, err
+        SELECT t.academic_year_id
+        FROM academics.grading_policies p
+        LEFT JOIN academics.course c ON c.company_id = p.company_id
+        LEFT JOIN academics.section s ON s.course_id = c.course_id
+        LEFT JOIN academics.term t ON t.term_id = s.term_id
+        WHERE p.policy_id = $1
+        LIMIT 1
+    `, policyID).Scan(&academicYearID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return uuid.Nil, nil // not an error, just no association
+		}
+		return uuid.Nil, err
+	}
+	return academicYearID, nil
 }
-
 func (s *analyticsService) getAcademicYearForGuardian(ctx context.Context, studentID uuid.UUID) (uuid.UUID, error) {
 	// Return the academic year of the student's most recent active enrollment
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
 		SELECT academic_year_id FROM academics.enrollments
-		WHERE student_id = $1 AND status = 'active' AND deleted_at IS NULL
+		WHERE student_id = $1 AND status = 'active'
 		ORDER BY created_at DESC LIMIT 1
 	`, studentID).Scan(&academicYearID)
 	if err != nil {
@@ -2326,13 +2330,13 @@ func (s *analyticsService) ProcessRoomDeleted(ctx context.Context, payload []byt
 // Helper: get academic years where a room is used (via timetable entries)
 func (s *analyticsService) getAcademicYearsForRoom(ctx context.Context, roomID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
-		SELECT DISTINCT t.academic_year_id
-		FROM academics.timetable_entry te
-		JOIN academics.timetable_slot ts ON ts.slot_id = te.slot_id
-		JOIN academics.timetable tt ON tt.timetable_id = ts.timetable_id
-		JOIN academics.term t ON t.term_id = tt.term_id
-		WHERE te.room_id = $1 AND te.deleted_at IS NULL
-	`, roomID)
+        SELECT DISTINCT t.academic_year_id
+        FROM academics.timetable_entries te
+        JOIN academics.timetable_slots ts ON ts.slot_id = te.slot_id
+        JOIN academics.timetables tt ON tt.timetable_id = ts.timetable_id
+        JOIN academics.term t ON t.term_id = tt.term_id
+        WHERE te.room_id = $1
+    `, roomID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for room: %w", err)
 	}
@@ -2347,7 +2351,6 @@ func (s *analyticsService) getAcademicYearsForRoom(ctx context.Context, roomID u
 	}
 	return ids, rows.Err()
 }
-
 func (s *analyticsService) applyRoomUpdate(ctx context.Context, update *models.RoomMetricsUpdate, eventType string, entityID uuid.UUID) error {
 	idempotencyKey := fmt.Sprintf("analytics:room:%s:%s:%s", eventType, update.AcademicYearID.String(), entityID.String())
 	exists, err := s.idempotencyStore.Exists(ctx, nil, idempotencyKey)
@@ -2824,7 +2827,7 @@ func (s *analyticsService) applyStudentUpdate(ctx context.Context, update *model
 func (s *analyticsService) getAcademicYearsForStudent(ctx context.Context, studentID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
 		SELECT DISTINCT academic_year_id FROM academics.enrollments
-		WHERE student_id = $1 AND deleted_at IS NULL
+		WHERE student_id = $1
 	`, studentID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for student: %w", err)
@@ -3076,12 +3079,12 @@ func (s *analyticsService) applySubjectUpdate(ctx context.Context, update *model
 // Helper: get academic years where a subject is used (via subject‑course mappings and sections)
 func (s *analyticsService) getAcademicYearsForSubject(ctx context.Context, subjectID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
-		SELECT DISTINCT t.academic_year_id
-		FROM academics.subject_course_mapping scm
-		JOIN academics.section s ON s.course_id = scm.course_id
-		JOIN academics.term t ON t.term_id = s.term_id
-		WHERE scm.subject_id = $1 AND s.deleted_at IS NULL AND scm.deleted_at IS NULL
-	`, subjectID)
+        SELECT DISTINCT t.academic_year_id
+        FROM academics.subject_course_mapping scm
+        JOIN academics.section s ON s.course_id = scm.course_id
+        JOIN academics.term t ON t.term_id = s.term_id
+        WHERE scm.subject_id = $1 AND s.deleted_at IS NULL
+    `, subjectID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for subject: %w", err)
 	}
@@ -3096,7 +3099,6 @@ func (s *analyticsService) getAcademicYearsForSubject(ctx context.Context, subje
 	}
 	return ids, rows.Err()
 }
-
 func (s *analyticsService) getSubjectByID(ctx context.Context, subjectID uuid.UUID) (*models.Subject, error) {
 	var subject models.Subject
 	query := `SELECT subject_id, is_active, credits FROM academics.subject WHERE subject_id = $1 AND deleted_at IS NULL`
@@ -3298,19 +3300,18 @@ func (s *analyticsService) applySubmissionUpdate(ctx context.Context, update *mo
 func (s *analyticsService) getAcademicYearForSubmission(ctx context.Context, submissionID uuid.UUID) (uuid.UUID, error) {
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
-		SELECT t.academic_year_id
-		FROM academics.assignment_submission sub
-		JOIN academics.assignments a ON a.assignment_id = sub.assignment_id
-		JOIN academics.section s ON s.section_id = a.section_id
-		JOIN academics.term t ON t.term_id = s.term_id
-		WHERE sub.submission_id = $1 AND sub.deleted_at IS NULL
-	`, submissionID).Scan(&academicYearID)
+        SELECT t.academic_year_id
+        FROM academics.assignment_submissions sub   -- ← changed from assignment_submission
+        JOIN academics.assignments a ON a.assignment_id = sub.assignment_id
+        JOIN academics.section s ON s.section_id = a.section_id
+        JOIN academics.term t ON t.term_id = s.term_id
+        WHERE sub.submission_id = $1
+    `, submissionID).Scan(&academicYearID)
 	return academicYearID, err
 }
-
 func (s *analyticsService) getSubmissionByID(ctx context.Context, submissionID uuid.UUID) (*models.AssignmentSubmission, error) {
 	var sub models.AssignmentSubmission
-	query := `SELECT submission_id, status FROM academics.assignment_submission WHERE submission_id = $1 AND deleted_at IS NULL`
+	query := `SELECT submission_id, status FROM academics.assignment_submissions WHERE submission_id = $1` // ← changed
 	err := s.pgClient.DB.QueryRowContext(ctx, query, submissionID).Scan(&sub.SubmissionID, &sub.Status)
 	if err != nil {
 		return nil, err
@@ -3538,18 +3539,19 @@ func (s *analyticsService) applyTeacherUpdate(ctx context.Context, update *model
 // Helper: get academic years where a teacher is assigned (via teacher-section or teacher-subject assignments)
 func (s *analyticsService) getAcademicYearsForTeacher(ctx context.Context, teacherID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
-		SELECT DISTINCT t.academic_year_id
-		FROM academics.teacher_section ts
-		JOIN academics.section s ON s.section_id = ts.section_id
-		JOIN academics.term t ON t.term_id = s.term_id
-		WHERE ts.teacher_id = $1 AND ts.deleted_at IS NULL
-		UNION
-		SELECT DISTINCT t.academic_year_id
-		FROM academics.teacher_subject ts
-		JOIN academics.section s ON s.course_id = ts.course_id
-		JOIN academics.term t ON t.term_id = s.term_id
-		WHERE ts.teacher_id = $1 AND ts.deleted_at IS NULL
-	`, teacherID)
+        SELECT DISTINCT t.academic_year_id
+        FROM academics.teacher_sections ts
+        JOIN academics.section s ON s.section_id = ts.section_id
+        JOIN academics.term t ON t.term_id = s.term_id
+        WHERE ts.teacher_id = $1
+        UNION
+        SELECT DISTINCT t.academic_year_id
+        FROM academics.teacher_subjects tsub
+        JOIN academics.subject_course_mapping scm ON scm.subject_id = tsub.subject_id
+        JOIN academics.section s ON s.course_id = scm.course_id
+        JOIN academics.term t ON t.term_id = s.term_id
+        WHERE tsub.teacher_id = $1
+    `, teacherID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for teacher: %w", err)
 	}
@@ -3564,7 +3566,6 @@ func (s *analyticsService) getAcademicYearsForTeacher(ctx context.Context, teach
 	}
 	return ids, rows.Err()
 }
-
 func (s *analyticsService) getTeacherByID(ctx context.Context, teacherID uuid.UUID) (*models.Teacher, error) {
 	var teacher models.Teacher
 	query := `SELECT teacher_id, status FROM academics.teacher WHERE teacher_id = $1 AND deleted_at IS NULL`
@@ -3840,47 +3841,44 @@ func (s *analyticsService) applyTimetableUpdate(ctx context.Context, update *mod
 
 func (s *analyticsService) getTimetableByID(ctx context.Context, timetableID uuid.UUID) (*models.Timetable, error) {
 	var tt models.Timetable
-	query := `SELECT timetable_id, academic_year_id, is_active FROM academics.timetable WHERE timetable_id = $1 AND deleted_at IS NULL`
+	query := `SELECT timetable_id, academic_year_id, is_active FROM academics.timetables WHERE timetable_id = $1 AND deleted_at IS NULL`
 	err := s.pgClient.DB.QueryRowContext(ctx, query, timetableID).Scan(&tt.TimetableID, &tt.AcademicYearID, &tt.IsActive)
 	if err != nil {
 		return nil, err
 	}
 	return &tt, nil
 }
-
 func (s *analyticsService) getAcademicYearForTimetableSlot(ctx context.Context, slotID uuid.UUID) (uuid.UUID, error) {
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
-		SELECT t.academic_year_id
-		FROM academics.timetable_slot ts
-		JOIN academics.timetable tt ON tt.timetable_id = ts.timetable_id
-		WHERE ts.slot_id = $1 AND ts.deleted_at IS NULL
-	`, slotID).Scan(&academicYearID)
+        SELECT t.academic_year_id
+        FROM academics.timetable_slots ts
+        JOIN academics.timetables tt ON tt.timetable_id = ts.timetable_id
+        WHERE ts.slot_id = $1
+    `, slotID).Scan(&academicYearID)
 	return academicYearID, err
 }
-
 func (s *analyticsService) getAcademicYearForTimetableEntry(ctx context.Context, entryID uuid.UUID) (uuid.UUID, error) {
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
-		SELECT t.academic_year_id
-		FROM academics.timetable_entry te
-		JOIN academics.timetable_slot ts ON ts.slot_id = te.slot_id
-		JOIN academics.timetable tt ON tt.timetable_id = ts.timetable_id
-		WHERE te.entry_id = $1 AND te.deleted_at IS NULL
-	`, entryID).Scan(&academicYearID)
+        SELECT t.academic_year_id
+        FROM academics.timetable_entries te
+        JOIN academics.timetable_slots ts ON ts.slot_id = te.slot_id
+        JOIN academics.timetables tt ON tt.timetable_id = ts.timetable_id
+        WHERE te.entry_id = $1
+    `, entryID).Scan(&academicYearID)
 	return academicYearID, err
 }
-
 func (s *analyticsService) getAcademicYearForTimetableChange(ctx context.Context, changeID uuid.UUID) (uuid.UUID, error) {
 	var academicYearID uuid.UUID
 	err := s.pgClient.DB.QueryRowContext(ctx, `
-		SELECT t.academic_year_id
-		FROM academics.timetable_change tc
-		JOIN academics.timetable_entry te ON te.entry_id = tc.entry_id
-		JOIN academics.timetable_slot ts ON ts.slot_id = te.slot_id
-		JOIN academics.timetable tt ON tt.timetable_id = ts.timetable_id
-		WHERE tc.change_id = $1 AND tc.deleted_at IS NULL
-	`, changeID).Scan(&academicYearID)
+        SELECT t.academic_year_id
+        FROM academics.timetable_changes tc
+        JOIN academics.timetable_entries te ON te.entry_id = tc.entry_id
+        JOIN academics.timetable_slots ts ON ts.slot_id = te.slot_id
+        JOIN academics.timetables tt ON tt.timetable_id = ts.timetable_id
+        WHERE tc.change_id = $1
+    `, changeID).Scan(&academicYearID)
 	return academicYearID, err
 }
 
@@ -4257,13 +4255,12 @@ func (s *analyticsService) applyTransportUpdate(ctx context.Context, update *mod
 }
 
 func (s *analyticsService) getAcademicYearsForTransportRoute(ctx context.Context, routeID uuid.UUID) ([]uuid.UUID, error) {
-	// A route is used in student assignments, which are tied to academic years via effective_from date.
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
-		SELECT DISTINCT ay.academic_year_id
-		FROM academics.student_transport_assignments sta
-		JOIN academics.academic_year ay ON sta.effective_from BETWEEN ay.start_date AND ay.end_date
-		WHERE sta.route_id = $1 AND sta.deleted_at IS NULL
-	`, routeID)
+        SELECT DISTINCT ay.academic_year_id
+        FROM academics.student_transport_assignments sta
+        JOIN academics.academic_year ay ON sta.effective_from BETWEEN ay.start_date AND ay.end_date
+        WHERE sta.route_id = $1
+    `, routeID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for route: %w", err)
 	}
@@ -4278,14 +4275,13 @@ func (s *analyticsService) getAcademicYearsForTransportRoute(ctx context.Context
 	}
 	return ids, rows.Err()
 }
-
 func (s *analyticsService) getAcademicYearsForTransportStop(ctx context.Context, stopID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
-		SELECT DISTINCT ay.academic_year_id
-		FROM academics.student_transport_assignments sta
-		JOIN academics.academic_year ay ON sta.effective_from BETWEEN ay.start_date AND ay.end_date
-		WHERE sta.stop_id = $1 AND sta.deleted_at IS NULL
-	`, stopID)
+        SELECT DISTINCT ay.academic_year_id
+        FROM academics.student_transport_assignments sta
+        JOIN academics.academic_year ay ON sta.effective_from BETWEEN ay.start_date AND ay.end_date
+        WHERE sta.stop_id = $1
+    `, stopID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for stop: %w", err)
 	}
@@ -4303,11 +4299,11 @@ func (s *analyticsService) getAcademicYearsForTransportStop(ctx context.Context,
 
 func (s *analyticsService) getAcademicYearsForTransportVehicle(ctx context.Context, vehicleID uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := s.pgClient.DB.QueryContext(ctx, `
-		SELECT DISTINCT ay.academic_year_id
-		FROM academics.transport_driver_assignments da
-		JOIN academics.academic_year ay ON da.assignment_date BETWEEN ay.start_date AND ay.end_date
-		WHERE da.vehicle_id = $1 AND da.deleted_at IS NULL
-	`, vehicleID)
+        SELECT DISTINCT ay.academic_year_id
+        FROM academics.transport_driver_assignments da
+        JOIN academics.academic_year ay ON da.assignment_date BETWEEN ay.start_date AND ay.end_date
+        WHERE da.vehicle_id = $1
+    `, vehicleID)
 	if err != nil {
 		return nil, fmt.Errorf("query academic years for vehicle: %w", err)
 	}

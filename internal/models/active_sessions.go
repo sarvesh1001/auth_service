@@ -3,28 +3,32 @@ package models
 import (
 	"net"
 	"time"
-	
+
 	"auth-service/internal/rbac" // Import rbac package
 )
 
+// PermissionMaskSegments defines the number of uint64 segments needed for permission mask
+// 13 segments × 64 bits = 832 bits (enough for 800 permissions)
+const PermissionMaskSegments = 13
+
 type ActiveSession struct {
-	UserID             string    `db:"user_id" json:"user_id"`
-	SessionToken       string    `db:"session_token" json:"session_token"`
-	DeviceID           string    `db:"device_id" json:"device_id"`
-	DeviceFingerprint  string    `db:"device_fingerprint" json:"device_fingerprint"`
-	KYCVerified        bool      `db:"kyc_verified" json:"kyc_verified"`
-	CreatedAt          time.Time `db:"created_at" json:"created_at"`
-	LastActivity       time.Time `db:"last_activity" json:"last_activity"`
-	ExpiresAt          time.Time `db:"expires_at" json:"expires_at"`
-	IPAddress          net.IP    `db:"ip_address" json:"ip_address"`
-	EncryptionKey      []byte    `db:"encryption_key" json:"encryption_key"`
-	
+	UserID            string    `db:"user_id" json:"user_id"`
+	SessionToken      string    `db:"session_token" json:"session_token"`
+	DeviceID          string    `db:"device_id" json:"device_id"`
+	DeviceFingerprint string    `db:"device_fingerprint" json:"device_fingerprint"`
+	KYCVerified       bool      `db:"kyc_verified" json:"kyc_verified"`
+	CreatedAt         time.Time `db:"created_at" json:"created_at"`
+	LastActivity      time.Time `db:"last_activity" json:"last_activity"`
+	ExpiresAt         time.Time `db:"expires_at" json:"expires_at"`
+	IPAddress         net.IP    `db:"ip_address" json:"ip_address"`
+	EncryptionKey     []byte    `db:"encryption_key" json:"encryption_key"`
+
 	// Session type
-	SessionType        string    `db:"session_type" json:"session_type"` // "user" or "admin"
-	
-	// Role and permissions - UPDATED
-	Role               string    `db:"role" json:"role,omitempty"` // Role string (e.g., "super_admin", "admin_manager", "owner", "employee")
-	PermissionMask     []uint64  `db:"permission_mask" json:"permission_mask,omitempty"`
+	SessionType string `db:"session_type" json:"session_type"` // "user", "admin", "student", or "web"
+
+	// Role and permissions
+	Role           string   `db:"role" json:"role,omitempty"` // e.g., "super_admin", "admin_manager", "owner", "employee"
+	PermissionMask []uint64 `db:"permission_mask" json:"permission_mask,omitempty"`
 }
 
 // IsAdminSession checks if this is an admin session
@@ -34,7 +38,17 @@ func (s *ActiveSession) IsAdminSession() bool {
 
 // IsUserSession checks if this is a user session
 func (s *ActiveSession) IsUserSession() bool {
-	return s.SessionType == SessionTypeUser || s.SessionType == ""
+	return s.SessionType == SessionTypeUser
+}
+
+// IsStudentSession checks if this is a student session
+func (s *ActiveSession) IsStudentSession() bool {
+	return s.SessionType == SessionTypeStudent
+}
+
+// IsWebSession checks if this is a web session
+func (s *ActiveSession) IsWebSession() bool {
+	return s.SessionType == SessionTypeWeb
 }
 
 // SetAdminSession marks this session as admin session
@@ -47,12 +61,22 @@ func (s *ActiveSession) SetUserSession() {
 	s.SessionType = SessionTypeUser
 }
 
+// SetStudentSession marks this session as student session
+func (s *ActiveSession) SetStudentSession() {
+	s.SessionType = SessionTypeStudent
+}
+
+// SetWebSession marks this session as web session
+func (s *ActiveSession) SetWebSession() {
+	s.SessionType = SessionTypeWeb
+}
+
 // HasPermission checks if session has a specific permission
 func (s *ActiveSession) HasPermission(permissionName string) bool {
 	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
 		return false
 	}
-	
+
 	// Use rbac package for permission checking
 	return rbac.HasPermission(s.PermissionMask, permissionName)
 }
@@ -62,7 +86,7 @@ func (s *ActiveSession) GetPermissions() []string {
 	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
 		return []string{}
 	}
-	
+
 	// Use rbac package to get permissions from mask
 	return rbac.GetPermissionsFromMask(s.PermissionMask)
 }
@@ -72,7 +96,7 @@ func (s *ActiveSession) HasAnyPermission(permissions ...string) bool {
 	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
 		return false
 	}
-	
+
 	return rbac.HasAnyPermission(s.PermissionMask, permissions...)
 }
 
@@ -81,7 +105,7 @@ func (s *ActiveSession) HasAllPermissions(permissions ...string) bool {
 	if s.PermissionMask == nil || len(s.PermissionMask) == 0 {
 		return false
 	}
-	
+
 	return rbac.HasAllPermissions(s.PermissionMask, permissions...)
 }
 
@@ -162,9 +186,9 @@ func (s *ActiveSession) getRoleLevelFromString(role string) int {
 	}
 }
 
-// CreateFullPermissionMask creates a mask with all bits set
+// CreateFullPermissionMask creates a mask with all bits set (using global segment count)
 func (s *ActiveSession) CreateFullPermissionMask() []uint64 {
-	mask := make([]uint64, 4)
+	mask := make([]uint64, PermissionMaskSegments)
 	for i := range mask {
 		mask[i] = ^uint64(0) // Set all bits to 1
 	}
@@ -181,20 +205,23 @@ func (s *ActiveSession) BuildPermissionMaskFromBitPositions(bitPositions []uint6
 	return rbac.BuildMaskFromBitPositions(bitPositions)
 }
 
-// Add these constants to your main models.go file
+// ============================================================================
+// Constants
+// ============================================================================
+
+// Session type constants
 const (
-	
-	// Session type constants
-	SessionTypeUser  = "user"
-	SessionTypeAdmin = "admin"
-	SessionTypeWeb   = "web" // For web sessions
+	SessionTypeUser    = "user"
+	SessionTypeAdmin   = "admin"
+	SessionTypeStudent = "student"
+	SessionTypeWeb     = "web"
 )
 
-// Global helper function (add this to models.go if not present)
+// Global helper function to create a full permission mask (using 13 segments)
 func CreateFullPermissionMask() []uint64 {
-	mask := make([]uint64, 4)
+	mask := make([]uint64, PermissionMaskSegments)
 	for i := range mask {
-		mask[i] = ^uint64(0) // Set all bits to 1
+		mask[i] = ^uint64(0)
 	}
 	return mask
 }

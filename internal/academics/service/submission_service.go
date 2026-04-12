@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,9 +13,19 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// SubmissionService defines all operations on student submissions.
+// ---------------------------------------------------------------------
+// Event types (matching outbox pattern)
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Service interface (updated – removed created_by/updated_by from requests)
+// ---------------------------------------------------------------------
+
 type SubmissionService interface {
 	CreateSubmission(ctx context.Context, req CreateSubmissionRequest, idempotencyKey string) (*models.AssignmentSubmission, error)
 	GetSubmissionByID(ctx context.Context, id uuid.UUID) (*models.AssignmentSubmission, error)
@@ -27,17 +39,53 @@ type SubmissionService interface {
 	GetCommentsBySubmission(ctx context.Context, submissionID uuid.UUID) ([]*models.AssignmentComment, error)
 }
 
+// ---------------------------------------------------------------------
+// Request structs (no created_by/updated_by)
+// ---------------------------------------------------------------------
+
+type CreateSubmissionRequest struct {
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	StudentID    uuid.UUID `json:"student_id"`
+	FileURL      string    `json:"file_url,omitempty"`
+	Remarks      string    `json:"remarks,omitempty"`
+}
+
+type UpdateSubmissionRequest struct {
+	SubmissionID uuid.UUID `json:"submission_id"`
+	FileURL      string    `json:"file_url,omitempty"`
+	Remarks      string    `json:"remarks,omitempty"`
+}
+
+type GradeSubmissionRequest struct {
+	SubmissionID uuid.UUID `json:"submission_id"`
+	Marks        float64   `json:"marks"`
+	Feedback     string    `json:"feedback,omitempty"`
+	GradedBy     uuid.UUID `json:"graded_by"`
+	Remarks      string    `json:"remarks,omitempty"`
+}
+
+type AddCommentRequest struct {
+	SubmissionID uuid.UUID `json:"submission_id"`
+	Comment      string    `json:"comment"`
+	CommentBy    uuid.UUID `json:"comment_by"`
+}
+
+// ---------------------------------------------------------------------
+// Service implementation
+// ---------------------------------------------------------------------
+
 type submissionService struct {
-	repo             repository.SubmissionRepository
-	assignmentRepo   repository.AssignmentRepository
-	studentSvc       StudentService
-	teacherSvc       TeacherService
-	notificationSvc  NotificationService
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	pgClient         *client.PostgresClient
-	logger           *zap.Logger
+	repo            repository.SubmissionRepository
+	assignmentRepo  repository.AssignmentRepository
+	studentSvc      StudentService
+	teacherSvc      TeacherService
+	notificationSvc NotificationService
+	pgClient        *client.PostgresClient
+	logger          *zap.Logger
+
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
 
 func NewSubmissionService(
@@ -46,11 +94,11 @@ func NewSubmissionService(
 	studentSvc StudentService,
 	teacherSvc TeacherService,
 	notificationSvc NotificationService,
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) SubmissionService {
 	return &submissionService{
 		repo:             repo,
@@ -58,47 +106,44 @@ func NewSubmissionService(
 		studentSvc:       studentSvc,
 		teacherSvc:       teacherSvc,
 		notificationSvc:  notificationSvc,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
 		pgClient:         pgClient,
 		logger:           logger.Named("submission_service"),
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
 	}
 }
 
-// Request structs
-type CreateSubmissionRequest struct {
-	AssignmentID uuid.UUID  `json:"assignment_id"`
-	StudentID    uuid.UUID  `json:"student_id"`
-	FileURL      string     `json:"file_url,omitempty"`
-	Remarks      string     `json:"remarks,omitempty"`
-	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+// ---------------------------------------------------------------------
+// Helper: store outbox event for submission
+// ---------------------------------------------------------------------
+
+func (s *submissionService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType string, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "submission",
+		AggregateID:   aggregateID.String(),
+		EventType:     eventType,
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
 }
 
-type UpdateSubmissionRequest struct {
-	SubmissionID uuid.UUID  `json:"submission_id"`
-	FileURL      string     `json:"file_url,omitempty"`
-	Remarks      string     `json:"remarks,omitempty"`
-	UpdatedBy    *uuid.UUID `json:"updated_by,omitempty"`
-}
+// ---------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------
 
-type GradeSubmissionRequest struct {
-	SubmissionID uuid.UUID  `json:"submission_id"`
-	Marks        float64    `json:"marks"`
-	Feedback     string     `json:"feedback,omitempty"`
-	GradedBy     uuid.UUID  `json:"graded_by"`
-	Remarks      string     `json:"remarks,omitempty"`
-	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
-}
-
-type AddCommentRequest struct {
-	SubmissionID uuid.UUID  `json:"submission_id"`
-	Comment      string     `json:"comment"`
-	CommentBy    uuid.UUID  `json:"comment_by"`
-	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
-}
-
-// Helper validation
 func (s *submissionService) validateCreate(req CreateSubmissionRequest) error {
 	if req.AssignmentID == uuid.Nil {
 		return fmt.Errorf("%w: assignment_id required", ErrInvalidInput)
@@ -116,7 +161,10 @@ func (s *submissionService) validateUpdate(req UpdateSubmissionRequest) error {
 	return nil
 }
 
-// CreateSubmission – student submits assignment
+// ---------------------------------------------------------------------
+// CreateSubmission (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) CreateSubmission(ctx context.Context, req CreateSubmissionRequest, idempotencyKey string) (*models.AssignmentSubmission, error) {
 	logger := s.logger.With(
 		zap.String("method", "CreateSubmission"),
@@ -137,17 +185,10 @@ func (s *submissionService) CreateSubmission(ctx context.Context, req CreateSubm
 
 	// Idempotency check
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var submission models.AssignmentSubmission
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &submission); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
+		var existing models.AssignmentSubmission
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.SubmissionID != uuid.Nil {
 			logger.Info("returning idempotent response")
-			return &submission, nil
+			return &existing, nil
 		}
 	}
 
@@ -179,51 +220,50 @@ func (s *submissionService) CreateSubmission(ctx context.Context, req CreateSubm
 		FileURL:        req.FileURL,
 		Remarks:        req.Remarks,
 		Status:         status,
-		CreatedBy:      req.CreatedBy,
+		// CreatedBy removed – column no longer exists
 	}
 
 	if err := s.repo.CreateSubmission(ctx, tx, submission); err != nil {
 		return nil, err
 	}
 
+	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, submission); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			return nil, fmt.Errorf("failed to store idempotency key: %w", err)
 		}
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SUBMISSION_CREATE", submission.SubmissionID, nil, submission, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Audit log – use nil for actor (or could be extracted from context)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "submission",
+			&submission.SubmissionID, "user", nil, nil, nil, map[string]interface{}{
+				"assignment_id": submission.AssignmentID,
+				"student_id":    submission.StudentID,
+				"status":        submission.Status,
+			})
 	}
 
 	// Outbox event
-	eventData := map[string]interface{}{
-		"submission_id": submission.SubmissionID,
-		"assignment_id": submission.AssignmentID,
-		"student_id":    submission.StudentID,
-		"status":        submission.Status,
-		"submitted_at":  submission.SubmissionDate,
-	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubmissionCreated), eventData); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, string(EventSubmissionCreated), submission.SubmissionID, submission); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
-	// Commit before sending notification (to avoid notifying on failure)
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Send notification to teacher (async)
+	// Send notification to teacher (async) – no created_by available
 	s.notifyTeacherOnSubmission(ctx, assignment, submission)
 
 	logger.Info("submission created", zap.String("submission_id", submission.SubmissionID.String()))
 	return submission, nil
 }
 
-// GetSubmissionByID
+// ---------------------------------------------------------------------
+// Read‑only operations (no transaction needed)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) GetSubmissionByID(ctx context.Context, id uuid.UUID) (*models.AssignmentSubmission, error) {
 	sub, err := s.repo.GetSubmissionByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -235,7 +275,6 @@ func (s *submissionService) GetSubmissionByID(ctx context.Context, id uuid.UUID)
 	return sub, nil
 }
 
-// GetSubmissionByAssignmentAndStudent
 func (s *submissionService) GetSubmissionByAssignmentAndStudent(ctx context.Context, assignmentID, studentID uuid.UUID) (*models.AssignmentSubmission, error) {
 	sub, err := s.repo.GetSubmissionByAssignmentAndStudent(ctx, s.pgClient.DB, assignmentID, studentID)
 	if err != nil {
@@ -247,17 +286,18 @@ func (s *submissionService) GetSubmissionByAssignmentAndStudent(ctx context.Cont
 	return sub, nil
 }
 
-// ListSubmissions
 func (s *submissionService) ListSubmissions(ctx context.Context, filter repository.SubmissionFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.AssignmentSubmission, error) {
 	return s.repo.ListSubmissions(ctx, s.pgClient.DB, filter, pagination, sort)
 }
 
-// CountSubmissions
 func (s *submissionService) CountSubmissions(ctx context.Context, filter repository.SubmissionFilter) (int64, error) {
 	return s.repo.CountSubmissions(ctx, s.pgClient.DB, filter)
 }
 
-// UpdateSubmission – allows resubmission
+// ---------------------------------------------------------------------
+// UpdateSubmission (with audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) UpdateSubmission(ctx context.Context, req UpdateSubmissionRequest) (*models.AssignmentSubmission, error) {
 	logger := s.logger.With(zap.String("method", "UpdateSubmission"), zap.String("submission_id", req.SubmissionID.String()))
 
@@ -288,15 +328,18 @@ func (s *submissionService) UpdateSubmission(ctx context.Context, req UpdateSubm
 		return nil, err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SUBMISSION_UPDATE", existing.SubmissionID, nil, existing, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "submission",
+			&req.SubmissionID, "user", nil, nil, nil, map[string]interface{}{
+				"file_url": existing.FileURL,
+				"remarks":  existing.Remarks,
+			})
 	}
 
-	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubmissionUpdated), existing); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("store outbox event: %w", err)
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, string(EventSubmissionUpdated), existing.SubmissionID, existing); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -307,7 +350,10 @@ func (s *submissionService) UpdateSubmission(ctx context.Context, req UpdateSubm
 	return existing, nil
 }
 
-// DeleteSubmission
+// ---------------------------------------------------------------------
+// DeleteSubmission (hard delete, deletedBy ignored as table has no such column)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) DeleteSubmission(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteSubmission"), zap.String("submission_id", id.String()))
 
@@ -317,21 +363,19 @@ func (s *submissionService) DeleteSubmission(ctx context.Context, id uuid.UUID, 
 	}
 	defer tx.Rollback()
 
-	existing, _ := s.repo.GetSubmissionByID(ctx, tx, id)
 	if err := s.repo.DeleteSubmission(ctx, tx, id, deletedBy); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "SUBMISSION_DELETE", id, existing, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "submission",
+			&id, "user", deletedBy, nil, nil, nil)
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubmissionDeleted), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, string(EventSubmissionDeleted), id, map[string]interface{}{
 		"submission_id": id,
-		"deleted_by":    deletedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -342,7 +386,10 @@ func (s *submissionService) DeleteSubmission(ctx context.Context, id uuid.UUID, 
 	return nil
 }
 
-// GradeSubmission – teacher grades a submission
+// ---------------------------------------------------------------------
+// GradeSubmission (with audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) GradeSubmission(ctx context.Context, req GradeSubmissionRequest) (*models.AssignmentGrade, error) {
 	logger := s.logger.With(
 		zap.String("method", "GradeSubmission"),
@@ -385,36 +432,37 @@ func (s *submissionService) GradeSubmission(ctx context.Context, req GradeSubmis
 		return nil, err
 	}
 
-	// Create grade record
+	// Create grade record – no created_by column
 	grade := &models.AssignmentGrade{
 		SubmissionID: req.SubmissionID,
 		Marks:        req.Marks,
 		GradedBy:     req.GradedBy,
 		GradedAt:     now,
 		Remarks:      req.Remarks,
-		CreatedBy:    req.CreatedBy,
 	}
 	if err := s.repo.CreateGrade(ctx, tx, grade); err != nil {
 		return nil, err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SUBMISSION_GRADE", submission.SubmissionID, nil, grade, &req.GradedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "grade", "submission",
+			&submission.SubmissionID, "user", &req.GradedBy, nil, nil, map[string]interface{}{
+				"marks":    req.Marks,
+				"feedback": req.Feedback,
+			})
 	}
 
-	// Outbox
-	eventData := map[string]interface{}{
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, string(EventSubmissionGraded), submission.SubmissionID, map[string]interface{}{
 		"submission_id": submission.SubmissionID,
 		"assignment_id": submission.AssignmentID,
 		"student_id":    submission.StudentID,
 		"marks":         req.Marks,
 		"feedback":      req.Feedback,
 		"graded_by":     req.GradedBy,
-	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubmissionGraded), eventData); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("store outbox event: %w", err)
+	}); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -428,7 +476,10 @@ func (s *submissionService) GradeSubmission(ctx context.Context, req GradeSubmis
 	return grade, nil
 }
 
-// AddComment – teacher adds comment on submission
+// ---------------------------------------------------------------------
+// AddComment (with audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) AddComment(ctx context.Context, req AddCommentRequest) (*models.AssignmentComment, error) {
 	logger := s.logger.With(
 		zap.String("method", "AddComment"),
@@ -458,61 +509,65 @@ func (s *submissionService) AddComment(ctx context.Context, req AddCommentReques
 		SubmissionID: req.SubmissionID,
 		CommentBy:    req.CommentBy,
 		Comment:      req.Comment,
-		CreatedBy:    req.CreatedBy,
+		// CreatedBy removed
 	}
 	if err := s.repo.AddComment(ctx, tx, comment); err != nil {
 		return nil, err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SUBMISSION_COMMENT", comment.CommentID, nil, comment, &req.CommentBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "add_comment", "submission_comment",
+			&comment.CommentID, "user", &req.CommentBy, nil, nil, map[string]interface{}{
+				"submission_id": req.SubmissionID,
+				"comment":       req.Comment,
+			})
 	}
 
-	// Outbox
-	eventData := map[string]interface{}{
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, string(EventSubmissionCommentAdded), comment.CommentID, map[string]interface{}{
 		"submission_id": req.SubmissionID,
 		"comment_id":    comment.CommentID,
 		"comment_by":    req.CommentBy,
 		"comment":       req.Comment,
-	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubmissionCommentAdded), eventData); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("store outbox event: %w", err)
+	}); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Notify student about comment (optional)
+	// Notify student about comment
 	s.notifyStudentOnComment(ctx, sub, comment)
 
 	logger.Info("comment added")
 	return comment, nil
 }
 
-// GetCommentsBySubmission
+// ---------------------------------------------------------------------
+// GetCommentsBySubmission (read-only)
+// ---------------------------------------------------------------------
+
 func (s *submissionService) GetCommentsBySubmission(ctx context.Context, submissionID uuid.UUID) ([]*models.AssignmentComment, error) {
 	return s.repo.GetCommentsBySubmission(ctx, s.pgClient.DB, submissionID)
 }
 
-// Notification helpers
+// ---------------------------------------------------------------------
+// Notification helpers (no created_by passed)
+// ---------------------------------------------------------------------
 
 func (s *submissionService) notifyTeacherOnSubmission(ctx context.Context, assignment *models.Assignment, submission *models.AssignmentSubmission) {
-	// Run async
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		// Get teacher info (need company ID, user ID)
 		teacher, err := s.teacherSvc.GetByID(notifyCtx, assignment.TeacherID)
 		if err != nil || teacher == nil {
 			s.logger.Error("failed to fetch teacher for notification", zap.String("teacher_id", assignment.TeacherID.String()), zap.Error(err))
 			return
 		}
 
-		// Create notification for teacher (target user)
 		notifReq := CreateNotificationRequest{
 			CompanyID: teacher.CompanyID,
 			Title:     fmt.Sprintf("New Submission for %s", assignment.Title),
@@ -525,7 +580,7 @@ func (s *submissionService) notifyTeacherOnSubmission(ctx context.Context, assig
 					TargetEntityID: teacher.UserID,
 				},
 			},
-			CreatedBy: submission.CreatedBy,
+			CreatedBy: nil, // no actor info available
 		}
 		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "submission."+submission.SubmissionID.String()); err != nil {
 			s.logger.Error("failed to send teacher notification for submission", zap.Error(err))
@@ -538,14 +593,12 @@ func (s *submissionService) notifyStudentOnGrade(ctx context.Context, submission
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		// Get student info
 		student, err := s.studentSvc.GetByID(notifyCtx, submission.StudentID)
 		if err != nil || student == nil {
 			s.logger.Error("failed to fetch student for notification", zap.String("student_id", submission.StudentID.String()), zap.Error(err))
 			return
 		}
 
-		// Get assignment title
 		assignment, err := s.assignmentRepo.GetByID(notifyCtx, s.pgClient.DB, submission.AssignmentID)
 		if err != nil || assignment == nil {
 			s.logger.Error("failed to fetch assignment for notification", zap.String("assignment_id", submission.AssignmentID.String()), zap.Error(err))
@@ -557,7 +610,6 @@ func (s *submissionService) notifyStudentOnGrade(ctx context.Context, submission
 			marks = fmt.Sprintf(" Marks: %.2f", *submission.MarksObtained)
 		}
 
-		// Notify student using TargetStudent with student ID
 		notifReq := CreateNotificationRequest{
 			CompanyID: student.CompanyID,
 			Title:     fmt.Sprintf("Assignment Graded: %s", assignment.Title),
@@ -570,7 +622,7 @@ func (s *submissionService) notifyStudentOnGrade(ctx context.Context, submission
 					TargetEntityID: student.StudentID,
 				},
 			},
-			CreatedBy: submission.GradedBy,
+			CreatedBy: submission.GradedBy, // graded_by is the actor
 		}
 		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "submission.grade."+submission.SubmissionID.String()); err != nil {
 			s.logger.Error("failed to send student notification for grade", zap.Error(err))
@@ -601,7 +653,7 @@ func (s *submissionService) notifyStudentOnComment(ctx context.Context, submissi
 					TargetEntityID: student.StudentID,
 				},
 			},
-			CreatedBy: &comment.CommentBy,
+			CreatedBy: &comment.CommentBy, // comment_by is the actor
 		}
 		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "submission.comment."+comment.CommentID.String()); err != nil {
 			s.logger.Error("failed to send student notification for comment", zap.Error(err))

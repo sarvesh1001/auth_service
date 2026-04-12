@@ -223,17 +223,20 @@ CREATE TABLE IF NOT EXISTS academics.admissions (
     created_by      UUID REFERENCES users(user_id)
 );
 
+-- Updated academics.enrollments table with audit columns (updated_by, version)
 CREATE TABLE IF NOT EXISTS academics.enrollments (
-    enrollment_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id      UUID NOT NULL REFERENCES academics.students(student_id) ON DELETE CASCADE,
+    enrollment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id       UUID NOT NULL REFERENCES academics.students(student_id) ON DELETE CASCADE,
     academic_year_id UUID NOT NULL REFERENCES academics.academic_year(academic_year_id) ON DELETE CASCADE,
-    section_id      UUID NOT NULL REFERENCES academics.section(section_id) ON DELETE CASCADE,
-    enrollment_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    roll_number     VARCHAR(20),
-    status          VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','withdrawn')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID REFERENCES users(user_id),
+    section_id       UUID NOT NULL REFERENCES academics.section(section_id) ON DELETE CASCADE,
+    enrollment_date  DATE NOT NULL DEFAULT CURRENT_DATE,
+    roll_number      VARCHAR(20),
+    status           VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'withdrawn')),
+    version          INT NOT NULL DEFAULT 0,                     -- ✅ added for optimistic locking
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID REFERENCES users(user_id),
+    updated_by       UUID REFERENCES users(user_id),             -- ✅ added for audit trail
     UNIQUE (student_id, academic_year_id)
 );
 
@@ -314,9 +317,9 @@ CREATE TABLE IF NOT EXISTS academics.teacher_schedule_preferences (
     preferred_end_time TIME,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID REFERENCES users(user_id)
+    created_by      UUID REFERENCES users(user_id),
+    UNIQUE (teacher_id, day_of_week)
 );
-
 -- =====================================================
 -- TIMETABLE
 -- =====================================================
@@ -469,21 +472,20 @@ CREATE TABLE IF NOT EXISTS academics.assignments (
     deleted_at      TIMESTAMPTZ
 );
 
-CREATE TABLE IF NOT EXISTS academics.assignment_submissions (
-    submission_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    assignment_id   UUID NOT NULL REFERENCES academics.assignments(assignment_id) ON DELETE CASCADE,
-    student_id      UUID NOT NULL REFERENCES academics.students(student_id) ON DELETE CASCADE,
+CREATE TABLE academics.assignment_submissions (
+    submission_id   UUID PRIMARY KEY,
+    assignment_id   UUID NOT NULL REFERENCES academics.assignments(assignment_id),
+    student_id      UUID NOT NULL REFERENCES academics.students(student_id),  -- who submitted
     submission_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     file_url        TEXT,
     remarks         TEXT,
-    status          VARCHAR(20) NOT NULL DEFAULT 'submitted' CHECK (status IN ('submitted','late','graded','returned')),
+    status          VARCHAR(20) NOT NULL DEFAULT 'submitted',
     marks_obtained  NUMERIC(6,2),
     feedback        TEXT,
     graded_by       UUID REFERENCES users(user_id),
     graded_at       TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- audit timestamp
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID REFERENCES users(user_id),
     UNIQUE (assignment_id, student_id)
 );
 
@@ -494,8 +496,7 @@ CREATE TABLE IF NOT EXISTS academics.assignment_grades (
     graded_by       UUID NOT NULL REFERENCES users(user_id),
     graded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     remarks         TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID REFERENCES users(user_id)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS academics.assignment_comments (
@@ -503,10 +504,8 @@ CREATE TABLE IF NOT EXISTS academics.assignment_comments (
     submission_id   UUID NOT NULL REFERENCES academics.assignment_submissions(submission_id) ON DELETE CASCADE,
     comment_by      UUID NOT NULL REFERENCES users(user_id),
     comment         TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID REFERENCES users(user_id)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 -- =====================================================
 -- EXAMS
 -- =====================================================
@@ -562,14 +561,13 @@ CREATE TABLE IF NOT EXISTS academics.exam_results (
 CREATE TABLE IF NOT EXISTS academics.exam_grades (
     grade_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     exam_id         UUID NOT NULL REFERENCES academics.exams(exam_id) ON DELETE CASCADE,
-    grade_name      VARCHAR(10) NOT NULL,
+    grade_name      VARCHAR(20) NOT NULL,
     min_marks       NUMERIC(6,2) NOT NULL,
     max_marks       NUMERIC(6,2) NOT NULL,
-    grade_point     NUMERIC(3,2),
+    grade_point     NUMERIC(4,2),   -- changed from NUMERIC(3,2) to allow up to 99.99
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (exam_id, grade_name)
 );
-
 CREATE TABLE IF NOT EXISTS academics.grading_policies (
     policy_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id      UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
@@ -746,9 +744,9 @@ CREATE TABLE IF NOT EXISTS academics.library_books (
     deleted_at       TIMESTAMPTZ
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_lib_books_isbn_active 
-    ON academics.library_books(isbn) 
-    WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX idx_lib_books_isbn_active 
+ON academics.library_books (company_id, isbn) 
+WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS academics.library_book_copies (
     copy_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1646,3 +1644,4 @@ CREATE TABLE IF NOT EXISTS academics.student_auth (
 CREATE INDEX IF NOT EXISTS idx_student_auth_student_id 
     ON academics.student_auth(student_id) 
     WHERE deleted_at IS NULL;
+

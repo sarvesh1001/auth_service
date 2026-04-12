@@ -29,5 +29,5 @@ type AssignmentSubmission struct {
 	GradedAt       *time.Time       `json:"graded_at,omitempty"`
 	CreatedAt      time.Time        `json:"created_at"`
 	UpdatedAt      time.Time        `json:"updated_at"`
-	CreatedBy      *uuid.UUID       `json:"created_by,omitempty"`
+	// CreatedBy removed – student is identified via student_id
 }

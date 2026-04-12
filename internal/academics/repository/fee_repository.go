@@ -4,6 +4,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -434,8 +435,9 @@ func (r *feeRepository) CountInvoices(ctx context.Context, db DBTX, filter Invoi
 }
 
 func (r *feeRepository) UpdateInvoiceStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, updatedBy *uuid.UUID) error {
-	query := `UPDATE academics.student_fee_invoices SET status = $2, updated_by = $3, updated_at = NOW() WHERE invoice_id = $1`
-	result, err := db.ExecContext(ctx, query, id, status, updatedBy)
+	// updated_by column does not exist in student_fee_invoices table – removed from query
+	query := `UPDATE academics.student_fee_invoices SET status = $2, updated_at = NOW() WHERE invoice_id = $1`
+	result, err := db.ExecContext(ctx, query, id, status)
 	if err != nil {
 		return fmt.Errorf("update invoice status: %w", err)
 	}
@@ -444,6 +446,7 @@ func (r *feeRepository) UpdateInvoiceStatus(ctx context.Context, db DBTX, id uui
 		return fmt.Errorf("rows affected: %w", err)
 	}
 	if rows == 0 {
+
 		return fmt.Errorf("invoice %s not found", id)
 	}
 	return nil
@@ -656,13 +659,13 @@ func (r *feeRepository) UpdateDiscount(ctx context.Context, db DBTX, discount *m
 	query := `
         UPDATE academics.fee_discounts
         SET discount_type = $2, discount_value = $3, reason = $4, approved_by = $5,
-            valid_from = $6, valid_until = $7, updated_by = $8, updated_at = NOW()
+            valid_from = $6, valid_until = $7, updated_at = NOW()
         WHERE discount_id = $1
         RETURNING updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		discount.DiscountID, discount.DiscountType, discount.DiscountValue, discount.Reason,
-		discount.ApprovedBy, discount.ValidFrom, discount.ValidUntil, discount.CreatedBy,
+		discount.ApprovedBy, discount.ValidFrom, discount.ValidUntil,
 	).Scan(&discount.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -739,13 +742,13 @@ func (r *feeRepository) UpdatePenalty(ctx context.Context, db DBTX, penalty *mod
 	query := `
         UPDATE academics.fee_penalties
         SET penalty_date = $2, amount = $3, reason = $4, waived = $5, waived_by = $6,
-            updated_by = $7, updated_at = NOW()
+            updated_at = NOW()
         WHERE penalty_id = $1
         RETURNING updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		penalty.PenaltyID, penalty.PenaltyDate, penalty.Amount, penalty.Reason,
-		penalty.Waived, penalty.WaivedBy, penalty.CreatedBy,
+		penalty.Waived, penalty.WaivedBy,
 	).Scan(&penalty.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -759,21 +762,26 @@ func (r *feeRepository) UpdatePenalty(ctx context.Context, db DBTX, penalty *mod
 // --- Receipts -----------------------------------------------------------
 
 func (r *feeRepository) CreateReceipt(ctx context.Context, db DBTX, receipt *models.FeeReceipt) error {
+	// Marshal receipt data to JSON
+	receiptDataJSON, err := json.Marshal(receipt.ReceiptData)
+	if err != nil {
+		return fmt.Errorf("marshal receipt data: %w", err)
+	}
+
 	query := `
         INSERT INTO academics.fee_receipts (
             payment_id, receipt_no, receipt_data, generated_at, created_by, created_at
         ) VALUES ($1, $2, $3, NOW(), $4, NOW())
         RETURNING receipt_id, generated_at, created_at
     `
-	err := db.QueryRowContext(ctx, query,
-		receipt.PaymentID, receipt.ReceiptNo, receipt.ReceiptData, receipt.CreatedBy,
+	err = db.QueryRowContext(ctx, query,
+		receipt.PaymentID, receipt.ReceiptNo, receiptDataJSON, receipt.CreatedBy,
 	).Scan(&receipt.ReceiptID, &receipt.GeneratedAt, &receipt.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("create receipt: %w", err)
 	}
 	return nil
 }
-
 func (r *feeRepository) GetReceiptByPaymentID(ctx context.Context, db DBTX, paymentID uuid.UUID) (*models.FeeReceipt, error) {
 	query := `
         SELECT receipt_id, payment_id, receipt_no, receipt_data, generated_at, created_at, created_by
@@ -1168,12 +1176,13 @@ func (r *feeRepository) scanPenalty(row scanner) (*models.FeePenalty, error) {
 func (r *feeRepository) scanReceipt(row scanner) (*models.FeeReceipt, error) {
 	var rec models.FeeReceipt
 	var createdBy uuid.NullUUID
+	var receiptDataJSON []byte
 
 	err := row.Scan(
 		&rec.ReceiptID,
 		&rec.PaymentID,
 		&rec.ReceiptNo,
-		&rec.ReceiptData,
+		&receiptDataJSON,
 		&rec.GeneratedAt,
 		&rec.CreatedAt,
 		&createdBy,
@@ -1184,11 +1193,23 @@ func (r *feeRepository) scanReceipt(row scanner) (*models.FeeReceipt, error) {
 		}
 		return nil, fmt.Errorf("scan receipt: %w", err)
 	}
+
 	if createdBy.Valid {
 		rec.CreatedBy = &createdBy.UUID
 	}
+
+	// Unmarshal JSONB data into the map
+	if len(receiptDataJSON) > 0 {
+		if err := json.Unmarshal(receiptDataJSON, &rec.ReceiptData); err != nil {
+			return nil, fmt.Errorf("unmarshal receipt_data: %w", err)
+		}
+	} else {
+		rec.ReceiptData = make(map[string]interface{})
+	}
+
 	return &rec, nil
 }
+
 func (r *feeRepository) GetFeeStructureItemByID(ctx context.Context, db DBTX, itemID uuid.UUID) (*models.FeeStructureItem, error) {
 	query := `
 		SELECT item_id, fee_structure_id, fee_head, amount, is_mandatory, description,

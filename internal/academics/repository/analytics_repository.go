@@ -853,7 +853,7 @@ func (r *analyticsRepository) UpdateAcademicYearMetrics(ctx context.Context, db 
             total_exemptions, total_subject_mappings, courses_with_curriculum,
             total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
             last_updated
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, NOW())
         ON CONFLICT (academic_year_id) DO UPDATE SET
             total_students   = analytics.academic_year_metrics.total_students + EXCLUDED.total_students,
             active_students  = analytics.academic_year_metrics.active_students + EXCLUDED.active_students,
@@ -911,214 +911,6 @@ func (r *analyticsRepository) UpdateAcademicYearMetrics(ctx context.Context, db 
 			zap.String("academic_year_id", update.AcademicYearID.String()),
 			zap.Error(err))
 		return fmt.Errorf("update academic year metrics: %w", err)
-	}
-	return nil
-}
-
-func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
-	query := `
-        WITH student_counts AS (
-            SELECT e.academic_year_id, COUNT(DISTINCT e.student_id) AS total_students,
-                   COUNT(DISTINCT e.student_id) FILTER (WHERE s.status = 'active') AS active_students
-            FROM academics.enrollments e
-            JOIN academics.students s ON s.student_id = e.student_id
-            WHERE e.academic_year_id = $1
-              AND e.deleted_at IS NULL AND s.deleted_at IS NULL
-            GROUP BY e.academic_year_id
-        ),
-        term_counts AS (
-            SELECT academic_year_id, COUNT(*) AS total_terms
-            FROM academics.term
-            WHERE academic_year_id = $1 AND deleted_at IS NULL
-            GROUP BY academic_year_id
-        ),
-        section_counts AS (
-            SELECT t.academic_year_id, COUNT(DISTINCT s.section_id) AS total_sections
-            FROM academics.section s
-            JOIN academics.term t ON t.term_id = s.term_id
-            WHERE t.academic_year_id = $1 AND s.deleted_at IS NULL AND t.deleted_at IS NULL
-            GROUP BY t.academic_year_id
-        ),
-        course_counts AS (
-            SELECT t.academic_year_id, COUNT(DISTINCT s.course_id) AS total_courses
-            FROM academics.section s
-            JOIN academics.term t ON t.term_id = s.term_id
-            WHERE t.academic_year_id = $1 AND s.deleted_at IS NULL AND t.deleted_at IS NULL
-            GROUP BY t.academic_year_id
-        ),
-        subject_counts AS (
-            SELECT t.academic_year_id, COUNT(DISTINCT sub.subject_id) AS total_subjects
-            FROM academics.section s
-            JOIN academics.term t ON t.term_id = s.term_id
-            JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
-            JOIN academics.subject sub ON sub.subject_id = scm.subject_id
-            WHERE t.academic_year_id = $1 AND s.deleted_at IS NULL AND t.deleted_at IS NULL
-              AND sub.deleted_at IS NULL
-            GROUP BY t.academic_year_id
-        ),
-        admission_counts AS (
-            SELECT academic_year_id,
-                   COUNT(*) AS total_admissions,
-                   COUNT(*) FILTER (WHERE admission_status = 'approved') AS approved_admissions,
-                   COUNT(*) FILTER (WHERE admission_status = 'pending') AS pending_admissions,
-                   COUNT(*) FILTER (WHERE admission_status = 'rejected') AS rejected_admissions
-            FROM academics.admissions
-            WHERE academic_year_id = $1
-            GROUP BY academic_year_id
-        ),
-        assignment_counts AS (
-            SELECT t.academic_year_id,
-                   COUNT(a.assignment_id) AS total_assignments,
-                   COUNT(a.assignment_id) FILTER (WHERE a.is_published = true) AS published_assignments
-            FROM academics.assignments a
-            JOIN academics.section s ON s.section_id = a.section_id
-            JOIN academics.term t ON t.term_id = s.term_id
-            WHERE t.academic_year_id = $1
-              AND a.deleted_at IS NULL
-            GROUP BY t.academic_year_id
-        ),
-        attendance_counts AS (
-            SELECT e.academic_year_id,
-                   COUNT(a.attendance_id) AS total_attendance_records,
-                   COUNT(a.attendance_id) FILTER (WHERE a.status = 'absent') AS total_absent_records,
-                   COUNT(a.attendance_id) FILTER (WHERE a.status = 'late') AS total_late_records,
-                   COUNT(a.attendance_id) FILTER (WHERE a.status = 'half-day') AS total_half_day_records
-            FROM academics.student_attendance a
-            JOIN academics.enrollments e ON e.enrollment_id = a.enrollment_id
-            WHERE e.academic_year_id = $1
-            GROUP BY e.academic_year_id
-        ),
-        exemption_counts AS (
-            SELECT e.academic_year_id,
-                   COUNT(ex.exemption_id) AS total_exemptions
-            FROM academics.student_attendance_exemptions ex
-            JOIN academics.enrollments e ON e.student_id = ex.student_id
-            WHERE e.academic_year_id = $1
-              AND ex.from_date <= (SELECT end_date FROM academics.academic_year WHERE academic_year_id = $1)
-            GROUP BY e.academic_year_id
-        ),
-        curriculum_counts AS (
-            SELECT t.academic_year_id,
-                   COUNT(scm.mapping_id) AS total_subject_mappings,
-                   COUNT(DISTINCT s.course_id) FILTER (WHERE scm.mapping_id IS NOT NULL) AS courses_with_curriculum
-            FROM academics.section s
-            JOIN academics.term t ON t.term_id = s.term_id
-            LEFT JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
-            WHERE t.academic_year_id = $1 AND s.deleted_at IS NULL AND t.deleted_at IS NULL
-            GROUP BY t.academic_year_id
-        ),
-        enrollment_counts AS (
-            SELECT academic_year_id,
-                   COUNT(*) AS total_enrollments,
-                   COUNT(*) FILTER (WHERE status = 'active') AS active_enrollments,
-                   COUNT(*) FILTER (WHERE status = 'completed') AS completed_enrollments,
-                   COUNT(*) FILTER (WHERE status = 'withdrawn') AS withdrawn_enrollments
-            FROM academics.enrollments
-            WHERE academic_year_id = $1 AND deleted_at IS NULL
-            GROUP BY academic_year_id
-        )
-        SELECT
-            COALESCE(sc.total_students, 0),
-            COALESCE(sc.active_students, 0),
-            COALESCE(tc.total_terms, 0),
-            COALESCE(scc.total_sections, 0),
-            COALESCE(cc.total_courses, 0),
-            COALESCE(suc.total_subjects, 0),
-            COALESCE(ac.total_admissions, 0),
-            COALESCE(ac.approved_admissions, 0),
-            COALESCE(ac.pending_admissions, 0),
-            COALESCE(ac.rejected_admissions, 0),
-            COALESCE(asc.total_assignments, 0),
-            COALESCE(asc.published_assignments, 0),
-            COALESCE(att.total_attendance_records, 0),
-            COALESCE(att.total_absent_records, 0),
-            COALESCE(att.total_late_records, 0),
-            COALESCE(att.total_half_day_records, 0),
-            COALESCE(exc.total_exemptions, 0),
-            COALESCE(cur.total_subject_mappings, 0),
-            COALESCE(cur.courses_with_curriculum, 0),
-            COALESCE(enc.total_enrollments, 0),
-            COALESCE(enc.active_enrollments, 0),
-            COALESCE(enc.completed_enrollments, 0),
-            COALESCE(enc.withdrawn_enrollments, 0)
-        FROM (SELECT $1 AS academic_year_id) ay
-        LEFT JOIN student_counts sc ON sc.academic_year_id = ay.academic_year_id
-        LEFT JOIN term_counts tc ON tc.academic_year_id = ay.academic_year_id
-        LEFT JOIN section_counts scc ON scc.academic_year_id = ay.academic_year_id
-        LEFT JOIN course_counts cc ON cc.academic_year_id = ay.academic_year_id
-        LEFT JOIN subject_counts suc ON suc.academic_year_id = ay.academic_year_id
-        LEFT JOIN admission_counts ac ON ac.academic_year_id = ay.academic_year_id
-        LEFT JOIN assignment_counts asc ON asc.academic_year_id = ay.academic_year_id
-        LEFT JOIN attendance_counts att ON att.academic_year_id = ay.academic_year_id
-        LEFT JOIN exemption_counts exc ON exc.academic_year_id = ay.academic_year_id
-        LEFT JOIN curriculum_counts cur ON cur.academic_year_id = ay.academic_year_id
-        LEFT JOIN enrollment_counts enc ON enc.academic_year_id = ay.academic_year_id
-    `
-	var totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects int
-	var totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions int
-	var totalAssignments, publishedAssignments int
-	var totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords int
-	var totalExemptions, totalSubjectMappings, coursesWithCurriculum int
-	var totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments int
-	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
-		&totalStudents, &activeStudents, &totalTerms, &totalSections, &totalCourses, &totalSubjects,
-		&totalAdmissions, &approvedAdmissions, &pendingAdmissions, &rejectedAdmissions,
-		&totalAssignments, &publishedAssignments,
-		&totalAttendanceRecords, &totalAbsentRecords, &totalLateRecords, &totalHalfDayRecords,
-		&totalExemptions, &totalSubjectMappings, &coursesWithCurriculum,
-		&totalEnrollments, &activeEnrollments, &completedEnrollments, &withdrawnEnrollments,
-	)
-	if err != nil {
-		return fmt.Errorf("recompute metrics: %w", err)
-	}
-	upsertQuery := `
-        INSERT INTO analytics.academic_year_metrics (
-            academic_year_id, total_students, active_students, total_terms,
-            total_sections, total_courses, total_subjects,
-            total_admissions, approved_admissions, pending_admissions, rejected_admissions,
-            total_assignments, published_assignments,
-            total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
-            total_exemptions, total_subject_mappings, courses_with_curriculum,
-            total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
-            last_updated
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW())
-        ON CONFLICT (academic_year_id) DO UPDATE SET
-            total_students   = EXCLUDED.total_students,
-            active_students  = EXCLUDED.active_students,
-            total_terms      = EXCLUDED.total_terms,
-            total_sections   = EXCLUDED.total_sections,
-            total_courses    = EXCLUDED.total_courses,
-            total_subjects   = EXCLUDED.total_subjects,
-            total_admissions = EXCLUDED.total_admissions,
-            approved_admissions = EXCLUDED.approved_admissions,
-            pending_admissions = EXCLUDED.pending_admissions,
-            rejected_admissions = EXCLUDED.rejected_admissions,
-            total_assignments = EXCLUDED.total_assignments,
-            published_assignments = EXCLUDED.published_assignments,
-            total_attendance_records = EXCLUDED.total_attendance_records,
-            total_absent_records = EXCLUDED.total_absent_records,
-            total_late_records = EXCLUDED.total_late_records,
-            total_half_day_records = EXCLUDED.total_half_day_records,
-            total_exemptions = EXCLUDED.total_exemptions,
-            total_subject_mappings = EXCLUDED.total_subject_mappings,
-            courses_with_curriculum = EXCLUDED.courses_with_curriculum,
-            total_enrollments = EXCLUDED.total_enrollments,
-            active_enrollments = EXCLUDED.active_enrollments,
-            completed_enrollments = EXCLUDED.completed_enrollments,
-            withdrawn_enrollments = EXCLUDED.withdrawn_enrollments,
-            last_updated = NOW()
-    `
-	_, err = db.ExecContext(ctx, upsertQuery,
-		academicYearID,
-		totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects,
-		totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions,
-		totalAssignments, publishedAssignments,
-		totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords,
-		totalExemptions, totalSubjectMappings, coursesWithCurriculum,
-		totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments,
-	)
-	if err != nil {
-		return fmt.Errorf("upsert metrics: %w", err)
 	}
 	return nil
 }
@@ -2157,8 +1949,6 @@ func (r *analyticsRepository) UpdateSectionMetrics(ctx context.Context, db DBTX,
 }
 
 func (r *analyticsRepository) RefreshSectionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
-	// Sections are linked to terms, which belong to academic years.
-	// We also need total capacity (sum of section capacities) and used capacity (sum of enrollments per section)
 	query := `
 		WITH sections_in_year AS (
 			SELECT s.section_id, s.capacity, s.is_active
@@ -2170,7 +1960,8 @@ func (r *analyticsRepository) RefreshSectionMetrics(ctx context.Context, db DBTX
 		enrollment_counts AS (
 			SELECT e.section_id, COUNT(*) AS enrolled
 			FROM academics.enrollments e
-			WHERE e.academic_year_id = $1 AND e.status = 'active' AND e.deleted_at IS NULL
+			WHERE e.academic_year_id = $1
+			  AND e.status = 'active'
 			GROUP BY e.section_id
 		)
 		SELECT
@@ -2181,13 +1972,18 @@ func (r *analyticsRepository) RefreshSectionMetrics(ctx context.Context, db DBTX
 		FROM sections_in_year s
 		LEFT JOIN enrollment_counts ec ON ec.section_id = s.section_id
 	`
+
 	var totalSections, activeSections, totalCapacity, usedCapacity int
-	err := db.QueryRowContext(ctx, query, academicYearID).Scan(&totalSections, &activeSections, &totalCapacity, &usedCapacity)
+
+	err := db.QueryRowContext(ctx, query, academicYearID).
+		Scan(&totalSections, &activeSections, &totalCapacity, &usedCapacity)
 	if err != nil {
 		return fmt.Errorf("refresh section metrics: %w", err)
 	}
+
 	upsertQuery := `
-        INSERT INTO analytics.section_metrics (academic_year_id, total_sections, active_sections, total_capacity, used_capacity, last_updated)
+        INSERT INTO analytics.section_metrics 
+        (academic_year_id, total_sections, active_sections, total_capacity, used_capacity, last_updated)
         VALUES ($1, $2, $3, $4, $5, NOW())
         ON CONFLICT (academic_year_id) DO UPDATE SET
             total_sections = EXCLUDED.total_sections,
@@ -2196,13 +1992,16 @@ func (r *analyticsRepository) RefreshSectionMetrics(ctx context.Context, db DBTX
             used_capacity = EXCLUDED.used_capacity,
             last_updated = NOW()
     `
-	_, err = db.ExecContext(ctx, upsertQuery, academicYearID, totalSections, activeSections, totalCapacity, usedCapacity)
+
+	_, err = db.ExecContext(ctx, upsertQuery,
+		academicYearID, totalSections, activeSections, totalCapacity, usedCapacity,
+	)
 	if err != nil {
 		return fmt.Errorf("upsert section metrics: %w", err)
 	}
+
 	return nil
 }
-
 func (r *analyticsRepository) DeleteSectionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `DELETE FROM analytics.section_metrics WHERE academic_year_id = $1`
 	result, err := db.ExecContext(ctx, query, academicYearID)
@@ -2303,15 +2102,22 @@ func (r *analyticsRepository) RefreshStudentMetrics(ctx context.Context, db DBTX
 			COUNT(DISTINCT s.student_id) FILTER (WHERE s.gender = 'female') AS female_students
 		FROM academics.students s
 		JOIN academics.enrollments e ON e.student_id = s.student_id
-		WHERE e.academic_year_id = $1 AND e.deleted_at IS NULL AND s.deleted_at IS NULL
+		WHERE e.academic_year_id = $1
+		  AND e.status = 'active'
+		  AND s.deleted_at IS NULL
 	`
+
 	var totalStudents, activeStudents, maleStudents, femaleStudents int
-	err := db.QueryRowContext(ctx, query, academicYearID).Scan(&totalStudents, &activeStudents, &maleStudents, &femaleStudents)
+
+	err := db.QueryRowContext(ctx, query, academicYearID).
+		Scan(&totalStudents, &activeStudents, &maleStudents, &femaleStudents)
 	if err != nil {
 		return fmt.Errorf("refresh student metrics: %w", err)
 	}
+
 	upsertQuery := `
-        INSERT INTO analytics.student_metrics (academic_year_id, total_students, active_students, male_students, female_students, last_updated)
+        INSERT INTO analytics.student_metrics 
+        (academic_year_id, total_students, active_students, male_students, female_students, last_updated)
         VALUES ($1, $2, $3, $4, $5, NOW())
         ON CONFLICT (academic_year_id) DO UPDATE SET
             total_students = EXCLUDED.total_students,
@@ -2320,13 +2126,16 @@ func (r *analyticsRepository) RefreshStudentMetrics(ctx context.Context, db DBTX
             female_students = EXCLUDED.female_students,
             last_updated = NOW()
     `
-	_, err = db.ExecContext(ctx, upsertQuery, academicYearID, totalStudents, activeStudents, maleStudents, femaleStudents)
+
+	_, err = db.ExecContext(ctx, upsertQuery,
+		academicYearID, totalStudents, activeStudents, maleStudents, femaleStudents,
+	)
 	if err != nil {
 		return fmt.Errorf("upsert student metrics: %w", err)
 	}
+
 	return nil
 }
-
 func (r *analyticsRepository) DeleteStudentMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `DELETE FROM analytics.student_metrics WHERE academic_year_id = $1`
 	result, err := db.ExecContext(ctx, query, academicYearID)
@@ -2547,26 +2356,27 @@ func (r *analyticsRepository) UpdateSubmissionMetrics(ctx context.Context, db DB
 
 func (r *analyticsRepository) RefreshSubmissionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `
-		WITH submissions_in_year AS (
-			SELECT sub.submission_id, sub.status, sub.submission_date
-			FROM academics.assignment_submissions sub
-			JOIN academics.assignments a ON a.assignment_id = sub.assignment_id
-			JOIN academics.section s ON s.section_id = a.section_id
-			JOIN academics.term t ON t.term_id = s.term_id
-			WHERE t.academic_year_id = $1
-			  AND sub.deleted_at IS NULL
-		)
-		SELECT
-			COUNT(*) AS total_submissions,
-			COUNT(*) FILTER (WHERE status = 'late') AS late_submissions,
-			COUNT(*) FILTER (WHERE status = 'graded') AS graded_submissions
-		FROM submissions_in_year
-	`
+        WITH submissions_in_year AS (
+            SELECT sub.submission_id, sub.status, sub.submission_date
+            FROM academics.assignment_submissions sub
+            JOIN academics.assignments a ON a.assignment_id = sub.assignment_id
+            JOIN academics.section s ON s.section_id = a.section_id
+            JOIN academics.term t ON t.term_id = s.term_id
+            WHERE t.academic_year_id = $1
+        )
+        SELECT
+            COUNT(*) AS total_submissions,
+            COUNT(*) FILTER (WHERE status = 'late') AS late_submissions,
+            COUNT(*) FILTER (WHERE status = 'graded') AS graded_submissions
+        FROM submissions_in_year
+    `
+
 	var total, late, graded int
 	err := db.QueryRowContext(ctx, query, academicYearID).Scan(&total, &late, &graded)
 	if err != nil {
 		return fmt.Errorf("refresh submission metrics: %w", err)
 	}
+
 	upsertQuery := `
         INSERT INTO analytics.submission_metrics (academic_year_id, total_submissions, late_submissions, graded_submissions, last_updated)
         VALUES ($1, $2, $3, $4, NOW())
@@ -2576,13 +2386,14 @@ func (r *analyticsRepository) RefreshSubmissionMetrics(ctx context.Context, db D
             graded_submissions = EXCLUDED.graded_submissions,
             last_updated = NOW()
     `
+
 	_, err = db.ExecContext(ctx, upsertQuery, academicYearID, total, late, graded)
 	if err != nil {
 		return fmt.Errorf("upsert submission metrics: %w", err)
 	}
+
 	return nil
 }
-
 func (r *analyticsRepository) DeleteSubmissionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `DELETE FROM analytics.submission_metrics WHERE academic_year_id = $1`
 	result, err := db.ExecContext(ctx, query, academicYearID)
@@ -2670,30 +2481,31 @@ func (r *analyticsRepository) UpdateTeacherMetrics(ctx context.Context, db DBTX,
 }
 
 func (r *analyticsRepository) RefreshTeacherMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
-	// Teachers are assigned to sections in terms. We'll count distinct teachers assigned to sections in this academic year.
 	query := `
-		WITH company AS (
-			SELECT company_id FROM academics.academic_year WHERE academic_year_id = $1
-		),
-		teachers_in_year AS (
-			SELECT DISTINCT t.teacher_id, t.status
-			FROM academics.teacher t
-			JOIN academics.teacher_section ts ON ts.teacher_id = t.teacher_id
-			JOIN academics.section s ON s.section_id = ts.section_id
-			JOIN academics.term term ON term.term_id = s.term_id
-			WHERE term.academic_year_id = $1
-			  AND t.deleted_at IS NULL
-		)
-		SELECT
-			COUNT(teacher_id) AS total_teachers,
-			COUNT(teacher_id) FILTER (WHERE status = 'active') AS active_teachers
-		FROM teachers_in_year
-	`
+        WITH company AS (
+            SELECT company_id FROM academics.academic_year WHERE academic_year_id = $1
+        ),
+        teachers_in_year AS (
+            SELECT DISTINCT t.teacher_id, t.status
+            FROM academics.teachers t
+            JOIN academics.teacher_sections ts ON ts.teacher_id = t.teacher_id
+            JOIN academics.section s ON s.section_id = ts.section_id
+            JOIN academics.term term ON term.term_id = s.term_id
+            WHERE term.academic_year_id = $1
+              AND t.deleted_at IS NULL
+        )
+        SELECT
+            COUNT(teacher_id) AS total_teachers,
+            COUNT(teacher_id) FILTER (WHERE status = 'active') AS active_teachers
+        FROM teachers_in_year
+    `
+
 	var totalTeachers, activeTeachers int
 	err := db.QueryRowContext(ctx, query, academicYearID).Scan(&totalTeachers, &activeTeachers)
 	if err != nil {
 		return fmt.Errorf("refresh teacher metrics: %w", err)
 	}
+
 	upsertQuery := `
         INSERT INTO analytics.teacher_metrics (academic_year_id, total_teachers, active_teachers, last_updated)
         VALUES ($1, $2, $3, NOW())
@@ -2702,13 +2514,14 @@ func (r *analyticsRepository) RefreshTeacherMetrics(ctx context.Context, db DBTX
             active_teachers = EXCLUDED.active_teachers,
             last_updated = NOW()
     `
+
 	_, err = db.ExecContext(ctx, upsertQuery, academicYearID, totalTeachers, activeTeachers)
 	if err != nil {
 		return fmt.Errorf("upsert teacher metrics: %w", err)
 	}
+
 	return nil
 }
-
 func (r *analyticsRepository) DeleteTeacherMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `DELETE FROM analytics.teacher_metrics WHERE academic_year_id = $1`
 	result, err := db.ExecContext(ctx, query, academicYearID)
@@ -2966,19 +2779,19 @@ func (r *analyticsRepository) UpdateTransportMetrics(ctx context.Context, db DBT
 }
 
 func (r *analyticsRepository) RefreshTransportMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
-	// Transport is company-level. We'll get the company from the academic year.
 	query := `
-		WITH company AS (
-			SELECT company_id FROM academics.academic_year WHERE academic_year_id = $1
-		)
-		SELECT
-			(SELECT COUNT(*) FROM academics.transport_routes WHERE company_id = (SELECT company_id FROM company) AND deleted_at IS NULL) AS total_routes,
-			(SELECT COUNT(*) FROM academics.transport_stops WHERE route_id IN (SELECT route_id FROM academics.transport_routes WHERE company_id = (SELECT company_id FROM company)) AND deleted_at IS NULL) AS total_stops,
-			(SELECT COUNT(*) FROM academics.transport_vehicles WHERE company_id = (SELECT company_id FROM company) AND deleted_at IS NULL) AS total_vehicles,
-			(SELECT COUNT(*) FROM academics.transport_vehicles WHERE company_id = (SELECT company_id FROM company) AND is_active = true AND deleted_at IS NULL) AS active_vehicles,
-			(SELECT COUNT(*) FROM academics.transport_driver_assignments WHERE vehicle_id IN (SELECT vehicle_id FROM academics.transport_vehicles WHERE company_id = (SELECT company_id FROM company)) AND deleted_at IS NULL) AS total_driver_assignments,
-			(SELECT COUNT(*) FROM academics.student_transport_assignments WHERE route_id IN (SELECT route_id FROM academics.transport_routes WHERE company_id = (SELECT company_id FROM company)) AND deleted_at IS NULL) AS total_student_assignments
-	`
+        WITH company AS (
+            SELECT company_id FROM academics.academic_year WHERE academic_year_id = $1
+        )
+        SELECT
+            (SELECT COUNT(*) FROM academics.transport_routes WHERE company_id = (SELECT company_id FROM company)) AS total_routes,
+            (SELECT COUNT(*) FROM academics.transport_stops WHERE route_id IN (SELECT route_id FROM academics.transport_routes WHERE company_id = (SELECT company_id FROM company))) AS total_stops,
+            (SELECT COUNT(*) FROM academics.transport_vehicles WHERE company_id = (SELECT company_id FROM company)) AS total_vehicles,
+            (SELECT COUNT(*) FROM academics.transport_vehicles WHERE company_id = (SELECT company_id FROM company) AND is_active = true) AS active_vehicles,
+            (SELECT COUNT(*) FROM academics.transport_driver_assignments WHERE vehicle_id IN (SELECT vehicle_id FROM academics.transport_vehicles WHERE company_id = (SELECT company_id FROM company))) AS total_driver_assignments,
+            (SELECT COUNT(*) FROM academics.student_transport_assignments WHERE route_id IN (SELECT route_id FROM academics.transport_routes WHERE company_id = (SELECT company_id FROM company))) AS total_student_assignments
+    `
+
 	var totalRoutes, totalStops, totalVehicles, activeVehicles, totalDriverAssignments, totalStudentAssignments int
 	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
 		&totalRoutes, &totalStops, &totalVehicles, &activeVehicles,
@@ -2987,6 +2800,7 @@ func (r *analyticsRepository) RefreshTransportMetrics(ctx context.Context, db DB
 	if err != nil {
 		return fmt.Errorf("refresh transport metrics: %w", err)
 	}
+
 	upsertQuery := `
         INSERT INTO analytics.transport_metrics (
             academic_year_id, total_routes, total_stops, total_vehicles, active_vehicles,
@@ -3001,13 +2815,16 @@ func (r *analyticsRepository) RefreshTransportMetrics(ctx context.Context, db DB
             total_student_assignments = EXCLUDED.total_student_assignments,
             last_updated = NOW()
     `
+
 	_, err = db.ExecContext(ctx, upsertQuery,
-		academicYearID, totalRoutes, totalStops, totalVehicles, activeVehicles,
+		academicYearID,
+		totalRoutes, totalStops, totalVehicles, activeVehicles,
 		totalDriverAssignments, totalStudentAssignments,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert transport metrics: %w", err)
 	}
+
 	return nil
 }
 
@@ -3027,5 +2844,244 @@ func (r *analyticsRepository) DeleteTransportMetrics(ctx context.Context, db DBT
 	if rows == 0 {
 		return fmt.Errorf("%w: transport metrics %s", ErrNotFound, academicYearID)
 	}
+	return nil
+}
+
+func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
+	query := `
+        WITH student_counts AS (
+            SELECT 
+                e.academic_year_id,
+                COUNT(DISTINCT e.student_id) AS total_students,
+                COUNT(DISTINCT e.student_id) FILTER (WHERE s.status = 'active') AS active_students
+            FROM academics.enrollments e
+            JOIN academics.students s ON s.student_id = e.student_id
+            WHERE e.academic_year_id = $1
+              AND e.status = 'active'
+              AND s.deleted_at IS NULL
+            GROUP BY e.academic_year_id
+        ),
+        term_counts AS (
+            SELECT academic_year_id, COUNT(*) AS total_terms
+            FROM academics.term
+            WHERE academic_year_id = $1 AND deleted_at IS NULL
+            GROUP BY academic_year_id
+        ),
+        section_counts AS (
+            SELECT 
+                t.academic_year_id, 
+                COUNT(DISTINCT s.section_id) AS total_sections
+            FROM academics.section s
+            JOIN academics.term t ON t.term_id = s.term_id
+            WHERE t.academic_year_id = $1 
+              AND s.deleted_at IS NULL 
+              AND t.deleted_at IS NULL
+            GROUP BY t.academic_year_id
+        ),
+        course_counts AS (
+            SELECT 
+                t.academic_year_id, 
+                COUNT(DISTINCT s.course_id) AS total_courses
+            FROM academics.section s
+            JOIN academics.term t ON t.term_id = s.term_id
+            WHERE t.academic_year_id = $1 
+              AND s.deleted_at IS NULL 
+              AND t.deleted_at IS NULL
+            GROUP BY t.academic_year_id
+        ),
+        subject_counts AS (
+            SELECT 
+                t.academic_year_id, 
+                COUNT(DISTINCT sub.subject_id) AS total_subjects
+            FROM academics.section s
+            JOIN academics.term t ON t.term_id = s.term_id
+            JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
+            JOIN academics.subject sub ON sub.subject_id = scm.subject_id
+            WHERE t.academic_year_id = $1 
+              AND s.deleted_at IS NULL 
+              AND t.deleted_at IS NULL
+              AND sub.deleted_at IS NULL
+            GROUP BY t.academic_year_id
+        ),
+        admission_counts AS (
+            SELECT 
+                academic_year_id,
+                COUNT(*) AS total_admissions,
+                COUNT(*) FILTER (WHERE admission_status = 'approved') AS approved_admissions,
+                COUNT(*) FILTER (WHERE admission_status = 'pending') AS pending_admissions,
+                COUNT(*) FILTER (WHERE admission_status = 'rejected') AS rejected_admissions
+            FROM academics.admissions
+            WHERE academic_year_id = $1
+            GROUP BY academic_year_id
+        ),
+        assignment_counts AS (
+            SELECT 
+                t.academic_year_id,
+                COUNT(a.assignment_id) AS total_assignments,
+                COUNT(a.assignment_id) FILTER (WHERE a.is_published = true) AS published_assignments
+            FROM academics.assignments a
+            JOIN academics.section s ON s.section_id = a.section_id
+            JOIN academics.term t ON t.term_id = s.term_id
+            WHERE t.academic_year_id = $1 AND a.deleted_at IS NULL
+            GROUP BY t.academic_year_id
+        ),
+        attendance_counts AS (
+            SELECT 
+                e.academic_year_id,
+                COUNT(a.attendance_id) AS total_attendance_records,
+                COUNT(a.attendance_id) FILTER (WHERE a.status = 'absent') AS total_absent_records,
+                COUNT(a.attendance_id) FILTER (WHERE a.status = 'late') AS total_late_records,
+                COUNT(a.attendance_id) FILTER (WHERE a.status = 'half-day') AS total_half_day_records
+            FROM academics.student_attendance a
+            JOIN academics.enrollments e ON e.enrollment_id = a.enrollment_id
+            WHERE e.academic_year_id = $1
+            GROUP BY e.academic_year_id
+        ),
+        exemption_counts AS (
+            SELECT 
+                e.academic_year_id,
+                COUNT(ex.exemption_id) AS total_exemptions
+            FROM academics.student_attendance_exemptions ex
+            JOIN academics.enrollments e ON e.student_id = ex.student_id
+            WHERE e.academic_year_id = $1
+              AND ex.from_date <= (SELECT end_date FROM academics.academic_year WHERE academic_year_id = $1)
+            GROUP BY e.academic_year_id
+        ),
+        curriculum_counts AS (
+            SELECT 
+                t.academic_year_id,
+                COUNT(scm.mapping_id) AS total_subject_mappings,
+                COUNT(DISTINCT s.course_id) FILTER (WHERE scm.mapping_id IS NOT NULL) AS courses_with_curriculum
+            FROM academics.section s
+            JOIN academics.term t ON t.term_id = s.term_id
+            LEFT JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
+            WHERE t.academic_year_id = $1 
+              AND s.deleted_at IS NULL 
+              AND t.deleted_at IS NULL
+            GROUP BY t.academic_year_id
+        ),
+        enrollment_counts AS (
+            SELECT 
+                academic_year_id,
+                COUNT(*) AS total_enrollments,
+                COUNT(*) FILTER (WHERE status = 'active') AS active_enrollments,
+                COUNT(*) FILTER (WHERE status = 'completed') AS completed_enrollments,
+                COUNT(*) FILTER (WHERE status = 'withdrawn') AS withdrawn_enrollments
+            FROM academics.enrollments
+            WHERE academic_year_id = $1
+            GROUP BY academic_year_id
+        )
+        SELECT
+            COALESCE(sc.total_students, 0),
+            COALESCE(sc.active_students, 0),
+            COALESCE(tc.total_terms, 0),
+            COALESCE(scc.total_sections, 0),
+            COALESCE(cc.total_courses, 0),
+            COALESCE(suc.total_subjects, 0),
+            COALESCE(ac.total_admissions, 0),
+            COALESCE(ac.approved_admissions, 0),
+            COALESCE(ac.pending_admissions, 0),
+            COALESCE(ac.rejected_admissions, 0),
+            COALESCE(assign_cte.total_assignments, 0),
+            COALESCE(assign_cte.published_assignments, 0),
+            COALESCE(att.total_attendance_records, 0),
+            COALESCE(att.total_absent_records, 0),
+            COALESCE(att.total_late_records, 0),
+            COALESCE(att.total_half_day_records, 0),
+            COALESCE(exc.total_exemptions, 0),
+            COALESCE(cur.total_subject_mappings, 0),
+            COALESCE(cur.courses_with_curriculum, 0),
+            COALESCE(enc.total_enrollments, 0),
+            COALESCE(enc.active_enrollments, 0),
+            COALESCE(enc.completed_enrollments, 0),
+            COALESCE(enc.withdrawn_enrollments, 0)
+        FROM (SELECT $1 AS academic_year_id) ay
+        LEFT JOIN student_counts sc ON sc.academic_year_id = ay.academic_year_id
+        LEFT JOIN term_counts tc ON tc.academic_year_id = ay.academic_year_id
+        LEFT JOIN section_counts scc ON scc.academic_year_id = ay.academic_year_id
+        LEFT JOIN course_counts cc ON cc.academic_year_id = ay.academic_year_id
+        LEFT JOIN subject_counts suc ON suc.academic_year_id = ay.academic_year_id
+        LEFT JOIN admission_counts ac ON ac.academic_year_id = ay.academic_year_id
+        LEFT JOIN assignment_counts assign_cte ON assign_cte.academic_year_id = ay.academic_year_id
+        LEFT JOIN attendance_counts att ON att.academic_year_id = ay.academic_year_id
+        LEFT JOIN exemption_counts exc ON exc.academic_year_id = ay.academic_year_id
+        LEFT JOIN curriculum_counts cur ON cur.academic_year_id = ay.academic_year_id
+        LEFT JOIN enrollment_counts enc ON enc.academic_year_id = ay.academic_year_id
+    `
+
+	var totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects int
+	var totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions int
+	var totalAssignments, publishedAssignments int
+	var totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords int
+	var totalExemptions, totalSubjectMappings, coursesWithCurriculum int
+	var totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments int
+
+	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
+		&totalStudents, &activeStudents, &totalTerms, &totalSections, &totalCourses, &totalSubjects,
+		&totalAdmissions, &approvedAdmissions, &pendingAdmissions, &rejectedAdmissions,
+		&totalAssignments, &publishedAssignments,
+		&totalAttendanceRecords, &totalAbsentRecords, &totalLateRecords, &totalHalfDayRecords,
+		&totalExemptions, &totalSubjectMappings, &coursesWithCurriculum,
+		&totalEnrollments, &activeEnrollments, &completedEnrollments, &withdrawnEnrollments,
+	)
+	if err != nil {
+		return fmt.Errorf("recompute metrics: %w", err)
+	}
+
+	upsertQuery := `
+        INSERT INTO analytics.academic_year_metrics (
+            academic_year_id, total_students, active_students, total_terms,
+            total_sections, total_courses, total_subjects,
+            total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+            total_assignments, published_assignments,
+            total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+            total_exemptions, total_subject_mappings, courses_with_curriculum,
+            total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+            last_updated
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            $12, $13, $14, $15, $16, $17, $18, $19, $20,
+            $21, $22, $23, $24, NOW()
+        )
+        ON CONFLICT (academic_year_id) DO UPDATE SET
+            total_students = EXCLUDED.total_students,
+            active_students = EXCLUDED.active_students,
+            total_terms = EXCLUDED.total_terms,
+            total_sections = EXCLUDED.total_sections,
+            total_courses = EXCLUDED.total_courses,
+            total_subjects = EXCLUDED.total_subjects,
+            total_admissions = EXCLUDED.total_admissions,
+            approved_admissions = EXCLUDED.approved_admissions,
+            pending_admissions = EXCLUDED.pending_admissions,
+            rejected_admissions = EXCLUDED.rejected_admissions,
+            total_assignments = EXCLUDED.total_assignments,
+            published_assignments = EXCLUDED.published_assignments,
+            total_attendance_records = EXCLUDED.total_attendance_records,
+            total_absent_records = EXCLUDED.total_absent_records,
+            total_late_records = EXCLUDED.total_late_records,
+            total_half_day_records = EXCLUDED.total_half_day_records,
+            total_exemptions = EXCLUDED.total_exemptions,
+            total_subject_mappings = EXCLUDED.total_subject_mappings,
+            courses_with_curriculum = EXCLUDED.courses_with_curriculum,
+            total_enrollments = EXCLUDED.total_enrollments,
+            active_enrollments = EXCLUDED.active_enrollments,
+            completed_enrollments = EXCLUDED.completed_enrollments,
+            withdrawn_enrollments = EXCLUDED.withdrawn_enrollments,
+            last_updated = NOW()
+    `
+
+	_, err = db.ExecContext(ctx, upsertQuery,
+		academicYearID,
+		totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects,
+		totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions,
+		totalAssignments, publishedAssignments,
+		totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords,
+		totalExemptions, totalSubjectMappings, coursesWithCurriculum,
+		totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert metrics: %w", err)
+	}
+
 	return nil
 }

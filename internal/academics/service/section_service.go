@@ -2,9 +2,9 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -12,15 +12,15 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// ---------------------------------------------------------------------
-// SectionService interface (unchanged)
-// ---------------------------------------------------------------------
-
+// SectionService defines the interface for section operations.
 type SectionService interface {
 	Create(ctx context.Context, req CreateSectionRequest) (*models.Section, error)
-	BulkCreate(ctx context.Context, req []CreateSectionRequest) ([]*models.Section, error)
+	BulkCreate(ctx context.Context, reqs []CreateSectionRequest) ([]*models.Section, error)
 	Upsert(ctx context.Context, req CreateSectionRequest) (*models.Section, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Section, error)
 	List(ctx context.Context, filter repository.SectionFilter, p repository.Pagination, s repository.Sort) ([]*models.Section, error)
@@ -36,53 +36,44 @@ type SectionService interface {
 	ValidateCapacity(ctx context.Context, sectionID uuid.UUID) error
 }
 
-// ---------------------------------------------------------------------
-// sectionService struct (updated with audit/outbox)
-// ---------------------------------------------------------------------
-
 type sectionService struct {
-	repo           repository.SectionRepository
-	courseRepo     repository.CourseRepository
-	termRepo       repository.TermRepository
-	enrollmentRepo repository.EnrollmentRepository
-
-	auditLogger AuditLogger
-	outboxStore OutboxStore
-
-	pgClient *client.PostgresClient
-	logger   *zap.Logger
+	repo             repository.SectionRepository
+	courseRepo       repository.CourseRepository
+	termRepo         repository.TermRepository
+	enrollmentRepo   repository.EnrollmentRepository
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
+	idempotencyStore idempotency.Store
+	pgClient         *client.PostgresClient
+	logger           *zap.Logger
 }
 
-// ---------------------------------------------------------------------
-// Constructor (updated)
-// ---------------------------------------------------------------------
-
+// NewSectionService creates a new section service with all dependencies.
 func NewSectionService(
 	repo repository.SectionRepository,
 	courseRepo repository.CourseRepository,
 	termRepo repository.TermRepository,
 	enrollmentRepo repository.EnrollmentRepository,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 ) SectionService {
 	return &sectionService{
-		repo:           repo,
-		courseRepo:     courseRepo,
-		termRepo:       termRepo,
-		enrollmentRepo: enrollmentRepo,
-		auditLogger:    auditLogger,
-		outboxStore:    outboxStore,
-		pgClient:       pgClient,
-		logger:         logger.Named("section_service"),
+		repo:             repo,
+		courseRepo:       courseRepo,
+		termRepo:         termRepo,
+		enrollmentRepo:   enrollmentRepo,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
+		idempotencyStore: idempotencyStore,
+		pgClient:         pgClient,
+		logger:           logger.Named("section_service"),
 	}
 }
 
-// ---------------------------------------------------------------------
-// Validation helpers (reusable)
-// ---------------------------------------------------------------------
-
+// validateInput performs basic validation on the request.
 func (s *sectionService) validateInput(req CreateSectionRequest) error {
 	if req.CourseID == uuid.Nil {
 		return fmt.Errorf("%w: course_id is required", ErrInvalidInput)
@@ -99,8 +90,7 @@ func (s *sectionService) validateInput(req CreateSectionRequest) error {
 	return nil
 }
 
-// validateDomain ensures course exists, term exists, and term belongs to the same company as course.
-// Returns the course and term for reuse.
+// validateDomain ensures the course and term exist and belong to the same company.
 func (s *sectionService) validateDomain(ctx context.Context, tx repository.DBTX, courseID, termID uuid.UUID) (*models.Course, *models.Term, error) {
 	course, err := s.courseRepo.GetByID(ctx, tx, courseID)
 	if err != nil {
@@ -109,7 +99,6 @@ func (s *sectionService) validateDomain(ctx context.Context, tx repository.DBTX,
 	if course == nil {
 		return nil, nil, fmt.Errorf("%w: course %s", ErrNotFound, courseID)
 	}
-
 	term, err := s.termRepo.GetByID(ctx, tx, termID)
 	if err != nil {
 		return nil, nil, err
@@ -117,7 +106,7 @@ func (s *sectionService) validateDomain(ctx context.Context, tx repository.DBTX,
 	if term == nil {
 		return nil, nil, fmt.Errorf("%w: term %s", ErrNotFound, termID)
 	}
-
+	// Get academic year for term to verify company consistency
 	ay, err := s.termRepo.GetAcademicYearByTerm(ctx, tx, termID)
 	if err != nil {
 		return nil, nil, err
@@ -131,15 +120,8 @@ func (s *sectionService) validateDomain(ctx context.Context, tx repository.DBTX,
 	return course, term, nil
 }
 
-// ---------------------------------------------------------------------
-// Core CRUD (upgraded with outbox, audit, locking)
-// ---------------------------------------------------------------------
-
+// Create implements SectionService.
 func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (*models.Section, error) {
-	// Add timeout for safety
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(
 		zap.String("method", "Create"),
 		zap.String("course_id", req.CourseID.String()),
@@ -157,13 +139,23 @@ func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (
 	}
 	defer tx.Rollback()
 
-	// Validate domain (course, term, company consistency)
+	// Idempotency check
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.Section
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
+
+	// Validate domain (course and term)
 	_, _, err = s.validateDomain(ctx, tx, req.CourseID, req.TermID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check uniqueness
+	// Check uniqueness (course_id, term_id, name)
 	exists, err := s.repo.Exists(ctx, tx, req.CourseID, req.TermID, req.Name)
 	if err != nil {
 		return nil, err
@@ -186,13 +178,31 @@ func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (
 		return nil, err
 	}
 
+	// Store idempotency response
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, section); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit log
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_CREATE", section.SectionID, nil, section, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "create", "section",
+			&section.SectionID, "user", req.CreatedBy, nil, nil,
+			map[string]interface{}{"name": section.Name, "course_id": section.CourseID, "term_id": section.TermID})
 	}
 
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionCreated), section); err != nil {
+	payload, _ := json.Marshal(section)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   section.SectionID.String(),
+		EventType:     string(EventSectionCreated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
@@ -204,14 +214,19 @@ func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (
 	return section, nil
 }
 
+// BulkCreate implements SectionService.
 func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionRequest) ([]*models.Section, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("batch_size", len(reqs)))
 
-	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
+	// Validate each request first (without transaction)
+	for i, req := range reqs {
+		if err := s.validateInput(req); err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -219,7 +234,17 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 	}
 	defer tx.Rollback()
 
-	// Collect unique course and term IDs
+	// Idempotency check (optional for bulk)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing []*models.Section
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent bulk request, returning cached response")
+			return existing, nil
+		}
+	}
+
+	// Preload all needed courses and terms
 	courseIDs := make(map[uuid.UUID]struct{})
 	termIDs := make(map[uuid.UUID]struct{})
 	for _, req := range reqs {
@@ -229,7 +254,7 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 	courseList := keysToSlice(courseIDs)
 	termList := keysToSlice(termIDs)
 
-	// Preload and lock courses (optional: lock only if needed)
+	// Load courses
 	coursesMap := make(map[uuid.UUID]*models.Course)
 	for _, cid := range courseList {
 		course, err := s.courseRepo.GetByIDForUpdate(ctx, tx, cid)
@@ -242,7 +267,7 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		coursesMap[cid] = course
 	}
 
-	// Preload terms
+	// Load terms
 	termsMap, err := s.termRepo.GetByIDs(ctx, tx, termList)
 	if err != nil {
 		return nil, fmt.Errorf("preload terms: %w", err)
@@ -253,13 +278,13 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		}
 	}
 
-	// Preload academic years for terms (to validate company)
+	// Get academic years for terms to verify company consistency
 	termToAYMap, err := s.termRepo.GetAcademicYearsByTermIDs(ctx, tx, termList)
 	if err != nil {
 		return nil, fmt.Errorf("preload academic years: %w", err)
 	}
 
-	// Preload existing sections
+	// Load existing sections to check duplicates
 	existingSections, err := s.repo.List(ctx, tx, repository.SectionFilter{
 		CourseIDs: courseList,
 		TermIDs:   termList,
@@ -273,12 +298,10 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		existingKeyMap[key] = true
 	}
 
+	// Prepare sections for creation
 	seen := make(map[string]bool)
 	var toCreate []*models.Section
 	for i, req := range reqs {
-		if err := s.validateInput(req); err != nil {
-			return nil, fmt.Errorf("item %d: %w", i, err)
-		}
 		key := req.CourseID.String() + ":" + req.TermID.String() + ":" + req.Name
 		if seen[key] {
 			return nil, fmt.Errorf("item %d: %w: duplicate in batch", i, ErrDuplicate)
@@ -287,8 +310,6 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		if existingKeyMap[key] {
 			return nil, fmt.Errorf("item %d: %w: already exists", i, ErrDuplicate)
 		}
-
-		// Validate company consistency
 		course := coursesMap[req.CourseID]
 		ay := termToAYMap[req.TermID]
 		if course == nil {
@@ -300,7 +321,6 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		if course.CompanyID != ay.CompanyID {
 			return nil, fmt.Errorf("item %d: term does not belong to same company as course", i)
 		}
-
 		toCreate = append(toCreate, &models.Section{
 			CourseID:  req.CourseID,
 			TermID:    req.TermID,
@@ -312,17 +332,36 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 		})
 	}
 
+	// Bulk insert
 	if err := s.repo.BulkCreate(ctx, tx, toCreate); err != nil {
 		return nil, err
 	}
 
+	// Store idempotency response
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, toCreate); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit and outbox for each created section
 	for _, sec := range toCreate {
-		if err := s.auditLogger.Log(ctx, tx, "SECTION_BULK_CREATE", sec.SectionID, nil, sec, sec.CreatedBy); err != nil {
-			logger.Error("audit failed", zap.String("section_id", sec.SectionID.String()), zap.Error(err))
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, tx, nil, "academics", "bulk_create", "section",
+				&sec.SectionID, "user", sec.CreatedBy, nil, nil,
+				map[string]interface{}{"name": sec.Name})
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventSectionCreated), sec); err != nil {
-			return nil, fmt.Errorf("outbox store for section %s: %w", sec.SectionID, err)
+		payload, _ := json.Marshal(sec)
+		outboxEvent := &outbox.Event{
+			EventID:       uuid.New().String(),
+			AggregateType: "section",
+			AggregateID:   sec.SectionID.String(),
+			EventType:     string(EventSectionCreated),
+			Payload:       payload,
+			Status:        "pending",
+		}
+		if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+			return nil, fmt.Errorf("store outbox event for %s: %w", sec.SectionID, err)
 		}
 	}
 
@@ -334,10 +373,8 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 	return toCreate, nil
 }
 
+// Upsert implements SectionService.
 func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (*models.Section, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(
 		zap.String("method", "Upsert"),
 		zap.String("course_id", req.CourseID.String()),
@@ -355,6 +392,16 @@ func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (
 	}
 	defer tx.Rollback()
 
+	// Idempotency
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.Section
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
+
 	// Validate domain
 	_, _, err = s.validateDomain(ctx, tx, req.CourseID, req.TermID)
 	if err != nil {
@@ -371,17 +418,37 @@ func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (
 		UpdatedBy: req.UpdatedBy,
 	}
 
+	// Upsert operation (create or update)
 	if err := s.repo.Upsert(ctx, tx, section); err != nil {
 		return nil, err
 	}
 
-	// For upsert, we don't know if it was insert or update. We'll publish a generic event.
-	// If you need to differentiate, you could fetch before and after.
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_UPSERT", section.SectionID, nil, section, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Idempotency store
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, section); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), section); err != nil {
-		return nil, fmt.Errorf("outbox store: %w", err)
+
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "upsert", "section",
+			&section.SectionID, "user", req.UpdatedBy, nil, nil,
+			map[string]interface{}{"name": section.Name})
+	}
+
+	// Outbox event (use created/updated based on existence? Simpler: always "section.updated" for upsert)
+	payload, _ := json.Marshal(section)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   section.SectionID.String(),
+		EventType:     string(EventSectionUpdated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -392,61 +459,45 @@ func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (
 	return section, nil
 }
 
-// ---------------------------------------------------------------------
-// Read‑only operations (unchanged, no transaction needed)
-// ---------------------------------------------------------------------
-
+// GetByID implements SectionService.
 func (s *sectionService) GetByID(ctx context.Context, id uuid.UUID) (*models.Section, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	sec, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
+	section, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
 		return nil, err
 	}
-	if sec == nil {
+	if section == nil {
 		return nil, fmt.Errorf("%w: section %s", ErrNotFound, id)
 	}
-	return sec, nil
+	return section, nil
 }
 
+// List implements SectionService.
 func (s *sectionService) List(ctx context.Context, filter repository.SectionFilter, p repository.Pagination, srt repository.Sort) ([]*models.Section, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
+// ListByCourse implements SectionService.
 func (s *sectionService) ListByCourse(ctx context.Context, courseID uuid.UUID) ([]*models.Section, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	return s.repo.ListByCourse(ctx, s.pgClient.DB, courseID)
 }
 
+// ListByTerm implements SectionService.
 func (s *sectionService) ListByTerm(ctx context.Context, termID uuid.UUID) ([]*models.Section, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	return s.repo.ListByTerm(ctx, s.pgClient.DB, termID)
 }
 
+// Count implements SectionService.
 func (s *sectionService) Count(ctx context.Context, filter repository.SectionFilter) (int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
+// Exists implements SectionService.
 func (s *sectionService) Exists(ctx context.Context, courseID, termID uuid.UUID, name string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	return s.repo.Exists(ctx, s.pgClient.DB, courseID, termID, name)
 }
 
-// ---------------------------------------------------------------------
-// Update operations (with locking, audit, outbox)
-// ---------------------------------------------------------------------
-
+// Update implements SectionService.
 func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (*models.Section, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("section_id", req.SectionID.String()))
 
 	if req.SectionID == uuid.Nil {
@@ -465,6 +516,17 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 	}
 	defer tx.Rollback()
 
+	// Idempotency
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.Section
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
+
+	// Lock and fetch current section
 	section, err := s.repo.GetByIDForUpdate(ctx, tx, req.SectionID)
 	if err != nil {
 		return nil, err
@@ -474,7 +536,7 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 	}
 	oldSection := *section
 
-	// If name changed, check uniqueness
+	// Check name uniqueness if changed
 	if req.Name != section.Name {
 		exists, err := s.repo.Exists(ctx, tx, section.CourseID, section.TermID, req.Name)
 		if err != nil {
@@ -485,6 +547,7 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 		}
 	}
 
+	// Update fields
 	section.Name = req.Name
 	section.Capacity = req.Capacity
 	section.IsActive = req.IsActive
@@ -494,16 +557,33 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 		return nil, err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_UPDATE", req.SectionID, &oldSection, section, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Idempotency store
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, section); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
-	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
-		"old": oldSection,
-		"new": section,
-	}); err != nil {
-		return nil, fmt.Errorf("outbox store: %w", err)
+
+	// Audit log with before/after
+	if s.auditService != nil {
+		beforeJSON, _ := json.Marshal(oldSection)
+		afterJSON, _ := json.Marshal(section)
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "update", "section",
+			&req.SectionID, "user", req.UpdatedBy, beforeJSON, afterJSON, nil)
+	}
+
+	// Outbox event (store the full updated object)
+	payload, _ := json.Marshal(section)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   section.SectionID.String(),
+		EventType:     string(EventSectionUpdated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -514,10 +594,8 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 	return section, nil
 }
 
+// UpdateCapacity implements SectionService.
 func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID, capacity int, updatedBy *uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "UpdateCapacity"), zap.String("section_id", sectionID.String()))
 
 	if capacity < 0 {
@@ -530,6 +608,7 @@ func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID
 	}
 	defer tx.Rollback()
 
+	// Fetch old capacity for audit
 	section, err := s.repo.GetByIDForUpdate(ctx, tx, sectionID)
 	if err != nil {
 		return err
@@ -543,17 +622,30 @@ func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID
 		return err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_CAPACITY_UPDATE", sectionID, map[string]interface{}{"capacity": oldCapacity}, map[string]interface{}{"capacity": capacity}, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "update_capacity", "section",
+			&sectionID, "user", updatedBy, nil, nil,
+			map[string]interface{}{"old_capacity": oldCapacity, "new_capacity": capacity})
 	}
-	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+
+	// Outbox event (partial update)
+	eventData := map[string]interface{}{
 		"section_id": sectionID,
 		"old":        map[string]interface{}{"capacity": oldCapacity},
 		"new":        map[string]interface{}{"capacity": capacity},
-	}); err != nil {
-		return fmt.Errorf("outbox store: %w", err)
+	}
+	payload, _ := json.Marshal(eventData)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   sectionID.String(),
+		EventType:     string(EventSectionUpdated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -564,10 +656,8 @@ func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID
 	return nil
 }
 
+// Activate implements SectionService.
 func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "Activate"), zap.String("section_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -589,17 +679,28 @@ func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *
 		return err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_ACTIVATE", id, map[string]interface{}{"is_active": oldActive}, map[string]interface{}{"is_active": true}, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "activate", "section",
+			&id, "user", updatedBy, nil, nil,
+			map[string]interface{}{"was_active": oldActive, "is_active": true})
 	}
-	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+
+	eventData := map[string]interface{}{
 		"section_id": id,
 		"old":        map[string]interface{}{"is_active": oldActive},
 		"new":        map[string]interface{}{"is_active": true},
-	}); err != nil {
-		return fmt.Errorf("outbox store: %w", err)
+	}
+	payload, _ := json.Marshal(eventData)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   id.String(),
+		EventType:     string(EventSectionUpdated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -610,10 +711,8 @@ func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *
 	return nil
 }
 
+// Deactivate implements SectionService.
 func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "Deactivate"), zap.String("section_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -635,17 +734,28 @@ func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 		return err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_DEACTIVATE", id, map[string]interface{}{"is_active": oldActive}, map[string]interface{}{"is_active": false}, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "deactivate", "section",
+			&id, "user", updatedBy, nil, nil,
+			map[string]interface{}{"was_active": oldActive, "is_active": false})
 	}
-	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionUpdated), map[string]interface{}{
+
+	eventData := map[string]interface{}{
 		"section_id": id,
 		"old":        map[string]interface{}{"is_active": oldActive},
 		"new":        map[string]interface{}{"is_active": false},
-	}); err != nil {
-		return fmt.Errorf("outbox store: %w", err)
+	}
+	payload, _ := json.Marshal(eventData)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   id.String(),
+		EventType:     string(EventSectionUpdated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -656,10 +766,8 @@ func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 	return nil
 }
 
+// Delete implements SectionService.
 func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("section_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -668,7 +776,7 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	}
 	defer tx.Rollback()
 
-	// Lock the section to prevent concurrent deletes
+	// Lock and fetch
 	section, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
 		return err
@@ -679,7 +787,7 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return nil
 	}
 
-	// Check for dependent enrollments
+	// Check for dependencies (enrollments)
 	count, err := s.enrollmentRepo.CountBySection(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("failed to check enrollments: %w", err)
@@ -693,15 +801,28 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	}
 
 	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SECTION_DELETE", id, section, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		beforeJSON, _ := json.Marshal(section)
+		_ = s.auditService.LogAction(ctx, tx, nil, "academics", "delete", "section",
+			&id, "user", deletedBy, beforeJSON, nil, nil)
 	}
+
 	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSectionDeleted), map[string]interface{}{
+	eventData := map[string]interface{}{
 		"section_id": id,
 		"deleted_by": deletedBy,
-	}); err != nil {
-		return fmt.Errorf("outbox store: %w", err)
+	}
+	payload, _ := json.Marshal(eventData)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "section",
+		AggregateID:   id.String(),
+		EventType:     string(EventSectionDeleted),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -712,17 +833,8 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Validation (read-only, but should be done within transaction if used in critical path)
-// ---------------------------------------------------------------------
-
+// ValidateCapacity implements SectionService.
 func (s *sectionService) ValidateCapacity(ctx context.Context, sectionID uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	// For validation, we don't need a transaction unless we intend to lock.
-	// But to avoid race conditions, we should use a row lock when the caller is about to enroll.
-	// This method is read-only; we'll rely on caller to lock if needed.
 	section, err := s.repo.GetByID(ctx, s.pgClient.DB, sectionID)
 	if err != nil {
 		return err
@@ -731,25 +843,19 @@ func (s *sectionService) ValidateCapacity(ctx context.Context, sectionID uuid.UU
 		return fmt.Errorf("%w: section %s", ErrNotFound, sectionID)
 	}
 	if section.Capacity <= 0 {
-		return nil
+		return nil // unlimited capacity
 	}
-
 	enrolled, err := s.enrollmentRepo.CountActiveBySection(ctx, s.pgClient.DB, sectionID)
 	if err != nil {
 		return fmt.Errorf("failed to count enrollments: %w", err)
 	}
-
 	if enrolled >= int64(section.Capacity) {
 		return fmt.Errorf("%w: section capacity %d exceeded (enrolled: %d)", ErrCapacityExceeded, section.Capacity, enrolled)
 	}
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------
-
-// keysToSlice converts a map of UUIDs to a slice (reused from earlier)
+// Helper
 func keysToSlice(m map[uuid.UUID]struct{}) []uuid.UUID {
 	s := make([]uuid.UUID, 0, len(m))
 	for k := range m {

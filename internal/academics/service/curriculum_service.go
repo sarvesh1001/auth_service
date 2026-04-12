@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -10,31 +12,37 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
 // ---------------------------------------------------------------------
-// CurriculumService interface (unchanged)
+// Event types (matching outbox pattern)
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// CurriculumService interface (updated with idempotency keys)
 // ---------------------------------------------------------------------
 
 type CurriculumService interface {
-	AssignSubjectToCourse(ctx context.Context, req AssignSubjectRequest) error
-	BulkAssignSubjects(ctx context.Context, reqs []AssignSubjectRequest) error
+	AssignSubjectToCourse(ctx context.Context, req AssignSubjectRequest, idempotencyKey string) error
+	BulkAssignSubjects(ctx context.Context, reqs []AssignSubjectRequest, idempotencyKey string) error
 
 	GetSubjectsByCourse(ctx context.Context, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error)
 	GetSubjectsByCourseAndTerm(ctx context.Context, courseID uuid.UUID, termNumber int) ([]*models.SubjectCourseMapping, error)
 
 	GetCoursesBySubject(ctx context.Context, subjectID uuid.UUID) ([]*models.SubjectCourseMapping, error)
 
-	RemoveMapping(ctx context.Context, mappingID uuid.UUID) error
-	RemoveAllForCourse(ctx context.Context, courseID uuid.UUID) error
+	RemoveMapping(ctx context.Context, mappingID uuid.UUID, idempotencyKey string) error
+	RemoveAllForCourse(ctx context.Context, courseID uuid.UUID, idempotencyKey string) error
 
 	Exists(ctx context.Context, courseID, subjectID uuid.UUID, termNumber int) (bool, error)
-
 	ValidateCurriculum(ctx context.Context, courseID uuid.UUID) error
 }
 
 // ---------------------------------------------------------------------
-// curriculumService struct (updated)
+// curriculumService struct (updated with proper infrastructure)
 // ---------------------------------------------------------------------
 
 type curriculumService struct {
@@ -42,12 +50,15 @@ type curriculumService struct {
 	courseRepo  repository.CourseRepository
 	subjectRepo repository.SubjectRepository
 
-	auditLogger         AuditLogger
-	outboxStore         OutboxStore
-	notificationService NotificationService // added
-
 	pgClient *client.PostgresClient
 	logger   *zap.Logger
+
+	notificationService NotificationService
+
+	// Infrastructure dependencies (same pattern as assignment/attendance)
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
 
 // ---------------------------------------------------------------------
@@ -58,29 +69,56 @@ func NewCurriculumService(
 	mappingRepo repository.SubjectCourseMappingRepository,
 	courseRepo repository.CourseRepository,
 	subjectRepo repository.SubjectRepository,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
-	notificationService NotificationService, // new parameter
+	notificationService NotificationService,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) CurriculumService {
 	return &curriculumService{
 		mappingRepo:         mappingRepo,
 		courseRepo:          courseRepo,
 		subjectRepo:         subjectRepo,
-		auditLogger:         auditLogger,
-		outboxStore:         outboxStore,
 		pgClient:            pgClient,
 		logger:              logger.Named("curriculum_service"),
 		notificationService: notificationService,
+		idempotencyStore:    idempotencyStore,
+		auditService:        auditService,
+		outboxRepo:          outboxRepo,
 	}
 }
 
 // ---------------------------------------------------------------------
-// Helper for notification creation
+// Helper: store outbox event for curriculum
 // ---------------------------------------------------------------------
 
-// buildNotificationRequestForCurriculum constructs a CreateNotificationRequest for curriculum changes.
+func (s *curriculumService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "subject_course_mapping",
+		AggregateID:   aggregateID.String(),
+		EventType:     string(eventType),
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
+}
+
+// ---------------------------------------------------------------------
+// Helper for notification creation (unchanged, but now uses actor from context or request)
+// ---------------------------------------------------------------------
+
 func (s *curriculumService) buildNotificationRequestForCurriculum(
 	course *models.Course,
 	subject *models.Subject,
@@ -132,15 +170,16 @@ func (s *curriculumService) buildNotificationRequestForCurriculum(
 }
 
 // ---------------------------------------------------------------------
-// Core Operations (updated with notifications)
+// Core Operations (updated with idempotency, audit, outbox)
 // ---------------------------------------------------------------------
 
-func (s *curriculumService) AssignSubjectToCourse(ctx context.Context, req AssignSubjectRequest) error {
+func (s *curriculumService) AssignSubjectToCourse(ctx context.Context, req AssignSubjectRequest, idempotencyKey string) error {
 	logger := s.logger.With(
 		zap.String("method", "AssignSubjectToCourse"),
 		zap.String("course_id", req.CourseID.String()),
 		zap.String("subject_id", req.SubjectID.String()),
 		zap.Int("term", req.TermNumber),
+		zap.String("idempotency_key", idempotencyKey),
 	)
 
 	if err := s.validateAssign(req); err != nil {
@@ -152,6 +191,15 @@ func (s *curriculumService) AssignSubjectToCourse(ctx context.Context, req Assig
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing struct{ Dummy bool } // we only need to know if key exists
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	// Lock the course to prevent concurrent curriculum changes
 	course, err := s.courseRepo.GetByIDForUpdate(ctx, tx, req.CourseID)
@@ -189,15 +237,27 @@ func (s *curriculumService) AssignSubjectToCourse(ctx context.Context, req Assig
 		return err
 	}
 
+	// Store idempotency key inside transaction
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit log
-	if err := s.auditLogger.Log(ctx, tx, "CURRICULUM_ASSIGN",
-		mapping.MappingID, nil, mapping, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "assign", "subject_course_mapping",
+			&mapping.MappingID, "user", nil, nil, nil, map[string]interface{}{
+				"course_id":     mapping.CourseID,
+				"subject_id":    mapping.SubjectID,
+				"term_number":   mapping.TermNumber,
+				"is_compulsory": mapping.IsCompulsory,
+			})
 	}
 
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectAssigned), mapping); err != nil {
-		return fmt.Errorf("store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventSubjectAssigned, mapping.MappingID, mapping); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -208,7 +268,7 @@ func (s *curriculumService) AssignSubjectToCourse(ctx context.Context, req Assig
 
 	// Create notification (after commit)
 	if s.notificationService != nil {
-		notifReq := s.buildNotificationRequestForCurriculum(course, subject, req.TermNumber, "assigned", nil) // actor is nil because request doesn't have one
+		notifReq := s.buildNotificationRequestForCurriculum(course, subject, req.TermNumber, "assigned", nil)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
@@ -217,17 +277,30 @@ func (s *curriculumService) AssignSubjectToCourse(ctx context.Context, req Assig
 	return nil
 }
 
-func (s *curriculumService) BulkAssignSubjects(ctx context.Context, reqs []AssignSubjectRequest) error {
+func (s *curriculumService) BulkAssignSubjects(ctx context.Context, reqs []AssignSubjectRequest, idempotencyKey string) error {
 	if len(reqs) == 0 {
 		return nil
 	}
-	logger := s.logger.With(zap.String("method", "BulkAssignSubjects"), zap.Int("count", len(reqs)))
+	logger := s.logger.With(
+		zap.String("method", "BulkAssignSubjects"),
+		zap.Int("count", len(reqs)),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing struct{ Dummy bool }
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	// Collect all course and subject IDs
 	courseIDs := make(map[uuid.UUID]struct{})
@@ -310,13 +383,25 @@ func (s *curriculumService) BulkAssignSubjects(ctx context.Context, reqs []Assig
 		return err
 	}
 
-	// Audit logs (optional per mapping)
-	for _, m := range mappings {
-		if err := s.auditLogger.Log(ctx, tx, "CURRICULUM_BULK_ASSIGN",
-			m.MappingID, nil, m, nil); err != nil {
-			logger.Error("audit log failed", zap.String("mapping_id", m.MappingID.String()), zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventSubjectAssigned), m); err != nil {
+	}
+
+	// Audit and outbox for each mapping
+	for _, m := range mappings {
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_assign", "subject_course_mapping",
+				&m.MappingID, "user", nil, nil, nil, map[string]interface{}{
+					"course_id":     m.CourseID,
+					"subject_id":    m.SubjectID,
+					"term_number":   m.TermNumber,
+					"is_compulsory": m.IsCompulsory,
+				})
+		}
+		if err := s.storeOutboxEvent(ctx, tx, EventSubjectAssigned, m.MappingID, m); err != nil {
 			return fmt.Errorf("outbox store for mapping %s: %w", m.MappingID, err)
 		}
 	}
@@ -344,14 +429,27 @@ func (s *curriculumService) BulkAssignSubjects(ctx context.Context, reqs []Assig
 	return nil
 }
 
-func (s *curriculumService) RemoveMapping(ctx context.Context, mappingID uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "RemoveMapping"), zap.String("mapping_id", mappingID.String()))
+func (s *curriculumService) RemoveMapping(ctx context.Context, mappingID uuid.UUID, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "RemoveMapping"),
+		zap.String("mapping_id", mappingID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing struct{ Dummy bool }
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	mapping, err := s.mappingRepo.GetByIDForUpdate(ctx, tx, mappingID)
 	if err != nil {
@@ -381,14 +479,25 @@ func (s *curriculumService) RemoveMapping(ctx context.Context, mappingID uuid.UU
 		return err
 	}
 
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit log
-	if err := s.auditLogger.Log(ctx, tx, "CURRICULUM_UNASSIGN",
-		mappingID, mapping, nil, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "unassign", "subject_course_mapping",
+			&mappingID, "user", nil, nil, nil, map[string]interface{}{
+				"course_id":   mapping.CourseID,
+				"subject_id":  mapping.SubjectID,
+				"term_number": mapping.TermNumber,
+			})
 	}
 
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectUnassigned), mapping); err != nil {
+	if err := s.storeOutboxEvent(ctx, tx, EventSubjectUnassigned, mappingID, mapping); err != nil {
 		return fmt.Errorf("outbox store: %w", err)
 	}
 
@@ -409,14 +518,27 @@ func (s *curriculumService) RemoveMapping(ctx context.Context, mappingID uuid.UU
 	return nil
 }
 
-func (s *curriculumService) RemoveAllForCourse(ctx context.Context, courseID uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "RemoveAllForCourse"), zap.String("course_id", courseID.String()))
+func (s *curriculumService) RemoveAllForCourse(ctx context.Context, courseID uuid.UUID, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "RemoveAllForCourse"),
+		zap.String("course_id", courseID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing struct{ Dummy bool }
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	// Lock the course
 	course, err := s.courseRepo.GetByIDForUpdate(ctx, tx, courseID)
@@ -436,13 +558,24 @@ func (s *curriculumService) RemoveAllForCourse(ctx context.Context, courseID uui
 		return err
 	}
 
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit and outbox for each removed mapping
 	for _, m := range mappings {
-		if err := s.auditLogger.Log(ctx, tx, "CURRICULUM_REMOVE_ALL",
-			m.MappingID, m, nil, nil); err != nil {
-			logger.Error("audit log failed", zap.String("mapping_id", m.MappingID.String()), zap.Error(err))
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "remove_all", "subject_course_mapping",
+				&m.MappingID, "user", nil, nil, nil, map[string]interface{}{
+					"course_id":   m.CourseID,
+					"subject_id":  m.SubjectID,
+					"term_number": m.TermNumber,
+				})
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventSubjectUnassigned), m); err != nil {
+		if err := s.storeOutboxEvent(ctx, tx, EventSubjectUnassigned, m.MappingID, m); err != nil {
 			return fmt.Errorf("outbox store for mapping %s: %w", m.MappingID, err)
 		}
 	}
@@ -453,10 +586,8 @@ func (s *curriculumService) RemoveAllForCourse(ctx context.Context, courseID uui
 
 	logger.Info("all mappings removed", zap.Int("count", len(mappings)))
 
-	// Create notifications (after commit) – for each removed mapping
+	// Create notification (after commit) – summary notification
 	if s.notificationService != nil && len(mappings) > 0 {
-		// Fetch subject details (we already have them? Not in mappings list; we need to fetch each subject)
-		// Alternatively, we can send a summary notification. For simplicity, we'll send one summary notification.
 		title := "All Subjects Removed from Course"
 		message := fmt.Sprintf("All subjects have been removed from course '%s' (%s)", course.Name, course.Code)
 		notifReq := CreateNotificationRequest{
@@ -481,7 +612,7 @@ func (s *curriculumService) RemoveAllForCourse(ctx context.Context, courseID uui
 }
 
 // ---------------------------------------------------------------------
-// Read‑only operations (unchanged)
+// Read‑only operations (unchanged, no idempotency/audit needed)
 // ---------------------------------------------------------------------
 
 func (s *curriculumService) GetSubjectsByCourse(ctx context.Context, courseID uuid.UUID) ([]*models.SubjectCourseMapping, error) {

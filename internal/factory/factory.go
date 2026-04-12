@@ -231,7 +231,11 @@ type Factory struct {
 	reportingHandler                  *payrollhandler.ReportingHandler
 	taxDeclarationHandler             *payrollhandler.TaxDeclarationHandler
 	academicsInfra                    *AcademicsInfraFactory // <-- new
-	
+	analyticsConsumer                 *consumer.AnalyticsConsumer
+	analyticsConsumerCancel           context.CancelFunc
+	studentConsumer                   *consumer.StudentConsumer
+	studentConsumerCancel             context.CancelFunc
+
 	// Email sender for notifications
 	emailSender email.Sender
 }
@@ -315,17 +319,17 @@ func NewFactory() (*Factory, error) {
 	f.initializeManagers()
 
 	// ============================================================
-	// NEW: Initialize Academics + Infrastructure Factory
+	// Initialize Academics + Infrastructure Factory
 	// ============================================================
 	academicsInfra, err := NewAcademicsInfraFactory(
-		f.postgresClient,
-		f.redisClient,
-		f.kafkaProducer,
-		f.encryptionManager,
-		&kafkaEventPublisher{producer: f.kafkaProducer}, // EventPublisher
-		f.GetAuditService(),                             // *audit.AuditService
-		f.emailSender,                                   // email.Sender
-		f.GetSessionService(),                           // *mainservice.SessionService
+		f.PostgresClient(),
+		f.RedisClient(),
+		f.KafkaProducer(),
+		f.EncryptionManager(),
+		&kafkaEventPublisher{producer: f.KafkaProducer()},
+		f.GetAuditService(),
+		f.emailSender,
+		f.GetSessionService(),
 		f.logger,
 	)
 	if err != nil {
@@ -387,6 +391,74 @@ func NewFactory() (*Factory, error) {
 	}
 
 	f.initializePayrollWorker()
+
+	// ============================================================
+	// Initialize analytics and student consumers
+	// ============================================================
+	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
+		// Analytics consumer – listens to academics-events topic
+		analyticsTopic := "academics-events" // or make configurable
+		analyticsKafkaConsumer, err := client.NewKafkaConsumer(
+			f.config,
+			analyticsTopic,
+			"analytics-consumer-group",
+			f.logger,
+		)
+		if err != nil {
+			f.logger.Error("Failed to create analytics Kafka consumer", zap.Error(err))
+		} else {
+			analyticsSvc := f.academicsInfra.AnalyticsService()
+			analyticsRepo := f.academicsInfra.AnalyticsRepo()
+			f.analyticsConsumer = consumer.NewAnalyticsConsumer(
+				analyticsSvc,
+				analyticsRepo,
+				f.postgresClient,
+				f.logger,
+				analyticsKafkaConsumer,
+				analyticsTopic,
+				f.config.Kafka.Brokers,
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			f.analyticsConsumerCancel = cancel
+			go func() {
+				f.analyticsConsumer.Start(ctx)
+				f.logger.Info("Analytics consumer stopped")
+			}()
+			f.logger.Info("Analytics consumer started", zap.String("topic", analyticsTopic))
+		}
+
+		// Student consumer – listens to the same topic (can be extended)
+		studentTopics := []string{"academics-events"} // can add more if needed
+		studentConsumers := make(map[string]*client.KafkaConsumer)
+		for _, topic := range studentTopics {
+			kc, err := client.NewKafkaConsumer(
+				f.config,
+				topic,
+				"student-consumer-group",
+				f.logger,
+			)
+			if err != nil {
+				f.logger.Error("Failed to create student Kafka consumer", zap.String("topic", topic), zap.Error(err))
+				continue
+			}
+			studentConsumers[topic] = kc
+		}
+		if len(studentConsumers) > 0 {
+			f.studentConsumer = consumer.NewStudentConsumer(studentConsumers, f.config.Kafka.Brokers)
+			ctx, cancel := context.WithCancel(context.Background())
+			f.studentConsumerCancel = cancel
+			go func() {
+				if err := f.studentConsumer.Start(ctx); err != nil && err != context.Canceled {
+					f.logger.Error("Student consumer stopped with error", zap.Error(err))
+				}
+			}()
+			f.logger.Info("Student consumer started", zap.Strings("topics", studentTopics))
+		} else {
+			f.logger.Warn("No Kafka consumers created for student consumer – disabled")
+		}
+	} else {
+		f.logger.Warn("Kafka not available – analytics and student consumers disabled")
+	}
 
 	return f, nil
 }
@@ -970,7 +1042,27 @@ func (f *Factory) GetTaxDeclarationHandler() *payrollhandler.TaxDeclarationHandl
 	}
 	return f.taxDeclarationHandler
 }
+func (f *Factory) RedisClient() *client.RedisClient {
+	if f.redisClient == nil {
+		client, err := client.NewRedisClient(f.config, f.logger)
+		if err != nil {
+			f.logger.Fatal("Failed to initialize Redis client", zap.Error(err))
+		}
+		f.redisClient = client
+	}
+	return f.redisClient
+}
 
+func (f *Factory) KafkaProducer() *client.KafkaProducer {
+	if f.kafkaProducer == nil {
+		producer, err := client.NewKafkaProducer(f.config, f.logger)
+		if err != nil {
+			f.logger.Fatal("Failed to initialize Kafka producer", zap.Error(err))
+		}
+		f.kafkaProducer = producer
+	}
+	return f.kafkaProducer
+}
 func (f *Factory) DeviceHeartbeatRepository() hrpostgres.DeviceHeartbeatRepository {
 	if f.deviceHeartbeatRepository == nil {
 		f.deviceHeartbeatRepository = hrpostgres.NewDeviceHeartbeatRepository(
@@ -2743,7 +2835,7 @@ func (f *Factory) InitializeHandlers() error {
 		payslipHandler,
 		reportingHandler,
 		taxDeclarationHandler,
-		academicHandlers,   // <-- added
+		academicHandlers, // <-- added
 	)
 
 	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, and biometric systems")
@@ -2848,6 +2940,26 @@ func (f *Factory) Close() error {
 			f.attendanceBatchOutboxCancel()
 		}
 
+		// Shutdown analytics and student consumers
+		if f.analyticsConsumerCancel != nil {
+			f.logger.Info("Stopping analytics consumer...")
+			f.analyticsConsumerCancel()
+		}
+		if f.studentConsumerCancel != nil {
+			f.logger.Info("Stopping student consumer...")
+			f.studentConsumerCancel()
+		}
+		if f.analyticsConsumer != nil {
+			if err := f.analyticsConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close analytics consumer", zap.Error(err))
+			}
+		}
+		if f.studentConsumer != nil {
+			if err := f.studentConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close student consumer", zap.Error(err))
+			}
+		}
+
 		if f.postgresClient != nil {
 			f.postgresClient.Close()
 		}
@@ -2878,7 +2990,6 @@ func (f *Factory) Close() error {
 
 	return nil
 }
-
 func (f *Factory) Config() *config.Config                           { return f.config }
 func (f *Factory) TLSManager() *tls.TLSManager                      { return f.tlsManager }
 func (f *Factory) ScyllaClient() *scylla.ScyllaClient               { return f.scyllaClient }

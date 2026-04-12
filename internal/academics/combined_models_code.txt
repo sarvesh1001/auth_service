@@ -331,7 +331,7 @@ type Teacher struct {
 	JoiningDate    *time.Time    `json:"joining_date,omitempty"`
 	Status         TeacherStatus `json:"status"`
 
-	Version   int        `json:"version"`
+	// Version removed – optimistic locking not used
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 	CreatedBy *uuid.UUID `json:"created_by,omitempty"`

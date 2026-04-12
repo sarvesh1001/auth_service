@@ -236,7 +236,7 @@ func (r *academicYearRepository) GetByName(ctx context.Context, db DBTX, company
 		SELECT academic_year_id, company_id, name, start_date, end_date,
 		       is_current, created_at, updated_at, created_by, updated_by
 		FROM academics.academic_year
-		WHERE company_id = $1 AND name = $2 AND deleted_at IS NULL
+		WHERE company_id = $1 AND name ILIKE $2 AND deleted_at IS NULL
 	`
 	var ay models.AcademicYear
 	var createdBy, updatedBy uuid.NullUUID
@@ -262,7 +262,6 @@ func (r *academicYearRepository) GetByName(ctx context.Context, db DBTX, company
 	}
 	return &ay, nil
 }
-
 func (r *academicYearRepository) List(ctx context.Context, db DBTX, filter AcademicYearFilter, p Pagination, s Sort) ([]*models.AcademicYear, error) {
 	where, args := r.buildAcademicYearFilter(filter)
 	orderBy, err := r.validateSort(s)

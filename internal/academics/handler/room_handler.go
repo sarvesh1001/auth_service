@@ -83,6 +83,7 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 // BulkCreate handles POST /api/v1/companies/{companyID}/rooms/bulk
 func (h *RoomHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -112,17 +113,21 @@ func (h *RoomHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set company ID and created/updated by for each
+	// Set metadata
 	for i := range reqs {
 		reqs[i].CompanyID = companyID
 		reqs[i].CreatedBy = &userID
 		reqs[i].UpdatedBy = &userID
 	}
 
-	rooms, err := h.roomService.BulkCreate(ctx, reqs)
+	// ✅ FIX: get idempotency key
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+
+	rooms, err := h.roomService.BulkCreate(ctx, reqs, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to bulk create rooms",
 			zap.Int("batch_size", len(reqs)),
+			zap.String("company_id", companyID.String()),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -295,6 +300,7 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 // Update handles PUT /api/v1/companies/{companyID}/rooms/{roomID}
 func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -329,10 +335,14 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	req.RoomID = roomID
 	req.UpdatedBy = &userID
 
-	room, err := h.roomService.Update(ctx, req)
+	// ✅ FIX
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+
+	room, err := h.roomService.Update(ctx, req, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to update room",
 			zap.String("room_id", roomID.String()),
+			zap.String("company_id", companyID.String()),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -348,6 +358,7 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 // Delete handles DELETE /api/v1/companies/{companyID}/rooms/{roomID}
 func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -373,10 +384,14 @@ func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.roomService.Delete(ctx, roomID, &userID)
+	// ✅ FIX
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+
+	err = h.roomService.Delete(ctx, roomID, &userID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to delete room",
 			zap.String("room_id", roomID.String()),
+			zap.String("company_id", companyID.String()),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -391,6 +406,7 @@ func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 // Activate handles PATCH /api/v1/companies/{companyID}/rooms/{roomID}/activate
 func (h *RoomHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -416,10 +432,15 @@ func (h *RoomHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.roomService.Activate(ctx, roomID, &userID)
+	// ✅ FIX: idempotency key
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+
+	err = h.roomService.Activate(ctx, roomID, &userID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to activate room",
 			zap.String("room_id", roomID.String()),
+			zap.String("company_id", companyID.String()),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -434,6 +455,7 @@ func (h *RoomHandler) Activate(w http.ResponseWriter, r *http.Request) {
 // Deactivate handles PATCH /api/v1/companies/{companyID}/rooms/{roomID}/deactivate
 func (h *RoomHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -459,10 +481,15 @@ func (h *RoomHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.roomService.Deactivate(ctx, roomID, &userID)
+	// ✅ FIX: idempotency key
+	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+
+	err = h.roomService.Deactivate(ctx, roomID, &userID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to deactivate room",
 			zap.String("room_id", roomID.String()),
+			zap.String("company_id", companyID.String()),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return

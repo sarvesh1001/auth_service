@@ -452,6 +452,25 @@ func (h *AdminHandler) VerifyAdminOTPLogin(w http.ResponseWriter, r *http.Reques
 //			util.Duration("duration", time.Since(startTime)),
 //		)
 //	}
+const MaxPermissionBits = 800 // or fetch from DB at startup
+
+// Helper to create empty mask of required length
+func newEmptyPermissionMask() []uint64 {
+	segments := (MaxPermissionBits + 63) / 64 // ceil(800/64) = 13
+	return make([]uint64, segments)
+}
+
+// Helper to create full mask (all bits set) of required length
+func newFullPermissionMask() []uint64 {
+	segments := (MaxPermissionBits + 63) / 64
+	mask := make([]uint64, segments)
+	for i := 0; i < segments; i++ {
+		mask[i] = ^uint64(0)
+	}
+	// Optionally clear trailing bits beyond MaxPermissionBits
+	return mask
+}
+
 func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -506,9 +525,9 @@ func (h *AdminHandler) VerifyAdminMPINLogin(w http.ResponseWriter, r *http.Reque
 			util.ErrorField(err))
 		// Use full access as fallback for super admin
 		if admin.IsSuperAdmin() {
-			permissionMask = []uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
+			permissionMask = newFullPermissionMask()
 		} else {
-			permissionMask = []uint64{0, 0, 0, 0}
+			permissionMask = newEmptyPermissionMask()
 		}
 	}
 

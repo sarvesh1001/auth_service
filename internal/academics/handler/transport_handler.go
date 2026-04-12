@@ -61,8 +61,11 @@ func (h *TransportHandler) CreateRoute(w http.ResponseWriter, r *http.Request) {
 	req.UpdatedBy = &userID
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	route, err := h.transportService.CreateRoute(ctx, req, idempotencyKey)
+	route, err := h.transportService.CreateRoute(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create transport route",
 			zap.String("company_id", companyID.String()),
@@ -251,8 +254,11 @@ func (h *TransportHandler) CreateStop(w http.ResponseWriter, r *http.Request) {
 	req.UpdatedBy = &userID
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	stop, err := h.transportService.CreateStop(ctx, req, idempotencyKey)
+	stop, err := h.transportService.CreateStop(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create transport stop",
 			zap.String("route_id", routeID.String()),
@@ -428,8 +434,11 @@ func (h *TransportHandler) CreateVehicle(w http.ResponseWriter, r *http.Request)
 	req.UpdatedBy = &userID
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	vehicle, err := h.transportService.CreateVehicle(ctx, req, idempotencyKey)
+	vehicle, err := h.transportService.CreateVehicle(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create transport vehicle",
 			zap.String("company_id", companyID.String()),
@@ -618,8 +627,11 @@ func (h *TransportHandler) CreateDriverAssignment(w http.ResponseWriter, r *http
 	req.UpdatedBy = &userID
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	assignment, err := h.transportService.CreateDriverAssignment(ctx, req, idempotencyKey)
+	assignment, err := h.transportService.CreateDriverAssignment(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create driver assignment",
 			zap.String("vehicle_id", vehicleID.String()),
@@ -794,8 +806,11 @@ func (h *TransportHandler) CreateStudentAssignment(w http.ResponseWriter, r *htt
 	req.UpdatedBy = &userID
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	assignment, err := h.transportService.CreateStudentAssignment(ctx, req, idempotencyKey)
+	assignment, err := h.transportService.CreateStudentAssignment(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create student transport assignment",
 			zap.String("student_id", req.StudentID.String()),

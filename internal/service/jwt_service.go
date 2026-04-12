@@ -86,7 +86,7 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 				s.logger.Warn("Failed to get admin permission mask, using full access",
 					zap.String("admin_id", req.UserID),
 					zap.Error(err))
-				permissionMask = models.CreateFullPermissionMask()
+				permissionMask = models.CreateFullPermissionMask() // must return 13 blocks
 			} else {
 				permissionMask = mask
 			}
@@ -119,7 +119,8 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 					zap.String("user_id", req.UserID),
 					zap.String("company_id", req.CompanyID),
 					zap.Error(err))
-				permissionMask = []uint64{0, 0, 0, 0}
+				// ✅ FIXED: 13 blocks instead of 4
+				permissionMask = make([]uint64, 13)
 			} else {
 				permissionMask = mask
 				s.logger.Info("✅ User permission mask retrieved",
@@ -129,12 +130,20 @@ func (s *JWTService) CreateAccessToken(ctx context.Context, req *CreateAccessTok
 			}
 
 		default:
-			// For other session types like "student", use empty permission mask
-			permissionMask = []uint64{}
+			// For other session types like "student"
+			// ✅ FIXED: 13 blocks instead of empty slice
+			permissionMask = make([]uint64, 13)
 			s.logger.Info("Using empty permission mask for session type",
 				zap.String("user_id", req.UserID),
 				zap.String("session_type", req.SessionType))
 		}
+	}
+
+	// ✅ CRITICAL FIX – Normalise mask to exactly 13 blocks
+	if len(permissionMask) < 13 {
+		fullMask := make([]uint64, 13)
+		copy(fullMask, permissionMask)
+		permissionMask = fullMask
 	}
 
 	claims := &models.JWTClaims{

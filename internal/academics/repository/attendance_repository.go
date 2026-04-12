@@ -101,8 +101,8 @@ func (r *attendanceRepository) buildAttendanceFilter(filter AttendanceFilter) (s
 	}
 
 	if filter.StudentID != nil || filter.SectionID != nil || filter.TermID != nil || filter.AcademicYearID != nil {
-		// Need to join enrollments
-		fromClause += " JOIN academics.enrollments e ON a.enrollment_id = e.enrollment_id AND e.deleted_at IS NULL"
+		// Join enrollments – include both active and completed records for historical data
+		fromClause += " JOIN academics.enrollments e ON a.enrollment_id = e.enrollment_id AND e.status IN ('active', 'completed')"
 		if filter.StudentID != nil {
 			conditions = append(conditions, fmt.Sprintf("e.student_id = $%d", idx))
 			args = append(args, *filter.StudentID)
@@ -389,7 +389,7 @@ func (r *attendanceRepository) RecalculateSummary(ctx context.Context, db DBTX, 
                 WHERE e.student_id = $1
                   AND e.academic_year_id = $2
                   AND sec.term_id = $3
-                  AND e.deleted_at IS NULL
+                  AND e.status IN ('active', 'completed')
             ),
             attendance_stats AS (
                 SELECT
@@ -426,7 +426,7 @@ func (r *attendanceRepository) RecalculateSummary(ctx context.Context, db DBTX, 
                 FROM academics.enrollments e
                 WHERE e.student_id = $1
                   AND e.academic_year_id = $2
-                  AND e.deleted_at IS NULL
+                  AND e.status IN ('active', 'completed')
             ),
             attendance_stats AS (
                 SELECT

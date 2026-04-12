@@ -44,7 +44,7 @@ type academicYearService struct {
 	outboxRepo          outbox.Repository
 	idempotencyStore    idempotency.Store
 	auditService        *audit.AuditService
-	notificationService NotificationService // added
+	notificationService NotificationService
 }
 
 // NewAcademicYearService creates a new service instance.
@@ -55,7 +55,7 @@ func NewAcademicYearService(
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
-	notificationService NotificationService, // new parameter
+	notificationService NotificationService,
 ) AcademicYearService {
 	return &academicYearService{
 		repo:                repo,
@@ -72,10 +72,9 @@ func NewAcademicYearService(
 // Helper for notification creation
 // ---------------------------------------------------------------------
 
-// buildNotificationRequest constructs a CreateNotificationRequest for an academic year event.
 func (s *academicYearService) buildNotificationRequest(
 	ay *models.AcademicYear,
-	operation string, // e.g., "created", "updated", "deleted", etc.
+	operation string,
 	actor *uuid.UUID,
 ) CreateNotificationRequest {
 	var title, message string
@@ -98,7 +97,7 @@ func (s *academicYearService) buildNotificationRequest(
 	case "set_current":
 		title = "Academic Year Set as Current"
 		message = fmt.Sprintf("Academic year '%s' is now the current academic year", ay.Name)
-		notificationType = models.NotificationTypeEvent // changed from NotificationTypeSuccess
+		notificationType = models.NotificationTypeEvent
 		priority = models.PriorityHigh
 	case "deleted":
 		title = "Academic Year Deleted"
@@ -120,7 +119,7 @@ func (s *academicYearService) buildNotificationRequest(
 		ExpiresAt: nil,
 		Targets: []NotificationTargetInput{
 			{
-				TargetType:     models.TargetCompany, // changed from TargetTypeCompany
+				TargetType:     models.TargetCompany,
 				TargetEntityID: ay.CompanyID,
 			},
 		},
@@ -132,7 +131,6 @@ func (s *academicYearService) buildNotificationRequest(
 // Core CRUD Operations
 // ---------------------------------------------------------------------
 
-// Create creates a new academic year.
 func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYearRequest) (*models.AcademicYear, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
@@ -140,14 +138,8 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		zap.String("name", req.Name),
 	)
 
-	// Idempotency check
-	if key, ok := ctx.Value("idempotency_key").(string); ok && key != "" {
-		var existing *models.AcademicYear
-		if err := s.idempotencyStore.Get(ctx, nil, key, &existing); err == nil && existing != nil {
-			logger.Info("idempotent request, returning cached response")
-			return existing, nil
-		}
-	}
+	// Extract idempotency key once
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateInput(req.CompanyID, req.Name, req.StartDate, req.EndDate); err != nil {
 		return nil, err
@@ -158,6 +150,15 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check (inside transaction)
+	if idempotencyKey != "" {
+		var existing *models.AcademicYear
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	// Overlap check
 	overlap, err := s.repo.CheckOverlap(ctx, tx, req.CompanyID, req.StartDate, req.EndDate, uuid.Nil)
@@ -177,7 +178,7 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		return nil, fmt.Errorf("%w: academic year name %s already exists", ErrDuplicate, req.Name)
 	}
 
-	// If this year should be current, ensure no other current year exists
+	// If this year should be current, unset any existing current year
 	if req.IsCurrent {
 		if err := s.repo.UnsetCurrent(ctx, tx, req.CompanyID, req.UpdatedBy); err != nil {
 			return nil, fmt.Errorf("unset current: %w", err)
@@ -198,7 +199,15 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		return nil, err
 	}
 
-	// Store outbox event
+	// Store idempotency key after successful insert (before commit)
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, ay); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+			// Continue – data already inserted; idempotency not critical for correctness
+		}
+	}
+
+	// Outbox event
 	payload, _ := json.Marshal(ay)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -219,7 +228,7 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 
 	logger.Info("academic year created", zap.String("id", ay.AcademicYearID.String()))
 
-	// Audit logging (after commit)
+	// Audit logging (after commit – no transaction)
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "academics", "create", "academic_year",
 			&ay.AcademicYearID, "user", req.CreatedBy, nil, nil,
@@ -229,33 +238,36 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(ay, "created", req.CreatedBy)
-		// Use a unique idempotency key for the notification
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
 	}
 
-	// Store idempotency key response
-	if key, ok := ctx.Value("idempotency_key").(string); ok && key != "" {
-		_ = s.idempotencyStore.Store(ctx, nil, key, ay)
-	}
-
 	return ay, nil
 }
 
-// BulkCreate creates multiple academic years in one transaction.
 func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcademicYearRequest) ([]*models.AcademicYear, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
 
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("batch_size", len(reqs)))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check (entire bulk operation)
+	if idempotencyKey != "" {
+		var existing []*models.AcademicYear
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent bulk request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	// Pre-load existing years to avoid duplicate name checks per company
 	companyIDs := make(map[uuid.UUID]struct{})
@@ -325,6 +337,13 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 		return nil, err
 	}
 
+	// Store idempotency key after successful insert
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, years); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Store outbox events for each created year
 	for _, ay := range years {
 		payload, _ := json.Marshal(ay)
@@ -370,13 +389,13 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 	return years, nil
 }
 
-// Upsert creates or updates an academic year based on name.
 func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYearRequest) (*models.AcademicYear, error) {
 	logger := s.logger.With(
 		zap.String("method", "Upsert"),
 		zap.String("company_id", req.CompanyID.String()),
 		zap.String("name", req.Name),
 	)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateInput(req.CompanyID, req.Name, req.StartDate, req.EndDate); err != nil {
 		return nil, err
@@ -388,13 +407,21 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 	}
 	defer tx.Rollback()
 
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing *models.AcademicYear
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
+
 	existing, _ := s.repo.GetByName(ctx, tx, req.CompanyID, req.Name)
 	excludeID := uuid.Nil
 	if existing != nil {
 		excludeID = existing.AcademicYearID
 	}
 
-	// Overlap check
 	overlap, err := s.repo.CheckOverlap(ctx, tx, req.CompanyID, req.StartDate, req.EndDate, excludeID)
 	if err != nil {
 		return nil, fmt.Errorf("overlap check: %w", err)
@@ -427,6 +454,13 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 		return nil, err
 	}
 
+	// Store idempotency key after successful upsert
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, ay); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	payload, _ := json.Marshal(ay)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -451,7 +485,6 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 			&ay.AcademicYearID, "user", req.CreatedBy, nil, nil, map[string]interface{}{"name": ay.Name})
 	}
 
-	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(ay, operation, req.CreatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -462,7 +495,6 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 	return ay, nil
 }
 
-// GetByID retrieves an academic year by its ID.
 func (s *academicYearService) GetByID(ctx context.Context, id uuid.UUID) (*models.AcademicYear, error) {
 	logger := s.logger.With(zap.String("method", "GetByID"), zap.String("id", id.String()))
 	ay, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
@@ -476,7 +508,6 @@ func (s *academicYearService) GetByID(ctx context.Context, id uuid.UUID) (*model
 	return ay, nil
 }
 
-// GetByName retrieves an academic year by company and name.
 func (s *academicYearService) GetByName(ctx context.Context, companyID uuid.UUID, name string) (*models.AcademicYear, error) {
 	logger := s.logger.With(zap.String("method", "GetByName"), zap.String("company_id", companyID.String()), zap.String("name", name))
 	ay, err := s.repo.GetByName(ctx, s.pgClient.DB, companyID, name)
@@ -490,7 +521,6 @@ func (s *academicYearService) GetByName(ctx context.Context, companyID uuid.UUID
 	return ay, nil
 }
 
-// GetCurrent retrieves the current academic year for a company.
 func (s *academicYearService) GetCurrent(ctx context.Context, companyID uuid.UUID) (*models.AcademicYear, error) {
 	logger := s.logger.With(zap.String("method", "GetCurrent"), zap.String("company_id", companyID.String()))
 	ay, err := s.repo.GetCurrent(ctx, s.pgClient.DB, companyID)
@@ -504,43 +534,48 @@ func (s *academicYearService) GetCurrent(ctx context.Context, companyID uuid.UUI
 	return ay, nil
 }
 
-// List returns a paginated list of academic years based on filter and sort.
 func (s *academicYearService) List(ctx context.Context, filter repository.AcademicYearFilter, p repository.Pagination, srt repository.Sort) ([]*models.AcademicYear, error) {
 	logger := s.logger.With(zap.String("method", "List"))
 	logger.Debug("listing academic years")
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
-// ListByCompany returns all academic years for a company (with default limit).
 func (s *academicYearService) ListByCompany(ctx context.Context, companyID uuid.UUID) ([]*models.AcademicYear, error) {
 	logger := s.logger.With(zap.String("method", "ListByCompany"), zap.String("company_id", companyID.String()))
 	logger.Debug("listing academic years for company")
 	return s.repo.ListByCompany(ctx, s.pgClient.DB, companyID)
 }
 
-// Count returns the total number of academic years matching a filter.
 func (s *academicYearService) Count(ctx context.Context, filter repository.AcademicYearFilter) (int64, error) {
 	logger := s.logger.With(zap.String("method", "Count"))
 	logger.Debug("counting academic years")
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
-// Exists checks if an academic year with given name exists in a company.
 func (s *academicYearService) Exists(ctx context.Context, companyID uuid.UUID, name string) (bool, error) {
 	logger := s.logger.With(zap.String("method", "Exists"), zap.String("company_id", companyID.String()), zap.String("name", name))
 	logger.Debug("checking existence")
 	return s.repo.Exists(ctx, s.pgClient.DB, companyID, name)
 }
 
-// Update updates an existing academic year.
 func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYearRequest) (*models.AcademicYear, error) {
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("id", req.AcademicYearID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing *models.AcademicYear
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	existing, err := s.repo.GetByIDForUpdate(ctx, tx, req.AcademicYearID)
 	if err != nil {
@@ -578,6 +613,13 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 		return nil, err
 	}
 
+	// Store idempotency key after successful update
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, existing); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	payload, _ := json.Marshal(existing)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -602,7 +644,6 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 			&existing.AcademicYearID, "user", req.UpdatedBy, nil, nil, nil)
 	}
 
-	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(existing, "updated", req.UpdatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -613,9 +654,10 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 	return existing, nil
 }
 
-// UpdateDates updates the start and end dates of an academic year.
 func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, start, end time.Time, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "UpdateDates"), zap.String("id", id.String()))
+	// Idempotency not implemented for this method because it's a partial update.
+	// Could be added if needed.
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -643,7 +685,6 @@ func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, sta
 		return err
 	}
 
-	// After updating, fetch the updated year for outbox event
 	updatedAy, err := s.repo.GetByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -676,7 +717,6 @@ func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, sta
 			&id, "user", updatedBy, nil, nil, map[string]interface{}{"start_date": start, "end_date": end})
 	}
 
-	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(updatedAy, "dates_updated", updatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -687,9 +727,9 @@ func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, sta
 	return nil
 }
 
-// SetCurrent marks an academic year as the current one for its company.
 func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academicYearID uuid.UUID, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "SetCurrent"), zap.String("company_id", companyID.String()), zap.String("id", academicYearID.String()))
+	// Idempotency not critical for this operation.
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -701,7 +741,6 @@ func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academi
 		return err
 	}
 
-	// Retrieve the academic year for event
 	ay, err := s.repo.GetByID(ctx, tx, academicYearID)
 	if err != nil {
 		return err
@@ -734,7 +773,6 @@ func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academi
 			&academicYearID, "user", updatedBy, nil, nil, map[string]interface{}{"is_current": true})
 	}
 
-	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(ay, "set_current", updatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -745,9 +783,9 @@ func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academi
 	return nil
 }
 
-// Delete soft-deletes an academic year.
 func (s *academicYearService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("id", id.String()))
+	// Idempotency not needed for delete (deleting twice should be harmless or return not found).
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -791,7 +829,6 @@ func (s *academicYearService) Delete(ctx context.Context, id uuid.UUID, deletedB
 			&id, "user", deletedBy, nil, nil, nil)
 	}
 
-	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(ay, "deleted", deletedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -802,7 +839,6 @@ func (s *academicYearService) Delete(ctx context.Context, id uuid.UUID, deletedB
 	return nil
 }
 
-// ValidateOverlap checks if a date range overlaps with any existing academic year for the company.
 func (s *academicYearService) ValidateOverlap(ctx context.Context, companyID uuid.UUID, start, end time.Time) error {
 	overlap, err := s.repo.CheckOverlap(ctx, s.pgClient.DB, companyID, start, end, uuid.Nil)
 	if err != nil {
@@ -814,7 +850,6 @@ func (s *academicYearService) ValidateOverlap(ctx context.Context, companyID uui
 	return nil
 }
 
-// validateInput performs basic validation on request data.
 func (s *academicYearService) validateInput(companyID uuid.UUID, name string, start, end time.Time) error {
 	if companyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id is required", ErrInvalidInput)
@@ -831,7 +866,6 @@ func (s *academicYearService) validateInput(companyID uuid.UUID, name string, st
 	return nil
 }
 
-// checkOverlapInMemory checks for date overlap in a slice of academic years (used for bulk validation).
 func (s *academicYearService) checkOverlapInMemory(years []*models.AcademicYear, start, end time.Time, excludeID uuid.UUID) error {
 	for _, ay := range years {
 		if excludeID != uuid.Nil && ay.AcademicYearID == excludeID {

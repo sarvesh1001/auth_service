@@ -141,83 +141,6 @@ func (r *studentRepository) decryptField(ctx context.Context, encValue, encDEK, 
 
 // --- Build filter ------------------------------------------------------
 
-func (r *studentRepository) buildStudentFilter(filter StudentFilter) (string, []interface{}) {
-	var conditions []string
-	var args []interface{}
-	idx := 1
-
-	if filter.CompanyID != uuid.Nil {
-		conditions = append(conditions, fmt.Sprintf("s.company_id = $%d", idx))
-		args = append(args, filter.CompanyID)
-		idx++
-	}
-
-	if filter.AdmissionNumber != "" {
-		conditions = append(conditions, fmt.Sprintf("s.admission_no = $%d", idx))
-		args = append(args, filter.AdmissionNumber)
-		idx++
-	}
-
-	if filter.Status != nil {
-		conditions = append(conditions, fmt.Sprintf("s.status = $%d", idx))
-		args = append(args, *filter.Status)
-		idx++
-	}
-
-	if filter.IsActive != nil {
-		if *filter.IsActive {
-			conditions = append(conditions, "s.status = 'active'")
-		} else {
-			conditions = append(conditions, "s.status != 'active'")
-		}
-	}
-
-	if filter.Search != "" {
-		conditions = append(conditions, fmt.Sprintf("(s.admission_no ILIKE $%d OR s.first_name ILIKE $%d OR s.last_name ILIKE $%d)", idx, idx, idx))
-		args = append(args, "%"+filter.Search+"%")
-		idx++
-	}
-
-	// Join-related conditions (must be added only after ensuring the necessary joins)
-	// The actual joins are handled in List/Count; here we just build the WHERE clause.
-	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil || filter.JoinedFrom != nil || filter.JoinedTo != nil
-	if needEnrollments {
-		// These conditions reference tables that will be joined (e, sec)
-		if filter.CourseID != nil {
-			conditions = append(conditions, fmt.Sprintf("sec.course_id = $%d", idx))
-			args = append(args, *filter.CourseID)
-			idx++
-		}
-		if filter.SectionID != nil {
-			conditions = append(conditions, fmt.Sprintf("e.section_id = $%d", idx))
-			args = append(args, *filter.SectionID)
-			idx++
-		}
-		if filter.TermID != nil {
-			conditions = append(conditions, fmt.Sprintf("sec.term_id = $%d", idx))
-			args = append(args, *filter.TermID)
-			idx++
-		}
-		if filter.JoinedFrom != nil {
-			conditions = append(conditions, fmt.Sprintf("e.enrollment_date >= $%d", idx))
-			args = append(args, *filter.JoinedFrom)
-			idx++
-		}
-		if filter.JoinedTo != nil {
-			conditions = append(conditions, fmt.Sprintf("e.enrollment_date <= $%d", idx))
-			args = append(args, *filter.JoinedTo)
-			idx++
-		}
-	}
-
-	conditions = append(conditions, "s.deleted_at IS NULL")
-
-	if len(conditions) == 0 {
-		return "", args
-	}
-	return "WHERE " + strings.Join(conditions, " AND "), args
-}
-
 // --- Create ------------------------------------------------------------
 
 func (r *studentRepository) Create(ctx context.Context, db DBTX, s *models.Student) error {
@@ -465,7 +388,7 @@ func (r *studentRepository) List(ctx context.Context, db DBTX, filter StudentFil
 	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil || filter.JoinedFrom != nil || filter.JoinedTo != nil
 	if needEnrollments {
 		// Always join enrollments and section when any enrollment-related filter is present
-		fromClause += " LEFT JOIN academics.enrollments e ON s.student_id = e.student_id AND e.deleted_at IS NULL"
+		fromClause += " LEFT JOIN academics.enrollments e ON s.student_id = e.student_id AND e.status IN ('active','completed')"
 		fromClause += " LEFT JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
 	}
 
@@ -512,23 +435,72 @@ func (r *studentRepository) List(ctx context.Context, db DBTX, filter StudentFil
 // --- Count --------------------------------------------------------------
 
 func (r *studentRepository) Count(ctx context.Context, db DBTX, filter StudentFilter) (int64, error) {
-	where, args := r.buildStudentFilter(filter)
+	// Get base conditions that do not require joins
+	where, args := r.buildBaseStudentFilter(filter)
 
-	fromClause := "FROM academics.students s"
-	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil || filter.JoinedFrom != nil || filter.JoinedTo != nil
+	// Determine if we need to add an EXISTS clause for enrollment filters
+	needEnrollments := filter.CourseID != nil || filter.SectionID != nil || filter.TermID != nil ||
+		filter.JoinedFrom != nil || filter.JoinedTo != nil
+
 	if needEnrollments {
-		fromClause += " LEFT JOIN academics.enrollments e ON s.student_id = e.student_id AND e.deleted_at IS NULL"
-		fromClause += " LEFT JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
+		// Build the enrollment conditions inside the EXISTS subquery
+		var enrollmentConditions []string
+		idx := len(args) + 1
+
+		if filter.CourseID != nil {
+			enrollmentConditions = append(enrollmentConditions, fmt.Sprintf("sec.course_id = $%d", idx))
+			args = append(args, *filter.CourseID)
+			idx++
+		}
+		if filter.SectionID != nil {
+			enrollmentConditions = append(enrollmentConditions, fmt.Sprintf("e.section_id = $%d", idx))
+			args = append(args, *filter.SectionID)
+			idx++
+		}
+		if filter.TermID != nil {
+			enrollmentConditions = append(enrollmentConditions, fmt.Sprintf("sec.term_id = $%d", idx))
+			args = append(args, *filter.TermID)
+			idx++
+		}
+		if filter.JoinedFrom != nil {
+			enrollmentConditions = append(enrollmentConditions, fmt.Sprintf("e.enrollment_date >= $%d", idx))
+			args = append(args, *filter.JoinedFrom)
+			idx++
+		}
+		if filter.JoinedTo != nil {
+			enrollmentConditions = append(enrollmentConditions, fmt.Sprintf("e.enrollment_date <= $%d", idx))
+			args = append(args, *filter.JoinedTo)
+			idx++
+		}
+
+		existsClause := `
+            EXISTS (
+                SELECT 1
+                FROM academics.enrollments e
+                JOIN academics.section sec ON sec.section_id = e.section_id AND sec.deleted_at IS NULL
+                WHERE e.student_id = s.student_id
+                  AND e.status IN ('active','completed')
+        `
+		if len(enrollmentConditions) > 0 {
+			existsClause += " AND " + strings.Join(enrollmentConditions, " AND ")
+		}
+		existsClause += ")"
+
+		// Combine the base WHERE with the EXISTS clause
+		if where == "" {
+			where = "WHERE " + existsClause
+		} else {
+			where += " AND " + existsClause
+		}
 	}
 
-	query := fmt.Sprintf("SELECT COUNT(DISTINCT s.student_id) %s %s", fromClause, where)
-
+	query := "SELECT COUNT(*) FROM academics.students s " + where
 	var count int64
 	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
 		r.logger.Error("failed to count students",
-			util.Any("filter", filter),
-			util.ErrorField(err))
+			zap.Any("filter", filter),
+			zap.Error(err))
 		return 0, fmt.Errorf("count students: %w", err)
 	}
 	return count, nil
@@ -757,13 +729,19 @@ func (r *studentRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, d
 
 func (r *studentRepository) CountByCourse(ctx context.Context, db DBTX, courseID uuid.UUID) (int64, error) {
 	query := `
-		SELECT COUNT(DISTINCT s.student_id)
+		SELECT COUNT(*)
 		FROM academics.students s
-		JOIN academics.enrollments e ON s.student_id = e.student_id
-		JOIN academics.section sec ON e.section_id = sec.section_id
-		WHERE sec.course_id = $1 AND e.status = 'active' AND e.deleted_at IS NULL
-		  AND s.deleted_at IS NULL
+		WHERE s.deleted_at IS NULL
+		AND EXISTS (
+			SELECT 1
+			FROM academics.enrollments e
+			JOIN academics.section sec ON sec.section_id = e.section_id
+			WHERE e.student_id = s.student_id
+			  AND sec.course_id = $1
+			  AND e.status IN ('active','completed')
+		)
 	`
+
 	var count int64
 	err := db.QueryRowContext(ctx, query, courseID).Scan(&count)
 	if err != nil {
@@ -779,12 +757,18 @@ func (r *studentRepository) CountByCourse(ctx context.Context, db DBTX, courseID
 
 func (r *studentRepository) CountBySection(ctx context.Context, db DBTX, sectionID uuid.UUID) (int64, error) {
 	query := `
-		SELECT COUNT(DISTINCT s.student_id)
+		SELECT COUNT(*)
 		FROM academics.students s
-		JOIN academics.enrollments e ON s.student_id = e.student_id
-		WHERE e.section_id = $1 AND e.status = 'active' AND e.deleted_at IS NULL
-		  AND s.deleted_at IS NULL
+		WHERE s.deleted_at IS NULL
+		AND EXISTS (
+			SELECT 1
+			FROM academics.enrollments e
+			WHERE e.student_id = s.student_id
+			  AND e.section_id = $1
+			  AND e.status IN ('active','completed')
+		)
 	`
+
 	var count int64
 	err := db.QueryRowContext(ctx, query, sectionID).Scan(&count)
 	if err != nil {
@@ -1390,4 +1374,92 @@ func (r *studentRepository) GetByPhone(ctx context.Context, db DBTX, companyID u
     `
 	row := db.QueryRowContext(ctx, query, companyID, enc.EncryptedValue)
 	return r.scanStudent(ctx, row)
+}
+
+// buildBaseStudentFilter returns WHERE clause and args for filters that do NOT require joins.
+// This includes: company_id, admission_number, status, is_active, search, and deleted_at.
+func (r *studentRepository) buildBaseStudentFilter(filter StudentFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("s.company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.AdmissionNumber != "" {
+		conditions = append(conditions, fmt.Sprintf("s.admission_no = $%d", idx))
+		args = append(args, filter.AdmissionNumber)
+		idx++
+	}
+	if filter.Status != nil {
+		conditions = append(conditions, fmt.Sprintf("s.status = $%d", idx))
+		args = append(args, *filter.Status)
+		idx++
+	}
+	if filter.IsActive != nil {
+		if *filter.IsActive {
+			conditions = append(conditions, "s.status = 'active'")
+		} else {
+			conditions = append(conditions, "s.status != 'active'")
+		}
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("(s.admission_no ILIKE $%d OR s.first_name ILIKE $%d OR s.last_name ILIKE $%d)", idx, idx, idx))
+		args = append(args, "%"+filter.Search+"%")
+		idx++
+	}
+	conditions = append(conditions, "s.deleted_at IS NULL")
+
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+// buildStudentFilter returns WHERE clause and args for full filtering (including enrollment conditions).
+// This is used when the outer query joins the enrollments and section tables.
+func (r *studentRepository) buildStudentFilter(filter StudentFilter) (string, []interface{}) {
+	baseWhere, baseArgs := r.buildBaseStudentFilter(filter)
+	var conditions []string
+	args := baseArgs
+	idx := len(args) + 1
+
+	// Append enrollment conditions only if they are present.
+	if filter.CourseID != nil {
+		conditions = append(conditions, fmt.Sprintf("sec.course_id = $%d", idx))
+		args = append(args, *filter.CourseID)
+		idx++
+	}
+	if filter.SectionID != nil {
+		conditions = append(conditions, fmt.Sprintf("e.section_id = $%d", idx))
+		args = append(args, *filter.SectionID)
+		idx++
+	}
+	if filter.TermID != nil {
+		conditions = append(conditions, fmt.Sprintf("sec.term_id = $%d", idx))
+		args = append(args, *filter.TermID)
+		idx++
+	}
+	if filter.JoinedFrom != nil {
+		conditions = append(conditions, fmt.Sprintf("e.enrollment_date >= $%d", idx))
+		args = append(args, *filter.JoinedFrom)
+		idx++
+	}
+	if filter.JoinedTo != nil {
+		conditions = append(conditions, fmt.Sprintf("e.enrollment_date <= $%d", idx))
+		args = append(args, *filter.JoinedTo)
+		idx++
+	}
+
+	if len(conditions) == 0 {
+		return baseWhere, baseArgs
+	}
+
+	// Combine base WHERE with enrollment conditions (assumes joins exist).
+	if baseWhere == "" {
+		return "WHERE " + strings.Join(conditions, " AND "), args
+	}
+	return baseWhere + " AND " + strings.Join(conditions, " AND "), args
 }

@@ -205,6 +205,7 @@ func NewRouter(
 			r.Post("/reset/{deviceID}", biometricSyncHandler.ForceDeviceResync)
 			r.Get("/health", biometricSyncHandler.HealthCheck)
 		})
+		r.Post("/companies/{companyID}/academics/students/login", academicHandlers.StudentHandler.Login)
 
 		// Protected routes (JWT required)
 		r.Group(func(r chi.Router) {
@@ -231,6 +232,7 @@ func NewRouter(
 			// Main company‑scoped routes
 			r.Route("/companies/{companyID}", func(r chi.Router) {
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
+				r.Use(IdempotencyMiddleware) // <-- add this line
 
 				// Company info
 				r.Get("/", adminHandler.GetCompany)
@@ -1839,5 +1841,17 @@ func respondWithJWTError(w http.ResponseWriter, logger *zap.Logger, statusCode i
 		"error":   message,
 		"message": "Authentication failed",
 		"code":    statusCode,
+	})
+}
+
+// IdempotencyMiddleware reads Idempotency-Key header and stores it in request context.
+func IdempotencyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("Idempotency-Key")
+		if key != "" {
+			ctx := context.WithValue(r.Context(), "idempotency_key", key)
+			r = r.WithContext(ctx)
+		}
+		next.ServeHTTP(w, r)
 	})
 }

@@ -20,6 +20,7 @@ var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrAccountLocked      = errors.New("account locked")
 	ErrNoPasswordSet      = errors.New("no password set")
+	ErrStudentNotFound    = errors.New("student not found")
 )
 
 // --- Request/Response ------------------------------------------------------
@@ -78,67 +79,95 @@ func (s *studentAuthService) Login(ctx context.Context, req LoginRequest) (*Logi
 		zap.String("company_id", req.CompanyID.String()),
 	)
 
-	// 1. Find student by identifier (phone or email)
-	var student *models.Student
-	var err error
-	if strings.Contains(req.Identifier, "@") {
-		student, err = s.studentRepo.GetByEmail(ctx, s.pgClient.DB, req.CompanyID, req.Identifier)
-	} else {
-		student, err = s.studentRepo.GetByPhone(ctx, s.pgClient.DB, req.CompanyID, req.Identifier)
+	// 1. Try admission number (plaintext, reliable)
+	student, err := s.studentRepo.GetByAdmissionNumber(ctx, s.pgClient.DB, req.CompanyID, req.Identifier)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		logger.Error("failed to find student by admission number", zap.Error(err))
 	}
-	if err != nil {
-		logger.Error("failed to find student", zap.Error(err))
-		return nil, fmt.Errorf("find student: %w", err)
-	}
-	if student == nil {
-		return nil, ErrInvalidCredentials // don't reveal existence
+	if student != nil {
+		logger.Debug("student found by admission number")
+		goto verify
 	}
 
-	// 2. Check if account is locked
+	// 2. Try email (encrypted – may fail until deterministic hash, but keep for future)
+	if strings.Contains(req.Identifier, "@") {
+		student, err = s.studentRepo.GetByEmail(ctx, s.pgClient.DB, req.CompanyID, req.Identifier)
+		if err != nil && !errors.Is(err, repository.ErrNotFound) {
+			logger.Error("failed to find student by email", zap.Error(err))
+		}
+		if student != nil {
+			logger.Debug("student found by email")
+			goto verify
+		}
+	}
+
+	// 3. Try phone (encrypted – may fail until deterministic hash)
+	student, err = s.studentRepo.GetByPhone(ctx, s.pgClient.DB, req.CompanyID, req.Identifier)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		logger.Error("failed to find student by phone", zap.Error(err))
+	}
+	if student == nil {
+		logger.Info("no student found for identifier", zap.String("identifier", req.Identifier))
+		return nil, ErrInvalidCredentials
+	}
+	logger.Debug("student found by phone")
+
+verify:
+	// 4. Check if account is locked
 	locked, err := s.authRepo.IsLocked(ctx, s.pgClient.DB, student.StudentID)
 	if err != nil {
-		return nil, fmt.Errorf("check locked: %w", err)
+		// If no auth record exists, treat as not locked
+		if !errors.Is(err, repository.ErrNotFound) {
+			return nil, fmt.Errorf("check locked: %w", err)
+		}
+		locked = false
 	}
 	if locked {
 		return nil, ErrAccountLocked
 	}
 
-	// 3. Verify password
+	// 5. Verify password
 	valid, err := s.authRepo.VerifyPassword(ctx, s.pgClient.DB, student.StudentID, req.Password)
 	if err != nil {
+		// If no auth record, treat as invalid password
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, ErrInvalidCredentials
+		}
 		return nil, fmt.Errorf("verify password: %w", err)
 	}
 	if !valid {
-		// Increment login attempts
+		// Increment login attempts (only if auth record exists)
 		auth, getErr := s.authRepo.GetByStudentID(ctx, s.pgClient.DB, student.StudentID)
 		if getErr == nil && auth != nil {
 			newAttempts := auth.LoginAttempts + 1
 			if err := s.authRepo.UpdateLoginAttempts(ctx, s.pgClient.DB, student.StudentID, &newAttempts); err != nil {
 				logger.Error("failed to increment login attempts", zap.Error(err))
 			}
-			// Lock after 5 failed attempts
 			if newAttempts >= 5 {
 				if err := s.authRepo.LockAccount(ctx, s.pgClient.DB, student.StudentID, nil); err != nil {
 					logger.Error("failed to lock account", zap.Error(err))
 				}
 			}
-		} else {
-			// No auth record yet – can't increment attempts. Possibly the student has no password set.
-			// In that case, we return invalid credentials as well.
 		}
 		return nil, ErrInvalidCredentials
 	}
 
-	// 4. Success: reset attempts, update last login
+	// 6. Success: reset attempts, update last login
 	if err := s.authRepo.RecordLoginSuccess(ctx, s.pgClient.DB, student.StudentID); err != nil {
-		logger.Error("failed to record login success", zap.Error(err))
-		// continue anyway
+		// If no auth record, create one (this should not happen because password exists)
+		if errors.Is(err, repository.ErrNotFound) {
+			if setErr := s.authRepo.SetPassword(ctx, s.pgClient.DB, student.StudentID, req.Password, nil); setErr != nil {
+				logger.Error("failed to create auth record on success", zap.Error(setErr))
+			}
+		} else {
+			logger.Error("failed to record login success", zap.Error(err))
+		}
 	}
 
-	// 5. Retrieve full auth record (optional)
+	// 7. Retrieve full auth record (optional)
 	auth, _ := s.authRepo.GetByStudentID(ctx, s.pgClient.DB, student.StudentID)
 
-	// (Optional) Send login notification
+	// 8. Send login notification (optional)
 	if s.notifSvc != nil {
 		title := "New Login"
 		message := fmt.Sprintf("Your account was accessed on %s", time.Now().Format(time.RFC3339))
@@ -152,34 +181,81 @@ func (s *studentAuthService) Login(ctx context.Context, req LoginRequest) (*Logi
 }
 
 // ---------------------------------------------------------------------------
-// Password Management (delegated to repository)
+// Password Management (with student existence check)
 // ---------------------------------------------------------------------------
+
+// SetPassword sets or updates a student's password.
+// It first verifies that the student exists in the students table.
 func (s *studentAuthService) SetPassword(ctx context.Context, studentID uuid.UUID, password string, updatedBy *uuid.UUID) error {
+	// 1. Check that the student actually exists
+	student, err := s.studentRepo.GetByID(ctx, s.pgClient.DB, studentID)
+	if err != nil {
+		return fmt.Errorf("check student existence: %w", err)
+	}
+	if student == nil {
+		return ErrStudentNotFound
+	}
+
+	// 2. Delegate to auth repository (insert or update)
 	return s.authRepo.SetPassword(ctx, s.pgClient.DB, studentID, password, updatedBy)
 }
 
+// VerifyPassword checks if the provided password matches the stored one.
+// It does NOT check student existence because if there's no auth record, it will return false.
 func (s *studentAuthService) VerifyPassword(ctx context.Context, studentID uuid.UUID, password string) (bool, error) {
+	// Optionally check student existence first, but not strictly required.
+	// If student doesn't exist, VerifyPassword will likely return false because no auth record.
 	return s.authRepo.VerifyPassword(ctx, s.pgClient.DB, studentID, password)
 }
 
+// HasPassword returns true if the student has a password set (i.e., an auth record with a non-empty password).
+// It does not check student existence; if student has no auth record, returns false.
 func (s *studentAuthService) HasPassword(ctx context.Context, studentID uuid.UUID) (bool, error) {
 	return s.authRepo.HasPassword(ctx, s.pgClient.DB, studentID)
 }
 
+// ResetPassword is an admin‑only operation that directly sets a new password.
+// It checks student existence before proceeding.
 func (s *studentAuthService) ResetPassword(ctx context.Context, studentID uuid.UUID, newPassword string, updatedBy *uuid.UUID) error {
+	// 1. Check student exists
+	student, err := s.studentRepo.GetByID(ctx, s.pgClient.DB, studentID)
+	if err != nil {
+		return fmt.Errorf("check student existence: %w", err)
+	}
+	if student == nil {
+		return ErrStudentNotFound
+	}
+
+	// 2. Set new password
 	return s.authRepo.ResetPassword(ctx, s.pgClient.DB, studentID, newPassword, updatedBy)
 }
 
+// ChangePassword allows a student to change their own password after verifying the old one.
+// It checks student existence before verifying the old password.
 func (s *studentAuthService) ChangePassword(ctx context.Context, studentID uuid.UUID, oldPassword, newPassword string, updatedBy *uuid.UUID) error {
-	// Verify old password
+	// 1. Check student exists
+	student, err := s.studentRepo.GetByID(ctx, s.pgClient.DB, studentID)
+	if err != nil {
+		return fmt.Errorf("check student existence: %w", err)
+	}
+	if student == nil {
+		return ErrStudentNotFound
+	}
+
+	// 2. Verify old password
 	valid, err := s.authRepo.VerifyPassword(ctx, s.pgClient.DB, studentID, oldPassword)
 	if err != nil {
+		// If no auth record, treat as invalid
+		if errors.Is(err, repository.ErrNotFound) {
+			return ErrInvalidCredentials
+		}
 		return fmt.Errorf("verify old password: %w", err)
 	}
 	if !valid {
 		return ErrInvalidCredentials
 	}
-	// Set new password
+
+	// 3. Set new password
 	return s.authRepo.SetPassword(ctx, s.pgClient.DB, studentID, newPassword, updatedBy)
 }
 

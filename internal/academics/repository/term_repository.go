@@ -34,6 +34,7 @@ type TermRepository interface {
 	GetAcademicYearByTerm(ctx context.Context, db DBTX, termID uuid.UUID) (*models.AcademicYear, error)
 	GetByIDs(ctx context.Context, db DBTX, ids []uuid.UUID) (map[uuid.UUID]*models.Term, error)
 	GetAcademicYearsByTermIDs(ctx context.Context, db DBTX, termIDs []uuid.UUID) (map[uuid.UUID]*models.AcademicYear, error)
+	GetByName(ctx context.Context, db DBTX, academicYearID uuid.UUID, name string) (*models.Term, error)
 }
 
 type termRepository struct {
@@ -669,4 +670,35 @@ func (r *termRepository) GetAcademicYearsByTermIDs(ctx context.Context, db DBTX,
 		return nil, fmt.Errorf("rows iteration: %w", err)
 	}
 	return result, nil
+}
+func (r *termRepository) GetByName(ctx context.Context, db DBTX, academicYearID uuid.UUID, name string) (*models.Term, error) {
+	query := `
+		SELECT term_id, academic_year_id, name, start_date, end_date,
+		       is_current, created_at, updated_at, created_by, updated_by
+		FROM academics.term
+		WHERE academic_year_id = $1 AND name = $2 AND deleted_at IS NULL
+	`
+	var t models.Term
+	var createdBy, updatedBy uuid.NullUUID
+	err := db.QueryRowContext(ctx, query, academicYearID, name).Scan(
+		&t.TermID, &t.AcademicYearID, &t.Name, &t.StartDate, &t.EndDate,
+		&t.IsCurrent, &t.CreatedAt, &t.UpdatedAt, &createdBy, &updatedBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		r.logger.Error("failed to get term by name",
+			zap.String("academic_year_id", academicYearID.String()),
+			zap.String("name", name),
+			zap.Error(err))
+		return nil, fmt.Errorf("get term by name: %w", err)
+	}
+	if createdBy.Valid {
+		t.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		t.UpdatedBy = &updatedBy.UUID
+	}
+	return &t, nil
 }

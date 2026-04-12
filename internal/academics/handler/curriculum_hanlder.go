@@ -35,6 +35,20 @@ type assignSubjectRequest struct {
 	IsCompulsory bool      `json:"is_compulsory"`
 }
 
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
+
+// getIdempotencyKey extracts the idempotency key from the request header.
+// If not provided, it returns an empty string (the service will then skip idempotency checks).
+func (h *CurriculumHandler) getIdempotencyKey(r *http.Request) string {
+	return r.Header.Get("Idempotency-Key")
+}
+
+// ---------------------------------------------------------------------
+// Handlers (updated to pass idempotency key)
+// ---------------------------------------------------------------------
+
 // AssignSubject handles POST /api/v1/companies/{companyID}/courses/{courseID}/subjects
 func (h *CurriculumHandler) AssignSubject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -83,7 +97,8 @@ func (h *CurriculumHandler) AssignSubject(w http.ResponseWriter, r *http.Request
 		IsCompulsory: req.IsCompulsory,
 	}
 
-	err = h.curriculumService.AssignSubjectToCourse(ctx, assignReq)
+	idempotencyKey := h.getIdempotencyKey(r)
+	err = h.curriculumService.AssignSubjectToCourse(ctx, assignReq, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to assign subject to course",
 			zap.String("course_id", courseID.String()),
@@ -130,7 +145,8 @@ func (h *CurriculumHandler) BulkAssignSubjects(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	err = h.curriculumService.BulkAssignSubjects(ctx, reqs)
+	idempotencyKey := h.getIdempotencyKey(r)
+	err = h.curriculumService.BulkAssignSubjects(ctx, reqs, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to bulk assign subjects",
 			zap.Int("batch_size", len(reqs)),
@@ -261,7 +277,8 @@ func (h *CurriculumHandler) RemoveMapping(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	err = h.curriculumService.RemoveMapping(ctx, mappingID)
+	idempotencyKey := h.getIdempotencyKey(r)
+	err = h.curriculumService.RemoveMapping(ctx, mappingID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to remove mapping",
 			zap.String("mapping_id", mappingID.String()),
@@ -298,7 +315,8 @@ func (h *CurriculumHandler) RemoveAllForCourse(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	err = h.curriculumService.RemoveAllForCourse(ctx, courseID)
+	idempotencyKey := h.getIdempotencyKey(r)
+	err = h.curriculumService.RemoveAllForCourse(ctx, courseID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to remove all mappings for course",
 			zap.String("course_id", courseID.String()),
@@ -412,7 +430,10 @@ func (h *CurriculumHandler) ValidateCurriculum(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// Helper methods (same as AdmissionHandler)
+// ---------------------------------------------------------------------
+// Helper methods (unchanged)
+// ---------------------------------------------------------------------
+
 func (h *CurriculumHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
 	// Placeholder – implement actual permission check
 	return true
@@ -421,7 +442,7 @@ func (h *CurriculumHandler) hasPermission(ctx context.Context, companyID uuid.UU
 func (h *CurriculumHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func (h *CurriculumHandler) respondWithError(w http.ResponseWriter, status int, message string) {

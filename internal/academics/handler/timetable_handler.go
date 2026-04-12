@@ -34,8 +34,8 @@ func NewTimetableHandler(timetableService service.TimetableService, logger *zap.
 // CreateTimetable handles POST /api/v1/companies/{companyID}/timetables
 func (h *TimetableHandler) CreateTimetable(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
@@ -58,7 +58,7 @@ func (h *TimetableHandler) CreateTimetable(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Validate required fields
+	// validations
 	if req.AcademicYearID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "academic_year_id is required")
 		return
@@ -79,9 +79,8 @@ func (h *TimetableHandler) CreateTimetable(w http.ResponseWriter, r *http.Reques
 	req.CreatedBy = &userID
 	req.UpdatedBy = &userID
 
-	idempotencyKey := r.Header.Get("Idempotency-Key") // optional
-
-	timetable, err := h.timetableService.CreateTimetable(ctx, req, idempotencyKey)
+	// ❌ REMOVE idempotencyKey
+	timetable, err := h.timetableService.CreateTimetable(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create timetable",
 			zap.String("section_id", req.SectionID.String()),

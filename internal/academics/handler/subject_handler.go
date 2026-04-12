@@ -14,13 +14,11 @@ import (
 	"auth-service/internal/academics/service"
 )
 
-// SubjectHandler handles all subject-related endpoints.
 type SubjectHandler struct {
 	subjectService service.SubjectService
 	logger         *zap.Logger
 }
 
-// NewSubjectHandler creates a new SubjectHandler.
 func NewSubjectHandler(subjectService service.SubjectService, logger *zap.Logger) *SubjectHandler {
 	return &SubjectHandler{
 		subjectService: subjectService,
@@ -28,9 +26,6 @@ func NewSubjectHandler(subjectService service.SubjectService, logger *zap.Logger
 	}
 }
 
-// ---------------------- Request/Response structs ---------------------------
-
-// CreateSubjectRequest is the body for creating a subject.
 type CreateSubjectRequest struct {
 	Code        string `json:"code"`
 	Name        string `json:"name"`
@@ -39,7 +34,6 @@ type CreateSubjectRequest struct {
 	IsActive    bool   `json:"is_active,omitempty"`
 }
 
-// UpdateSubjectRequest is the body for updating a subject.
 type UpdateSubjectRequest struct {
 	Code        string `json:"code"`
 	Name        string `json:"name"`
@@ -48,13 +42,9 @@ type UpdateSubjectRequest struct {
 	IsActive    bool   `json:"is_active,omitempty"`
 }
 
-// ---------------------- CRUD ----------------------------------------------
-
-// Create handles POST /api/v1/companies/{companyID}/subjects
 func (h *SubjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
@@ -77,17 +67,14 @@ func (h *SubjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
-	if req.Code == "" {
-		h.respondWithError(w, http.StatusBadRequest, "code is required")
-		return
-	}
-	if req.Name == "" {
-		h.respondWithError(w, http.StatusBadRequest, "name is required")
+	if req.Code == "" || req.Name == "" {
+		h.respondWithError(w, http.StatusBadRequest, "code and name are required")
 		return
 	}
 
-	// Build service request
+	// ✅ FIX: read idempotency key from context (set by middleware)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	createReq := service.CreateSubjectRequest{
 		CompanyID:   companyID,
 		Code:        req.Code,
@@ -99,11 +86,12 @@ func (h *SubjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 		UpdatedBy:   &userID,
 	}
 
-	subject, err := h.subjectService.Create(ctx, createReq)
+	subject, err := h.subjectService.Create(ctx, createReq, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to create subject",
 			zap.String("company_id", companyID.String()),
 			zap.String("code", req.Code),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -116,11 +104,9 @@ func (h *SubjectHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// BulkCreate handles POST /api/v1/companies/{companyID}/subjects/bulk
 func (h *SubjectHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
@@ -142,20 +128,19 @@ func (h *SubjectHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
 	if len(reqs) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "empty batch")
 		return
 	}
 
-	// Convert to service requests
+	// ✅ FIX: read idempotency key from context
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	createReqs := make([]service.CreateSubjectRequest, len(reqs))
 	for i, r := range reqs {
-		if r.Code == "" {
-			h.respondWithError(w, http.StatusBadRequest, "code is required for all subjects")
-			return
-		}
-		if r.Name == "" {
-			h.respondWithError(w, http.StatusBadRequest, "name is required for all subjects")
+		if r.Code == "" || r.Name == "" {
+			h.respondWithError(w, http.StatusBadRequest, "code and name required for all subjects")
 			return
 		}
 		createReqs[i] = service.CreateSubjectRequest{
@@ -170,10 +155,11 @@ func (h *SubjectHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	subjects, err := h.subjectService.BulkCreate(ctx, createReqs)
+	subjects, err := h.subjectService.BulkCreate(ctx, createReqs, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to bulk create subjects",
 			zap.Int("count", len(reqs)),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -186,7 +172,6 @@ func (h *SubjectHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetByID handles GET /api/v1/companies/{companyID}/subjects/{subjectID}
 func (h *SubjectHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -223,7 +208,6 @@ func (h *SubjectHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetByCode handles GET /api/v1/companies/{companyID}/subjects/code/{code}
 func (h *SubjectHandler) GetByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -260,8 +244,6 @@ func (h *SubjectHandler) GetByCode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// List handles GET /api/v1/companies/{companyID}/subjects with query params
-// List handles GET /api/v1/companies/{companyID}/subjects with query params
 func (h *SubjectHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -276,19 +258,17 @@ func (h *SubjectHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build filter
 	filter := repository.SubjectFilter{
-		CompanyID: companyID, // not pointer
+		CompanyID: companyID,
 	}
 	if status := r.URL.Query().Get("is_active"); status != "" {
 		active := status == "true"
 		filter.IsActive = &active
 	}
 	if search := r.URL.Query().Get("search"); search != "" {
-		filter.Search = search // not pointer
+		filter.Search = search
 	}
 
-	// Pagination
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -299,7 +279,6 @@ func (h *SubjectHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	pagination := repository.Pagination{Limit: limit, Offset: offset}
 
-	// Sorting
 	sortField := r.URL.Query().Get("sort_field")
 	if sortField == "" {
 		sortField = "created_at"
@@ -322,7 +301,6 @@ func (h *SubjectHandler) List(w http.ResponseWriter, r *http.Request) {
 	count, err := h.subjectService.Count(ctx, filter)
 	if err != nil {
 		h.logger.Error("Failed to count subjects", zap.Error(err))
-		// non-fatal
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -336,18 +314,15 @@ func (h *SubjectHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Update handles PUT /api/v1/companies/{companyID}/subjects/{subjectID}
 func (h *SubjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
 
-	subjectIDStr := chi.URLParam(r, "subjectID")
-	subjectID, err := uuid.Parse(subjectIDStr)
+	subjectID, err := uuid.Parse(chi.URLParam(r, "subjectID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid subject ID")
 		return
@@ -370,17 +345,14 @@ func (h *SubjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
-	if req.Code == "" {
-		h.respondWithError(w, http.StatusBadRequest, "code is required")
-		return
-	}
-	if req.Name == "" {
-		h.respondWithError(w, http.StatusBadRequest, "name is required")
+	if req.Code == "" || req.Name == "" {
+		h.respondWithError(w, http.StatusBadRequest, "code and name are required")
 		return
 	}
 
-	// Build service request
+	// ✅ FIX: read idempotency key from context
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	updateReq := service.UpdateSubjectRequest{
 		SubjectID:   subjectID,
 		Code:        req.Code,
@@ -391,10 +363,11 @@ func (h *SubjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 		UpdatedBy:   &userID,
 	}
 
-	subject, err := h.subjectService.Update(ctx, updateReq)
+	subject, err := h.subjectService.Update(ctx, updateReq, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to update subject",
 			zap.String("subject_id", subjectID.String()),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -407,18 +380,15 @@ func (h *SubjectHandler) Update(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Activate handles PATCH /api/v1/companies/{companyID}/subjects/{subjectID}/activate
 func (h *SubjectHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
 
-	subjectIDStr := chi.URLParam(r, "subjectID")
-	subjectID, err := uuid.Parse(subjectIDStr)
+	subjectID, err := uuid.Parse(chi.URLParam(r, "subjectID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid subject ID")
 		return
@@ -435,10 +405,14 @@ func (h *SubjectHandler) Activate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.subjectService.Activate(ctx, subjectID, &userID)
+	// ✅ FIX: read idempotency key from context
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
+	err = h.subjectService.Activate(ctx, subjectID, &userID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to activate subject",
 			zap.String("subject_id", subjectID.String()),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -450,18 +424,15 @@ func (h *SubjectHandler) Activate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Deactivate handles PATCH /api/v1/companies/{companyID}/subjects/{subjectID}/deactivate
 func (h *SubjectHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
 
-	subjectIDStr := chi.URLParam(r, "subjectID")
-	subjectID, err := uuid.Parse(subjectIDStr)
+	subjectID, err := uuid.Parse(chi.URLParam(r, "subjectID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid subject ID")
 		return
@@ -478,10 +449,14 @@ func (h *SubjectHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.subjectService.Deactivate(ctx, subjectID, &userID)
+	// ✅ FIX: read idempotency key from context
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
+	err = h.subjectService.Deactivate(ctx, subjectID, &userID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to deactivate subject",
 			zap.String("subject_id", subjectID.String()),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -493,20 +468,23 @@ func (h *SubjectHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Delete handles DELETE /api/v1/companies/{companyID}/subjects/{subjectID}
 func (h *SubjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := chi.URLParam(r, "companyID")
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := uuid.Parse(chi.URLParam(r, "companyID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
 		return
 	}
 
-	subjectIDStr := chi.URLParam(r, "subjectID")
-	subjectID, err := uuid.Parse(subjectIDStr)
+	subjectID, err := uuid.Parse(chi.URLParam(r, "subjectID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid subject ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
@@ -515,10 +493,14 @@ func (h *SubjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.subjectService.Delete(ctx, subjectID, nil) // deletedBy can be set if needed
+	// ✅ FIX: read idempotency key from context
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
+	err = h.subjectService.Delete(ctx, subjectID, &userID, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to delete subject",
 			zap.String("subject_id", subjectID.String()),
+			zap.String("idempotency_key", idempotencyKey),
 			zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -530,7 +512,6 @@ func (h *SubjectHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ValidateCode handles GET /api/v1/companies/{companyID}/subjects/validate-code?code=...
 func (h *SubjectHandler) ValidateCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -567,10 +548,8 @@ func (h *SubjectHandler) ValidateCode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------- Helper Methods -------------------------------------
-
+// hasPermission is a placeholder – real permission checks are done via middleware
 func (h *SubjectHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
-	// Placeholder – implement actual permission check
 	return true
 }
 

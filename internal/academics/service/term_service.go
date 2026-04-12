@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,129 +12,129 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// ---------------------------------------------------------------------
-// TermService interface (unchanged)
-// ---------------------------------------------------------------------
-
+// TermService defines the interface for term operations
 type TermService interface {
 	Create(ctx context.Context, req CreateTermRequest) (*models.Term, error)
 	BulkCreate(ctx context.Context, req []CreateTermRequest) ([]*models.Term, error)
 	Upsert(ctx context.Context, req CreateTermRequest) (*models.Term, error)
-
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Term, error)
 	GetCurrent(ctx context.Context, academicYearID uuid.UUID) (*models.Term, error)
-
 	List(ctx context.Context, filter repository.TermFilter, p repository.Pagination, s repository.Sort) ([]*models.Term, error)
 	ListByAcademicYear(ctx context.Context, academicYearID uuid.UUID) ([]*models.Term, error)
 	Count(ctx context.Context, filter repository.TermFilter) (int64, error)
-
 	Exists(ctx context.Context, academicYearID uuid.UUID, name string) (bool, error)
-
 	Update(ctx context.Context, req UpdateTermRequest) (*models.Term, error)
-
 	SetCurrent(ctx context.Context, academicYearID, termID uuid.UUID, updatedBy *uuid.UUID) error
-
 	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
-
 	ValidateTermWithinAcademicYear(ctx context.Context, term *models.Term) error
 }
 
-// ---------------------------------------------------------------------
-// termService struct (updated with notification service)
-// ---------------------------------------------------------------------
-
 type termService struct {
-	repo        repository.TermRepository
-	ayRepo      repository.AcademicYearRepository
-	sectionRepo repository.SectionRepository // for dependency checks
-
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	idempotencyStore IdempotencyStore
-	notifSvc         NotificationService // added
-
-	pgClient *client.PostgresClient
-	logger   *zap.Logger
+	repo             repository.TermRepository
+	ayRepo           repository.AcademicYearRepository
+	sectionRepo      repository.SectionRepository
+	pgClient         *client.PostgresClient
+	logger           *zap.Logger
+	outboxRepo       outbox.Repository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	notificationSvc  NotificationService
 }
 
-// ---------------------------------------------------------------------
-// Constructor (updated)
-// ---------------------------------------------------------------------
-
+// NewTermService creates a new term service
 func NewTermService(
 	repo repository.TermRepository,
 	ayRepo repository.AcademicYearRepository,
 	sectionRepo repository.SectionRepository,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	idempotencyStore IdempotencyStore,
-	notifSvc NotificationService, // added
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	notificationSvc NotificationService,
 ) TermService {
 	return &termService{
 		repo:             repo,
 		ayRepo:           ayRepo,
 		sectionRepo:      sectionRepo,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		idempotencyStore: idempotencyStore,
-		notifSvc:         notifSvc,
 		pgClient:         pgClient,
 		logger:           logger.Named("term_service"),
+		outboxRepo:       outboxRepo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		notificationSvc:  notificationSvc,
 	}
 }
 
-// ---------------------------------------------------------------------
-// Helper: createNotification (same as in exam service)
-// ---------------------------------------------------------------------
+// Helper: build notification request (similar to academic year)
+func (s *termService) buildNotificationRequest(
+	term *models.Term,
+	ay *models.AcademicYear,
+	operation string,
+	actor *uuid.UUID,
+) CreateNotificationRequest {
+	var title, message string
+	var notifType models.NotificationType
+	priority := models.PriorityNormal
 
-// getUserIDsForTerm returns a list of user IDs (students + teachers) that are affected by this term.
-// This is a placeholder – you should implement it using your enrollment and teacher repositories.
-func (s *termService) getUserIDsForTerm(ctx context.Context, tx repository.DBTX, termID uuid.UUID) ([]uuid.UUID, error) {
-	// Example: fetch enrollments and teacher assignments for this term
-	// For now, return empty slice and log a warning.
-	s.logger.Warn("getUserIDsForTerm not implemented – returning empty list", zap.String("term_id", termID.String()))
-	return nil, nil
-}
+	switch operation {
+	case "created":
+		title = "New Term Created"
+		message = fmt.Sprintf("Term '%s' has been created for academic year %s (%s - %s)",
+			term.Name, ay.Name, term.StartDate.Format("2006-01-02"), term.EndDate.Format("2006-01-02"))
+		notifType = models.NotificationTypeInfo
+	case "updated":
+		title = "Term Updated"
+		message = fmt.Sprintf("Term '%s' has been updated (%s - %s)",
+			term.Name, term.StartDate.Format("2006-01-02"), term.EndDate.Format("2006-01-02"))
+		notifType = models.NotificationTypeInfo
+	case "set_current":
+		title = "Current Term Changed"
+		message = fmt.Sprintf("Term '%s' is now the current term for academic year %s", term.Name, ay.Name)
+		notifType = models.NotificationTypeEvent
+		priority = models.PriorityHigh
+	case "deleted":
+		title = "Term Deleted"
+		message = fmt.Sprintf("Term '%s' has been deleted from academic year %s", term.Name, ay.Name)
+		notifType = models.NotificationTypeWarning
+		priority = models.PriorityHigh
+	default:
+		title = "Term Changed"
+		message = fmt.Sprintf("Term '%s' was modified", term.Name)
+		notifType = models.NotificationTypeInfo
+	}
 
-// createNotification sends a notification to the specified user IDs.
-func (s *termService) createNotification(ctx context.Context, title, message string, notifType models.NotificationType, priority models.NotificationPriority, companyID uuid.UUID, userIDs []uuid.UUID, createdBy *uuid.UUID) {
-	if s.notifSvc == nil || len(userIDs) == 0 {
-		return
-	}
-	targets := make([]NotificationTargetInput, len(userIDs))
-	for i, uid := range userIDs {
-		targets[i] = NotificationTargetInput{
-			TargetType:     models.TargetUser, // or TargetStudent / TargetTeacher
-			TargetEntityID: uid,
-		}
-	}
-	req := CreateNotificationRequest{
-		CompanyID: companyID,
+	return CreateNotificationRequest{
+		CompanyID: ay.CompanyID,
 		Title:     title,
 		Message:   message,
 		Type:      notifType,
 		Priority:  priority,
 		ExpiresAt: nil,
-		Targets:   targets,
-		CreatedBy: createdBy,
-	}
-	// Use background context to avoid cancellation of the main request
-	_, err := s.notifSvc.Create(context.Background(), req, "")
-	if err != nil {
-		s.logger.Error("failed to send notification",
-			zap.String("title", title),
-			zap.Error(err))
+		Targets: []NotificationTargetInput{
+			{
+				TargetType:     models.TargetCompany,
+				TargetEntityID: ay.CompanyID,
+			},
+		},
+		CreatedBy: actor,
 	}
 }
 
-// ---------------------------------------------------------------------
-// Validation helpers (unchanged)
-// ---------------------------------------------------------------------
+// Helper: send notification (non‑blocking)
+func (s *termService) sendNotification(ctx context.Context, req CreateNotificationRequest, idempotencyKey string) {
+	if s.notificationSvc == nil {
+		return
+	}
+	_, _ = s.notificationSvc.Create(ctx, req, idempotencyKey)
+}
 
+// Validation helpers
 func (s *termService) validateInput(req CreateTermRequest) error {
 	if req.AcademicYearID == uuid.Nil {
 		return fmt.Errorf("%w: academic_year_id is required", ErrInvalidInput)
@@ -164,27 +165,21 @@ func (s *termService) validateAcademicYear(ctx context.Context, tx repository.DB
 func (s *termService) validateTermDates(ay *models.AcademicYear, startDate, endDate time.Time) error {
 	if startDate.Before(ay.StartDate) || endDate.After(ay.EndDate) {
 		return fmt.Errorf("%w: term dates must be within academic year %s (%s - %s)",
-			ErrInvalidInput, ay.Name, ay.StartDate, ay.EndDate)
+			ErrInvalidInput, ay.Name, ay.StartDate.Format("2006-01-02"), ay.EndDate.Format("2006-01-02"))
 	}
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Create (with notification after commit)
-// ---------------------------------------------------------------------
-
+// Create a single term
 func (s *termService) Create(ctx context.Context, req CreateTermRequest) (*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(
 		zap.String("method", "Create"),
 		zap.String("academic_year_id", req.AcademicYearID.String()),
 		zap.String("name", req.Name),
 	)
 
-	// Idempotency check
-	if idempotencyKey, ok := ctx.Value("idempotency_key").(string); ok && idempotencyKey != "" {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
 		var existing *models.Term
 		if err := s.idempotencyStore.Get(ctx, nil, idempotencyKey, &existing); err == nil && existing != nil {
 			logger.Info("idempotent request, returning cached response")
@@ -206,6 +201,7 @@ func (s *termService) Create(ctx context.Context, req CreateTermRequest) (*model
 	if err != nil {
 		return nil, err
 	}
+
 	if err := s.validateTermDates(ay, req.StartDate, req.EndDate); err != nil {
 		return nil, err
 	}
@@ -240,46 +236,58 @@ func (s *termService) Create(ctx context.Context, req CreateTermRequest) (*model
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TERM_CREATE", term.TermID, nil, term, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// After creation, if this term should be current, atomically unset others and set this one.
+	if req.IsCurrent {
+		if err := s.repo.SetCurrent(ctx, tx, req.AcademicYearID, term.TermID, req.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("set current term: %w", err)
+		}
+		term.IsCurrent = true
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTermCreated), term); err != nil {
-		return nil, fmt.Errorf("store outbox event: %w", err)
-	}
-
-	if idempotencyKey, ok := ctx.Value("idempotency_key").(string); ok && idempotencyKey != "" {
+	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, term); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
+	}
+
+	payload, _ := json.Marshal(term)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "term",
+		AggregateID:   term.TermID.String(),
+		EventType:     string(EventTermCreated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// --- Notification after commit ---
-	userIDs, _ := s.getUserIDsForTerm(ctx, nil, term.TermID) // use nil DB (separate connection)
-	title := fmt.Sprintf("New Term: %s", term.Name)
-	message := fmt.Sprintf("A new term '%s' has been added for academic year %s, from %s to %s.",
-		term.Name, ay.Name, term.StartDate.Format("2006-01-02"), term.EndDate.Format("2006-01-02"))
-	s.createNotification(ctx, title, message, models.NotificationTypeEvent, models.PriorityNormal, ay.CompanyID, userIDs, req.CreatedBy)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", "create", "term",
+			&term.TermID, "user", req.CreatedBy, nil, nil,
+			map[string]interface{}{"name": term.Name, "academic_year_id": term.AcademicYearID})
+	}
+
+	if s.notificationSvc != nil {
+		notifReq := s.buildNotificationRequest(term, ay, "created", req.CreatedBy)
+		s.sendNotification(ctx, notifReq, uuid.New().String())
+	}
 
 	logger.Info("term created", zap.String("term_id", term.TermID.String()))
 	return term, nil
 }
 
-// ---------------------------------------------------------------------
-// BulkCreate (with notifications after commit)
-// ---------------------------------------------------------------------
-
+// BulkCreate creates multiple terms in one transaction
 func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) ([]*models.Term, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -288,7 +296,7 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 	}
 	defer tx.Rollback()
 
-	// Preload academic years and existing terms (same as before)
+	// Group by academic year
 	ayIDSet := make(map[uuid.UUID]struct{})
 	for _, req := range reqs {
 		ayIDSet[req.AcademicYearID] = struct{}{}
@@ -298,6 +306,7 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 		ayIDs = append(ayIDs, id)
 	}
 
+	// Load academic years
 	ayMap := make(map[uuid.UUID]*models.AcademicYear)
 	for _, id := range ayIDs {
 		ay, err := s.ayRepo.GetByID(ctx, tx, id)
@@ -310,6 +319,7 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 		ayMap[id] = ay
 	}
 
+	// Load existing terms for each academic year
 	existingTermsMap := make(map[uuid.UUID][]*models.Term)
 	for _, id := range ayIDs {
 		terms, err := s.repo.ListByAcademicYear(ctx, tx, id)
@@ -319,12 +329,12 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 		existingTermsMap[id] = terms
 	}
 
+	// Prepare all terms and validate overlaps/duplicates in batch
 	type provisionalTerm struct {
 		req  CreateTermRequest
 		term *models.Term
 	}
 	grouped := make(map[uuid.UUID][]provisionalTerm)
-
 	for i, req := range reqs {
 		if err := s.validateInput(req); err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
@@ -345,21 +355,35 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 		grouped[req.AcademicYearID] = append(grouped[req.AcademicYearID], provisionalTerm{req: req, term: term})
 	}
 
-	// Validate each group (overlaps, duplicates) – same as before
 	allTerms := make([]*models.Term, 0, len(reqs))
-	for ayID, provList := range grouped {
-		existing := existingTermsMap[ayID]
+	termsToSetCurrent := make(map[uuid.UUID]*models.Term) // academicYearID -> term that should be current
 
-		// duplicate names within batch
+	for ayID, provList := range grouped {
+		// Check duplicate names within batch
 		nameSet := make(map[string]bool)
+		currentCount := 0
+		var currentTerm *models.Term
+
 		for _, pt := range provList {
 			if nameSet[pt.req.Name] {
 				return nil, fmt.Errorf("%w: duplicate term name '%s' in batch for academic year %s", ErrDuplicate, pt.req.Name, ayID)
 			}
 			nameSet[pt.req.Name] = true
+
+			if pt.req.IsCurrent {
+				currentCount++
+				currentTerm = pt.term
+			}
 		}
 
-		// overlaps within batch
+		if currentCount > 1 {
+			return nil, fmt.Errorf("%w: only one term can be current per academic year (academic year %s)", ErrInvalidInput, ayID)
+		}
+		if currentCount == 1 {
+			termsToSetCurrent[ayID] = currentTerm
+		}
+
+		// Check overlaps within batch
 		for i := 0; i < len(provList); i++ {
 			for j := i + 1; j < len(provList); j++ {
 				a := provList[i].term
@@ -369,30 +393,46 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 				}
 			}
 		}
-
-		// overlaps with existing
+		// Check overlaps with existing terms
+		existing := existingTermsMap[ayID]
 		for _, pt := range provList {
 			for _, ex := range existing {
 				if !(pt.term.StartDate.After(ex.EndDate) || pt.term.EndDate.Before(ex.StartDate)) {
 					return nil, fmt.Errorf("%w: term '%s' overlaps with existing term '%s' (%s - %s)",
-						ErrOverlap, pt.term.Name, ex.Name, ex.StartDate, ex.EndDate)
+						ErrOverlap, pt.term.Name, ex.Name, ex.StartDate.Format("2006-01-02"), ex.EndDate.Format("2006-01-02"))
 				}
 			}
 			allTerms = append(allTerms, pt.term)
 		}
 	}
 
+	// Bulk insert
 	if err := s.repo.BulkCreate(ctx, tx, allTerms); err != nil {
 		return nil, err
 	}
 
-	// Audit and outbox for each term
-	for _, term := range allTerms {
-		if err := s.auditLogger.Log(ctx, tx, "TERM_BULK_CREATE", term.TermID, nil, term, term.CreatedBy); err != nil {
-			logger.Error("audit failed", zap.String("term_id", term.TermID.String()), zap.Error(err))
+	// After insertion, set the appropriate term(s) as current
+	for ayID, termToSet := range termsToSetCurrent {
+		if err := s.repo.SetCurrent(ctx, tx, ayID, termToSet.TermID, termToSet.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("set current term for academic year %s: %w", ayID, err)
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventTermCreated), term); err != nil {
-			return nil, fmt.Errorf("outbox store for term %s: %w", term.TermID, err)
+		termToSet.IsCurrent = true
+	}
+
+	// Outbox events for each term
+	for _, term := range allTerms {
+		payload, _ := json.Marshal(term)
+		outboxEvent := &outbox.Event{
+			EventID:       uuid.New().String(),
+			AggregateType: "term",
+			AggregateID:   term.TermID.String(),
+			EventType:     string(EventTermCreated),
+			Payload:       payload,
+			Headers:       map[string]string{},
+			Status:        "pending",
+		}
+		if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+			return nil, fmt.Errorf("store outbox event for term %s: %w", term.TermID, err)
 		}
 	}
 
@@ -400,28 +440,26 @@ func (s *termService) BulkCreate(ctx context.Context, reqs []CreateTermRequest) 
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// --- Notifications after commit (for each term) ---
+	// Audit and notifications (async, best-effort)
 	for _, term := range allTerms {
 		ay := ayMap[term.AcademicYearID]
-		userIDs, _ := s.getUserIDsForTerm(ctx, nil, term.TermID)
-		title := fmt.Sprintf("New Term: %s", term.Name)
-		message := fmt.Sprintf("A new term '%s' has been added for academic year %s, from %s to %s.",
-			term.Name, ay.Name, term.StartDate.Format("2006-01-02"), term.EndDate.Format("2006-01-02"))
-		s.createNotification(ctx, title, message, models.NotificationTypeEvent, models.PriorityNormal, ay.CompanyID, userIDs, term.CreatedBy)
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", "bulk_create", "term",
+				&term.TermID, "user", term.CreatedBy, nil, nil,
+				map[string]interface{}{"name": term.Name, "academic_year_id": term.AcademicYearID})
+		}
+		if s.notificationSvc != nil {
+			notifReq := s.buildNotificationRequest(term, ay, "created", term.CreatedBy)
+			s.sendNotification(ctx, notifReq, uuid.New().String())
+		}
 	}
 
 	logger.Info("bulk created terms", zap.Int("count", len(allTerms)))
 	return allTerms, nil
 }
 
-// ---------------------------------------------------------------------
-// Upsert (with notification after commit)
-// ---------------------------------------------------------------------
-
+// Upsert creates or replaces a term by name (unique per academic year)
 func (s *termService) Upsert(ctx context.Context, req CreateTermRequest) (*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(
 		zap.String("method", "Upsert"),
 		zap.String("academic_year_id", req.AcademicYearID.String()),
@@ -446,19 +484,14 @@ func (s *termService) Upsert(ctx context.Context, req CreateTermRequest) (*model
 		return nil, err
 	}
 
-	var existingID uuid.UUID
-	terms, err := s.repo.ListByAcademicYear(ctx, tx, req.AcademicYearID)
-	if err != nil {
-		return nil, err
-	}
-	for _, t := range terms {
-		if t.Name == req.Name {
-			existingID = t.TermID
-			break
-		}
+	// Find existing term by name
+	existing, _ := s.repo.GetByName(ctx, tx, req.AcademicYearID, req.Name)
+	excludeID := uuid.Nil
+	if existing != nil {
+		excludeID = existing.TermID
 	}
 
-	overlap, err := s.repo.CheckOverlap(ctx, tx, req.AcademicYearID, req.StartDate, req.EndDate, existingID)
+	overlap, err := s.repo.CheckOverlap(ctx, tx, req.AcademicYearID, req.StartDate, req.EndDate, excludeID)
 	if err != nil {
 		return nil, err
 	}
@@ -476,39 +509,68 @@ func (s *termService) Upsert(ctx context.Context, req CreateTermRequest) (*model
 		UpdatedBy:      req.UpdatedBy,
 	}
 
+	var eventType EventType
+	if existing == nil {
+		eventType = EventTermCreated
+	} else {
+		eventType = EventTermUpdated
+	}
+
 	if err := s.repo.Upsert(ctx, tx, term); err != nil {
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TERM_UPSERT", term.TermID, nil, term, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// After upsert, if the term should be current, ensure only this one is current
+	if req.IsCurrent {
+		if err := s.repo.SetCurrent(ctx, tx, term.AcademicYearID, term.TermID, req.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("set current term: %w", err)
+		}
+		term.IsCurrent = true
 	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventTermUpdated), term); err != nil {
-		return nil, fmt.Errorf("outbox store: %w", err)
+
+	payload, _ := json.Marshal(term)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "term",
+		AggregateID:   term.TermID.String(),
+		EventType:     string(eventType),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// --- Notification after commit ---
-	userIDs, _ := s.getUserIDsForTerm(ctx, nil, term.TermID)
-	title := fmt.Sprintf("Term Updated: %s", term.Name)
-	message := fmt.Sprintf("Term '%s' has been updated. New dates: %s to %s.",
-		term.Name, term.StartDate.Format("2006-01-02"), term.EndDate.Format("2006-01-02"))
-	s.createNotification(ctx, title, message, models.NotificationTypeEvent, models.PriorityNormal, ay.CompanyID, userIDs, req.UpdatedBy)
+	if s.auditService != nil {
+		action := "upsert"
+		if existing == nil {
+			action = "create"
+		}
+		_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", action, "term",
+			&term.TermID, "user", req.CreatedBy, nil, nil,
+			map[string]interface{}{"name": term.Name})
+	}
+
+	if s.notificationSvc != nil {
+		operation := "created"
+		if existing != nil {
+			operation = "updated"
+		}
+		notifReq := s.buildNotificationRequest(term, ay, operation, req.CreatedBy)
+		s.sendNotification(ctx, notifReq, uuid.New().String())
+	}
 
 	logger.Info("term upserted", zap.String("term_id", term.TermID.String()))
 	return term, nil
 }
 
-// ---------------------------------------------------------------------
-// Read‑only methods (unchanged)
-// ---------------------------------------------------------------------
-
+// GetByID retrieves a term by its ID
 func (s *termService) GetByID(ctx context.Context, id uuid.UUID) (*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	term, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
 		return nil, err
@@ -519,9 +581,8 @@ func (s *termService) GetByID(ctx context.Context, id uuid.UUID) (*models.Term, 
 	return term, nil
 }
 
+// GetCurrent returns the current term for an academic year
 func (s *termService) GetCurrent(ctx context.Context, academicYearID uuid.UUID) (*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	term, err := s.repo.GetCurrent(ctx, s.pgClient.DB, academicYearID)
 	if err != nil {
 		return nil, err
@@ -532,39 +593,38 @@ func (s *termService) GetCurrent(ctx context.Context, academicYearID uuid.UUID) 
 	return term, nil
 }
 
+// List returns a filtered list of terms
 func (s *termService) List(ctx context.Context, filter repository.TermFilter, p repository.Pagination, srt repository.Sort) ([]*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
+// ListByAcademicYear returns all terms for a given academic year
 func (s *termService) ListByAcademicYear(ctx context.Context, academicYearID uuid.UUID) ([]*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
 	return s.repo.ListByAcademicYear(ctx, s.pgClient.DB, academicYearID)
 }
 
+// Count returns the number of terms matching the filter
 func (s *termService) Count(ctx context.Context, filter repository.TermFilter) (int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
+// Exists checks if a term with the given name exists in the academic year
 func (s *termService) Exists(ctx context.Context, academicYearID uuid.UUID, name string) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	return s.repo.Exists(ctx, s.pgClient.DB, academicYearID, name)
 }
 
-// ---------------------------------------------------------------------
-// Update (with notification after commit)
-// ---------------------------------------------------------------------
-
+// Update modifies an existing term
 func (s *termService) Update(ctx context.Context, req UpdateTermRequest) (*models.Term, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("term_id", req.TermID.String()))
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.Term
+		if err := s.idempotencyStore.Get(ctx, nil, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -579,8 +639,8 @@ func (s *termService) Update(ctx context.Context, req UpdateTermRequest) (*model
 	if term == nil {
 		return nil, fmt.Errorf("%w: term %s", ErrNotFound, req.TermID)
 	}
-	oldTerm := *term
 
+	oldTerm := *term
 	ay, err := s.validateAcademicYear(ctx, tx, term.AcademicYearID)
 	if err != nil {
 		return nil, err
@@ -617,39 +677,54 @@ func (s *termService) Update(ctx context.Context, req UpdateTermRequest) (*model
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TERM_UPDATE", req.TermID, &oldTerm, term, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// If the term should be current, ensure only this one is current
+	if req.IsCurrent {
+		if err := s.repo.SetCurrent(ctx, tx, term.AcademicYearID, term.TermID, req.UpdatedBy); err != nil {
+			return nil, fmt.Errorf("set current term: %w", err)
+		}
+		term.IsCurrent = true
 	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventTermUpdated), map[string]interface{}{
-		"old": oldTerm,
-		"new": term,
-	}); err != nil {
-		return nil, fmt.Errorf("outbox store: %w", err)
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, term)
+	}
+
+	// Outbox event for update
+	payload, _ := json.Marshal(term)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "term",
+		AggregateID:   term.TermID.String(),
+		EventType:     string(EventTermUpdated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// --- Notification after commit ---
-	userIDs, _ := s.getUserIDsForTerm(ctx, nil, term.TermID)
-	title := fmt.Sprintf("Term Updated: %s", term.Name)
-	message := fmt.Sprintf("Term '%s' has been updated. New dates: %s to %s.",
-		term.Name, term.StartDate.Format("2006-01-02"), term.EndDate.Format("2006-01-02"))
-	s.createNotification(ctx, title, message, models.NotificationTypeEvent, models.PriorityNormal, ay.CompanyID, userIDs, req.UpdatedBy)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", "update", "term",
+			&term.TermID, "user", req.UpdatedBy, nil, nil,
+			map[string]interface{}{"old_name": oldTerm.Name, "new_name": term.Name})
+	}
+
+	if s.notificationSvc != nil {
+		notifReq := s.buildNotificationRequest(term, ay, "updated", req.UpdatedBy)
+		s.sendNotification(ctx, notifReq, uuid.New().String())
+	}
 
 	logger.Info("term updated")
 	return term, nil
 }
 
-// ---------------------------------------------------------------------
-// SetCurrent (with notification after commit)
-// ---------------------------------------------------------------------
-
+// SetCurrent marks a term as the current one for its academic year (unsetting any previous current)
 func (s *termService) SetCurrent(ctx context.Context, academicYearID, termID uuid.UUID, updatedBy *uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(
 		zap.String("method", "SetCurrent"),
 		zap.String("academic_year_id", academicYearID.String()),
@@ -666,6 +741,7 @@ func (s *termService) SetCurrent(ctx context.Context, academicYearID, termID uui
 		return err
 	}
 
+	// Retrieve the term for outbox and notification
 	term, err := s.repo.GetByID(ctx, tx, termID)
 	if err != nil {
 		return err
@@ -674,15 +750,19 @@ func (s *termService) SetCurrent(ctx context.Context, academicYearID, termID uui
 		return fmt.Errorf("%w: term %s", ErrNotFound, termID)
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TERM_SET_CURRENT", termID, nil, term, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Outbox event
+	payload, _ := json.Marshal(term)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "term",
+		AggregateID:   term.TermID.String(),
+		EventType:     string(EventTermSetCurrent),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
 	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventTermSetCurrent), map[string]interface{}{
-		"academic_year_id": academicYearID,
-		"term_id":          termID,
-		"updated_by":       updatedBy,
-	}); err != nil {
-		return fmt.Errorf("outbox store: %w", err)
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	ay, err := s.ayRepo.GetByID(ctx, tx, academicYearID)
@@ -697,24 +777,23 @@ func (s *termService) SetCurrent(ctx context.Context, academicYearID, termID uui
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// --- Notification after commit ---
-	userIDs, _ := s.getUserIDsForTerm(ctx, nil, termID)
-	title := fmt.Sprintf("Current Term Changed: %s", term.Name)
-	message := fmt.Sprintf("The current term for academic year %s is now '%s'.", ay.Name, term.Name)
-	s.createNotification(ctx, title, message, models.NotificationTypeEvent, models.PriorityHigh, ay.CompanyID, userIDs, updatedBy)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", "set_current", "term",
+			&termID, "user", updatedBy, nil, nil,
+			map[string]interface{}{"is_current": true})
+	}
+
+	if s.notificationSvc != nil {
+		notifReq := s.buildNotificationRequest(term, ay, "set_current", updatedBy)
+		s.sendNotification(ctx, notifReq, uuid.New().String())
+	}
 
 	logger.Info("term set as current")
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Delete (with notification after commit)
-// ---------------------------------------------------------------------
-
+// Delete soft-deletes a term, checking for dependent sections first
 func (s *termService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("term_id", id.String()))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -728,7 +807,6 @@ func (s *termService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 		return err
 	}
 	if term == nil {
-		// Idempotent: already deleted
 		logger.Info("term already deleted (idempotent)")
 		return nil
 	}
@@ -748,14 +826,19 @@ func (s *termService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TERM_DELETE", id, term, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Outbox event
+	payload, _ := json.Marshal(term)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "term",
+		AggregateID:   term.TermID.String(),
+		EventType:     string(EventTermDeleted),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
 	}
-	if err := s.outboxStore.Store(ctx, tx, string(EventTermDeleted), map[string]interface{}{
-		"term_id":    id,
-		"deleted_by": deletedBy,
-	}); err != nil {
-		return fmt.Errorf("outbox store: %w", err)
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	ay, err := s.ayRepo.GetByID(ctx, tx, term.AcademicYearID)
@@ -770,24 +853,23 @@ func (s *termService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// --- Notification after commit ---
-	userIDs, _ := s.getUserIDsForTerm(ctx, nil, id)
-	title := fmt.Sprintf("Term Deleted: %s", term.Name)
-	message := fmt.Sprintf("Term '%s' for academic year %s has been deleted.", term.Name, ay.Name)
-	s.createNotification(ctx, title, message, models.NotificationTypeAlert, models.PriorityNormal, ay.CompanyID, userIDs, deletedBy)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", "delete", "term",
+			&id, "user", deletedBy, nil, nil,
+			map[string]interface{}{"name": term.Name})
+	}
+
+	if s.notificationSvc != nil {
+		notifReq := s.buildNotificationRequest(term, ay, "deleted", deletedBy)
+		s.sendNotification(ctx, notifReq, uuid.New().String())
+	}
 
 	logger.Info("term deleted")
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// ValidateTermWithinAcademicYear (unchanged)
-// ---------------------------------------------------------------------
-
+// ValidateTermWithinAcademicYear checks that a term's dates fall inside its academic year
 func (s *termService) ValidateTermWithinAcademicYear(ctx context.Context, term *models.Term) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
 	ay, err := s.ayRepo.GetByID(ctx, s.pgClient.DB, term.AcademicYearID)
 	if err != nil {
 		return err

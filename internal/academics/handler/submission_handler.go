@@ -14,13 +14,11 @@ import (
 	"auth-service/internal/academics/service"
 )
 
-// SubmissionHandler handles all submission-related endpoints.
 type SubmissionHandler struct {
 	submissionService service.SubmissionService
 	logger            *zap.Logger
 }
 
-// NewSubmissionHandler creates a new SubmissionHandler.
 func NewSubmissionHandler(submissionService service.SubmissionService, logger *zap.Logger) *SubmissionHandler {
 	return &SubmissionHandler{
 		submissionService: submissionService,
@@ -28,9 +26,7 @@ func NewSubmissionHandler(submissionService service.SubmissionService, logger *z
 	}
 }
 
-// --------------------------------------------------------------------------
 // CreateSubmission – POST /api/v1/companies/{companyID}/assignments/{assignmentID}/submissions
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) CreateSubmission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -47,7 +43,7 @@ func (h *SubmissionHandler) CreateSubmission(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	userID, err := getUserIDFromContext(ctx)
+	_, err = getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -69,9 +65,10 @@ func (h *SubmissionHandler) CreateSubmission(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "student_id is required")
 		return
 	}
-	req.CreatedBy = &userID
+	// ❌ Removed: req.CreatedBy = &userID (no longer exists)
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	// Read idempotency key from context (set by middleware)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	submission, err := h.submissionService.CreateSubmission(ctx, req, idempotencyKey)
 	if err != nil {
@@ -90,9 +87,7 @@ func (h *SubmissionHandler) CreateSubmission(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// --------------------------------------------------------------------------
 // GetSubmissionByID – GET /api/v1/companies/{companyID}/submissions/{submissionID}
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) GetSubmissionByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -129,9 +124,7 @@ func (h *SubmissionHandler) GetSubmissionByID(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// --------------------------------------------------------------------------
 // GetSubmissionByAssignmentAndStudent – GET /api/v1/companies/{companyID}/students/{studentID}/assignments/{assignmentID}/submission
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) GetSubmissionByAssignmentAndStudent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -176,10 +169,7 @@ func (h *SubmissionHandler) GetSubmissionByAssignmentAndStudent(w http.ResponseW
 	})
 }
 
-// --------------------------------------------------------------------------
 // ListSubmissions – GET /api/v1/companies/{companyID}/submissions
-// --------------------------------------------------------------------------
-// ListSubmissions handles GET /api/v1/companies/{companyID}/submissions
 func (h *SubmissionHandler) ListSubmissions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -194,7 +184,6 @@ func (h *SubmissionHandler) ListSubmissions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Build filter
 	filter := repository.SubmissionFilter{}
 	if assignmentIDStr := r.URL.Query().Get("assignment_id"); assignmentIDStr != "" {
 		if aid, err := uuid.Parse(assignmentIDStr); err == nil {
@@ -213,20 +202,7 @@ func (h *SubmissionHandler) ListSubmissions(w http.ResponseWriter, r *http.Reque
 		b, _ := strconv.ParseBool(graded)
 		filter.Graded = &b
 	}
-	// Date filters removed because SubmissionFilter does not have FromDate/ToDate fields
-	// If your filter supports them, uncomment and add the fields.
-	// if fromDateStr := r.URL.Query().Get("from_date"); fromDateStr != "" {
-	// 	if t, err := time.Parse(time.RFC3339, fromDateStr); err == nil {
-	// 		filter.FromDate = &t
-	// 	}
-	// }
-	// if toDateStr := r.URL.Query().Get("to_date"); toDateStr != "" {
-	// 	if t, err := time.Parse(time.RFC3339, toDateStr); err == nil {
-	// 		filter.ToDate = &t
-	// 	}
-	// }
 
-	// Pagination
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -237,7 +213,6 @@ func (h *SubmissionHandler) ListSubmissions(w http.ResponseWriter, r *http.Reque
 	}
 	pagination := repository.Pagination{Limit: limit, Offset: offset}
 
-	// Sorting
 	sortField := r.URL.Query().Get("sort_field")
 	if sortField == "" {
 		sortField = "submission_date"
@@ -260,7 +235,6 @@ func (h *SubmissionHandler) ListSubmissions(w http.ResponseWriter, r *http.Reque
 	count, err := h.submissionService.CountSubmissions(ctx, filter)
 	if err != nil {
 		h.logger.Error("Failed to count submissions", zap.Error(err))
-		// non-fatal
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -274,9 +248,7 @@ func (h *SubmissionHandler) ListSubmissions(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// --------------------------------------------------------------------------
 // UpdateSubmission – PUT /api/v1/companies/{companyID}/submissions/{submissionID}
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) UpdateSubmission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -293,7 +265,7 @@ func (h *SubmissionHandler) UpdateSubmission(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	userID, err := getUserIDFromContext(ctx)
+	_, err = getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -310,7 +282,7 @@ func (h *SubmissionHandler) UpdateSubmission(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	req.SubmissionID = submissionID
-	req.UpdatedBy = &userID
+	// ❌ Removed: req.UpdatedBy = &userID (no longer exists)
 
 	submission, err := h.submissionService.UpdateSubmission(ctx, req)
 	if err != nil {
@@ -328,9 +300,7 @@ func (h *SubmissionHandler) UpdateSubmission(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// --------------------------------------------------------------------------
 // DeleteSubmission – DELETE /api/v1/companies/{companyID}/submissions/{submissionID}
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) DeleteSubmission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -352,7 +322,6 @@ func (h *SubmissionHandler) DeleteSubmission(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// optional: get user from context for deletedBy
 	userID, _ := getUserIDFromContext(ctx)
 	err = h.submissionService.DeleteSubmission(ctx, submissionID, &userID)
 	if err != nil {
@@ -369,9 +338,7 @@ func (h *SubmissionHandler) DeleteSubmission(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// --------------------------------------------------------------------------
 // GradeSubmission – POST /api/v1/companies/{companyID}/submissions/{submissionID}/grade
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) GradeSubmission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -406,7 +373,7 @@ func (h *SubmissionHandler) GradeSubmission(w http.ResponseWriter, r *http.Reque
 	}
 	req.SubmissionID = submissionID
 	req.GradedBy = userID
-	req.CreatedBy = &userID
+	// ❌ Removed: req.CreatedBy = &userID (no longer exists)
 
 	grade, err := h.submissionService.GradeSubmission(ctx, req)
 	if err != nil {
@@ -424,9 +391,7 @@ func (h *SubmissionHandler) GradeSubmission(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// --------------------------------------------------------------------------
 // AddComment – POST /api/v1/companies/{companyID}/submissions/{submissionID}/comments
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -461,7 +426,7 @@ func (h *SubmissionHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 	}
 	req.SubmissionID = submissionID
 	req.CommentBy = userID
-	req.CreatedBy = &userID
+	// ❌ Removed: req.CreatedBy = &userID (no longer exists)
 
 	comment, err := h.submissionService.AddComment(ctx, req)
 	if err != nil {
@@ -479,9 +444,7 @@ func (h *SubmissionHandler) AddComment(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --------------------------------------------------------------------------
 // GetCommentsBySubmission – GET /api/v1/companies/{companyID}/submissions/{submissionID}/comments
-// --------------------------------------------------------------------------
 func (h *SubmissionHandler) GetCommentsBySubmission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -518,12 +481,9 @@ func (h *SubmissionHandler) GetCommentsBySubmission(w http.ResponseWriter, r *ht
 	})
 }
 
-// --------------------------------------------------------------------------
-// Helper methods (same as other handlers)
-// --------------------------------------------------------------------------
-
+// Helper methods
 func (h *SubmissionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
-	// Placeholder – implement actual permission check
+	// TODO: implement proper permission check
 	return true
 }
 

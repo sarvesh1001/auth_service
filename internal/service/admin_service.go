@@ -4792,8 +4792,9 @@ func countFilters(filters models.AdminSearchFilter) int {
 
 // Add to AdminService in service/admin.go
 func (s *AdminService) buildPermissionMaskFromPermissions(permissions []*models.Permission) []uint64 {
+	// We now support 800 permissions → 13 uint64 blocks
 	if len(permissions) == 0 {
-		return []uint64{0, 0, 0, 0}
+		return make([]uint64, 13)
 	}
 
 	var bitPositions []uint64
@@ -4803,7 +4804,16 @@ func (s *AdminService) buildPermissionMaskFromPermissions(permissions []*models.
 		}
 	}
 
-	return rbac.BuildMaskFromBitPositions(bitPositions)
+	mask := rbac.BuildMaskFromBitPositions(bitPositions)
+
+	// Ensure mask always has 13 blocks (hard requirement)
+	if len(mask) < 13 {
+		fullMask := make([]uint64, 13)
+		copy(fullMask, mask)
+		return fullMask
+	}
+
+	return mask
 }
 
 func (s *AdminService) GetAdminPermissionMask(ctx context.Context, adminID uuid.UUID) ([]uint64, error) {

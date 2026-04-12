@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,88 +13,102 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// AttendanceService defines the public methods for attendance operations.
+// ---------------------------------------------------------------------
+// Event types (matching outbox pattern)
+// ---------------------------------------------------------------------
+
 type AttendanceService interface {
-	// MarkAttendance creates or updates a single attendance record.
 	MarkAttendance(ctx context.Context, req MarkAttendanceRequest, idempotencyKey string) (*models.StudentAttendance, error)
-
-	// BulkMarkAttendance processes multiple attendance records in one transaction.
 	BulkMarkAttendance(ctx context.Context, req BulkMarkAttendanceRequest) ([]*models.StudentAttendance, error)
-
-	// GetAttendanceByID returns a single attendance record.
 	GetAttendanceByID(ctx context.Context, id uuid.UUID) (*models.StudentAttendance, error)
-
-	// ListAttendance returns attendance records matching the filter.
 	ListAttendance(ctx context.Context, filter ListAttendanceRequest) ([]*models.StudentAttendance, int64, error)
-
-	// DeleteAttendance soft-deletes an attendance record.
 	DeleteAttendance(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
-
-	// GetSummary returns the attendance summary for a student.
 	GetSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*AttendanceSummaryResponse, error)
-
-	// RecalculateSummary forces recalculation of a student's summary.
 	RecalculateSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error
-
-	// BulkRecalcSummaries recalculates summaries for multiple students.
 	BulkRecalcSummaries(ctx context.Context, studentIDs []uuid.UUID, academicYearID uuid.UUID, termID *uuid.UUID) error
-
-	// CreateExemption creates an attendance exemption.
 	CreateExemption(ctx context.Context, req CreateAttendanceExemptionRequest, idempotencyKey string) (*models.StudentAttendanceExemption, error)
-
-	// UpdateExemption updates an existing exemption.
 	UpdateExemption(ctx context.Context, req UpdateAttendanceExemptionRequest) (*models.StudentAttendanceExemption, error)
-
-	// DeleteExemption deletes an exemption.
 	DeleteExemption(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
-
-	// ListExemptions returns exemptions for a student or date range.
 	ListExemptions(ctx context.Context, studentID *uuid.UUID, fromDate, toDate *time.Time, limit, offset int) ([]*models.StudentAttendanceExemption, error)
 }
 
+// ---------------------------------------------------------------------
+// Service implementation
+// ---------------------------------------------------------------------
+
 type attendanceService struct {
-	repo             repository.AttendanceRepository
-	enrollmentRepo   repository.EnrollmentRepository
-	studentRepo      repository.StudentRepository // Added
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	eventPublisher   EventPublisher
-	pgClient         *client.PostgresClient
-	logger           *zap.Logger
-	notificationSvc  NotificationService
+	repo            repository.AttendanceRepository
+	enrollmentRepo  repository.EnrollmentRepository
+	studentRepo     repository.StudentRepository
+	pgClient        *client.PostgresClient
+	logger          *zap.Logger
+	notificationSvc NotificationService
+
+	// Infrastructure dependencies (same pattern as assignment service)
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
 
-// NewAttendanceService creates a new attendance service.
 func NewAttendanceService(
 	repo repository.AttendanceRepository,
 	enrollmentRepo repository.EnrollmentRepository,
-	studentRepo repository.StudentRepository, // Added
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	eventPublisher EventPublisher,
+	studentRepo repository.StudentRepository,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 	notificationSvc NotificationService,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) AttendanceService {
 	return &attendanceService{
 		repo:             repo,
 		enrollmentRepo:   enrollmentRepo,
 		studentRepo:      studentRepo,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		eventPublisher:   eventPublisher,
 		pgClient:         pgClient,
 		logger:           logger.Named("attendance_service"),
 		notificationSvc:  notificationSvc,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
 	}
 }
 
-// validateAttendanceInput checks required fields.
+// ---------------------------------------------------------------------
+// Helper: store outbox event for attendance
+// ---------------------------------------------------------------------
+
+func (s *attendanceService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "attendance",
+		AggregateID:   aggregateID.String(),
+		EventType:     string(eventType),
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
+}
+
+// ---------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------
+
 func (s *attendanceService) validateAttendanceInput(req MarkAttendanceRequest) error {
 	if req.EnrollmentID == uuid.Nil {
 		return fmt.Errorf("%w: enrollment_id is required", ErrInvalidInput)
@@ -109,77 +125,17 @@ func (s *attendanceService) validateAttendanceInput(req MarkAttendanceRequest) e
 	return nil
 }
 
-// createAttendanceNotification sends a notification for the given attendance record.
-// It runs asynchronously after the main transaction commits.
-func (s *attendanceService) createAttendanceNotification(ctx context.Context, enrollmentID uuid.UUID, date time.Time, status models.AttendanceStatus, markedBy *uuid.UUID) {
-	// Fetch enrollment to get student ID
-	enrollment, err := s.enrollmentRepo.GetByIDUnsafe(ctx, s.pgClient.DB, enrollmentID)
-	if err != nil {
-		s.logger.Error("failed to fetch enrollment for notification", zap.String("enrollment_id", enrollmentID.String()), zap.Error(err))
-		return
-	}
-	if enrollment == nil {
-		s.logger.Error("enrollment not found for notification", zap.String("enrollment_id", enrollmentID.String()))
-		return
-	}
+// ---------------------------------------------------------------------
+// MarkAttendance (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
 
-	// Fetch student to get company ID and other details
-	student, err := s.studentRepo.GetByID(ctx, s.pgClient.DB, enrollment.StudentID)
-	if err != nil {
-		s.logger.Error("failed to fetch student for notification", zap.String("student_id", enrollment.StudentID.String()), zap.Error(err))
-		return
-	}
-	if student == nil {
-		s.logger.Error("student not found for notification", zap.String("student_id", enrollment.StudentID.String()))
-		return
-	}
-
-	var title, message string
-	switch status {
-	case models.StatusAbsent:
-		title = "Attendance Alert: Absent"
-		message = fmt.Sprintf("Student was marked absent on %s", date.Format("2006-01-02"))
-	case models.StatusLate:
-		title = "Attendance Alert: Late Arrival"
-		message = fmt.Sprintf("Student was marked late on %s", date.Format("2006-01-02"))
-	default:
-		return // no notification needed
-	}
-
-	// Build notification request
-	notifReq := CreateNotificationRequest{
-		CompanyID: student.CompanyID,
-		Title:     title,
-		Message:   message,
-		Type:      models.NotificationTypeAlert,
-		Priority:  models.PriorityNormal,
-		ExpiresAt: nil,
-		Targets: []NotificationTargetInput{
-			{
-				TargetType:     models.TargetStudent,
-				TargetEntityID: enrollment.StudentID,
-			},
-		},
-		CreatedBy: markedBy,
-	}
-
-	// Create notification (its own transaction)
-	_, err = s.notificationSvc.Create(ctx, notifReq, "")
-	if err != nil {
-		s.logger.Error("failed to create attendance notification",
-			zap.String("enrollment_id", enrollmentID.String()),
-			zap.String("status", string(status)),
-			zap.Error(err))
-	}
-}
-
-// MarkAttendance implements AttendanceService.
 func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendanceRequest, idempotencyKey string) (*models.StudentAttendance, error) {
 	logger := s.logger.With(
 		zap.String("method", "MarkAttendance"),
 		zap.String("enrollment_id", req.EnrollmentID.String()),
 		zap.Time("date", req.Date),
 		zap.String("status", string(req.Status)),
+		zap.String("idempotency_key", idempotencyKey),
 	)
 
 	if err := s.validateAttendanceInput(req); err != nil {
@@ -192,18 +148,12 @@ func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendan
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (same pattern as assignment service)
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var attendance models.StudentAttendance
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &attendance); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
+		var existing models.StudentAttendance
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.AttendanceID != uuid.Nil {
 			logger.Info("returning idempotent response")
-			return &attendance, nil
+			return &existing, nil
 		}
 	}
 
@@ -220,42 +170,49 @@ func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendan
 		return nil, err
 	}
 
+	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, attendance); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "UPSERT", attendance.AttendanceID, nil, attendance, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "upsert", "attendance",
+			&attendance.AttendanceID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"enrollment_id": attendance.EnrollmentID,
+				"date":          attendance.AttendanceDate,
+				"status":        attendance.Status,
+			})
 	}
 
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceMarked), attendance); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceMarked, attendance.AttendanceID, attendance); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// After commit, create notification asynchronously
+	// Async notifications (unchanged)
 	go s.createAttendanceNotification(context.Background(), req.EnrollmentID, req.Date, req.Status, req.MarkedBy)
 
 	logger.Info("attendance marked", zap.String("attendance_id", attendance.AttendanceID.String()))
 	return attendance, nil
 }
 
-// BulkMarkAttendance implements AttendanceService.
+// ---------------------------------------------------------------------
+// BulkMarkAttendance (no idempotency, but uses outbox + audit)
+// ---------------------------------------------------------------------
+
 func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMarkAttendanceRequest) ([]*models.StudentAttendance, error) {
 	if len(req.Attendances) == 0 {
 		return nil, nil
 	}
 	logger := s.logger.With(zap.String("method", "BulkMarkAttendance"), zap.Int("count", len(req.Attendances)))
 
-	// Validate each request
 	for i, r := range req.Attendances {
 		if err := s.validateAttendanceInput(r); err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
@@ -285,34 +242,27 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 		return nil, err
 	}
 
-	// Audit (could be batched, but we'll do individually for simplicity)
+	// Audit for each
 	for _, a := range attendances {
-		if err := s.auditLogger.Log(ctx, tx, "UPSERT", a.AttendanceID, nil, a, req.CreatedBy); err != nil {
-			logger.Error("audit log failed", zap.String("attendance_id", a.AttendanceID.String()), zap.Error(err))
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_upsert", "attendance",
+				&a.AttendanceID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+					"enrollment_id": a.EnrollmentID,
+					"date":          a.AttendanceDate,
+					"status":        a.Status,
+				})
 		}
-	}
-
-	// Outbox event with summary payload
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceBulkMarked), map[string]interface{}{
-		"count": len(attendances),
-		"enrollment_ids": func() []uuid.UUID {
-			ids := make([]uuid.UUID, len(attendances))
-			for i, a := range attendances {
-				ids[i] = a.EnrollmentID
-			}
-			return ids
-		}(),
-		"created_by": req.CreatedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+		// Outbox event per attendance (or one batch event – here per record)
+		if err := s.storeOutboxEvent(ctx, tx, EventAttendanceBulkMarked, a.AttendanceID, a); err != nil {
+			return nil, fmt.Errorf("outbox store for %s: %w", a.AttendanceID, err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// After commit, create notifications asynchronously
+	// Async notifications
 	for _, a := range attendances {
 		if a.Status == models.StatusAbsent || a.Status == models.StatusLate {
 			go s.createAttendanceNotification(context.Background(), a.EnrollmentID, a.AttendanceDate, a.Status, a.MarkedBy)
@@ -322,6 +272,10 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 	logger.Info("bulk attendance marked", zap.Int("count", len(attendances)))
 	return attendances, nil
 }
+
+// ---------------------------------------------------------------------
+// GetAttendanceByID, ListAttendance, DeleteAttendance (simpler)
+// ---------------------------------------------------------------------
 
 func (s *attendanceService) GetAttendanceByID(ctx context.Context, id uuid.UUID) (*models.StudentAttendance, error) {
 	a, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
@@ -334,9 +288,7 @@ func (s *attendanceService) GetAttendanceByID(ctx context.Context, id uuid.UUID)
 	return a, nil
 }
 
-// ListAttendance implements AttendanceService.
 func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAttendanceRequest) ([]*models.StudentAttendance, int64, error) {
-	// Build repository filter
 	repoFilter := repository.AttendanceFilter{
 		EnrollmentID:   filter.EnrollmentID,
 		StudentID:      filter.StudentID,
@@ -348,7 +300,6 @@ func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAtten
 		Status:         filter.Status,
 		MarkedBy:       filter.MarkedBy,
 	}
-
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 50
@@ -361,7 +312,6 @@ func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAtten
 		offset = 0
 	}
 	pag := repository.Pagination{Limit: limit, Offset: offset}
-
 	sortField := filter.SortField
 	if sortField == "" {
 		sortField = "attendance_date"
@@ -376,30 +326,27 @@ func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAtten
 	if err != nil {
 		return nil, 0, err
 	}
-
 	total, err := s.repo.Count(ctx, s.pgClient.DB, repoFilter)
 	if err != nil {
 		return nil, 0, err
 	}
-
 	return attendances, total, nil
 }
 
-// DeleteAttendance implements AttendanceService.
 func (s *attendanceService) DeleteAttendance(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteAttendance"), zap.String("attendance_id", id.String()))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// First, get the attendance record for audit
-	a, err := s.repo.GetByID(ctx, tx, id)
+	existing, err := s.repo.GetByID(ctx, tx, id)
 	if err != nil {
 		return err
 	}
-	if a == nil {
+	if existing == nil {
 		return fmt.Errorf("%w: attendance %s", ErrNotFound, id)
 	}
 
@@ -407,28 +354,30 @@ func (s *attendanceService) DeleteAttendance(ctx context.Context, id uuid.UUID, 
 		return err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, a, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "attendance",
+			&id, "user", deletedBy, nil, nil, nil)
 	}
 
-	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceMarked)+".deleted", map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceMarked+".deleted", id, map[string]interface{}{
 		"attendance_id": id,
 		"deleted_by":    deletedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	logger.Info("attendance deleted")
 	return nil
 }
 
-// GetSummary implements AttendanceService.
+// ---------------------------------------------------------------------
+// Summary methods (with outbox)
+// ---------------------------------------------------------------------
+
 func (s *attendanceService) GetSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*AttendanceSummaryResponse, error) {
 	summary, err := s.repo.GetSummary(ctx, s.pgClient.DB, studentID, academicYearID, termID)
 	if err != nil {
@@ -437,7 +386,6 @@ func (s *attendanceService) GetSummary(ctx context.Context, studentID, academicY
 	if summary == nil {
 		return nil, fmt.Errorf("%w: attendance summary not found", ErrNotFound)
 	}
-
 	return &AttendanceSummaryResponse{
 		SummaryID:            summary.SummaryID,
 		StudentID:            summary.StudentID,
@@ -454,13 +402,13 @@ func (s *attendanceService) GetSummary(ctx context.Context, studentID, academicY
 	}, nil
 }
 
-// RecalculateSummary implements AttendanceService.
 func (s *attendanceService) RecalculateSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error {
 	logger := s.logger.With(
 		zap.String("method", "RecalculateSummary"),
 		zap.String("student_id", studentID.String()),
 		zap.String("academic_year_id", academicYearID.String()),
 	)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -471,24 +419,23 @@ func (s *attendanceService) RecalculateSummary(ctx context.Context, studentID, a
 		return err
 	}
 
-	// Outbox event for summary update
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceSummaryUpdated), map[string]interface{}{
+	// Use a placeholder aggregate ID (e.g., studentID) for outbox
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceSummaryUpdated, studentID, map[string]interface{}{
 		"student_id":       studentID,
 		"academic_year_id": academicYearID,
 		"term_id":          termID,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	logger.Info("summary recalculated")
 	return nil
 }
 
-// BulkRecalcSummaries implements AttendanceService.
 func (s *attendanceService) BulkRecalcSummaries(ctx context.Context, studentIDs []uuid.UUID, academicYearID uuid.UUID, termID *uuid.UUID) error {
 	if len(studentIDs) == 0 {
 		return nil
@@ -498,6 +445,7 @@ func (s *attendanceService) BulkRecalcSummaries(ctx context.Context, studentIDs 
 		zap.Int("count", len(studentIDs)),
 		zap.String("academic_year_id", academicYearID.String()),
 	)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -508,30 +456,34 @@ func (s *attendanceService) BulkRecalcSummaries(ctx context.Context, studentIDs 
 		return err
 	}
 
-	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceSummaryUpdated), map[string]interface{}{
+	// One outbox event for the bulk operation
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceSummaryUpdated, uuid.Nil, map[string]interface{}{
 		"student_ids":      studentIDs,
 		"academic_year_id": academicYearID,
 		"term_id":          termID,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	logger.Info("bulk summaries recalculated")
 	return nil
 }
 
-// CreateExemption implements AttendanceService.
+// ---------------------------------------------------------------------
+// Exemption methods (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAttendanceExemptionRequest, idempotencyKey string) (*models.StudentAttendanceExemption, error) {
 	logger := s.logger.With(
 		zap.String("method", "CreateExemption"),
 		zap.String("student_id", req.StudentID.String()),
 		zap.Time("from", req.FromDate),
 		zap.Time("to", req.ToDate),
+		zap.String("idempotency_key", idempotencyKey),
 	)
 
 	if req.StudentID == uuid.Nil {
@@ -550,18 +502,12 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 	}
 	defer tx.Rollback()
 
+	// Idempotency check
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var ex models.StudentAttendanceExemption
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &ex); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
+		var existing models.StudentAttendanceExemption
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.ExemptionID != uuid.Nil {
 			logger.Info("returning idempotent response")
-			return &ex, nil
+			return &existing, nil
 		}
 	}
 
@@ -584,13 +530,17 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 		}
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "CREATE", exemption.ExemptionID, nil, exemption, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "attendance_exemption",
+			&exemption.ExemptionID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"student_id": exemption.StudentID,
+				"from_date":  exemption.FromDate,
+				"to_date":    exemption.ToDate,
+			})
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceExemptionCreated), exemption); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceExemptionCreated, exemption.ExemptionID, exemption); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -601,7 +551,6 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 	return exemption, nil
 }
 
-// UpdateExemption implements AttendanceService.
 func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAttendanceExemptionRequest) (*models.StudentAttendanceExemption, error) {
 	logger := s.logger.With(zap.String("method", "UpdateExemption"), zap.String("exemption_id", req.ExemptionID.String()))
 
@@ -621,7 +570,6 @@ func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAtten
 	}
 	defer tx.Rollback()
 
-	// Get existing for audit
 	existing, err := s.repo.GetExemptionByID(ctx, tx, req.ExemptionID)
 	if err != nil {
 		return nil, err
@@ -639,13 +587,16 @@ func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAtten
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE", existing.ExemptionID, existing, existing, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "attendance_exemption",
+			&req.ExemptionID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old_from_date": existing.FromDate,
+				"new_from_date": req.FromDate,
+			})
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceExemptionUpdated), existing); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceExemptionUpdated, existing.ExemptionID, existing); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -656,16 +607,15 @@ func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAtten
 	return existing, nil
 }
 
-// DeleteExemption implements AttendanceService.
 func (s *attendanceService) DeleteExemption(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteExemption"), zap.String("exemption_id", id.String()))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Get for audit
 	ex, err := s.repo.GetExemptionByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -678,26 +628,26 @@ func (s *attendanceService) DeleteExemption(ctx context.Context, id uuid.UUID, d
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, ex, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "attendance_exemption",
+			&id, "user", deletedBy, nil, nil, nil)
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventAttendanceExemptionDeleted), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceExemptionDeleted, id, map[string]interface{}{
 		"exemption_id": id,
 		"deleted_by":   deletedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	logger.Info("exemption deleted")
 	return nil
 }
 
-// ListExemptions implements AttendanceService.
 func (s *attendanceService) ListExemptions(ctx context.Context, studentID *uuid.UUID, fromDate, toDate *time.Time, limit, offset int) ([]*models.StudentAttendanceExemption, error) {
 	if limit <= 0 {
 		limit = 50
@@ -710,4 +660,49 @@ func (s *attendanceService) ListExemptions(ctx context.Context, studentID *uuid.
 	}
 	pag := repository.Pagination{Limit: limit, Offset: offset}
 	return s.repo.ListExemptions(ctx, s.pgClient.DB, studentID, fromDate, toDate, pag)
+}
+
+// ---------------------------------------------------------------------
+// Notification helper (unchanged, kept for completeness)
+// ---------------------------------------------------------------------
+
+func (s *attendanceService) createAttendanceNotification(ctx context.Context, enrollmentID uuid.UUID, date time.Time, status models.AttendanceStatus, markedBy *uuid.UUID) {
+	enrollment, err := s.enrollmentRepo.GetByIDUnsafe(ctx, s.pgClient.DB, enrollmentID)
+	if err != nil || enrollment == nil {
+		s.logger.Error("failed to fetch enrollment for notification", zap.Error(err))
+		return
+	}
+	student, err := s.studentRepo.GetByID(ctx, s.pgClient.DB, enrollment.StudentID)
+	if err != nil || student == nil {
+		s.logger.Error("failed to fetch student for notification", zap.Error(err))
+		return
+	}
+	var title, message string
+	switch status {
+	case models.StatusAbsent:
+		title = "Attendance Alert: Absent"
+		message = fmt.Sprintf("Student was marked absent on %s", date.Format("2006-01-02"))
+	case models.StatusLate:
+		title = "Attendance Alert: Late Arrival"
+		message = fmt.Sprintf("Student was marked late on %s", date.Format("2006-01-02"))
+	default:
+		return
+	}
+	notifReq := CreateNotificationRequest{
+		CompanyID: student.CompanyID,
+		Title:     title,
+		Message:   message,
+		Type:      models.NotificationTypeAlert,
+		Priority:  models.PriorityNormal,
+		Targets: []NotificationTargetInput{
+			{
+				TargetType:     models.TargetStudent,
+				TargetEntityID: enrollment.StudentID,
+			},
+		},
+		CreatedBy: markedBy,
+	}
+	if _, err := s.notificationSvc.Create(ctx, notifReq, ""); err != nil {
+		s.logger.Error("failed to create attendance notification", zap.Error(err))
+	}
 }

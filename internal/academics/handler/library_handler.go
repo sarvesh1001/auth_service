@@ -35,6 +35,7 @@ func NewLibraryHandler(libraryService service.LibraryService, logger *zap.Logger
 // CreateCategory handles POST /api/v1/companies/{companyID}/library/categories
 func (h *LibraryHandler) CreateCategory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromURL(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
@@ -62,9 +63,13 @@ func (h *LibraryHandler) CreateCategory(w http.ResponseWriter, r *http.Request) 
 	req.CreatedBy = &userID
 	req.UpdatedBy = &userID
 
+	// ✅ FIX: pass idempotency via context (NOT as argument)
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	category, err := h.libraryService.CreateCategory(ctx, req, idempotencyKey)
+	category, err := h.libraryService.CreateCategory(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create library category",
 			zap.String("company_id", companyID.String()),
@@ -279,6 +284,7 @@ func (h *LibraryHandler) DeleteCategory(w http.ResponseWriter, r *http.Request) 
 // CreateBook handles POST /api/v1/companies/{companyID}/library/books
 func (h *LibraryHandler) CreateBook(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromURL(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
@@ -306,9 +312,13 @@ func (h *LibraryHandler) CreateBook(w http.ResponseWriter, r *http.Request) {
 	req.CreatedBy = &userID
 	req.UpdatedBy = &userID
 
+	// ✅ FIX: inject idempotency key into context
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	book, err := h.libraryService.CreateBook(ctx, req, idempotencyKey)
+	book, err := h.libraryService.CreateBook(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create book",
 			zap.String("company_id", companyID.String()),
@@ -573,6 +583,7 @@ func (h *LibraryHandler) DeleteBook(w http.ResponseWriter, r *http.Request) {
 // CreateCopy handles POST /api/v1/companies/{companyID}/library/copies
 func (h *LibraryHandler) CreateCopy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromURL(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
@@ -598,9 +609,13 @@ func (h *LibraryHandler) CreateCopy(w http.ResponseWriter, r *http.Request) {
 
 	req.CreatedBy = &userID
 
+	// ✅ FIX: inject idempotency into context
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	copy, err := h.libraryService.CreateCopy(ctx, req, idempotencyKey)
+	copy, err := h.libraryService.CreateCopy(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to create copy",
 			zap.String("company_id", companyID.String()),
@@ -845,9 +860,9 @@ func (h *LibraryHandler) DeleteCopy(w http.ResponseWriter, r *http.Request) {
 // Issue / Return
 // ----------------------------------------------------------------------------
 
-// IssueBook handles POST /api/v1/companies/{companyID}/library/issues
 func (h *LibraryHandler) IssueBook(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	companyID, err := getCompanyIDFromURL(r, "companyID")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
@@ -874,9 +889,13 @@ func (h *LibraryHandler) IssueBook(w http.ResponseWriter, r *http.Request) {
 	req.IssuedBy = &userID
 	req.CreatedBy = &userID
 
+	// ✅ FIX: inject idempotency into context
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
 
-	issue, err := h.libraryService.IssueBook(ctx, req, idempotencyKey)
+	issue, err := h.libraryService.IssueBook(ctx, req)
 	if err != nil {
 		h.logger.Error("Failed to issue book",
 			zap.String("company_id", companyID.String()),

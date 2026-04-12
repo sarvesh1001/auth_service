@@ -14,7 +14,7 @@ import (
 	"auth-service/internal/util"
 )
 
-// TransportRepository defines all database operations for transport domain.
+// TransportRepository defines all transport-related persistence methods.
 type TransportRepository interface {
 	// Routes
 	CreateRoute(ctx context.Context, db DBTX, r *models.TransportRoute) error
@@ -24,15 +24,15 @@ type TransportRepository interface {
 	UpdateRoute(ctx context.Context, db DBTX, r *models.TransportRoute) error
 	DeleteRoute(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
 
-	// Stops
+	// Stops (no updated_by column)
 	CreateStop(ctx context.Context, db DBTX, s *models.TransportStop) error
 	GetStopByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.TransportStop, error)
 	ListStops(ctx context.Context, db DBTX, filter TransportStopFilter, p Pagination, s Sort) ([]*models.TransportStop, error)
 	CountStops(ctx context.Context, db DBTX, filter TransportStopFilter) (int64, error)
 	UpdateStop(ctx context.Context, db DBTX, s *models.TransportStop) error
-	DeleteStop(ctx context.Context, db DBTX, id uuid.UUID) error // no soft delete on stops, just delete
+	DeleteStop(ctx context.Context, db DBTX, id uuid.UUID) error
 
-	// Vehicles
+	// Vehicles (have updated_by)
 	CreateVehicle(ctx context.Context, db DBTX, v *models.TransportVehicle) error
 	GetVehicleByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.TransportVehicle, error)
 	GetVehicleByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, number string) (*models.TransportVehicle, error)
@@ -41,21 +41,21 @@ type TransportRepository interface {
 	UpdateVehicle(ctx context.Context, db DBTX, v *models.TransportVehicle) error
 	DeleteVehicle(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
 
-	// Driver Assignments
+	// Driver assignments (no updated_by)
 	CreateDriverAssignment(ctx context.Context, db DBTX, da *models.TransportDriverAssignment) error
 	GetDriverAssignmentByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.TransportDriverAssignment, error)
 	ListDriverAssignments(ctx context.Context, db DBTX, filter TransportDriverAssignmentFilter, p Pagination, s Sort) ([]*models.TransportDriverAssignment, error)
 	CountDriverAssignments(ctx context.Context, db DBTX, filter TransportDriverAssignmentFilter) (int64, error)
 	UpdateDriverAssignment(ctx context.Context, db DBTX, da *models.TransportDriverAssignment) error
-	DeleteDriverAssignment(ctx context.Context, db DBTX, id uuid.UUID) error // soft delete? table has no deleted_at, so physical delete
+	DeleteDriverAssignment(ctx context.Context, db DBTX, id uuid.UUID) error
 
-	// Student Transport Assignments
+	// Student transport assignments (no updated_by)
 	CreateStudentAssignment(ctx context.Context, db DBTX, sa *models.StudentTransportAssignment) error
 	GetStudentAssignmentByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.StudentTransportAssignment, error)
 	ListStudentAssignments(ctx context.Context, db DBTX, filter StudentTransportAssignmentFilter, p Pagination, s Sort) ([]*models.StudentTransportAssignment, error)
 	CountStudentAssignments(ctx context.Context, db DBTX, filter StudentTransportAssignmentFilter) (int64, error)
 	UpdateStudentAssignment(ctx context.Context, db DBTX, sa *models.StudentTransportAssignment) error
-	DeleteStudentAssignment(ctx context.Context, db DBTX, id uuid.UUID) error // soft delete not present
+	DeleteStudentAssignment(ctx context.Context, db DBTX, id uuid.UUID) error
 }
 
 type transportRepository struct {
@@ -69,7 +69,9 @@ func NewTransportRepository(logger *zap.Logger) TransportRepository {
 	}
 }
 
-// -------------------- Helper functions --------------------
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
 
 func (r *transportRepository) validatePagination(p Pagination) (int, int) {
 	limit := p.Limit
@@ -101,7 +103,9 @@ func (r *transportRepository) validateSort(s Sort, allowed map[string]bool, defa
 	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
 }
 
-// -------------------- Routes --------------------
+// ---------------------------------------------------------------------
+// Routes (have updated_by)
+// ---------------------------------------------------------------------
 
 var allowedRouteSortFields = map[string]bool{
 	"created_at":  true,
@@ -120,19 +124,16 @@ func (r *transportRepository) buildRouteFilter(filter TransportRouteFilter) (str
 		args = append(args, filter.CompanyID)
 		idx++
 	}
-
 	if filter.IsActive != nil {
 		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
 		args = append(args, *filter.IsActive)
 		idx++
 	}
-
 	if filter.Search != "" {
 		conditions = append(conditions, fmt.Sprintf("(route_name ILIKE $%d OR start_point ILIKE $%d OR end_point ILIKE $%d)", idx, idx, idx))
 		args = append(args, "%"+filter.Search+"%")
 		idx++
 	}
-
 	conditions = append(conditions, "deleted_at IS NULL")
 
 	if len(conditions) == 0 {
@@ -187,7 +188,6 @@ func (r *transportRepository) ListRoutes(ctx context.Context, db DBTX, filter Tr
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -199,11 +199,11 @@ func (r *transportRepository) ListRoutes(ctx context.Context, db DBTX, filter Tr
 
 	var routes []*models.TransportRoute
 	for rows.Next() {
-		r, err := r.scanRoute(rows)
+		rt, err := r.scanRoute(rows)
 		if err != nil {
 			return nil, err
 		}
-		routes = append(routes, r)
+		routes = append(routes, rt)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("rows iteration: %w", err)
@@ -266,6 +266,7 @@ func (r *transportRepository) scanRoute(row scanner) (*models.TransportRoute, er
 	var route models.TransportRoute
 	var createdBy, updatedBy uuid.NullUUID
 	var distanceKm sql.NullFloat64
+
 	err := row.Scan(
 		&route.RouteID, &route.CompanyID, &route.RouteName, &route.StartPoint, &route.EndPoint,
 		&distanceKm, &route.IsActive,
@@ -290,7 +291,9 @@ func (r *transportRepository) scanRoute(row scanner) (*models.TransportRoute, er
 	return &route, nil
 }
 
-// -------------------- Stops --------------------
+// ---------------------------------------------------------------------
+// Stops (no updated_by column)
+// ---------------------------------------------------------------------
 
 var allowedStopSortFields = map[string]bool{
 	"created_at": true,
@@ -309,13 +312,11 @@ func (r *transportRepository) buildStopFilter(filter TransportStopFilter) (strin
 		args = append(args, filter.RouteID)
 		idx++
 	}
-
 	if filter.Search != "" {
 		conditions = append(conditions, fmt.Sprintf("stop_name ILIKE $%d", idx))
 		args = append(args, "%"+filter.Search+"%")
 		idx++
 	}
-
 	if len(conditions) == 0 {
 		return "", args
 	}
@@ -323,17 +324,18 @@ func (r *transportRepository) buildStopFilter(filter TransportStopFilter) (strin
 }
 
 func (r *transportRepository) CreateStop(ctx context.Context, db DBTX, stop *models.TransportStop) error {
+	// Note: table has NO updated_by column
 	query := `
         INSERT INTO academics.transport_stops (
             route_id, stop_name, stop_order, latitude, longitude, pickup_time, drop_time,
-            created_by, updated_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+            created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
         RETURNING stop_id, created_at, updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		stop.RouteID, stop.StopName, stop.StopOrder, stop.Latitude, stop.Longitude,
 		stop.PickupTime, stop.DropTime,
-		stop.CreatedBy, stop.UpdatedBy,
+		stop.CreatedBy,
 	).Scan(&stop.StopID, &stop.CreatedAt, &stop.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create transport stop", util.ErrorField(err))
@@ -345,7 +347,7 @@ func (r *transportRepository) CreateStop(ctx context.Context, db DBTX, stop *mod
 func (r *transportRepository) GetStopByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.TransportStop, error) {
 	query := `
         SELECT stop_id, route_id, stop_name, stop_order, latitude, longitude, pickup_time, drop_time,
-               created_at, updated_at, created_by, updated_by
+               created_at, updated_at, created_by
         FROM academics.transport_stops
         WHERE stop_id = $1
     `
@@ -363,13 +365,12 @@ func (r *transportRepository) ListStops(ctx context.Context, db DBTX, filter Tra
 
 	query := fmt.Sprintf(`
         SELECT stop_id, route_id, stop_name, stop_order, latitude, longitude, pickup_time, drop_time,
-               created_at, updated_at, created_by, updated_by
+               created_at, updated_at, created_by
         FROM academics.transport_stops
         %s
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -406,16 +407,17 @@ func (r *transportRepository) CountStops(ctx context.Context, db DBTX, filter Tr
 }
 
 func (r *transportRepository) UpdateStop(ctx context.Context, db DBTX, stop *models.TransportStop) error {
+	// Table has no updated_by column; we only update the stop's data and updated_at.
 	query := `
         UPDATE academics.transport_stops
         SET stop_name = $2, stop_order = $3, latitude = $4, longitude = $5,
-            pickup_time = $6, drop_time = $7, updated_by = $8, updated_at = NOW()
+            pickup_time = $6, drop_time = $7, updated_at = NOW()
         WHERE stop_id = $1
         RETURNING updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		stop.StopID, stop.StopName, stop.StopOrder, stop.Latitude, stop.Longitude,
-		stop.PickupTime, stop.DropTime, stop.UpdatedBy,
+		stop.PickupTime, stop.DropTime,
 	).Scan(&stop.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -446,14 +448,15 @@ func (r *transportRepository) DeleteStop(ctx context.Context, db DBTX, id uuid.U
 
 func (r *transportRepository) scanStop(row scanner) (*models.TransportStop, error) {
 	var stop models.TransportStop
-	var createdBy, updatedBy uuid.NullUUID
+	var createdBy uuid.NullUUID
 	var latitude, longitude sql.NullFloat64
 	var pickupTime, dropTime sql.NullTime
+
 	err := row.Scan(
 		&stop.StopID, &stop.RouteID, &stop.StopName, &stop.StopOrder,
 		&latitude, &longitude, &pickupTime, &dropTime,
 		&stop.CreatedAt, &stop.UpdatedAt,
-		&createdBy, &updatedBy,
+		&createdBy,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -476,13 +479,12 @@ func (r *transportRepository) scanStop(row scanner) (*models.TransportStop, erro
 	if createdBy.Valid {
 		stop.CreatedBy = &createdBy.UUID
 	}
-	if updatedBy.Valid {
-		stop.UpdatedBy = &updatedBy.UUID
-	}
 	return &stop, nil
 }
 
-// -------------------- Vehicles --------------------
+// ---------------------------------------------------------------------
+// Vehicles (have updated_by)
+// ---------------------------------------------------------------------
 
 var allowedVehicleSortFields = map[string]bool{
 	"created_at":   true,
@@ -502,19 +504,16 @@ func (r *transportRepository) buildVehicleFilter(filter TransportVehicleFilter) 
 		args = append(args, filter.CompanyID)
 		idx++
 	}
-
 	if filter.IsActive != nil {
 		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
 		args = append(args, *filter.IsActive)
 		idx++
 	}
-
 	if filter.Search != "" {
 		conditions = append(conditions, fmt.Sprintf("(vehicle_no ILIKE $%d OR vehicle_type ILIKE $%d)", idx, idx))
 		args = append(args, "%"+filter.Search+"%")
 		idx++
 	}
-
 	conditions = append(conditions, "deleted_at IS NULL")
 
 	if len(conditions) == 0 {
@@ -584,7 +583,6 @@ func (r *transportRepository) ListVehicles(ctx context.Context, db DBTX, filter 
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -666,6 +664,7 @@ func (r *transportRepository) scanVehicle(row scanner) (*models.TransportVehicle
 	var createdBy, updatedBy uuid.NullUUID
 	var capacity sql.NullInt32
 	var insuranceExpiry, fitnessExpiry sql.NullTime
+
 	err := row.Scan(
 		&v.VehicleID, &v.CompanyID, &v.VehicleNo, &v.VehicleType,
 		&capacity, &insuranceExpiry, &fitnessExpiry, &v.IsActive,
@@ -697,7 +696,9 @@ func (r *transportRepository) scanVehicle(row scanner) (*models.TransportVehicle
 	return &v, nil
 }
 
-// -------------------- Driver Assignments --------------------
+// ---------------------------------------------------------------------
+// Driver Assignments (no updated_by column)
+// ---------------------------------------------------------------------
 
 var allowedDriverAssignmentSortFields = map[string]bool{
 	"created_at":      true,
@@ -717,20 +718,16 @@ func (r *transportRepository) buildDriverAssignmentFilter(filter TransportDriver
 		args = append(args, filter.VehicleID)
 		idx++
 	}
-
 	if filter.IsActive != nil {
 		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
 		args = append(args, *filter.IsActive)
 		idx++
 	}
-
 	if filter.Date != nil {
-		// Active on a given date: assignment_date <= date AND (end_date IS NULL OR end_date >= date)
 		conditions = append(conditions, fmt.Sprintf("assignment_date <= $%d AND (end_date IS NULL OR end_date >= $%d)", idx, idx))
 		args = append(args, *filter.Date)
 		idx++
 	}
-
 	if len(conditions) == 0 {
 		return "", args
 	}
@@ -738,17 +735,18 @@ func (r *transportRepository) buildDriverAssignmentFilter(filter TransportDriver
 }
 
 func (r *transportRepository) CreateDriverAssignment(ctx context.Context, db DBTX, da *models.TransportDriverAssignment) error {
+	// Table has NO updated_by column
 	query := `
         INSERT INTO academics.transport_driver_assignments (
             vehicle_id, driver_name, driver_phone, driver_license, assignment_date, end_date, is_active,
-            created_by, updated_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+            created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
         RETURNING assignment_id, created_at, updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		da.VehicleID, da.DriverName, da.DriverPhone, da.DriverLicense,
 		da.AssignmentDate, da.EndDate, da.IsActive,
-		da.CreatedBy, da.UpdatedBy,
+		da.CreatedBy,
 	).Scan(&da.AssignmentID, &da.CreatedAt, &da.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create driver assignment", util.ErrorField(err))
@@ -761,7 +759,7 @@ func (r *transportRepository) GetDriverAssignmentByID(ctx context.Context, db DB
 	query := `
         SELECT assignment_id, vehicle_id, driver_name, driver_phone, driver_license,
                assignment_date, end_date, is_active,
-               created_at, updated_at, created_by, updated_by
+               created_at, updated_at, created_by
         FROM academics.transport_driver_assignments
         WHERE assignment_id = $1
     `
@@ -780,13 +778,12 @@ func (r *transportRepository) ListDriverAssignments(ctx context.Context, db DBTX
 	query := fmt.Sprintf(`
         SELECT assignment_id, vehicle_id, driver_name, driver_phone, driver_license,
                assignment_date, end_date, is_active,
-               created_at, updated_at, created_by, updated_by
+               created_at, updated_at, created_by
         FROM academics.transport_driver_assignments
         %s
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -823,18 +820,18 @@ func (r *transportRepository) CountDriverAssignments(ctx context.Context, db DBT
 }
 
 func (r *transportRepository) UpdateDriverAssignment(ctx context.Context, db DBTX, da *models.TransportDriverAssignment) error {
+	// Table has NO updated_by column; we only update the assignment data and updated_at.
 	query := `
         UPDATE academics.transport_driver_assignments
         SET driver_name = $2, driver_phone = $3, driver_license = $4,
             assignment_date = $5, end_date = $6, is_active = $7,
-            updated_by = $8, updated_at = NOW()
+            updated_at = NOW()
         WHERE assignment_id = $1
         RETURNING updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		da.AssignmentID, da.DriverName, da.DriverPhone, da.DriverLicense,
 		da.AssignmentDate, da.EndDate, da.IsActive,
-		da.UpdatedBy,
 	).Scan(&da.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -865,13 +862,14 @@ func (r *transportRepository) DeleteDriverAssignment(ctx context.Context, db DBT
 
 func (r *transportRepository) scanDriverAssignment(row scanner) (*models.TransportDriverAssignment, error) {
 	var da models.TransportDriverAssignment
-	var createdBy, updatedBy uuid.NullUUID
+	var createdBy uuid.NullUUID
 	var endDate sql.NullTime
+
 	err := row.Scan(
 		&da.AssignmentID, &da.VehicleID, &da.DriverName, &da.DriverPhone, &da.DriverLicense,
 		&da.AssignmentDate, &endDate, &da.IsActive,
 		&da.CreatedAt, &da.UpdatedAt,
-		&createdBy, &updatedBy,
+		&createdBy,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -885,13 +883,12 @@ func (r *transportRepository) scanDriverAssignment(row scanner) (*models.Transpo
 	if createdBy.Valid {
 		da.CreatedBy = &createdBy.UUID
 	}
-	if updatedBy.Valid {
-		da.UpdatedBy = &updatedBy.UUID
-	}
 	return &da, nil
 }
 
-// -------------------- Student Transport Assignments --------------------
+// ---------------------------------------------------------------------
+// Student Transport Assignments (no updated_by column)
+// ---------------------------------------------------------------------
 
 var allowedStudentAssignmentSortFields = map[string]bool{
 	"created_at":     true,
@@ -910,32 +907,26 @@ func (r *transportRepository) buildStudentAssignmentFilter(filter StudentTranspo
 		args = append(args, filter.StudentID)
 		idx++
 	}
-
 	if filter.RouteID != uuid.Nil {
 		conditions = append(conditions, fmt.Sprintf("route_id = $%d", idx))
 		args = append(args, filter.RouteID)
 		idx++
 	}
-
 	if filter.StopID != uuid.Nil {
 		conditions = append(conditions, fmt.Sprintf("stop_id = $%d", idx))
 		args = append(args, filter.StopID)
 		idx++
 	}
-
 	if filter.IsActive != nil {
 		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
 		args = append(args, *filter.IsActive)
 		idx++
 	}
-
 	if filter.EffectiveDate != nil {
-		// Effective on a given date: effective_from <= date AND (effective_to IS NULL OR effective_to >= date)
 		conditions = append(conditions, fmt.Sprintf("effective_from <= $%d AND (effective_to IS NULL OR effective_to >= $%d)", idx, idx))
 		args = append(args, *filter.EffectiveDate)
 		idx++
 	}
-
 	if len(conditions) == 0 {
 		return "", args
 	}
@@ -943,18 +934,19 @@ func (r *transportRepository) buildStudentAssignmentFilter(filter StudentTranspo
 }
 
 func (r *transportRepository) CreateStudentAssignment(ctx context.Context, db DBTX, sa *models.StudentTransportAssignment) error {
+	// Table has NO updated_by column
 	query := `
         INSERT INTO academics.student_transport_assignments (
             student_id, route_id, stop_id, pickup_point, drop_point,
             effective_from, effective_to, is_active,
-            created_by, updated_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
         RETURNING assignment_id, created_at, updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		sa.StudentID, sa.RouteID, sa.StopID, sa.PickupPoint, sa.DropPoint,
 		sa.EffectiveFrom, sa.EffectiveTo, sa.IsActive,
-		sa.CreatedBy, sa.UpdatedBy,
+		sa.CreatedBy,
 	).Scan(&sa.AssignmentID, &sa.CreatedAt, &sa.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create student transport assignment", util.ErrorField(err))
@@ -967,7 +959,7 @@ func (r *transportRepository) GetStudentAssignmentByID(ctx context.Context, db D
 	query := `
         SELECT assignment_id, student_id, route_id, stop_id, pickup_point, drop_point,
                effective_from, effective_to, is_active,
-               created_at, updated_at, created_by, updated_by
+               created_at, updated_at, created_by
         FROM academics.student_transport_assignments
         WHERE assignment_id = $1
     `
@@ -986,13 +978,12 @@ func (r *transportRepository) ListStudentAssignments(ctx context.Context, db DBT
 	query := fmt.Sprintf(`
         SELECT assignment_id, student_id, route_id, stop_id, pickup_point, drop_point,
                effective_from, effective_to, is_active,
-               created_at, updated_at, created_by, updated_by
+               created_at, updated_at, created_by
         FROM academics.student_transport_assignments
         %s
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -1029,18 +1020,18 @@ func (r *transportRepository) CountStudentAssignments(ctx context.Context, db DB
 }
 
 func (r *transportRepository) UpdateStudentAssignment(ctx context.Context, db DBTX, sa *models.StudentTransportAssignment) error {
+	// Table has NO updated_by column
 	query := `
         UPDATE academics.student_transport_assignments
         SET student_id = $2, route_id = $3, stop_id = $4, pickup_point = $5, drop_point = $6,
             effective_from = $7, effective_to = $8, is_active = $9,
-            updated_by = $10, updated_at = NOW()
+            updated_at = NOW()
         WHERE assignment_id = $1
         RETURNING updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		sa.AssignmentID, sa.StudentID, sa.RouteID, sa.StopID, sa.PickupPoint, sa.DropPoint,
 		sa.EffectiveFrom, sa.EffectiveTo, sa.IsActive,
-		sa.UpdatedBy,
 	).Scan(&sa.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1071,14 +1062,15 @@ func (r *transportRepository) DeleteStudentAssignment(ctx context.Context, db DB
 
 func (r *transportRepository) scanStudentAssignment(row scanner) (*models.StudentTransportAssignment, error) {
 	var sa models.StudentTransportAssignment
-	var createdBy, updatedBy uuid.NullUUID
+	var createdBy uuid.NullUUID
 	var effectiveTo sql.NullTime
+
 	err := row.Scan(
 		&sa.AssignmentID, &sa.StudentID, &sa.RouteID, &sa.StopID,
 		&sa.PickupPoint, &sa.DropPoint,
 		&sa.EffectiveFrom, &effectiveTo, &sa.IsActive,
 		&sa.CreatedAt, &sa.UpdatedAt,
-		&createdBy, &updatedBy,
+		&createdBy,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1091,9 +1083,6 @@ func (r *transportRepository) scanStudentAssignment(row scanner) (*models.Studen
 	}
 	if createdBy.Valid {
 		sa.CreatedBy = &createdBy.UUID
-	}
-	if updatedBy.Valid {
-		sa.UpdatedBy = &updatedBy.UUID
 	}
 	return &sa, nil
 }

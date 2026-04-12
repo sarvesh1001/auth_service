@@ -4323,7 +4323,8 @@ INSERT INTO system_departments (name, module_code, description, bitmask) VALUES
     ('Company Management', 'company_management', 'Overall company management and strategy', 1 << 18),
     ('Super Admin Management', 'super_admin', 'Super Admin management and system control', 1 << 19),
     ('Attendance', 'attendance', 'Attendance and time tracking management', 1 << 20),
-    ('Payroll', 'payroll', 'Payroll management and processing', 1 << 21)
+    ('Payroll', 'payroll', 'Payroll management and processing', 1 << 21),
+    ('Academics', 'academics', 'Academic management system', 1 << 22)
 ON CONFLICT (name) DO NOTHING;
 
 

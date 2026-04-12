@@ -2604,11 +2604,13 @@ func (r *CompanyRepositoryImpl) GetPermissionBitIndexes(ctx context.Context, per
 
 // Helper method to build full access mask (all bits = 1)
 func (r *CompanyRepositoryImpl) buildFullAccessMask() []uint64 {
-	// We have 229 permissions, so we need 4 uint64s (229/64 = 3.57 -> 4)
-	mask := make([]uint64, 4)
+	// We have 800 permissions, so we need 13 uint64s (800/64 = 12.5 -> 13)
+	mask := make([]uint64, 13)
+
 	for i := range mask {
 		mask[i] = ^uint64(0) // Set all bits to 1
 	}
+
 	return mask
 }
 

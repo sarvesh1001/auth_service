@@ -70,10 +70,12 @@ func (h *GuardianHandler) Create(w http.ResponseWriter, r *http.Request) {
 	req.CreatedBy = &userID
 	req.UpdatedBy = &userID
 
-	// Get idempotency key from header
+	// --- FIX: Inject idempotency key into context, not as argument ---
 	idempotencyKey := r.Header.Get("Idempotency-Key")
-
-	guardian, err := h.guardianService.Create(ctx, req, idempotencyKey)
+	if idempotencyKey != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
+	}
+	guardian, err := h.guardianService.Create(ctx, req) // only 2 args now
 	if err != nil {
 		h.logger.Error("Failed to create guardian",
 			zap.String("student_id", req.StudentID.String()),

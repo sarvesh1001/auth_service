@@ -30,7 +30,7 @@ func NewEnrollmentHandler(enrollmentService service.EnrollmentService, logger *z
 }
 
 // ---------------------------------------------------------------------
-// Helper functions (same as in admission handler)
+// Helper functions
 // ---------------------------------------------------------------------
 
 func (h *EnrollmentHandler) hasPermission(ctx context.Context, companyID uuid.UUID, permission string) bool {
@@ -160,7 +160,8 @@ func (h *EnrollmentHandler) BulkEnroll(w http.ResponseWriter, r *http.Request) {
 		reqs[i].UpdatedBy = &userID
 	}
 
-	enrollments, err := h.enrollmentService.BulkEnroll(ctx, reqs)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	enrollments, err := h.enrollmentService.BulkEnroll(ctx, reqs, idempotencyKey)
 	if err != nil {
 		h.logger.Error("failed to bulk enroll students",
 			zap.Int("count", len(reqs)),
@@ -222,7 +223,8 @@ func (h *EnrollmentHandler) UpsertEnrollment(w http.ResponseWriter, r *http.Requ
 	req.CreatedBy = &userID
 	req.UpdatedBy = &userID
 
-	enrollment, err := h.enrollmentService.UpsertEnrollment(ctx, req)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	enrollment, err := h.enrollmentService.UpsertEnrollment(ctx, req, idempotencyKey)
 	if err != nil {
 		h.logger.Error("failed to upsert enrollment",
 			zap.String("student_id", req.StudentID.String()),
@@ -376,17 +378,17 @@ func (h *EnrollmentHandler) List(w http.ResponseWriter, r *http.Request) {
 	filter := repository.EnrollmentFilter{}
 	if studentIDStr := r.URL.Query().Get("student_id"); studentIDStr != "" {
 		if studentID, err := uuid.Parse(studentIDStr); err == nil {
-			filter.StudentID = studentID // fixed: assign value, not pointer
+			filter.StudentID = studentID
 		}
 	}
 	if academicYearIDStr := r.URL.Query().Get("academic_year_id"); academicYearIDStr != "" {
 		if academicYearID, err := uuid.Parse(academicYearIDStr); err == nil {
-			filter.AcademicYearID = academicYearID // fixed
+			filter.AcademicYearID = academicYearID
 		}
 	}
 	if sectionIDStr := r.URL.Query().Get("section_id"); sectionIDStr != "" {
 		if sectionID, err := uuid.Parse(sectionIDStr); err == nil {
-			filter.SectionID = sectionID // fixed
+			filter.SectionID = sectionID
 		}
 	}
 	if status := r.URL.Query().Get("status"); status != "" {
@@ -592,7 +594,8 @@ func (h *EnrollmentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	req.EnrollmentID = enrollmentID
 	req.UpdatedBy = &userID
 
-	enrollment, err := h.enrollmentService.Update(ctx, req)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	enrollment, err := h.enrollmentService.Update(ctx, req, idempotencyKey)
 	if err != nil {
 		h.logger.Error("failed to update enrollment",
 			zap.String("enrollment_id", enrollmentID.String()),
@@ -647,7 +650,8 @@ func (h *EnrollmentHandler) UpdateRollNumber(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.enrollmentService.UpdateRollNumber(ctx, enrollmentID, req.RollNumber, &userID); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.UpdateRollNumber(ctx, enrollmentID, req.RollNumber, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to update roll number",
 			zap.String("enrollment_id", enrollmentID.String()),
 			zap.Error(err))
@@ -701,7 +705,8 @@ func (h *EnrollmentHandler) TransferSection(w http.ResponseWriter, r *http.Reque
 	req.EnrollmentID = enrollmentID
 	req.UpdatedBy = &userID
 
-	enrollment, err := h.enrollmentService.TransferSection(ctx, req)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	enrollment, err := h.enrollmentService.TransferSection(ctx, req, idempotencyKey)
 	if err != nil {
 		h.logger.Error("failed to transfer section",
 			zap.String("enrollment_id", enrollmentID.String()),
@@ -753,7 +758,8 @@ func (h *EnrollmentHandler) BulkTransferSection(w http.ResponseWriter, r *http.R
 		reqs[i].UpdatedBy = &userID
 	}
 
-	if err := h.enrollmentService.BulkTransferSection(ctx, reqs); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.BulkTransferSection(ctx, reqs, idempotencyKey); err != nil {
 		h.logger.Error("failed to bulk transfer sections",
 			zap.Int("count", len(reqs)),
 			zap.Error(err))
@@ -801,7 +807,8 @@ func (h *EnrollmentHandler) SwapSections(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := h.enrollmentService.SwapSections(ctx, req.EnrollmentID1, req.EnrollmentID2, &userID); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.SwapSections(ctx, req.EnrollmentID1, req.EnrollmentID2, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to swap sections",
 			zap.String("enrollment_id1", req.EnrollmentID1.String()),
 			zap.String("enrollment_id2", req.EnrollmentID2.String()),
@@ -861,7 +868,8 @@ func (h *EnrollmentHandler) PromoteStudent(w http.ResponseWriter, r *http.Reques
 
 	req.UpdatedBy = &userID
 
-	enrollment, err := h.enrollmentService.PromoteStudent(ctx, req)
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	enrollment, err := h.enrollmentService.PromoteStudent(ctx, req, idempotencyKey)
 	if err != nil {
 		h.logger.Error("failed to promote student",
 			zap.String("student_id", req.StudentID.String()),
@@ -912,7 +920,8 @@ func (h *EnrollmentHandler) BulkPromote(w http.ResponseWriter, r *http.Request) 
 		reqs[i].UpdatedBy = &userID
 	}
 
-	if err := h.enrollmentService.BulkPromote(ctx, reqs); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.BulkPromote(ctx, reqs, idempotencyKey); err != nil {
 		h.logger.Error("failed to bulk promote students",
 			zap.Int("count", len(reqs)),
 			zap.Error(err))
@@ -970,7 +979,8 @@ func (h *EnrollmentHandler) PromoteSection(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := h.enrollmentService.PromoteSection(ctx, sectionID, req.NextSectionID, req.AcademicYearID, &userID); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.PromoteSection(ctx, sectionID, req.NextSectionID, req.AcademicYearID, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to promote section",
 			zap.String("section_id", sectionID.String()),
 			zap.String("next_section_id", req.NextSectionID.String()),
@@ -1016,7 +1026,8 @@ func (h *EnrollmentHandler) GraduateStudent(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := h.enrollmentService.GraduateStudent(ctx, enrollmentID, &userID); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.GraduateStudent(ctx, enrollmentID, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to graduate student",
 			zap.String("enrollment_id", enrollmentID.String()),
 			zap.Error(err))
@@ -1057,7 +1068,8 @@ func (h *EnrollmentHandler) MarkAlumni(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.enrollmentService.MarkAlumni(ctx, studentID, &userID); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.MarkAlumni(ctx, studentID, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to mark student as alumni",
 			zap.String("student_id", studentID.String()),
 			zap.Error(err))
@@ -1112,7 +1124,8 @@ func (h *EnrollmentHandler) BulkUpdateStatus(w http.ResponseWriter, r *http.Requ
 
 	req.UpdatedBy = &userID
 
-	if err := h.enrollmentService.BulkUpdateStatus(ctx, req); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.BulkUpdateStatus(ctx, req, idempotencyKey); err != nil {
 		h.logger.Error("failed to bulk update enrollment status",
 			zap.Int("count", len(req.EnrollmentIDs)),
 			zap.String("status", req.Status),
@@ -1160,7 +1173,8 @@ func (h *EnrollmentHandler) BulkAssignRollNumbers(w http.ResponseWriter, r *http
 
 	req.UpdatedBy = &userID
 
-	if err := h.enrollmentService.BulkAssignRollNumbers(ctx, req); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.BulkAssignRollNumbers(ctx, req, idempotencyKey); err != nil {
 		h.logger.Error("failed to bulk assign roll numbers",
 			zap.Int("count", len(req.RollNumbers)),
 			zap.Error(err))
@@ -1385,23 +1399,26 @@ func (h *EnrollmentHandler) GetPromotionStats(w http.ResponseWriter, r *http.Req
 
 // Activate handles PATCH /api/v1/companies/{companyID}/enrollments/{enrollmentID}/activate
 func (h *EnrollmentHandler) Activate(w http.ResponseWriter, r *http.Request) {
-	h.updateStatusAction(w, r, "activate", func(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-		return h.enrollmentService.Activate(ctx, id, updatedBy)
-	})
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	h.updateStatusAction(w, r, "activate", func(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempKey string) error {
+		return h.enrollmentService.Activate(ctx, id, updatedBy, idempKey)
+	}, idempotencyKey)
 }
 
 // Complete handles PATCH /api/v1/companies/{companyID}/enrollments/{enrollmentID}/complete
 func (h *EnrollmentHandler) Complete(w http.ResponseWriter, r *http.Request) {
-	h.updateStatusAction(w, r, "complete", func(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-		return h.enrollmentService.Complete(ctx, id, updatedBy)
-	})
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	h.updateStatusAction(w, r, "complete", func(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempKey string) error {
+		return h.enrollmentService.Complete(ctx, id, updatedBy, idempKey)
+	}, idempotencyKey)
 }
 
 // Withdraw handles PATCH /api/v1/companies/{companyID}/enrollments/{enrollmentID}/withdraw
 func (h *EnrollmentHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
-	h.updateStatusAction(w, r, "withdraw", func(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-		return h.enrollmentService.Withdraw(ctx, id, updatedBy)
-	})
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	h.updateStatusAction(w, r, "withdraw", func(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempKey string) error {
+		return h.enrollmentService.Withdraw(ctx, id, updatedBy, idempKey)
+	}, idempotencyKey)
 }
 
 // UpdateStatus handles PATCH /api/v1/companies/{companyID}/enrollments/{enrollmentID}/status
@@ -1443,7 +1460,8 @@ func (h *EnrollmentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := h.enrollmentService.UpdateStatus(ctx, enrollmentID, req.Status, &userID); err != nil {
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if err := h.enrollmentService.UpdateStatus(ctx, enrollmentID, req.Status, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to update enrollment status",
 			zap.String("enrollment_id", enrollmentID.String()),
 			zap.String("status", req.Status),
@@ -1459,7 +1477,7 @@ func (h *EnrollmentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request)
 }
 
 // updateStatusAction is a helper for simple status change endpoints.
-func (h *EnrollmentHandler) updateStatusAction(w http.ResponseWriter, r *http.Request, actionName string, fn func(context.Context, uuid.UUID, *uuid.UUID) error) {
+func (h *EnrollmentHandler) updateStatusAction(w http.ResponseWriter, r *http.Request, actionName string, fn func(context.Context, uuid.UUID, *uuid.UUID, string) error, idempotencyKey string) {
 	ctx := r.Context()
 
 	companyID, err := parseUUIDFromPath(r, "companyID")
@@ -1486,7 +1504,7 @@ func (h *EnrollmentHandler) updateStatusAction(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := fn(ctx, enrollmentID, &userID); err != nil {
+	if err := fn(ctx, enrollmentID, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to "+actionName+" enrollment",
 			zap.String("enrollment_id", enrollmentID.String()),
 			zap.Error(err))

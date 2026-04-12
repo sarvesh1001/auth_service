@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +15,9 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
 // ---------------------------------------------------------------------
@@ -25,12 +30,12 @@ const (
 )
 
 // ---------------------------------------------------------------------
-// SubjectService interface
+// SubjectService interface (updated with idempotency keys)
 // ---------------------------------------------------------------------
 type SubjectService interface {
-	Create(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error)
-	BulkCreate(ctx context.Context, req []CreateSubjectRequest) ([]*models.Subject, error)
-	Upsert(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error)
+	Create(ctx context.Context, req CreateSubjectRequest, idempotencyKey string) (*models.Subject, error)
+	BulkCreate(ctx context.Context, req []CreateSubjectRequest, idempotencyKey string) ([]*models.Subject, error)
+	Upsert(ctx context.Context, req CreateSubjectRequest, idempotencyKey string) (*models.Subject, error)
 
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Subject, error)
 	GetByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Subject, error)
@@ -42,25 +47,28 @@ type SubjectService interface {
 
 	Exists(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
 
-	Update(ctx context.Context, req UpdateSubjectRequest) (*models.Subject, error)
+	Update(ctx context.Context, req UpdateSubjectRequest, idempotencyKey string) (*models.Subject, error)
 
-	Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error
-	Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error
+	Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 
-	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
+	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
 
 	ValidateUniqueCode(ctx context.Context, companyID uuid.UUID, code string) error
 }
 
 // ---------------------------------------------------------------------
-// subjectService struct
+// subjectService struct (updated dependencies)
 // ---------------------------------------------------------------------
 type subjectService struct {
-	repo        repository.SubjectRepository
-	auditLogger AuditLogger
-	outboxStore OutboxStore
-	pgClient    *client.PostgresClient
-	logger      *zap.Logger
+	repo     repository.SubjectRepository
+	pgClient *client.PostgresClient
+	logger   *zap.Logger
+
+	// Infrastructure dependencies
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
 
 // ---------------------------------------------------------------------
@@ -68,18 +76,45 @@ type subjectService struct {
 // ---------------------------------------------------------------------
 func NewSubjectService(
 	repo repository.SubjectRepository,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) SubjectService {
 	return &subjectService{
-		repo:        repo,
-		auditLogger: auditLogger,
-		outboxStore: outboxStore,
-		pgClient:    pgClient,
-		logger:      logger.Named("subject_service"),
+		repo:             repo,
+		pgClient:         pgClient,
+		logger:           logger.Named("subject_service"),
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
 	}
+}
+
+// ---------------------------------------------------------------------
+// Helper: store outbox event for subject
+// ---------------------------------------------------------------------
+func (s *subjectService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "subject",
+		AggregateID:   aggregateID.String(),
+		EventType:     string(eventType),
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
 }
 
 // ---------------------------------------------------------------------
@@ -102,9 +137,9 @@ func (s *subjectService) validateInput(req CreateSubjectRequest) error {
 }
 
 // ---------------------------------------------------------------------
-// Create
+// Create (with idempotency, audit, outbox)
 // ---------------------------------------------------------------------
-func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error) {
+func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest, idempotencyKey string) (*models.Subject, error) {
 	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 
@@ -112,6 +147,7 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 		zap.String("method", "Create"),
 		zap.String("company_id", req.CompanyID.String()),
 		zap.String("code", req.Code),
+		zap.String("idempotency_key", idempotencyKey),
 	)
 
 	if err := s.validateInput(req); err != nil {
@@ -125,6 +161,15 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing models.Subject
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.SubjectID != uuid.Nil {
+			logger.Info("returning idempotent response")
+			return &existing, nil
+		}
+	}
 
 	// Check uniqueness (application‑level check, but DB constraint is the final guard)
 	exists, err := s.repo.Exists(ctx, tx, req.CompanyID, req.Code)
@@ -158,13 +203,25 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 		return nil, err
 	}
 
-	// Audit log (non‑critical – we log error but don’t fail the operation)
-	if err := s.auditLogger.Log(ctx, tx, "SUBJECT_CREATE", subject.SubjectID, nil, subject, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key inside transaction
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, subject); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "subject",
+			&subject.SubjectID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"code":       subject.Code,
+				"name":       subject.Name,
+				"company_id": subject.CompanyID,
+			})
 	}
 
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectCreated), subject); err != nil {
+	if err := s.storeOutboxEvent(ctx, tx, EventSubjectCreated, subject.SubjectID, subject); err != nil {
 		logger.Error("failed to store outbox event", zap.Error(err))
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
@@ -179,16 +236,20 @@ func (s *subjectService) Create(ctx context.Context, req CreateSubjectRequest) (
 }
 
 // ---------------------------------------------------------------------
-// BulkCreate
+// BulkCreate (with idempotency, audit, outbox)
 // ---------------------------------------------------------------------
-func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectRequest) ([]*models.Subject, error) {
+func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectRequest, idempotencyKey string) ([]*models.Subject, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 
-	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
+	logger := s.logger.With(
+		zap.String("method", "BulkCreate"),
+		zap.Int("count", len(reqs)),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	// Basic input validation and collect unique keys per company
 	type key struct {
@@ -218,6 +279,15 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing []*models.Subject
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && len(existing) > 0 {
+			logger.Info("returning idempotent response")
+			return existing, nil
+		}
+	}
 
 	// Pre‑load existing subjects for each company to reduce DB duplicate checks
 	existingMap := make(map[key]*models.Subject) // key -> existing subject
@@ -262,12 +332,23 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 		return nil, err
 	}
 
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, subjects); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit and outbox for each created subject
 	for _, subj := range subjects {
-		if err := s.auditLogger.Log(ctx, tx, "SUBJECT_BULK_CREATE", subj.SubjectID, nil, subj, subj.CreatedBy); err != nil {
-			logger.Error("audit log failed", zap.String("subject_id", subj.SubjectID.String()), zap.Error(err))
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_create", "subject",
+				&subj.SubjectID, "user", subj.CreatedBy, nil, nil, map[string]interface{}{
+					"code": subj.Code,
+					"name": subj.Name,
+				})
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventSubjectCreated), subj); err != nil {
+		if err := s.storeOutboxEvent(ctx, tx, EventSubjectCreated, subj.SubjectID, subj); err != nil {
 			logger.Error("failed to store outbox event", zap.String("subject_id", subj.SubjectID.String()), zap.Error(err))
 			return nil, fmt.Errorf("store outbox event for subject %s: %w", subj.SubjectID, err)
 		}
@@ -283,9 +364,9 @@ func (s *subjectService) BulkCreate(ctx context.Context, reqs []CreateSubjectReq
 }
 
 // ---------------------------------------------------------------------
-// Upsert (with correct event type)
+// Upsert (with idempotency, audit, outbox)
 // ---------------------------------------------------------------------
-func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (*models.Subject, error) {
+func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest, idempotencyKey string) (*models.Subject, error) {
 	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 
@@ -293,6 +374,7 @@ func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (
 		zap.String("method", "Upsert"),
 		zap.String("company_id", req.CompanyID.String()),
 		zap.String("code", req.Code),
+		zap.String("idempotency_key", idempotencyKey),
 	)
 
 	if err := s.validateInput(req); err != nil {
@@ -306,6 +388,15 @@ func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing models.Subject
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.SubjectID != uuid.Nil {
+			logger.Info("returning idempotent response")
+			return &existing, nil
+		}
+	}
 
 	subject := &models.Subject{
 		CompanyID:   req.CompanyID,
@@ -329,22 +420,36 @@ func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (
 		return nil, err
 	}
 
-	// Choose correct event type
-	eventType := EventSubjectUpdated
-	if inserted {
-		eventType = EventSubjectCreated
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, subject); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	// Audit log (treat upsert as create/update accordingly)
-	auditAction := "SUBJECT_UPSERT"
+	// Choose correct event type and audit action
+	eventType := EventSubjectUpdated
+	auditAction := "upsert"
 	if inserted {
-		auditAction = "SUBJECT_CREATE"
+		eventType = EventSubjectCreated
+		auditAction = "create"
+	} else {
+		auditAction = "update"
 	}
-	if err := s.auditLogger.Log(ctx, tx, auditAction, subject.SubjectID, nil, subject, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", auditAction, "subject",
+			&subject.SubjectID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"code":       subject.Code,
+				"name":       subject.Name,
+				"inserted":   inserted,
+				"company_id": subject.CompanyID,
+			})
 	}
+
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(eventType), subject); err != nil {
+	if err := s.storeOutboxEvent(ctx, tx, eventType, subject.SubjectID, subject); err != nil {
 		logger.Error("failed to store outbox event", zap.Error(err))
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
@@ -359,7 +464,7 @@ func (s *subjectService) Upsert(ctx context.Context, req CreateSubjectRequest) (
 }
 
 // ---------------------------------------------------------------------
-// Read‑only operations (with timeouts)
+// Read‑only operations (with timeouts, no idempotency)
 // ---------------------------------------------------------------------
 func (s *subjectService) GetByID(ctx context.Context, id uuid.UUID) (*models.Subject, error) {
 	ctx, cancel := context.WithTimeout(ctx, readTimeout)
@@ -398,13 +503,17 @@ func (s *subjectService) Exists(ctx context.Context, companyID uuid.UUID, code s
 }
 
 // ---------------------------------------------------------------------
-// Update (with locking, audit, outbox)
+// Update (with idempotency, locking, audit, outbox)
 // ---------------------------------------------------------------------
-func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (*models.Subject, error) {
+func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest, idempotencyKey string) (*models.Subject, error) {
 	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 
-	logger := s.logger.With(zap.String("method", "Update"), zap.String("subject_id", req.SubjectID.String()))
+	logger := s.logger.With(
+		zap.String("method", "Update"),
+		zap.String("subject_id", req.SubjectID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	if req.SubjectID == uuid.Nil {
 		return nil, fmt.Errorf("%w: subject_id is required", ErrInvalidInput)
@@ -425,6 +534,15 @@ func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing models.Subject
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.SubjectID != uuid.Nil {
+			logger.Info("returning idempotent response")
+			return &existing, nil
+		}
+	}
 
 	subject, err := s.repo.GetByIDForUpdate(ctx, tx, req.SubjectID)
 	if err != nil {
@@ -462,12 +580,28 @@ func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (
 		return nil, err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SUBJECT_UPDATE", req.SubjectID, &oldSubject, subject, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, subject); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
+
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "subject",
+			&req.SubjectID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old_code":   oldSubject.Code,
+				"new_code":   subject.Code,
+				"old_name":   oldSubject.Name,
+				"new_name":   subject.Name,
+				"old_active": oldSubject.IsActive,
+				"new_active": subject.IsActive,
+			})
+	}
+
 	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectUpdated), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventSubjectUpdated, subject.SubjectID, map[string]interface{}{
 		"old": oldSubject,
 		"new": subject,
 	}); err != nil {
@@ -485,17 +619,17 @@ func (s *subjectService) Update(ctx context.Context, req UpdateSubjectRequest) (
 }
 
 // ---------------------------------------------------------------------
-// Activate / Deactivate
+// Activate / Deactivate (with idempotency)
 // ---------------------------------------------------------------------
-func (s *subjectService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	return s.toggleActive(ctx, id, updatedBy, true)
+func (s *subjectService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+	return s.toggleActive(ctx, id, updatedBy, true, idempotencyKey)
 }
 
-func (s *subjectService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	return s.toggleActive(ctx, id, updatedBy, false)
+func (s *subjectService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+	return s.toggleActive(ctx, id, updatedBy, false, idempotencyKey)
 }
 
-func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, active bool) error {
+func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, active bool, idempotencyKey string) error {
 	ctx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 
@@ -503,6 +637,7 @@ func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updated
 		zap.String("method", "toggleActive"),
 		zap.String("subject_id", id.String()),
 		zap.Bool("active", active),
+		zap.String("idempotency_key", idempotencyKey),
 	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -511,6 +646,15 @@ func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updated
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var dummy struct{}
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &dummy); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	subject, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
@@ -532,16 +676,28 @@ func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updated
 		return updateErr
 	}
 
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit
-	auditAction := "SUBJECT_ACTIVATE"
+	auditAction := "activate"
 	if !active {
-		auditAction = "SUBJECT_DEACTIVATE"
+		auditAction = "deactivate"
 	}
-	if err := s.auditLogger.Log(ctx, tx, auditAction, id, map[string]interface{}{"is_active": oldActive}, map[string]interface{}{"is_active": active}, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", auditAction, "subject",
+			&id, "user", updatedBy, nil, nil, map[string]interface{}{
+				"old_active": oldActive,
+				"new_active": active,
+			})
 	}
+
 	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectUpdated), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventSubjectUpdated, id, map[string]interface{}{
 		"subject_id": id,
 		"old":        map[string]interface{}{"is_active": oldActive},
 		"new":        map[string]interface{}{"is_active": active},
@@ -562,11 +718,15 @@ func (s *subjectService) toggleActive(ctx context.Context, id uuid.UUID, updated
 // ---------------------------------------------------------------------
 // Delete (idempotent, with assignment check)
 // ---------------------------------------------------------------------
-func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
+func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error {
 	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
 
-	logger := s.logger.With(zap.String("method", "Delete"), zap.String("subject_id", id.String()))
+	logger := s.logger.With(
+		zap.String("method", "Delete"),
+		zap.String("subject_id", id.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -574,6 +734,15 @@ func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var dummy struct{}
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &dummy); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	// Lock the subject
 	subject, err := s.repo.GetByIDForUpdate(ctx, tx, id)
@@ -583,7 +752,11 @@ func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	if subject == nil {
 		// Idempotent: already deleted
 		logger.Info("subject already deleted (idempotent)")
-		return nil
+		// Still store idempotency key to prevent future attempts
+		if idempotencyKey != "" {
+			_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{})
+		}
+		return tx.Commit()
 	}
 
 	// Check if the subject is assigned to any course
@@ -602,12 +775,21 @@ func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return err
 	}
 
-	// Audit
-	if err := s.auditLogger.Log(ctx, tx, "SUBJECT_DELETE", id, subject, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
+
+	// Audit
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "subject",
+			&id, "user", deletedBy, nil, nil, nil)
+	}
+
 	// Outbox
-	if err := s.outboxStore.Store(ctx, tx, string(EventSubjectDeleted), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventSubjectDeleted, id, map[string]interface{}{
 		"subject_id": id,
 		"deleted_by": deletedBy,
 	}); err != nil {
@@ -625,7 +807,7 @@ func (s *subjectService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 }
 
 // ---------------------------------------------------------------------
-// ValidateUniqueCode
+// ValidateUniqueCode (read‑only, no idempotency)
 // ---------------------------------------------------------------------
 func (s *subjectService) ValidateUniqueCode(ctx context.Context, companyID uuid.UUID, code string) error {
 	ctx, cancel := context.WithTimeout(ctx, readTimeout)

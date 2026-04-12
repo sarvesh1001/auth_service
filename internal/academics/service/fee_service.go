@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -44,6 +45,7 @@ type FeeService interface {
 	GetPaymentByID(ctx context.Context, id uuid.UUID) (*models.StudentFeePayment, error)
 	GetPaymentsByInvoice(ctx context.Context, invoiceID uuid.UUID) ([]*models.StudentFeePayment, error)
 	ListPayments(ctx context.Context, filter repository.PaymentFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.StudentFeePayment, error)
+	GenerateReceipt(ctx context.Context, paymentID uuid.UUID, receiptNo string, idempotencyKey string) (*models.FeeReceipt, error)
 
 	// Discounts
 	CreateDiscount(ctx context.Context, req CreateDiscountRequest) (*models.FeeDiscount, error)
@@ -55,7 +57,6 @@ type FeeService interface {
 	UpdatePenalty(ctx context.Context, req UpdatePenaltyRequest) (*models.FeePenalty, error)
 
 	// Receipts
-	GenerateReceipt(ctx context.Context, paymentID uuid.UUID, receiptNo string) (*models.FeeReceipt, error)
 	GetReceiptByNumber(ctx context.Context, receiptNo string) (*models.FeeReceipt, error)
 }
 
@@ -473,25 +474,23 @@ func (s *feeService) DeleteFeeStructureItem(ctx context.Context, itemID uuid.UUI
 // ---------- Invoices ----------
 func (s *feeService) CreateInvoice(ctx context.Context, req CreateInvoiceRequest) (*models.StudentFeeInvoice, error) {
 	logger := s.logger.With(zap.String("method", "CreateInvoice"), zap.String("student_id", req.StudentID.String()))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Validate student exists
 	student, err := s.studentRepo.GetByID(ctx, tx, req.StudentID)
 	if err != nil || student == nil {
 		return nil, fmt.Errorf("%w: student %s", ErrNotFound, req.StudentID)
 	}
 
-	// Validate fee structure exists
 	fs, err := s.repo.GetFeeStructureByID(ctx, tx, req.FeeStructureID)
 	if err != nil || fs == nil {
 		return nil, fmt.Errorf("%w: fee structure %s", ErrNotFound, req.FeeStructureID)
 	}
 
-	// Build invoice
 	inv := &models.StudentFeeInvoice{
 		StudentID:      req.StudentID,
 		FeeStructureID: req.FeeStructureID,
@@ -500,9 +499,10 @@ func (s *feeService) CreateInvoice(ctx context.Context, req CreateInvoiceRequest
 		TotalAmount:    req.TotalAmount,
 		PaidAmount:     0,
 		Balance:        req.TotalAmount,
-		Status:         "pending",
+		Status:         "unpaid", // FIXED: was "pending", now matches DB constraint
 		CreatedBy:      req.CreatedBy,
 	}
+
 	items := make([]*models.StudentFeeInvoiceItem, 0, len(req.Items))
 	for _, it := range req.Items {
 		items = append(items, &models.StudentFeeInvoiceItem{
@@ -517,7 +517,6 @@ func (s *feeService) CreateInvoice(ctx context.Context, req CreateInvoiceRequest
 		return nil, err
 	}
 
-	// Outbox event
 	payload, _ := json.Marshal(inv)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -536,6 +535,7 @@ func (s *feeService) CreateInvoice(ctx context.Context, req CreateInvoiceRequest
 	}
 
 	logger.Info("invoice created", zap.String("invoice_id", inv.InvoiceID.String()))
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &student.CompanyID, "academics", "create", "fee_invoice",
 			&inv.InvoiceID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -543,7 +543,6 @@ func (s *feeService) CreateInvoice(ctx context.Context, req CreateInvoiceRequest
 			})
 	}
 
-	// Send notification to student
 	title := "New Fee Invoice"
 	message := fmt.Sprintf("A new fee invoice %s of amount %.2f has been generated. Due date: %s.", inv.InvoiceNo, inv.TotalAmount, inv.DueDate.Format("2006-01-02"))
 	s.sendNotificationToStudent(ctx, req.StudentID, title, message, models.NotificationTypeInfo, models.PriorityNormal, req.CreatedBy)
@@ -930,67 +929,67 @@ func (s *feeService) UpdatePenalty(ctx context.Context, req UpdatePenaltyRequest
 }
 
 // ---------- Receipts ----------
-func (s *feeService) GenerateReceipt(ctx context.Context, paymentID uuid.UUID, receiptNo string) (*models.FeeReceipt, error) {
-	logger := s.logger.With(zap.String("method", "GenerateReceipt"), zap.String("payment_id", paymentID.String()))
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
+// func (s *feeService) GenerateReceipt(ctx context.Context, paymentID uuid.UUID, receiptNo string) (*models.FeeReceipt, error) {
+// 	logger := s.logger.With(zap.String("method", "GenerateReceipt"), zap.String("payment_id", paymentID.String()))
+// 	tx, err := s.pgClient.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("begin tx: %w", err)
+// 	}
+// 	defer tx.Rollback()
 
-	payment, err := s.repo.GetPaymentByID(ctx, tx, paymentID)
-	if err != nil {
-		return nil, err
-	}
-	if payment == nil {
-		return nil, fmt.Errorf("%w: payment %s", ErrNotFound, paymentID)
-	}
+// 	payment, err := s.repo.GetPaymentByID(ctx, tx, paymentID)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	if payment == nil {
+// 		return nil, fmt.Errorf("%w: payment %s", ErrNotFound, paymentID)
+// 	}
 
-	// Get invoice to know student ID
-	inv, err := s.repo.GetInvoiceByID(ctx, tx, payment.InvoiceID)
-	if err != nil {
-		return nil, err
-	}
-	if inv == nil {
-		return nil, fmt.Errorf("%w: invoice %s", ErrNotFound, payment.InvoiceID)
-	}
+// 	// Get invoice to know student ID
+// 	inv, err := s.repo.GetInvoiceByID(ctx, tx, payment.InvoiceID)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	if inv == nil {
+// 		return nil, fmt.Errorf("%w: invoice %s", ErrNotFound, payment.InvoiceID)
+// 	}
 
-	receipt := &models.FeeReceipt{
-		PaymentID:   paymentID,
-		ReceiptNo:   receiptNo,
-		ReceiptData: map[string]interface{}{"payment": payment},
-		CreatedBy:   payment.CreatedBy,
-	}
-	if err := s.repo.CreateReceipt(ctx, tx, receipt); err != nil {
-		return nil, err
-	}
+// 	receipt := &models.FeeReceipt{
+// 		PaymentID:   paymentID,
+// 		ReceiptNo:   receiptNo,
+// 		ReceiptData: map[string]interface{}{"payment": payment},
+// 		CreatedBy:   payment.CreatedBy,
+// 	}
+// 	if err := s.repo.CreateReceipt(ctx, tx, receipt); err != nil {
+// 		return nil, err
+// 	}
 
-	payload, _ := json.Marshal(receipt)
-	outboxEvent := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "fee_receipt",
-		AggregateID:   receipt.ReceiptID.String(),
-		EventType:     string(EventFeeReceiptGenerated),
-		Payload:       payload,
-		Status:        "pending",
-	}
-	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
-		return nil, fmt.Errorf("store outbox event: %w", err)
-	}
+// 	payload, _ := json.Marshal(receipt)
+// 	outboxEvent := &outbox.Event{
+// 		EventID:       uuid.New().String(),
+// 		AggregateType: "fee_receipt",
+// 		AggregateID:   receipt.ReceiptID.String(),
+// 		EventType:     string(EventFeeReceiptGenerated),
+// 		Payload:       payload,
+// 		Status:        "pending",
+// 	}
+// 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+// 		return nil, fmt.Errorf("store outbox event: %w", err)
+// 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit tx: %w", err)
-	}
+// 	if err := tx.Commit(); err != nil {
+// 		return nil, fmt.Errorf("commit tx: %w", err)
+// 	}
 
-	logger.Info("receipt generated", zap.String("receipt_id", receipt.ReceiptID.String()))
+// 	logger.Info("receipt generated", zap.String("receipt_id", receipt.ReceiptID.String()))
 
-	// Send notification to student
-	title := "Fee Receipt Generated"
-	message := fmt.Sprintf("Receipt %s has been generated for payment of %.2f on invoice %s.", receipt.ReceiptNo, payment.Amount, inv.InvoiceNo)
-	s.sendNotificationToStudent(ctx, inv.StudentID, title, message, models.NotificationTypeInfo, models.PriorityNormal, payment.CreatedBy)
+// 	// Send notification to student
+// 	title := "Fee Receipt Generated"
+// 	message := fmt.Sprintf("Receipt %s has been generated for payment of %.2f on invoice %s.", receipt.ReceiptNo, payment.Amount, inv.InvoiceNo)
+// 	s.sendNotificationToStudent(ctx, inv.StudentID, title, message, models.NotificationTypeInfo, models.PriorityNormal, payment.CreatedBy)
 
-	return receipt, nil
-}
+// 	return receipt, nil
+// }
 
 func (s *feeService) GetReceiptByNumber(ctx context.Context, receiptNo string) (*models.FeeReceipt, error) {
 	return s.repo.GetReceiptByNumber(ctx, s.pgClient.DB, receiptNo)
@@ -1032,4 +1031,104 @@ func (s *feeService) validateFeeStructureReferences(ctx context.Context, tx *sql
 		// This would require a section repo method.
 	}
 	return nil
+}
+func (s *feeService) GenerateReceipt(ctx context.Context, paymentID uuid.UUID, receiptNo string, idempotencyKey string) (*models.FeeReceipt, error) {
+	logger := s.logger.With(zap.String("method", "GenerateReceipt"), zap.String("payment_id", paymentID.String()))
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing *models.FeeReceipt
+		if err := s.idempotencyStore.Get(ctx, nil, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Check if receipt already exists for this payment
+	existingReceipt, _ := s.repo.GetReceiptByPaymentID(ctx, tx, paymentID)
+	if existingReceipt != nil {
+		logger.Info("receipt already exists for this payment")
+		return existingReceipt, nil
+	}
+
+	// Check if receipt number already exists (to avoid duplicate key violation)
+	if receiptNo != "" {
+		existingByNo, _ := s.repo.GetReceiptByNumber(ctx, tx, receiptNo)
+		if existingByNo != nil {
+			return nil, fmt.Errorf("receipt number %s already exists", receiptNo)
+		}
+	} else {
+		// Auto-generate receipt number if not provided
+		receiptNo = generateReceiptNumber() // implement helper
+	}
+
+	payment, err := s.repo.GetPaymentByID(ctx, tx, paymentID)
+	if err != nil {
+		return nil, err
+	}
+	if payment == nil {
+		return nil, fmt.Errorf("%w: payment %s", ErrNotFound, paymentID)
+	}
+
+	inv, err := s.repo.GetInvoiceByID(ctx, tx, payment.InvoiceID)
+	if err != nil {
+		return nil, err
+	}
+	if inv == nil {
+		return nil, fmt.Errorf("%w: invoice %s", ErrNotFound, payment.InvoiceID)
+	}
+
+	receipt := &models.FeeReceipt{
+		PaymentID:   paymentID,
+		ReceiptNo:   receiptNo,
+		ReceiptData: map[string]interface{}{"payment": payment, "invoice": inv},
+		CreatedBy:   payment.CreatedBy,
+	}
+
+	if err := s.repo.CreateReceipt(ctx, tx, receipt); err != nil {
+		return nil, err
+	}
+
+	// Store idempotency response
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, receipt); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
+	payload, _ := json.Marshal(receipt)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "fee_receipt",
+		AggregateID:   receipt.ReceiptID.String(),
+		EventType:     string(EventFeeReceiptGenerated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("receipt generated", zap.String("receipt_id", receipt.ReceiptID.String()))
+
+	title := "Fee Receipt Generated"
+	message := fmt.Sprintf("Receipt %s has been generated for payment of %.2f on invoice %s.", receipt.ReceiptNo, payment.Amount, inv.InvoiceNo)
+	s.sendNotificationToStudent(ctx, inv.StudentID, title, message, models.NotificationTypeInfo, models.PriorityNormal, payment.CreatedBy)
+
+	return receipt, nil
+}
+
+// Helper to generate unique receipt number
+func generateReceiptNumber() string {
+	return fmt.Sprintf("RCPT-%d", time.Now().UnixNano())
 }

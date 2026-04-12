@@ -14,9 +14,7 @@ import (
 	"auth-service/internal/util"
 )
 
-// TeacherRepository defines all database operations for teachers.
 type TeacherRepository interface {
-	// Core CRUD
 	Create(ctx context.Context, db DBTX, t *models.Teacher) error
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Teacher, error)
 	GetByUserID(ctx context.Context, db DBTX, userID uuid.UUID) (*models.Teacher, error)
@@ -30,22 +28,16 @@ type TeacherRepository interface {
 	BulkCreate(ctx context.Context, db DBTX, teachers []*models.Teacher) error
 	BulkUpdateStatus(ctx context.Context, db DBTX, ids []uuid.UUID, status string, updatedBy *uuid.UUID) error
 	CountByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) (int64, error)
-
-	// Teacher Subjects
 	AddSubject(ctx context.Context, db DBTX, teacherID, subjectID uuid.UUID, isPrimary bool) error
 	RemoveSubject(ctx context.Context, db DBTX, teacherID, subjectID uuid.UUID) error
 	GetSubjectsByTeacher(ctx context.Context, db DBTX, teacherID uuid.UUID) ([]*models.TeacherSubject, error)
 	GetTeachersBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.Teacher, error)
 	UpdateSubjectPrimary(ctx context.Context, db DBTX, teacherID, subjectID uuid.UUID, isPrimary bool) error
-
-	// Teacher Sections
 	AddSection(ctx context.Context, db DBTX, teacherID, sectionID uuid.UUID, isClassTeacher bool) error
 	RemoveSection(ctx context.Context, db DBTX, teacherID, sectionID uuid.UUID) error
 	GetSectionsByTeacher(ctx context.Context, db DBTX, teacherID uuid.UUID) ([]*models.TeacherSection, error)
 	GetTeachersBySection(ctx context.Context, db DBTX, sectionID uuid.UUID) ([]*models.Teacher, error)
 	UpdateClassTeacherStatus(ctx context.Context, db DBTX, teacherID, sectionID uuid.UUID, isClassTeacher bool) error
-
-	// Teacher Schedule Preferences
 	SetSchedulePreference(ctx context.Context, db DBTX, pref *models.TeacherSchedulePreference) error
 	GetSchedulePreferences(ctx context.Context, db DBTX, teacherID uuid.UUID) ([]*models.TeacherSchedulePreference, error)
 	DeleteSchedulePreference(ctx context.Context, db DBTX, preferenceID uuid.UUID) error
@@ -57,16 +49,11 @@ type teacherRepository struct {
 	logger *zap.Logger
 }
 
-// NewTeacherRepository creates a new teacher repository.
 func NewTeacherRepository(logger *zap.Logger) TeacherRepository {
 	return &teacherRepository{
 		logger: logger.Named("teacher_repo"),
 	}
 }
-
-// ----------------------------------------------------------------------------
-// Helper functions
-// ----------------------------------------------------------------------------
 
 var allowedTeacherSortFields = map[string]bool{
 	"created_at":     true,
@@ -111,7 +98,6 @@ func (r *teacherRepository) buildTeacherFilter(filter TeacherFilter) (string, []
 	var conditions []string
 	var args []interface{}
 	idx := 1
-
 	if filter.CompanyID != uuid.Nil {
 		conditions = append(conditions, fmt.Sprintf("t.company_id = $%d", idx))
 		args = append(args, filter.CompanyID)
@@ -150,33 +136,25 @@ func (r *teacherRepository) buildTeacherFilter(filter TeacherFilter) (string, []
 		idx++
 	}
 	conditions = append(conditions, "t.deleted_at IS NULL")
-
 	if len(conditions) == 0 {
 		return "", args
 	}
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// beginTxIfNotTx returns a transaction if the input is not already one.
-// Returns (tx, true) if a new transaction was created, (db, false) if db was already a tx.
-
-// ----------------------------------------------------------------------------
-// Core CRUD
-// ----------------------------------------------------------------------------
-
+// Create inserts a new teacher record (no version column)
 func (r *teacherRepository) Create(ctx context.Context, db DBTX, t *models.Teacher) error {
 	query := `
         INSERT INTO academics.teachers (
             company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version, created_by, updated_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
-        RETURNING teacher_id, created_at, updated_at, version
+            joining_date, status, created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        RETURNING teacher_id, created_at, updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		t.CompanyID, t.UserID, t.EmployeeCode, t.Qualification, t.Specialization,
-		t.JoiningDate, t.Status, 0, t.CreatedBy, t.UpdatedBy,
-	).Scan(&t.TeacherID, &t.CreatedAt, &t.UpdatedAt, &t.Version)
-
+		t.JoiningDate, t.Status, t.CreatedBy, t.UpdatedBy,
+	).Scan(&t.TeacherID, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create teacher",
 			util.String("company_id", t.CompanyID.String()),
@@ -187,6 +165,7 @@ func (r *teacherRepository) Create(ctx context.Context, db DBTX, t *models.Teach
 	return nil
 }
 
+// BulkCreate inserts many teachers (no version)
 func (r *teacherRepository) BulkCreate(ctx context.Context, db DBTX, teachers []*models.Teacher) error {
 	if len(teachers) == 0 {
 		return nil
@@ -201,24 +180,22 @@ func (r *teacherRepository) BulkCreate(ctx context.Context, db DBTX, teachers []
 			_ = tx.Rollback()
 		}
 	}()
-
 	stmt, err := tx.PrepareContext(ctx, `
         INSERT INTO academics.teachers (
             company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version, created_by, updated_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
-        RETURNING teacher_id, created_at, updated_at, version
+            joining_date, status, created_by, updated_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        RETURNING teacher_id, created_at, updated_at
     `)
 	if err != nil {
 		return fmt.Errorf("prepare statement: %w", err)
 	}
 	defer stmt.Close()
-
 	for _, t := range teachers {
 		err := stmt.QueryRowContext(ctx,
 			t.CompanyID, t.UserID, t.EmployeeCode, t.Qualification, t.Specialization,
-			t.JoiningDate, t.Status, 0, t.CreatedBy, t.UpdatedBy,
-		).Scan(&t.TeacherID, &t.CreatedAt, &t.UpdatedAt, &t.Version)
+			t.JoiningDate, t.Status, t.CreatedBy, t.UpdatedBy,
+		).Scan(&t.TeacherID, &t.CreatedAt, &t.UpdatedAt)
 		if err != nil {
 			r.logger.Error("bulk create teacher failed",
 				util.String("company_id", t.CompanyID.String()),
@@ -227,7 +204,6 @@ func (r *teacherRepository) BulkCreate(ctx context.Context, db DBTX, teachers []
 			return fmt.Errorf("bulk create teacher row: %w", err)
 		}
 	}
-
 	if isOwner {
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit tx: %w", err)
@@ -237,11 +213,12 @@ func (r *teacherRepository) BulkCreate(ctx context.Context, db DBTX, teachers []
 	return nil
 }
 
+// GetByID (no version column in SELECT)
 func (r *teacherRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Teacher, error) {
 	query := `
         SELECT
             teacher_id, company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version,
+            joining_date, status,
             created_at, updated_at, created_by, updated_by
         FROM academics.teachers
         WHERE teacher_id = $1 AND deleted_at IS NULL
@@ -250,11 +227,12 @@ func (r *teacherRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	return r.scanTeacher(row)
 }
 
+// GetByUserID (no version)
 func (r *teacherRepository) GetByUserID(ctx context.Context, db DBTX, userID uuid.UUID) (*models.Teacher, error) {
 	query := `
         SELECT
             teacher_id, company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version,
+            joining_date, status,
             created_at, updated_at, created_by, updated_by
         FROM academics.teachers
         WHERE user_id = $1 AND deleted_at IS NULL
@@ -263,11 +241,12 @@ func (r *teacherRepository) GetByUserID(ctx context.Context, db DBTX, userID uui
 	return r.scanTeacher(row)
 }
 
+// GetByEmployeeCode (no version)
 func (r *teacherRepository) GetByEmployeeCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Teacher, error) {
 	query := `
         SELECT
             teacher_id, company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version,
+            joining_date, status,
             created_at, updated_at, created_by, updated_by
         FROM academics.teachers
         WHERE company_id = $1 AND employee_code = $2 AND deleted_at IS NULL
@@ -276,6 +255,7 @@ func (r *teacherRepository) GetByEmployeeCode(ctx context.Context, db DBTX, comp
 	return r.scanTeacher(row)
 }
 
+// GetByIDs (no version)
 func (r *teacherRepository) GetByIDs(ctx context.Context, db DBTX, ids []uuid.UUID) ([]*models.Teacher, error) {
 	if len(ids) == 0 {
 		return []*models.Teacher{}, nil
@@ -289,19 +269,17 @@ func (r *teacherRepository) GetByIDs(ctx context.Context, db DBTX, ids []uuid.UU
 	query := fmt.Sprintf(`
         SELECT
             teacher_id, company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version,
+            joining_date, status,
             created_at, updated_at, created_by, updated_by
         FROM academics.teachers
         WHERE teacher_id IN (%s) AND deleted_at IS NULL
     `, strings.Join(placeholders, ","))
-
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to get teachers by IDs", zap.Error(err))
 		return nil, fmt.Errorf("get teachers by IDs: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.Teacher
 	for rows.Next() {
 		t, err := r.scanTeacher(rows)
@@ -316,6 +294,7 @@ func (r *teacherRepository) GetByIDs(ctx context.Context, db DBTX, ids []uuid.UU
 	return result, nil
 }
 
+// List (no version)
 func (r *teacherRepository) List(ctx context.Context, db DBTX, filter TeacherFilter, p Pagination, s Sort) ([]*models.Teacher, error) {
 	where, args := r.buildTeacherFilter(filter)
 	orderBy, err := r.validateSort(s)
@@ -323,20 +302,17 @@ func (r *teacherRepository) List(ctx context.Context, db DBTX, filter TeacherFil
 		return nil, err
 	}
 	limit, offset := r.validatePagination(p)
-
 	query := fmt.Sprintf(`
         SELECT
             teacher_id, company_id, user_id, employee_code, qualification, specialization,
-            joining_date, status, version,
+            joining_date, status,
             created_at, updated_at, created_by, updated_by
         FROM academics.teachers t
         %s
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
-
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to list teachers",
@@ -345,7 +321,6 @@ func (r *teacherRepository) List(ctx context.Context, db DBTX, filter TeacherFil
 		return nil, fmt.Errorf("list teachers: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.Teacher
 	for rows.Next() {
 		t, err := r.scanTeacher(rows)
@@ -360,11 +335,10 @@ func (r *teacherRepository) List(ctx context.Context, db DBTX, filter TeacherFil
 	return result, nil
 }
 
+// Count unchanged
 func (r *teacherRepository) Count(ctx context.Context, db DBTX, filter TeacherFilter) (int64, error) {
 	where, args := r.buildTeacherFilter(filter)
-
 	query := fmt.Sprintf("SELECT COUNT(*) FROM academics.teachers t %s", where)
-
 	var count int64
 	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
 	if err != nil {
@@ -376,6 +350,7 @@ func (r *teacherRepository) Count(ctx context.Context, db DBTX, filter TeacherFi
 	return count, nil
 }
 
+// Update – removed version check (optimistic locking removed)
 func (r *teacherRepository) Update(ctx context.Context, db DBTX, t *models.Teacher) error {
 	query := `
         UPDATE academics.teachers
@@ -387,10 +362,9 @@ func (r *teacherRepository) Update(ctx context.Context, db DBTX, t *models.Teach
             joining_date = $6,
             status = $7,
             updated_by = $8,
-            version = version + 1,
             updated_at = NOW()
-        WHERE teacher_id = $1 AND version = $9 AND deleted_at IS NULL
-        RETURNING updated_at, version
+        WHERE teacher_id = $1 AND deleted_at IS NULL
+        RETURNING updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		t.TeacherID,
@@ -401,17 +375,14 @@ func (r *teacherRepository) Update(ctx context.Context, db DBTX, t *models.Teach
 		t.JoiningDate,
 		t.Status,
 		t.UpdatedBy,
-		t.Version,
-	).Scan(&t.UpdatedAt, &t.Version)
-
+	).Scan(&t.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// Check existence to differentiate not found vs version conflict
 			var exists bool
 			checkQuery := `SELECT EXISTS(SELECT 1 FROM academics.teachers WHERE teacher_id = $1 AND deleted_at IS NULL)`
 			_ = db.QueryRowContext(ctx, checkQuery, t.TeacherID).Scan(&exists)
 			if exists {
-				return fmt.Errorf("%w: teacher %s version mismatch", ErrVersionConflict, t.TeacherID)
+				return fmt.Errorf("%w: teacher %s update failed (maybe no changes?)", ErrNotFound, t.TeacherID)
 			}
 			return fmt.Errorf("%w: teacher %s", ErrNotFound, t.TeacherID)
 		}
@@ -423,6 +394,7 @@ func (r *teacherRepository) Update(ctx context.Context, db DBTX, t *models.Teach
 	return nil
 }
 
+// UpdateStatus unchanged (no version)
 func (r *teacherRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, updatedBy *uuid.UUID) error {
 	query := `UPDATE academics.teachers SET status = $2, updated_by = $3, updated_at = NOW() WHERE teacher_id = $1 AND deleted_at IS NULL`
 	result, err := db.ExecContext(ctx, query, id, status, updatedBy)
@@ -443,6 +415,7 @@ func (r *teacherRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.U
 	return nil
 }
 
+// Delete unchanged
 func (r *teacherRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
 	query := `UPDATE academics.teachers SET deleted_at = NOW(), updated_by = $2, updated_at = NOW() WHERE teacher_id = $1 AND deleted_at IS NULL`
 	result, err := db.ExecContext(ctx, query, id, deletedBy)
@@ -462,6 +435,7 @@ func (r *teacherRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, d
 	return nil
 }
 
+// BulkUpdateStatus unchanged
 func (r *teacherRepository) BulkUpdateStatus(ctx context.Context, db DBTX, ids []uuid.UUID, status string, updatedBy *uuid.UUID) error {
 	if len(ids) == 0 {
 		return nil
@@ -476,7 +450,6 @@ func (r *teacherRepository) BulkUpdateStatus(ctx context.Context, db DBTX, ids [
 			_ = tx.Rollback()
 		}
 	}()
-
 	placeholders := make([]string, len(ids))
 	args := make([]interface{}, len(ids)+2)
 	args[0] = status
@@ -490,7 +463,6 @@ func (r *teacherRepository) BulkUpdateStatus(ctx context.Context, db DBTX, ids [
         SET status = $1, updated_by = $2, updated_at = NOW()
         WHERE teacher_id IN (%s) AND deleted_at IS NULL
     `, strings.Join(placeholders, ","))
-
 	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to bulk update teacher status",
@@ -506,7 +478,6 @@ func (r *teacherRepository) BulkUpdateStatus(ctx context.Context, db DBTX, ids [
 	if rows == 0 {
 		return fmt.Errorf("no teachers updated")
 	}
-
 	if isOwner {
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit tx: %w", err)
@@ -516,6 +487,7 @@ func (r *teacherRepository) BulkUpdateStatus(ctx context.Context, db DBTX, ids [
 	return nil
 }
 
+// CountByCompany unchanged
 func (r *teacherRepository) CountByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) (int64, error) {
 	query := `SELECT COUNT(*) FROM academics.teachers WHERE company_id = $1 AND deleted_at IS NULL`
 	var count int64
@@ -529,10 +501,7 @@ func (r *teacherRepository) CountByCompany(ctx context.Context, db DBTX, company
 	return count, nil
 }
 
-// ----------------------------------------------------------------------------
-// Teacher Subjects
-// ----------------------------------------------------------------------------
-
+// AddSubject unchanged
 func (r *teacherRepository) AddSubject(ctx context.Context, db DBTX, teacherID, subjectID uuid.UUID, isPrimary bool) error {
 	query := `
         INSERT INTO academics.teacher_subjects (teacher_id, subject_id, is_primary, created_at)
@@ -554,6 +523,7 @@ func (r *teacherRepository) AddSubject(ctx context.Context, db DBTX, teacherID, 
 	return nil
 }
 
+// RemoveSubject unchanged
 func (r *teacherRepository) RemoveSubject(ctx context.Context, db DBTX, teacherID, subjectID uuid.UUID) error {
 	query := `DELETE FROM academics.teacher_subjects WHERE teacher_id = $1 AND subject_id = $2`
 	result, err := db.ExecContext(ctx, query, teacherID, subjectID)
@@ -574,6 +544,7 @@ func (r *teacherRepository) RemoveSubject(ctx context.Context, db DBTX, teacherI
 	return nil
 }
 
+// GetSubjectsByTeacher unchanged
 func (r *teacherRepository) GetSubjectsByTeacher(ctx context.Context, db DBTX, teacherID uuid.UUID) ([]*models.TeacherSubject, error) {
 	query := `
         SELECT id, teacher_id, subject_id, is_primary, created_at
@@ -588,7 +559,6 @@ func (r *teacherRepository) GetSubjectsByTeacher(ctx context.Context, db DBTX, t
 		return nil, fmt.Errorf("get subjects by teacher: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.TeacherSubject
 	for rows.Next() {
 		var ts models.TeacherSubject
@@ -603,10 +573,11 @@ func (r *teacherRepository) GetSubjectsByTeacher(ctx context.Context, db DBTX, t
 	return result, nil
 }
 
+// GetTeachersBySubject unchanged
 func (r *teacherRepository) GetTeachersBySubject(ctx context.Context, db DBTX, subjectID uuid.UUID) ([]*models.Teacher, error) {
 	query := `
         SELECT t.teacher_id, t.company_id, t.user_id, t.employee_code, t.qualification,
-               t.specialization, t.joining_date, t.status, t.version,
+               t.specialization, t.joining_date, t.status,
                t.created_at, t.updated_at, t.created_by, t.updated_by
         FROM academics.teachers t
         INNER JOIN academics.teacher_subjects ts ON t.teacher_id = ts.teacher_id
@@ -620,7 +591,6 @@ func (r *teacherRepository) GetTeachersBySubject(ctx context.Context, db DBTX, s
 		return nil, fmt.Errorf("get teachers by subject: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.Teacher
 	for rows.Next() {
 		t, err := r.scanTeacher(rows)
@@ -635,6 +605,7 @@ func (r *teacherRepository) GetTeachersBySubject(ctx context.Context, db DBTX, s
 	return result, nil
 }
 
+// UpdateSubjectPrimary unchanged
 func (r *teacherRepository) UpdateSubjectPrimary(ctx context.Context, db DBTX, teacherID, subjectID uuid.UUID, isPrimary bool) error {
 	query := `
         UPDATE academics.teacher_subjects
@@ -659,10 +630,7 @@ func (r *teacherRepository) UpdateSubjectPrimary(ctx context.Context, db DBTX, t
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Teacher Sections
-// ----------------------------------------------------------------------------
-
+// AddSection unchanged
 func (r *teacherRepository) AddSection(ctx context.Context, db DBTX, teacherID, sectionID uuid.UUID, isClassTeacher bool) error {
 	tx, isOwner, err := beginTxIfNotTx(ctx, db)
 	if err != nil {
@@ -674,8 +642,6 @@ func (r *teacherRepository) AddSection(ctx context.Context, db DBTX, teacherID, 
 			_ = tx.Rollback()
 		}
 	}()
-
-	// If isClassTeacher is true, ensure no other class teacher for this section
 	if isClassTeacher {
 		var existing uuid.UUID
 		checkQuery := `SELECT teacher_id FROM academics.teacher_sections WHERE section_id = $1 AND is_class_teacher = true`
@@ -686,7 +652,6 @@ func (r *teacherRepository) AddSection(ctx context.Context, db DBTX, teacherID, 
 			return fmt.Errorf("check class teacher: %w", err)
 		}
 	}
-
 	query := `
         INSERT INTO academics.teacher_sections (teacher_id, section_id, is_class_teacher, created_at)
         VALUES ($1, $2, $3, NOW())
@@ -700,7 +665,6 @@ func (r *teacherRepository) AddSection(ctx context.Context, db DBTX, teacherID, 
 			util.ErrorField(err))
 		return fmt.Errorf("add teacher section: %w", err)
 	}
-
 	if isOwner {
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit tx: %w", err)
@@ -710,6 +674,7 @@ func (r *teacherRepository) AddSection(ctx context.Context, db DBTX, teacherID, 
 	return nil
 }
 
+// RemoveSection unchanged
 func (r *teacherRepository) RemoveSection(ctx context.Context, db DBTX, teacherID, sectionID uuid.UUID) error {
 	query := `DELETE FROM academics.teacher_sections WHERE teacher_id = $1 AND section_id = $2`
 	result, err := db.ExecContext(ctx, query, teacherID, sectionID)
@@ -730,6 +695,7 @@ func (r *teacherRepository) RemoveSection(ctx context.Context, db DBTX, teacherI
 	return nil
 }
 
+// GetSectionsByTeacher unchanged
 func (r *teacherRepository) GetSectionsByTeacher(ctx context.Context, db DBTX, teacherID uuid.UUID) ([]*models.TeacherSection, error) {
 	query := `
         SELECT id, teacher_id, section_id, is_class_teacher, created_at
@@ -744,7 +710,6 @@ func (r *teacherRepository) GetSectionsByTeacher(ctx context.Context, db DBTX, t
 		return nil, fmt.Errorf("get sections by teacher: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.TeacherSection
 	for rows.Next() {
 		var ts models.TeacherSection
@@ -759,10 +724,11 @@ func (r *teacherRepository) GetSectionsByTeacher(ctx context.Context, db DBTX, t
 	return result, nil
 }
 
+// GetTeachersBySection (no version in SELECT)
 func (r *teacherRepository) GetTeachersBySection(ctx context.Context, db DBTX, sectionID uuid.UUID) ([]*models.Teacher, error) {
 	query := `
         SELECT t.teacher_id, t.company_id, t.user_id, t.employee_code, t.qualification,
-               t.specialization, t.joining_date, t.status, t.version,
+               t.specialization, t.joining_date, t.status,
                t.created_at, t.updated_at, t.created_by, t.updated_by
         FROM academics.teachers t
         INNER JOIN academics.teacher_sections ts ON t.teacher_id = ts.teacher_id
@@ -776,7 +742,6 @@ func (r *teacherRepository) GetTeachersBySection(ctx context.Context, db DBTX, s
 		return nil, fmt.Errorf("get teachers by section: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.Teacher
 	for rows.Next() {
 		t, err := r.scanTeacher(rows)
@@ -791,6 +756,7 @@ func (r *teacherRepository) GetTeachersBySection(ctx context.Context, db DBTX, s
 	return result, nil
 }
 
+// UpdateClassTeacherStatus unchanged
 func (r *teacherRepository) UpdateClassTeacherStatus(ctx context.Context, db DBTX, teacherID, sectionID uuid.UUID, isClassTeacher bool) error {
 	tx, isOwner, err := beginTxIfNotTx(ctx, db)
 	if err != nil {
@@ -802,9 +768,7 @@ func (r *teacherRepository) UpdateClassTeacherStatus(ctx context.Context, db DBT
 			_ = tx.Rollback()
 		}
 	}()
-
 	if isClassTeacher {
-		// Ensure no other class teacher for this section
 		var existing uuid.UUID
 		checkQuery := `SELECT teacher_id FROM academics.teacher_sections WHERE section_id = $1 AND is_class_teacher = true AND teacher_id != $2`
 		err = tx.QueryRowContext(ctx, checkQuery, sectionID, teacherID).Scan(&existing)
@@ -814,7 +778,6 @@ func (r *teacherRepository) UpdateClassTeacherStatus(ctx context.Context, db DBT
 			return fmt.Errorf("check class teacher: %w", err)
 		}
 	}
-
 	query := `
         UPDATE academics.teacher_sections
         SET is_class_teacher = $3
@@ -835,7 +798,6 @@ func (r *teacherRepository) UpdateClassTeacherStatus(ctx context.Context, db DBT
 	if rows == 0 {
 		return fmt.Errorf("teacher section not found")
 	}
-
 	if isOwner {
 		if err = tx.Commit(); err != nil {
 			return fmt.Errorf("commit tx: %w", err)
@@ -845,12 +807,8 @@ func (r *teacherRepository) UpdateClassTeacherStatus(ctx context.Context, db DBT
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Teacher Schedule Preferences
-// ----------------------------------------------------------------------------
-
+// SetSchedulePreference unchanged (no version)
 func (r *teacherRepository) SetSchedulePreference(ctx context.Context, db DBTX, pref *models.TeacherSchedulePreference) error {
-	// Upsert: insert or update on conflict
 	query := `
         INSERT INTO academics.teacher_schedule_preferences
             (preference_id, teacher_id, day_of_week, preferred_start_time, preferred_end_time, created_at, updated_at, created_by)
@@ -879,6 +837,7 @@ func (r *teacherRepository) SetSchedulePreference(ctx context.Context, db DBTX, 
 	return nil
 }
 
+// GetSchedulePreferences unchanged
 func (r *teacherRepository) GetSchedulePreferences(ctx context.Context, db DBTX, teacherID uuid.UUID) ([]*models.TeacherSchedulePreference, error) {
 	query := `
         SELECT preference_id, teacher_id, day_of_week, preferred_start_time, preferred_end_time,
@@ -895,7 +854,6 @@ func (r *teacherRepository) GetSchedulePreferences(ctx context.Context, db DBTX,
 		return nil, fmt.Errorf("get schedule preferences: %w", err)
 	}
 	defer rows.Close()
-
 	var result []*models.TeacherSchedulePreference
 	for rows.Next() {
 		var pref models.TeacherSchedulePreference
@@ -919,6 +877,7 @@ func (r *teacherRepository) GetSchedulePreferences(ctx context.Context, db DBTX,
 	return result, nil
 }
 
+// DeleteSchedulePreference unchanged
 func (r *teacherRepository) DeleteSchedulePreference(ctx context.Context, db DBTX, preferenceID uuid.UUID) error {
 	query := `DELETE FROM academics.teacher_schedule_preferences WHERE preference_id = $1`
 	result, err := db.ExecContext(ctx, query, preferenceID)
@@ -938,8 +897,8 @@ func (r *teacherRepository) DeleteSchedulePreference(ctx context.Context, db DBT
 	return nil
 }
 
+// UpdateSchedulePreference unchanged
 func (r *teacherRepository) UpdateSchedulePreference(ctx context.Context, db DBTX, pref *models.TeacherSchedulePreference) error {
-	// Equivalent to SetSchedulePreference, but with existing ID (or upsert)
 	query := `
         UPDATE academics.teacher_schedule_preferences
         SET day_of_week = $3, preferred_start_time = $4, preferred_end_time = $5, updated_at = NOW()
@@ -952,7 +911,6 @@ func (r *teacherRepository) UpdateSchedulePreference(ctx context.Context, db DBT
 	).Scan(&pref.PreferenceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// If not found, fallback to insert
 			return r.SetSchedulePreference(ctx, db, pref)
 		}
 		r.logger.Error("failed to update schedule preference",
@@ -963,6 +921,7 @@ func (r *teacherRepository) UpdateSchedulePreference(ctx context.Context, db DBT
 	return nil
 }
 
+// ClearSchedulePreferences unchanged
 func (r *teacherRepository) ClearSchedulePreferences(ctx context.Context, db DBTX, teacherID uuid.UUID) error {
 	query := `DELETE FROM academics.teacher_schedule_preferences WHERE teacher_id = $1`
 	_, err := db.ExecContext(ctx, query, teacherID)
@@ -975,15 +934,11 @@ func (r *teacherRepository) ClearSchedulePreferences(ctx context.Context, db DBT
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// scanTeacher
-// ----------------------------------------------------------------------------
-
+// scanTeacher – removed version column
 func (r *teacherRepository) scanTeacher(row scanner) (*models.Teacher, error) {
 	var t models.Teacher
 	var joiningDate sql.NullTime
 	var createdBy, updatedBy uuid.NullUUID
-
 	err := row.Scan(
 		&t.TeacherID,
 		&t.CompanyID,
@@ -993,7 +948,6 @@ func (r *teacherRepository) scanTeacher(row scanner) (*models.Teacher, error) {
 		&t.Specialization,
 		&joiningDate,
 		&t.Status,
-		&t.Version,
 		&t.CreatedAt,
 		&t.UpdatedAt,
 		&createdBy,
@@ -1005,7 +959,6 @@ func (r *teacherRepository) scanTeacher(row scanner) (*models.Teacher, error) {
 		}
 		return nil, fmt.Errorf("scan teacher: %w", err)
 	}
-
 	if joiningDate.Valid {
 		t.JoiningDate = &joiningDate.Time
 	}
@@ -1015,6 +968,5 @@ func (r *teacherRepository) scanTeacher(row scanner) (*models.Teacher, error) {
 	if updatedBy.Valid {
 		t.UpdatedBy = &updatedBy.UUID
 	}
-
 	return &t, nil
 }

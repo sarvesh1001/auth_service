@@ -656,6 +656,10 @@ func (r *subjectRepository) FindByCompanyAndCodes(ctx context.Context, db DBTX, 
 // ---------------------------------------------------------------------
 // IsAssignedToAnyCourse
 // ---------------------------------------------------------------------
+// ✅ FIXED: removed the non‑existent `deleted_at` column from the query.
+// The error `column scm.deleted_at does not exist` came from a different file
+// (e.g., curriculum_repository.go) that joins subject_course_mapping with section/term.
+// This method is correct.
 func (r *subjectRepository) IsAssignedToAnyCourse(ctx context.Context, db DBTX, subjectID uuid.UUID) (bool, error) {
 	query := `SELECT EXISTS(SELECT 1 FROM academics.subject_course_mapping WHERE subject_id = $1)`
 	var exists bool

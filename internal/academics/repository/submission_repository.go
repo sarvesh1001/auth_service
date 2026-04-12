@@ -39,7 +39,6 @@ type submissionRepository struct {
 	logger *zap.Logger
 }
 
-// NewSubmissionRepository creates a new submission repository.
 func NewSubmissionRepository(logger *zap.Logger) SubmissionRepository {
 	return &submissionRepository{
 		logger: logger.Named("submission_repo"),
@@ -134,14 +133,13 @@ func (r *submissionRepository) CreateSubmission(ctx context.Context, db DBTX, s 
         INSERT INTO academics.assignment_submissions (
             assignment_id, student_id, submission_date, file_url, remarks,
             status, marks_obtained, feedback, graded_by, graded_at,
-            created_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+            created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
         RETURNING submission_id, created_at, updated_at
     `
 	err := db.QueryRowContext(ctx, query,
 		s.AssignmentID, s.StudentID, s.SubmissionDate, s.FileURL, s.Remarks,
 		s.Status, s.MarksObtained, s.Feedback, s.GradedBy, s.GradedAt,
-		s.CreatedBy,
 	).Scan(&s.SubmissionID, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create submission",
@@ -158,7 +156,7 @@ func (r *submissionRepository) GetSubmissionByID(ctx context.Context, db DBTX, i
         SELECT
             submission_id, assignment_id, student_id, submission_date, file_url, remarks,
             status, marks_obtained, feedback, graded_by, graded_at,
-            created_at, updated_at, created_by
+            created_at, updated_at
         FROM academics.assignment_submissions
         WHERE submission_id = $1
     `
@@ -171,7 +169,7 @@ func (r *submissionRepository) GetSubmissionByAssignmentAndStudent(ctx context.C
         SELECT
             submission_id, assignment_id, student_id, submission_date, file_url, remarks,
             status, marks_obtained, feedback, graded_by, graded_at,
-            created_at, updated_at, created_by
+            created_at, updated_at
         FROM academics.assignment_submissions
         WHERE assignment_id = $1 AND student_id = $2
     `
@@ -191,7 +189,7 @@ func (r *submissionRepository) ListSubmissions(ctx context.Context, db DBTX, fil
         SELECT
             submission_id, assignment_id, student_id, submission_date, file_url, remarks,
             status, marks_obtained, feedback, graded_by, graded_at,
-            created_at, updated_at, created_by
+            created_at, updated_at
         FROM academics.assignment_submissions s
         %s
         %s
@@ -279,7 +277,6 @@ func (r *submissionRepository) UpdateSubmission(ctx context.Context, db DBTX, s 
 }
 
 func (r *submissionRepository) DeleteSubmission(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
-	// Hard delete as per schema (no deleted_at column)
 	query := `DELETE FROM academics.assignment_submissions WHERE submission_id = $1`
 	result, err := db.ExecContext(ctx, query, id)
 	if err != nil {
@@ -325,12 +322,12 @@ func (r *submissionRepository) GradeSubmission(ctx context.Context, db DBTX, sub
 func (r *submissionRepository) CreateGrade(ctx context.Context, db DBTX, g *models.AssignmentGrade) error {
 	query := `
         INSERT INTO academics.assignment_grades (
-            submission_id, marks, graded_by, graded_at, remarks, created_by, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            submission_id, marks, graded_by, graded_at, remarks, created_at
+        ) VALUES ($1, $2, $3, $4, $5, NOW())
         RETURNING grade_id, created_at
     `
 	err := db.QueryRowContext(ctx, query,
-		g.SubmissionID, g.Marks, g.GradedBy, g.GradedAt, g.Remarks, g.CreatedBy,
+		g.SubmissionID, g.Marks, g.GradedBy, g.GradedAt, g.Remarks,
 	).Scan(&g.GradeID, &g.CreatedAt)
 	if err != nil {
 		r.logger.Error("failed to create grade",
@@ -344,7 +341,7 @@ func (r *submissionRepository) CreateGrade(ctx context.Context, db DBTX, g *mode
 func (r *submissionRepository) GetGradesBySubmission(ctx context.Context, db DBTX, submissionID uuid.UUID) ([]*models.AssignmentGrade, error) {
 	query := `
         SELECT
-            grade_id, submission_id, marks, graded_by, graded_at, remarks, created_at, created_by
+            grade_id, submission_id, marks, graded_by, graded_at, remarks, created_at
         FROM academics.assignment_grades
         WHERE submission_id = $1
         ORDER BY graded_at DESC
@@ -361,7 +358,6 @@ func (r *submissionRepository) GetGradesBySubmission(ctx context.Context, db DBT
 	var grades []*models.AssignmentGrade
 	for rows.Next() {
 		var g models.AssignmentGrade
-		var createdBy uuid.NullUUID
 		if err := rows.Scan(
 			&g.GradeID,
 			&g.SubmissionID,
@@ -370,12 +366,8 @@ func (r *submissionRepository) GetGradesBySubmission(ctx context.Context, db DBT
 			&g.GradedAt,
 			&g.Remarks,
 			&g.CreatedAt,
-			&createdBy,
 		); err != nil {
 			return nil, fmt.Errorf("scan grade: %w", err)
-		}
-		if createdBy.Valid {
-			g.CreatedBy = &createdBy.UUID
 		}
 		grades = append(grades, &g)
 	}
@@ -390,12 +382,12 @@ func (r *submissionRepository) GetGradesBySubmission(ctx context.Context, db DBT
 func (r *submissionRepository) AddComment(ctx context.Context, db DBTX, c *models.AssignmentComment) error {
 	query := `
         INSERT INTO academics.assignment_comments (
-            submission_id, comment_by, comment, created_by, created_at
-        ) VALUES ($1, $2, $3, $4, NOW())
+            submission_id, comment_by, comment, created_at
+        ) VALUES ($1, $2, $3, NOW())
         RETURNING comment_id, created_at
     `
 	err := db.QueryRowContext(ctx, query,
-		c.SubmissionID, c.CommentBy, c.Comment, c.CreatedBy,
+		c.SubmissionID, c.CommentBy, c.Comment,
 	).Scan(&c.CommentID, &c.CreatedAt)
 	if err != nil {
 		r.logger.Error("failed to add comment",
@@ -409,7 +401,7 @@ func (r *submissionRepository) AddComment(ctx context.Context, db DBTX, c *model
 func (r *submissionRepository) GetCommentsBySubmission(ctx context.Context, db DBTX, submissionID uuid.UUID) ([]*models.AssignmentComment, error) {
 	query := `
         SELECT
-            comment_id, submission_id, comment_by, comment, created_at, created_by
+            comment_id, submission_id, comment_by, comment, created_at
         FROM academics.assignment_comments
         WHERE submission_id = $1
         ORDER BY created_at ASC
@@ -426,19 +418,14 @@ func (r *submissionRepository) GetCommentsBySubmission(ctx context.Context, db D
 	var comments []*models.AssignmentComment
 	for rows.Next() {
 		var c models.AssignmentComment
-		var createdBy uuid.NullUUID
 		if err := rows.Scan(
 			&c.CommentID,
 			&c.SubmissionID,
 			&c.CommentBy,
 			&c.Comment,
 			&c.CreatedAt,
-			&createdBy,
 		); err != nil {
 			return nil, fmt.Errorf("scan comment: %w", err)
-		}
-		if createdBy.Valid {
-			c.CreatedBy = &createdBy.UUID
 		}
 		comments = append(comments, &c)
 	}
@@ -448,11 +435,12 @@ func (r *submissionRepository) GetCommentsBySubmission(ctx context.Context, db D
 	return comments, nil
 }
 
-// scanSubmission scans a row into an AssignmentSubmission model.
+// scanSubmission scans a row into an AssignmentSubmission model (no created_by).
+// scanSubmission scans a row into an AssignmentSubmission model (no created_by column).
 func (r *submissionRepository) scanSubmission(row scanner) (*models.AssignmentSubmission, error) {
 	var s models.AssignmentSubmission
 	var marksObtained sql.NullFloat64
-	var gradedBy, createdBy uuid.NullUUID
+	var gradedBy uuid.NullUUID
 	var gradedAt sql.NullTime
 
 	err := row.Scan(
@@ -469,7 +457,6 @@ func (r *submissionRepository) scanSubmission(row scanner) (*models.AssignmentSu
 		&gradedAt,
 		&s.CreatedAt,
 		&s.UpdatedAt,
-		&createdBy,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -485,9 +472,6 @@ func (r *submissionRepository) scanSubmission(row scanner) (*models.AssignmentSu
 	}
 	if gradedAt.Valid {
 		s.GradedAt = &gradedAt.Time
-	}
-	if createdBy.Valid {
-		s.CreatedBy = &createdBy.UUID
 	}
 	return &s, nil
 }

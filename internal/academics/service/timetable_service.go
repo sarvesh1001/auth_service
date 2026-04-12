@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,86 +12,12 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// ============================================================================
-// Service interface and struct
-// ============================================================================
-
-type TimetableService interface {
-	// Timetable operations
-	CreateTimetable(ctx context.Context, req CreateTimetableRequest, idempotencyKey string) (*models.Timetable, error)
-	GetTimetableByID(ctx context.Context, id uuid.UUID) (*models.Timetable, error)
-	ListTimetables(ctx context.Context, filter repository.TimetableFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.Timetable, error)
-	UpdateTimetable(ctx context.Context, req UpdateTimetableRequest) (*models.Timetable, error)
-	DeleteTimetable(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
-	GetActiveTimetableForSection(ctx context.Context, termID, sectionID uuid.UUID) (*models.Timetable, error)
-
-	// Slot operations
-	AddSlot(ctx context.Context, req AddSlotRequest) (*models.TimetableSlot, error)
-	UpdateSlot(ctx context.Context, req UpdateSlotRequest) (*models.TimetableSlot, error)
-	RemoveSlot(ctx context.Context, slotID uuid.UUID, deletedBy *uuid.UUID) error
-	GetSlotsForTimetable(ctx context.Context, timetableID uuid.UUID) ([]*models.TimetableSlot, error)
-
-	// Entry operations
-	AddEntry(ctx context.Context, req AddEntryRequest) (*models.TimetableEntry, error)
-	UpdateEntry(ctx context.Context, req UpdateEntryRequest) (*models.TimetableEntry, error)
-	RemoveEntry(ctx context.Context, entryID uuid.UUID, deletedBy *uuid.UUID) error
-	GetEntriesForSlot(ctx context.Context, slotID uuid.UUID) ([]*models.TimetableEntry, error)
-
-	// Change tracking
-	AddChange(ctx context.Context, req AddChangeRequest) (*models.TimetableChange, error)
-	GetChangesForEntry(ctx context.Context, entryID uuid.UUID) ([]*models.TimetableChange, error)
-}
-
-type timetableService struct {
-	repo             repository.TimetableRepository
-	sectionRepo      repository.SectionRepository
-	subjectRepo      repository.SubjectRepository
-	teacherRepo      repository.TeacherRepository
-	roomRepo         repository.RoomRepository
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	eventPublisher   EventPublisher
-	pgClient         *client.PostgresClient
-	logger           *zap.Logger
-	notificationSvc  NotificationService
-}
-
-func NewTimetableService(
-	repo repository.TimetableRepository,
-	sectionRepo repository.SectionRepository,
-	subjectRepo repository.SubjectRepository,
-	teacherRepo repository.TeacherRepository,
-	roomRepo repository.RoomRepository,
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	eventPublisher EventPublisher,
-	pgClient *client.PostgresClient,
-	logger *zap.Logger,
-	notificationSvc NotificationService,
-) TimetableService {
-	return &timetableService{
-		repo:             repo,
-		sectionRepo:      sectionRepo,
-		subjectRepo:      subjectRepo,
-		teacherRepo:      teacherRepo,
-		roomRepo:         roomRepo,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		eventPublisher:   eventPublisher,
-		pgClient:         pgClient,
-		logger:           logger.Named("timetable_service"),
-		notificationSvc:  notificationSvc,
-	}
-}
-
-// ============================================================================
-// Request DTOs
-// ============================================================================
+// ---------- Request types ----------
 
 type CreateTimetableRequest struct {
 	AcademicYearID uuid.UUID  `json:"academic_year_id"`
@@ -116,7 +43,7 @@ type UpdateTimetableRequest struct {
 
 type AddSlotRequest struct {
 	TimetableID uuid.UUID  `json:"timetable_id"`
-	DayOfWeek   int        `json:"day_of_week"` // 0-6 (Monday-Sunday)
+	DayOfWeek   int        `json:"day_of_week"`
 	StartTime   time.Time  `json:"start_time"`
 	EndTime     time.Time  `json:"end_time"`
 	SlotNumber  int        `json:"slot_number,omitempty"`
@@ -157,9 +84,76 @@ type AddChangeRequest struct {
 	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
 }
 
-// ============================================================================
-// Validation helpers
-// ============================================================================
+// ---------- Service Interface ----------
+
+type TimetableService interface {
+	CreateTimetable(ctx context.Context, req CreateTimetableRequest) (*models.Timetable, error)
+	GetTimetableByID(ctx context.Context, id uuid.UUID) (*models.Timetable, error)
+	ListTimetables(ctx context.Context, filter repository.TimetableFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.Timetable, error)
+	UpdateTimetable(ctx context.Context, req UpdateTimetableRequest) (*models.Timetable, error)
+	DeleteTimetable(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
+	GetActiveTimetableForSection(ctx context.Context, termID, sectionID uuid.UUID) (*models.Timetable, error)
+	AddSlot(ctx context.Context, req AddSlotRequest) (*models.TimetableSlot, error)
+	UpdateSlot(ctx context.Context, req UpdateSlotRequest) (*models.TimetableSlot, error)
+	RemoveSlot(ctx context.Context, slotID uuid.UUID, deletedBy *uuid.UUID) error
+	GetSlotsForTimetable(ctx context.Context, timetableID uuid.UUID) ([]*models.TimetableSlot, error)
+	AddEntry(ctx context.Context, req AddEntryRequest) (*models.TimetableEntry, error)
+	UpdateEntry(ctx context.Context, req UpdateEntryRequest) (*models.TimetableEntry, error)
+	RemoveEntry(ctx context.Context, entryID uuid.UUID, deletedBy *uuid.UUID) error
+	GetEntriesForSlot(ctx context.Context, slotID uuid.UUID) ([]*models.TimetableEntry, error)
+	AddChange(ctx context.Context, req AddChangeRequest) (*models.TimetableChange, error)
+	GetChangesForEntry(ctx context.Context, entryID uuid.UUID) ([]*models.TimetableChange, error)
+}
+
+// ---------- Service Implementation ----------
+
+type timetableService struct {
+	repo             repository.TimetableRepository
+	sectionRepo      repository.SectionRepository
+	courseRepo       repository.CourseRepository // ✅ Added
+	subjectRepo      repository.SubjectRepository
+	teacherRepo      repository.TeacherRepository
+	roomRepo         repository.RoomRepository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
+	pgClient         *client.PostgresClient
+	logger           *zap.Logger
+	notificationSvc  NotificationService
+}
+
+// ✅ Updated constructor to include courseRepo
+func NewTimetableService(
+	repo repository.TimetableRepository,
+	sectionRepo repository.SectionRepository,
+	courseRepo repository.CourseRepository,
+	subjectRepo repository.SubjectRepository,
+	teacherRepo repository.TeacherRepository,
+	roomRepo repository.RoomRepository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+	notificationSvc NotificationService,
+) TimetableService {
+	return &timetableService{
+		repo:             repo,
+		sectionRepo:      sectionRepo,
+		courseRepo:       courseRepo,
+		subjectRepo:      subjectRepo,
+		teacherRepo:      teacherRepo,
+		roomRepo:         roomRepo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
+		pgClient:         pgClient,
+		logger:           logger.Named("timetable_service"),
+		notificationSvc:  notificationSvc,
+	}
+}
+
+// ---------- Validation Helpers ----------
 
 func (s *timetableService) validateTimetableInput(req CreateTimetableRequest) error {
 	if req.AcademicYearID == uuid.Nil {
@@ -209,16 +203,15 @@ func (s *timetableService) validateEntryInput(req AddEntryRequest) error {
 	return nil
 }
 
-// ============================================================================
-// Timetable CRUD
-// ============================================================================
+// ---------- Core Business Methods ----------
 
-func (s *timetableService) CreateTimetable(ctx context.Context, req CreateTimetableRequest, idempotencyKey string) (*models.Timetable, error) {
+func (s *timetableService) CreateTimetable(ctx context.Context, req CreateTimetableRequest) (*models.Timetable, error) {
 	logger := s.logger.With(
 		zap.String("method", "CreateTimetable"),
 		zap.String("section_id", req.SectionID.String()),
-		zap.String("idempotency_key", idempotencyKey),
 	)
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateTimetableInput(req); err != nil {
 		return nil, err
@@ -231,21 +224,13 @@ func (s *timetableService) CreateTimetable(ctx context.Context, req CreateTimeta
 	defer tx.Rollback()
 
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var tt models.Timetable
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &tt); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
-			logger.Info("returning idempotent response")
-			return &tt, nil
+		var existing models.Timetable
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.TimetableID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
 		}
 	}
 
-	// Validate section existence and permissions
 	section, err := s.sectionRepo.GetByID(ctx, tx, req.SectionID)
 	if err != nil {
 		return nil, err
@@ -254,7 +239,6 @@ func (s *timetableService) CreateTimetable(ctx context.Context, req CreateTimeta
 		return nil, fmt.Errorf("%w: section %s", ErrNotFound, req.SectionID)
 	}
 
-	// Check if another active timetable exists for the same section/term (optional)
 	existing, err := s.repo.GetActiveTimetableForSection(ctx, tx, req.TermID, req.SectionID)
 	if err != nil && err != repository.ErrNotFound {
 		return nil, err
@@ -281,17 +265,29 @@ func (s *timetableService) CreateTimetable(ctx context.Context, req CreateTimeta
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, tt); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			return nil, fmt.Errorf("failed to store idempotency key: %w", err)
 		}
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_CREATE", tt.TimetableID, nil, tt, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &section.CourseID, "academics", "create", "timetable",
+			&tt.TimetableID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"section_id": req.SectionID,
+				"term_id":    req.TermID,
+			})
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableCreated), tt); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	payload, _ := json.Marshal(tt)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable",
+		AggregateID:   tt.TimetableID.String(),
+		EventType:     string(EventTimetableCreated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -300,13 +296,21 @@ func (s *timetableService) CreateTimetable(ctx context.Context, req CreateTimeta
 
 	logger.Info("timetable created", zap.String("id", tt.TimetableID.String()))
 
-	// Send notification (async)
-	go s.sendTimetableNotification(ctx, tt, "created", req.CreatedBy)
+	// Launch notification in a goroutine with recovery
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("panic in sendTimetableNotification", zap.Any("recover", r))
+			}
+		}()
+		s.sendTimetableNotification(tt, "created", req.CreatedBy)
+	}()
 
 	return tt, nil
 }
 
 func (s *timetableService) GetTimetableByID(ctx context.Context, id uuid.UUID) (*models.Timetable, error) {
+	logger := s.logger.With(zap.String("method", "GetTimetableByID"), zap.String("id", id.String()))
 	tt, err := s.repo.GetTimetableByID(ctx, s.pgClient.DB, id)
 	if err != nil {
 		return nil, err
@@ -314,15 +318,20 @@ func (s *timetableService) GetTimetableByID(ctx context.Context, id uuid.UUID) (
 	if tt == nil {
 		return nil, fmt.Errorf("%w: timetable %s", ErrNotFound, id)
 	}
+	logger.Debug("timetable retrieved")
 	return tt, nil
 }
 
 func (s *timetableService) ListTimetables(ctx context.Context, filter repository.TimetableFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.Timetable, error) {
+	logger := s.logger.With(zap.String("method", "ListTimetables"))
+	logger.Debug("listing timetables")
 	return s.repo.ListTimetables(ctx, s.pgClient.DB, filter, pagination, sort)
 }
 
 func (s *timetableService) UpdateTimetable(ctx context.Context, req UpdateTimetableRequest) (*models.Timetable, error) {
 	logger := s.logger.With(zap.String("method", "UpdateTimetable"), zap.String("timetable_id", req.TimetableID.String()))
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if req.TimetableID == uuid.Nil {
 		return nil, fmt.Errorf("%w: timetable_id is required", ErrInvalidInput)
@@ -333,6 +342,14 @@ func (s *timetableService) UpdateTimetable(ctx context.Context, req UpdateTimeta
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing models.Timetable
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.TimetableID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
+		}
+	}
 
 	tt, err := s.repo.GetTimetableByID(ctx, tx, req.TimetableID)
 	if err != nil {
@@ -355,16 +372,32 @@ func (s *timetableService) UpdateTimetable(ctx context.Context, req UpdateTimeta
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_UPDATE", req.TimetableID, oldTT, tt, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, tt); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableUpdated), map[string]interface{}{
-		"old": oldTT,
-		"new": tt,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "timetable",
+			&req.TimetableID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old": oldTT,
+				"new": tt,
+			})
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{"old": oldTT, "new": tt})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable",
+		AggregateID:   tt.TimetableID.String(),
+		EventType:     string(EventTimetableUpdated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -372,9 +405,10 @@ func (s *timetableService) UpdateTimetable(ctx context.Context, req UpdateTimeta
 	}
 
 	logger.Info("timetable updated")
-
-	go s.sendTimetableNotification(ctx, tt, "updated", req.UpdatedBy)
-
+	go func() {
+		defer func() { recover() }()
+		s.sendTimetableNotification(tt, "updated", req.UpdatedBy)
+	}()
 	return tt, nil
 }
 
@@ -387,22 +421,38 @@ func (s *timetableService) DeleteTimetable(ctx context.Context, id uuid.UUID, de
 	}
 	defer tx.Rollback()
 
-	tt, _ := s.repo.GetTimetableByID(ctx, tx, id)
+	tt, err := s.repo.GetTimetableByID(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if tt == nil {
+		return fmt.Errorf("%w: timetable %s", ErrNotFound, id)
+	}
 
 	if err := s.repo.DeleteTimetable(ctx, tx, id, deletedBy); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_DELETE", id, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "timetable",
+			&id, "user", deletedBy, nil, nil, nil)
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableDeleted), map[string]interface{}{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"timetable_id": id,
 		"deleted_by":   deletedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable",
+		AggregateID:   id.String(),
+		EventType:     string(EventTimetableDeleted),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -410,26 +460,33 @@ func (s *timetableService) DeleteTimetable(ctx context.Context, id uuid.UUID, de
 	}
 
 	logger.Info("timetable deleted")
-
-	if tt != nil {
-		go s.sendTimetableNotification(ctx, tt, "deleted", deletedBy)
-	}
+	go func() {
+		defer func() { recover() }()
+		s.sendTimetableNotification(tt, "deleted", deletedBy)
+	}()
 	return nil
 }
 
 func (s *timetableService) GetActiveTimetableForSection(ctx context.Context, termID, sectionID uuid.UUID) (*models.Timetable, error) {
-	return s.repo.GetActiveTimetableForSection(ctx, s.pgClient.DB, termID, sectionID)
+	logger := s.logger.With(zap.String("method", "GetActiveTimetableForSection"), zap.String("term_id", termID.String()), zap.String("section_id", sectionID.String()))
+	tt, err := s.repo.GetActiveTimetableForSection(ctx, s.pgClient.DB, termID, sectionID)
+	if err != nil {
+		return nil, err
+	}
+	if tt == nil {
+		return nil, fmt.Errorf("%w: no active timetable for section %s in term %s", ErrNotFound, sectionID, termID)
+	}
+	logger.Debug("active timetable retrieved")
+	return tt, nil
 }
-
-// ============================================================================
-// Slot operations
-// ============================================================================
 
 func (s *timetableService) AddSlot(ctx context.Context, req AddSlotRequest) (*models.TimetableSlot, error) {
 	logger := s.logger.With(
 		zap.String("method", "AddSlot"),
 		zap.String("timetable_id", req.TimetableID.String()),
 	)
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateSlotInput(req); err != nil {
 		return nil, err
@@ -440,6 +497,14 @@ func (s *timetableService) AddSlot(ctx context.Context, req AddSlotRequest) (*mo
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing models.TimetableSlot
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.SlotID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
+		}
+	}
 
 	tt, err := s.repo.GetTimetableByID(ctx, tx, req.TimetableID)
 	if err != nil {
@@ -462,13 +527,32 @@ func (s *timetableService) AddSlot(ctx context.Context, req AddSlotRequest) (*mo
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_SLOT_ADD", slot.SlotID, nil, slot, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, slot); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableSlotAdded), slot); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "add", "timetable_slot",
+			&slot.SlotID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"timetable_id": req.TimetableID,
+				"day_of_week":  req.DayOfWeek,
+			})
+	}
+
+	payload, _ := json.Marshal(slot)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_slot",
+		AggregateID:   slot.SlotID.String(),
+		EventType:     string(EventTimetableSlotAdded),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -476,14 +560,17 @@ func (s *timetableService) AddSlot(ctx context.Context, req AddSlotRequest) (*mo
 	}
 
 	logger.Info("slot added", zap.String("slot_id", slot.SlotID.String()))
-
-	go s.sendSlotNotification(ctx, slot, "added", req.CreatedBy)
-
+	go func() {
+		defer func() { recover() }()
+		s.sendSlotNotification(slot, "added", req.CreatedBy)
+	}()
 	return slot, nil
 }
 
 func (s *timetableService) UpdateSlot(ctx context.Context, req UpdateSlotRequest) (*models.TimetableSlot, error) {
 	logger := s.logger.With(zap.String("method", "UpdateSlot"), zap.String("slot_id", req.SlotID.String()))
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if req.SlotID == uuid.Nil {
 		return nil, fmt.Errorf("%w: slot_id is required", ErrInvalidInput)
@@ -494,6 +581,14 @@ func (s *timetableService) UpdateSlot(ctx context.Context, req UpdateSlotRequest
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing models.TimetableSlot
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.SlotID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
+		}
+	}
 
 	slot, err := s.repo.GetSlotByID(ctx, tx, req.SlotID)
 	if err != nil {
@@ -513,16 +608,32 @@ func (s *timetableService) UpdateSlot(ctx context.Context, req UpdateSlotRequest
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_SLOT_UPDATE", req.SlotID, oldSlot, slot, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, slot); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableSlotUpdated), map[string]interface{}{
-		"old": oldSlot,
-		"new": slot,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "timetable_slot",
+			&req.SlotID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old": oldSlot,
+				"new": slot,
+			})
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{"old": oldSlot, "new": slot})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_slot",
+		AggregateID:   slot.SlotID.String(),
+		EventType:     string(EventTimetableSlotUpdated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -530,9 +641,10 @@ func (s *timetableService) UpdateSlot(ctx context.Context, req UpdateSlotRequest
 	}
 
 	logger.Info("slot updated")
-
-	go s.sendSlotNotification(ctx, slot, "updated", req.UpdatedBy)
-
+	go func() {
+		defer func() { recover() }()
+		s.sendSlotNotification(slot, "updated", req.UpdatedBy)
+	}()
 	return slot, nil
 }
 
@@ -545,22 +657,38 @@ func (s *timetableService) RemoveSlot(ctx context.Context, slotID uuid.UUID, del
 	}
 	defer tx.Rollback()
 
-	slot, _ := s.repo.GetSlotByID(ctx, tx, slotID)
+	slot, err := s.repo.GetSlotByID(ctx, tx, slotID)
+	if err != nil {
+		return err
+	}
+	if slot == nil {
+		return fmt.Errorf("%w: slot %s", ErrNotFound, slotID)
+	}
 
 	if err := s.repo.RemoveSlot(ctx, tx, slotID); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_SLOT_DELETE", slotID, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "timetable_slot",
+			&slotID, "user", deletedBy, nil, nil, nil)
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableSlotDeleted), map[string]interface{}{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"slot_id":    slotID,
 		"deleted_by": deletedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_slot",
+		AggregateID:   slotID.String(),
+		EventType:     string(EventTimetableSlotDeleted),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -568,26 +696,30 @@ func (s *timetableService) RemoveSlot(ctx context.Context, slotID uuid.UUID, del
 	}
 
 	logger.Info("slot removed")
-
-	if slot != nil {
-		go s.sendSlotNotification(ctx, slot, "deleted", deletedBy)
-	}
+	go func() {
+		defer func() { recover() }()
+		s.sendSlotNotification(slot, "deleted", deletedBy)
+	}()
 	return nil
 }
 
 func (s *timetableService) GetSlotsForTimetable(ctx context.Context, timetableID uuid.UUID) ([]*models.TimetableSlot, error) {
-	return s.repo.GetSlotsForTimetable(ctx, s.pgClient.DB, timetableID)
+	logger := s.logger.With(zap.String("method", "GetSlotsForTimetable"), zap.String("timetable_id", timetableID.String()))
+	slots, err := s.repo.GetSlotsForTimetable(ctx, s.pgClient.DB, timetableID)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debug("slots retrieved", zap.Int("count", len(slots)))
+	return slots, nil
 }
-
-// ============================================================================
-// Entry operations
-// ============================================================================
 
 func (s *timetableService) AddEntry(ctx context.Context, req AddEntryRequest) (*models.TimetableEntry, error) {
 	logger := s.logger.With(
 		zap.String("method", "AddEntry"),
 		zap.String("slot_id", req.SlotID.String()),
 	)
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateEntryInput(req); err != nil {
 		return nil, err
@@ -599,6 +731,14 @@ func (s *timetableService) AddEntry(ctx context.Context, req AddEntryRequest) (*
 	}
 	defer tx.Rollback()
 
+	if idempotencyKey != "" {
+		var existing models.TimetableEntry
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.EntryID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
+		}
+	}
+
 	slot, err := s.repo.GetSlotByID(ctx, tx, req.SlotID)
 	if err != nil {
 		return nil, err
@@ -607,7 +747,6 @@ func (s *timetableService) AddEntry(ctx context.Context, req AddEntryRequest) (*
 		return nil, fmt.Errorf("%w: slot %s", ErrNotFound, req.SlotID)
 	}
 
-	// Validate subject and teacher exist and are active
 	subject, err := s.subjectRepo.GetByID(ctx, tx, req.SubjectID)
 	if err != nil {
 		return nil, err
@@ -630,7 +769,6 @@ func (s *timetableService) AddEntry(ctx context.Context, req AddEntryRequest) (*
 		return nil, fmt.Errorf("teacher %s is not active", req.TeacherID)
 	}
 
-	// Validate room if provided
 	if req.RoomID != nil && *req.RoomID != uuid.Nil {
 		room, err := s.roomRepo.GetByID(ctx, tx, *req.RoomID)
 		if err != nil {
@@ -656,13 +794,32 @@ func (s *timetableService) AddEntry(ctx context.Context, req AddEntryRequest) (*
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_ENTRY_ADD", entry.EntryID, nil, entry, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, entry); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableEntryAdded), entry); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "add", "timetable_entry",
+			&entry.EntryID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"slot_id":    req.SlotID,
+				"subject_id": req.SubjectID,
+			})
+	}
+
+	payload, _ := json.Marshal(entry)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_entry",
+		AggregateID:   entry.EntryID.String(),
+		EventType:     string(EventTimetableEntryAdded),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -670,14 +827,17 @@ func (s *timetableService) AddEntry(ctx context.Context, req AddEntryRequest) (*
 	}
 
 	logger.Info("entry added", zap.String("entry_id", entry.EntryID.String()))
-
-	go s.sendEntryNotification(ctx, entry, "added", req.CreatedBy)
-
+	go func() {
+		defer func() { recover() }()
+		s.sendEntryNotification(entry, "added", req.CreatedBy)
+	}()
 	return entry, nil
 }
 
 func (s *timetableService) UpdateEntry(ctx context.Context, req UpdateEntryRequest) (*models.TimetableEntry, error) {
 	logger := s.logger.With(zap.String("method", "UpdateEntry"), zap.String("entry_id", req.EntryID.String()))
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if req.EntryID == uuid.Nil {
 		return nil, fmt.Errorf("%w: entry_id is required", ErrInvalidInput)
@@ -689,6 +849,14 @@ func (s *timetableService) UpdateEntry(ctx context.Context, req UpdateEntryReque
 	}
 	defer tx.Rollback()
 
+	if idempotencyKey != "" {
+		var existing models.TimetableEntry
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.EntryID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
+		}
+	}
+
 	entry, err := s.repo.GetEntryByID(ctx, tx, req.EntryID)
 	if err != nil {
 		return nil, err
@@ -699,7 +867,6 @@ func (s *timetableService) UpdateEntry(ctx context.Context, req UpdateEntryReque
 
 	oldEntry := *entry
 
-	// Validate new subject/teacher/room as before
 	subject, err := s.subjectRepo.GetByID(ctx, tx, req.SubjectID)
 	if err != nil {
 		return nil, err
@@ -743,16 +910,32 @@ func (s *timetableService) UpdateEntry(ctx context.Context, req UpdateEntryReque
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_ENTRY_UPDATE", req.EntryID, oldEntry, entry, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, entry); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableEntryUpdated), map[string]interface{}{
-		"old": oldEntry,
-		"new": entry,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "timetable_entry",
+			&req.EntryID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old": oldEntry,
+				"new": entry,
+			})
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{"old": oldEntry, "new": entry})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_entry",
+		AggregateID:   entry.EntryID.String(),
+		EventType:     string(EventTimetableEntryUpdated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -760,9 +943,10 @@ func (s *timetableService) UpdateEntry(ctx context.Context, req UpdateEntryReque
 	}
 
 	logger.Info("entry updated")
-
-	go s.sendEntryNotification(ctx, entry, "updated", req.UpdatedBy)
-
+	go func() {
+		defer func() { recover() }()
+		s.sendEntryNotification(entry, "updated", req.UpdatedBy)
+	}()
 	return entry, nil
 }
 
@@ -775,22 +959,38 @@ func (s *timetableService) RemoveEntry(ctx context.Context, entryID uuid.UUID, d
 	}
 	defer tx.Rollback()
 
-	entry, _ := s.repo.GetEntryByID(ctx, tx, entryID)
+	entry, err := s.repo.GetEntryByID(ctx, tx, entryID)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return fmt.Errorf("%w: entry %s", ErrNotFound, entryID)
+	}
 
 	if err := s.repo.RemoveEntry(ctx, tx, entryID); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_ENTRY_DELETE", entryID, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "timetable_entry",
+			&entryID, "user", deletedBy, nil, nil, nil)
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableEntryDeleted), map[string]interface{}{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"entry_id":   entryID,
 		"deleted_by": deletedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_entry",
+		AggregateID:   entryID.String(),
+		EventType:     string(EventTimetableEntryDeleted),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -798,23 +998,27 @@ func (s *timetableService) RemoveEntry(ctx context.Context, entryID uuid.UUID, d
 	}
 
 	logger.Info("entry removed")
-
-	if entry != nil {
-		go s.sendEntryNotification(ctx, entry, "deleted", deletedBy)
-	}
+	go func() {
+		defer func() { recover() }()
+		s.sendEntryNotification(entry, "deleted", deletedBy)
+	}()
 	return nil
 }
 
 func (s *timetableService) GetEntriesForSlot(ctx context.Context, slotID uuid.UUID) ([]*models.TimetableEntry, error) {
-	return s.repo.GetEntriesForSlot(ctx, s.pgClient.DB, slotID)
+	logger := s.logger.With(zap.String("method", "GetEntriesForSlot"), zap.String("slot_id", slotID.String()))
+	entries, err := s.repo.GetEntriesForSlot(ctx, s.pgClient.DB, slotID)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debug("entries retrieved", zap.Int("count", len(entries)))
+	return entries, nil
 }
-
-// ============================================================================
-// Change tracking
-// ============================================================================
 
 func (s *timetableService) AddChange(ctx context.Context, req AddChangeRequest) (*models.TimetableChange, error) {
 	logger := s.logger.With(zap.String("method", "AddChange"), zap.String("entry_id", req.EntryID.String()))
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if req.EntryID == uuid.Nil {
 		return nil, fmt.Errorf("%w: entry_id is required", ErrInvalidInput)
@@ -828,6 +1032,14 @@ func (s *timetableService) AddChange(ctx context.Context, req AddChangeRequest) 
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing models.TimetableChange
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.ChangeID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existing, nil
+		}
+	}
 
 	entry, err := s.repo.GetEntryByID(ctx, tx, req.EntryID)
 	if err != nil {
@@ -850,13 +1062,32 @@ func (s *timetableService) AddChange(ctx context.Context, req AddChangeRequest) 
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "TIMETABLE_CHANGE_ADD", change.ChangeID, nil, change, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, change); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventTimetableChangeAdded), change); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "add", "timetable_change",
+			&change.ChangeID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"entry_id": req.EntryID,
+				"reason":   req.Reason,
+			})
+	}
+
+	payload, _ := json.Marshal(change)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "timetable_change",
+		AggregateID:   change.ChangeID.String(),
+		EventType:     string(EventTimetableChangeAdded),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -864,63 +1095,63 @@ func (s *timetableService) AddChange(ctx context.Context, req AddChangeRequest) 
 	}
 
 	logger.Info("change added", zap.String("change_id", change.ChangeID.String()))
-
-	go s.sendChangeNotification(ctx, change, req.CreatedBy)
-
+	go func() {
+		defer func() { recover() }()
+		s.sendChangeNotification(change, req.CreatedBy)
+	}()
 	return change, nil
 }
 
 func (s *timetableService) GetChangesForEntry(ctx context.Context, entryID uuid.UUID) ([]*models.TimetableChange, error) {
-	return s.repo.GetChangesForEntry(ctx, s.pgClient.DB, entryID)
+	logger := s.logger.With(zap.String("method", "GetChangesForEntry"), zap.String("entry_id", entryID.String()))
+	changes, err := s.repo.GetChangesForEntry(ctx, s.pgClient.DB, entryID)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debug("changes retrieved", zap.Int("count", len(changes)))
+	return changes, nil
 }
 
-// ============================================================================
-// Notification helpers
-// ============================================================================
+// ---------- NOTIFICATION METHODS (FIXED) ----------
+// All now use a detached background context, a valid DB connection (s.pgClient.DB),
+// and fetch the course to get the real company ID.
 
-func (s *timetableService) sendTimetableNotification(ctx context.Context, tt *models.Timetable, action string, actor *uuid.UUID) {
-	// Fetch section to get course/term info (optional)
-	section, err := s.sectionRepo.GetByID(ctx, nil, tt.SectionID)
+func (s *timetableService) sendTimetableNotification(tt *models.Timetable, action string, actor *uuid.UUID) {
+	if s.notificationSvc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	section, err := s.sectionRepo.GetByID(ctx, s.pgClient.DB, tt.SectionID)
 	if err != nil || section == nil {
-		s.logger.Error("failed to fetch section for notification", zap.Error(err))
+		s.logger.Error("failed to fetch section for timetable notification", zap.Error(err))
 		return
 	}
 
-	// Target all teachers assigned to this section? Or just the class teacher?
-	// For simplicity, we target the created_by user (admin) and the class teacher.
-	// In a real system you would target all teachers and students in the section.
+	// ✅ Fetch the course to get the real company ID
+	course, err := s.courseRepo.GetByID(ctx, s.pgClient.DB, section.CourseID)
+	if err != nil || course == nil {
+		s.logger.Error("failed to fetch course for timetable notification", zap.Error(err))
+		return
+	}
 
 	title := fmt.Sprintf("Timetable %s", action)
 	message := fmt.Sprintf("The timetable for section %s has been %s.", section.Name, action)
 
-	targets := []NotificationTargetInput{}
-
+	var targets []NotificationTargetInput
 	if actor != nil && *actor != uuid.Nil {
 		targets = append(targets, NotificationTargetInput{
 			TargetType:     models.TargetUser,
 			TargetEntityID: *actor,
 		})
 	}
-
-	// Optionally fetch class teacher for the section and notify them
-	teachers, err := s.teacherRepo.GetTeachersBySection(ctx, nil, tt.SectionID)
-	if err == nil {
-		for _, t := range teachers {
-			if t.Status == models.TeacherActive {
-				targets = append(targets, NotificationTargetInput{
-					TargetType:     models.TargetUser,
-					TargetEntityID: t.UserID,
-				})
-			}
-		}
-	}
-
 	if len(targets) == 0 {
 		return
 	}
 
 	notifReq := CreateNotificationRequest{
-		CompanyID: section.CourseID, // Not ideal, but companyID is needed. We can get company from section's course.
+		CompanyID: course.CompanyID, // ✅ Use the real company ID
 		Title:     title,
 		Message:   message,
 		Type:      models.NotificationTypeInfo,
@@ -928,21 +1159,33 @@ func (s *timetableService) sendTimetableNotification(ctx context.Context, tt *mo
 		Targets:   targets,
 		CreatedBy: actor,
 	}
-	// Use a new context with timeout to avoid blocking
-	notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := s.notificationSvc.Create(notifyCtx, notifReq, fmt.Sprintf("timetable.%s:%s", action, tt.TimetableID.String())); err != nil {
-		s.logger.Error("failed to create timetable notification", zap.Error(err))
+
+	if _, err := s.notificationSvc.Create(ctx, notifReq, fmt.Sprintf("timetable.%s:%s", action, tt.TimetableID.String())); err != nil {
+		s.logger.Error("failed to send timetable notification", zap.Error(err))
 	}
 }
 
-func (s *timetableService) sendSlotNotification(ctx context.Context, slot *models.TimetableSlot, action string, actor *uuid.UUID) {
-	tt, err := s.repo.GetTimetableByID(ctx, nil, slot.TimetableID)
-	if err != nil || tt == nil {
+func (s *timetableService) sendSlotNotification(slot *models.TimetableSlot, action string, actor *uuid.UUID) {
+	if s.notificationSvc == nil {
 		return
 	}
-	section, err := s.sectionRepo.GetByID(ctx, nil, tt.SectionID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tt, err := s.repo.GetTimetableByID(ctx, s.pgClient.DB, slot.TimetableID)
+	if err != nil || tt == nil {
+		s.logger.Error("failed to fetch timetable for slot notification", zap.Error(err))
+		return
+	}
+	section, err := s.sectionRepo.GetByID(ctx, s.pgClient.DB, tt.SectionID)
 	if err != nil || section == nil {
+		s.logger.Error("failed to fetch section for slot notification", zap.Error(err))
+		return
+	}
+	// ✅ Fetch course for company ID
+	course, err := s.courseRepo.GetByID(ctx, s.pgClient.DB, section.CourseID)
+	if err != nil || course == nil {
+		s.logger.Error("failed to fetch course for slot notification", zap.Error(err))
 		return
 	}
 
@@ -950,21 +1193,19 @@ func (s *timetableService) sendSlotNotification(ctx context.Context, slot *model
 	message := fmt.Sprintf("A slot on day %d from %s to %s has been %s in section %s.",
 		slot.DayOfWeek, slot.StartTime.Format("15:04"), slot.EndTime.Format("15:04"), action, section.Name)
 
-	targets := []NotificationTargetInput{}
+	var targets []NotificationTargetInput
 	if actor != nil && *actor != uuid.Nil {
 		targets = append(targets, NotificationTargetInput{
 			TargetType:     models.TargetUser,
 			TargetEntityID: *actor,
 		})
 	}
-	// Notify class teachers etc. as above...
-
 	if len(targets) == 0 {
 		return
 	}
 
 	notifReq := CreateNotificationRequest{
-		CompanyID: section.CourseID, // Again, need proper company
+		CompanyID: course.CompanyID,
 		Title:     title,
 		Message:   message,
 		Type:      models.NotificationTypeInfo,
@@ -972,32 +1213,48 @@ func (s *timetableService) sendSlotNotification(ctx context.Context, slot *model
 		Targets:   targets,
 		CreatedBy: actor,
 	}
-	notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := s.notificationSvc.Create(notifyCtx, notifReq, fmt.Sprintf("slot.%s:%s", action, slot.SlotID.String())); err != nil {
-		s.logger.Error("failed to create slot notification", zap.Error(err))
+
+	if _, err := s.notificationSvc.Create(ctx, notifReq, fmt.Sprintf("slot.%s:%s", action, slot.SlotID.String())); err != nil {
+		s.logger.Error("failed to send slot notification", zap.Error(err))
 	}
 }
 
-func (s *timetableService) sendEntryNotification(ctx context.Context, entry *models.TimetableEntry, action string, actor *uuid.UUID) {
-	slot, err := s.repo.GetSlotByID(ctx, nil, entry.SlotID)
+func (s *timetableService) sendEntryNotification(entry *models.TimetableEntry, action string, actor *uuid.UUID) {
+	if s.notificationSvc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	slot, err := s.repo.GetSlotByID(ctx, s.pgClient.DB, entry.SlotID)
 	if err != nil || slot == nil {
+		s.logger.Error("failed to fetch slot for entry notification", zap.Error(err))
 		return
 	}
-	tt, err := s.repo.GetTimetableByID(ctx, nil, slot.TimetableID)
+	tt, err := s.repo.GetTimetableByID(ctx, s.pgClient.DB, slot.TimetableID)
 	if err != nil || tt == nil {
+		s.logger.Error("failed to fetch timetable for entry notification", zap.Error(err))
 		return
 	}
-	section, err := s.sectionRepo.GetByID(ctx, nil, tt.SectionID)
+	section, err := s.sectionRepo.GetByID(ctx, s.pgClient.DB, tt.SectionID)
 	if err != nil || section == nil {
+		s.logger.Error("failed to fetch section for entry notification", zap.Error(err))
 		return
 	}
-	subject, err := s.subjectRepo.GetByID(ctx, nil, entry.SubjectID)
+	// ✅ Fetch course for company ID
+	course, err := s.courseRepo.GetByID(ctx, s.pgClient.DB, section.CourseID)
+	if err != nil || course == nil {
+		s.logger.Error("failed to fetch course for entry notification", zap.Error(err))
+		return
+	}
+	subject, err := s.subjectRepo.GetByID(ctx, s.pgClient.DB, entry.SubjectID)
 	if err != nil || subject == nil {
+		s.logger.Error("failed to fetch subject for entry notification", zap.Error(err))
 		return
 	}
-	teacher, err := s.teacherRepo.GetByID(ctx, nil, entry.TeacherID)
+	teacher, err := s.teacherRepo.GetByID(ctx, s.pgClient.DB, entry.TeacherID)
 	if err != nil || teacher == nil {
+		s.logger.Error("failed to fetch teacher for entry notification", zap.Error(err))
 		return
 	}
 
@@ -1012,14 +1269,13 @@ func (s *timetableService) sendEntryNotification(ctx context.Context, entry *mod
 			TargetEntityID: *actor,
 		})
 	}
-	// Notify teacher and class teacher
 	targets = append(targets, NotificationTargetInput{
 		TargetType:     models.TargetUser,
 		TargetEntityID: teacher.UserID,
 	})
 
 	notifReq := CreateNotificationRequest{
-		CompanyID: section.CourseID,
+		CompanyID: course.CompanyID,
 		Title:     title,
 		Message:   message,
 		Type:      models.NotificationTypeInfo,
@@ -1027,28 +1283,43 @@ func (s *timetableService) sendEntryNotification(ctx context.Context, entry *mod
 		Targets:   targets,
 		CreatedBy: actor,
 	}
-	notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := s.notificationSvc.Create(notifyCtx, notifReq, fmt.Sprintf("entry.%s:%s", action, entry.EntryID.String())); err != nil {
-		s.logger.Error("failed to create entry notification", zap.Error(err))
+
+	if _, err := s.notificationSvc.Create(ctx, notifReq, fmt.Sprintf("entry.%s:%s", action, entry.EntryID.String())); err != nil {
+		s.logger.Error("failed to send entry notification", zap.Error(err))
 	}
 }
 
-func (s *timetableService) sendChangeNotification(ctx context.Context, change *models.TimetableChange, actor *uuid.UUID) {
-	entry, err := s.repo.GetEntryByID(ctx, nil, change.EntryID)
+func (s *timetableService) sendChangeNotification(change *models.TimetableChange, actor *uuid.UUID) {
+	if s.notificationSvc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	entry, err := s.repo.GetEntryByID(ctx, s.pgClient.DB, change.EntryID)
 	if err != nil || entry == nil {
+		s.logger.Error("failed to fetch entry for change notification", zap.Error(err))
 		return
 	}
-	slot, err := s.repo.GetSlotByID(ctx, nil, entry.SlotID)
+	slot, err := s.repo.GetSlotByID(ctx, s.pgClient.DB, entry.SlotID)
 	if err != nil || slot == nil {
+		s.logger.Error("failed to fetch slot for change notification", zap.Error(err))
 		return
 	}
-	tt, err := s.repo.GetTimetableByID(ctx, nil, slot.TimetableID)
+	tt, err := s.repo.GetTimetableByID(ctx, s.pgClient.DB, slot.TimetableID)
 	if err != nil || tt == nil {
+		s.logger.Error("failed to fetch timetable for change notification", zap.Error(err))
 		return
 	}
-	section, err := s.sectionRepo.GetByID(ctx, nil, tt.SectionID)
+	section, err := s.sectionRepo.GetByID(ctx, s.pgClient.DB, tt.SectionID)
 	if err != nil || section == nil {
+		s.logger.Error("failed to fetch section for change notification", zap.Error(err))
+		return
+	}
+	// ✅ Fetch course for company ID
+	course, err := s.courseRepo.GetByID(ctx, s.pgClient.DB, section.CourseID)
+	if err != nil || course == nil {
+		s.logger.Error("failed to fetch course for change notification", zap.Error(err))
 		return
 	}
 
@@ -1062,9 +1333,8 @@ func (s *timetableService) sendChangeNotification(ctx context.Context, change *m
 			TargetEntityID: *actor,
 		})
 	}
-	// Notify teacher
 	if entry.TeacherID != uuid.Nil {
-		teacher, err := s.teacherRepo.GetByID(ctx, nil, entry.TeacherID)
+		teacher, err := s.teacherRepo.GetByID(ctx, s.pgClient.DB, entry.TeacherID)
 		if err == nil && teacher != nil {
 			targets = append(targets, NotificationTargetInput{
 				TargetType:     models.TargetUser,
@@ -1072,9 +1342,12 @@ func (s *timetableService) sendChangeNotification(ctx context.Context, change *m
 			})
 		}
 	}
+	if len(targets) == 0 {
+		return
+	}
 
 	notifReq := CreateNotificationRequest{
-		CompanyID: section.CourseID,
+		CompanyID: course.CompanyID,
 		Title:     title,
 		Message:   message,
 		Type:      models.NotificationTypeInfo,
@@ -1082,9 +1355,8 @@ func (s *timetableService) sendChangeNotification(ctx context.Context, change *m
 		Targets:   targets,
 		CreatedBy: actor,
 	}
-	notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := s.notificationSvc.Create(notifyCtx, notifReq, fmt.Sprintf("change.%s", change.ChangeID.String())); err != nil {
-		s.logger.Error("failed to create change notification", zap.Error(err))
+
+	if _, err := s.notificationSvc.Create(ctx, notifReq, fmt.Sprintf("change.%s", change.ChangeID.String())); err != nil {
+		s.logger.Error("failed to send change notification", zap.Error(err))
 	}
 }

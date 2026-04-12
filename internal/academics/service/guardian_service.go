@@ -2,9 +2,10 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -12,10 +13,14 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
+// GuardianService defines the business operations for guardians.
 type GuardianService interface {
-	Create(ctx context.Context, req CreateGuardianRequest, idempotencyKey string) (*models.Guardian, error)
+	Create(ctx context.Context, req CreateGuardianRequest) (*models.Guardian, error)
 	BulkCreate(ctx context.Context, reqs []CreateGuardianRequest) ([]*models.Guardian, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Guardian, error)
 	GetByStudentID(ctx context.Context, studentID uuid.UUID) ([]*models.Guardian, error)
@@ -28,41 +33,44 @@ type GuardianService interface {
 	Exists(ctx context.Context, studentID uuid.UUID, guardianName, relation string) (bool, error)
 }
 
+// guardianService is the concrete implementation.
 type guardianService struct {
-	repo             repository.GuardianRepository
-	studentRepo      repository.StudentRepository // to validate student exists
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	eventPublisher   EventPublisher
-	pgClient         *client.PostgresClient
-	logger           *zap.Logger
-	notificationSvc  NotificationService // Added for notifications
+	repo                repository.GuardianRepository
+	studentRepo         repository.StudentRepository
+	pgClient            *client.PostgresClient
+	logger              *zap.Logger
+	outboxRepo          outbox.Repository
+	idempotencyStore    idempotency.Store
+	auditService        *audit.AuditService
+	notificationService NotificationService
 }
 
+// NewGuardianService creates a new service instance.
 func NewGuardianService(
 	repo repository.GuardianRepository,
 	studentRepo repository.StudentRepository,
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	eventPublisher EventPublisher,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
-	notificationSvc NotificationService, // New parameter
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	notificationService NotificationService,
 ) GuardianService {
 	return &guardianService{
-		repo:             repo,
-		studentRepo:      studentRepo,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		eventPublisher:   eventPublisher,
-		pgClient:         pgClient,
-		logger:           logger.Named("guardian_service"),
-		notificationSvc:  notificationSvc,
+		repo:                repo,
+		studentRepo:         studentRepo,
+		pgClient:            pgClient,
+		logger:              logger.Named("guardian_service"),
+		outboxRepo:          outboxRepo,
+		idempotencyStore:    idempotencyStore,
+		auditService:        auditService,
+		notificationService: notificationService,
 	}
 }
+
+// ---------------------------------------------------------------------
+// Helper methods
+// ---------------------------------------------------------------------
 
 func (s *guardianService) sanitizeCreate(req *CreateGuardianRequest) {
 	req.GuardianName = strings.TrimSpace(req.GuardianName)
@@ -73,7 +81,7 @@ func (s *guardianService) sanitizeCreate(req *CreateGuardianRequest) {
 	req.Occupation = strings.TrimSpace(req.Occupation)
 }
 
-func (s *guardianService) validateCreateInput(req CreateGuardianRequest) error {
+func (s *guardianService) validateCreateInput(ctx context.Context, tx *sql.Tx, req CreateGuardianRequest) error {
 	if req.StudentID == uuid.Nil {
 		return fmt.Errorf("%w: student_id is required", ErrInvalidInput)
 	}
@@ -83,8 +91,8 @@ func (s *guardianService) validateCreateInput(req CreateGuardianRequest) error {
 	if req.Relation == "" {
 		return fmt.Errorf("%w: relation is required", ErrInvalidInput)
 	}
-	// Optionally validate that the student exists
-	student, err := s.studentRepo.GetByID(context.Background(), s.pgClient.DB, req.StudentID)
+	// Validate that the student exists
+	student, err := s.studentRepo.GetByID(ctx, tx, req.StudentID)
 	if err != nil {
 		return fmt.Errorf("%w: student validation failed: %w", ErrInvalidInput, err)
 	}
@@ -94,14 +102,73 @@ func (s *guardianService) validateCreateInput(req CreateGuardianRequest) error {
 	return nil
 }
 
-func (s *guardianService) Create(ctx context.Context, req CreateGuardianRequest, idempotencyKey string) (*models.Guardian, error) {
+func (s *guardianService) buildNotificationRequest(
+	guardian *models.Guardian,
+	student *models.Student,
+	operation string,
+	actor *uuid.UUID,
+) CreateNotificationRequest {
+	var title, message string
+	var notificationType models.NotificationType
+	priority := models.PriorityNormal
+
+	switch operation {
+	case "created":
+		title = "Guardian Added"
+		message = fmt.Sprintf("Guardian %s (%s) has been added for student %s %s",
+			guardian.GuardianName, guardian.Relation, student.FirstName, student.LastName)
+		notificationType = models.NotificationTypeInfo
+	case "updated":
+		title = "Guardian Updated"
+		message = fmt.Sprintf("Guardian %s (%s) has been updated.", guardian.GuardianName, guardian.Relation)
+		notificationType = models.NotificationTypeInfo
+	case "deleted":
+		title = "Guardian Deleted"
+		message = fmt.Sprintf("Guardian %s (%s) has been deleted.", guardian.GuardianName, guardian.Relation)
+		notificationType = models.NotificationTypeWarning
+		priority = models.PriorityHigh
+	case "primary_set":
+		title = "Primary Guardian Changed"
+		message = fmt.Sprintf("Guardian %s (%s) is now the primary guardian for student %s %s",
+			guardian.GuardianName, guardian.Relation, student.FirstName, student.LastName)
+		notificationType = models.NotificationTypeInfo
+	default:
+		title = "Guardian Change"
+		message = fmt.Sprintf("Guardian %s (%s) was modified.", guardian.GuardianName, guardian.Relation)
+		notificationType = models.NotificationTypeInfo
+	}
+
+	return CreateNotificationRequest{
+		CompanyID: student.CompanyID,
+		Title:     title,
+		Message:   message,
+		Type:      notificationType,
+		Priority:  priority,
+		ExpiresAt: nil,
+		Targets: []NotificationTargetInput{
+			{
+				TargetType:     models.TargetUser,
+				TargetEntityID: *actor,
+			},
+		},
+		CreatedBy: actor,
+	}
+}
+
+// ---------------------------------------------------------------------
+// Core CRUD Operations
+// ---------------------------------------------------------------------
+
+func (s *guardianService) Create(ctx context.Context, req CreateGuardianRequest) (*models.Guardian, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
 		zap.String("student_id", req.StudentID.String()),
 		zap.String("guardian_name", req.GuardianName),
-		zap.String("idempotency_key", idempotencyKey),
 	)
 	s.sanitizeCreate(&req)
+
+	// Extract idempotency key from context
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -109,22 +176,16 @@ func (s *guardianService) Create(ctx context.Context, req CreateGuardianRequest,
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (inside transaction)
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var guardian models.Guardian
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &guardian); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
-			logger.Info("returning idempotent response")
-			return &guardian, nil
+		var existingGuardian models.Guardian
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existingGuardian); err == nil && existingGuardian.GuardianID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existingGuardian, nil
 		}
 	}
 
-	if err := s.validateCreateInput(req); err != nil {
+	if err := s.validateCreateInput(ctx, tx, req); err != nil {
 		return nil, err
 	}
 
@@ -138,38 +199,40 @@ func (s *guardianService) Create(ctx context.Context, req CreateGuardianRequest,
 		IsPrimary:    req.IsPrimary,
 		Occupation:   req.Occupation,
 		Income:       req.Income,
-		// CreatedBy, UpdatedBy not in model; handled by repo default timestamps
 	}
 
 	if err := s.repo.Create(ctx, tx, guardian); err != nil {
 		return nil, err
 	}
 
+	// Store idempotency key after successful insert
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, guardian); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			return nil, fmt.Errorf("failed to store idempotency key: %w", err)
+			// Continue – data already inserted; idempotency not critical
 		}
 	}
 
-	// Audit log - use req.CreatedBy as actor
-	if err := s.auditLogger.Log(ctx, tx, "CREATE", guardian.GuardianID, nil, guardian, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
-	}
-
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventGuardianCreated), guardian); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	payload, _ := json.Marshal(guardian)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "guardian",
+		AggregateID:   guardian.GuardianID.String(),
+		EventType:     string(EventGuardianCreated),
+		Payload:       payload,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// Fetch student to get company ID for notification
-	var companyID uuid.UUID
+	// Fetch student for company ID (used after commit)
 	student, err := s.studentRepo.GetByID(ctx, tx, req.StudentID)
 	if err != nil {
 		logger.Error("failed to fetch student for company ID", zap.Error(err))
-	} else if student != nil {
-		companyID = student.CompanyID
+		student = nil
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -178,29 +241,19 @@ func (s *guardianService) Create(ctx context.Context, req CreateGuardianRequest,
 
 	logger.Info("guardian created", zap.String("id", guardian.GuardianID.String()))
 
-	// Notify the actor about guardian creation
-	if req.CreatedBy != nil && *req.CreatedBy != uuid.Nil {
-		go func() {
-			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			notifReq := CreateNotificationRequest{
-				CompanyID: companyID,
-				Title:     "Guardian Added",
-				Message:   fmt.Sprintf("Guardian %s (%s) has been added for student.", guardian.GuardianName, guardian.Relation),
-				Type:      models.NotificationTypeInfo,
-				Priority:  models.PriorityNormal,
-				Targets: []NotificationTargetInput{
-					{
-						TargetType:     models.TargetUser,
-						TargetEntityID: *req.CreatedBy,
-					},
-				},
-				CreatedBy: req.CreatedBy,
-			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "guardian.created:"+guardian.GuardianID.String()); err != nil {
-				logger.Error("failed to create notification for guardian creation", zap.Error(err))
-			}
-		}()
+	// Audit logging (after commit – no transaction)
+	if s.auditService != nil && student != nil {
+		_ = s.auditService.LogAction(ctx, nil, &student.CompanyID, "academics", "create", "guardian",
+			&guardian.GuardianID, "user", req.CreatedBy, nil, nil,
+			map[string]interface{}{"guardian_name": guardian.GuardianName})
+	}
+
+	// Create notification (after commit)
+	if s.notificationService != nil && student != nil && req.CreatedBy != nil && *req.CreatedBy != uuid.Nil {
+		notifReq := s.buildNotificationRequest(guardian, student, "created", req.CreatedBy)
+		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
+			logger.Error("failed to create notification", zap.Error(err))
+		}
 	}
 
 	return guardian, nil
@@ -211,23 +264,34 @@ func (s *guardianService) BulkCreate(ctx context.Context, reqs []CreateGuardianR
 		return nil, nil
 	}
 
-	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
+	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("batch_size", len(reqs)))
 	for i := range reqs {
 		s.sanitizeCreate(&reqs[i])
 	}
 
-	// Validate all inputs
-	for i, req := range reqs {
-		if err := s.validateCreateInput(req); err != nil {
-			return nil, fmt.Errorf("item %d: %w", i, err)
-		}
-	}
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check for entire bulk operation
+	if idempotencyKey != "" {
+		var existing []*models.Guardian
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent bulk request, returning cached response")
+			return existing, nil
+		}
+	}
+
+	// Validate each request
+	for i, req := range reqs {
+		if err := s.validateCreateInput(ctx, tx, req); err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+	}
 
 	guardians := make([]*models.Guardian, 0, len(reqs))
 	for _, req := range reqs {
@@ -241,7 +305,6 @@ func (s *guardianService) BulkCreate(ctx context.Context, reqs []CreateGuardianR
 			IsPrimary:    req.IsPrimary,
 			Occupation:   req.Occupation,
 			Income:       req.Income,
-			// CreatedBy, UpdatedBy not in model
 		})
 	}
 
@@ -249,25 +312,41 @@ func (s *guardianService) BulkCreate(ctx context.Context, reqs []CreateGuardianR
 		return nil, err
 	}
 
-	for i, g := range guardians {
-		// Audit log - use the request's CreatedBy
-		if err := s.auditLogger.Log(ctx, tx, "CREATE", g.GuardianID, nil, g, reqs[i].CreatedBy); err != nil {
-			logger.Error("audit log failed", zap.String("guardian_id", g.GuardianID.String()), zap.Error(err))
-		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventGuardianCreated), g); err != nil {
-			logger.Error("failed to store outbox event", zap.String("guardian_id", g.GuardianID.String()), zap.Error(err))
-			return nil, fmt.Errorf("failed to store outbox event for guardian %s: %w", g.GuardianID, err)
+	// Store idempotency key after successful insert
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, guardians); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
 
-	// Pre-fetch company IDs for each student
-	companyIDs := make([]uuid.UUID, len(reqs))
-	for i, req := range reqs {
-		student, err := s.studentRepo.GetByID(ctx, tx, req.StudentID)
-		if err != nil {
-			logger.Error("failed to fetch student for company ID", zap.String("student_id", req.StudentID.String()), zap.Error(err))
-		} else if student != nil {
-			companyIDs[i] = student.CompanyID
+	// Store outbox events for each guardian
+	for _, g := range guardians {
+		payload, _ := json.Marshal(g)
+		outboxEvent := &outbox.Event{
+			EventID:       uuid.New().String(),
+			AggregateType: "guardian",
+			AggregateID:   g.GuardianID.String(),
+			EventType:     string(EventGuardianCreated),
+			Payload:       payload,
+			Status:        "pending",
+		}
+		if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+			return nil, fmt.Errorf("store outbox event for %s: %w", g.GuardianID, err)
+		}
+	}
+
+	// Pre‑fetch students for notifications
+	students := make(map[uuid.UUID]*models.Student)
+	for _, g := range guardians {
+		if _, ok := students[g.StudentID]; !ok {
+			student, err := s.studentRepo.GetByID(ctx, tx, g.StudentID)
+			if err != nil {
+				logger.Error("failed to fetch student", zap.String("student_id", g.StudentID.String()), zap.Error(err))
+				continue
+			}
+			if student != nil {
+				students[g.StudentID] = student
+			}
 		}
 	}
 
@@ -277,32 +356,20 @@ func (s *guardianService) BulkCreate(ctx context.Context, reqs []CreateGuardianR
 
 	logger.Info("bulk created guardians", zap.Int("count", len(guardians)))
 
-	// Notify each actor (if different)
+	// Audit and notifications (after commit)
 	for i, g := range guardians {
-		if reqs[i].CreatedBy != nil && *reqs[i].CreatedBy != uuid.Nil {
-			go func(req CreateGuardianRequest, guardian *models.Guardian, companyID uuid.UUID) {
-				notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				notifReq := CreateNotificationRequest{
-					CompanyID: companyID,
-					Title:     "Guardian Added (Bulk)",
-					Message:   fmt.Sprintf("Guardian %s (%s) has been added for student.", guardian.GuardianName, guardian.Relation),
-					Type:      models.NotificationTypeInfo,
-					Priority:  models.PriorityNormal,
-					Targets: []NotificationTargetInput{
-						{
-							TargetType:     models.TargetUser,
-							TargetEntityID: *req.CreatedBy,
-						},
-					},
-					CreatedBy: req.CreatedBy,
-				}
-				if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "guardian.created:"+guardian.GuardianID.String()); err != nil {
-					logger.Error("failed to create notification for bulk guardian creation",
-						zap.String("guardian_id", guardian.GuardianID.String()),
-						zap.Error(err))
-				}
-			}(reqs[i], g, companyIDs[i])
+		student := students[g.StudentID]
+		if s.auditService != nil && student != nil {
+			_ = s.auditService.LogAction(ctx, nil, &student.CompanyID, "academics", "bulk_create", "guardian",
+				&g.GuardianID, "user", reqs[i].CreatedBy, nil, nil, nil)
+		}
+		if s.notificationService != nil && student != nil && reqs[i].CreatedBy != nil && *reqs[i].CreatedBy != uuid.Nil {
+			notifReq := s.buildNotificationRequest(g, student, "created", reqs[i].CreatedBy)
+			if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
+				logger.Error("failed to create notification for guardian",
+					zap.String("id", g.GuardianID.String()),
+					zap.Error(err))
+			}
 		}
 	}
 
@@ -310,6 +377,7 @@ func (s *guardianService) BulkCreate(ctx context.Context, reqs []CreateGuardianR
 }
 
 func (s *guardianService) GetByID(ctx context.Context, id uuid.UUID) (*models.Guardian, error) {
+	logger := s.logger.With(zap.String("method", "GetByID"), zap.String("id", id.String()))
 	guardian, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
 		return nil, err
@@ -317,18 +385,25 @@ func (s *guardianService) GetByID(ctx context.Context, id uuid.UUID) (*models.Gu
 	if guardian == nil {
 		return nil, fmt.Errorf("%w: guardian %s", ErrNotFound, id)
 	}
+	logger.Debug("guardian retrieved")
 	return guardian, nil
 }
 
 func (s *guardianService) GetByStudentID(ctx context.Context, studentID uuid.UUID) ([]*models.Guardian, error) {
+	logger := s.logger.With(zap.String("method", "GetByStudentID"), zap.String("student_id", studentID.String()))
+	logger.Debug("listing guardians for student")
 	return s.repo.GetByStudentID(ctx, s.pgClient.DB, studentID)
 }
 
 func (s *guardianService) GetPrimaryGuardian(ctx context.Context, studentID uuid.UUID) (*models.Guardian, error) {
+	logger := s.logger.With(zap.String("method", "GetPrimaryGuardian"), zap.String("student_id", studentID.String()))
+	logger.Debug("getting primary guardian")
 	return s.repo.GetPrimaryGuardian(ctx, s.pgClient.DB, studentID)
 }
 
 func (s *guardianService) List(ctx context.Context, filter GuardianFilter, p repository.Pagination, srt repository.Sort) ([]*models.Guardian, error) {
+	logger := s.logger.With(zap.String("method", "List"))
+	logger.Debug("listing guardians")
 	repoFilter := repository.GuardianFilter{
 		StudentID: filter.StudentID,
 		IsPrimary: filter.IsPrimary,
@@ -339,6 +414,8 @@ func (s *guardianService) List(ctx context.Context, filter GuardianFilter, p rep
 }
 
 func (s *guardianService) Count(ctx context.Context, filter GuardianFilter) (int64, error) {
+	logger := s.logger.With(zap.String("method", "Count"))
+	logger.Debug("counting guardians")
 	repoFilter := repository.GuardianFilter{
 		StudentID: filter.StudentID,
 		IsPrimary: filter.IsPrimary,
@@ -358,11 +435,22 @@ func (s *guardianService) Update(ctx context.Context, req UpdateGuardianRequest)
 		return nil, fmt.Errorf("%w: guardian_id is required", ErrInvalidInput)
 	}
 
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existingGuardian models.Guardian
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existingGuardian); err == nil && existingGuardian.GuardianID != uuid.Nil {
+			logger.Info("idempotent request, returning cached response")
+			return &existingGuardian, nil
+		}
+	}
 
 	existing, err := s.repo.GetByID(ctx, tx, req.GuardianID)
 	if err != nil {
@@ -382,32 +470,40 @@ func (s *guardianService) Update(ctx context.Context, req UpdateGuardianRequest)
 	existing.IsPrimary = req.IsPrimary
 	existing.Occupation = req.Occupation
 	existing.Income = req.Income
-	// Note: UpdatedBy not stored in model; repo will update updated_at automatically
 
 	if err := s.repo.Update(ctx, tx, existing); err != nil {
 		return nil, err
 	}
 
-	// Audit log - use req.UpdatedBy as actor
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE", existing.GuardianID, oldGuardian, existing, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key after successful update
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, existing); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventGuardianUpdated), map[string]interface{}{
+	// Outbox event
+	payload, _ := json.Marshal(map[string]interface{}{
 		"old": oldGuardian,
 		"new": existing,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "guardian",
+		AggregateID:   existing.GuardianID.String(),
+		EventType:     string(EventGuardianUpdated),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// Get company ID for notification
-	var companyID uuid.UUID
+	// Fetch student for company ID
 	student, err := s.studentRepo.GetByID(ctx, tx, existing.StudentID)
 	if err != nil {
 		logger.Error("failed to fetch student for company ID", zap.Error(err))
-	} else if student != nil {
-		companyID = student.CompanyID
+		student = nil
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -416,29 +512,19 @@ func (s *guardianService) Update(ctx context.Context, req UpdateGuardianRequest)
 
 	logger.Info("guardian updated")
 
-	// Notify the actor about guardian update
-	if req.UpdatedBy != nil && *req.UpdatedBy != uuid.Nil {
-		go func() {
-			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			notifReq := CreateNotificationRequest{
-				CompanyID: companyID,
-				Title:     "Guardian Updated",
-				Message:   fmt.Sprintf("Guardian %s (%s) has been updated.", existing.GuardianName, existing.Relation),
-				Type:      models.NotificationTypeInfo,
-				Priority:  models.PriorityNormal,
-				Targets: []NotificationTargetInput{
-					{
-						TargetType:     models.TargetUser,
-						TargetEntityID: *req.UpdatedBy,
-					},
-				},
-				CreatedBy: req.UpdatedBy,
-			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "guardian.updated:"+existing.GuardianID.String()); err != nil {
-				logger.Error("failed to create notification for guardian update", zap.Error(err))
-			}
-		}()
+	// Audit logging (after commit)
+	if s.auditService != nil && student != nil {
+		_ = s.auditService.LogAction(ctx, nil, &student.CompanyID, "academics", "update", "guardian",
+			&existing.GuardianID, "user", req.UpdatedBy, nil, nil,
+			map[string]interface{}{"guardian_name": existing.GuardianName})
+	}
+
+	// Notification (after commit)
+	if s.notificationService != nil && student != nil && req.UpdatedBy != nil && *req.UpdatedBy != uuid.Nil {
+		notifReq := s.buildNotificationRequest(existing, student, "updated", req.UpdatedBy)
+		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
+			logger.Error("failed to create notification", zap.Error(err))
+		}
 	}
 
 	return existing, nil
@@ -446,6 +532,7 @@ func (s *guardianService) Update(ctx context.Context, req UpdateGuardianRequest)
 
 func (s *guardianService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("guardian_id", id.String()))
+	// Idempotency not critical for delete (deleting twice is harmless).
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -453,7 +540,6 @@ func (s *guardianService) Delete(ctx context.Context, id uuid.UUID, deletedBy *u
 	}
 	defer tx.Rollback()
 
-	// Fetch guardian for notification (before delete)
 	guardian, err := s.repo.GetByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -462,29 +548,32 @@ func (s *guardianService) Delete(ctx context.Context, id uuid.UUID, deletedBy *u
 		return fmt.Errorf("%w: guardian %s", ErrNotFound, id)
 	}
 
-	// Get student for company ID
-	var companyID uuid.UUID
+	// Fetch student before deletion (for audit/notification)
 	student, err := s.studentRepo.GetByID(ctx, tx, guardian.StudentID)
 	if err != nil {
 		logger.Error("failed to fetch student for company ID", zap.Error(err))
-	} else if student != nil {
-		companyID = student.CompanyID
+		student = nil
 	}
 
 	if err := s.repo.Delete(ctx, tx, id); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
-	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventGuardianDeleted), map[string]interface{}{
+	// Outbox event
+	payload, _ := json.Marshal(map[string]interface{}{
 		"guardian_id": id,
 		"deleted_by":  deletedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	})
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "guardian",
+		AggregateID:   id.String(),
+		EventType:     string(EventGuardianDeleted),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -493,29 +582,18 @@ func (s *guardianService) Delete(ctx context.Context, id uuid.UUID, deletedBy *u
 
 	logger.Info("guardian deleted")
 
-	// Notify the actor about guardian deletion
-	if deletedBy != nil && *deletedBy != uuid.Nil {
-		go func() {
-			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			notifReq := CreateNotificationRequest{
-				CompanyID: companyID,
-				Title:     "Guardian Deleted",
-				Message:   fmt.Sprintf("Guardian %s (%s) has been deleted.", guardian.GuardianName, guardian.Relation),
-				Type:      models.NotificationTypeWarning,
-				Priority:  models.PriorityHigh,
-				Targets: []NotificationTargetInput{
-					{
-						TargetType:     models.TargetUser,
-						TargetEntityID: *deletedBy,
-					},
-				},
-				CreatedBy: deletedBy,
-			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "guardian.deleted:"+id.String()); err != nil {
-				logger.Error("failed to create notification for guardian deletion", zap.Error(err))
-			}
-		}()
+	// Audit logging (after commit)
+	if s.auditService != nil && student != nil {
+		_ = s.auditService.LogAction(ctx, nil, &student.CompanyID, "academics", "delete", "guardian",
+			&id, "user", deletedBy, nil, nil, nil)
+	}
+
+	// Notification (after commit)
+	if s.notificationService != nil && student != nil && deletedBy != nil && *deletedBy != uuid.Nil {
+		notifReq := s.buildNotificationRequest(guardian, student, "deleted", deletedBy)
+		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
+			logger.Error("failed to create notification", zap.Error(err))
+		}
 	}
 
 	return nil
@@ -528,41 +606,67 @@ func (s *guardianService) SetPrimary(ctx context.Context, studentID, guardianID 
 		zap.String("guardian_id", guardianID.String()),
 	)
 
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (optional, because this is a simple update)
+	if idempotencyKey != "" {
+		var result interface{}
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &result); err == nil && result != nil {
+			logger.Info("idempotent request, skipping")
+			return nil
+		}
+	}
+
 	if err := s.repo.SetPrimary(ctx, tx, studentID, guardianID); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "SET_PRIMARY", guardianID, nil, map[string]interface{}{"student_id": studentID}, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventGuardianPrimarySet), map[string]interface{}{
-		"student_id":  studentID,
-		"guardian_id": guardianID,
-		"updated_by":  updatedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
-	}
-
-	// Fetch guardian and student for notification
+	// Fetch guardian and student for outbox, audit, notification
 	guardian, err := s.repo.GetByID(ctx, tx, guardianID)
 	if err != nil {
-		logger.Error("failed to fetch guardian for notification", zap.Error(err))
+		logger.Error("failed to fetch guardian for outbox", zap.Error(err))
+		guardian = nil
 	}
 	student, err := s.studentRepo.GetByID(ctx, tx, studentID)
 	if err != nil {
-		logger.Error("failed to fetch student for notification", zap.Error(err))
+		logger.Error("failed to fetch student for outbox", zap.Error(err))
+		student = nil
 	}
-	companyID := uuid.Nil
-	if student != nil {
-		companyID = student.CompanyID
+
+	// Outbox event
+	eventPayload := map[string]interface{}{
+		"student_id":  studentID,
+		"guardian_id": guardianID,
+		"updated_by":  updatedBy,
+	}
+	if guardian != nil {
+		eventPayload["guardian_name"] = guardian.GuardianName
+		eventPayload["relation"] = guardian.Relation
+	}
+	payload, _ := json.Marshal(eventPayload)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "guardian",
+		AggregateID:   guardianID.String(),
+		EventType:     string(EventGuardianPrimarySet),
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -571,35 +675,32 @@ func (s *guardianService) SetPrimary(ctx context.Context, studentID, guardianID 
 
 	logger.Info("primary guardian set")
 
-	// Notify the actor about primary change
-	if updatedBy != nil && *updatedBy != uuid.Nil {
-		go func() {
-			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			notifReq := CreateNotificationRequest{
-				CompanyID: companyID,
-				Title:     "Primary Guardian Changed",
-				Message:   fmt.Sprintf("Guardian %s (%s) has been set as primary for the student.", guardian.GuardianName, guardian.Relation),
-				Type:      models.NotificationTypeInfo,
-				Priority:  models.PriorityNormal,
-				Targets: []NotificationTargetInput{
-					{
-						TargetType:     models.TargetUser,
-						TargetEntityID: *updatedBy,
-					},
-				},
-				CreatedBy: updatedBy,
-			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "guardian.primary:"+guardianID.String()); err != nil {
-				logger.Error("failed to create notification for primary guardian change", zap.Error(err))
-			}
-		}()
+	// Audit logging (after commit)
+	if s.auditService != nil && student != nil {
+		_ = s.auditService.LogAction(ctx, nil, &student.CompanyID, "academics", "set_primary", "guardian",
+			&guardianID, "user", updatedBy, nil, nil,
+			map[string]interface{}{"student_id": studentID, "guardian_id": guardianID})
+	}
+
+	// Notification (after commit)
+	if s.notificationService != nil && guardian != nil && student != nil && updatedBy != nil && *updatedBy != uuid.Nil {
+		notifReq := s.buildNotificationRequest(guardian, student, "primary_set", updatedBy)
+		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
+			logger.Error("failed to create notification", zap.Error(err))
+		}
 	}
 
 	return nil
 }
 
 func (s *guardianService) Exists(ctx context.Context, studentID uuid.UUID, guardianName, relation string) (bool, error) {
+	logger := s.logger.With(
+		zap.String("method", "Exists"),
+		zap.String("student_id", studentID.String()),
+		zap.String("guardian_name", guardianName),
+		zap.String("relation", relation),
+	)
+	logger.Debug("checking existence")
 	filter := repository.GuardianFilter{
 		StudentID: studentID,
 		Search:    guardianName,

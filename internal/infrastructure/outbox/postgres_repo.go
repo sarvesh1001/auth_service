@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 )
 
 type PostgresRepository struct {
@@ -16,9 +17,36 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 
 // Store inside TX
 func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event) error {
-	headers, _ := json.Marshal(event.Headers)
+	// Validate required fields
+	if event.EventID == "" {
+		return errors.New("event_id cannot be empty")
+	}
+	if event.AggregateType == "" {
+		return errors.New("aggregate_type cannot be empty")
+	}
+	if event.AggregateID == "" {
+		return errors.New("aggregate_id cannot be empty")
+	}
+	if event.EventType == "" {
+		return errors.New("event_type cannot be empty")
+	}
+	if len(event.Payload) == 0 {
+		return errors.New("payload cannot be empty")
+	}
 
-	_, err := tx.ExecContext(ctx, `
+	// Marshal headers (nil becomes JSON null)
+	var headers []byte
+	var err error
+	if event.Headers == nil {
+		headers = []byte("null")
+	} else {
+		headers, err = json.Marshal(event.Headers)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO outbox.events (
 			event_id, aggregate_type, aggregate_id,
 			event_type, payload, headers
@@ -68,7 +96,15 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 			return nil, err
 		}
 
-		json.Unmarshal(headers, &e.Headers)
+		// Unmarshal headers (if present)
+		if len(headers) > 0 && string(headers) != "null" {
+			if err := json.Unmarshal(headers, &e.Headers); err != nil {
+				// Log but continue with empty headers
+				e.Headers = make(map[string]string)
+			}
+		} else {
+			e.Headers = make(map[string]string)
+		}
 
 		events = append(events, &e)
 	}
@@ -78,6 +114,9 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 
 // Mark processed
 func (r *PostgresRepository) MarkProcessed(ctx context.Context, eventID string) error {
+	if eventID == "" {
+		return errors.New("event_id cannot be empty")
+	}
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE outbox.events
 		SET status = 'processed', processed_at = NOW()
@@ -89,6 +128,9 @@ func (r *PostgresRepository) MarkProcessed(ctx context.Context, eventID string) 
 
 // Mark failed
 func (r *PostgresRepository) MarkFailed(ctx context.Context, eventID string, retryCount int) error {
+	if eventID == "" {
+		return errors.New("event_id cannot be empty")
+	}
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE outbox.events
 		SET retry_count = $2

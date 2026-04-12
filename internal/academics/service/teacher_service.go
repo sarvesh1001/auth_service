@@ -2,7 +2,8 @@ package service
 
 import (
 	"context"
-	"errors"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -13,11 +14,12 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
-// TeacherService defines the business logic for teacher management.
 type TeacherService interface {
-	// Basic CRUD
 	Create(ctx context.Context, req CreateTeacherRequest, idempotencyKey string) (*models.Teacher, error)
 	BulkCreate(ctx context.Context, reqs []CreateTeacherRequest) ([]*models.Teacher, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Teacher, error)
@@ -30,22 +32,16 @@ type TeacherService interface {
 	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
 	BulkUpdateStatus(ctx context.Context, ids []uuid.UUID, status string, updatedBy *uuid.UUID) error
 	CountByCompany(ctx context.Context, companyID uuid.UUID) (int64, error)
-
-	// Subject management
 	AddSubject(ctx context.Context, teacherID, subjectID uuid.UUID, isPrimary bool) error
 	RemoveSubject(ctx context.Context, teacherID, subjectID uuid.UUID) error
 	GetSubjectsByTeacher(ctx context.Context, teacherID uuid.UUID) ([]*models.TeacherSubject, error)
 	GetTeachersBySubject(ctx context.Context, subjectID uuid.UUID) ([]*models.Teacher, error)
 	UpdateSubjectPrimary(ctx context.Context, teacherID, subjectID uuid.UUID, isPrimary bool) error
-
-	// Section management
 	AddSection(ctx context.Context, teacherID, sectionID uuid.UUID, isClassTeacher bool) error
 	RemoveSection(ctx context.Context, teacherID, sectionID uuid.UUID) error
 	GetSectionsByTeacher(ctx context.Context, teacherID uuid.UUID) ([]*models.TeacherSection, error)
 	GetTeachersBySection(ctx context.Context, sectionID uuid.UUID) ([]*models.Teacher, error)
 	UpdateClassTeacherStatus(ctx context.Context, teacherID, sectionID uuid.UUID, isClassTeacher bool) error
-
-	// Schedule preferences
 	SetSchedulePreference(ctx context.Context, pref *models.TeacherSchedulePreference) error
 	GetSchedulePreferences(ctx context.Context, teacherID uuid.UUID) ([]*models.TeacherSchedulePreference, error)
 	UpdateSchedulePreference(ctx context.Context, pref *models.TeacherSchedulePreference) error
@@ -55,38 +51,55 @@ type TeacherService interface {
 
 type teacherService struct {
 	repo             repository.TeacherRepository
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	eventPublisher   EventPublisher
 	pgClient         *client.PostgresClient
 	logger           *zap.Logger
-	notificationSvc  NotificationService // Added for notifications
+	notificationSvc  NotificationService
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
 
 func NewTeacherService(
 	repo repository.TeacherRepository,
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	eventPublisher EventPublisher,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
-	notificationSvc NotificationService, // New parameter
+	notificationSvc NotificationService,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) TeacherService {
 	return &teacherService{
 		repo:             repo,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		eventPublisher:   eventPublisher,
 		pgClient:         pgClient,
 		logger:           logger.Named("teacher_service"),
 		notificationSvc:  notificationSvc,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
 	}
 }
 
-// sanitizeCreate trims spaces and normalizes fields.
+func (s *teacherService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "teacher",
+		AggregateID:   aggregateID.String(),
+		EventType:     string(eventType),
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
+}
+
 func (s *teacherService) sanitizeCreate(req *CreateTeacherRequest) {
 	req.EmployeeCode = strings.TrimSpace(strings.ToUpper(req.EmployeeCode))
 	req.Qualification = strings.TrimSpace(req.Qualification)
@@ -138,39 +151,26 @@ func (s *teacherService) Create(ctx context.Context, req CreateTeacherRequest, i
 		zap.String("employee_code", req.EmployeeCode),
 		zap.String("idempotency_key", idempotencyKey),
 	)
-
 	s.sanitizeCreate(&req)
 	if err := s.validateCreateInput(req); err != nil {
 		return nil, err
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var teacher models.Teacher
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &teacher); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
+		var existing models.Teacher
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.TeacherID != uuid.Nil {
 			logger.Info("returning idempotent response")
-			return &teacher, nil
+			return &existing, nil
 		}
 	}
-
-	// Check uniqueness of employee code per company
 	existing, _ := s.repo.GetByEmployeeCode(ctx, tx, req.CompanyID, req.EmployeeCode)
 	if existing != nil {
 		return nil, fmt.Errorf("%w: employee code %s already exists for company %s", ErrDuplicate, req.EmployeeCode, req.CompanyID)
 	}
-
 	teacher := &models.Teacher{
 		CompanyID:      req.CompanyID,
 		UserID:         req.UserID,
@@ -182,36 +182,28 @@ func (s *teacherService) Create(ctx context.Context, req CreateTeacherRequest, i
 		CreatedBy:      req.CreatedBy,
 		UpdatedBy:      req.UpdatedBy,
 	}
-
 	if err := s.repo.Create(ctx, tx, teacher); err != nil {
 		return nil, err
 	}
-
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, teacher); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			return nil, fmt.Errorf("failed to store idempotency key: %w", err)
 		}
 	}
-
-	// Audit log
-	if err := s.auditLogger.Log(ctx, tx, "CREATE", teacher.TeacherID, nil, teacher, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "teacher",
+			&teacher.TeacherID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"employee_code": teacher.EmployeeCode,
+				"user_id":       teacher.UserID,
+			})
 	}
-
-	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherCreated), teacher); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherCreated, teacher.TeacherID, teacher); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("teacher created", zap.String("id", teacher.TeacherID.String()))
-
-	// Notify the teacher (via user ID) about account creation
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -229,11 +221,10 @@ func (s *teacherService) Create(ctx context.Context, req CreateTeacherRequest, i
 			},
 			CreatedBy: req.CreatedBy,
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.created:"+teacher.TeacherID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for teacher creation", zap.Error(err))
 		}
 	}()
-
 	return teacher, nil
 }
 
@@ -242,12 +233,9 @@ func (s *teacherService) BulkCreate(ctx context.Context, reqs []CreateTeacherReq
 		return nil, nil
 	}
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
-
 	for i := range reqs {
 		s.sanitizeCreate(&reqs[i])
 	}
-
-	// Validate all inputs and collect keys for uniqueness check
 	type key struct {
 		companyID uuid.UUID
 		empCode   string
@@ -263,21 +251,17 @@ func (s *teacherService) BulkCreate(ctx context.Context, reqs []CreateTeacherReq
 		}
 		batchKeys[k] = i
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Check existing employees
 	for k := range batchKeys {
 		existing, _ := s.repo.GetByEmployeeCode(ctx, tx, k.companyID, k.empCode)
 		if existing != nil {
 			return nil, fmt.Errorf("%w: employee code %s already exists", ErrDuplicate, k.empCode)
 		}
 	}
-
 	teachers := make([]*models.Teacher, 0, len(reqs))
 	for _, req := range reqs {
 		teachers = append(teachers, &models.Teacher{
@@ -292,28 +276,24 @@ func (s *teacherService) BulkCreate(ctx context.Context, reqs []CreateTeacherReq
 			UpdatedBy:      req.UpdatedBy,
 		})
 	}
-
 	if err := s.repo.BulkCreate(ctx, tx, teachers); err != nil {
 		return nil, err
 	}
-
 	for _, t := range teachers {
-		if err := s.auditLogger.Log(ctx, tx, "CREATE", t.TeacherID, nil, t, t.CreatedBy); err != nil {
-			logger.Error("audit log failed", zap.String("teacher_id", t.TeacherID.String()), zap.Error(err))
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_create", "teacher",
+				&t.TeacherID, "user", t.CreatedBy, nil, nil, map[string]interface{}{
+					"employee_code": t.EmployeeCode,
+				})
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventTeacherCreated), t); err != nil {
-			logger.Error("failed to store outbox event", zap.String("teacher_id", t.TeacherID.String()), zap.Error(err))
-			return nil, fmt.Errorf("failed to store outbox event for teacher %s: %w", t.TeacherID, err)
+		if err := s.storeOutboxEvent(ctx, tx, EventTeacherCreated, t.TeacherID, t); err != nil {
+			return nil, fmt.Errorf("outbox store for teacher %s: %w", t.TeacherID, err)
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("bulk created teachers", zap.Int("count", len(teachers)))
-
-	// Notify each teacher asynchronously
 	for _, t := range teachers {
 		go func(teacher *models.Teacher) {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -329,14 +309,13 @@ func (s *teacherService) BulkCreate(ctx context.Context, reqs []CreateTeacherReq
 				},
 				CreatedBy: teacher.CreatedBy,
 			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.created:"+teacher.TeacherID.String()); err != nil {
+			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 				logger.Error("failed to create notification for teacher creation",
 					zap.String("teacher_id", teacher.TeacherID.String()),
 					zap.Error(err))
 			}
 		}(t)
 	}
-
 	return teachers, nil
 }
 
@@ -382,19 +361,21 @@ func (s *teacherService) Count(ctx context.Context, filter repository.TeacherFil
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
+func (s *teacherService) CountByCompany(ctx context.Context, companyID uuid.UUID) (int64, error) {
+	return s.repo.CountByCompany(ctx, s.pgClient.DB, companyID)
+}
+
 func (s *teacherService) Update(ctx context.Context, req UpdateTeacherRequest) (*models.Teacher, error) {
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("teacher_id", req.TeacherID.String()))
 	s.sanitizeUpdate(&req)
 	if err := s.validateUpdateInput(req); err != nil {
 		return nil, err
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	teacher, err := s.repo.GetByID(ctx, tx, req.TeacherID)
 	if err != nil {
 		return nil, err
@@ -402,16 +383,13 @@ func (s *teacherService) Update(ctx context.Context, req UpdateTeacherRequest) (
 	if teacher == nil {
 		return nil, fmt.Errorf("%w: teacher %s", ErrNotFound, req.TeacherID)
 	}
-
 	if req.EmployeeCode != teacher.EmployeeCode {
 		existing, _ := s.repo.GetByEmployeeCode(ctx, tx, teacher.CompanyID, req.EmployeeCode)
 		if existing != nil && existing.TeacherID != teacher.TeacherID {
 			return nil, fmt.Errorf("%w: employee code %s already exists", ErrDuplicate, req.EmployeeCode)
 		}
 	}
-
 	oldTeacher := *teacher
-
 	teacher.UserID = req.UserID
 	teacher.EmployeeCode = req.EmployeeCode
 	teacher.Qualification = req.Qualification
@@ -421,33 +399,26 @@ func (s *teacherService) Update(ctx context.Context, req UpdateTeacherRequest) (
 		teacher.Status = models.TeacherStatus(req.Status)
 	}
 	teacher.UpdatedBy = req.UpdatedBy
-
 	if err := s.repo.Update(ctx, tx, teacher); err != nil {
-		if errors.Is(err, repository.ErrVersionConflict) {
-			return nil, fmt.Errorf("%w: teacher was modified concurrently", ErrConcurrentUpdate)
-		}
 		return nil, err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE", teacher.TeacherID, &oldTeacher, teacher, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "teacher",
+			&req.TeacherID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old_employee_code": oldTeacher.EmployeeCode,
+				"new_employee_code": teacher.EmployeeCode,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherUpdated), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherUpdated, teacher.TeacherID, map[string]interface{}{
 		"old": oldTeacher,
 		"new": teacher,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("teacher updated")
-
-	// Notify the teacher about the update
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -462,11 +433,10 @@ func (s *teacherService) Update(ctx context.Context, req UpdateTeacherRequest) (
 			},
 			CreatedBy: req.UpdatedBy,
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.updated:"+teacher.TeacherID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for teacher update", zap.Error(err))
 		}
 	}()
-
 	return teacher, nil
 }
 
@@ -475,13 +445,11 @@ func (s *teacherService) UpdateStatus(ctx context.Context, id uuid.UUID, status 
 	if !models.IsValidTeacherStatus(status) {
 		return fmt.Errorf("%w: invalid status %q", ErrInvalidInput, status)
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	teacher, err := s.repo.GetByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -490,31 +458,28 @@ func (s *teacherService) UpdateStatus(ctx context.Context, id uuid.UUID, status 
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, id)
 	}
 	oldStatus := teacher.Status
-
 	if err := s.repo.UpdateStatus(ctx, tx, id, status, updatedBy); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE_STATUS", id, map[string]string{"status": string(oldStatus)}, map[string]string{"status": status}, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update_status", "teacher",
+			&id, "user", updatedBy, nil, nil, map[string]interface{}{
+				"old_status": oldStatus,
+				"new_status": status,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherStatusUpdated), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherStatusUpdated, id, map[string]interface{}{
 		"teacher_id": id,
 		"old_status": oldStatus,
 		"new_status": status,
 		"updated_by": updatedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("teacher status updated")
-
-	// Notify the teacher about status change
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -529,51 +494,38 @@ func (s *teacherService) UpdateStatus(ctx context.Context, id uuid.UUID, status 
 			},
 			CreatedBy: updatedBy,
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.status:"+id.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for teacher status update", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
 func (s *teacherService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("teacher_id", id.String()))
-
-	// Check if teacher has any active assignments (e.g., timetable entries) – could be added later.
-	// For now, allow delete.
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher info for notification (before delete)
 	teacher, _ := s.repo.GetByID(ctx, tx, id)
-
 	if err := s.repo.Delete(ctx, tx, id, deletedBy); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "teacher",
+			&id, "user", deletedBy, nil, nil, nil)
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherDeleted), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherDeleted, id, map[string]interface{}{
 		"teacher_id": id,
 		"deleted_by": deletedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("teacher deleted")
-
-	// Notify the teacher about deletion (if we had their user ID)
 	if teacher != nil && teacher.UserID != uuid.Nil {
 		go func() {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -589,12 +541,11 @@ func (s *teacherService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 				},
 				CreatedBy: deletedBy,
 			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.deleted:"+id.String()); err != nil {
+			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 				logger.Error("failed to create notification for teacher deletion", zap.Error(err))
 			}
 		}()
 	}
-
 	return nil
 }
 
@@ -603,42 +554,39 @@ func (s *teacherService) BulkUpdateStatus(ctx context.Context, ids []uuid.UUID, 
 		return nil
 	}
 	logger := s.logger.With(zap.String("method", "BulkUpdateStatus"), zap.Int("count", len(ids)), zap.String("status", status))
-
 	if !models.IsValidTeacherStatus(status) {
 		return fmt.Errorf("%w: invalid status %q", ErrInvalidInput, status)
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Fetch teachers for notification (after commit)
 	teachers, err := s.repo.GetByIDs(ctx, tx, ids)
 	if err != nil {
 		return err
 	}
-
 	if err := s.repo.BulkUpdateStatus(ctx, tx, ids, status, updatedBy); err != nil {
 		return err
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherBulkStatusUpdated), map[string]interface{}{
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_update_status", "teacher",
+			nil, "user", updatedBy, nil, nil, map[string]interface{}{
+				"teacher_ids": ids,
+				"status":      status,
+			})
+	}
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherBulkStatusUpdated, uuid.Nil, map[string]interface{}{
 		"teacher_ids": ids,
 		"status":      status,
 		"updated_by":  updatedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("bulk status update completed")
-
-	// Notify each teacher asynchronously
 	for _, t := range teachers {
 		go func(teacher *models.Teacher) {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -654,22 +602,15 @@ func (s *teacherService) BulkUpdateStatus(ctx context.Context, ids []uuid.UUID, 
 				},
 				CreatedBy: updatedBy,
 			}
-			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.bulk_status:"+teacher.TeacherID.String()); err != nil {
+			if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 				logger.Error("failed to create notification for bulk teacher status update",
 					zap.String("teacher_id", teacher.TeacherID.String()),
 					zap.Error(err))
 			}
 		}(t)
 	}
-
 	return nil
 }
-
-func (s *teacherService) CountByCompany(ctx context.Context, companyID uuid.UUID) (int64, error) {
-	return s.repo.CountByCompany(ctx, s.pgClient.DB, companyID)
-}
-
-// Subject management
 
 func (s *teacherService) AddSubject(ctx context.Context, teacherID, subjectID uuid.UUID, isPrimary bool) error {
 	logger := s.logger.With(zap.String("method", "AddSubject"), zap.String("teacher_id", teacherID.String()), zap.String("subject_id", subjectID.String()))
@@ -678,8 +619,6 @@ func (s *teacherService) AddSubject(ctx context.Context, teacherID, subjectID uu
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -687,30 +626,27 @@ func (s *teacherService) AddSubject(ctx context.Context, teacherID, subjectID uu
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.AddSubject(ctx, tx, teacherID, subjectID, isPrimary); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "ADD_SUBJECT", teacherID, nil, map[string]interface{}{"subject_id": subjectID, "is_primary": isPrimary}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "add_subject", "teacher_subject",
+			&teacherID, "user", nil, nil, nil, map[string]interface{}{
+				"subject_id": subjectID,
+				"is_primary": isPrimary,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSubjectAssigned), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSubjectAssigned, teacherID, map[string]interface{}{
 		"teacher_id": teacherID,
 		"subject_id": subjectID,
 		"is_primary": isPrimary,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("subject added to teacher")
-
-	// Notify the teacher about subject assignment
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -724,11 +660,10 @@ func (s *teacherService) AddSubject(ctx context.Context, teacherID, subjectID uu
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.subject.added:"+teacherID.String()+":"+subjectID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for subject assignment", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
@@ -739,8 +674,6 @@ func (s *teacherService) RemoveSubject(ctx context.Context, teacherID, subjectID
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -748,29 +681,25 @@ func (s *teacherService) RemoveSubject(ctx context.Context, teacherID, subjectID
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.RemoveSubject(ctx, tx, teacherID, subjectID); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "REMOVE_SUBJECT", teacherID, map[string]interface{}{"subject_id": subjectID}, nil, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "remove_subject", "teacher_subject",
+			&teacherID, "user", nil, nil, nil, map[string]interface{}{
+				"subject_id": subjectID,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSubjectRemoved), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSubjectRemoved, teacherID, map[string]interface{}{
 		"teacher_id": teacherID,
 		"subject_id": subjectID,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("subject removed from teacher")
-
-	// Notify the teacher about subject removal
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -784,11 +713,10 @@ func (s *teacherService) RemoveSubject(ctx context.Context, teacherID, subjectID
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.subject.removed:"+teacherID.String()+":"+subjectID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for subject removal", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
@@ -807,8 +735,6 @@ func (s *teacherService) UpdateSubjectPrimary(ctx context.Context, teacherID, su
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -816,30 +742,27 @@ func (s *teacherService) UpdateSubjectPrimary(ctx context.Context, teacherID, su
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.UpdateSubjectPrimary(ctx, tx, teacherID, subjectID, isPrimary); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE_SUBJECT_PRIMARY", teacherID, map[string]interface{}{"subject_id": subjectID, "old_primary": !isPrimary}, map[string]interface{}{"is_primary": isPrimary}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update_subject_primary", "teacher_subject",
+			&teacherID, "user", nil, nil, nil, map[string]interface{}{
+				"subject_id": subjectID,
+				"is_primary": isPrimary,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSubjectUpdated), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSubjectUpdated, teacherID, map[string]interface{}{
 		"teacher_id": teacherID,
 		"subject_id": subjectID,
 		"is_primary": isPrimary,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("teacher subject primary status updated")
-
-	// Notify the teacher about primary status change
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -853,15 +776,12 @@ func (s *teacherService) UpdateSubjectPrimary(ctx context.Context, teacherID, su
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.subject.primary:"+teacherID.String()+":"+subjectID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for subject primary update", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
-
-// Section management
 
 func (s *teacherService) AddSection(ctx context.Context, teacherID, sectionID uuid.UUID, isClassTeacher bool) error {
 	logger := s.logger.With(zap.String("method", "AddSection"), zap.String("teacher_id", teacherID.String()), zap.String("section_id", sectionID.String()))
@@ -870,8 +790,6 @@ func (s *teacherService) AddSection(ctx context.Context, teacherID, sectionID uu
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -879,30 +797,27 @@ func (s *teacherService) AddSection(ctx context.Context, teacherID, sectionID uu
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.AddSection(ctx, tx, teacherID, sectionID, isClassTeacher); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "ADD_SECTION", teacherID, nil, map[string]interface{}{"section_id": sectionID, "is_class_teacher": isClassTeacher}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "add_section", "teacher_section",
+			&teacherID, "user", nil, nil, nil, map[string]interface{}{
+				"section_id":       sectionID,
+				"is_class_teacher": isClassTeacher,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSectionAssigned), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSectionAssigned, teacherID, map[string]interface{}{
 		"teacher_id":       teacherID,
 		"section_id":       sectionID,
 		"is_class_teacher": isClassTeacher,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("section added to teacher")
-
-	// Notify the teacher about section assignment
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -916,11 +831,10 @@ func (s *teacherService) AddSection(ctx context.Context, teacherID, sectionID uu
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.section.added:"+teacherID.String()+":"+sectionID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for section assignment", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
@@ -931,8 +845,6 @@ func (s *teacherService) RemoveSection(ctx context.Context, teacherID, sectionID
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -940,29 +852,25 @@ func (s *teacherService) RemoveSection(ctx context.Context, teacherID, sectionID
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.RemoveSection(ctx, tx, teacherID, sectionID); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "REMOVE_SECTION", teacherID, map[string]interface{}{"section_id": sectionID}, nil, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "remove_section", "teacher_section",
+			&teacherID, "user", nil, nil, nil, map[string]interface{}{
+				"section_id": sectionID,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSectionRemoved), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSectionRemoved, teacherID, map[string]interface{}{
 		"teacher_id": teacherID,
 		"section_id": sectionID,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("section removed from teacher")
-
-	// Notify the teacher about section removal
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -976,11 +884,10 @@ func (s *teacherService) RemoveSection(ctx context.Context, teacherID, sectionID
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.section.removed:"+teacherID.String()+":"+sectionID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for section removal", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
@@ -999,8 +906,6 @@ func (s *teacherService) UpdateClassTeacherStatus(ctx context.Context, teacherID
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -1008,30 +913,27 @@ func (s *teacherService) UpdateClassTeacherStatus(ctx context.Context, teacherID
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.UpdateClassTeacherStatus(ctx, tx, teacherID, sectionID, isClassTeacher); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE_CLASS_TEACHER", teacherID, nil, map[string]interface{}{"section_id": sectionID, "is_class_teacher": isClassTeacher}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update_class_teacher", "teacher_section",
+			&teacherID, "user", nil, nil, nil, map[string]interface{}{
+				"section_id":       sectionID,
+				"is_class_teacher": isClassTeacher,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherClassTeacherUpdated), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherClassTeacherUpdated, teacherID, map[string]interface{}{
 		"teacher_id":       teacherID,
 		"section_id":       sectionID,
 		"is_class_teacher": isClassTeacher,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("class teacher status updated")
-
-	// Notify the teacher about class teacher role change
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1045,15 +947,12 @@ func (s *teacherService) UpdateClassTeacherStatus(ctx context.Context, teacherID
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.class_teacher:"+teacherID.String()+":"+sectionID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for class teacher update", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
-
-// Schedule preferences
 
 func (s *teacherService) SetSchedulePreference(ctx context.Context, pref *models.TeacherSchedulePreference) error {
 	logger := s.logger.With(zap.String("method", "SetSchedulePreference"), zap.String("teacher_id", pref.TeacherID.String()), zap.Int("day_of_week", pref.DayOfWeek))
@@ -1062,8 +961,6 @@ func (s *teacherService) SetSchedulePreference(ctx context.Context, pref *models
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, pref.TeacherID)
 	if err != nil {
 		return err
@@ -1071,26 +968,24 @@ func (s *teacherService) SetSchedulePreference(ctx context.Context, pref *models
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, pref.TeacherID)
 	}
-
 	if err := s.repo.SetSchedulePreference(ctx, tx, pref); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "SET_SCHEDULE_PREF", pref.TeacherID, nil, pref, pref.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "set_schedule_preference", "teacher_schedule_preference",
+			&pref.PreferenceID, "user", pref.CreatedBy, nil, nil, map[string]interface{}{
+				"day_of_week": pref.DayOfWeek,
+				"start_time":  pref.PreferredStartTime,
+				"end_time":    pref.PreferredEndTime,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSchedulePreferenceSet), pref); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSchedulePreferenceSet, pref.PreferenceID, pref); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("schedule preference set")
-
-	// Notify the teacher about schedule preference set
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1105,11 +1000,10 @@ func (s *teacherService) SetSchedulePreference(ctx context.Context, pref *models
 			},
 			CreatedBy: pref.CreatedBy,
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.schedule.set:"+pref.PreferenceID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for schedule preference set", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
@@ -1124,8 +1018,6 @@ func (s *teacherService) UpdateSchedulePreference(ctx context.Context, pref *mod
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, pref.TeacherID)
 	if err != nil {
 		return err
@@ -1133,26 +1025,24 @@ func (s *teacherService) UpdateSchedulePreference(ctx context.Context, pref *mod
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, pref.TeacherID)
 	}
-
 	if err := s.repo.UpdateSchedulePreference(ctx, tx, pref); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE_SCHEDULE_PREF", pref.TeacherID, nil, pref, pref.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update_schedule_preference", "teacher_schedule_preference",
+			&pref.PreferenceID, "user", pref.CreatedBy, nil, nil, map[string]interface{}{
+				"day_of_week": pref.DayOfWeek,
+				"start_time":  pref.PreferredStartTime,
+				"end_time":    pref.PreferredEndTime,
+			})
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSchedulePreferenceUpdated), pref); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSchedulePreferenceUpdated, pref.PreferenceID, pref); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("schedule preference updated")
-
-	// Notify the teacher about schedule preference update
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1167,11 +1057,10 @@ func (s *teacherService) UpdateSchedulePreference(ctx context.Context, pref *mod
 			},
 			CreatedBy: pref.CreatedBy,
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.schedule.update:"+pref.PreferenceID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for schedule preference update", zap.Error(err))
 		}
 	}()
-
 	return nil
 }
 
@@ -1182,28 +1071,18 @@ func (s *teacherService) DeleteSchedulePreference(ctx context.Context, preferenc
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Need teacher ID for notification, fetch pref first
-	var _ uuid.UUID
-	_, err = s.repo.GetSchedulePreferences(ctx, tx, uuid.Nil) // can't, need teacher ID. Instead, we should have a method to get pref by ID.
-	// To keep simple, we'll skip notification for delete if we can't get teacher ID easily.
-	// Alternatively, we can get the pref by ID from a separate method. For now, we assume we have teacher ID from context.
-	// We'll add a method to get a single preference by ID in repository (optional). For brevity, we'll skip notification here.
 	if err := s.repo.DeleteSchedulePreference(ctx, tx, preferenceID); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "DELETE_SCHEDULE_PREF", uuid.Nil, nil, map[string]interface{}{"preference_id": preferenceID}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete_schedule_preference", "teacher_schedule_preference",
+			&preferenceID, "user", nil, nil, nil, nil)
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSchedulePreferenceDeleted), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSchedulePreferenceDeleted, preferenceID, map[string]interface{}{
 		"preference_id": preferenceID,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -1218,8 +1097,6 @@ func (s *teacherService) ClearSchedulePreferences(ctx context.Context, teacherID
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Get teacher details for notification
 	teacher, err := s.repo.GetByID(ctx, tx, teacherID)
 	if err != nil {
 		return err
@@ -1227,28 +1104,22 @@ func (s *teacherService) ClearSchedulePreferences(ctx context.Context, teacherID
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
-
 	if err := s.repo.ClearSchedulePreferences(ctx, tx, teacherID); err != nil {
 		return err
 	}
-
-	if err := s.auditLogger.Log(ctx, tx, "CLEAR_SCHEDULE_PREFS", teacherID, nil, nil, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "clear_schedule_preferences", "teacher_schedule_preference",
+			&teacherID, "user", nil, nil, nil, nil)
 	}
-
-	if err := s.outboxStore.Store(ctx, tx, string(EventTeacherSchedulePreferencesCleared), map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, EventTeacherSchedulePreferencesCleared, teacherID, map[string]interface{}{
 		"teacher_id": teacherID,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	logger.Info("schedule preferences cleared")
-
-	// Notify the teacher about clear
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1262,10 +1133,9 @@ func (s *teacherService) ClearSchedulePreferences(ctx context.Context, teacherID
 				{TargetType: models.TargetUser, TargetEntityID: teacher.UserID},
 			},
 		}
-		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, "teacher.schedule.clear:"+teacherID.String()); err != nil {
+		if _, err := s.notificationSvc.Create(notifyCtx, notifReq, ""); err != nil {
 			logger.Error("failed to create notification for schedule preferences cleared", zap.Error(err))
 		}
 	}()
-
 	return nil
 }

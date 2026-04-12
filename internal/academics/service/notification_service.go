@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,10 +14,17 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
 
 // ---------------------------------------------------------------------
-// DTOs (can also be moved to types.go)
+// Event types (matching outbox pattern)
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// DTOs
 // ---------------------------------------------------------------------
 
 type NotificationTargetInput struct {
@@ -61,8 +70,7 @@ type UserNotificationCounts struct {
 	ByPriority map[models.NotificationPriority]int64
 }
 
-// NotificationOutboxEvent is the structure stored in outbox for notification.created events.
-// It includes both the notification and its targets, matching the consumer's expected format.
+// NotificationOutboxEvent is the structure stored in outbox for notification events.
 type NotificationOutboxEvent struct {
 	NotificationID uuid.UUID `json:"notification_id"`
 	Title          string    `json:"title"`
@@ -82,47 +90,20 @@ type NotificationOutboxEvent struct {
 // ---------------------------------------------------------------------
 
 type NotificationService interface {
-	// Create a new notification with its targets.
 	Create(ctx context.Context, req CreateNotificationRequest, idempotencyKey string) (*models.Notification, error)
-
-	// Get a notification by ID.
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Notification, error)
-
-	// Update an existing notification (title, message, etc.) – targets cannot be changed via update.
 	Update(ctx context.Context, req UpdateNotificationRequest) (*models.Notification, error)
-
-	// Delete (soft delete) a notification.
 	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
-
-	// List notifications for a specific user. Uses the NotificationReads table to filter read/unread.
 	ListUserNotifications(ctx context.Context, req ListUserNotificationsRequest) ([]*models.Notification, int64, error)
-
-	// Mark a notification as read for a user.
 	MarkAsRead(ctx context.Context, notificationID, userID uuid.UUID) error
-
-	// Mark all notifications for a user as read.
 	MarkAllAsRead(ctx context.Context, userID uuid.UUID) error
-
-	// Get the read status for a set of notifications for a user.
 	GetReadStatuses(ctx context.Context, notificationIDs []uuid.UUID, userID uuid.UUID) (map[uuid.UUID]bool, error)
-
-	// Get counts (total, unread, by priority) for a user.
-	GetCounts(ctx context.Context, userID uuid.UUID) (*UserNotificationCounts, error)
-
-	// Get a summary of notifications for a user (e.g., recent unread).
-	GetUserNotificationSummary(ctx context.Context, userID uuid.UUID) ([]*models.Notification, error)
-
-	// Add targets to an existing notification.
-	AddTargets(ctx context.Context, notificationID uuid.UUID, targets []NotificationTargetInput) error
-
-	// Remove targets from a notification.
-	RemoveTargets(ctx context.Context, notificationID uuid.UUID, targetIDs []uuid.UUID) error
-
-	// Get all targets for a notification.
-	GetTargets(ctx context.Context, notificationID uuid.UUID) ([]*models.NotificationTarget, error)
-
-	// Get the read count for a notification.
 	GetReadCount(ctx context.Context, notificationID uuid.UUID) (int64, error)
+	GetCounts(ctx context.Context, userID uuid.UUID) (*UserNotificationCounts, error)
+	GetUserNotificationSummary(ctx context.Context, userID uuid.UUID) ([]*models.Notification, error)
+	AddTargets(ctx context.Context, notificationID uuid.UUID, targets []NotificationTargetInput) error
+	RemoveTargets(ctx context.Context, notificationID uuid.UUID, targetIDs []uuid.UUID) error
+	GetTargets(ctx context.Context, notificationID uuid.UUID) ([]*models.NotificationTarget, error)
 }
 
 // ---------------------------------------------------------------------
@@ -130,33 +111,58 @@ type NotificationService interface {
 // ---------------------------------------------------------------------
 
 type notificationService struct {
-	repo             repository.NotificationRepository
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	eventPublisher   EventPublisher
-	pgClient         *client.PostgresClient
-	logger           *zap.Logger
+	repo     repository.NotificationRepository
+	pgClient *client.PostgresClient
+	logger   *zap.Logger
+
+	// Infrastructure dependencies (same pattern as assignment)
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
 
 func NewNotificationService(
 	repo repository.NotificationRepository,
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	eventPublisher EventPublisher,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) NotificationService {
 	return &notificationService{
 		repo:             repo,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		eventPublisher:   eventPublisher,
 		pgClient:         pgClient,
 		logger:           logger.Named("notification_service"),
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
 	}
+}
+
+// ---------------------------------------------------------------------
+// Helper: store outbox event for notification
+// ---------------------------------------------------------------------
+
+func (s *notificationService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "notification",
+		AggregateID:   aggregateID.String(),
+		EventType:     string(eventType),
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
 }
 
 // ---------------------------------------------------------------------
@@ -166,7 +172,6 @@ func NewNotificationService(
 func (s *notificationService) sanitizeCreate(req *CreateNotificationRequest) {
 	req.Title = strings.TrimSpace(req.Title)
 	req.Message = strings.TrimSpace(req.Message)
-	// Types are enums, no trimming needed.
 }
 
 func (s *notificationService) validateCreateInput(req CreateNotificationRequest) error {
@@ -230,18 +235,12 @@ func (s *notificationService) Create(ctx context.Context, req CreateNotification
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (same pattern as assignment service)
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var notif models.Notification
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &notif); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
+		var existing models.Notification
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.NotificationID != uuid.Nil {
 			logger.Info("returning idempotent response")
-			return &notif, nil
+			return &existing, nil
 		}
 	}
 
@@ -255,7 +254,6 @@ func (s *notificationService) Create(ctx context.Context, req CreateNotification
 		})
 	}
 
-	// Prepare notification model
 	notification := &models.Notification{
 		CompanyID: req.CompanyID,
 		Title:     req.Title,
@@ -264,28 +262,33 @@ func (s *notificationService) Create(ctx context.Context, req CreateNotification
 		Priority:  req.Priority,
 		ExpiresAt: req.ExpiresAt,
 		CreatedBy: req.CreatedBy,
-		UpdatedBy: req.CreatedBy, // on create, both are same
+		UpdatedBy: req.CreatedBy,
 	}
 
-	// Insert notification and its targets in a single transaction
 	if err := s.repo.Create(ctx, tx, notification, targets); err != nil {
 		return nil, err
 	}
 
+	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, notification); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			return nil, fmt.Errorf("failed to store idempotency key: %w", err)
 		}
 	}
 
 	// Audit log
-	if err := s.auditLogger.Log(ctx, tx, "CREATE", notification.NotificationID, nil, notification, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "notification",
+			&notification.NotificationID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"title":      notification.Title,
+				"type":       notification.Type,
+				"priority":   notification.Priority,
+				"company_id": notification.CompanyID,
+			})
 	}
 
-	// Build combined outbox event with targets
-	outboxEvent := NotificationOutboxEvent{
+	// Build outbox payload
+	outboxPayload := NotificationOutboxEvent{
 		NotificationID: notification.NotificationID,
 		Title:          notification.Title,
 		Message:        notification.Message,
@@ -299,7 +302,7 @@ func (s *notificationService) Create(ctx context.Context, req CreateNotification
 		}, len(targets)),
 	}
 	for i, t := range targets {
-		outboxEvent.Targets[i] = struct {
+		outboxPayload.Targets[i] = struct {
 			TargetType string    `json:"target_type"`
 			EntityID   uuid.UUID `json:"entity_id"`
 		}{
@@ -308,10 +311,8 @@ func (s *notificationService) Create(ctx context.Context, req CreateNotification
 		}
 	}
 
-	// Store outbox event for notification creation
-	if err := s.outboxStore.Store(ctx, tx, string(EventNotificationCreated), outboxEvent); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventNotificationCreated, notification.NotificationID, outboxPayload); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -349,7 +350,6 @@ func (s *notificationService) Update(ctx context.Context, req UpdateNotification
 	}
 	defer tx.Rollback()
 
-	// Retrieve existing notification (with lock, if needed)
 	existing, err := s.repo.GetByID(ctx, tx, req.NotificationID)
 	if err != nil {
 		return nil, err
@@ -358,7 +358,6 @@ func (s *notificationService) Update(ctx context.Context, req UpdateNotification
 		return nil, fmt.Errorf("%w: notification %s", ErrNotFound, req.NotificationID)
 	}
 
-	// Update fields
 	existing.Title = req.Title
 	existing.Message = req.Message
 	existing.Type = req.Type
@@ -370,13 +369,16 @@ func (s *notificationService) Update(ctx context.Context, req UpdateNotification
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE", existing.NotificationID, existing, existing, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "notification",
+			&req.NotificationID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old_title": existing.Title,
+				"new_title": req.Title,
+			})
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventNotificationUpdated), existing); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventNotificationUpdated, existing.NotificationID, existing); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -403,16 +405,17 @@ func (s *notificationService) Delete(ctx context.Context, id uuid.UUID, deletedB
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "notification",
+			&id, "user", deletedBy, nil, nil, nil)
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventNotificationDeleted), map[string]interface{}{
+	deletePayload := map[string]interface{}{
 		"notification_id": id,
 		"deleted_by":      deletedBy,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	}
+	if err := s.storeOutboxEvent(ctx, tx, EventNotificationDeleted, id, deletePayload); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -433,8 +436,6 @@ func (s *notificationService) ListUserNotifications(ctx context.Context, req Lis
 		zap.String("user_id", req.UserID.String()),
 	)
 
-	// Build filter for repository (only notifications that are relevant to this user)
-	// The repository's List method already handles user‑specific read status if we set the filter's UserID and ReadStatus.
 	filter := repository.NotificationFilter{
 		UserID:     &req.UserID,
 		ReadStatus: req.ReadStatus,
@@ -450,7 +451,6 @@ func (s *notificationService) ListUserNotifications(ctx context.Context, req Lis
 		filter.Priorities = priorities
 	}
 
-	// Convert sort
 	sortField := req.SortField
 	if sortField == "" {
 		sortField = "created_at"
@@ -461,7 +461,6 @@ func (s *notificationService) ListUserNotifications(ctx context.Context, req Lis
 	}
 	srt := repository.Sort{Field: sortField, Direction: sortDir}
 
-	// Pagination
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20
@@ -507,17 +506,19 @@ func (s *notificationService) MarkAsRead(ctx context.Context, notificationID, us
 		return err
 	}
 
-	// Optionally audit and outbox for read events
-	if err := s.auditLogger.Log(ctx, tx, "MARK_READ", notificationID, nil, map[string]interface{}{"user_id": userID}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "mark_read", "notification",
+			&notificationID, "user", &userID, nil, nil, map[string]interface{}{
+				"user_id": userID,
+			})
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventNotificationRead), map[string]interface{}{
+	readPayload := map[string]interface{}{
 		"notification_id": notificationID,
 		"user_id":         userID,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	}
+	if err := s.storeOutboxEvent(ctx, tx, EventNotificationRead, notificationID, readPayload); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -534,10 +535,9 @@ func (s *notificationService) MarkAllAsRead(ctx context.Context, userID uuid.UUI
 		zap.String("user_id", userID.String()),
 	)
 
-	// Get all unread notification IDs for this user
 	filter := repository.NotificationFilter{
 		UserID:     &userID,
-		ReadStatus: ptrBool(false), // unread
+		ReadStatus: ptrBool(false),
 	}
 	pag := repository.Pagination{Limit: 1000, Offset: 0}
 	srt := repository.Sort{Field: "created_at", Direction: "ASC"}
@@ -563,15 +563,18 @@ func (s *notificationService) MarkAllAsRead(ctx context.Context, userID uuid.UUI
 		}
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "MARK_ALL_READ", uuid.Nil, nil, map[string]interface{}{"user_id": userID}, nil); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "mark_all_read", "notification",
+			nil, "user", &userID, nil, nil, map[string]interface{}{
+				"user_id": userID,
+			})
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventNotificationAllRead), map[string]interface{}{
+	allReadPayload := map[string]interface{}{
 		"user_id": userID,
-	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+	}
+	if err := s.storeOutboxEvent(ctx, tx, EventNotificationAllRead, userID, allReadPayload); err != nil {
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -591,22 +594,18 @@ func (s *notificationService) GetReadCount(ctx context.Context, notificationID u
 }
 
 func (s *notificationService) GetCounts(ctx context.Context, userID uuid.UUID) (*UserNotificationCounts, error) {
-	// Total count
 	totalFilter := repository.NotificationFilter{UserID: &userID}
 	total, err := s.repo.Count(ctx, s.pgClient.DB, totalFilter)
 	if err != nil {
 		return nil, err
 	}
 
-	// Unread count
 	unreadFilter := repository.NotificationFilter{UserID: &userID, ReadStatus: ptrBool(false)}
 	unread, err := s.repo.Count(ctx, s.pgClient.DB, unreadFilter)
 	if err != nil {
 		return nil, err
 	}
 
-	// Counts by priority – we need to count with filter by priority.
-	// Since repository.Count does not support grouping, we'll do individual queries or extend repository.
 	byPriority := make(map[models.NotificationPriority]int64)
 	priorities := []models.NotificationPriority{
 		models.PriorityLow, models.PriorityNormal, models.PriorityHigh, models.PriorityUrgent,
@@ -632,11 +631,10 @@ func (s *notificationService) GetCounts(ctx context.Context, userID uuid.UUID) (
 	}, nil
 }
 
-// GetUserNotificationSummary returns recent unread notifications (or all recent) for a user.
 func (s *notificationService) GetUserNotificationSummary(ctx context.Context, userID uuid.UUID) ([]*models.Notification, error) {
 	filter := repository.NotificationFilter{
 		UserID:     &userID,
-		ReadStatus: ptrBool(false), // only unread
+		ReadStatus: ptrBool(false),
 	}
 	pag := repository.Pagination{Limit: 10, Offset: 0}
 	srt := repository.Sort{Field: "created_at", Direction: "DESC"}
@@ -653,25 +651,14 @@ func (s *notificationService) GetUserNotificationSummary(ctx context.Context, us
 // ---------------------------------------------------------------------
 
 func (s *notificationService) AddTargets(ctx context.Context, notificationID uuid.UUID, targets []NotificationTargetInput) error {
-	_ = s.logger.With(
-		zap.String("method", "AddTargets"),
-		zap.String("notification_id", notificationID.String()),
-	)
-
-	// Convert input to repository models
 	repoTargets := make([]*models.NotificationTarget, len(targets))
 	for i, t := range targets {
 		repoTargets[i] = &models.NotificationTarget{
 			NotificationID: notificationID,
 			TargetType:     t.TargetType,
 			TargetEntityID: t.TargetEntityID,
-			// CreatedBy not available here; will be set in repository? Actually, the repo expects CreatedBy.
-			// We'll need to pass it. We could fetch from existing notification or require caller to provide.
-			// For simplicity, we'll pass nil, but the repository will not set created_by. We may need to extend.
-			// Let's pass nil, and the repository will insert with NULL created_by.
 		}
 	}
-
 	return s.repo.AddTargets(ctx, s.pgClient.DB, notificationID, repoTargets)
 }
 

@@ -5,14 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
-
-	"auth-service/internal/academics/repository"
-	"auth-service/internal/academics/service"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"auth-service/internal/academics/repository"
+	"auth-service/internal/academics/service"
 )
 
 type AssignmentHandler struct {
@@ -28,7 +28,7 @@ func NewAssignmentHandler(assignmentService service.AssignmentService, logger *z
 }
 
 // Create handles POST /api/v1/companies/{companyID}/assignments
-// Expects X-Idempotency-Key header (optional)
+// Idempotency key is read from context (set by middleware from Idempotency-Key header)
 func (h *AssignmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -81,7 +81,8 @@ func (h *AssignmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	req.CreatedBy = &userID
 	req.UpdatedBy = &userID
 
-	idempotencyKey := r.Header.Get("X-Idempotency-Key")
+	// 🔁 Read idempotency key from context (set by middleware)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	assignment, err := h.assignmentService.Create(ctx, req, idempotencyKey)
 	if err != nil {
@@ -101,7 +102,7 @@ func (h *AssignmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// BulkCreate handles POST /api/v1/companies/{companyID}/assignments/bulk
+// BulkCreate handles POST /api/v1/companies/{companyID}/academics/assignments/bulk
 func (h *AssignmentHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -139,7 +140,10 @@ func (h *AssignmentHandler) BulkCreate(w http.ResponseWriter, r *http.Request) {
 		reqs[i].UpdatedBy = &userID
 	}
 
-	assignments, err := h.assignmentService.BulkCreate(ctx, reqs)
+	// 🔁 Read idempotency key from context (set by middleware)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
+	assignments, err := h.assignmentService.BulkCreate(ctx, reqs, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to bulk create assignments",
 			zap.Int("batch_size", len(reqs)),
@@ -193,10 +197,7 @@ func (h *AssignmentHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 }
 
 // List handles GET /api/v1/companies/{companyID}/assignments
-// Query params:
-//
-//	section_id, subject_id, teacher_id, is_published, search, due_from, due_to
-//	limit, offset, sort_field, sort_direction
+// Query params: section_id, subject_id, teacher_id, is_published, search, due_from, due_to, limit, offset, sort_field, sort_direction
 func (h *AssignmentHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -237,7 +238,6 @@ func (h *AssignmentHandler) List(w http.ResponseWriter, r *http.Request) {
 	if search := r.URL.Query().Get("search"); search != "" {
 		filter.Search = search
 	}
-	// Use DueDateFrom and DueDateTo (adjust field names as per your AssignmentFilter)
 	if dueFromStr := r.URL.Query().Get("due_from"); dueFromStr != "" {
 		if dueFrom, err := time.Parse(time.RFC3339, dueFromStr); err == nil {
 			filter.DueDateFrom = &dueFrom
@@ -283,7 +283,6 @@ func (h *AssignmentHandler) List(w http.ResponseWriter, r *http.Request) {
 	count, err := h.assignmentService.Count(ctx, filter)
 	if err != nil {
 		h.logger.Error("Failed to count assignments", zap.Error(err))
-		// Non-fatal, we can still return assignments without total
 		count = 0
 	}
 
@@ -394,7 +393,7 @@ func (h *AssignmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Publish handles PATCH /api/v1/companies/{companyID}/assignments/{assignmentID}/publish
+// Publish handles POST /api/v1/companies/{companyID}/assignments/{assignmentID}/publish
 // Request body: { "published": true/false }
 func (h *AssignmentHandler) Publish(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

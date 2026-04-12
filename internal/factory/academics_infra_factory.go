@@ -24,7 +24,7 @@ import (
 )
 
 // ---------------------------------------------------------------------
-// EventPublisher interface and Kafka wrapper (unchanged)
+// EventPublisher interface and Kafka wrapper
 // ---------------------------------------------------------------------
 
 type EventPublisher interface {
@@ -40,7 +40,7 @@ func (k *kafkaEventPublisher) Publish(ctx context.Context, topic string, key str
 }
 
 // ---------------------------------------------------------------------
-// Interface adapters for academics/service requirements (unchanged)
+// Interface adapters (retained for compatibility, but only EventPublisher adapter is used)
 // ---------------------------------------------------------------------
 
 type auditLoggerAdapter struct {
@@ -90,7 +90,7 @@ func (e *eventPublisherAdapter) Publish(ctx context.Context, event academicsvc.E
 }
 
 // ---------------------------------------------------------------------
-// AcademicsInfraFactory (updated)
+// AcademicsInfraFactory
 // ---------------------------------------------------------------------
 
 type AcademicsInfraFactory struct {
@@ -103,7 +103,7 @@ type AcademicsInfraFactory struct {
 	emailSender    email.Sender
 	sessionService *mainservice.SessionService
 
-	// Academics repositories (unchanged)
+	// Repositories
 	academicEventRepo        repository.AcademicEventRepository
 	academicYearRepo         repository.AcademicYearRepository
 	admissionRepo            repository.AdmissionRepository
@@ -130,13 +130,13 @@ type AcademicsInfraFactory struct {
 	timetableRepo            repository.TimetableRepository
 	transportRepo            repository.TransportRepository
 
-	// Idempotency & Outbox (unchanged)
+	// Idempotency & Outbox
 	idempotencyStore         idempotency.Store
 	outboxRepo               outbox.Repository
 	academicsOutboxProcessor *outbox.Processor
 	academicsOutboxCancel    context.CancelFunc
 
-	// Academic services (unchanged)
+	// Services
 	notificationService academicsvc.NotificationService
 	examService         academicsvc.ExamService
 	studentAuthService  academicsvc.StudentAuthService
@@ -162,7 +162,7 @@ type AcademicsInfraFactory struct {
 	assignmentService   academicsvc.AssignmentService
 	feeService          academicsvc.FeeService
 
-	// Academic handlers (existing)
+	// Handlers
 	academicYearHandler *handler.AcademicYearHandler
 	sectionHandler      *handler.SectionHandler
 	enrollmentHandler   *handler.EnrollmentHandler
@@ -184,13 +184,11 @@ type AcademicsInfraFactory struct {
 	attendanceHandler   *handler.AttendanceHandler
 	admissionHandler    *handler.AdmissionHandler
 	termHandler         *handler.TermHandler
-
-	// --- NEW handlers for analytics & curriculum ---
-	analyticsHandler  *handler.AnalyticsHandler
-	curriculumHandler *handler.CurriculumHandler
+	analyticsHandler    *handler.AnalyticsHandler
+	curriculumHandler   *handler.CurriculumHandler
 }
 
-// NewAcademicsInfraFactory (unchanged except initializing new fields to nil – no change needed)
+// NewAcademicsInfraFactory constructor
 func NewAcademicsInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
@@ -211,12 +209,12 @@ func NewAcademicsInfraFactory(
 		sessionService: sessionService,
 	}
 
-	// Idempotency store (unchanged)
+	// Idempotency store
 	pgStore := idempotency.NewPostgresStore(postgresClient.DB)
 	redisCache := idempotency.NewRedisCache(redisClient, 24*time.Hour)
 	af.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
 
-	// Repositories (unchanged)
+	// Repositories
 	af.academicEventRepo = repository.NewAcademicEventRepository(af.log)
 	af.academicYearRepo = repository.NewAcademicYearRepository(af.log)
 	af.admissionRepo = repository.NewAdmissionRepository(af.log)
@@ -243,7 +241,7 @@ func NewAcademicsInfraFactory(
 	af.timetableRepo = repository.NewTimetableRepository(af.log)
 	af.transportRepo = repository.NewTransportRepository(af.log)
 
-	// Outbox (unchanged)
+	// Outbox
 	if kafkaProducer != nil {
 		af.outboxRepo = outbox.NewPostgresRepository(postgresClient.DB)
 		af.academicsOutboxProcessor = outbox.NewProcessor(
@@ -261,7 +259,7 @@ func NewAcademicsInfraFactory(
 }
 
 // ================================
-// Repository Getters (unchanged)
+// Repository Getters
 // ================================
 
 func (af *AcademicsInfraFactory) AcademicEventRepo() repository.AcademicEventRepository {
@@ -347,19 +345,18 @@ func (af *AcademicsInfraFactory) OutboxRepository() outbox.Repository {
 }
 
 // ================================
-// Academic Service Getters (unchanged)
+// Service Getters (all corrected)
 // ================================
 
 func (af *AcademicsInfraFactory) NotificationService() academicsvc.NotificationService {
 	if af.notificationService == nil {
 		af.notificationService = academicsvc.NewNotificationService(
 			af.NotificationRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.notificationService
@@ -376,7 +373,7 @@ func (af *AcademicsInfraFactory) ExamService() academicsvc.ExamService {
 			af.postgresClient,
 			af.log,
 			af.outboxRepo,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 			af.NotificationService(),
 		)
@@ -402,12 +399,11 @@ func (af *AcademicsInfraFactory) GuardianService() academicsvc.GuardianService {
 		af.guardianService = academicsvc.NewGuardianService(
 			af.GuardianRepo(),
 			af.StudentRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
+			af.outboxRepo,
+			af.idempotencyStore,
+			af.auditService,
 			af.NotificationService(),
 		)
 	}
@@ -423,13 +419,13 @@ func (af *AcademicsInfraFactory) EnrollmentService() academicsvc.EnrollmentServi
 			af.CourseRepo(),
 			af.AcademicYearRepo(),
 			af.TermRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
+			&eventPublisherAdapter{pub: af.eventPublisher}, // EventPublisher
 		)
 	}
 	return af.enrollmentService
@@ -442,8 +438,9 @@ func (af *AcademicsInfraFactory) SectionService() academicsvc.SectionService {
 			af.CourseRepo(),
 			af.TermRepo(),
 			af.EnrollmentRepo(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
+			af.auditService,
+			af.outboxRepo,
+			af.idempotencyStore,
 			af.postgresClient,
 			af.log,
 		)
@@ -458,7 +455,7 @@ func (af *AcademicsInfraFactory) AcademicYearService() academicsvc.AcademicYearS
 			af.postgresClient,
 			af.log,
 			af.outboxRepo,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 			af.NotificationService(),
 		)
@@ -473,7 +470,7 @@ func (af *AcademicsInfraFactory) GradingService() academicsvc.GradingService {
 			af.postgresClient,
 			af.log,
 			af.outboxRepo,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.NotificationService(),
@@ -486,10 +483,9 @@ func (af *AcademicsInfraFactory) TransportService() academicsvc.TransportService
 	if af.transportService == nil {
 		af.transportService = academicsvc.NewTransportService(
 			af.TransportRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
@@ -502,13 +498,12 @@ func (af *AcademicsInfraFactory) TeacherService() academicsvc.TeacherService {
 	if af.teacherService == nil {
 		af.teacherService = academicsvc.NewTeacherService(
 			af.TeacherRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.teacherService
@@ -522,11 +517,11 @@ func (af *AcademicsInfraFactory) SubmissionService() academicsvc.SubmissionServi
 			af.StudentService(),
 			af.TeacherService(),
 			af.NotificationService(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
 			af.postgresClient,
 			af.log,
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.submissionService
@@ -538,11 +533,12 @@ func (af *AcademicsInfraFactory) CurriculumService() academicsvc.CurriculumServi
 			af.SubjectCourseMappingRepo(),
 			af.CourseRepo(),
 			af.SubjectRepo(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.curriculumService
@@ -552,10 +548,11 @@ func (af *AcademicsInfraFactory) SubjectService() academicsvc.SubjectService {
 	if af.subjectService == nil {
 		af.subjectService = academicsvc.NewSubjectService(
 			af.SubjectRepo(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
 			af.postgresClient,
 			af.log,
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.subjectService
@@ -570,13 +567,12 @@ func (af *AcademicsInfraFactory) StudentService() academicsvc.StudentService {
 			af.CourseRepo(),
 			af.TermRepo(),
 			af.AcademicYearRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.outboxRepo,
+			af.idempotencyStore,
+			af.auditService,
 		)
 	}
 	return af.studentService
@@ -588,10 +584,9 @@ func (af *AcademicsInfraFactory) LibraryService() academicsvc.LibraryService {
 			af.LibraryRepo(),
 			af.postgresClient,
 			af.log,
-			&eventPublisherAdapter{pub: af.eventPublisher},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&auditLoggerAdapter{svc: af.auditService},
-			af.IdempotencyStore(),
+			af.outboxRepo,
+			af.idempotencyStore,
+			af.auditService,
 			af.NotificationService(),
 			af.StudentService(),
 		)
@@ -603,13 +598,12 @@ func (af *AcademicsInfraFactory) RoomService() academicsvc.RoomService {
 	if af.roomService == nil {
 		af.roomService = academicsvc.NewRoomService(
 			af.RoomRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.roomService
@@ -620,13 +614,13 @@ func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService
 		af.timetableService = academicsvc.NewTimetableService(
 			af.TimetableRepo(),
 			af.SectionRepo(),
+			af.CourseRepo(), // ✅ Added CourseRepository
 			af.SubjectRepo(),
 			af.TeacherRepo(),
 			af.RoomRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
@@ -634,7 +628,6 @@ func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService
 	}
 	return af.timetableService
 }
-
 func (af *AcademicsInfraFactory) CourseService() academicsvc.CourseService {
 	if af.courseService == nil {
 		af.courseService = academicsvc.NewCourseService(
@@ -643,7 +636,7 @@ func (af *AcademicsInfraFactory) CourseService() academicsvc.CourseService {
 			af.postgresClient,
 			af.log,
 			af.outboxRepo,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 			af.NotificationService(),
 		)
@@ -657,12 +650,12 @@ func (af *AcademicsInfraFactory) TermService() academicsvc.TermService {
 			af.TermRepo(),
 			af.AcademicYearRepo(),
 			af.SectionRepo(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			af.IdempotencyStore(),
-			af.NotificationService(),
 			af.postgresClient,
 			af.log,
+			af.outboxRepo,
+			af.idempotencyStore,
+			af.auditService,
+			af.NotificationService(),
 		)
 	}
 	return af.termService
@@ -674,7 +667,7 @@ func (af *AcademicsInfraFactory) AnalyticsService() academicsvc.AnalyticsService
 			af.AnalyticsRepo(),
 			af.postgresClient,
 			af.log,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 		)
 	}
@@ -688,7 +681,7 @@ func (af *AcademicsInfraFactory) AdmissionService() academicsvc.AdmissionService
 			af.postgresClient,
 			af.log,
 			af.outboxRepo,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 			af.NotificationService(),
 		)
@@ -702,13 +695,12 @@ func (af *AcademicsInfraFactory) AttendanceService() academicsvc.AttendanceServi
 			af.AttendanceRepo(),
 			af.EnrollmentRepo(),
 			af.StudentRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.attendanceService
@@ -722,13 +714,13 @@ func (af *AcademicsInfraFactory) AssignmentService() academicsvc.AssignmentServi
 			af.SubjectRepo(),
 			af.CourseRepo(),
 			af.SectionRepo(),
-			af.IdempotencyStore(),
-			&auditLoggerAdapter{svc: af.auditService},
-			&outboxStoreAdapter{repo: af.outboxRepo},
-			&eventPublisherAdapter{pub: af.eventPublisher},
-			af.NotificationService(),
 			af.postgresClient,
 			af.log,
+			af.NotificationService(),
+			&eventPublisherAdapter{pub: af.eventPublisher}, // EventPublisher
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
 		)
 	}
 	return af.assignmentService
@@ -744,7 +736,7 @@ func (af *AcademicsInfraFactory) FeeService() academicsvc.FeeService {
 			af.postgresClient,
 			af.log,
 			af.outboxRepo,
-			af.IdempotencyStore(),
+			af.idempotencyStore,
 			af.auditService,
 			af.NotificationService(),
 		)
@@ -753,7 +745,7 @@ func (af *AcademicsInfraFactory) FeeService() academicsvc.FeeService {
 }
 
 // ================================
-// Academic Handler Getters
+// Handler Getters (unchanged)
 // ================================
 
 func (af *AcademicsInfraFactory) AcademicYearHandler() *handler.AcademicYearHandler {
@@ -908,8 +900,6 @@ func (af *AcademicsInfraFactory) TermHandler() *handler.TermHandler {
 	return af.termHandler
 }
 
-// --- NEW handler getters for analytics & curriculum ---
-
 func (af *AcademicsInfraFactory) AnalyticsHandler() *handler.AnalyticsHandler {
 	if af.analyticsHandler == nil {
 		af.analyticsHandler = handler.NewAnalyticsHandler(af.AnalyticsService(), af.log)
@@ -925,10 +915,9 @@ func (af *AcademicsInfraFactory) CurriculumHandler() *handler.CurriculumHandler 
 }
 
 // ================================
-// Routes Registration (NEW)
+// Routes Registration
 // ================================
 
-// RegisterRoutes wires all academics HTTP routes using the existing router function.
 func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainservice.JWTService, logger *zap.Logger) {
 	academics.RegisterAcademicRoutes(
 		r,
@@ -960,7 +949,7 @@ func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainse
 	)
 }
 
-// Close shuts down the outbox processor (unchanged)
+// Close shuts down the outbox processor
 func (af *AcademicsInfraFactory) Close() {
 	if af.academicsOutboxCancel != nil {
 		af.academicsOutboxCancel()

@@ -18,7 +18,6 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// ExamService interface (unchanged)
 type ExamService interface {
 	CreateExam(ctx context.Context, req CreateExamRequest) (*models.Exam, error)
 	GetExamByID(ctx context.Context, id uuid.UUID) (*models.Exam, error)
@@ -46,7 +45,7 @@ type ExamService interface {
 type examService struct {
 	repo             repository.ExamRepository
 	termRepo         repository.TermRepository
-	academicYearRepo repository.AcademicYearRepository // added
+	academicYearRepo repository.AcademicYearRepository
 	subjectRepo      repository.SubjectRepository
 	enrollmentRepo   repository.EnrollmentRepository
 	pgClient         *client.PostgresClient
@@ -60,7 +59,7 @@ type examService struct {
 func NewExamService(
 	repo repository.ExamRepository,
 	termRepo repository.TermRepository,
-	academicYearRepo repository.AcademicYearRepository, // added
+	academicYearRepo repository.AcademicYearRepository,
 	subjectRepo repository.SubjectRepository,
 	enrollmentRepo repository.EnrollmentRepository,
 	pgClient *client.PostgresClient,
@@ -85,109 +84,16 @@ func NewExamService(
 	}
 }
 
-// ---------------------------------------------------------------------
-// Request structs (unchanged)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Helper functions (shared)
+// ----------------------------------------------------------------------
 
-type CreateExamRequest struct {
-	AcademicYearID uuid.UUID
-	TermID         uuid.UUID
-	ExamName       string
-	StartDate      time.Time
-	EndDate        time.Time
-	Description    string
-	IsActive       bool
-	CreatedBy      *uuid.UUID
-	UpdatedBy      *uuid.UUID
-}
-
-type UpdateExamRequest struct {
-	ExamID      uuid.UUID
-	TermID      uuid.UUID
-	ExamName    string
-	StartDate   time.Time
-	EndDate     time.Time
-	Description string
-	IsActive    bool
-	UpdatedBy   *uuid.UUID
-}
-
-type CreateExamScheduleRequest struct {
-	ExamID       uuid.UUID
-	SubjectID    uuid.UUID
-	Date         time.Time
-	StartTime    *time.Time
-	EndTime      *time.Time
-	RoomID       *uuid.UUID
-	MaxMarks     float64
-	PassingMarks float64
-	CreatedBy    *uuid.UUID
-	UpdatedBy    *uuid.UUID
-}
-
-type UpdateExamScheduleRequest struct {
-	ScheduleID   uuid.UUID
-	SubjectID    uuid.UUID
-	Date         time.Time
-	StartTime    *time.Time
-	EndTime      *time.Time
-	RoomID       *uuid.UUID
-	MaxMarks     float64
-	PassingMarks float64
-	UpdatedBy    *uuid.UUID
-}
-
-type CreateExamResultRequest struct {
-	ExamID        uuid.UUID
-	EnrollmentID  uuid.UUID
-	SubjectID     uuid.UUID
-	MarksObtained *float64
-	Grade         string
-	Remarks       string
-	EnteredBy     *uuid.UUID
-	CreatedBy     *uuid.UUID
-}
-
-type UpdateExamResultRequest struct {
-	ResultID      uuid.UUID
-	MarksObtained *float64
-	Grade         string
-	Remarks       string
-	EnteredBy     *uuid.UUID
-	UpdatedBy     *uuid.UUID
-}
-
-type CreateExamGradeRequest struct {
-	ExamID     uuid.UUID
-	GradeName  string
-	MinMarks   float64
-	MaxMarks   float64
-	GradePoint float64
-	CreatedBy  *uuid.UUID
-}
-
-type UpdateExamGradeRequest struct {
-	GradeID    uuid.UUID
-	GradeName  string
-	MinMarks   float64
-	MaxMarks   float64
-	GradePoint float64
-	UpdatedBy  *uuid.UUID
-}
-
-// ---------------------------------------------------------------------
-// Helpers for notifications
-// ---------------------------------------------------------------------
-
-// getStudentIDsForTerm returns all student IDs enrolled in the given term.
-// Uses a raw SQL query to avoid repository changes.
 func (s *examService) getStudentIDsForTerm(ctx context.Context, termID uuid.UUID) ([]uuid.UUID, error) {
 	query := `
 		SELECT DISTINCT e.student_id
 		FROM academics.enrollments e
-		JOIN academics.sections sec ON e.section_id = sec.section_id
+		JOIN academics.section sec ON e.section_id = sec.section_id
 		WHERE sec.term_id = $1
-		  AND e.deleted_at IS NULL
 		  AND sec.deleted_at IS NULL
 	`
 	rows, err := s.pgClient.DB.QueryContext(ctx, query, termID)
@@ -195,7 +101,6 @@ func (s *examService) getStudentIDsForTerm(ctx context.Context, termID uuid.UUID
 		return nil, fmt.Errorf("query student IDs for term %s: %w", termID, err)
 	}
 	defer rows.Close()
-
 	var studentIDs []uuid.UUID
 	for rows.Next() {
 		var sid uuid.UUID
@@ -210,9 +115,7 @@ func (s *examService) getStudentIDsForTerm(ctx context.Context, termID uuid.UUID
 	return studentIDs, nil
 }
 
-// getCompanyIDForTerm returns the company ID of the academic year to which the term belongs.
 func (s *examService) getCompanyIDForTerm(ctx context.Context, termID uuid.UUID) (uuid.UUID, error) {
-	// Get term first
 	term, err := s.termRepo.GetByID(ctx, s.pgClient.DB, termID)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("get term %s: %w", termID, err)
@@ -220,7 +123,6 @@ func (s *examService) getCompanyIDForTerm(ctx context.Context, termID uuid.UUID)
 	if term == nil {
 		return uuid.Nil, fmt.Errorf("term %s not found", termID)
 	}
-	// Get academic year
 	academicYear, err := s.academicYearRepo.GetByID(ctx, s.pgClient.DB, term.AcademicYearID)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("get academic year %s: %w", term.AcademicYearID, err)
@@ -231,7 +133,6 @@ func (s *examService) getCompanyIDForTerm(ctx context.Context, termID uuid.UUID)
 	return academicYear.CompanyID, nil
 }
 
-// createNotification sends a notification to the specified student IDs using the notification service.
 func (s *examService) createNotification(ctx context.Context, companyID uuid.UUID, title, message string,
 	notifType models.NotificationType, priority models.NotificationPriority,
 	studentIDs []uuid.UUID, createdBy *uuid.UUID) {
@@ -255,7 +156,6 @@ func (s *examService) createNotification(ctx context.Context, companyID uuid.UUI
 		Targets:   targets,
 		CreatedBy: createdBy,
 	}
-	// Use background context to avoid cancellation of the main request
 	_, err := s.notifSvc.Create(context.Background(), req, "")
 	if err != nil {
 		s.logger.Error("failed to send notification",
@@ -264,9 +164,9 @@ func (s *examService) createNotification(ctx context.Context, companyID uuid.UUI
 	}
 }
 
-// ---------------------------------------------------------------------
-// Exam methods
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Exam CRUD
+// ----------------------------------------------------------------------
 
 func (s *examService) CreateExam(ctx context.Context, req CreateExamRequest) (*models.Exam, error) {
 	logger := s.logger.With(
@@ -275,14 +175,6 @@ func (s *examService) CreateExam(ctx context.Context, req CreateExamRequest) (*m
 		zap.String("term_id", req.TermID.String()),
 		zap.String("exam_name", req.ExamName),
 	)
-
-	if key, ok := ctx.Value("idempotency_key").(string); ok && key != "" {
-		var existing *models.Exam
-		if err := s.idempotencyStore.Get(ctx, nil, key, &existing); err == nil && existing != nil {
-			logger.Info("idempotent request, returning cached response")
-			return existing, nil
-		}
-	}
 
 	if err := s.validateExamCreate(req); err != nil {
 		return nil, err
@@ -293,6 +185,15 @@ func (s *examService) CreateExam(ctx context.Context, req CreateExamRequest) (*m
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.Exam
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	term, err := s.termRepo.GetByID(ctx, tx, req.TermID)
 	if err != nil {
@@ -346,21 +247,22 @@ func (s *examService) CreateExam(ctx context.Context, req CreateExamRequest) (*m
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, exam); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Send notification after commit
 	studentIDs, _ := s.getStudentIDsForTerm(ctx, term.TermID)
 	companyID, _ := s.getCompanyIDForTerm(ctx, term.TermID)
 	if companyID != uuid.Nil {
 		title := fmt.Sprintf("New Exam: %s", exam.ExamName)
 		message := fmt.Sprintf("A new exam '%s' has been scheduled from %s to %s.", exam.ExamName, exam.StartDate.Format("2006-01-02"), exam.EndDate.Format("2006-01-02"))
 		s.createNotification(ctx, companyID, title, message, models.NotificationTypeEvent, models.PriorityNormal, studentIDs, req.CreatedBy)
-	}
-
-	if key, ok := ctx.Value("idempotency_key").(string); ok && key != "" {
-		_ = s.idempotencyStore.Store(ctx, nil, key, exam)
 	}
 
 	logger.Info("exam created", zap.String("exam_id", exam.ExamID.String()))
@@ -538,9 +440,9 @@ func (s *examService) DeleteExam(ctx context.Context, id uuid.UUID, deletedBy *u
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Exam Schedule methods
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Exam Schedule (idempotency added)
+// ----------------------------------------------------------------------
 
 func (s *examService) CreateExamSchedule(ctx context.Context, req CreateExamScheduleRequest) (*models.ExamSchedule, error) {
 	logger := s.logger.With(
@@ -558,6 +460,15 @@ func (s *examService) CreateExamSchedule(ctx context.Context, req CreateExamSche
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.ExamSchedule
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	exam, err := s.repo.GetExamByID(ctx, tx, req.ExamID)
 	if err != nil {
@@ -618,11 +529,16 @@ func (s *examService) CreateExamSchedule(ctx context.Context, req CreateExamSche
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, schedule); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Send notification after commit
 	studentIDs, _ := s.getStudentIDsForTerm(ctx, exam.TermID)
 	companyID, _ := s.getCompanyIDForTerm(ctx, exam.TermID)
 	if companyID != uuid.Nil {
@@ -779,9 +695,9 @@ func (s *examService) DeleteExamSchedule(ctx context.Context, id uuid.UUID) erro
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Exam Result methods
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Exam Result (idempotency added)
+// ----------------------------------------------------------------------
 
 func (s *examService) CreateExamResult(ctx context.Context, req CreateExamResultRequest) (*models.ExamResult, error) {
 	logger := s.logger.With(
@@ -800,6 +716,15 @@ func (s *examService) CreateExamResult(ctx context.Context, req CreateExamResult
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.ExamResult
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	exam, err := s.repo.GetExamByID(ctx, tx, req.ExamID)
 	if err != nil || exam == nil {
@@ -829,11 +754,11 @@ func (s *examService) CreateExamResult(ctx context.Context, req CreateExamResult
 		return nil, fmt.Errorf("%w: subject %s not scheduled for this exam", ErrInvalidInput, req.SubjectID)
 	}
 
-	existing, err := s.repo.GetExamResultsByExamAndEnrollment(ctx, tx, req.ExamID, req.EnrollmentID)
+	existingResults, err := s.repo.GetExamResultsByExamAndEnrollment(ctx, tx, req.ExamID, req.EnrollmentID)
 	if err != nil {
 		return nil, err
 	}
-	for _, r := range existing {
+	for _, r := range existingResults {
 		if r.SubjectID == req.SubjectID {
 			return nil, fmt.Errorf("%w: result already exists for this subject and exam", ErrDuplicate)
 		}
@@ -874,11 +799,16 @@ func (s *examService) CreateExamResult(ctx context.Context, req CreateExamResult
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, result); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Send notification to the specific student
 	studentID := enrollment.StudentID
 	companyID, _ := s.getCompanyIDForTerm(ctx, exam.TermID)
 	if companyID != uuid.Nil && studentID != uuid.Nil {
@@ -903,6 +833,15 @@ func (s *examService) BulkCreateExamResults(ctx context.Context, reqs []CreateEx
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing []*models.ExamResult
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent bulk request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	for i, req := range reqs {
 		if err := s.validateExamResultCreate(req); err != nil {
@@ -998,11 +937,16 @@ func (s *examService) BulkCreateExamResults(ctx context.Context, reqs []CreateEx
 		}
 	}
 
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, results); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Send notifications for each result after commit
 	for _, res := range results {
 		enrollment, _ := s.enrollmentRepo.GetByIDUnsafe(ctx, s.pgClient.DB, res.EnrollmentID)
 		if enrollment == nil {
@@ -1153,9 +1097,9 @@ func (s *examService) DeleteExamResult(ctx context.Context, id uuid.UUID) error 
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Exam Grade methods (unchanged)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Exam Grade (idempotency added)
+// ----------------------------------------------------------------------
 
 func (s *examService) CreateExamGrade(ctx context.Context, req CreateExamGradeRequest) (*models.ExamGrade, error) {
 	logger := s.logger.With(
@@ -1173,6 +1117,15 @@ func (s *examService) CreateExamGrade(ctx context.Context, req CreateExamGradeRe
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var existing *models.ExamGrade
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached response")
+			return existing, nil
+		}
+	}
 
 	exam, err := s.repo.GetExamByID(ctx, tx, req.ExamID)
 	if err != nil || exam == nil {
@@ -1220,6 +1173,12 @@ func (s *examService) CreateExamGrade(ctx context.Context, req CreateExamGradeRe
 	}
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return nil, fmt.Errorf("store outbox event: %w", err)
+	}
+
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, grade); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1369,9 +1328,9 @@ func (s *examService) DeleteExamGrade(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Validation helpers (unchanged)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Validation helpers
+// ----------------------------------------------------------------------
 
 func (s *examService) validateExamCreate(req CreateExamRequest) error {
 	if req.AcademicYearID == uuid.Nil {
@@ -1438,4 +1397,94 @@ func (s *examService) validateExamGradeCreate(req CreateExamGradeRequest) error 
 		return fmt.Errorf("%w: max_marks must be greater than min_marks", ErrInvalidInput)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------
+// Request structs with JSON tags (snake_case)
+// ---------------------------------------------------------------------
+
+type CreateExamRequest struct {
+	AcademicYearID uuid.UUID  `json:"academic_year_id"`
+	TermID         uuid.UUID  `json:"term_id"`
+	ExamName       string     `json:"exam_name"`
+	StartDate      time.Time  `json:"start_date"`
+	EndDate        time.Time  `json:"end_date"`
+	Description    string     `json:"description"`
+	IsActive       bool       `json:"is_active"`
+	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+type UpdateExamRequest struct {
+	ExamID      uuid.UUID  `json:"exam_id"`
+	TermID      uuid.UUID  `json:"term_id"`
+	ExamName    string     `json:"exam_name"`
+	StartDate   time.Time  `json:"start_date"`
+	EndDate     time.Time  `json:"end_date"`
+	Description string     `json:"description"`
+	IsActive    bool       `json:"is_active"`
+	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+type CreateExamScheduleRequest struct {
+	ExamID       uuid.UUID  `json:"exam_id"`
+	SubjectID    uuid.UUID  `json:"subject_id"`
+	Date         time.Time  `json:"date"`
+	StartTime    *time.Time `json:"start_time,omitempty"`
+	EndTime      *time.Time `json:"end_time,omitempty"`
+	RoomID       *uuid.UUID `json:"room_id,omitempty"`
+	MaxMarks     float64    `json:"max_marks"`
+	PassingMarks float64    `json:"passing_marks"`
+	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedBy    *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+type UpdateExamScheduleRequest struct {
+	ScheduleID   uuid.UUID  `json:"schedule_id"`
+	SubjectID    uuid.UUID  `json:"subject_id"`
+	Date         time.Time  `json:"date"`
+	StartTime    *time.Time `json:"start_time,omitempty"`
+	EndTime      *time.Time `json:"end_time,omitempty"`
+	RoomID       *uuid.UUID `json:"room_id,omitempty"`
+	MaxMarks     float64    `json:"max_marks"`
+	PassingMarks float64    `json:"passing_marks"`
+	UpdatedBy    *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+type CreateExamResultRequest struct {
+	ExamID        uuid.UUID  `json:"exam_id"`
+	EnrollmentID  uuid.UUID  `json:"enrollment_id"`
+	SubjectID     uuid.UUID  `json:"subject_id"`
+	MarksObtained *float64   `json:"marks_obtained,omitempty"`
+	Grade         string     `json:"grade,omitempty"`
+	Remarks       string     `json:"remarks,omitempty"`
+	EnteredBy     *uuid.UUID `json:"entered_by,omitempty"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type UpdateExamResultRequest struct {
+	ResultID      uuid.UUID  `json:"result_id"`
+	MarksObtained *float64   `json:"marks_obtained,omitempty"`
+	Grade         string     `json:"grade,omitempty"`
+	Remarks       string     `json:"remarks,omitempty"`
+	EnteredBy     *uuid.UUID `json:"entered_by,omitempty"`
+	UpdatedBy     *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+type CreateExamGradeRequest struct {
+	ExamID     uuid.UUID  `json:"exam_id"`
+	GradeName  string     `json:"grade_name"`
+	MinMarks   float64    `json:"min_marks"`
+	MaxMarks   float64    `json:"max_marks"`
+	GradePoint float64    `json:"grade_point"`
+	CreatedBy  *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type UpdateExamGradeRequest struct {
+	GradeID    uuid.UUID  `json:"grade_id"`
+	GradeName  string     `json:"grade_name"`
+	MinMarks   float64    `json:"min_marks"`
+	MaxMarks   float64    `json:"max_marks"`
+	GradePoint float64    `json:"grade_point"`
+	UpdatedBy  *uuid.UUID `json:"updated_by,omitempty"`
 }

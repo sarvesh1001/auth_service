@@ -115,23 +115,6 @@ func (s *gradingService) createNotification(ctx context.Context, companyID uuid.
 // GradingPolicy methods
 // ----------------------------------------------------------------------
 
-type CreateGradingPolicyRequest struct {
-	CompanyID    uuid.UUID
-	PolicyName   string
-	GradingScale models.GradingScale
-	IsDefault    bool
-	CreatedBy    *uuid.UUID
-	UpdatedBy    *uuid.UUID
-}
-
-type UpdateGradingPolicyRequest struct {
-	PolicyID     uuid.UUID
-	PolicyName   string
-	GradingScale models.GradingScale
-	IsDefault    bool
-	UpdatedBy    *uuid.UUID
-}
-
 func (s *gradingService) CreateGradingPolicy(ctx context.Context, req CreateGradingPolicyRequest, idempotencyKey string) (*models.GradingPolicy, error) {
 	logger := s.logger.With(
 		zap.String("method", "CreateGradingPolicy"),
@@ -438,22 +421,6 @@ func (s *gradingService) unsetDefaultPolicy(ctx context.Context, tx *sql.Tx, com
 // GradeBoundary methods
 // ----------------------------------------------------------------------
 
-type CreateGradeBoundaryRequest struct {
-	PolicyID      uuid.UUID
-	Grade         string
-	MinPercentage float64
-	MaxPercentage float64
-	GradePoint    *float64
-}
-
-type UpdateGradeBoundaryRequest struct {
-	BoundaryID    uuid.UUID
-	Grade         string
-	MinPercentage float64
-	MaxPercentage float64
-	GradePoint    *float64
-}
-
 func (s *gradingService) CreateGradeBoundary(ctx context.Context, req CreateGradeBoundaryRequest) (*models.GradeBoundary, error) {
 	logger := s.logger.With(
 		zap.String("method", "CreateGradeBoundary"),
@@ -634,15 +601,23 @@ func (s *gradingService) ListGradeBoundaries(ctx context.Context, filter reposit
 }
 
 func (s *gradingService) UpdateGradeBoundary(ctx context.Context, req UpdateGradeBoundaryRequest) (*models.GradeBoundary, error) {
-	logger := s.logger.With(zap.String("method", "UpdateGradeBoundary"), zap.String("boundary_id", req.BoundaryID.String()))
+	logger := s.logger.With(
+		zap.String("method", "UpdateGradeBoundary"),
+		zap.String("boundary_id", req.BoundaryID.String()),
+	)
 
-	if err := s.validateGradeBoundaryInput(CreateGradeBoundaryRequest{
-		Grade:         req.Grade,
-		MinPercentage: req.MinPercentage,
-		MaxPercentage: req.MaxPercentage,
-		GradePoint:    req.GradePoint,
-	}); err != nil {
-		return nil, err
+	// Validate only the fields that are actually updatable (PolicyID is not needed for an update)
+	if strings.TrimSpace(req.Grade) == "" {
+		return nil, fmt.Errorf("%w: grade is required", ErrInvalidInput)
+	}
+	if req.MinPercentage < 0 || req.MaxPercentage < 0 {
+		return nil, fmt.Errorf("%w: percentages cannot be negative", ErrInvalidInput)
+	}
+	if req.MinPercentage > req.MaxPercentage {
+		return nil, fmt.Errorf("%w: min_percentage must be <= max_percentage", ErrInvalidInput)
+	}
+	if req.GradePoint != nil && *req.GradePoint < 0 {
+		return nil, fmt.Errorf("%w: grade_point cannot be negative", ErrInvalidInput)
 	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -660,7 +635,6 @@ func (s *gradingService) UpdateGradeBoundary(ctx context.Context, req UpdateGrad
 	}
 
 	oldBoundary := *boundary
-
 	boundary.Grade = req.Grade
 	boundary.MinPercentage = req.MinPercentage
 	boundary.MaxPercentage = req.MaxPercentage
@@ -700,22 +674,21 @@ func (s *gradingService) UpdateGradeBoundary(ctx context.Context, req UpdateGrad
 				&boundary.BoundaryID, "user", nil, nil, nil, nil)
 		}
 	}
-
 	if s.eventPublisher != nil {
 		_ = s.eventPublisher.Publish(ctx, Event{Type: EventGradeBoundaryUpdated, Data: boundary})
 	}
 
-	// Send notification
 	policy, _ := s.repo.GetGradingPolicyByID(ctx, s.pgClient.DB, boundary.PolicyID)
 	if policy != nil {
 		title := "Grade Boundary Updated"
-		message := fmt.Sprintf("Grade boundary for '%s' has been updated (old: %0.1f-%0.1f%%, new: %0.1f-%0.1f%%).", oldBoundary.Grade, oldBoundary.MinPercentage, oldBoundary.MaxPercentage, boundary.MinPercentage, boundary.MaxPercentage)
+		message := fmt.Sprintf("Grade boundary for '%s' has been updated (old: %0.1f-%0.1f%%, new: %0.1f-%0.1f%%).",
+			oldBoundary.Grade, oldBoundary.MinPercentage, oldBoundary.MaxPercentage,
+			boundary.MinPercentage, boundary.MaxPercentage)
 		s.createNotification(ctx, policy.CompanyID, title, message, models.NotificationTypeInfo, models.PriorityLow, nil)
 	}
 
 	return boundary, nil
 }
-
 func (s *gradingService) DeleteGradeBoundary(ctx context.Context, id uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteGradeBoundary"), zap.String("boundary_id", id.String()))
 
@@ -879,4 +852,37 @@ func (s *gradingService) validateGradeBoundaryInput(req CreateGradeBoundaryReque
 		return fmt.Errorf("%w: grade_point cannot be negative", ErrInvalidInput)
 	}
 	return nil
+}
+
+type CreateGradingPolicyRequest struct {
+	CompanyID    uuid.UUID           `json:"company_id,omitempty"`
+	PolicyName   string              `json:"policy_name"`
+	GradingScale models.GradingScale `json:"grading_scale"`
+	IsDefault    bool                `json:"is_default"`
+	CreatedBy    *uuid.UUID          `json:"created_by,omitempty"`
+	UpdatedBy    *uuid.UUID          `json:"updated_by,omitempty"`
+}
+
+type UpdateGradingPolicyRequest struct {
+	PolicyID     uuid.UUID           `json:"policy_id"`
+	PolicyName   string              `json:"policy_name"`
+	GradingScale models.GradingScale `json:"grading_scale"`
+	IsDefault    bool                `json:"is_default"`
+	UpdatedBy    *uuid.UUID          `json:"updated_by,omitempty"`
+}
+
+type CreateGradeBoundaryRequest struct {
+	PolicyID      uuid.UUID `json:"policy_id"`
+	Grade         string    `json:"grade"`
+	MinPercentage float64   `json:"min_percentage"`
+	MaxPercentage float64   `json:"max_percentage"`
+	GradePoint    *float64  `json:"grade_point,omitempty"`
+}
+
+type UpdateGradeBoundaryRequest struct {
+	BoundaryID    uuid.UUID `json:"boundary_id"`
+	Grade         string    `json:"grade"`
+	MinPercentage float64   `json:"min_percentage"`
+	MaxPercentage float64   `json:"max_percentage"`
+	GradePoint    *float64  `json:"grade_point,omitempty"`
 }

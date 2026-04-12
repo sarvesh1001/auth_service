@@ -1150,12 +1150,10 @@ func (h *FeeHandler) GenerateReceipt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ReceiptNo == "" {
-		h.respondWithError(w, http.StatusBadRequest, "receipt_no is required")
-		return
-	}
+	// Extract idempotency key from header
+	idempotencyKey := r.Header.Get("Idempotency-Key")
 
-	receipt, err := h.feeService.GenerateReceipt(ctx, paymentID, req.ReceiptNo)
+	receipt, err := h.feeService.GenerateReceipt(ctx, paymentID, req.ReceiptNo, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to generate receipt",
 			zap.String("payment_id", paymentID.String()),

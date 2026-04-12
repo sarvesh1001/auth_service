@@ -39,14 +39,32 @@ func NewAuditRepository(postgresClient *client.PostgresClient, logger *zap.Logge
 func (r *AuditRepositoryImpl) CreateAuditLog(ctx context.Context, log *AuditLog) error {
 	startTime := time.Now()
 	query := `
-		INSERT INTO audit.audit_logs (
-			audit_id, company_id, module, action, entity_type, entity_id,
-			actor_type, actor_id, before_state, after_state, metadata, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+        INSERT INTO audit.audit_logs (
+            audit_id, company_id, module, action, entity_type, entity_id,
+            actor_type, actor_id, before_state, after_state, metadata, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+
+	// Convert empty []byte to nil (PostgreSQL NULL)
+	var beforeState, afterState, metadata interface{}
+	if len(log.BeforeState) == 0 {
+		beforeState = nil
+	} else {
+		beforeState = log.BeforeState
+	}
+	if len(log.AfterState) == 0 {
+		afterState = nil
+	} else {
+		afterState = log.AfterState
+	}
+	if len(log.Metadata) == 0 {
+		metadata = nil
+	} else {
+		metadata = log.Metadata
+	}
 
 	_, err := r.client.Exec(ctx, query,
 		log.AuditID, log.CompanyID, log.Module, log.Action, log.EntityType, log.EntityID,
-		log.ActorType, log.ActorID, log.BeforeState, log.AfterState, log.Metadata, log.CreatedAt,
+		log.ActorType, log.ActorID, beforeState, afterState, metadata, log.CreatedAt,
 	)
 	if err != nil {
 		r.logger.Error("Failed to create audit log",
@@ -83,9 +101,27 @@ func (r *AuditRepositoryImpl) CreateAuditLogBatch(ctx context.Context, logs []*A
 	defer stmt.Close()
 
 	for _, log := range logs {
+		// Convert empty []byte to nil for each log in batch
+		var beforeState, afterState, metadata interface{}
+		if len(log.BeforeState) == 0 {
+			beforeState = nil
+		} else {
+			beforeState = log.BeforeState
+		}
+		if len(log.AfterState) == 0 {
+			afterState = nil
+		} else {
+			afterState = log.AfterState
+		}
+		if len(log.Metadata) == 0 {
+			metadata = nil
+		} else {
+			metadata = log.Metadata
+		}
+
 		_, err := stmt.ExecContext(ctx,
 			log.AuditID, log.CompanyID, log.Module, log.Action, log.EntityType, log.EntityID,
-			log.ActorType, log.ActorID, log.BeforeState, log.AfterState, log.Metadata, log.CreatedAt,
+			log.ActorType, log.ActorID, beforeState, afterState, metadata, log.CreatedAt,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert audit log %s: %w", log.AuditID, err)
@@ -98,17 +134,34 @@ func (r *AuditRepositoryImpl) CreateAuditLogBatch(ctx context.Context, logs []*A
 	return nil
 }
 
-// ✅ NEW: Transaction‑aware create
 func (r *AuditRepositoryImpl) CreateAuditLogWithTx(ctx context.Context, tx *sql.Tx, log *AuditLog) error {
 	query := `
-		INSERT INTO audit.audit_logs (
-			audit_id, company_id, module, action, entity_type, entity_id,
-			actor_type, actor_id, before_state, after_state, metadata, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+        INSERT INTO audit.audit_logs (
+            audit_id, company_id, module, action, entity_type, entity_id,
+            actor_type, actor_id, before_state, after_state, metadata, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
+
+	// Convert empty []byte to nil (PostgreSQL NULL)
+	var beforeState, afterState, metadata interface{}
+	if len(log.BeforeState) == 0 {
+		beforeState = nil
+	} else {
+		beforeState = log.BeforeState
+	}
+	if len(log.AfterState) == 0 {
+		afterState = nil
+	} else {
+		afterState = log.AfterState
+	}
+	if len(log.Metadata) == 0 {
+		metadata = nil
+	} else {
+		metadata = log.Metadata
+	}
 
 	_, err := tx.ExecContext(ctx, query,
 		log.AuditID, log.CompanyID, log.Module, log.Action, log.EntityType, log.EntityID,
-		log.ActorType, log.ActorID, log.BeforeState, log.AfterState, log.Metadata, log.CreatedAt,
+		log.ActorType, log.ActorID, beforeState, afterState, metadata, log.CreatedAt,
 	)
 	if err != nil {
 		r.logger.Error("Failed to create audit log (with tx)",

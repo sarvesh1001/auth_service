@@ -1,4 +1,3 @@
-// File: internal/consumer/student_consumer.go
 package consumer
 
 import (
@@ -16,43 +15,33 @@ import (
 	"auth-service/internal/util"
 )
 
-// StudentConsumer consumes student, academic-year, notification, teacher, room,
-// guardian, admission, assignment, submission, attendance, exam, grading, fee,
-// library, and transport events from Kafka, applies retry logic, and sends permanently
-// failed messages to a DLQ.
 type StudentConsumer struct {
 	kafkaConsumers map[string]*client.KafkaConsumer
 	logger         *zap.Logger
 	maxRetries     int
-	producer       *kafka.Writer // for retries and DLQ
+	producer       *kafka.Writer
 }
 
-// NewStudentConsumer creates a new StudentConsumer.
-// It expects a map of topic → KafkaConsumer and uses the same brokers for producing.
 func NewStudentConsumer(
 	kafkaConsumers map[string]*client.KafkaConsumer,
 	brokers []string,
 ) *StudentConsumer {
 	logger := util.Get().Named("student_consumer")
-
 	topics := make([]string, 0, len(kafkaConsumers))
 	for t := range kafkaConsumers {
 		topics = append(topics, t)
 	}
-
 	producer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
 		Balancer:     &kafka.LeastBytes{},
 		RequiredAcks: kafka.RequireOne,
 		Async:        false,
 	}
-
 	logger.Info("Student consumer initialized",
 		zap.Strings("topics", topics),
 		zap.Int("topic_count", len(topics)),
 		zap.Int("max_retries", 3),
 	)
-
 	return &StudentConsumer{
 		kafkaConsumers: kafkaConsumers,
 		logger:         logger,
@@ -61,27 +50,22 @@ func NewStudentConsumer(
 	}
 }
 
-// Start begins consuming from all assigned topics.
 func (c *StudentConsumer) Start(ctx context.Context) error {
 	c.logger.Info("Student consumer started")
-
 	for topic, kc := range c.kafkaConsumers {
 		go c.consumeTopic(ctx, topic, kc)
 	}
-
 	<-ctx.Done()
 	c.logger.Info("Student consumer stopped")
 	return ctx.Err()
 }
 
-// consumeTopic runs the consumption loop for a single topic.
 func (c *StudentConsumer) consumeTopic(
 	ctx context.Context,
 	topic string,
 	kc *client.KafkaConsumer,
 ) {
 	c.logger.Info("started topic consumer", zap.String("topic", topic))
-
 	for {
 		msg, err := kc.ConsumeMessage(ctx)
 		if err != nil {
@@ -95,10 +79,8 @@ func (c *StudentConsumer) consumeTopic(
 			time.Sleep(time.Second)
 			continue
 		}
-
 		eventType := c.extractEventType(msg)
 		retryCount := c.getRetryCount(msg)
-
 		err = c.handleEvent(ctx, eventType, msg.Value)
 		if err != nil {
 			c.logger.Error("event processing failed",
@@ -106,7 +88,6 @@ func (c *StudentConsumer) consumeTopic(
 				zap.Int("retry", retryCount),
 				zap.Error(err),
 			)
-
 			if retryCount < c.maxRetries {
 				c.logger.Warn("retrying event",
 					zap.String("event_type", eventType),
@@ -125,7 +106,6 @@ func (c *StudentConsumer) consumeTopic(
 					continue
 				}
 			}
-
 			if commitErr := kc.CommitMessage(ctx, msg); commitErr != nil {
 				c.logger.Error("failed to commit original message",
 					zap.String("topic", topic),
@@ -134,7 +114,6 @@ func (c *StudentConsumer) consumeTopic(
 			}
 			continue
 		}
-
 		if err := kc.CommitMessage(ctx, msg); err != nil {
 			c.logger.Error("failed to commit message",
 				zap.String("topic", topic),
@@ -144,10 +123,8 @@ func (c *StudentConsumer) consumeTopic(
 	}
 }
 
-// handleEvent routes the event to the appropriate handler.
 func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, payload []byte) error {
 	switch eventType {
-	// Student events
 	case "student.created":
 		return c.handleStudentCreated(ctx, payload)
 	case "student.updated":
@@ -168,8 +145,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleStudentDeactivated(ctx, payload)
 	case "student.bulk_status_updated":
 		return c.handleStudentBulkStatusUpdated(ctx, payload)
-
-	// Academic year events
 	case "academic_year.created":
 		return c.handleAcademicYearCreated(ctx, payload)
 	case "academic_year.updated":
@@ -178,8 +153,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleAcademicYearDeleted(ctx, payload)
 	case "academic_year.set_current":
 		return c.handleAcademicYearSetCurrent(ctx, payload)
-
-	// Notification events
 	case "notification.created":
 		return c.handleNotificationCreated(ctx, payload)
 	case "notification.updated":
@@ -190,8 +163,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleNotificationRead(ctx, payload)
 	case "notification.all_read":
 		return c.handleNotificationAllRead(ctx, payload)
-
-	// Teacher events
 	case "teacher.created":
 		return c.handleTeacherCreated(ctx, payload)
 	case "teacher.updated":
@@ -222,8 +193,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleTeacherSchedulePreferencesCleared(ctx, payload)
 	case "teacher.bulk_status_updated":
 		return c.handleTeacherBulkStatusUpdated(ctx, payload)
-
-	// Room events
 	case "room.created":
 		return c.handleRoomCreated(ctx, payload)
 	case "room.updated":
@@ -234,8 +203,12 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleRoomActivated(ctx, payload)
 	case "room.deactivated":
 		return c.handleRoomDeactivated(ctx, payload)
-
-	// Guardian events
+	case "course.created":
+		return c.handleCourseCreated(ctx, payload)
+	case "course.updated":
+		return c.handleCourseUpdated(ctx, payload)
+	case "course.deleted":
+		return c.handleCourseDeleted(ctx, payload)
 	case "guardian.created":
 		return c.handleGuardianCreated(ctx, payload)
 	case "guardian.updated":
@@ -244,8 +217,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleGuardianDeleted(ctx, payload)
 	case "guardian.primary_set":
 		return c.handleGuardianPrimarySet(ctx, payload)
-
-	// Admission events
 	case "admission.created":
 		return c.handleAdmissionCreated(ctx, payload)
 	case "admission.updated":
@@ -254,8 +225,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleAdmissionStatusUpdated(ctx, payload)
 	case "admission.deleted":
 		return c.handleAdmissionDeleted(ctx, payload)
-
-	// Assignment events
 	case "assignment.created":
 		return c.handleAssignmentCreated(ctx, payload)
 	case "assignment.updated":
@@ -264,8 +233,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleAssignmentDeleted(ctx, payload)
 	case "assignment.published":
 		return c.handleAssignmentPublished(ctx, payload)
-
-	// Submission events
 	case "submission.created":
 		return c.handleSubmissionCreated(ctx, payload)
 	case "submission.updated":
@@ -276,8 +243,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleSubmissionGraded(ctx, payload)
 	case "submission.comment_added":
 		return c.handleSubmissionCommentAdded(ctx, payload)
-
-	// Attendance events
 	case "attendance.marked":
 		return c.handleAttendanceMarked(ctx, payload)
 	case "attendance.bulk_marked":
@@ -290,8 +255,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleAttendanceExemptionUpdated(ctx, payload)
 	case "attendance.exemption_deleted":
 		return c.handleAttendanceExemptionDeleted(ctx, payload)
-
-	// Exam events
 	case "exam.created":
 		return c.handleExamCreated(ctx, payload)
 	case "exam.updated":
@@ -316,8 +279,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleExamGradeUpdated(ctx, payload)
 	case "exam_grade.deleted":
 		return c.handleExamGradeDeleted(ctx, payload)
-
-	// Grading events
 	case "grading_policy.created":
 		return c.handleGradingPolicyCreated(ctx, payload)
 	case "grading_policy.updated":
@@ -330,8 +291,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleGradeBoundaryUpdated(ctx, payload)
 	case "grade_boundary.deleted":
 		return c.handleGradeBoundaryDeleted(ctx, payload)
-
-	// Fee events
 	case "fee_structure.created":
 		return c.handleFeeStructureCreated(ctx, payload)
 	case "fee_structure.updated":
@@ -354,8 +313,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleFeePenaltyCreated(ctx, payload)
 	case "fee_receipt.generated":
 		return c.handleFeeReceiptGenerated(ctx, payload)
-
-	// Library events
 	case "library_category.created":
 		return c.handleLibraryCategoryCreated(ctx, payload)
 	case "library_category.updated":
@@ -380,8 +337,6 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleLibraryBookReturned(ctx, payload)
 	case "library_fine.paid":
 		return c.handleLibraryFinePaid(ctx, payload)
-
-	// Transport events
 	case "transport.route.created":
 		return c.handleTransportRouteCreated(ctx, payload)
 	case "transport.route.updated":
@@ -412,14 +367,50 @@ func (c *StudentConsumer) handleEvent(ctx context.Context, eventType string, pay
 		return c.handleTransportStudentAssignmentUpdated(ctx, payload)
 	case "transport.student_assignment.deleted":
 		return c.handleTransportStudentAssignmentDeleted(ctx, payload)
-
+	case "section.created":
+		return c.handleSectionCreated(ctx, payload)
+	case "section.updated":
+		return c.handleSectionUpdated(ctx, payload)
+	case "section.deleted":
+		return c.handleSectionDeleted(ctx, payload)
+	// Subject events
+	case "subject.created":
+		return c.handleSubjectCreated(ctx, payload)
+	case "subject.updated":
+		return c.handleSubjectUpdated(ctx, payload)
+	case "subject.deleted":
+		return c.handleSubjectDeleted(ctx, payload)
+	case "subject.assigned":
+		return c.handleSubjectAssigned(ctx, payload)
+	case "subject.unassigned":
+		return c.handleSubjectUnassigned(ctx, payload)
+	// Enrollment events
+	case "enrollment.created":
+		return c.handleEnrollmentCreated(ctx, payload)
+	case "enrollment.updated":
+		return c.handleEnrollmentUpdated(ctx, payload)
+	case "enrollment.deleted":
+		return c.handleEnrollmentDeleted(ctx, payload)
+	case "enrollment.activated":
+		return c.handleEnrollmentActivated(ctx, payload)
+	case "enrollment.completed":
+		return c.handleEnrollmentCompleted(ctx, payload)
+	case "enrollment.withdrawn":
+		return c.handleEnrollmentWithdrawn(ctx, payload)
+	case "enrollment.transferred":
+		return c.handleEnrollmentTransferred(ctx, payload)
+	case "enrollment.promoted":
+		return c.handleEnrollmentPromoted(ctx, payload)
+	// Term events (ignored)
+	case "term.created", "term.updated", "term.deleted", "term.set_current":
+		return nil
 	default:
 		c.logger.Warn("unknown event type", zap.String("event_type", eventType))
 		return nil
 	}
 }
 
-// ----- Student event handlers (unchanged) -----
+// ---------- Student Event Handlers ----------
 func (c *StudentConsumer) handleStudentCreated(ctx context.Context, payload []byte) error {
 	var student models.Student
 	if err := json.Unmarshal(payload, &student); err != nil {
@@ -513,7 +504,7 @@ func (c *StudentConsumer) handleStudentBulkStatusUpdated(ctx context.Context, pa
 	return nil
 }
 
-// ----- Academic year event handlers (unchanged) -----
+// ---------- Academic Year Event Handlers ----------
 func (c *StudentConsumer) handleAcademicYearCreated(ctx context.Context, payload []byte) error {
 	var ay models.AcademicYear
 	if err := json.Unmarshal(payload, &ay); err != nil {
@@ -561,7 +552,7 @@ func (c *StudentConsumer) handleAcademicYearSetCurrent(ctx context.Context, payl
 	return nil
 }
 
-// ----- Notification event handlers (unchanged) -----
+// ---------- Notification Event Handlers ----------
 type NotificationEvent struct {
 	NotificationID uuid.UUID `json:"notification_id"`
 	Title          string    `json:"title"`
@@ -628,7 +619,7 @@ func (c *StudentConsumer) handleNotificationAllRead(ctx context.Context, payload
 	return nil
 }
 
-// ----- Teacher event handlers (unchanged) -----
+// ---------- Teacher Event Handlers ----------
 func (c *StudentConsumer) handleTeacherCreated(ctx context.Context, payload []byte) error {
 	var teacher models.Teacher
 	if err := json.Unmarshal(payload, &teacher); err != nil {
@@ -774,7 +765,7 @@ func (c *StudentConsumer) handleTeacherBulkStatusUpdated(ctx context.Context, pa
 	return nil
 }
 
-// ----- Room event handlers (unchanged) -----
+// ---------- Room Event Handlers ----------
 func (c *StudentConsumer) handleRoomCreated(ctx context.Context, payload []byte) error {
 	var room models.Room
 	if err := json.Unmarshal(payload, &room); err != nil {
@@ -827,7 +818,45 @@ func (c *StudentConsumer) handleRoomDeactivated(ctx context.Context, payload []b
 	return nil
 }
 
-// ----- Guardian event handlers (unchanged) -----
+// ---------- Course Event Handlers ----------
+func (c *StudentConsumer) handleCourseCreated(ctx context.Context, payload []byte) error {
+	var course models.Course
+	if err := json.Unmarshal(payload, &course); err != nil {
+		return err
+	}
+	c.logger.Info("course created event",
+		zap.String("course_id", course.CourseID.String()),
+		zap.String("company_id", course.CompanyID.String()),
+		zap.String("code", course.Code),
+		zap.String("name", course.Name),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleCourseUpdated(ctx context.Context, payload []byte) error {
+	var course models.Course
+	if err := json.Unmarshal(payload, &course); err != nil {
+		return err
+	}
+	c.logger.Info("course updated event",
+		zap.String("course_id", course.CourseID.String()),
+		zap.String("code", course.Code),
+		zap.String("name", course.Name),
+		zap.Bool("is_active", course.IsActive),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleCourseDeleted(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	c.logger.Info("course deleted event", zap.Any("data", data))
+	return nil
+}
+
+// ---------- Guardian Event Handlers ----------
 func (c *StudentConsumer) handleGuardianCreated(ctx context.Context, payload []byte) error {
 	var guardian models.Guardian
 	if err := json.Unmarshal(payload, &guardian); err != nil {
@@ -881,7 +910,7 @@ func (c *StudentConsumer) handleGuardianPrimarySet(ctx context.Context, payload 
 	return nil
 }
 
-// ----- Admission event handlers (unchanged) -----
+// ---------- Admission Event Handlers ----------
 func (c *StudentConsumer) handleAdmissionCreated(ctx context.Context, payload []byte) error {
 	var admission models.Admission
 	if err := json.Unmarshal(payload, &admission); err != nil {
@@ -932,7 +961,7 @@ func (c *StudentConsumer) handleAdmissionDeleted(ctx context.Context, payload []
 	return nil
 }
 
-// ----- Assignment event handlers (unchanged) -----
+// ---------- Assignment Event Handlers ----------
 func (c *StudentConsumer) handleAssignmentCreated(ctx context.Context, payload []byte) error {
 	var assignment models.Assignment
 	if err := json.Unmarshal(payload, &assignment); err != nil {
@@ -982,7 +1011,7 @@ func (c *StudentConsumer) handleAssignmentPublished(ctx context.Context, payload
 	return nil
 }
 
-// ----- Submission event handlers (unchanged) -----
+// ---------- Submission Event Handlers ----------
 type SubmissionEvent struct {
 	SubmissionID uuid.UUID  `json:"submission_id"`
 	AssignmentID uuid.UUID  `json:"assignment_id"`
@@ -1064,7 +1093,7 @@ func (c *StudentConsumer) handleSubmissionCommentAdded(ctx context.Context, payl
 	return nil
 }
 
-// ----- Attendance event handlers (unchanged) -----
+// ---------- Attendance Event Handlers ----------
 type AttendanceEvent struct {
 	AttendanceID   uuid.UUID  `json:"attendance_id,omitempty"`
 	EnrollmentID   uuid.UUID  `json:"enrollment_id"`
@@ -1154,7 +1183,7 @@ func (c *StudentConsumer) handleAttendanceExemptionDeleted(ctx context.Context, 
 	return nil
 }
 
-// ----- Exam event handlers (unchanged) -----
+// ---------- Exam Event Handlers ----------
 func (c *StudentConsumer) handleExamCreated(ctx context.Context, payload []byte) error {
 	var exam models.Exam
 	if err := json.Unmarshal(payload, &exam); err != nil {
@@ -1282,7 +1311,7 @@ func (c *StudentConsumer) handleExamGradeDeleted(ctx context.Context, payload []
 	return nil
 }
 
-// ----- Grading event handlers (unchanged) -----
+// ---------- Grading Policy & Boundary Event Handlers ----------
 func (c *StudentConsumer) handleGradingPolicyCreated(ctx context.Context, payload []byte) error {
 	var policy models.GradingPolicy
 	if err := json.Unmarshal(payload, &policy); err != nil {
@@ -1358,7 +1387,7 @@ func (c *StudentConsumer) handleGradeBoundaryDeleted(ctx context.Context, payloa
 	return nil
 }
 
-// ----- Fee event handlers (unchanged) -----
+// ---------- Fee Event Handlers ----------
 func (c *StudentConsumer) handleFeeStructureCreated(ctx context.Context, payload []byte) error {
 	var fs models.FeeStructure
 	if err := json.Unmarshal(payload, &fs); err != nil {
@@ -1500,7 +1529,7 @@ func (c *StudentConsumer) handleFeeReceiptGenerated(ctx context.Context, payload
 	return nil
 }
 
-// ----- Library event handlers (unchanged) -----
+// ---------- Library Event Handlers ----------
 func (c *StudentConsumer) handleLibraryCategoryCreated(ctx context.Context, payload []byte) error {
 	var cat models.LibraryCategory
 	if err := json.Unmarshal(payload, &cat); err != nil {
@@ -1655,8 +1684,7 @@ func (c *StudentConsumer) handleLibraryFinePaid(ctx context.Context, payload []b
 	return nil
 }
 
-// ----- Transport event handlers -----
-
+// ---------- Transport Event Handlers ----------
 func (c *StudentConsumer) handleTransportRouteCreated(ctx context.Context, payload []byte) error {
 	var route models.TransportRoute
 	if err := json.Unmarshal(payload, &route); err != nil {
@@ -1827,8 +1855,271 @@ func (c *StudentConsumer) handleTransportStudentAssignmentDeleted(ctx context.Co
 	return nil
 }
 
-// ----- Helpers -----
+// ---------- Section Event Handlers ----------
+type SectionEvent struct {
+	SectionID uuid.UUID `json:"section_id"`
+	CourseID  uuid.UUID `json:"course_id"`
+	TermID    uuid.UUID `json:"term_id"`
+	Name      string    `json:"name"`
+	Capacity  int       `json:"capacity"`
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
 
+func (c *StudentConsumer) handleSectionCreated(ctx context.Context, payload []byte) error {
+	var event SectionEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		var data map[string]interface{}
+		if err2 := json.Unmarshal(payload, &data); err2 != nil {
+			return err
+		}
+		c.logger.Info("section created event (generic)", zap.Any("data", data))
+		return nil
+	}
+	c.logger.Info("section created event",
+		zap.String("section_id", event.SectionID.String()),
+		zap.String("course_id", event.CourseID.String()),
+		zap.String("term_id", event.TermID.String()),
+		zap.String("name", event.Name),
+		zap.Int("capacity", event.Capacity),
+		zap.Bool("is_active", event.IsActive),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleSectionUpdated(ctx context.Context, payload []byte) error {
+	var update struct {
+		Old SectionEvent `json:"old"`
+		New SectionEvent `json:"new"`
+	}
+	if err := json.Unmarshal(payload, &update); err == nil && update.New.SectionID != uuid.Nil {
+		c.logger.Info("section updated event",
+			zap.String("section_id", update.New.SectionID.String()),
+			zap.String("old_name", update.Old.Name),
+			zap.String("new_name", update.New.Name),
+			zap.Int("old_capacity", update.Old.Capacity),
+			zap.Int("new_capacity", update.New.Capacity),
+		)
+		return nil
+	}
+	var event SectionEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		var data map[string]interface{}
+		if err2 := json.Unmarshal(payload, &data); err2 != nil {
+			return err
+		}
+		c.logger.Info("section updated event (generic)", zap.Any("data", data))
+		return nil
+	}
+	c.logger.Info("section updated event (direct)",
+		zap.String("section_id", event.SectionID.String()),
+		zap.String("name", event.Name),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleSectionDeleted(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	sectionID, _ := data["section_id"].(string)
+	deletedBy, _ := data["deleted_by"].(string)
+	c.logger.Info("section deleted event",
+		zap.String("section_id", sectionID),
+		zap.String("deleted_by", deletedBy),
+	)
+	return nil
+}
+
+// ---------- Subject Event Handlers ----------
+func (c *StudentConsumer) handleSubjectCreated(ctx context.Context, payload []byte) error {
+	var subject models.Subject
+	if err := json.Unmarshal(payload, &subject); err != nil {
+		return err
+	}
+	c.logger.Info("subject created event",
+		zap.String("subject_id", subject.SubjectID.String()),
+		zap.String("company_id", subject.CompanyID.String()),
+		zap.String("code", subject.Code),
+		zap.String("name", subject.Name),
+		zap.Int("credits", subject.Credits),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleSubjectUpdated(ctx context.Context, payload []byte) error {
+	var update struct {
+		Old models.Subject `json:"old"`
+		New models.Subject `json:"new"`
+	}
+	if err := json.Unmarshal(payload, &update); err == nil && update.New.SubjectID != uuid.Nil {
+		c.logger.Info("subject updated event",
+			zap.String("subject_id", update.New.SubjectID.String()),
+			zap.String("old_code", update.Old.Code),
+			zap.String("new_code", update.New.Code),
+			zap.String("old_name", update.Old.Name),
+			zap.String("new_name", update.New.Name),
+		)
+		return nil
+	}
+	var subject models.Subject
+	if err := json.Unmarshal(payload, &subject); err != nil {
+		return err
+	}
+	c.logger.Info("subject updated event (direct)",
+		zap.String("subject_id", subject.SubjectID.String()),
+		zap.String("code", subject.Code),
+		zap.String("name", subject.Name),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleSubjectDeleted(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	subjectID, _ := data["subject_id"].(string)
+	deletedBy, _ := data["deleted_by"].(string)
+	c.logger.Info("subject deleted event",
+		zap.String("subject_id", subjectID),
+		zap.String("deleted_by", deletedBy),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleSubjectAssigned(ctx context.Context, payload []byte) error {
+	var mapping models.SubjectCourseMapping
+	if err := json.Unmarshal(payload, &mapping); err != nil {
+		return err
+	}
+	c.logger.Info("subject assigned to course",
+		zap.String("mapping_id", mapping.MappingID.String()),
+		zap.String("course_id", mapping.CourseID.String()),
+		zap.String("subject_id", mapping.SubjectID.String()),
+		zap.Int("term_number", mapping.TermNumber),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleSubjectUnassigned(ctx context.Context, payload []byte) error {
+	var mapping models.SubjectCourseMapping
+	if err := json.Unmarshal(payload, &mapping); err != nil {
+		return err
+	}
+	c.logger.Info("subject unassigned from course",
+		zap.String("mapping_id", mapping.MappingID.String()),
+		zap.String("course_id", mapping.CourseID.String()),
+		zap.String("subject_id", mapping.SubjectID.String()),
+	)
+	return nil
+}
+
+// ---------- Enrollment Event Handlers ----------
+func (c *StudentConsumer) handleEnrollmentCreated(ctx context.Context, payload []byte) error {
+	var enrollment models.Enrollment
+	if err := json.Unmarshal(payload, &enrollment); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment created event",
+		zap.String("enrollment_id", enrollment.EnrollmentID.String()),
+		zap.String("student_id", enrollment.StudentID.String()),
+		zap.String("section_id", enrollment.SectionID.String()),
+		zap.String("academic_year_id", enrollment.AcademicYearID.String()),
+		zap.String("status", enrollment.Status),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentUpdated(ctx context.Context, payload []byte) error {
+	var enrollment models.Enrollment
+	if err := json.Unmarshal(payload, &enrollment); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment updated event",
+		zap.String("enrollment_id", enrollment.EnrollmentID.String()),
+		zap.String("status", enrollment.Status),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentDeleted(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment deleted event",
+		zap.Any("data", data),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentActivated(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment activated event",
+		zap.Any("data", data),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentCompleted(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment completed event",
+		zap.Any("data", data),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentWithdrawn(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment withdrawn event",
+		zap.Any("data", data),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentTransferred(ctx context.Context, payload []byte) error {
+	var enrollment models.Enrollment
+	if err := json.Unmarshal(payload, &enrollment); err != nil {
+		// Fallback to generic data
+		var data map[string]interface{}
+		if err2 := json.Unmarshal(payload, &data); err2 != nil {
+			return err
+		}
+		c.logger.Info("enrollment transferred event (generic)", zap.Any("data", data))
+		return nil
+	}
+	c.logger.Info("enrollment transferred event",
+		zap.String("enrollment_id", enrollment.EnrollmentID.String()),
+		zap.String("student_id", enrollment.StudentID.String()),
+		zap.String("section_id", enrollment.SectionID.String()),
+	)
+	return nil
+}
+
+func (c *StudentConsumer) handleEnrollmentPromoted(ctx context.Context, payload []byte) error {
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return err
+	}
+	c.logger.Info("enrollment promoted event",
+		zap.Any("data", data),
+	)
+	return nil
+}
+
+// ---------- Helper Methods ----------
 func (c *StudentConsumer) extractEventType(msg *kafka.Message) string {
 	for _, h := range msg.Headers {
 		if h.Key == "event_type" {
@@ -1869,7 +2160,6 @@ func (c *StudentConsumer) publishRetry(ctx context.Context, original *kafka.Mess
 			Value: []byte(fmt.Sprintf("%d", newRetryCount)),
 		})
 	}
-
 	retryMsg := kafka.Message{
 		Topic:   original.Topic,
 		Key:     original.Key,

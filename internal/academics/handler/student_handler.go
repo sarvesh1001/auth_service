@@ -102,6 +102,9 @@ func (h *StudentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		req.Status = string(models.StudentActive)
 	}
 
+	// Extract idempotency key from context (set by IdempotencyMiddleware)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	// Prepare service request
 	createReq := service.CreateStudentRequest{
 		CompanyID:             companyID,
@@ -125,7 +128,7 @@ func (h *StudentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		UpdatedBy:             &userID,
 	}
 
-	student, err := h.studentService.Create(ctx, createReq, "")
+	student, err := h.studentService.Create(ctx, createReq, idempotencyKey)
 	if err != nil {
 		h.logger.Error("Failed to create student",
 			zap.String("company_id", companyID.String()),
@@ -322,10 +325,6 @@ func (h *StudentHandler) List(w http.ResponseWriter, r *http.Request) {
 	if status := r.URL.Query().Get("status"); status != "" {
 		filter.Status = &status
 	}
-	// Add other filters if they exist in StudentFilter. For example:
-	// if admissionNo := r.URL.Query().Get("admission_no"); admissionNo != "" {
-	//     filter.AdmissionNo = &admissionNo
-	// }
 	if sectionIDStr := r.URL.Query().Get("section_id"); sectionIDStr != "" {
 		if sectionID, err := uuid.Parse(sectionIDStr); err == nil {
 			filter.SectionID = &sectionID
@@ -1060,10 +1059,6 @@ func (h *StudentHandler) Search(w http.ResponseWriter, r *http.Request) {
 // ---------------------- Student Authentication -----------------------------
 
 // StudentLoginRequest is the body for student login.
-type StudentLoginRequest struct {
-	Identifier string `json:"identifier"` // email or phone
-	Password   string `json:"password"`
-}
 
 // StudentLoginResponse is the response for successful login.
 type StudentLoginResponse struct {
@@ -1080,7 +1075,12 @@ type StudentLoginResponse struct {
 	CompanyID    string `json:"company_id"`
 }
 
-// Login handles POST /api/v1/students/login (no company ID in path, as it's inside request)
+type StudentLoginRequest struct {
+	CompanyID  string `json:"company_id"`
+	Identifier string `json:"identifier"`
+	Password   string `json:"password"`
+}
+
 func (h *StudentHandler) Login(w http.ResponseWriter, r *http.Request) {
 	var req StudentLoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1093,29 +1093,15 @@ func (h *StudentHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// We need companyID – it might be passed in the request or we could infer from identifier? But let's assume it's part of the login request.
-	// However, our service expects companyID. In the original design, the login request had company_id. Let's adjust.
-	// For now, we'll add company_id to the request body.
-	// I'll modify the request to include company_id.
-	// Actually, the original LoginRequest in service expects CompanyID. So we need to parse it.
-	var loginReq struct {
-		CompanyID  string `json:"company_id"`
-		Identifier string `json:"identifier"`
-		Password   string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&loginReq); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	companyID, err := uuid.Parse(loginReq.CompanyID)
+	companyID, err := uuid.Parse(req.CompanyID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 
 	authResp, err := h.studentAuthService.Login(r.Context(), service.LoginRequest{
-		Identifier: loginReq.Identifier,
-		Password:   loginReq.Password,
+		Identifier: req.Identifier,
+		Password:   req.Password,
 		CompanyID:  companyID,
 	})
 	if err != nil {
@@ -1133,7 +1119,6 @@ func (h *StudentHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Issue JWT tokens using session service
 	tokenPair, err := h.sessionService.IssueTokenPair(r.Context(), &mainService.IssueTokenPairRequest{
 		UserID:         authResp.Student.StudentID.String(),
 		Role:           "student",
@@ -1162,7 +1147,6 @@ func (h *StudentHandler) Login(w http.ResponseWriter, r *http.Request) {
 		Phone:        authResp.Student.Phone,
 		CompanyID:    authResp.Student.CompanyID.String(),
 	}
-
 	h.respondWithJSON(w, http.StatusOK, resp)
 }
 
@@ -1227,7 +1211,7 @@ type ChangePasswordRequest struct {
 // ChangePassword handles POST /api/v1/students/me/change-password (authenticated student)
 func (h *StudentHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	studentID, err := getUserIDFromContext(ctx) // assume context holds student ID
+	studentID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -1243,7 +1227,8 @@ func (h *StudentHandler) ChangePassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = h.studentAuthService.ChangePassword(ctx, studentID, req.OldPassword, req.NewPassword, &studentID)
+	// ✅ Pass nil instead of &studentID
+	err = h.studentAuthService.ChangePassword(ctx, studentID, req.OldPassword, req.NewPassword, nil)
 	if err != nil {
 		if err == service.ErrInvalidCredentials {
 			h.respondWithError(w, http.StatusUnauthorized, "invalid old password")

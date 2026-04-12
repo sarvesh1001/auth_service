@@ -3,16 +3,16 @@
 package handler
 
 import (
+	"auth-service/internal/academics/models"
+	"auth-service/internal/academics/repository"
+	"auth-service/internal/academics/service"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
-
-	"auth-service/internal/academics/models" // <-- add this line
-	"auth-service/internal/academics/repository"
-	"auth-service/internal/academics/service"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -32,17 +32,30 @@ func NewAcademicYearHandler(academicYearService service.AcademicYearService, log
 }
 
 // ---------------------------------------------------------------------
-// Request DTOs
+// Local request DTOs (no created_by/updated_by – taken from token)
 // ---------------------------------------------------------------------
 
+type createAcademicYearRequest struct {
+	Name      string    `json:"name"`
+	StartDate time.Time `json:"start_date"`
+	EndDate   time.Time `json:"end_date"`
+	IsCurrent bool      `json:"is_current"`
+}
+
+type updateAcademicYearRequest struct {
+	Name      string    `json:"name"`
+	StartDate time.Time `json:"start_date"`
+	EndDate   time.Time `json:"end_date"`
+	IsCurrent bool      `json:"is_current"`
+}
+
 type updateDatesRequest struct {
-	StartDate time.Time  `json:"start_date"`
-	EndDate   time.Time  `json:"end_date"`
-	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	StartDate time.Time `json:"start_date"`
+	EndDate   time.Time `json:"end_date"`
 }
 
 type setCurrentRequest struct {
-	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
+	// empty – no fields needed
 }
 
 type validateOverlapRequest struct {
@@ -74,21 +87,23 @@ func (h *AcademicYearHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req service.CreateAcademicYearRequest
+	var req createAcademicYearRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	req.CompanyID = companyID
-	if req.CreatedBy == nil {
-		req.CreatedBy = &userID
-	}
-	if req.UpdatedBy == nil {
-		req.UpdatedBy = &userID
+	serviceReq := service.CreateAcademicYearRequest{
+		CompanyID: companyID,
+		Name:      req.Name,
+		StartDate: req.StartDate,
+		EndDate:   req.EndDate,
+		IsCurrent: req.IsCurrent,
+		CreatedBy: &userID,
+		UpdatedBy: &userID,
 	}
 
-	ay, err := h.academicYearService.Create(ctx, req)
+	ay, err := h.academicYearService.Create(ctx, serviceReq)
 	if err != nil {
 		h.logger.Error("failed to create academic year", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -122,23 +137,26 @@ func (h *AcademicYearHandler) BulkCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var reqs []service.CreateAcademicYearRequest
+	var reqs []createAcademicYearRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	for i := range reqs {
-		reqs[i].CompanyID = companyID
-		if reqs[i].CreatedBy == nil {
-			reqs[i].CreatedBy = &userID
-		}
-		if reqs[i].UpdatedBy == nil {
-			reqs[i].UpdatedBy = &userID
+	serviceReqs := make([]service.CreateAcademicYearRequest, len(reqs))
+	for i, r := range reqs {
+		serviceReqs[i] = service.CreateAcademicYearRequest{
+			CompanyID: companyID,
+			Name:      r.Name,
+			StartDate: r.StartDate,
+			EndDate:   r.EndDate,
+			IsCurrent: r.IsCurrent,
+			CreatedBy: &userID,
+			UpdatedBy: &userID,
 		}
 	}
 
-	years, err := h.academicYearService.BulkCreate(ctx, reqs)
+	years, err := h.academicYearService.BulkCreate(ctx, serviceReqs)
 	if err != nil {
 		h.logger.Error("failed to bulk create academic years", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -172,21 +190,23 @@ func (h *AcademicYearHandler) Upsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req service.CreateAcademicYearRequest
+	var req createAcademicYearRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	req.CompanyID = companyID
-	if req.CreatedBy == nil {
-		req.CreatedBy = &userID
-	}
-	if req.UpdatedBy == nil {
-		req.UpdatedBy = &userID
+	serviceReq := service.CreateAcademicYearRequest{
+		CompanyID: companyID,
+		Name:      req.Name,
+		StartDate: req.StartDate,
+		EndDate:   req.EndDate,
+		IsCurrent: req.IsCurrent,
+		CreatedBy: &userID,
+		UpdatedBy: &userID,
 	}
 
-	ay, err := h.academicYearService.Upsert(ctx, req)
+	ay, err := h.academicYearService.Upsert(ctx, serviceReq)
 	if err != nil {
 		h.logger.Error("failed to upsert academic year", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -254,7 +274,7 @@ func (h *AcademicYearHandler) GetByName(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	name := r.URL.Query().Get("name")
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
 	if name == "" {
 		h.respondWithError(w, http.StatusBadRequest, "name query parameter is required")
 		return
@@ -377,7 +397,7 @@ func (h *AcademicYearHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply in‑memory filtering for name, start_after, end_before
+	// In-memory filtering for name, start_after, end_before
 	nameFilter := query.Get("name")
 	startAfterStr := query.Get("start_after")
 	endBeforeStr := query.Get("end_before")
@@ -400,7 +420,6 @@ func (h *AcademicYearHandler) List(w http.ResponseWriter, r *http.Request) {
 		filtered = append(filtered, y)
 	}
 
-	// Re-apply pagination on filtered results
 	start := pagination.Offset
 	end := start + pagination.Limit
 	if start > len(filtered) {
@@ -410,7 +429,6 @@ func (h *AcademicYearHandler) List(w http.ResponseWriter, r *http.Request) {
 		end = len(filtered)
 	}
 	paged := filtered[start:end]
-
 	total := len(filtered)
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -565,18 +583,22 @@ func (h *AcademicYearHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req service.UpdateAcademicYearRequest
+	var req updateAcademicYearRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	req.AcademicYearID = id
-	if req.UpdatedBy == nil {
-		req.UpdatedBy = &userID
+	serviceReq := service.UpdateAcademicYearRequest{
+		AcademicYearID: id,
+		Name:           req.Name,
+		StartDate:      req.StartDate,
+		EndDate:        req.EndDate,
+		IsCurrent:      req.IsCurrent,
+		UpdatedBy:      &userID,
 	}
 
-	ay, err := h.academicYearService.Update(ctx, req)
+	ay, err := h.academicYearService.Update(ctx, serviceReq)
 	if err != nil {
 		h.logger.Error("failed to update academic year", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -637,12 +659,7 @@ func (h *AcademicYearHandler) UpdateDates(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	updatedBy := req.UpdatedBy
-	if updatedBy == nil {
-		updatedBy = &userID
-	}
-
-	err = h.academicYearService.UpdateDates(ctx, id, req.StartDate, req.EndDate, updatedBy)
+	err = h.academicYearService.UpdateDates(ctx, id, req.StartDate, req.EndDate, &userID)
 	if err != nil {
 		h.logger.Error("failed to update academic year dates", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -682,15 +699,11 @@ func (h *AcademicYearHandler) SetCurrent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var req setCurrentRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// Body is ignored; we only use token
+	var _ setCurrentRequest
+	_ = json.NewDecoder(r.Body).Decode(&struct{}{})
 
-	updatedBy := req.UpdatedBy
-	if updatedBy == nil {
-		updatedBy = &userID
-	}
-
-	err = h.academicYearService.SetCurrent(ctx, companyID, id, updatedBy)
+	err = h.academicYearService.SetCurrent(ctx, companyID, id, &userID)
 	if err != nil {
 		h.logger.Error("failed to set current academic year", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())

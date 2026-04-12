@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,55 +14,99 @@ import (
 	"auth-service/internal/academics/models"
 	"auth-service/internal/academics/repository"
 	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 )
+
+// ---------------------------------------------------------------------
+// Service interface (updated with idempotency keys)
+// ---------------------------------------------------------------------
 
 type RoomService interface {
 	Create(ctx context.Context, req CreateRoomRequest, idempotencyKey string) (*models.Room, error)
+	BulkCreate(ctx context.Context, reqs []CreateRoomRequest, idempotencyKey string) ([]*models.Room, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Room, error)
 	GetByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Room, error)
 	List(ctx context.Context, filter repository.RoomFilter, p repository.Pagination, s repository.Sort) ([]*models.Room, error)
 	Count(ctx context.Context, filter repository.RoomFilter) (int64, error)
-	Update(ctx context.Context, req UpdateRoomRequest) (*models.Room, error)
-	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
-	Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error
-	Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error
-	BulkCreate(ctx context.Context, reqs []CreateRoomRequest) ([]*models.Room, error)
+	Update(ctx context.Context, req UpdateRoomRequest, idempotencyKey string) (*models.Room, error)
+	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	ExistsByCode(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
 	ListByBuilding(ctx context.Context, companyID uuid.UUID, building string) ([]*models.Room, error)
 }
 
+// ---------------------------------------------------------------------
+// Service implementation
+// ---------------------------------------------------------------------
+
 type roomService struct {
-	repo             repository.RoomRepository
-	idempotencyStore IdempotencyStore
-	auditLogger      AuditLogger
-	outboxStore      OutboxStore
-	eventPublisher   EventPublisher
-	pgClient         *client.PostgresClient
-	logger           *zap.Logger
-	notificationSvc  NotificationService // Added for notifications
+	repo            repository.RoomRepository
+	pgClient        *client.PostgresClient
+	logger          *zap.Logger
+	notificationSvc NotificationService
+
+	// Infrastructure dependencies (same pattern as assignment/attendance/curriculum)
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	outboxRepo       outbox.Repository
 }
+
+// ---------------------------------------------------------------------
+// Constructor (updated)
+// ---------------------------------------------------------------------
 
 func NewRoomService(
 	repo repository.RoomRepository,
-	idempotencyStore IdempotencyStore,
-	auditLogger AuditLogger,
-	outboxStore OutboxStore,
-	eventPublisher EventPublisher,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
-	notificationSvc NotificationService, // New parameter
+	notificationSvc NotificationService,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	outboxRepo outbox.Repository,
 ) RoomService {
 	return &roomService{
 		repo:             repo,
-		idempotencyStore: idempotencyStore,
-		auditLogger:      auditLogger,
-		outboxStore:      outboxStore,
-		eventPublisher:   eventPublisher,
 		pgClient:         pgClient,
 		logger:           logger.Named("room_service"),
 		notificationSvc:  notificationSvc,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		outboxRepo:       outboxRepo,
 	}
 }
+
+// ---------------------------------------------------------------------
+// Helper: store outbox event for room
+// ---------------------------------------------------------------------
+
+func (s *roomService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "room",
+		AggregateID:   aggregateID.String(),
+		EventType:     string(eventType),
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
+}
+
+// ---------------------------------------------------------------------
+// Sanitization & validation
+// ---------------------------------------------------------------------
 
 func (s *roomService) sanitizeCreate(req *CreateRoomRequest) {
 	req.RoomCode = strings.TrimSpace(strings.ToUpper(req.RoomCode))
@@ -88,7 +134,10 @@ func (s *roomService) validateUpdateInput(req UpdateRoomRequest) error {
 	return nil
 }
 
-// Create creates a new room with optional idempotency key.
+// ---------------------------------------------------------------------
+// Create (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
 func (s *roomService) Create(ctx context.Context, req CreateRoomRequest, idempotencyKey string) (*models.Room, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
@@ -108,18 +157,12 @@ func (s *roomService) Create(ctx context.Context, req CreateRoomRequest, idempot
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (same pattern as assignment service)
 	if idempotencyKey != "" {
-		exists, err := s.idempotencyStore.Exists(ctx, tx, idempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("idempotency check: %w", err)
-		}
-		if exists {
-			var room models.Room
-			if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &room); err != nil {
-				return nil, fmt.Errorf("failed to retrieve idempotent response: %w", err)
-			}
+		var existing models.Room
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.RoomID != uuid.Nil {
 			logger.Info("returning idempotent response")
-			return &room, nil
+			return &existing, nil
 		}
 	}
 
@@ -148,22 +191,25 @@ func (s *roomService) Create(ctx context.Context, req CreateRoomRequest, idempot
 		return nil, err
 	}
 
+	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, room); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			return nil, fmt.Errorf("failed to store idempotency key: %w", err)
 		}
 	}
 
 	// Audit log
-	if err := s.auditLogger.Log(ctx, tx, "CREATE", room.RoomID, nil, room, req.CreatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "room",
+			&room.RoomID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"room_code": room.RoomCode,
+				"building":  room.Building,
+			})
 	}
 
 	// Outbox event
-	if err := s.outboxStore.Store(ctx, tx, string(EventRoomCreated), room); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+	if err := s.storeOutboxEvent(ctx, tx, EventRoomCreated, room.RoomID, room); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -172,7 +218,7 @@ func (s *roomService) Create(ctx context.Context, req CreateRoomRequest, idempot
 
 	logger.Info("room created", zap.String("id", room.RoomID.String()))
 
-	// Notify the actor about room creation
+	// Notify the actor about room creation (after commit)
 	if req.CreatedBy != nil && *req.CreatedBy != uuid.Nil {
 		go func() {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -200,7 +246,10 @@ func (s *roomService) Create(ctx context.Context, req CreateRoomRequest, idempot
 	return room, nil
 }
 
-// GetByID retrieves a room by ID.
+// ---------------------------------------------------------------------
+// GetByID, GetByCode, List, Count, ExistsByCode, ListByBuilding (read-only, no idempotency)
+// ---------------------------------------------------------------------
+
 func (s *roomService) GetByID(ctx context.Context, id uuid.UUID) (*models.Room, error) {
 	room, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -212,7 +261,6 @@ func (s *roomService) GetByID(ctx context.Context, id uuid.UUID) (*models.Room, 
 	return room, nil
 }
 
-// GetByCode retrieves a room by company and room code.
 func (s *roomService) GetByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Room, error) {
 	code = strings.TrimSpace(strings.ToUpper(code))
 	room, err := s.repo.GetByCode(ctx, s.pgClient.DB, companyID, code)
@@ -225,19 +273,33 @@ func (s *roomService) GetByCode(ctx context.Context, companyID uuid.UUID, code s
 	return room, nil
 }
 
-// List returns rooms matching the filter.
 func (s *roomService) List(ctx context.Context, filter repository.RoomFilter, p repository.Pagination, srt repository.Sort) ([]*models.Room, error) {
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
-// Count returns the number of rooms matching the filter.
 func (s *roomService) Count(ctx context.Context, filter repository.RoomFilter) (int64, error) {
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
-// Update updates an existing room.
-func (s *roomService) Update(ctx context.Context, req UpdateRoomRequest) (*models.Room, error) {
-	logger := s.logger.With(zap.String("method", "Update"), zap.String("room_id", req.RoomID.String()))
+func (s *roomService) ExistsByCode(ctx context.Context, companyID uuid.UUID, code string) (bool, error) {
+	code = strings.TrimSpace(strings.ToUpper(code))
+	return s.repo.ExistsByCode(ctx, s.pgClient.DB, companyID, code)
+}
+
+func (s *roomService) ListByBuilding(ctx context.Context, companyID uuid.UUID, building string) ([]*models.Room, error) {
+	return s.repo.ListByBuilding(ctx, s.pgClient.DB, companyID, building)
+}
+
+// ---------------------------------------------------------------------
+// Update (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
+func (s *roomService) Update(ctx context.Context, req UpdateRoomRequest, idempotencyKey string) (*models.Room, error) {
+	logger := s.logger.With(
+		zap.String("method", "Update"),
+		zap.String("room_id", req.RoomID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	if err := s.validateUpdateInput(req); err != nil {
 		return nil, err
@@ -248,6 +310,15 @@ func (s *roomService) Update(ctx context.Context, req UpdateRoomRequest) (*model
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing models.Room
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.RoomID != uuid.Nil {
+			logger.Info("returning idempotent response")
+			return &existing, nil
+		}
+	}
 
 	room, err := s.repo.GetByID(ctx, tx, req.RoomID)
 	if err != nil {
@@ -281,16 +352,30 @@ func (s *roomService) Update(ctx context.Context, req UpdateRoomRequest) (*model
 		return nil, err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "UPDATE", room.RoomID, oldRoom, room, req.UpdatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, room); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventRoomUpdated), map[string]interface{}{
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "room",
+			&req.RoomID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
+				"old_room_code": oldRoom.RoomCode,
+				"new_room_code": room.RoomCode,
+				"old_capacity":  oldRoom.Capacity,
+				"new_capacity":  room.Capacity,
+			})
+	}
+
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, EventRoomUpdated, room.RoomID, map[string]interface{}{
 		"old": oldRoom,
 		"new": room,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return nil, fmt.Errorf("failed to store outbox event: %w", err)
+		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -299,7 +384,7 @@ func (s *roomService) Update(ctx context.Context, req UpdateRoomRequest) (*model
 
 	logger.Info("room updated")
 
-	// Notify the actor about room update
+	// Notify the actor about room update (after commit)
 	if req.UpdatedBy != nil && *req.UpdatedBy != uuid.Nil {
 		go func() {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -327,12 +412,16 @@ func (s *roomService) Update(ctx context.Context, req UpdateRoomRequest) (*model
 	return room, nil
 }
 
-// Delete soft-deletes a room.
-func (s *roomService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Delete"), zap.String("room_id", id.String()))
+// ---------------------------------------------------------------------
+// Delete (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
 
-	// TODO: Check for dependencies (e.g., timetables) before deletion.
-	// For now, assume it's allowed.
+func (s *roomService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "Delete"),
+		zap.String("room_id", id.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -340,23 +429,49 @@ func (s *roomService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 	}
 	defer tx.Rollback()
 
-	// Fetch room for notification (before delete)
-	room, _ := s.repo.GetByID(ctx, tx, id)
+	// Idempotency check
+	if idempotencyKey != "" {
+		var dummy struct{}
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &dummy); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
+
+	// Fetch room for audit and notification (before delete)
+	room, err := s.repo.GetByID(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if room == nil {
+		return fmt.Errorf("%w: room %s", ErrNotFound, id)
+	}
 
 	if err := s.repo.Delete(ctx, tx, id, deletedBy); err != nil {
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "DELETE", id, nil, nil, deletedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventRoomDeleted), map[string]interface{}{
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "room",
+			&id, "user", deletedBy, nil, nil, map[string]interface{}{
+				"room_code": room.RoomCode,
+			})
+	}
+
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, EventRoomDeleted, id, map[string]interface{}{
 		"room_id":    id,
 		"deleted_by": deletedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -365,8 +480,8 @@ func (s *roomService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 
 	logger.Info("room deleted")
 
-	// Notify the actor about room deletion
-	if room != nil && deletedBy != nil && *deletedBy != uuid.Nil {
+	// Notify the actor about room deletion (after commit)
+	if deletedBy != nil && *deletedBy != uuid.Nil {
 		go func() {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -393,15 +508,31 @@ func (s *roomService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 	return nil
 }
 
-// Activate sets a room as active.
-func (s *roomService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Activate"), zap.String("room_id", id.String()))
+// ---------------------------------------------------------------------
+// Activate (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
+func (s *roomService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "Activate"),
+		zap.String("room_id", id.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var dummy struct{}
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &dummy); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	// Fetch room for notification
 	room, err := s.repo.GetByID(ctx, tx, id)
@@ -416,16 +547,27 @@ func (s *roomService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uui
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "ACTIVATE", id, nil, nil, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventRoomActivated), map[string]interface{}{
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "activate", "room",
+			&id, "user", updatedBy, nil, nil, map[string]interface{}{
+				"room_code": room.RoomCode,
+			})
+	}
+
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, EventRoomActivated, id, map[string]interface{}{
 		"room_id":    id,
 		"updated_by": updatedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -434,7 +576,7 @@ func (s *roomService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uui
 
 	logger.Info("room activated")
 
-	// Notify the actor about room activation
+	// Notify the actor about room activation (after commit)
 	if updatedBy != nil && *updatedBy != uuid.Nil {
 		go func() {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -462,15 +604,31 @@ func (s *roomService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uui
 	return nil
 }
 
-// Deactivate sets a room as inactive.
-func (s *roomService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Deactivate"), zap.String("room_id", id.String()))
+// ---------------------------------------------------------------------
+// Deactivate (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
+func (s *roomService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "Deactivate"),
+		zap.String("room_id", id.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var dummy struct{}
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &dummy); err == nil {
+			logger.Info("idempotent operation: already processed")
+			return nil
+		}
+	}
 
 	// Fetch room for notification
 	room, err := s.repo.GetByID(ctx, tx, id)
@@ -485,16 +643,27 @@ func (s *roomService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *u
 		return err
 	}
 
-	if err := s.auditLogger.Log(ctx, tx, "DEACTIVATE", id, nil, nil, updatedBy); err != nil {
-		logger.Error("audit log failed", zap.Error(err))
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, struct{}{}); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
 	}
 
-	if err := s.outboxStore.Store(ctx, tx, string(EventRoomDeactivated), map[string]interface{}{
+	// Audit log
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "deactivate", "room",
+			&id, "user", updatedBy, nil, nil, map[string]interface{}{
+				"room_code": room.RoomCode,
+			})
+	}
+
+	// Outbox event
+	if err := s.storeOutboxEvent(ctx, tx, EventRoomDeactivated, id, map[string]interface{}{
 		"room_id":    id,
 		"updated_by": updatedBy,
 	}); err != nil {
-		logger.Error("failed to store outbox event", zap.Error(err))
-		return fmt.Errorf("failed to store outbox event: %w", err)
+		return fmt.Errorf("outbox store: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -503,7 +672,7 @@ func (s *roomService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *u
 
 	logger.Info("room deactivated")
 
-	// Notify the actor about room deactivation
+	// Notify the actor about room deactivation (after commit)
 	if updatedBy != nil && *updatedBy != uuid.Nil {
 		go func() {
 			notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -531,13 +700,35 @@ func (s *roomService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *u
 	return nil
 }
 
-// BulkCreate creates multiple rooms in one transaction.
-func (s *roomService) BulkCreate(ctx context.Context, reqs []CreateRoomRequest) ([]*models.Room, error) {
+// ---------------------------------------------------------------------
+// BulkCreate (with idempotency, audit, outbox)
+// ---------------------------------------------------------------------
+
+func (s *roomService) BulkCreate(ctx context.Context, reqs []CreateRoomRequest, idempotencyKey string) ([]*models.Room, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
 
-	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)))
+	logger := s.logger.With(
+		zap.String("method", "BulkCreate"),
+		zap.Int("count", len(reqs)),
+		zap.String("idempotency_key", idempotencyKey),
+	)
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var existing []*models.Room
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && len(existing) > 0 {
+			logger.Info("returning idempotent response")
+			return existing, nil
+		}
+	}
 
 	// Sanitize and validate each request
 	type key struct {
@@ -571,12 +762,6 @@ func (s *roomService) BulkCreate(ctx context.Context, reqs []CreateRoomRequest) 
 		})
 	}
 
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
 	// Check for duplicates against existing rooms
 	for k := range batchKeys {
 		exists, err := s.repo.ExistsByCode(ctx, tx, k.companyID, k.code)
@@ -592,14 +777,23 @@ func (s *roomService) BulkCreate(ctx context.Context, reqs []CreateRoomRequest) 
 		return nil, err
 	}
 
+	// Store idempotency key
+	if idempotencyKey != "" {
+		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, rooms); err != nil {
+			logger.Error("failed to store idempotency key", zap.Error(err))
+		}
+	}
+
 	// Audit and outbox for each room
 	for _, room := range rooms {
-		if err := s.auditLogger.Log(ctx, tx, "CREATE", room.RoomID, nil, room, room.CreatedBy); err != nil {
-			logger.Error("audit log failed", zap.String("room_id", room.RoomID.String()), zap.Error(err))
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_create", "room",
+				&room.RoomID, "user", room.CreatedBy, nil, nil, map[string]interface{}{
+					"room_code": room.RoomCode,
+				})
 		}
-		if err := s.outboxStore.Store(ctx, tx, string(EventRoomCreated), room); err != nil {
-			logger.Error("failed to store outbox event", zap.String("room_id", room.RoomID.String()), zap.Error(err))
-			return nil, fmt.Errorf("failed to store outbox event for room %s: %w", room.RoomID, err)
+		if err := s.storeOutboxEvent(ctx, tx, EventRoomCreated, room.RoomID, room); err != nil {
+			return nil, fmt.Errorf("outbox store for room %s: %w", room.RoomID, err)
 		}
 	}
 
@@ -609,7 +803,7 @@ func (s *roomService) BulkCreate(ctx context.Context, reqs []CreateRoomRequest) 
 
 	logger.Info("bulk created rooms", zap.Int("count", len(rooms)))
 
-	// Notify each actor (if different)
+	// Notify each actor (after commit)
 	for _, room := range rooms {
 		if room.CreatedBy != nil && *room.CreatedBy != uuid.Nil {
 			go func(r *models.Room) {
@@ -639,15 +833,4 @@ func (s *roomService) BulkCreate(ctx context.Context, reqs []CreateRoomRequest) 
 	}
 
 	return rooms, nil
-}
-
-// ExistsByCode checks if a room code exists for a company.
-func (s *roomService) ExistsByCode(ctx context.Context, companyID uuid.UUID, code string) (bool, error) {
-	code = strings.TrimSpace(strings.ToUpper(code))
-	return s.repo.ExistsByCode(ctx, s.pgClient.DB, companyID, code)
-}
-
-// ListByBuilding lists rooms in a building.
-func (s *roomService) ListByBuilding(ctx context.Context, companyID uuid.UUID, building string) ([]*models.Room, error) {
-	return s.repo.ListByBuilding(ctx, s.pgClient.DB, companyID, building)
 }
