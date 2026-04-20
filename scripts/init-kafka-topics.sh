@@ -4,7 +4,7 @@
 # Purpose: Automatically create all required Kafka topics (with DLQ support)
 #          Supports: student, teacher, guardian, room, notification,
 #                    admission, assignment, submission, attendance, exam,
-#                    fee, transport, and more.
+#                    fee, transport, accounting, and more.
 # ===============================================
 
 set -e
@@ -112,7 +112,10 @@ declare -A TOPIC_CONFIGS=(
     ["submission-events"]="3 1 2592000000 gzip"
     ["exam-events"]="3 1 2592000000 gzip"
     ["fee-events"]="3 1 2592000000 gzip"
-    ["transport-events"]="3 1 2592000000 gzip"          # <-- NEW
+    ["transport-events"]="3 1 2592000000 gzip"
+
+    # -------- ACCOUNTING (NEW) --------
+    ["accounting-events"]="3 1 2592000000 gzip"
 
     # -------- ANALYTICS --------
     ["audit-logs"]="3 1 2592000000 gzip"
@@ -136,10 +139,13 @@ declare -A TOPIC_CONFIGS=(
     ["submission-events.dlq"]="3 1 604800000 gzip"
     ["exam-events.dlq"]="3 1 604800000 gzip"
     ["fee-events.dlq"]="3 1 604800000 gzip"
-    ["transport-events.dlq"]="3 1 604800000 gzip"      # <-- NEW
+    ["transport-events.dlq"]="3 1 604800000 gzip"
     ["attendance.events.dlq"]="3 1 604800000 gzip"
     ["user-events.dlq"]="3 1 604800000 gzip"
     ["security-events.dlq"]="3 1 604800000 gzip"
+
+    # -------- ACCOUNTING DLQ (NEW) --------
+    ["accounting-events.dlq"]="3 1 604800000 gzip"
 )
 
 FAILED_TOPICS=()
@@ -190,7 +196,11 @@ check_topic "assignment-events"
 check_topic "submission-events"
 check_topic "exam-events"
 check_topic "fee-events"
-check_topic "transport-events"          # <-- NEW
+check_topic "transport-events"
+
+echo ""
+echo "📊 Accounting (NEW):"
+check_topic "accounting-events"
 
 echo ""
 echo "📊 Analytics:"
@@ -198,7 +208,7 @@ for t in "device-events" "mpin-events" "otp-events"; do check_topic $t; done
 
 echo ""
 echo "⚠️ DLQ Topics:"
-for t in "academics-events.dlq" "student-events.dlq" "teacher-events.dlq" "guardian-events.dlq" "room-events.dlq" "notification-events.dlq" "admission-events.dlq" "assignment-events.dlq" "submission-events.dlq" "exam-events.dlq" "fee-events.dlq" "transport-events.dlq" "attendance.events.dlq" "user-events.dlq" "security-events.dlq"; do check_topic $t; done
+for t in "academics-events.dlq" "student-events.dlq" "teacher-events.dlq" "guardian-events.dlq" "room-events.dlq" "notification-events.dlq" "admission-events.dlq" "assignment-events.dlq" "submission-events.dlq" "exam-events.dlq" "fee-events.dlq" "transport-events.dlq" "attendance.events.dlq" "user-events.dlq" "security-events.dlq" "accounting-events.dlq"; do check_topic $t; done
 
 echo ""
 

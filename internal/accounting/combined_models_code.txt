@@ -1,0 +1,935 @@
+
+================================================================================
+FILE: ./models/journal_line.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type JournalLine struct {
+	JournalLineID  uuid.UUID       `db:"journal_line_id" json:"journal_line_id"`
+	JournalEntryID uuid.UUID       `db:"journal_entry_id" json:"journal_entry_id"`
+	AccountID      uuid.UUID       `db:"account_id" json:"account_id"`
+	LineNumber     int             `db:"line_number" json:"line_number"`
+	DebitAmount    decimal.Decimal `db:"debit_amount" json:"debit_amount"`
+	CreditAmount   decimal.Decimal `db:"credit_amount" json:"credit_amount"`
+	Description    *string         `db:"description" json:"description,omitempty"`
+	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time       `db:"updated_at" json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/reconciliation_item.go
+================================================================================
+
+// FILE: ./models/reconciliation_item.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ReconciliationItem struct {
+	ItemID          uuid.UUID        `db:"item_id" json:"item_id"`
+	BatchID         uuid.UUID        `db:"batch_id" json:"batch_id"`
+	SourceType      string           `db:"source_type" json:"source_type"` // bank, payment_gateway, etc
+	SourceID        uuid.NullUUID    `db:"source_id" json:"source_id,omitempty"`
+	JournalEntryID  uuid.NullUUID    `db:"journal_entry_id" json:"journal_entry_id,omitempty"`
+	Amount          decimal.Decimal  `db:"amount" json:"amount"`
+	Currency        string           `db:"currency" json:"currency"`
+	TransactionDate time.Time        `db:"transaction_date" json:"transaction_date"`
+	MatchStatus     string           `db:"match_status" json:"match_status"`         // matched, unmatched, partial, ignored
+	MatchScore      *decimal.Decimal `db:"match_score" json:"match_score,omitempty"` // 0-100
+	Notes           *string          `db:"notes" json:"notes,omitempty"`
+	CreatedAt       time.Time        `db:"created_at" json:"created_at"`
+	UpdatedAt       time.Time        `db:"updated_at" json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/journal_entry.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type JournalEntry struct {
+	JournalEntryID uuid.UUID  `db:"journal_entry_id" json:"journal_entry_id"`
+	CompanyID      uuid.UUID  `db:"company_id" json:"company_id"`
+	JournalType    string     `db:"journal_type" json:"journal_type"`
+	EntryDate      time.Time  `db:"entry_date" json:"entry_date"`
+	Reference      *string    `db:"reference" json:"reference,omitempty"`
+	Description    *string    `db:"description" json:"description,omitempty"`
+	Status         string     `db:"status" json:"status"`
+	ReversalOf     *uuid.UUID `db:"reversal_of" json:"reversal_of,omitempty"`
+	SourceType     *string    `db:"source_type" json:"source_type,omitempty"`
+	SourceID       *uuid.UUID `db:"source_id" json:"source_id,omitempty"`
+	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
+	PostedAt       *time.Time `db:"posted_at" json:"posted_at,omitempty"`
+	PostedBy       *uuid.UUID `db:"posted_by" json:"posted_by,omitempty"`
+	CreatedBy      *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
+	UpdatedBy      *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
+	DeletedAt      *time.Time `db:"deleted_at" json:"deleted_at,omitempty"` // ✅ ADD THIS LINE
+}
+
+
+
+================================================================================
+FILE: ./models/ledger.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type AccountBalance struct {
+	BalanceID      uuid.UUID       `db:"balance_id" json:"balance_id"`
+	CompanyID      uuid.UUID       `db:"company_id" json:"company_id"`
+	AccountID      uuid.UUID       `db:"account_id" json:"account_id"`
+	FiscalYear     int             `db:"fiscal_year" json:"fiscal_year"`
+	Period         int             `db:"period" json:"period"` // 1-12
+	OpeningBalance decimal.Decimal `db:"opening_balance" json:"opening_balance"`
+	ClosingBalance decimal.Decimal `db:"closing_balance" json:"closing_balance"`
+	IsRecomputed   bool            `db:"is_recomputed" json:"is_recomputed"`
+	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time       `db:"updated_at" json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/reconciliation_adjustment.go
+================================================================================
+
+// FILE: ./models/reconciliation_adjustment.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ReconciliationAdjustment struct {
+	AdjustmentID     uuid.UUID       `db:"adjustment_id" json:"adjustment_id"`
+	BatchID          uuid.UUID       `db:"batch_id" json:"batch_id"`
+	JournalEntryID   uuid.UUID       `db:"journal_entry_id" json:"journal_entry_id"` // adjustment JE created
+	Reason           *string         `db:"reason" json:"reason,omitempty"`
+	AdjustmentAmount decimal.Decimal `db:"adjustment_amount" json:"adjustment_amount"`
+	CreatedAt        time.Time       `db:"created_at" json:"created_at"`
+	CreatedBy        *uuid.UUID      `db:"created_by" json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/reconciliation_batch.go
+================================================================================
+
+// FILE: ./models/reconciliation_batch.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ReconciliationBatch struct {
+	BatchID            uuid.UUID  `db:"batch_id" json:"batch_id"`
+	CompanyID          uuid.UUID  `db:"company_id" json:"company_id"`
+	ReconciliationType string     `db:"reconciliation_type" json:"reconciliation_type"` // bank, payment, ledger, external
+	Reference          *string    `db:"reference" json:"reference,omitempty"`
+	StartDate          *time.Time `db:"start_date" json:"start_date,omitempty"`
+	EndDate            *time.Time `db:"end_date" json:"end_date,omitempty"`
+	Status             string     `db:"status" json:"status"` // pending, in_progress, completed, failed
+	TotalRecords       int        `db:"total_records" json:"total_records"`
+	MatchedRecords     int        `db:"matched_records" json:"matched_records"`
+	UnmatchedRecords   int        `db:"unmatched_records" json:"unmatched_records"`
+	CreatedAt          time.Time  `db:"created_at" json:"created_at"`
+	CompletedAt        *time.Time `db:"completed_at" json:"completed_at,omitempty"`
+	CreatedBy          *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/reconciliation_difference.go
+================================================================================
+
+// FILE: ./models/reconciliation_difference.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ReconciliationDifference struct {
+	DifferenceID   uuid.UUID       `db:"difference_id" json:"difference_id"`
+	BatchID        uuid.UUID       `db:"batch_id" json:"batch_id"`
+	IssueType      string          `db:"issue_type" json:"issue_type"` // missing_entry, amount_mismatch, duplicate, timing_difference
+	ExpectedAmount decimal.Decimal `db:"expected_amount" json:"expected_amount"`
+	ActualAmount   decimal.Decimal `db:"actual_amount" json:"actual_amount"`
+	SourceID       uuid.NullUUID   `db:"source_id" json:"source_id,omitempty"`
+	JournalEntryID uuid.NullUUID   `db:"journal_entry_id" json:"journal_entry_id,omitempty"`
+	Description    *string         `db:"description" json:"description,omitempty"`
+	Resolved       bool            `db:"resolved" json:"resolved"`
+	ResolvedBy     *uuid.UUID      `db:"resolved_by" json:"resolved_by,omitempty"`
+	ResolvedAt     *time.Time      `db:"resolved_at" json:"resolved_at,omitempty"`
+	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/account.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Account struct {
+	AccountID       uuid.UUID  `db:"account_id" json:"account_id"`
+	CompanyID       uuid.UUID  `db:"company_id" json:"company_id"`
+	AccountCode     string     `db:"account_code" json:"account_code"`
+	AccountName     string     `db:"account_name" json:"account_name"`
+	AccountType     string     `db:"account_type" json:"account_type"` // asset, liability, equity, revenue, expense
+	ParentAccountID *uuid.UUID `db:"parent_account_id" json:"parent_account_id,omitempty"`
+	IsActive        bool       `db:"is_active" json:"is_active"`
+	Description     *string    `db:"description" json:"description,omitempty"`
+	CreatedAt       time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt       time.Time  `db:"updated_at" json:"updated_at"`
+	CreatedBy       *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+	UpdatedBy       *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
+	DeletedAt       *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/settings/accounting_settings.go
+================================================================================
+
+package settings
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AccountingSettings struct {
+	CompanyID                uuid.UUID  `db:"company_id" json:"company_id"`
+	FiscalYearStartMonth     int        `db:"fiscal_year_start_month" json:"fiscal_year_start_month"` // 1-12
+	CurrencyCode             string     `db:"currency_code" json:"currency_code"`
+	TaxScheme                string     `db:"tax_scheme" json:"tax_scheme"` // accrual, cash
+	AllowIntercompanyJournal bool       `db:"allow_intercompany_journal" json:"allow_intercompany_journal"`
+	AutoGenerateReversals    bool       `db:"auto_generate_reversals" json:"auto_generate_reversals"`
+	CreatedAt                time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt                time.Time  `db:"updated_at" json:"updated_at"`
+	CreatedBy                *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+	UpdatedBy                *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/enums/reconciliation.go
+================================================================================
+
+// FILE: ./models/enums/reconciliation.go
+package enums
+
+const (
+	ReconciliationTypeBank     = "bank"
+	ReconciliationTypePayment  = "payment"
+	ReconciliationTypeLedger   = "ledger"
+	ReconciliationTypeExternal = "external"
+)
+
+var ValidReconciliationTypes = []string{
+	ReconciliationTypeBank, ReconciliationTypePayment,
+	ReconciliationTypeLedger, ReconciliationTypeExternal,
+}
+
+const (
+	ReconciliationStatusPending    = "pending"
+	ReconciliationStatusInProgress = "in_progress"
+	ReconciliationStatusCompleted  = "completed"
+	ReconciliationStatusFailed     = "failed"
+)
+
+var ValidReconciliationStatuses = []string{
+	ReconciliationStatusPending, ReconciliationStatusInProgress,
+	ReconciliationStatusCompleted, ReconciliationStatusFailed,
+}
+
+const (
+	MatchStatusMatched   = "matched"
+	MatchStatusUnmatched = "unmatched"
+	MatchStatusPartial   = "partial"
+	MatchStatusIgnored   = "ignored"
+)
+
+var ValidMatchStatuses = []string{
+	MatchStatusMatched, MatchStatusUnmatched, MatchStatusPartial, MatchStatusIgnored,
+}
+
+const (
+	IssueTypeMissingEntry     = "missing_entry"
+	IssueTypeAmountMismatch   = "amount_mismatch"
+	IssueTypeDuplicate        = "duplicate"
+	IssueTypeTimingDifference = "timing_difference"
+)
+
+var ValidIssueTypes = []string{
+	IssueTypeMissingEntry, IssueTypeAmountMismatch,
+	IssueTypeDuplicate, IssueTypeTimingDifference,
+}
+
+
+
+================================================================================
+FILE: ./models/enums/journal_type.go
+================================================================================
+
+package enums
+
+const (
+	JournalTypeSales    = "sales"
+	JournalTypePurchase = "purchase"
+	JournalTypePayment  = "payment"
+	JournalTypeReceipt  = "receipt"
+	JournalTypeGeneral  = "general"
+	JournalTypeContra   = "contra"
+)
+
+var ValidJournalTypes = []string{
+	JournalTypeSales, JournalTypePurchase, JournalTypePayment,
+	JournalTypeReceipt, JournalTypeGeneral, JournalTypeContra,
+}
+
+
+
+================================================================================
+FILE: ./models/enums/common.go
+================================================================================
+
+package enums
+
+const (
+	JournalStatusDraft    = "draft"
+	JournalStatusPosted   = "posted"
+	JournalStatusReversed = "reversed"
+
+	ComplianceStatusDraft     = "draft"
+	ComplianceStatusSubmitted = "submitted"
+	ComplianceStatusFiled     = "filed"
+	ComplianceStatusAmended   = "amended"
+
+	FilingStatusSubmitted = "submitted"
+	FilingStatusAccepted  = "accepted"
+	FilingStatusRejected  = "rejected"
+	FilingStatusPending   = "pending"
+
+	TaxActionApplyTax      = "apply_tax"
+	TaxActionExempt        = "exempt"
+	TaxActionReverseCharge = "reverse_charge"
+)
+
+
+
+================================================================================
+FILE: ./models/enums/tax_type.go
+================================================================================
+
+package enums
+
+const (
+	TaxAppliesSales    = "sales"
+	TaxAppliesPurchase = "purchase"
+	TaxAppliesBoth     = "both"
+)
+
+
+
+================================================================================
+FILE: ./models/enums/account_type.go
+================================================================================
+
+package enums
+
+const (
+	AccountTypeAsset     = "asset"
+	AccountTypeLiability = "liability"
+	AccountTypeEquity    = "equity"
+	AccountTypeRevenue   = "revenue"
+	AccountTypeExpense   = "expense"
+)
+
+var ValidAccountTypes = []string{
+	AccountTypeAsset, AccountTypeLiability, AccountTypeEquity,
+	AccountTypeRevenue, AccountTypeExpense,
+}
+
+
+
+================================================================================
+FILE: ./models/tax/tax_rule.go
+================================================================================
+
+package tax
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TaxRule struct {
+	TaxRuleID uuid.UUID  `db:"tax_rule_id" json:"tax_rule_id"`
+	CompanyID uuid.UUID  `db:"company_id" json:"company_id"`
+	RuleName  string     `db:"rule_name" json:"rule_name"`
+	AppliesTo string     `db:"applies_to" json:"applies_to"` // sales, purchase, both
+	Priority  int        `db:"priority" json:"priority"`
+	IsActive  bool       `db:"is_active" json:"is_active"`
+	CreatedAt time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time  `db:"updated_at" json:"updated_at"`
+	CreatedBy *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+	UpdatedBy *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
+	DeletedAt *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+type TaxRuleVersion struct {
+	VersionID uuid.UUID  `db:"version_id" json:"version_id"`
+	TaxRuleID uuid.UUID  `db:"tax_rule_id" json:"tax_rule_id"`
+	Version   int        `db:"version" json:"version"`
+	RuleJSON  []byte     `db:"rule_json" json:"rule_json"` // JSONB
+	IsCurrent bool       `db:"is_current" json:"is_current"`
+	CreatedAt time.Time  `db:"created_at" json:"created_at"`
+	CreatedBy *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/tax/tax_action.go
+================================================================================
+
+// tax_action.go
+package tax
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TaxAction struct {
+	ActionID         uuid.UUID `db:"action_id" json:"action_id"`
+	TaxRuleID        uuid.UUID `db:"tax_rule_id" json:"tax_rule_id"`
+	TaxRateID        uuid.UUID `db:"tax_rate_id" json:"tax_rate_id"`
+	ActionType       string    `db:"action_type" json:"action_type"`             // apply_tax, exempt, reverse_charge
+	CalculationBasis string    `db:"calculation_basis" json:"calculation_basis"` // line_amount, taxable_value
+	CreatedAt        time.Time `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/tax/tax_transaction.go
+================================================================================
+
+package tax
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type TaxTransaction struct {
+	TaxTransactionID   uuid.UUID       `db:"tax_transaction_id" json:"tax_transaction_id"`
+	CompanyID          uuid.UUID       `db:"company_id" json:"company_id"`
+	TransactionType    string          `db:"transaction_type" json:"transaction_type"` // invoice, payment, journal
+	TransactionID      uuid.UUID       `db:"transaction_id" json:"transaction_id"`
+	TaxRuleID          *uuid.UUID      `db:"tax_rule_id" json:"tax_rule_id,omitempty"`
+	TaxRateID          *uuid.UUID      `db:"tax_rate_id" json:"tax_rate_id,omitempty"`
+	TaxableAmount      decimal.Decimal `db:"taxable_amount" json:"taxable_amount"`
+	TaxAmount          decimal.Decimal `db:"tax_amount" json:"tax_amount"`
+	Currency           string          `db:"currency" json:"currency"`
+	ExchangeRate       decimal.Decimal `db:"exchange_rate" json:"exchange_rate"`
+	BaseCurrencyAmount decimal.Decimal `db:"base_currency_amount" json:"base_currency_amount"` // generated column
+	TransactionDate    time.Time       `db:"transaction_date" json:"transaction_date"`
+	CreatedAt          time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/tax/tax_profile.go
+================================================================================
+
+package tax
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TaxProfile struct {
+	TaxProfileID       uuid.UUID  `db:"tax_profile_id" json:"tax_profile_id"`
+	CompanyID          uuid.UUID  `db:"company_id" json:"company_id"`
+	TaxRegime          string     `db:"tax_regime" json:"tax_regime"`
+	Jurisdiction       string     `db:"jurisdiction" json:"jurisdiction"`
+	RegistrationNumber *string    `db:"registration_number" json:"registration_number,omitempty"`
+	DefaultTaxRateID   *uuid.UUID `db:"default_tax_rate_id" json:"default_tax_rate_id,omitempty"`
+	Settings           []byte     `db:"settings" json:"settings,omitempty"` // JSONB
+	IsActive           bool       `db:"is_active" json:"is_active"`
+	CreatedAt          time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt          time.Time  `db:"updated_at" json:"updated_at"`
+	CreatedBy          *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+	UpdatedBy          *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
+	DeletedAt          *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/tax/tax_rate.go
+================================================================================
+
+package tax
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type TaxRate struct {
+	TaxRateID      uuid.UUID       `db:"tax_rate_id" json:"tax_rate_id"`
+	CompanyID      uuid.UUID       `db:"company_id" json:"company_id"`
+	TaxName        string          `db:"tax_name" json:"tax_name"`
+	RatePercentage decimal.Decimal `db:"rate_percentage" json:"rate_percentage"`
+	EffectiveFrom  time.Time       `db:"effective_from" json:"effective_from"`
+	EffectiveTo    *time.Time      `db:"effective_to" json:"effective_to,omitempty"`
+	IsActive       bool            `db:"is_active" json:"is_active"`
+	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time       `db:"updated_at" json:"updated_at"`
+	CreatedBy      *uuid.UUID      `db:"created_by" json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID      `db:"updated_by" json:"updated_by,omitempty"`
+	DeletedAt      *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/tax/tax_condition.go
+================================================================================
+
+package tax
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type TaxCondition struct {
+	ConditionID  uuid.UUID        `db:"condition_id" json:"condition_id"`
+	TaxRuleID    uuid.UUID        `db:"tax_rule_id" json:"tax_rule_id"`
+	FieldName    string           `db:"field_name" json:"field_name"`
+	Operator     string           `db:"operator" json:"operator"`
+	ValueText    *string          `db:"value_text" json:"value_text,omitempty"`
+	ValueNumeric *decimal.Decimal `db:"value_numeric" json:"value_numeric,omitempty"` // changed to decimal
+	CreatedAt    time.Time        `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/compliance/filing.go
+================================================================================
+
+package compliance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ComplianceFiling struct {
+	FilingID          uuid.UUID  `db:"filing_id" json:"filing_id"`
+	ReturnID          uuid.UUID  `db:"return_id" json:"return_id"`
+	SubmissionDate    time.Time  `db:"submission_date" json:"submission_date"`
+	AcknowledgementNo *string    `db:"acknowledgement_no" json:"acknowledgement_no,omitempty"`
+	FilingStatus      string     `db:"filing_status" json:"filing_status"` // submitted, accepted, rejected, pending
+	ErrorMessage      *string    `db:"error_message" json:"error_message,omitempty"`
+	Metadata          []byte     `db:"metadata" json:"metadata,omitempty"` // JSONB
+	CreatedBy         *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/compliance/return_line.go
+================================================================================
+
+package compliance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ComplianceReturnLine struct {
+	LineID        uuid.UUID       `db:"line_id" json:"line_id"`
+	ReturnID      uuid.UUID       `db:"return_id" json:"return_id"`
+	LineType      string          `db:"line_type" json:"line_type"`
+	TaxRateID     *uuid.UUID      `db:"tax_rate_id" json:"tax_rate_id,omitempty"`
+	TaxableAmount decimal.Decimal `db:"taxable_amount" json:"taxable_amount"`
+	TaxAmount     decimal.Decimal `db:"tax_amount" json:"tax_amount"`
+	Description   *string         `db:"description" json:"description,omitempty"`
+	CreatedAt     time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/compliance/audit_log.go
+================================================================================
+
+package compliance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ComplianceAuditLog struct {
+	AuditID   uuid.UUID  `db:"audit_id" json:"audit_id"`
+	CompanyID uuid.UUID  `db:"company_id" json:"company_id"`
+	ReturnID  *uuid.UUID `db:"return_id" json:"return_id,omitempty"`
+	Action    string     `db:"action" json:"action"`
+	OldState  []byte     `db:"old_state" json:"old_state,omitempty"` // JSONB
+	NewState  []byte     `db:"new_state" json:"new_state,omitempty"` // JSONB
+	ActedBy   *uuid.UUID `db:"acted_by" json:"acted_by,omitempty"`
+	ActedAt   time.Time  `db:"acted_at" json:"acted_at"`
+	IPAddress *string    `db:"ip_address" json:"ip_address,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/compliance/return.go
+================================================================================
+
+package compliance
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ComplianceReturn struct {
+	ReturnID       uuid.UUID       `db:"return_id" json:"return_id"`
+	CompanyID      uuid.UUID       `db:"company_id" json:"company_id"`
+	ReturnType     string          `db:"return_type" json:"return_type"`
+	PeriodStart    time.Time       `db:"period_start" json:"period_start"`
+	PeriodEnd      time.Time       `db:"period_end" json:"period_end"`
+	DueDate        time.Time       `db:"due_date" json:"due_date"`
+	FilingDate     *time.Time      `db:"filing_date" json:"filing_date,omitempty"`
+	Status         string          `db:"status" json:"status"` // draft, submitted, filed, amended
+	TotalLiability decimal.Decimal `db:"total_liability" json:"total_liability"`
+	TotalPaid      decimal.Decimal `db:"total_paid" json:"total_paid"`
+	IsLocked       bool            `db:"is_locked" json:"is_locked"`
+	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time       `db:"updated_at" json:"updated_at"`
+	CreatedBy      *uuid.UUID      `db:"created_by" json:"created_by,omitempty"`
+	UpdatedBy      *uuid.UUID      `db:"updated_by" json:"updated_by,omitempty"`
+	FiledBy        *uuid.UUID      `db:"filed_by" json:"filed_by,omitempty"`
+	FiledAt        *time.Time      `db:"filed_at" json:"filed_at,omitempty"`
+	DeletedAt      *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/daily_account_summary.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type DailyAccountSummary struct {
+	SummaryID        uuid.UUID       `db:"summary_id" json:"summary_id"`
+	CompanyID        uuid.UUID       `db:"company_id" json:"company_id"`
+	AccountID        uuid.UUID       `db:"account_id" json:"account_id"`
+	Date             time.Time       `db:"date" json:"date"`
+	TotalDebit       decimal.Decimal `db:"total_debit" json:"total_debit"`
+	TotalCredit      decimal.Decimal `db:"total_credit" json:"total_credit"`
+	NetMovement      decimal.Decimal `db:"net_movement" json:"net_movement"` // generated
+	TransactionCount int             `db:"transaction_count" json:"transaction_count"`
+	CreatedAt        time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/reconciliation_daily_stats.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ReconciliationDailyStats struct {
+	StatID             uuid.UUID `db:"stat_id" json:"stat_id"`
+	CompanyID          uuid.UUID `db:"company_id" json:"company_id"`
+	ReconciliationType string    `db:"reconciliation_type" json:"reconciliation_type"`
+	Date               time.Time `db:"date" json:"date"`
+
+	BatchesStarted   int `db:"batches_started" json:"batches_started"`
+	BatchesCompleted int `db:"batches_completed" json:"batches_completed"`
+
+	TotalItemsProcessed int `db:"total_items_processed" json:"total_items_processed"`
+	TotalMatched        int `db:"total_matched" json:"total_matched"`
+	TotalUnmatched      int `db:"total_unmatched" json:"total_unmatched"`
+	TotalIgnored        int `db:"total_ignored" json:"total_ignored"`
+
+	AvgMatchRate         float64 `db:"avg_match_rate" json:"avg_match_rate"`
+	AvgCompletionSeconds int     `db:"avg_completion_seconds" json:"avg_completion_seconds"`
+
+	DifferencesCreated    int     `db:"differences_created" json:"differences_created"`
+	DifferencesResolved   int     `db:"differences_resolved" json:"differences_resolved"`
+	AdjustmentsCreated    int     `db:"adjustments_created" json:"adjustments_created"`
+	TotalAdjustmentAmount float64 `db:"total_adjustment_amount" json:"total_adjustment_amount"`
+
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/journal_metric.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type JournalMetric struct {
+	MetricID     uuid.UUID       `db:"metric_id" json:"metric_id"`
+	CompanyID    uuid.UUID       `db:"company_id" json:"company_id"`
+	JournalType  *string         `db:"journal_type" json:"journal_type,omitempty"`
+	Date         time.Time       `db:"date" json:"date"`
+	TotalEntries int             `db:"total_entries" json:"total_entries"`
+	TotalAmount  decimal.Decimal `db:"total_amount" json:"total_amount"`
+	CreatedAt    time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/tax_summary.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type TaxSummary struct {
+	SummaryID        uuid.UUID       `db:"summary_id" json:"summary_id"`
+	CompanyID        uuid.UUID       `db:"company_id" json:"company_id"`
+	TaxRateID        *uuid.UUID      `db:"tax_rate_id" json:"tax_rate_id,omitempty"`
+	Date             time.Time       `db:"date" json:"date"`
+	TotalTaxable     decimal.Decimal `db:"total_taxable" json:"total_taxable"`
+	TotalTax         decimal.Decimal `db:"total_tax" json:"total_tax"`
+	TransactionCount int             `db:"transaction_count" json:"transaction_count"`
+	CreatedAt        time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/account_snapshot.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type AccountSnapshot struct {
+	SnapshotID   uuid.UUID       `db:"snapshot_id" json:"snapshot_id"`
+	CompanyID    uuid.UUID       `db:"company_id" json:"company_id"`
+	AccountID    uuid.UUID       `db:"account_id" json:"account_id"`
+	SnapshotDate time.Time       `db:"snapshot_date" json:"snapshot_date"`
+	Balance      decimal.Decimal `db:"balance" json:"balance"`
+	FiscalYear   *int            `db:"fiscal_year" json:"fiscal_year,omitempty"`
+	Period       *int            `db:"period" json:"period,omitempty"`
+	CreatedAt    time.Time       `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/reconciliation_diff_trends.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ReconciliationDiffTrends struct {
+	TrendID   uuid.UUID  `db:"trend_id" json:"trend_id"`
+	CompanyID uuid.UUID  `db:"company_id" json:"company_id"`
+	BatchID   *uuid.UUID `db:"batch_id" json:"batch_id,omitempty"`
+	IssueType string     `db:"issue_type" json:"issue_type"`
+	Date      time.Time  `db:"date" json:"date"`
+
+	Count               int     `db:"count" json:"count"`
+	TotalExpectedAmount float64 `db:"total_expected_amount" json:"total_expected_amount"`
+	TotalActualAmount   float64 `db:"total_actual_amount" json:"total_actual_amount"`
+	TotalVariance       float64 `db:"total_variance" json:"total_variance"`
+
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/reconciliation_batch_metrics.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ReconciliationBatchMetrics struct {
+	MetricID           uuid.UUID `db:"metric_id" json:"metric_id"`
+	BatchID            uuid.UUID `db:"batch_id" json:"batch_id"`
+	CompanyID          uuid.UUID `db:"company_id" json:"company_id"`
+	ReconciliationType string    `db:"reconciliation_type" json:"reconciliation_type"`
+
+	TotalItems     int     `db:"total_items" json:"total_items"`
+	MatchedItems   int     `db:"matched_items" json:"matched_items"`
+	UnmatchedItems int     `db:"unmatched_items" json:"unmatched_items"`
+	IgnoredItems   int     `db:"ignored_items" json:"ignored_items"`
+	MatchRate      float64 `db:"match_rate" json:"match_rate"`
+
+	StartedAt                 *time.Time `db:"started_at" json:"started_at,omitempty"`
+	CompletedAt               *time.Time `db:"completed_at" json:"completed_at,omitempty"`
+	CompletionDurationSeconds *int       `db:"completion_duration_seconds" json:"completion_duration_seconds,omitempty"`
+
+	TotalDifferences    int     `db:"total_differences" json:"total_differences"`
+	ResolvedDifferences int     `db:"resolved_differences" json:"resolved_differences"`
+	TotalAdjustments    int     `db:"total_adjustments" json:"total_adjustments"`
+	AdjustmentAmount    float64 `db:"adjustment_amount" json:"adjustment_amount"` // decimal stored as float64 in JSON
+
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/analytics/cashflow.go
+================================================================================
+
+package analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type Cashflow struct {
+	CashflowID  uuid.UUID       `db:"cashflow_id" json:"cashflow_id"`
+	CompanyID   uuid.UUID       `db:"company_id" json:"company_id"`
+	Date        time.Time       `db:"date" json:"date"`
+	Inflow      decimal.Decimal `db:"inflow" json:"inflow"`
+	Outflow     decimal.Decimal `db:"outflow" json:"outflow"`
+	NetCashflow decimal.Decimal `db:"net_cashflow" json:"net_cashflow"` // generated
+	CreatedAt   time.Time       `db:"created_at" json:"created_at"`
+}
+
+

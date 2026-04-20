@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -14,148 +15,167 @@ import (
 	"auth-service/internal/util"
 )
 
-// AnalyticsRepository defines all analytics data operations.
+// DBTX and scanner are assumed to be defined elsewhere in the package.
+// For completeness, they are kept as in the original file.
+
 type AnalyticsRepository interface {
-	// Student performance summaries
+	// Existing methods (unchanged)
 	GetStudentPerformanceSummary(ctx context.Context, db DBTX, id uuid.UUID) (*models.StudentPerformanceSummary, error)
 	ListStudentPerformanceSummaries(ctx context.Context, db DBTX, filter StudentPerformanceSummaryFilter, p Pagination, s Sort) ([]*models.StudentPerformanceSummary, error)
 	CountStudentPerformanceSummaries(ctx context.Context, db DBTX, filter StudentPerformanceSummaryFilter) (int64, error)
 	CreateStudentPerformanceSummary(ctx context.Context, db DBTX, summary *models.StudentPerformanceSummary) error
 	UpdateStudentPerformanceSummary(ctx context.Context, db DBTX, summary *models.StudentPerformanceSummary) error
 	DeleteStudentPerformanceSummary(ctx context.Context, db DBTX, id uuid.UUID) error
-
-	// Class performance summaries
 	GetClassPerformanceSummary(ctx context.Context, db DBTX, id uuid.UUID) (*models.ClassPerformanceSummary, error)
 	ListClassPerformanceSummaries(ctx context.Context, db DBTX, filter ClassPerformanceSummaryFilter, p Pagination, s Sort) ([]*models.ClassPerformanceSummary, error)
 	CountClassPerformanceSummaries(ctx context.Context, db DBTX, filter ClassPerformanceSummaryFilter) (int64, error)
 	CreateClassPerformanceSummary(ctx context.Context, db DBTX, summary *models.ClassPerformanceSummary) error
 	UpdateClassPerformanceSummary(ctx context.Context, db DBTX, summary *models.ClassPerformanceSummary) error
 	DeleteClassPerformanceSummary(ctx context.Context, db DBTX, id uuid.UUID) error
-
-	// Student rankings
 	GetStudentRanking(ctx context.Context, db DBTX, id uuid.UUID) (*models.StudentRanking, error)
 	ListStudentRankings(ctx context.Context, db DBTX, filter StudentRankingFilter, p Pagination, s Sort) ([]*models.StudentRanking, error)
 	CountStudentRankings(ctx context.Context, db DBTX, filter StudentRankingFilter) (int64, error)
 	CreateStudentRanking(ctx context.Context, db DBTX, ranking *models.StudentRanking) error
 	UpdateStudentRanking(ctx context.Context, db DBTX, ranking *models.StudentRanking) error
 	DeleteStudentRanking(ctx context.Context, db DBTX, id uuid.UUID) error
-
-	// Academic year metrics (aggregated)
 	GetAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.AcademicYearMetrics, error)
 	ListAcademicYearMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.AcademicYearMetrics, error)
 	UpdateAcademicYearMetrics(ctx context.Context, db DBTX, update *models.AcademicYearMetricsUpdate) error
 	RefreshAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Exam metrics
 	GetExamMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.ExamMetrics, error)
 	ListExamMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.ExamMetrics, error)
 	UpdateExamMetrics(ctx context.Context, db DBTX, update *models.ExamMetricsUpdate) error
 	RefreshExamMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteExamMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Fee metrics
 	GetFeeMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.FeeMetrics, error)
 	ListFeeMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.FeeMetrics, error)
 	UpdateFeeMetrics(ctx context.Context, db DBTX, update *models.FeeMetricsUpdate) error
 	RefreshFeeMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteFeeMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Grading metrics
 	GetGradingMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.GradingMetrics, error)
 	ListGradingMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.GradingMetrics, error)
 	UpdateGradingMetrics(ctx context.Context, db DBTX, update *models.GradingMetricsUpdate) error
 	RefreshGradingMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteGradingMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Guardian metrics
 	GetGuardianMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.GuardianMetrics, error)
 	ListGuardianMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.GuardianMetrics, error)
 	UpdateGuardianMetrics(ctx context.Context, db DBTX, update *models.GuardianMetricsUpdate) error
 	RefreshGuardianMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteGuardianMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Library metrics
 	GetLibraryMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.LibraryMetrics, error)
 	ListLibraryMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.LibraryMetrics, error)
 	UpdateLibraryMetrics(ctx context.Context, db DBTX, update *models.LibraryMetricsUpdate) error
 	RefreshLibraryMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteLibraryMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// ===================== New metrics for the 9 services =====================
-
-	// Room metrics
 	GetRoomMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.RoomMetrics, error)
 	ListRoomMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.RoomMetrics, error)
 	UpdateRoomMetrics(ctx context.Context, db DBTX, update *models.RoomMetricsUpdate) error
 	RefreshRoomMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteRoomMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Section metrics
 	GetSectionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.SectionMetrics, error)
 	ListSectionMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.SectionMetrics, error)
 	UpdateSectionMetrics(ctx context.Context, db DBTX, update *models.SectionMetricsUpdate) error
 	RefreshSectionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteSectionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Student metrics (additional to academic_year_metrics)
 	GetStudentMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.StudentMetrics, error)
 	ListStudentMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.StudentMetrics, error)
 	UpdateStudentMetrics(ctx context.Context, db DBTX, update *models.StudentMetricsUpdate) error
 	RefreshStudentMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteStudentMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Subject metrics
 	GetSubjectMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.SubjectMetrics, error)
 	ListSubjectMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.SubjectMetrics, error)
 	UpdateSubjectMetrics(ctx context.Context, db DBTX, update *models.SubjectMetricsUpdate) error
 	RefreshSubjectMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteSubjectMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Submission metrics
 	GetSubmissionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.SubmissionMetrics, error)
 	ListSubmissionMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.SubmissionMetrics, error)
 	UpdateSubmissionMetrics(ctx context.Context, db DBTX, update *models.SubmissionMetricsUpdate) error
 	RefreshSubmissionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteSubmissionMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Teacher metrics
 	GetTeacherMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.TeacherMetrics, error)
 	ListTeacherMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.TeacherMetrics, error)
 	UpdateTeacherMetrics(ctx context.Context, db DBTX, update *models.TeacherMetricsUpdate) error
 	RefreshTeacherMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteTeacherMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Timetable metrics
 	GetTimetableMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.TimetableMetrics, error)
 	ListTimetableMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.TimetableMetrics, error)
 	UpdateTimetableMetrics(ctx context.Context, db DBTX, update *models.TimetableMetricsUpdate) error
 	RefreshTimetableMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteTimetableMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
-
-	// Transport metrics
 	GetTransportMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.TransportMetrics, error)
 	ListTransportMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.TransportMetrics, error)
 	UpdateTransportMetrics(ctx context.Context, db DBTX, update *models.TransportMetricsUpdate) error
 	RefreshTransportMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
 	DeleteTransportMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error
+
+	// New methods for period attendance analytics
+	GetStudentSessionSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*models.StudentSessionSummary, error)
+	ListStudentSessionSummaries(ctx context.Context, db DBTX, filter StudentSessionSummaryFilter, p Pagination, s Sort) ([]*models.StudentSessionSummary, error)
+	CountStudentSessionSummaries(ctx context.Context, db DBTX, filter StudentSessionSummaryFilter) (int64, error)
+	CreateStudentSessionSummary(ctx context.Context, db DBTX, summary *models.StudentSessionSummary) error
+	UpdateStudentSessionSummary(ctx context.Context, db DBTX, summary *models.StudentSessionSummary) error
+	DeleteStudentSessionSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error
+
+	GetSectionSessionMetrics(ctx context.Context, db DBTX, sectionID uuid.UUID, sessionDate time.Time) (*models.SectionSessionMetrics, error)
+	UpsertSectionSessionMetrics(ctx context.Context, db DBTX, metrics *models.SectionSessionMetrics) error
+	ListSectionSessionMetrics(ctx context.Context, db DBTX, filter SectionSessionMetricsFilter, p Pagination, s Sort) ([]*models.SectionSessionMetrics, error)
+	DeleteSectionSessionMetrics(ctx context.Context, db DBTX, sectionID uuid.UUID, sessionDate time.Time) error
+
+	GetTeacherSessionMetrics(ctx context.Context, db DBTX, teacherID, academicYearID uuid.UUID) (*models.TeacherSessionMetrics, error)
+	UpsertTeacherSessionMetrics(ctx context.Context, db DBTX, metrics *models.TeacherSessionMetrics) error
+	ListTeacherSessionMetrics(ctx context.Context, db DBTX, filter TeacherSessionMetricsFilter, p Pagination, s Sort) ([]*models.TeacherSessionMetrics, error)
+	DeleteTeacherSessionMetrics(ctx context.Context, db DBTX, teacherID, academicYearID uuid.UUID) error
+
+	GetBiometricUsageMetrics(ctx context.Context, db DBTX, deviceID string, date time.Time) (*models.BiometricUsageMetrics, error)
+	UpsertBiometricUsageMetrics(ctx context.Context, db DBTX, metrics *models.BiometricUsageMetrics) error
+	ListBiometricUsageMetrics(ctx context.Context, db DBTX, filter BiometricUsageMetricsFilter, p Pagination, s Sort) ([]*models.BiometricUsageMetrics, error)
+	DeleteBiometricUsageMetrics(ctx context.Context, db DBTX, deviceID string, date time.Time) error
+	// Refresh methods for period attendance analytics
+	RefreshStudentSessionSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error
+	RefreshSectionSessionMetrics(ctx context.Context, db DBTX, sectionID uuid.UUID, sessionDate time.Time) error
+	RefreshTeacherSessionMetrics(ctx context.Context, db DBTX, teacherID, academicYearID uuid.UUID) error
+	RefreshBiometricUsageMetrics(ctx context.Context, db DBTX, deviceID string, date time.Time) error
 }
 
-// analyticsRepository implements AnalyticsRepository.
+// Filter structs for new entities
+type StudentSessionSummaryFilter struct {
+	StudentID      *uuid.UUID
+	AcademicYearID *uuid.UUID
+	TermID         *uuid.UUID
+}
+
+type SectionSessionMetricsFilter struct {
+	SectionID *uuid.UUID
+	FromDate  *time.Time
+	ToDate    *time.Time
+}
+
+type TeacherSessionMetricsFilter struct {
+	TeacherID      *uuid.UUID
+	AcademicYearID *uuid.UUID
+}
+
+type BiometricUsageMetricsFilter struct {
+	DeviceID  *string
+	CompanyID *uuid.UUID
+	FromDate  *time.Time
+	ToDate    *time.Time
+}
+
+// Pagination and Sort types (assumed defined elsewhere)
+
+// repository implementation
 type analyticsRepository struct {
 	logger *zap.Logger
 }
 
-// NewAnalyticsRepository creates a new instance.
 func NewAnalyticsRepository(logger *zap.Logger) AnalyticsRepository {
 	return &analyticsRepository{
 		logger: logger.Named("analytics_repo"),
 	}
 }
 
-// ================================ Helper functions ================================
-
-// validateSort validates and builds the ORDER BY clause.
 func (r *analyticsRepository) validateSort(s Sort, allowedFields map[string]bool) (string, error) {
 	field := s.Field
 	if field == "" {
@@ -171,7 +191,6 @@ func (r *analyticsRepository) validateSort(s Sort, allowedFields map[string]bool
 	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
 }
 
-// validatePagination returns limit and offset with defaults.
 func (r *analyticsRepository) validatePagination(p Pagination) (int, int) {
 	limit := p.Limit
 	if limit <= 0 {
@@ -767,153 +786,153 @@ func (r *analyticsRepository) scanStudentRanking(row scanner) (*models.StudentRa
 
 // ================================ Academic Year Metrics ================================
 
-func (r *analyticsRepository) GetAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.AcademicYearMetrics, error) {
-	query := `
-        SELECT academic_year_id, total_students, active_students, total_terms,
-               total_sections, total_courses, total_subjects,
-               total_admissions, approved_admissions, pending_admissions, rejected_admissions,
-               total_assignments, published_assignments,
-               total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
-               total_exemptions, total_subject_mappings, courses_with_curriculum,
-               total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
-               last_updated
-        FROM analytics.academic_year_metrics
-        WHERE academic_year_id = $1
-    `
-	var m models.AcademicYearMetrics
-	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
-		&m.AcademicYearID, &m.TotalStudents, &m.ActiveStudents, &m.TotalTerms,
-		&m.TotalSections, &m.TotalCourses, &m.TotalSubjects,
-		&m.TotalAdmissions, &m.ApprovedAdmissions, &m.PendingAdmissions, &m.RejectedAdmissions,
-		&m.TotalAssignments, &m.PublishedAssignments,
-		&m.TotalAttendanceRecords, &m.TotalAbsentRecords, &m.TotalLateRecords, &m.TotalHalfDayRecords,
-		&m.TotalExemptions, &m.TotalSubjectMappings, &m.CoursesWithCurriculum,
-		&m.TotalEnrollments, &m.ActiveEnrollments, &m.CompletedEnrollments, &m.WithdrawnEnrollments,
-		&m.LastUpdated,
-	)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get academic year metrics: %w", err)
-	}
-	return &m, nil
-}
+// func (r *analyticsRepository) GetAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.AcademicYearMetrics, error) {
+// 	query := `
+//         SELECT academic_year_id, total_students, active_students, total_terms,
+//                total_sections, total_courses, total_subjects,
+//                total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+//                total_assignments, published_assignments,
+//                total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+//                total_exemptions, total_subject_mappings, courses_with_curriculum,
+//                total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+//                last_updated
+//         FROM analytics.academic_year_metrics
+//         WHERE academic_year_id = $1
+//     `
+// 	var m models.AcademicYearMetrics
+// 	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
+// 		&m.AcademicYearID, &m.TotalStudents, &m.ActiveStudents, &m.TotalTerms,
+// 		&m.TotalSections, &m.TotalCourses, &m.TotalSubjects,
+// 		&m.TotalAdmissions, &m.ApprovedAdmissions, &m.PendingAdmissions, &m.RejectedAdmissions,
+// 		&m.TotalAssignments, &m.PublishedAssignments,
+// 		&m.TotalAttendanceRecords, &m.TotalAbsentRecords, &m.TotalLateRecords, &m.TotalHalfDayRecords,
+// 		&m.TotalExemptions, &m.TotalSubjectMappings, &m.CoursesWithCurriculum,
+// 		&m.TotalEnrollments, &m.ActiveEnrollments, &m.CompletedEnrollments, &m.WithdrawnEnrollments,
+// 		&m.LastUpdated,
+// 	)
+// 	if err != nil {
+// 		if errors.Is(err, sql.ErrNoRows) {
+// 			return nil, nil
+// 		}
+// 		return nil, fmt.Errorf("get academic year metrics: %w", err)
+// 	}
+// 	return &m, nil
+// }
 
-func (r *analyticsRepository) ListAcademicYearMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.AcademicYearMetrics, error) {
-	query := `
-        SELECT academic_year_id, total_students, active_students, total_terms,
-               total_sections, total_courses, total_subjects,
-               total_admissions, approved_admissions, pending_admissions, rejected_admissions,
-               total_assignments, published_assignments,
-               total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
-               total_exemptions, total_subject_mappings, courses_with_curriculum,
-               total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
-               last_updated
-        FROM analytics.academic_year_metrics
-        ORDER BY last_updated DESC
-        LIMIT $1 OFFSET $2
-    `
-	rows, err := db.QueryContext(ctx, query, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("list academic year metrics: %w", err)
-	}
-	defer rows.Close()
-	var results []*models.AcademicYearMetrics
-	for rows.Next() {
-		var m models.AcademicYearMetrics
-		if err := rows.Scan(
-			&m.AcademicYearID, &m.TotalStudents, &m.ActiveStudents, &m.TotalTerms,
-			&m.TotalSections, &m.TotalCourses, &m.TotalSubjects,
-			&m.TotalAdmissions, &m.ApprovedAdmissions, &m.PendingAdmissions, &m.RejectedAdmissions,
-			&m.TotalAssignments, &m.PublishedAssignments,
-			&m.TotalAttendanceRecords, &m.TotalAbsentRecords, &m.TotalLateRecords, &m.TotalHalfDayRecords,
-			&m.TotalExemptions, &m.TotalSubjectMappings, &m.CoursesWithCurriculum,
-			&m.TotalEnrollments, &m.ActiveEnrollments, &m.CompletedEnrollments, &m.WithdrawnEnrollments,
-			&m.LastUpdated,
-		); err != nil {
-			return nil, fmt.Errorf("scan row: %w", err)
-		}
-		results = append(results, &m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration: %w", err)
-	}
-	return results, nil
-}
+// func (r *analyticsRepository) ListAcademicYearMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.AcademicYearMetrics, error) {
+// 	query := `
+//         SELECT academic_year_id, total_students, active_students, total_terms,
+//                total_sections, total_courses, total_subjects,
+//                total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+//                total_assignments, published_assignments,
+//                total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+//                total_exemptions, total_subject_mappings, courses_with_curriculum,
+//                total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+//                last_updated
+//         FROM analytics.academic_year_metrics
+//         ORDER BY last_updated DESC
+//         LIMIT $1 OFFSET $2
+//     `
+// 	rows, err := db.QueryContext(ctx, query, limit, offset)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("list academic year metrics: %w", err)
+// 	}
+// 	defer rows.Close()
+// 	var results []*models.AcademicYearMetrics
+// 	for rows.Next() {
+// 		var m models.AcademicYearMetrics
+// 		if err := rows.Scan(
+// 			&m.AcademicYearID, &m.TotalStudents, &m.ActiveStudents, &m.TotalTerms,
+// 			&m.TotalSections, &m.TotalCourses, &m.TotalSubjects,
+// 			&m.TotalAdmissions, &m.ApprovedAdmissions, &m.PendingAdmissions, &m.RejectedAdmissions,
+// 			&m.TotalAssignments, &m.PublishedAssignments,
+// 			&m.TotalAttendanceRecords, &m.TotalAbsentRecords, &m.TotalLateRecords, &m.TotalHalfDayRecords,
+// 			&m.TotalExemptions, &m.TotalSubjectMappings, &m.CoursesWithCurriculum,
+// 			&m.TotalEnrollments, &m.ActiveEnrollments, &m.CompletedEnrollments, &m.WithdrawnEnrollments,
+// 			&m.LastUpdated,
+// 		); err != nil {
+// 			return nil, fmt.Errorf("scan row: %w", err)
+// 		}
+// 		results = append(results, &m)
+// 	}
+// 	if err := rows.Err(); err != nil {
+// 		return nil, fmt.Errorf("rows iteration: %w", err)
+// 	}
+// 	return results, nil
+// }
 
-func (r *analyticsRepository) UpdateAcademicYearMetrics(ctx context.Context, db DBTX, update *models.AcademicYearMetricsUpdate) error {
-	query := `
-        INSERT INTO analytics.academic_year_metrics (
-            academic_year_id, total_students, active_students, total_terms,
-            total_sections, total_courses, total_subjects,
-            total_admissions, approved_admissions, pending_admissions, rejected_admissions,
-            total_assignments, published_assignments,
-            total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
-            total_exemptions, total_subject_mappings, courses_with_curriculum,
-            total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
-            last_updated
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, NOW())
-        ON CONFLICT (academic_year_id) DO UPDATE SET
-            total_students   = analytics.academic_year_metrics.total_students + EXCLUDED.total_students,
-            active_students  = analytics.academic_year_metrics.active_students + EXCLUDED.active_students,
-            total_terms      = analytics.academic_year_metrics.total_terms + EXCLUDED.total_terms,
-            total_sections   = analytics.academic_year_metrics.total_sections + EXCLUDED.total_sections,
-            total_courses    = analytics.academic_year_metrics.total_courses + EXCLUDED.total_courses,
-            total_subjects   = analytics.academic_year_metrics.total_subjects + EXCLUDED.total_subjects,
-            total_admissions = analytics.academic_year_metrics.total_admissions + EXCLUDED.total_admissions,
-            approved_admissions = analytics.academic_year_metrics.approved_admissions + EXCLUDED.approved_admissions,
-            pending_admissions = analytics.academic_year_metrics.pending_admissions + EXCLUDED.pending_admissions,
-            rejected_admissions = analytics.academic_year_metrics.rejected_admissions + EXCLUDED.rejected_admissions,
-            total_assignments = analytics.academic_year_metrics.total_assignments + EXCLUDED.total_assignments,
-            published_assignments = analytics.academic_year_metrics.published_assignments + EXCLUDED.published_assignments,
-            total_attendance_records = analytics.academic_year_metrics.total_attendance_records + EXCLUDED.total_attendance_records,
-            total_absent_records = analytics.academic_year_metrics.total_absent_records + EXCLUDED.total_absent_records,
-            total_late_records = analytics.academic_year_metrics.total_late_records + EXCLUDED.total_late_records,
-            total_half_day_records = analytics.academic_year_metrics.total_half_day_records + EXCLUDED.total_half_day_records,
-            total_exemptions = analytics.academic_year_metrics.total_exemptions + EXCLUDED.total_exemptions,
-            total_subject_mappings = analytics.academic_year_metrics.total_subject_mappings + EXCLUDED.total_subject_mappings,
-            courses_with_curriculum = analytics.academic_year_metrics.courses_with_curriculum + EXCLUDED.courses_with_curriculum,
-            total_enrollments = analytics.academic_year_metrics.total_enrollments + EXCLUDED.total_enrollments,
-            active_enrollments = analytics.academic_year_metrics.active_enrollments + EXCLUDED.active_enrollments,
-            completed_enrollments = analytics.academic_year_metrics.completed_enrollments + EXCLUDED.completed_enrollments,
-            withdrawn_enrollments = analytics.academic_year_metrics.withdrawn_enrollments + EXCLUDED.withdrawn_enrollments,
-            last_updated = NOW()
-    `
-	_, err := db.ExecContext(ctx, query,
-		update.AcademicYearID,
-		update.DeltaStudents,
-		update.DeltaActive,
-		update.DeltaTerms,
-		update.DeltaSections,
-		update.DeltaCourses,
-		update.DeltaSubjects,
-		update.DeltaTotalAdm,
-		update.DeltaApprovedAdm,
-		update.DeltaPendingAdm,
-		update.DeltaRejectedAdm,
-		update.DeltaTotalAssignments,
-		update.DeltaPublishedAssignments,
-		update.DeltaAttendanceRecords,
-		update.DeltaAbsentRecords,
-		update.DeltaLateRecords,
-		update.DeltaHalfDayRecords,
-		update.DeltaExemptions,
-		update.DeltaTotalSubjectMappings,
-		update.DeltaCoursesWithCurriculum,
-		update.DeltaTotalEnrollments,
-		update.DeltaActiveEnrollments,
-		update.DeltaCompletedEnrollments,
-		update.DeltaWithdrawnEnrollments,
-	)
-	if err != nil {
-		r.logger.Error("failed to update academic year metrics",
-			zap.String("academic_year_id", update.AcademicYearID.String()),
-			zap.Error(err))
-		return fmt.Errorf("update academic year metrics: %w", err)
-	}
-	return nil
-}
+// func (r *analyticsRepository) UpdateAcademicYearMetrics(ctx context.Context, db DBTX, update *models.AcademicYearMetricsUpdate) error {
+// 	query := `
+//         INSERT INTO analytics.academic_year_metrics (
+//             academic_year_id, total_students, active_students, total_terms,
+//             total_sections, total_courses, total_subjects,
+//             total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+//             total_assignments, published_assignments,
+//             total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+//             total_exemptions, total_subject_mappings, courses_with_curriculum,
+//             total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+//             last_updated
+//         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, NOW())
+//         ON CONFLICT (academic_year_id) DO UPDATE SET
+//             total_students   = analytics.academic_year_metrics.total_students + EXCLUDED.total_students,
+//             active_students  = analytics.academic_year_metrics.active_students + EXCLUDED.active_students,
+//             total_terms      = analytics.academic_year_metrics.total_terms + EXCLUDED.total_terms,
+//             total_sections   = analytics.academic_year_metrics.total_sections + EXCLUDED.total_sections,
+//             total_courses    = analytics.academic_year_metrics.total_courses + EXCLUDED.total_courses,
+//             total_subjects   = analytics.academic_year_metrics.total_subjects + EXCLUDED.total_subjects,
+//             total_admissions = analytics.academic_year_metrics.total_admissions + EXCLUDED.total_admissions,
+//             approved_admissions = analytics.academic_year_metrics.approved_admissions + EXCLUDED.approved_admissions,
+//             pending_admissions = analytics.academic_year_metrics.pending_admissions + EXCLUDED.pending_admissions,
+//             rejected_admissions = analytics.academic_year_metrics.rejected_admissions + EXCLUDED.rejected_admissions,
+//             total_assignments = analytics.academic_year_metrics.total_assignments + EXCLUDED.total_assignments,
+//             published_assignments = analytics.academic_year_metrics.published_assignments + EXCLUDED.published_assignments,
+//             total_attendance_records = analytics.academic_year_metrics.total_attendance_records + EXCLUDED.total_attendance_records,
+//             total_absent_records = analytics.academic_year_metrics.total_absent_records + EXCLUDED.total_absent_records,
+//             total_late_records = analytics.academic_year_metrics.total_late_records + EXCLUDED.total_late_records,
+//             total_half_day_records = analytics.academic_year_metrics.total_half_day_records + EXCLUDED.total_half_day_records,
+//             total_exemptions = analytics.academic_year_metrics.total_exemptions + EXCLUDED.total_exemptions,
+//             total_subject_mappings = analytics.academic_year_metrics.total_subject_mappings + EXCLUDED.total_subject_mappings,
+//             courses_with_curriculum = analytics.academic_year_metrics.courses_with_curriculum + EXCLUDED.courses_with_curriculum,
+//             total_enrollments = analytics.academic_year_metrics.total_enrollments + EXCLUDED.total_enrollments,
+//             active_enrollments = analytics.academic_year_metrics.active_enrollments + EXCLUDED.active_enrollments,
+//             completed_enrollments = analytics.academic_year_metrics.completed_enrollments + EXCLUDED.completed_enrollments,
+//             withdrawn_enrollments = analytics.academic_year_metrics.withdrawn_enrollments + EXCLUDED.withdrawn_enrollments,
+//             last_updated = NOW()
+//     `
+// 	_, err := db.ExecContext(ctx, query,
+// 		update.AcademicYearID,
+// 		update.DeltaStudents,
+// 		update.DeltaActive,
+// 		update.DeltaTerms,
+// 		update.DeltaSections,
+// 		update.DeltaCourses,
+// 		update.DeltaSubjects,
+// 		update.DeltaTotalAdm,
+// 		update.DeltaApprovedAdm,
+// 		update.DeltaPendingAdm,
+// 		update.DeltaRejectedAdm,
+// 		update.DeltaTotalAssignments,
+// 		update.DeltaPublishedAssignments,
+// 		update.DeltaAttendanceRecords,
+// 		update.DeltaAbsentRecords,
+// 		update.DeltaLateRecords,
+// 		update.DeltaHalfDayRecords,
+// 		update.DeltaExemptions,
+// 		update.DeltaTotalSubjectMappings,
+// 		update.DeltaCoursesWithCurriculum,
+// 		update.DeltaTotalEnrollments,
+// 		update.DeltaActiveEnrollments,
+// 		update.DeltaCompletedEnrollments,
+// 		update.DeltaWithdrawnEnrollments,
+// 	)
+// 	if err != nil {
+// 		r.logger.Error("failed to update academic year metrics",
+// 			zap.String("academic_year_id", update.AcademicYearID.String()),
+// 			zap.Error(err))
+// 		return fmt.Errorf("update academic year metrics: %w", err)
+// 	}
+// 	return nil
+// }
 
 func (r *analyticsRepository) DeleteAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `DELETE FROM analytics.academic_year_metrics WHERE academic_year_id = $1`
@@ -2847,10 +2866,395 @@ func (r *analyticsRepository) DeleteTransportMetrics(ctx context.Context, db DBT
 	return nil
 }
 
+// func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
+// 	query := `
+//         WITH student_counts AS (
+//             SELECT
+//                 e.academic_year_id,
+//                 COUNT(DISTINCT e.student_id) AS total_students,
+//                 COUNT(DISTINCT e.student_id) FILTER (WHERE s.status = 'active') AS active_students
+//             FROM academics.enrollments e
+//             JOIN academics.students s ON s.student_id = e.student_id
+//             WHERE e.academic_year_id = $1
+//               AND e.status = 'active'
+//               AND s.deleted_at IS NULL
+//             GROUP BY e.academic_year_id
+//         ),
+//         term_counts AS (
+//             SELECT academic_year_id, COUNT(*) AS total_terms
+//             FROM academics.term
+//             WHERE academic_year_id = $1 AND deleted_at IS NULL
+//             GROUP BY academic_year_id
+//         ),
+//         section_counts AS (
+//             SELECT
+//                 t.academic_year_id,
+//                 COUNT(DISTINCT s.section_id) AS total_sections
+//             FROM academics.section s
+//             JOIN academics.term t ON t.term_id = s.term_id
+//             WHERE t.academic_year_id = $1
+//               AND s.deleted_at IS NULL
+//               AND t.deleted_at IS NULL
+//             GROUP BY t.academic_year_id
+//         ),
+//         course_counts AS (
+//             SELECT
+//                 t.academic_year_id,
+//                 COUNT(DISTINCT s.course_id) AS total_courses
+//             FROM academics.section s
+//             JOIN academics.term t ON t.term_id = s.term_id
+//             WHERE t.academic_year_id = $1
+//               AND s.deleted_at IS NULL
+//               AND t.deleted_at IS NULL
+//             GROUP BY t.academic_year_id
+//         ),
+//         subject_counts AS (
+//             SELECT
+//                 t.academic_year_id,
+//                 COUNT(DISTINCT sub.subject_id) AS total_subjects
+//             FROM academics.section s
+//             JOIN academics.term t ON t.term_id = s.term_id
+//             JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
+//             JOIN academics.subject sub ON sub.subject_id = scm.subject_id
+//             WHERE t.academic_year_id = $1
+//               AND s.deleted_at IS NULL
+//               AND t.deleted_at IS NULL
+//               AND sub.deleted_at IS NULL
+//             GROUP BY t.academic_year_id
+//         ),
+//         admission_counts AS (
+//             SELECT
+//                 academic_year_id,
+//                 COUNT(*) AS total_admissions,
+//                 COUNT(*) FILTER (WHERE admission_status = 'approved') AS approved_admissions,
+//                 COUNT(*) FILTER (WHERE admission_status = 'pending') AS pending_admissions,
+//                 COUNT(*) FILTER (WHERE admission_status = 'rejected') AS rejected_admissions
+//             FROM academics.admissions
+//             WHERE academic_year_id = $1
+//             GROUP BY academic_year_id
+//         ),
+//         assignment_counts AS (
+//             SELECT
+//                 t.academic_year_id,
+//                 COUNT(a.assignment_id) AS total_assignments,
+//                 COUNT(a.assignment_id) FILTER (WHERE a.is_published = true) AS published_assignments
+//             FROM academics.assignments a
+//             JOIN academics.section s ON s.section_id = a.section_id
+//             JOIN academics.term t ON t.term_id = s.term_id
+//             WHERE t.academic_year_id = $1 AND a.deleted_at IS NULL
+//             GROUP BY t.academic_year_id
+//         ),
+//         attendance_counts AS (
+//             SELECT
+//                 e.academic_year_id,
+//                 COUNT(a.attendance_id) AS total_attendance_records,
+//                 COUNT(a.attendance_id) FILTER (WHERE a.status = 'absent') AS total_absent_records,
+//                 COUNT(a.attendance_id) FILTER (WHERE a.status = 'late') AS total_late_records,
+//                 COUNT(a.attendance_id) FILTER (WHERE a.status = 'half-day') AS total_half_day_records
+//             FROM academics.student_attendance a
+//             JOIN academics.enrollments e ON e.enrollment_id = a.enrollment_id
+//             WHERE e.academic_year_id = $1
+//             GROUP BY e.academic_year_id
+//         ),
+//         exemption_counts AS (
+//             SELECT
+//                 e.academic_year_id,
+//                 COUNT(ex.exemption_id) AS total_exemptions
+//             FROM academics.student_attendance_exemptions ex
+//             JOIN academics.enrollments e ON e.student_id = ex.student_id
+//             WHERE e.academic_year_id = $1
+//               AND ex.from_date <= (SELECT end_date FROM academics.academic_year WHERE academic_year_id = $1)
+//             GROUP BY e.academic_year_id
+//         ),
+//         curriculum_counts AS (
+//             SELECT
+//                 t.academic_year_id,
+//                 COUNT(scm.mapping_id) AS total_subject_mappings,
+//                 COUNT(DISTINCT s.course_id) FILTER (WHERE scm.mapping_id IS NOT NULL) AS courses_with_curriculum
+//             FROM academics.section s
+//             JOIN academics.term t ON t.term_id = s.term_id
+//             LEFT JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
+//             WHERE t.academic_year_id = $1
+//               AND s.deleted_at IS NULL
+//               AND t.deleted_at IS NULL
+//             GROUP BY t.academic_year_id
+//         ),
+//         enrollment_counts AS (
+//             SELECT
+//                 academic_year_id,
+//                 COUNT(*) AS total_enrollments,
+//                 COUNT(*) FILTER (WHERE status = 'active') AS active_enrollments,
+//                 COUNT(*) FILTER (WHERE status = 'completed') AS completed_enrollments,
+//                 COUNT(*) FILTER (WHERE status = 'withdrawn') AS withdrawn_enrollments
+//             FROM academics.enrollments
+//             WHERE academic_year_id = $1
+//             GROUP BY academic_year_id
+//         )
+//         SELECT
+//             COALESCE(sc.total_students, 0),
+//             COALESCE(sc.active_students, 0),
+//             COALESCE(tc.total_terms, 0),
+//             COALESCE(scc.total_sections, 0),
+//             COALESCE(cc.total_courses, 0),
+//             COALESCE(suc.total_subjects, 0),
+//             COALESCE(ac.total_admissions, 0),
+//             COALESCE(ac.approved_admissions, 0),
+//             COALESCE(ac.pending_admissions, 0),
+//             COALESCE(ac.rejected_admissions, 0),
+//             COALESCE(assign_cte.total_assignments, 0),
+//             COALESCE(assign_cte.published_assignments, 0),
+//             COALESCE(att.total_attendance_records, 0),
+//             COALESCE(att.total_absent_records, 0),
+//             COALESCE(att.total_late_records, 0),
+//             COALESCE(att.total_half_day_records, 0),
+//             COALESCE(exc.total_exemptions, 0),
+//             COALESCE(cur.total_subject_mappings, 0),
+//             COALESCE(cur.courses_with_curriculum, 0),
+//             COALESCE(enc.total_enrollments, 0),
+//             COALESCE(enc.active_enrollments, 0),
+//             COALESCE(enc.completed_enrollments, 0),
+//             COALESCE(enc.withdrawn_enrollments, 0)
+//         FROM (SELECT $1 AS academic_year_id) ay
+//         LEFT JOIN student_counts sc ON sc.academic_year_id = ay.academic_year_id
+//         LEFT JOIN term_counts tc ON tc.academic_year_id = ay.academic_year_id
+//         LEFT JOIN section_counts scc ON scc.academic_year_id = ay.academic_year_id
+//         LEFT JOIN course_counts cc ON cc.academic_year_id = ay.academic_year_id
+//         LEFT JOIN subject_counts suc ON suc.academic_year_id = ay.academic_year_id
+//         LEFT JOIN admission_counts ac ON ac.academic_year_id = ay.academic_year_id
+//         LEFT JOIN assignment_counts assign_cte ON assign_cte.academic_year_id = ay.academic_year_id
+//         LEFT JOIN attendance_counts att ON att.academic_year_id = ay.academic_year_id
+//         LEFT JOIN exemption_counts exc ON exc.academic_year_id = ay.academic_year_id
+//         LEFT JOIN curriculum_counts cur ON cur.academic_year_id = ay.academic_year_id
+//         LEFT JOIN enrollment_counts enc ON enc.academic_year_id = ay.academic_year_id
+//     `
+
+// 	var totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects int
+// 	var totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions int
+// 	var totalAssignments, publishedAssignments int
+// 	var totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords int
+// 	var totalExemptions, totalSubjectMappings, coursesWithCurriculum int
+// 	var totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments int
+
+// 	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
+// 		&totalStudents, &activeStudents, &totalTerms, &totalSections, &totalCourses, &totalSubjects,
+// 		&totalAdmissions, &approvedAdmissions, &pendingAdmissions, &rejectedAdmissions,
+// 		&totalAssignments, &publishedAssignments,
+// 		&totalAttendanceRecords, &totalAbsentRecords, &totalLateRecords, &totalHalfDayRecords,
+// 		&totalExemptions, &totalSubjectMappings, &coursesWithCurriculum,
+// 		&totalEnrollments, &activeEnrollments, &completedEnrollments, &withdrawnEnrollments,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("recompute metrics: %w", err)
+// 	}
+
+// 	upsertQuery := `
+//         INSERT INTO analytics.academic_year_metrics (
+//             academic_year_id, total_students, active_students, total_terms,
+//             total_sections, total_courses, total_subjects,
+//             total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+//             total_assignments, published_assignments,
+//             total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+//             total_exemptions, total_subject_mappings, courses_with_curriculum,
+//             total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+//             last_updated
+//         ) VALUES (
+//             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+//             $12, $13, $14, $15, $16, $17, $18, $19, $20,
+//             $21, $22, $23, $24, NOW()
+//         )
+//         ON CONFLICT (academic_year_id) DO UPDATE SET
+//             total_students = EXCLUDED.total_students,
+//             active_students = EXCLUDED.active_students,
+//             total_terms = EXCLUDED.total_terms,
+//             total_sections = EXCLUDED.total_sections,
+//             total_courses = EXCLUDED.total_courses,
+//             total_subjects = EXCLUDED.total_subjects,
+//             total_admissions = EXCLUDED.total_admissions,
+//             approved_admissions = EXCLUDED.approved_admissions,
+//             pending_admissions = EXCLUDED.pending_admissions,
+//             rejected_admissions = EXCLUDED.rejected_admissions,
+//             total_assignments = EXCLUDED.total_assignments,
+//             published_assignments = EXCLUDED.published_assignments,
+//             total_attendance_records = EXCLUDED.total_attendance_records,
+//             total_absent_records = EXCLUDED.total_absent_records,
+//             total_late_records = EXCLUDED.total_late_records,
+//             total_half_day_records = EXCLUDED.total_half_day_records,
+//             total_exemptions = EXCLUDED.total_exemptions,
+//             total_subject_mappings = EXCLUDED.total_subject_mappings,
+//             courses_with_curriculum = EXCLUDED.courses_with_curriculum,
+//             total_enrollments = EXCLUDED.total_enrollments,
+//             active_enrollments = EXCLUDED.active_enrollments,
+//             completed_enrollments = EXCLUDED.completed_enrollments,
+//             withdrawn_enrollments = EXCLUDED.withdrawn_enrollments,
+//             last_updated = NOW()
+//     `
+
+// 	_, err = db.ExecContext(ctx, upsertQuery,
+// 		academicYearID,
+// 		totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects,
+// 		totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions,
+// 		totalAssignments, publishedAssignments,
+// 		totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords,
+// 		totalExemptions, totalSubjectMappings, coursesWithCurriculum,
+// 		totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments,
+// 	)
+// 	if err != nil {
+// 		return fmt.Errorf("upsert metrics: %w", err)
+// 	}
+
+// 	return nil
+// }
+
+func (r *analyticsRepository) GetAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) (*models.AcademicYearMetrics, error) {
+	query := `
+        SELECT academic_year_id, total_students, active_students, total_terms,
+               total_sections, total_courses, total_subjects,
+               total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+               total_assignments, published_assignments,
+               total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+               total_exemptions, total_subject_mappings, courses_with_curriculum,
+               total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+               total_sessions_generated, total_period_attendances, total_biometric_attendances, total_manual_period_attendances,
+               last_updated
+        FROM analytics.academic_year_metrics
+        WHERE academic_year_id = $1
+    `
+	var m models.AcademicYearMetrics
+	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
+		&m.AcademicYearID, &m.TotalStudents, &m.ActiveStudents, &m.TotalTerms,
+		&m.TotalSections, &m.TotalCourses, &m.TotalSubjects,
+		&m.TotalAdmissions, &m.ApprovedAdmissions, &m.PendingAdmissions, &m.RejectedAdmissions,
+		&m.TotalAssignments, &m.PublishedAssignments,
+		&m.TotalAttendanceRecords, &m.TotalAbsentRecords, &m.TotalLateRecords, &m.TotalHalfDayRecords,
+		&m.TotalExemptions, &m.TotalSubjectMappings, &m.CoursesWithCurriculum,
+		&m.TotalEnrollments, &m.ActiveEnrollments, &m.CompletedEnrollments, &m.WithdrawnEnrollments,
+		&m.TotalSessionsGenerated, &m.TotalPeriodAttendances, &m.TotalBiometricAttendances, &m.TotalManualPeriodAttendances,
+		&m.LastUpdated,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get academic year metrics: %w", err)
+	}
+	return &m, nil
+}
+
+// ListAcademicYearMetrics (updated with new fields)
+func (r *analyticsRepository) ListAcademicYearMetrics(ctx context.Context, db DBTX, limit, offset int) ([]*models.AcademicYearMetrics, error) {
+	query := `
+        SELECT academic_year_id, total_students, active_students, total_terms,
+               total_sections, total_courses, total_subjects,
+               total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+               total_assignments, published_assignments,
+               total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+               total_exemptions, total_subject_mappings, courses_with_curriculum,
+               total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+               total_sessions_generated, total_period_attendances, total_biometric_attendances, total_manual_period_attendances,
+               last_updated
+        FROM analytics.academic_year_metrics
+        ORDER BY last_updated DESC
+        LIMIT $1 OFFSET $2
+    `
+	rows, err := db.QueryContext(ctx, query, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list academic year metrics: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*models.AcademicYearMetrics
+	for rows.Next() {
+		var m models.AcademicYearMetrics
+		if err := rows.Scan(
+			&m.AcademicYearID, &m.TotalStudents, &m.ActiveStudents, &m.TotalTerms,
+			&m.TotalSections, &m.TotalCourses, &m.TotalSubjects,
+			&m.TotalAdmissions, &m.ApprovedAdmissions, &m.PendingAdmissions, &m.RejectedAdmissions,
+			&m.TotalAssignments, &m.PublishedAssignments,
+			&m.TotalAttendanceRecords, &m.TotalAbsentRecords, &m.TotalLateRecords, &m.TotalHalfDayRecords,
+			&m.TotalExemptions, &m.TotalSubjectMappings, &m.CoursesWithCurriculum,
+			&m.TotalEnrollments, &m.ActiveEnrollments, &m.CompletedEnrollments, &m.WithdrawnEnrollments,
+			&m.TotalSessionsGenerated, &m.TotalPeriodAttendances, &m.TotalBiometricAttendances, &m.TotalManualPeriodAttendances,
+			&m.LastUpdated,
+		); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		results = append(results, &m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return results, nil
+}
+
+// UpdateAcademicYearMetrics (updated with new delta fields)
+func (r *analyticsRepository) UpdateAcademicYearMetrics(ctx context.Context, db DBTX, update *models.AcademicYearMetricsUpdate) error {
+	query := `
+        INSERT INTO analytics.academic_year_metrics (
+            academic_year_id, total_students, active_students, total_terms,
+            total_sections, total_courses, total_subjects,
+            total_admissions, approved_admissions, pending_admissions, rejected_admissions,
+            total_assignments, published_assignments,
+            total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
+            total_exemptions, total_subject_mappings, courses_with_curriculum,
+            total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+            total_sessions_generated, total_period_attendances, total_biometric_attendances, total_manual_period_attendances,
+            last_updated
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, NOW())
+        ON CONFLICT (academic_year_id) DO UPDATE SET
+            total_students = analytics.academic_year_metrics.total_students + EXCLUDED.total_students,
+            active_students = analytics.academic_year_metrics.active_students + EXCLUDED.active_students,
+            total_terms = analytics.academic_year_metrics.total_terms + EXCLUDED.total_terms,
+            total_sections = analytics.academic_year_metrics.total_sections + EXCLUDED.total_sections,
+            total_courses = analytics.academic_year_metrics.total_courses + EXCLUDED.total_courses,
+            total_subjects = analytics.academic_year_metrics.total_subjects + EXCLUDED.total_subjects,
+            total_admissions = analytics.academic_year_metrics.total_admissions + EXCLUDED.total_admissions,
+            approved_admissions = analytics.academic_year_metrics.approved_admissions + EXCLUDED.approved_admissions,
+            pending_admissions = analytics.academic_year_metrics.pending_admissions + EXCLUDED.pending_admissions,
+            rejected_admissions = analytics.academic_year_metrics.rejected_admissions + EXCLUDED.rejected_admissions,
+            total_assignments = analytics.academic_year_metrics.total_assignments + EXCLUDED.total_assignments,
+            published_assignments = analytics.academic_year_metrics.published_assignments + EXCLUDED.published_assignments,
+            total_attendance_records = analytics.academic_year_metrics.total_attendance_records + EXCLUDED.total_attendance_records,
+            total_absent_records = analytics.academic_year_metrics.total_absent_records + EXCLUDED.total_absent_records,
+            total_late_records = analytics.academic_year_metrics.total_late_records + EXCLUDED.total_late_records,
+            total_half_day_records = analytics.academic_year_metrics.total_half_day_records + EXCLUDED.total_half_day_records,
+            total_exemptions = analytics.academic_year_metrics.total_exemptions + EXCLUDED.total_exemptions,
+            total_subject_mappings = analytics.academic_year_metrics.total_subject_mappings + EXCLUDED.total_subject_mappings,
+            courses_with_curriculum = analytics.academic_year_metrics.courses_with_curriculum + EXCLUDED.courses_with_curriculum,
+            total_enrollments = analytics.academic_year_metrics.total_enrollments + EXCLUDED.total_enrollments,
+            active_enrollments = analytics.academic_year_metrics.active_enrollments + EXCLUDED.active_enrollments,
+            completed_enrollments = analytics.academic_year_metrics.completed_enrollments + EXCLUDED.completed_enrollments,
+            withdrawn_enrollments = analytics.academic_year_metrics.withdrawn_enrollments + EXCLUDED.withdrawn_enrollments,
+            total_sessions_generated = analytics.academic_year_metrics.total_sessions_generated + EXCLUDED.total_sessions_generated,
+            total_period_attendances = analytics.academic_year_metrics.total_period_attendances + EXCLUDED.total_period_attendances,
+            total_biometric_attendances = analytics.academic_year_metrics.total_biometric_attendances + EXCLUDED.total_biometric_attendances,
+            total_manual_period_attendances = analytics.academic_year_metrics.total_manual_period_attendances + EXCLUDED.total_manual_period_attendances,
+            last_updated = NOW()
+    `
+	_, err := db.ExecContext(ctx, query,
+		update.AcademicYearID,
+		update.DeltaStudents, update.DeltaActive, update.DeltaTerms,
+		update.DeltaSections, update.DeltaCourses, update.DeltaSubjects,
+		update.DeltaTotalAdm, update.DeltaApprovedAdm, update.DeltaPendingAdm, update.DeltaRejectedAdm,
+		update.DeltaTotalAssignments, update.DeltaPublishedAssignments,
+		update.DeltaAttendanceRecords, update.DeltaAbsentRecords, update.DeltaLateRecords, update.DeltaHalfDayRecords,
+		update.DeltaExemptions, update.DeltaTotalSubjectMappings, update.DeltaCoursesWithCurriculum,
+		update.DeltaTotalEnrollments, update.DeltaActiveEnrollments, update.DeltaCompletedEnrollments, update.DeltaWithdrawnEnrollments,
+		update.DeltaSessionsGenerated, update.DeltaPeriodAttendances, update.DeltaBiometricAttendances, update.DeltaManualPeriodAttendances,
+	)
+	if err != nil {
+		r.logger.Error("failed to update academic year metrics",
+			zap.String("academic_year_id", update.AcademicYearID.String()),
+			zap.Error(err))
+		return fmt.Errorf("update academic year metrics: %w", err)
+	}
+	return nil
+}
+
+// RefreshAcademicYearMetrics (updated with new fields)
 func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db DBTX, academicYearID uuid.UUID) error {
 	query := `
         WITH student_counts AS (
-            SELECT 
+            SELECT
                 e.academic_year_id,
                 COUNT(DISTINCT e.student_id) AS total_students,
                 COUNT(DISTINCT e.student_id) FILTER (WHERE s.status = 'active') AS active_students
@@ -2868,43 +3272,43 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             GROUP BY academic_year_id
         ),
         section_counts AS (
-            SELECT 
-                t.academic_year_id, 
+            SELECT
+                t.academic_year_id,
                 COUNT(DISTINCT s.section_id) AS total_sections
             FROM academics.section s
             JOIN academics.term t ON t.term_id = s.term_id
-            WHERE t.academic_year_id = $1 
-              AND s.deleted_at IS NULL 
+            WHERE t.academic_year_id = $1
+              AND s.deleted_at IS NULL
               AND t.deleted_at IS NULL
             GROUP BY t.academic_year_id
         ),
         course_counts AS (
-            SELECT 
-                t.academic_year_id, 
+            SELECT
+                t.academic_year_id,
                 COUNT(DISTINCT s.course_id) AS total_courses
             FROM academics.section s
             JOIN academics.term t ON t.term_id = s.term_id
-            WHERE t.academic_year_id = $1 
-              AND s.deleted_at IS NULL 
+            WHERE t.academic_year_id = $1
+              AND s.deleted_at IS NULL
               AND t.deleted_at IS NULL
             GROUP BY t.academic_year_id
         ),
         subject_counts AS (
-            SELECT 
-                t.academic_year_id, 
+            SELECT
+                t.academic_year_id,
                 COUNT(DISTINCT sub.subject_id) AS total_subjects
             FROM academics.section s
             JOIN academics.term t ON t.term_id = s.term_id
             JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
             JOIN academics.subject sub ON sub.subject_id = scm.subject_id
-            WHERE t.academic_year_id = $1 
-              AND s.deleted_at IS NULL 
+            WHERE t.academic_year_id = $1
+              AND s.deleted_at IS NULL
               AND t.deleted_at IS NULL
               AND sub.deleted_at IS NULL
             GROUP BY t.academic_year_id
         ),
         admission_counts AS (
-            SELECT 
+            SELECT
                 academic_year_id,
                 COUNT(*) AS total_admissions,
                 COUNT(*) FILTER (WHERE admission_status = 'approved') AS approved_admissions,
@@ -2915,7 +3319,7 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             GROUP BY academic_year_id
         ),
         assignment_counts AS (
-            SELECT 
+            SELECT
                 t.academic_year_id,
                 COUNT(a.assignment_id) AS total_assignments,
                 COUNT(a.assignment_id) FILTER (WHERE a.is_published = true) AS published_assignments
@@ -2926,7 +3330,7 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             GROUP BY t.academic_year_id
         ),
         attendance_counts AS (
-            SELECT 
+            SELECT
                 e.academic_year_id,
                 COUNT(a.attendance_id) AS total_attendance_records,
                 COUNT(a.attendance_id) FILTER (WHERE a.status = 'absent') AS total_absent_records,
@@ -2938,7 +3342,7 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             GROUP BY e.academic_year_id
         ),
         exemption_counts AS (
-            SELECT 
+            SELECT
                 e.academic_year_id,
                 COUNT(ex.exemption_id) AS total_exemptions
             FROM academics.student_attendance_exemptions ex
@@ -2948,20 +3352,20 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             GROUP BY e.academic_year_id
         ),
         curriculum_counts AS (
-            SELECT 
+            SELECT
                 t.academic_year_id,
                 COUNT(scm.mapping_id) AS total_subject_mappings,
                 COUNT(DISTINCT s.course_id) FILTER (WHERE scm.mapping_id IS NOT NULL) AS courses_with_curriculum
             FROM academics.section s
             JOIN academics.term t ON t.term_id = s.term_id
             LEFT JOIN academics.subject_course_mapping scm ON scm.course_id = s.course_id
-            WHERE t.academic_year_id = $1 
-              AND s.deleted_at IS NULL 
+            WHERE t.academic_year_id = $1
+              AND s.deleted_at IS NULL
               AND t.deleted_at IS NULL
             GROUP BY t.academic_year_id
         ),
         enrollment_counts AS (
-            SELECT 
+            SELECT
                 academic_year_id,
                 COUNT(*) AS total_enrollments,
                 COUNT(*) FILTER (WHERE status = 'active') AS active_enrollments,
@@ -2970,6 +3374,22 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             FROM academics.enrollments
             WHERE academic_year_id = $1
             GROUP BY academic_year_id
+        ),
+        session_counts AS (
+            SELECT
+                s.academic_year_id,
+                COUNT(DISTINCT a.session_id) AS total_sessions_generated,
+                COUNT(ssa.attendance_id) AS total_period_attendances,
+                COUNT(ssa.attendance_id) FILTER (WHERE ssa.source_type = 'biometric') AS total_biometric_attendances,
+                COUNT(ssa.attendance_id) FILTER (WHERE ssa.source_type != 'biometric') AS total_manual_period_attendances
+            FROM academics.academic_session a
+            JOIN academics.timetable_entries te ON te.entry_id = a.timetable_entry_id
+            JOIN academics.timetable_slots ts ON ts.slot_id = te.slot_id
+            JOIN academics.timetables t ON t.timetable_id = ts.timetable_id
+            JOIN academics.academic_year s ON s.academic_year_id = t.academic_year_id
+            LEFT JOIN academics.student_session_attendance ssa ON ssa.session_id = a.session_id
+            WHERE s.academic_year_id = $1
+            GROUP BY s.academic_year_id
         )
         SELECT
             COALESCE(sc.total_students, 0),
@@ -2994,7 +3414,11 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             COALESCE(enc.total_enrollments, 0),
             COALESCE(enc.active_enrollments, 0),
             COALESCE(enc.completed_enrollments, 0),
-            COALESCE(enc.withdrawn_enrollments, 0)
+            COALESCE(enc.withdrawn_enrollments, 0),
+            COALESCE(session_counts.total_sessions_generated, 0),
+            COALESCE(session_counts.total_period_attendances, 0),
+            COALESCE(session_counts.total_biometric_attendances, 0),
+            COALESCE(session_counts.total_manual_period_attendances, 0)
         FROM (SELECT $1 AS academic_year_id) ay
         LEFT JOIN student_counts sc ON sc.academic_year_id = ay.academic_year_id
         LEFT JOIN term_counts tc ON tc.academic_year_id = ay.academic_year_id
@@ -3007,14 +3431,15 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
         LEFT JOIN exemption_counts exc ON exc.academic_year_id = ay.academic_year_id
         LEFT JOIN curriculum_counts cur ON cur.academic_year_id = ay.academic_year_id
         LEFT JOIN enrollment_counts enc ON enc.academic_year_id = ay.academic_year_id
+        LEFT JOIN session_counts ON session_counts.academic_year_id = ay.academic_year_id
     `
-
 	var totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects int
 	var totalAdmissions, approvedAdmissions, pendingAdmissions, rejectedAdmissions int
 	var totalAssignments, publishedAssignments int
 	var totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords int
 	var totalExemptions, totalSubjectMappings, coursesWithCurriculum int
 	var totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments int
+	var totalSessionsGenerated, totalPeriodAttendances, totalBiometricAttendances, totalManualPeriodAttendances int
 
 	err := db.QueryRowContext(ctx, query, academicYearID).Scan(
 		&totalStudents, &activeStudents, &totalTerms, &totalSections, &totalCourses, &totalSubjects,
@@ -3023,6 +3448,7 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
 		&totalAttendanceRecords, &totalAbsentRecords, &totalLateRecords, &totalHalfDayRecords,
 		&totalExemptions, &totalSubjectMappings, &coursesWithCurriculum,
 		&totalEnrollments, &activeEnrollments, &completedEnrollments, &withdrawnEnrollments,
+		&totalSessionsGenerated, &totalPeriodAttendances, &totalBiometricAttendances, &totalManualPeriodAttendances,
 	)
 	if err != nil {
 		return fmt.Errorf("recompute metrics: %w", err)
@@ -3037,11 +3463,12 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             total_attendance_records, total_absent_records, total_late_records, total_half_day_records,
             total_exemptions, total_subject_mappings, courses_with_curriculum,
             total_enrollments, active_enrollments, completed_enrollments, withdrawn_enrollments,
+            total_sessions_generated, total_period_attendances, total_biometric_attendances, total_manual_period_attendances,
             last_updated
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
             $12, $13, $14, $15, $16, $17, $18, $19, $20,
-            $21, $22, $23, $24, NOW()
+            $21, $22, $23, $24, $25, $26, $27, $28, NOW()
         )
         ON CONFLICT (academic_year_id) DO UPDATE SET
             total_students = EXCLUDED.total_students,
@@ -3067,9 +3494,12 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
             active_enrollments = EXCLUDED.active_enrollments,
             completed_enrollments = EXCLUDED.completed_enrollments,
             withdrawn_enrollments = EXCLUDED.withdrawn_enrollments,
+            total_sessions_generated = EXCLUDED.total_sessions_generated,
+            total_period_attendances = EXCLUDED.total_period_attendances,
+            total_biometric_attendances = EXCLUDED.total_biometric_attendances,
+            total_manual_period_attendances = EXCLUDED.total_manual_period_attendances,
             last_updated = NOW()
     `
-
 	_, err = db.ExecContext(ctx, upsertQuery,
 		academicYearID,
 		totalStudents, activeStudents, totalTerms, totalSections, totalCourses, totalSubjects,
@@ -3078,10 +3508,717 @@ func (r *analyticsRepository) RefreshAcademicYearMetrics(ctx context.Context, db
 		totalAttendanceRecords, totalAbsentRecords, totalLateRecords, totalHalfDayRecords,
 		totalExemptions, totalSubjectMappings, coursesWithCurriculum,
 		totalEnrollments, activeEnrollments, completedEnrollments, withdrawnEnrollments,
+		totalSessionsGenerated, totalPeriodAttendances, totalBiometricAttendances, totalManualPeriodAttendances,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert metrics: %w", err)
 	}
-
 	return nil
+}
+
+// -----------------------------------------------------------------------------
+// New method implementations for StudentSessionSummary
+// -----------------------------------------------------------------------------
+
+var allowedStudentSessionSummarySortFields = map[string]bool{
+	"student_id":            true,
+	"academic_year_id":      true,
+	"term_id":               true,
+	"total_sessions":        true,
+	"present_sessions":      true,
+	"absent_sessions":       true,
+	"late_sessions":         true,
+	"excused_sessions":      true,
+	"attendance_percentage": true,
+	"last_updated":          true,
+}
+
+func (r *analyticsRepository) buildStudentSessionSummaryFilter(filter StudentSessionSummaryFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+	if filter.StudentID != nil {
+		conditions = append(conditions, fmt.Sprintf("student_id = $%d", idx))
+		args = append(args, *filter.StudentID)
+		idx++
+	}
+	if filter.AcademicYearID != nil {
+		conditions = append(conditions, fmt.Sprintf("academic_year_id = $%d", idx))
+		args = append(args, *filter.AcademicYearID)
+		idx++
+	}
+	if filter.TermID != nil {
+		conditions = append(conditions, fmt.Sprintf("term_id = $%d", idx))
+		args = append(args, *filter.TermID)
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func (r *analyticsRepository) ListStudentSessionSummaries(ctx context.Context, db DBTX, filter StudentSessionSummaryFilter, p Pagination, s Sort) ([]*models.StudentSessionSummary, error) {
+	where, args := r.buildStudentSessionSummaryFilter(filter)
+	orderBy, err := r.validateSort(s, allowedStudentSessionSummarySortFields)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+
+	query := fmt.Sprintf(`
+        SELECT student_id, academic_year_id, term_id, total_sessions, present_sessions, absent_sessions, late_sessions, excused_sessions, attendance_percentage, last_updated
+        FROM analytics.student_session_summary
+        %s
+        %s
+        LIMIT $%d OFFSET $%d
+    `, where, orderBy, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to list student session summaries",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("list student session summaries: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*models.StudentSessionSummary
+	for rows.Next() {
+		var s models.StudentSessionSummary
+		if err := rows.Scan(
+			&s.StudentID, &s.AcademicYearID, &s.TermID,
+			&s.TotalSessions, &s.PresentSessions, &s.AbsentSessions,
+			&s.LateSessions, &s.ExcusedSessions, &s.AttendancePercentage,
+			&s.LastUpdated,
+		); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		results = append(results, &s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return results, nil
+}
+
+func (r *analyticsRepository) CountStudentSessionSummaries(ctx context.Context, db DBTX, filter StudentSessionSummaryFilter) (int64, error) {
+	where, args := r.buildStudentSessionSummaryFilter(filter)
+	query := fmt.Sprintf("SELECT COUNT(*) FROM analytics.student_session_summary %s", where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count student session summaries",
+			util.Any("filter", filter),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count student session summaries: %w", err)
+	}
+	return count, nil
+}
+
+// -----------------------------------------------------------------------------
+// SectionSessionMetrics
+// -----------------------------------------------------------------------------
+
+var allowedSectionSessionMetricsSortFields = map[string]bool{
+	"section_id":          true,
+	"session_date":        true,
+	"total_enrolled":      true,
+	"present_count":       true,
+	"absent_count":        true,
+	"late_count":          true,
+	"marked_by_teacher":   true,
+	"marked_by_biometric": true,
+}
+
+// -----------------------------------------------------------------------------
+// TeacherSessionMetrics
+// -----------------------------------------------------------------------------
+
+var allowedTeacherSessionMetricsSortFields = map[string]bool{
+	"teacher_id":              true,
+	"academic_year_id":        true,
+	"total_sessions_taught":   true,
+	"sessions_marked":         true,
+	"sessions_with_biometric": true,
+	"last_updated":            true,
+}
+
+func (r *analyticsRepository) GetStudentSessionSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*models.StudentSessionSummary, error) {
+	query := `
+        SELECT student_id, academic_year_id, term_id, total_sessions, present_sessions,
+               absent_sessions, late_sessions, excused_sessions, attendance_percentage, last_updated
+        FROM analytics.student_session_summary
+        WHERE student_id = $1 AND academic_year_id = $2 AND (term_id = $3 OR ($3 IS NULL AND term_id IS NULL))
+    `
+	var summary models.StudentSessionSummary
+	err := db.QueryRowContext(ctx, query, studentID, academicYearID, termID).Scan(
+		&summary.StudentID, &summary.AcademicYearID, &summary.TermID,
+		&summary.TotalSessions, &summary.PresentSessions, &summary.AbsentSessions,
+		&summary.LateSessions, &summary.ExcusedSessions, &summary.AttendancePercentage, &summary.LastUpdated,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get student session summary: %w", err)
+	}
+	return &summary, nil
+}
+
+func (r *analyticsRepository) CreateStudentSessionSummary(ctx context.Context, db DBTX, summary *models.StudentSessionSummary) error {
+	query := `
+        INSERT INTO analytics.student_session_summary (
+            student_id, academic_year_id, term_id, total_sessions, present_sessions,
+            absent_sessions, late_sessions, excused_sessions, last_updated
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        ON CONFLICT (student_id, academic_year_id, COALESCE(term_id, '00000000-0000-0000-0000-000000000000')) DO UPDATE SET
+            total_sessions = EXCLUDED.total_sessions,
+            present_sessions = EXCLUDED.present_sessions,
+            absent_sessions = EXCLUDED.absent_sessions,
+            late_sessions = EXCLUDED.late_sessions,
+            excused_sessions = EXCLUDED.excused_sessions,
+            last_updated = NOW()
+        RETURNING last_updated
+    `
+	err := db.QueryRowContext(ctx, query,
+		summary.StudentID, summary.AcademicYearID, summary.TermID,
+		summary.TotalSessions, summary.PresentSessions, summary.AbsentSessions,
+		summary.LateSessions, summary.ExcusedSessions,
+	).Scan(&summary.LastUpdated)
+	if err != nil {
+		return fmt.Errorf("create/update student session summary: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) UpdateStudentSessionSummary(ctx context.Context, db DBTX, summary *models.StudentSessionSummary) error {
+	// Same as Create because we upsert; but keep for interface consistency
+	return r.CreateStudentSessionSummary(ctx, db, summary)
+}
+
+func (r *analyticsRepository) DeleteStudentSessionSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error {
+	query := `DELETE FROM analytics.student_session_summary WHERE student_id = $1 AND academic_year_id = $2 AND (term_id = $3 OR ($3 IS NULL AND term_id IS NULL))`
+	result, err := db.ExecContext(ctx, query, studentID, academicYearID, termID)
+	if err != nil {
+		return fmt.Errorf("delete student session summary: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: student session summary for student %s, year %s", ErrNotFound, studentID, academicYearID)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) RefreshStudentSessionSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error {
+	// Compute from source tables: academic_session and student_session_attendance
+	query := `
+        WITH sessions AS (
+            SELECT a.session_id, a.section_id
+            FROM academics.academic_session a
+            JOIN academics.enrollments e ON e.section_id = a.section_id
+            WHERE e.student_id = $1
+              AND e.academic_year_id = $2
+              AND ($3 IS NULL OR e.term_id = $3)
+              AND a.session_date BETWEEN (SELECT start_date FROM academics.academic_year WHERE academic_year_id = $2)
+                                      AND (SELECT end_date FROM academics.academic_year WHERE academic_year_id = $2)
+        ),
+        attendance_stats AS (
+            SELECT
+                COUNT(*) AS total_sessions,
+                COUNT(*) FILTER (WHERE ssa.status = 'present') AS present_sessions,
+                COUNT(*) FILTER (WHERE ssa.status = 'absent') AS absent_sessions,
+                COUNT(*) FILTER (WHERE ssa.status = 'late') AS late_sessions,
+                COUNT(*) FILTER (WHERE ssa.status = 'excused') AS excused_sessions
+            FROM sessions s
+            LEFT JOIN academics.student_session_attendance ssa ON ssa.session_id = s.session_id
+            LEFT JOIN academics.enrollments e ON e.student_id = $1 AND e.academic_year_id = $2
+        )
+        INSERT INTO analytics.student_session_summary (
+            student_id, academic_year_id, term_id, total_sessions, present_sessions,
+            absent_sessions, late_sessions, excused_sessions, last_updated
+        )
+        SELECT $1, $2, $3,
+               COALESCE(total_sessions, 0),
+               COALESCE(present_sessions, 0),
+               COALESCE(absent_sessions, 0),
+               COALESCE(late_sessions, 0),
+               COALESCE(excused_sessions, 0),
+               NOW()
+        FROM attendance_stats
+        ON CONFLICT (student_id, academic_year_id, COALESCE(term_id, '00000000-0000-0000-0000-000000000000')) DO UPDATE SET
+            total_sessions = EXCLUDED.total_sessions,
+            present_sessions = EXCLUDED.present_sessions,
+            absent_sessions = EXCLUDED.absent_sessions,
+            late_sessions = EXCLUDED.late_sessions,
+            excused_sessions = EXCLUDED.excused_sessions,
+            last_updated = NOW()
+    `
+	_, err := db.ExecContext(ctx, query, studentID, academicYearID, termID)
+	if err != nil {
+		return fmt.Errorf("refresh student session summary: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) GetSectionSessionMetrics(ctx context.Context, db DBTX, sectionID uuid.UUID, sessionDate time.Time) (*models.SectionSessionMetrics, error) {
+	query := `
+        SELECT section_id, session_date, total_enrolled, present_count, absent_count, late_count,
+               marked_by_teacher, marked_by_biometric
+        FROM analytics.section_session_metrics
+        WHERE section_id = $1 AND session_date = $2
+    `
+	var m models.SectionSessionMetrics
+	err := db.QueryRowContext(ctx, query, sectionID, sessionDate).Scan(
+		&m.SectionID, &m.SessionDate, &m.TotalEnrolled, &m.PresentCount, &m.AbsentCount, &m.LateCount,
+		&m.MarkedByTeacher, &m.MarkedByBiometric,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get section session metrics: %w", err)
+	}
+	return &m, nil
+}
+
+func (r *analyticsRepository) UpsertSectionSessionMetrics(ctx context.Context, db DBTX, metrics *models.SectionSessionMetrics) error {
+	query := `
+        INSERT INTO analytics.section_session_metrics (
+            section_id, session_date, total_enrolled, present_count, absent_count, late_count,
+            marked_by_teacher, marked_by_biometric
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (section_id, session_date) DO UPDATE SET
+            total_enrolled = EXCLUDED.total_enrolled,
+            present_count = EXCLUDED.present_count,
+            absent_count = EXCLUDED.absent_count,
+            late_count = EXCLUDED.late_count,
+            marked_by_teacher = EXCLUDED.marked_by_teacher,
+            marked_by_biometric = EXCLUDED.marked_by_biometric
+    `
+	_, err := db.ExecContext(ctx, query,
+		metrics.SectionID, metrics.SessionDate, metrics.TotalEnrolled,
+		metrics.PresentCount, metrics.AbsentCount, metrics.LateCount,
+		metrics.MarkedByTeacher, metrics.MarkedByBiometric,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert section session metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) ListSectionSessionMetrics(ctx context.Context, db DBTX, filter SectionSessionMetricsFilter, p Pagination, s Sort) ([]*models.SectionSessionMetrics, error) {
+	where, args := r.buildSectionSessionMetricsFilter(filter)
+	orderBy, err := r.validateSort(s, allowedSectionSessionMetricsSortFields)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+	query := fmt.Sprintf(`
+        SELECT section_id, session_date, total_enrolled, present_count, absent_count, late_count,
+               marked_by_teacher, marked_by_biometric
+        FROM analytics.section_session_metrics
+        %s
+        %s
+        LIMIT $%d OFFSET $%d
+    `, where, orderBy, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list section session metrics: %w", err)
+	}
+	defer rows.Close()
+	var result []*models.SectionSessionMetrics
+	for rows.Next() {
+		var m models.SectionSessionMetrics
+		if err := rows.Scan(&m.SectionID, &m.SessionDate, &m.TotalEnrolled,
+			&m.PresentCount, &m.AbsentCount, &m.LateCount, &m.MarkedByTeacher, &m.MarkedByBiometric); err != nil {
+			return nil, err
+		}
+		result = append(result, &m)
+	}
+	return result, rows.Err()
+}
+
+func (r *analyticsRepository) DeleteSectionSessionMetrics(ctx context.Context, db DBTX, sectionID uuid.UUID, sessionDate time.Time) error {
+	query := `DELETE FROM analytics.section_session_metrics WHERE section_id = $1 AND session_date = $2`
+	_, err := db.ExecContext(ctx, query, sectionID, sessionDate)
+	if err != nil {
+		return fmt.Errorf("delete section session metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) RefreshSectionSessionMetrics(ctx context.Context, db DBTX, sectionID uuid.UUID, sessionDate time.Time) error {
+	query := `
+        WITH enrollments AS (
+            SELECT COUNT(*) AS total_enrolled
+            FROM academics.enrollments e
+            WHERE e.section_id = $1
+              AND e.status = 'active'
+              AND e.academic_year_id = (SELECT academic_year_id FROM academics.academic_year WHERE $2 BETWEEN start_date AND end_date)
+        ),
+        attendance AS (
+            SELECT
+                COUNT(*) FILTER (WHERE ssa.status = 'present') AS present_count,
+                COUNT(*) FILTER (WHERE ssa.status = 'absent') AS absent_count,
+                COUNT(*) FILTER (WHERE ssa.status = 'late') AS late_count,
+                COUNT(*) FILTER (WHERE ssa.source_type = 'web' OR ssa.source_type = 'manual') AS marked_by_teacher,
+                COUNT(*) FILTER (WHERE ssa.source_type = 'biometric') AS marked_by_biometric
+            FROM academics.academic_session a
+            LEFT JOIN academics.student_session_attendance ssa ON ssa.session_id = a.session_id
+            WHERE a.section_id = $1 AND a.session_date = $2
+        )
+        INSERT INTO analytics.section_session_metrics (
+            section_id, session_date, total_enrolled, present_count, absent_count, late_count,
+            marked_by_teacher, marked_by_biometric
+        )
+        SELECT $1, $2,
+               COALESCE(e.total_enrolled, 0),
+               COALESCE(a.present_count, 0),
+               COALESCE(a.absent_count, 0),
+               COALESCE(a.late_count, 0),
+               COALESCE(a.marked_by_teacher, 0),
+               COALESCE(a.marked_by_biometric, 0)
+        FROM enrollments e, attendance a
+        ON CONFLICT (section_id, session_date) DO UPDATE SET
+            total_enrolled = EXCLUDED.total_enrolled,
+            present_count = EXCLUDED.present_count,
+            absent_count = EXCLUDED.absent_count,
+            late_count = EXCLUDED.late_count,
+            marked_by_teacher = EXCLUDED.marked_by_teacher,
+            marked_by_biometric = EXCLUDED.marked_by_biometric
+    `
+	_, err := db.ExecContext(ctx, query, sectionID, sessionDate)
+	if err != nil {
+		return fmt.Errorf("refresh section session metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) buildSectionSessionMetricsFilter(filter SectionSessionMetricsFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+	if filter.SectionID != nil {
+		conditions = append(conditions, fmt.Sprintf("section_id = $%d", idx))
+		args = append(args, *filter.SectionID)
+		idx++
+	}
+	if filter.FromDate != nil {
+		conditions = append(conditions, fmt.Sprintf("session_date >= $%d", idx))
+		args = append(args, *filter.FromDate)
+		idx++
+	}
+	if filter.ToDate != nil {
+		conditions = append(conditions, fmt.Sprintf("session_date <= $%d", idx))
+		args = append(args, *filter.ToDate)
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func (r *analyticsRepository) GetTeacherSessionMetrics(ctx context.Context, db DBTX, teacherID, academicYearID uuid.UUID) (*models.TeacherSessionMetrics, error) {
+	query := `
+        SELECT teacher_id, academic_year_id, total_sessions_taught, sessions_marked,
+               sessions_with_biometric, last_updated
+        FROM analytics.teacher_session_metrics
+        WHERE teacher_id = $1 AND academic_year_id = $2
+    `
+	var m models.TeacherSessionMetrics
+	err := db.QueryRowContext(ctx, query, teacherID, academicYearID).Scan(
+		&m.TeacherID, &m.AcademicYearID, &m.TotalSessionsTaught, &m.SessionsMarked,
+		&m.SessionsWithBiometric, &m.LastUpdated,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get teacher session metrics: %w", err)
+	}
+	return &m, nil
+}
+
+func (r *analyticsRepository) UpsertTeacherSessionMetrics(ctx context.Context, db DBTX, metrics *models.TeacherSessionMetrics) error {
+	query := `
+        INSERT INTO analytics.teacher_session_metrics (
+            teacher_id, academic_year_id, total_sessions_taught, sessions_marked,
+            sessions_with_biometric, last_updated
+        ) VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (teacher_id, academic_year_id) DO UPDATE SET
+            total_sessions_taught = EXCLUDED.total_sessions_taught,
+            sessions_marked = EXCLUDED.sessions_marked,
+            sessions_with_biometric = EXCLUDED.sessions_with_biometric,
+            last_updated = NOW()
+    `
+	_, err := db.ExecContext(ctx, query,
+		metrics.TeacherID, metrics.AcademicYearID, metrics.TotalSessionsTaught,
+		metrics.SessionsMarked, metrics.SessionsWithBiometric,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert teacher session metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) ListTeacherSessionMetrics(ctx context.Context, db DBTX, filter TeacherSessionMetricsFilter, p Pagination, s Sort) ([]*models.TeacherSessionMetrics, error) {
+	where, args := r.buildTeacherSessionMetricsFilter(filter)
+	orderBy, err := r.validateSort(s, allowedTeacherSessionMetricsSortFields)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+	query := fmt.Sprintf(`
+        SELECT teacher_id, academic_year_id, total_sessions_taught, sessions_marked,
+               sessions_with_biometric, last_updated
+        FROM analytics.teacher_session_metrics
+        %s
+        %s
+        LIMIT $%d OFFSET $%d
+    `, where, orderBy, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list teacher session metrics: %w", err)
+	}
+	defer rows.Close()
+	var result []*models.TeacherSessionMetrics
+	for rows.Next() {
+		var m models.TeacherSessionMetrics
+		if err := rows.Scan(&m.TeacherID, &m.AcademicYearID, &m.TotalSessionsTaught,
+			&m.SessionsMarked, &m.SessionsWithBiometric, &m.LastUpdated); err != nil {
+			return nil, err
+		}
+		result = append(result, &m)
+	}
+	return result, rows.Err()
+}
+
+func (r *analyticsRepository) DeleteTeacherSessionMetrics(ctx context.Context, db DBTX, teacherID, academicYearID uuid.UUID) error {
+	query := `DELETE FROM analytics.teacher_session_metrics WHERE teacher_id = $1 AND academic_year_id = $2`
+	_, err := db.ExecContext(ctx, query, teacherID, academicYearID)
+	if err != nil {
+		return fmt.Errorf("delete teacher session metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) RefreshTeacherSessionMetrics(ctx context.Context, db DBTX, teacherID, academicYearID uuid.UUID) error {
+	query := `
+        WITH teacher_sessions AS (
+            SELECT DISTINCT a.session_id
+            FROM academics.academic_session a
+            WHERE a.teacher_id = $1
+              AND a.session_date BETWEEN (SELECT start_date FROM academics.academic_year WHERE academic_year_id = $2)
+                                     AND (SELECT end_date FROM academics.academic_year WHERE academic_year_id = $2)
+        ),
+        session_attendance AS (
+            SELECT
+                COUNT(DISTINCT ts.session_id) AS total_sessions_taught,
+                COUNT(DISTINCT CASE WHEN EXISTS (
+                    SELECT 1 FROM academics.student_session_attendance ssa WHERE ssa.session_id = ts.session_id
+                ) THEN ts.session_id END) AS sessions_marked,
+                COUNT(DISTINCT CASE WHEN EXISTS (
+                    SELECT 1 FROM academics.student_session_attendance ssa WHERE ssa.session_id = ts.session_id AND ssa.source_type = 'biometric'
+                ) THEN ts.session_id END) AS sessions_with_biometric
+            FROM teacher_sessions ts
+        )
+        INSERT INTO analytics.teacher_session_metrics (
+            teacher_id, academic_year_id, total_sessions_taught, sessions_marked, sessions_with_biometric, last_updated
+        )
+        SELECT $1, $2,
+               COALESCE(total_sessions_taught, 0),
+               COALESCE(sessions_marked, 0),
+               COALESCE(sessions_with_biometric, 0),
+               NOW()
+        FROM session_attendance
+        ON CONFLICT (teacher_id, academic_year_id) DO UPDATE SET
+            total_sessions_taught = EXCLUDED.total_sessions_taught,
+            sessions_marked = EXCLUDED.sessions_marked,
+            sessions_with_biometric = EXCLUDED.sessions_with_biometric,
+            last_updated = NOW()
+    `
+	_, err := db.ExecContext(ctx, query, teacherID, academicYearID)
+	if err != nil {
+		return fmt.Errorf("refresh teacher session metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) buildTeacherSessionMetricsFilter(filter TeacherSessionMetricsFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+	if filter.TeacherID != nil {
+		conditions = append(conditions, fmt.Sprintf("teacher_id = $%d", idx))
+		args = append(args, *filter.TeacherID)
+		idx++
+	}
+	if filter.AcademicYearID != nil {
+		conditions = append(conditions, fmt.Sprintf("academic_year_id = $%d", idx))
+		args = append(args, *filter.AcademicYearID)
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func (r *analyticsRepository) GetBiometricUsageMetrics(ctx context.Context, db DBTX, deviceID string, date time.Time) (*models.BiometricUsageMetrics, error) {
+	query := `
+        SELECT device_id, company_id, date, total_punches, successful_matches, failed_matches, unique_students
+        FROM analytics.biometric_usage_metrics
+        WHERE device_id = $1 AND date = $2
+    `
+	var m models.BiometricUsageMetrics
+	err := db.QueryRowContext(ctx, query, deviceID, date).Scan(
+		&m.DeviceID, &m.CompanyID, &m.Date, &m.TotalPunches, &m.SuccessfulMatches,
+		&m.FailedMatches, &m.UniqueStudents,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get biometric usage metrics: %w", err)
+	}
+	return &m, nil
+}
+
+func (r *analyticsRepository) UpsertBiometricUsageMetrics(ctx context.Context, db DBTX, metrics *models.BiometricUsageMetrics) error {
+	query := `
+        INSERT INTO analytics.biometric_usage_metrics (
+            device_id, company_id, date, total_punches, successful_matches, failed_matches, unique_students
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (device_id, date) DO UPDATE SET
+            total_punches = EXCLUDED.total_punches,
+            successful_matches = EXCLUDED.successful_matches,
+            failed_matches = EXCLUDED.failed_matches,
+            unique_students = EXCLUDED.unique_students
+    `
+	_, err := db.ExecContext(ctx, query,
+		metrics.DeviceID, metrics.CompanyID, metrics.Date,
+		metrics.TotalPunches, metrics.SuccessfulMatches, metrics.FailedMatches, metrics.UniqueStudents,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert biometric usage metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) ListBiometricUsageMetrics(ctx context.Context, db DBTX, filter BiometricUsageMetricsFilter, p Pagination, s Sort) ([]*models.BiometricUsageMetrics, error) {
+	where, args := r.buildBiometricUsageMetricsFilter(filter)
+	orderBy, err := r.validateSort(s, allowedBiometricUsageMetricsSortFields)
+	if err != nil {
+		return nil, err
+	}
+	limit, offset := r.validatePagination(p)
+	query := fmt.Sprintf(`
+        SELECT device_id, company_id, date, total_punches, successful_matches, failed_matches, unique_students
+        FROM analytics.biometric_usage_metrics
+        %s
+        %s
+        LIMIT $%d OFFSET $%d
+    `, where, orderBy, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list biometric usage metrics: %w", err)
+	}
+	defer rows.Close()
+	var result []*models.BiometricUsageMetrics
+	for rows.Next() {
+		var m models.BiometricUsageMetrics
+		if err := rows.Scan(&m.DeviceID, &m.CompanyID, &m.Date, &m.TotalPunches,
+			&m.SuccessfulMatches, &m.FailedMatches, &m.UniqueStudents); err != nil {
+			return nil, err
+		}
+		result = append(result, &m)
+	}
+	return result, rows.Err()
+}
+
+func (r *analyticsRepository) DeleteBiometricUsageMetrics(ctx context.Context, db DBTX, deviceID string, date time.Time) error {
+	query := `DELETE FROM analytics.biometric_usage_metrics WHERE device_id = $1 AND date = $2`
+	_, err := db.ExecContext(ctx, query, deviceID, date)
+	if err != nil {
+		return fmt.Errorf("delete biometric usage metrics: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) RefreshBiometricUsageMetrics(ctx context.Context, db DBTX, deviceID string, date time.Time) error {
+	// Compute from biometric punch logs (assuming you have a table `academics.biometric_punch_logs`)
+	// If you don't have such a table, you can compute from student_session_attendance with source_type = 'biometric'
+	query := `
+        WITH punches AS (
+            SELECT
+                device_id,
+                COUNT(*) AS total_punches,
+                COUNT(*) FILTER (WHERE matching_status = 'success') AS successful_matches,
+                COUNT(*) FILTER (WHERE matching_status = 'failed') AS failed_matches,
+                COUNT(DISTINCT student_id) AS unique_students
+            FROM academics.biometric_punch_logs
+            WHERE device_id = $1 AND DATE(punch_time) = $2
+            GROUP BY device_id
+        )
+        INSERT INTO analytics.biometric_usage_metrics (
+            device_id, company_id, date, total_punches, successful_matches, failed_matches, unique_students
+        )
+        SELECT $1, company_id, $2,
+               COALESCE(total_punches, 0),
+               COALESCE(successful_matches, 0),
+               COALESCE(failed_matches, 0),
+               COALESCE(unique_students, 0)
+        FROM punches
+        LEFT JOIN academics.companies c ON c.company_id = (SELECT company_id FROM academics.devices WHERE device_id = $1)
+        ON CONFLICT (device_id, date) DO UPDATE SET
+            total_punches = EXCLUDED.total_punches,
+            successful_matches = EXCLUDED.successful_matches,
+            failed_matches = EXCLUDED.failed_matches,
+            unique_students = EXCLUDED.unique_students
+    `
+	_, err := db.ExecContext(ctx, query, deviceID, date)
+	if err != nil {
+		return fmt.Errorf("refresh biometric usage metrics: %w", err)
+	}
+	return nil
+}
+
+var allowedBiometricUsageMetricsSortFields = map[string]bool{
+	"date": true, "total_punches": true,
+}
+
+func (r *analyticsRepository) buildBiometricUsageMetricsFilter(filter BiometricUsageMetricsFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+	if filter.DeviceID != nil {
+		conditions = append(conditions, fmt.Sprintf("device_id = $%d", idx))
+		args = append(args, *filter.DeviceID)
+		idx++
+	}
+	if filter.CompanyID != nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, *filter.CompanyID)
+		idx++
+	}
+	if filter.FromDate != nil {
+		conditions = append(conditions, fmt.Sprintf("date >= $%d", idx))
+		args = append(args, *filter.FromDate)
+		idx++
+	}
+	if filter.ToDate != nil {
+		conditions = append(conditions, fmt.Sprintf("date <= $%d", idx))
+		args = append(args, *filter.ToDate)
+		idx++
+	}
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
 }

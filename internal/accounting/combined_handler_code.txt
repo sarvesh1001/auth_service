@@ -1,0 +1,4120 @@
+
+================================================================================
+FILE: ./handler/ledger_handler.go
+================================================================================
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/service"
+)
+
+// LedgerHandler handles HTTP requests for ledger operations.
+type LedgerHandler struct {
+	ledgerService service.LedgerService
+	logger        *zap.Logger
+}
+
+// NewLedgerHandler creates a new LedgerHandler.
+func NewLedgerHandler(ledgerService service.LedgerService, logger *zap.Logger) *LedgerHandler {
+	return &LedgerHandler{
+		ledgerService: ledgerService,
+		logger:        logger.Named("ledger_handler"),
+	}
+}
+
+// ----------------------------
+// Request / Response structs
+// ----------------------------
+
+type getAccountBalanceRequest struct {
+	FiscalYear int `json:"fiscal_year"`
+	Period     int `json:"period"`
+}
+
+type getAccountBalanceResponse struct {
+	AccountID      string `json:"account_id"`
+	OpeningBalance string `json:"opening_balance"`
+	ClosingBalance string `json:"closing_balance"`
+}
+
+type recomputeBalancesRequest struct {
+	FiscalYear int `json:"fiscal_year"`
+}
+
+type recomputeBalancesResponse struct {
+	Message string `json:"message"`
+}
+
+// ----------------------------
+// Handlers
+// ----------------------------
+
+// GetAccountBalance handles GET /companies/{companyID}/ledger/balance?account_id=...&fiscal_year=...&period=...
+func (h *LedgerHandler) GetAccountBalance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parse company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	// Parse account ID from query parameter
+	accountIDStr := r.URL.Query().Get("account_id")
+	if accountIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "account_id query parameter is required")
+		return
+	}
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid account ID")
+		return
+	}
+
+	// Parse fiscal year and period
+	fiscalYearStr := r.URL.Query().Get("fiscal_year")
+	if fiscalYearStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "fiscal_year query parameter is required")
+		return
+	}
+	fiscalYear, err := strconv.Atoi(fiscalYearStr)
+	if err != nil || fiscalYear <= 0 {
+		h.respondWithError(w, http.StatusBadRequest, "invalid fiscal_year")
+		return
+	}
+
+	periodStr := r.URL.Query().Get("period")
+	if periodStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "period query parameter is required")
+		return
+	}
+	period, err := strconv.Atoi(periodStr)
+	if err != nil || period <= 0 {
+		h.respondWithError(w, http.StatusBadRequest, "invalid period")
+		return
+	}
+
+	// Authenticate user
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	// Permission check
+	if !h.hasPermission(ctx, companyID, userID, "ledger:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	// Call service
+	balance, err := h.ledgerService.GetAccountBalance(ctx, companyID, accountID, fiscalYear, period)
+	if err != nil {
+		h.logger.Error("failed to get account balance", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Build response
+	resp := getAccountBalanceResponse{
+		AccountID:      balance.AccountID.String(),
+		OpeningBalance: balance.OpeningBalance.String(),
+		ClosingBalance: balance.ClosingBalance.String(),
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+// RecomputeBalances handles POST /companies/{companyID}/ledger/recompute
+func (h *LedgerHandler) RecomputeBalances(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parse company ID from URL
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	// Parse request body
+	var req recomputeBalancesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.FiscalYear <= 0 {
+		h.respondWithError(w, http.StatusBadRequest, "fiscal_year must be a positive integer")
+		return
+	}
+
+	// Authenticate user
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	// Permission check
+	if !h.hasPermission(ctx, companyID, userID, "ledger:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	// Call service
+	err = h.ledgerService.RecomputeBalances(ctx, companyID, req.FiscalYear)
+	if err != nil {
+		h.logger.Error("failed to recompute balances", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": recomputeBalancesResponse{
+			Message: fmt.Sprintf("Balances recomputed successfully for fiscal year %d", req.FiscalYear),
+		},
+	})
+}
+
+// ----------------------------
+// Helper functions (same pattern as AcademicYearHandler)
+// ----------------------------
+
+// hasPermission is a placeholder for real RBAC logic.
+// In production, implement actual permission checks using your RBAC service.
+func (h *LedgerHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
+	// TODO: Integrate with actual permission service
+	// For now, allow all requests (as in the academic example)
+	return true
+}
+
+// respondWithJSON sends a JSON response with the given status code and data.
+func (h *LedgerHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode JSON response", zap.Error(err))
+	}
+}
+
+// respondWithError sends an error response in the standard format.
+func (h *LedgerHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+// getUserIDFromContext extracts the user ID from the request context.
+// Assumes the context has been populated by authentication middleware.
+func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("user ID not found in context")
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid user ID in context: %v", err)
+	}
+	return userID, nil
+}
+
+
+
+================================================================================
+FILE: ./handler/reconciliation_handler.go
+================================================================================
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/service"
+)
+
+type ReconciliationHandler struct {
+	svc    service.ReconciliationService
+	logger *zap.Logger
+}
+
+func NewReconciliationHandler(svc service.ReconciliationService, logger *zap.Logger) *ReconciliationHandler {
+	return &ReconciliationHandler{
+		svc:    svc,
+		logger: logger.Named("reconciliation_handler"),
+	}
+}
+
+// -------------------- Batch Endpoints --------------------
+
+type createBatchRequest struct {
+	ReconciliationType string     `json:"reconciliation_type"`
+	Reference          *string    `json:"reference,omitempty"`
+	StartDate          *time.Time `json:"start_date,omitempty"`
+	EndDate            *time.Time `json:"end_date,omitempty"`
+}
+
+func (h *ReconciliationHandler) CreateBatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	svcReq := service.CreateReconciliationBatchRequest{
+		CompanyID:          companyID,
+		ReconciliationType: req.ReconciliationType,
+		Reference:          req.Reference,
+		StartDate:          req.StartDate,
+		EndDate:            req.EndDate,
+		CreatedBy:          &userID,
+	}
+
+	batch, err := h.svc.CreateBatch(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to create batch", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    batch,
+		"message": "Reconciliation batch created",
+	})
+}
+
+func (h *ReconciliationHandler) GetBatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	batch, err := h.svc.GetBatch(ctx, batchID)
+	if err != nil {
+		h.logger.Error("failed to get batch", zap.Error(err))
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if batch.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "batch does not belong to this company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    batch,
+	})
+}
+
+type listBatchesRequest struct {
+	ReconciliationType string     `json:"reconciliation_type,omitempty"`
+	Status             string     `json:"status,omitempty"`
+	FromDate           *time.Time `json:"from_date,omitempty"`
+	ToDate             *time.Time `json:"to_date,omitempty"`
+	Limit              int        `json:"limit,omitempty"`
+	Offset             int        `json:"offset,omitempty"`
+}
+
+func (h *ReconciliationHandler) ListBatches(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req listBatchesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// allow empty body, use defaults
+		req = listBatchesRequest{}
+	}
+	if req.Limit <= 0 {
+		req.Limit = 50
+	}
+	if req.Limit > 1000 {
+		req.Limit = 1000
+	}
+	if req.Offset < 0 {
+		req.Offset = 0
+	}
+
+	filter := service.ReconciliationFilter{
+		CompanyID:          companyID,
+		ReconciliationType: req.ReconciliationType,
+		Status:             req.Status,
+		FromDate:           req.FromDate,
+		ToDate:             req.ToDate,
+	}
+	pagination := service.Pagination{Limit: req.Limit, Offset: req.Offset}
+
+	batches, total, err := h.svc.ListBatches(ctx, filter, pagination)
+	if err != nil {
+		h.logger.Error("failed to list batches", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list batches")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"items":  batches,
+			"total":  total,
+			"limit":  req.Limit,
+			"offset": req.Offset,
+		},
+	})
+}
+
+func (h *ReconciliationHandler) UpdateBatchStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.svc.UpdateBatchStats(ctx, batchID); err != nil {
+		h.logger.Error("failed to update batch stats", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Batch stats updated",
+	})
+}
+
+func (h *ReconciliationHandler) CompleteBatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:complete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.svc.CompleteBatch(ctx, batchID); err != nil {
+		h.logger.Error("failed to complete batch", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Batch completed",
+	})
+}
+
+func (h *ReconciliationHandler) DeleteBatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:delete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.svc.DeleteBatch(ctx, batchID); err != nil {
+		h.logger.Error("failed to delete batch", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Batch deleted",
+	})
+}
+
+// -------------------- Item Endpoints --------------------
+
+type addItemsRequest struct {
+	Items []service.ReconciliationItemInput `json:"items"`
+}
+
+func (h *ReconciliationHandler) AddItems(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req addItemsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.Items) == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "at least one item required")
+		return
+	}
+
+	items, err := h.svc.AddItems(ctx, batchID, req.Items)
+	if err != nil {
+		h.logger.Error("failed to add items", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    items,
+		"message": "Items added",
+	})
+}
+
+func (h *ReconciliationHandler) GetItems(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	status := r.URL.Query().Get("status")
+	items, err := h.svc.GetItems(ctx, batchID, status)
+	if err != nil {
+		h.logger.Error("failed to get items", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve items")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    items,
+	})
+}
+
+func (h *ReconciliationHandler) GetUnmatchedItems(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	items, err := h.svc.GetUnmatchedItems(ctx, batchID)
+	if err != nil {
+		h.logger.Error("failed to get unmatched items", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve unmatched items")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    items,
+	})
+}
+
+// -------------------- Matching Endpoints --------------------
+
+type autoMatchRequest struct {
+	Threshold string `json:"threshold"` // decimal string
+}
+
+func (h *ReconciliationHandler) AutoMatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:auto_match") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req autoMatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	threshold, err := decimal.NewFromString(req.Threshold)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid threshold amount")
+		return
+	}
+
+	result, err := h.svc.AutoMatch(ctx, batchID, threshold)
+	if err != nil {
+		h.logger.Error("auto-match failed", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    result,
+	})
+}
+
+type manualMatchRequest struct {
+	JournalEntryID string `json:"journal_entry_id"`
+	Score          string `json:"score"`
+}
+
+func (h *ReconciliationHandler) ManualMatch(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	itemID, err := uuid.Parse(chi.URLParam(r, "itemID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid item ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:manual_match") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req manualMatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	jeID, err := uuid.Parse(req.JournalEntryID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal_entry_id")
+		return
+	}
+	score, err := decimal.NewFromString(req.Score)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid score")
+		return
+	}
+
+	if err := h.svc.ManualMatch(ctx, itemID, jeID, score); err != nil {
+		h.logger.Error("manual match failed", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Item manually matched",
+	})
+}
+
+type setMatchStatusRequest struct {
+	Status         string  `json:"status"`
+	JournalEntryID *string `json:"journal_entry_id,omitempty"`
+	Score          *string `json:"score,omitempty"`
+}
+
+func (h *ReconciliationHandler) SetItemMatchStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	itemID, err := uuid.Parse(chi.URLParam(r, "itemID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid item ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req setMatchStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Status == "" {
+		h.respondWithError(w, http.StatusBadRequest, "status is required")
+		return
+	}
+	var jeID *uuid.UUID
+	if req.JournalEntryID != nil {
+		id, err := uuid.Parse(*req.JournalEntryID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid journal_entry_id")
+			return
+		}
+		jeID = &id
+	}
+	var score *decimal.Decimal
+	if req.Score != nil {
+		s, err := decimal.NewFromString(*req.Score)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid score")
+			return
+		}
+		score = &s
+	}
+
+	if err := h.svc.SetItemMatchStatus(ctx, itemID, req.Status, jeID, score); err != nil {
+		h.logger.Error("failed to set match status", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Match status updated",
+	})
+}
+
+func (h *ReconciliationHandler) UnmatchItem(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	itemID, err := uuid.Parse(chi.URLParam(r, "itemID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid item ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.svc.UnmatchItem(ctx, itemID); err != nil {
+		h.logger.Error("failed to unmatch item", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Item unmatched",
+	})
+}
+
+// -------------------- Difference Endpoints --------------------
+
+type createDifferenceRequest struct {
+	IssueType      string  `json:"issue_type"`
+	ExpectedAmount string  `json:"expected_amount"`
+	ActualAmount   string  `json:"actual_amount"`
+	SourceID       *string `json:"source_id,omitempty"`
+	JournalEntryID *string `json:"journal_entry_id,omitempty"`
+	Description    *string `json:"description,omitempty"`
+}
+
+func (h *ReconciliationHandler) CreateDifference(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:create_difference") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createDifferenceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	expected, err := decimal.NewFromString(req.ExpectedAmount)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid expected_amount")
+		return
+	}
+	actual, err := decimal.NewFromString(req.ActualAmount)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid actual_amount")
+		return
+	}
+	var sourceID *uuid.UUID
+	if req.SourceID != nil {
+		id, err := uuid.Parse(*req.SourceID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid source_id")
+			return
+		}
+		sourceID = &id
+	}
+	var jeID *uuid.UUID
+	if req.JournalEntryID != nil {
+		id, err := uuid.Parse(*req.JournalEntryID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid journal_entry_id")
+			return
+		}
+		jeID = &id
+	}
+
+	svcReq := service.CreateDifferenceRequest{
+		BatchID:        batchID,
+		IssueType:      req.IssueType,
+		ExpectedAmount: expected,
+		ActualAmount:   actual,
+		SourceID:       sourceID,
+		JournalEntryID: jeID,
+		Description:    req.Description,
+	}
+	diff, err := h.svc.CreateDifference(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to create difference", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    diff,
+		"message": "Difference recorded",
+	})
+}
+
+type resolveDifferenceRequest struct {
+	CreateAdjustment bool   `json:"create_adjustment"`
+	DebitAccountID   string `json:"debit_account_id,omitempty"`
+	CreditAccountID  string `json:"credit_account_id,omitempty"`
+	Description      string `json:"description,omitempty"`
+}
+
+func (h *ReconciliationHandler) ResolveDifference(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	diffID, err := uuid.Parse(chi.URLParam(r, "diffID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid difference ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:resolve_difference") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req resolveDifferenceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var adjReq *service.ResolveDifferenceAdjustmentRequest
+	if req.CreateAdjustment {
+		debitID, err := uuid.Parse(req.DebitAccountID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid debit_account_id")
+			return
+		}
+		creditID, err := uuid.Parse(req.CreditAccountID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid credit_account_id")
+			return
+		}
+		adjReq = &service.ResolveDifferenceAdjustmentRequest{
+			CreateAdjustment: true,
+			DebitAccountID:   debitID,
+			CreditAccountID:  creditID,
+			Description:      req.Description,
+		}
+	}
+
+	if err := h.svc.ResolveDifference(ctx, diffID, &userID, adjReq); err != nil {
+		h.logger.Error("failed to resolve difference", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Difference resolved",
+	})
+}
+
+func (h *ReconciliationHandler) GetDifferences(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	unresolvedOnly, _ := strconv.ParseBool(r.URL.Query().Get("unresolved_only"))
+	diffs, err := h.svc.GetDifferences(ctx, batchID, unresolvedOnly)
+	if err != nil {
+		h.logger.Error("failed to get differences", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve differences")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    diffs,
+	})
+}
+
+// -------------------- Adjustment Endpoints --------------------
+
+type createAdjustmentRequest struct {
+	JournalEntryID   string  `json:"journal_entry_id"`
+	Reason           *string `json:"reason,omitempty"`
+	AdjustmentAmount string  `json:"adjustment_amount"`
+}
+
+func (h *ReconciliationHandler) CreateAdjustment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:create_adjustment") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createAdjustmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	jeID, err := uuid.Parse(req.JournalEntryID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal_entry_id")
+		return
+	}
+	amount, err := decimal.NewFromString(req.AdjustmentAmount)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid adjustment_amount")
+		return
+	}
+
+	svcReq := service.CreateAdjustmentRequest{
+		BatchID:          batchID,
+		JournalEntryID:   jeID,
+		Reason:           req.Reason,
+		AdjustmentAmount: amount,
+		CreatedBy:        &userID,
+	}
+	adj, err := h.svc.CreateAdjustment(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to create adjustment", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    adj,
+		"message": "Adjustment created",
+	})
+}
+
+func (h *ReconciliationHandler) DeleteAdjustment(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	adjID, err := uuid.Parse(chi.URLParam(r, "adjID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid adjustment ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:delete_adjustment") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.svc.DeleteAdjustment(ctx, adjID); err != nil {
+		h.logger.Error("failed to delete adjustment", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Adjustment deleted",
+	})
+}
+
+func (h *ReconciliationHandler) GetAdjustments(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	batchID, err := uuid.Parse(chi.URLParam(r, "batchID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid batch ID")
+		return
+	}
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "reconciliation:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	adjustments, err := h.svc.GetAdjustments(ctx, batchID)
+	if err != nil {
+		h.logger.Error("failed to get adjustments", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve adjustments")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    adjustments,
+	})
+}
+
+// -------------------- Helpers --------------------
+
+func (h *ReconciliationHandler) hasPermission(ctx context.Context, companyID, userID uuid.UUID, permission string) bool {
+	// Placeholder – integrate with actual RBAC
+	return true
+}
+
+func getCompanyIDFromRequest(r *http.Request) (uuid.UUID, error) {
+	companyIDStr := chi.URLParam(r, "companyID")
+	if companyIDStr == "" {
+		companyIDStr = r.URL.Query().Get("companyId")
+	}
+	return uuid.Parse(companyIDStr)
+}
+
+func (h *ReconciliationHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode JSON response", zap.Error(err))
+	}
+}
+
+func (h *ReconciliationHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+
+
+================================================================================
+FILE: ./handler/report_handler.go
+================================================================================
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/service"
+)
+
+type ReportHandler struct {
+	querySvc *service.AccountingQueryService
+	logger   *zap.Logger
+}
+
+func NewReportHandler(querySvc *service.AccountingQueryService, logger *zap.Logger) *ReportHandler {
+	return &ReportHandler{
+		querySvc: querySvc,
+		logger:   logger.Named("report_handler"),
+	}
+}
+
+// ------------------------------
+// Trial Balance
+// ------------------------------
+type trialBalanceRequest struct {
+	FiscalYear int `json:"fiscal_year"`
+	Period     int `json:"period"`
+}
+
+func (h *ReportHandler) GetTrialBalance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	var req trialBalanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.FiscalYear == 0 || req.Period == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "fiscal_year and period are required")
+		return
+	}
+
+	entries, totalDebit, totalCredit, err := h.querySvc.GetTrialBalance(ctx, companyID, req.FiscalYear, req.Period)
+	if err != nil {
+		h.logger.Error("failed to get trial balance", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve trial balance")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"entries":      entries,
+			"total_debit":  totalDebit.String(),
+			"total_credit": totalCredit.String(),
+		},
+	})
+}
+
+// ------------------------------
+// General Ledger
+// ------------------------------
+func (h *ReportHandler) GetGeneralLedger(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	accountIDStr := r.URL.Query().Get("account_id")
+	if accountIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "account_id query parameter is required")
+		return
+	}
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid account_id")
+		return
+	}
+
+	startDate, err := h.parseDateParam(r, "start_date")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid start_date")
+		return
+	}
+	endDate, err := h.parseDateParam(r, "end_date")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+		return
+	}
+
+	entries, openingBalance, err := h.querySvc.GetGeneralLedger(ctx, companyID, accountID, startDate, endDate)
+	if err != nil {
+		h.logger.Error("failed to get general ledger", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve general ledger")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"opening_balance": openingBalance.String(),
+			"entries":         entries,
+		},
+	})
+}
+
+// ------------------------------
+// Balance Sheet
+// ------------------------------
+func (h *ReportHandler) GetBalanceSheet(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	asOf, err := h.parseDateParam(r, "as_of")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid as_of date")
+		return
+	}
+
+	assets, liabilities, equity, totalAssets, totalLiabilities, totalEquity, err := h.querySvc.GetBalanceSheet(ctx, companyID, asOf)
+	if err != nil {
+		h.logger.Error("failed to get balance sheet", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve balance sheet")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"assets":            assets,
+			"liabilities":       liabilities,
+			"equity":            equity,
+			"total_assets":      totalAssets.String(),
+			"total_liabilities": totalLiabilities.String(),
+			"total_equity":      totalEquity.String(),
+		},
+	})
+}
+
+// ------------------------------
+// Income Statement
+// ------------------------------
+type incomeStatementRequest struct {
+	FiscalYear int `json:"fiscal_year"`
+	Period     int `json:"period"`
+}
+
+func (h *ReportHandler) GetIncomeStatement(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	var req incomeStatementRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.FiscalYear == 0 || req.Period == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "fiscal_year and period are required")
+		return
+	}
+
+	revenues, expenses, totalRevenue, totalExpense, netIncome, err := h.querySvc.GetIncomeStatement(ctx, companyID, req.FiscalYear, req.Period)
+	if err != nil {
+		h.logger.Error("failed to get income statement", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve income statement")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"revenues":      revenues,
+			"expenses":      expenses,
+			"total_revenue": totalRevenue.String(),
+			"total_expense": totalExpense.String(),
+			"net_income":    netIncome.String(),
+		},
+	})
+}
+
+// ------------------------------
+// Cash Flow Statement
+// ------------------------------
+func (h *ReportHandler) GetCashFlowStatement(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	startDate, err := h.parseDateParam(r, "start_date")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid start_date")
+		return
+	}
+	endDate, err := h.parseDateParam(r, "end_date")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+		return
+	}
+
+	operating, investing, financing, err := h.querySvc.GetCashFlowStatement(ctx, companyID, startDate, endDate)
+	if err != nil {
+		h.logger.Error("failed to get cash flow statement", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve cash flow statement")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"operating": operating.String(),
+			"investing": investing.String(),
+			"financing": financing.String(),
+		},
+	})
+}
+
+// ------------------------------
+// Tax Summary
+// ------------------------------
+func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	startDate, err := h.parseDateParam(r, "start_date")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid start_date")
+		return
+	}
+	endDate, err := h.parseDateParam(r, "end_date")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+		return
+	}
+
+	results, totalTax, err := h.querySvc.GetTaxSummary(ctx, companyID, startDate, endDate)
+	if err != nil {
+		h.logger.Error("failed to get tax summary", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve tax summary")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"breakdown": results,
+			"total_tax": totalTax.String(),
+		},
+	})
+}
+
+// ------------------------------
+// List Compliance Returns
+// ------------------------------
+func (h *ReportHandler) ListComplianceReturns(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.checkPermission(ctx, companyID, "accounting:reports:read"); err != nil {
+		h.respondWithError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
+	status := r.URL.Query().Get("status")
+	yearStr := r.URL.Query().Get("year")
+	var year int
+	if yearStr != "" {
+		year, _ = strconv.Atoi(yearStr)
+	}
+	limit, offset := h.parsePagination(r)
+
+	summaries, total, err := h.querySvc.ListComplianceReturns(ctx, companyID, status, year, limit, offset)
+	if err != nil {
+		h.logger.Error("failed to list compliance returns", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve returns")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"items":  summaries,
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		},
+	})
+}
+
+// ------------------------------
+// Helpers (same as AcademicYearHandler)
+// ------------------------------
+func (h *ReportHandler) parseCompanyID(r *http.Request) (uuid.UUID, error) {
+	companyIDStr := chi.URLParam(r, "companyID")
+	if companyIDStr == "" {
+		return uuid.Nil, fmt.Errorf("company ID is required")
+	}
+	return uuid.Parse(companyIDStr)
+}
+
+func (h *ReportHandler) parseDateParam(r *http.Request, param string) (time.Time, error) {
+	val := r.URL.Query().Get(param)
+	if val == "" {
+		return time.Time{}, fmt.Errorf("missing %s", param)
+	}
+	return time.Parse("2006-01-02", val)
+}
+
+func (h *ReportHandler) parsePagination(r *http.Request) (limit, offset int) {
+	limit = 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	offset = 0
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if parsed, err := strconv.Atoi(o); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+	return
+}
+
+func (h *ReportHandler) checkPermission(ctx context.Context, companyID uuid.UUID, permission string) error {
+	// In real implementation, fetch user from context and check RBAC.
+	// For now, stub returning nil (allowed).
+	return nil
+}
+
+func (h *ReportHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode JSON response", zap.Error(err))
+	}
+}
+
+func (h *ReportHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+
+
+================================================================================
+FILE: ./handler/compliance_handler.go
+================================================================================
+
+// FILE: ./internal/accounting/handler/compliance_handler.go
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/repository"
+	"auth-service/internal/accounting/service"
+)
+
+type ComplianceHandler struct {
+	complianceService service.ComplianceService
+	logger            *zap.Logger
+}
+
+func NewComplianceHandler(complianceService service.ComplianceService, logger *zap.Logger) *ComplianceHandler {
+	return &ComplianceHandler{
+		complianceService: complianceService,
+		logger:            logger.Named("compliance_handler"),
+	}
+}
+
+// ---------- Request DTOs ----------
+type createReturnRequest struct {
+	ReturnType  string    `json:"return_type"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	DueDate     time.Time `json:"due_date"`
+}
+
+type updateReturnRequest struct {
+	DueDate     *time.Time `json:"due_date,omitempty"`
+	Description *string    `json:"description,omitempty"`
+}
+
+type fileReturnRequest struct {
+	AcknowledgementNo   *string          `json:"acknowledgement_no,omitempty"`
+	PaymentAmount       *decimal.Decimal `json:"payment_amount,omitempty"`
+	TaxPayableAccountID string           `json:"tax_payable_account_id"`
+	BankAccountID       string           `json:"bank_account_id"`
+	Metadata            json.RawMessage  `json:"metadata,omitempty"`
+}
+
+type amendReturnRequest struct {
+	// empty body, only amended by taken from context
+}
+
+type updateFilingStatusRequest struct {
+	Status       string  `json:"status"`
+	ErrorMessage *string `json:"error_message,omitempty"`
+}
+
+type listReturnsQuery struct {
+	Status   string `json:"status"`
+	FromDate string `json:"from_date"`
+	ToDate   string `json:"to_date"`
+	Limit    int    `json:"limit"`
+	Offset   int    `json:"offset"`
+}
+
+// ---------- Helper ----------
+func (h *ComplianceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
+	// TODO: implement actual permission check (e.g., via RBAC)
+	return true
+}
+
+func (h *ComplianceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode JSON response", zap.Error(err))
+	}
+}
+
+func (h *ComplianceHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+// ---------- Handlers ----------
+
+// CreateReturn godoc
+// @Summary Create a new compliance return
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param request body createReturnRequest true "Return details"
+// @Success 201 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns [post]
+func (h *ComplianceHandler) CreateReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createReturnRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	serviceReq := service.CreateReturnRequest{
+		CompanyID:   companyID,
+		ReturnType:  req.ReturnType,
+		PeriodStart: req.PeriodStart,
+		PeriodEnd:   req.PeriodEnd,
+		DueDate:     req.DueDate,
+		CreatedBy:   &userID,
+		UpdatedBy:   &userID,
+	}
+
+	ret, err := h.complianceService.CreateReturn(ctx, serviceReq)
+	if err != nil {
+		h.logger.Error("failed to create return", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    ret,
+		"message": "Compliance return created successfully",
+	})
+}
+
+// UpdateReturn godoc
+// @Summary Update an existing compliance return (draft only)
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Return ID"
+// @Param request body updateReturnRequest true "Update fields"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns/{id} [put]
+func (h *ComplianceHandler) UpdateReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	returnID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req updateReturnRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	serviceReq := service.UpdateReturnRequest{
+		ReturnID:  returnID,
+		DueDate:   req.DueDate,
+		UpdatedBy: &userID,
+	}
+
+	updated, err := h.complianceService.UpdateReturn(ctx, serviceReq)
+	if err != nil {
+		h.logger.Error("failed to update return", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// optional: check that updated belongs to the company
+	if updated.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    updated,
+		"message": "Return updated successfully",
+	})
+}
+
+// SubmitReturn godoc
+// @Summary Submit a return (change status from draft to submitted)
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Return ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns/{id}/submit [post]
+func (h *ComplianceHandler) SubmitReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	returnID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:submit") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.complianceService.SubmitReturn(ctx, returnID, &userID); err != nil {
+		h.logger.Error("failed to submit return", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Return submitted successfully",
+	})
+}
+
+// FileReturn godoc
+// @Summary File a submitted return with payment and acknowledgement
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Return ID"
+// @Param request body fileReturnRequest true "Filing details"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns/{id}/file [post]
+func (h *ComplianceHandler) FileReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	returnID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:file") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req fileReturnRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	taxPayableAccID, err := uuid.Parse(req.TaxPayableAccountID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax_payable_account_id")
+		return
+	}
+	bankAccID, err := uuid.Parse(req.BankAccountID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid bank_account_id")
+		return
+	}
+
+	serviceReq := service.FileReturnRequest{
+		AcknowledgementNo:   req.AcknowledgementNo,
+		PaymentAmount:       req.PaymentAmount,
+		TaxPayableAccountID: taxPayableAccID,
+		BankAccountID:       bankAccID,
+		Metadata:            req.Metadata,
+		FiledBy:             &userID,
+	}
+
+	filing, err := h.complianceService.FileReturn(ctx, returnID, serviceReq)
+	if err != nil {
+		h.logger.Error("failed to file return", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    filing,
+		"message": "Return filed successfully",
+	})
+}
+
+// AmendReturn godoc
+// @Summary Amend an already filed return (creates new draft return)
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Original Return ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns/{id}/amend [post]
+func (h *ComplianceHandler) AmendReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	returnID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:amend") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	req := service.AmendReturnRequest{
+		AmendedBy: &userID,
+	}
+
+	amended, err := h.complianceService.AmendReturn(ctx, returnID, req)
+	if err != nil {
+		h.logger.Error("failed to amend return", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    amended,
+		"message": "Return amended, new draft created",
+	})
+}
+
+// DeleteReturn godoc
+// @Summary Soft-delete a return (only if not filed)
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Return ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns/{id} [delete]
+func (h *ComplianceHandler) DeleteReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	returnID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:delete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.complianceService.DeleteReturn(ctx, returnID, &userID); err != nil {
+		h.logger.Error("failed to delete return", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Return deleted successfully",
+	})
+}
+
+// GetReturnByID godoc
+// @Summary Get a compliance return by ID
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Return ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns/{id} [get]
+func (h *ComplianceHandler) GetReturnByID(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	returnID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	ret, err := h.complianceService.GetReturnByID(ctx, returnID)
+	if err != nil {
+		h.logger.Error("failed to get return", zap.Error(err))
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	if ret.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    ret,
+	})
+}
+
+// ListReturns godoc
+// @Summary List compliance returns with filtering and pagination
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param status query string false "Filter by status"
+// @Param from_date query string false "Start date (YYYY-MM-DD)"
+// @Param to_date query string false "End date (YYYY-MM-DD)"
+// @Param limit query int false "Page size (default 50, max 1000)"
+// @Param offset query int false "Offset"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/returns [get]
+func (h *ComplianceHandler) ListReturns(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	query := r.URL.Query()
+	filter := repository.ComplianceReturnFilter{
+		CompanyID: companyID,
+		Status:    query.Get("status"),
+	}
+	// Date filtering – adjust field names based on actual filter struct.
+	// If the filter uses PeriodStart/PeriodEnd, uncomment and modify accordingly:
+	/*
+		if from := query.Get("from_date"); from != "" {
+			if t, err := time.Parse("2006-01-02", from); err == nil {
+				filter.PeriodStart = &t
+			}
+		}
+		if to := query.Get("to_date"); to != "" {
+			if t, err := time.Parse("2006-01-02", to); err == nil {
+				filter.PeriodEnd = &t
+			}
+		}
+	*/
+
+	limit := 50
+	if l, err := strconv.Atoi(query.Get("limit")); err == nil && l > 0 {
+		limit = l
+		if limit > 1000 {
+			limit = 1000
+		}
+	}
+	offset := 0
+	if o, err := strconv.Atoi(query.Get("offset")); err == nil && o >= 0 {
+		offset = o
+	}
+
+	pagination := service.Pagination{Limit: limit, Offset: offset}
+	items, total, err := h.complianceService.ListReturns(ctx, filter, pagination)
+	if err != nil {
+		h.logger.Error("failed to list returns", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list returns")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"items":  items,
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		},
+	})
+}
+
+// GetFilingByID godoc
+// @Summary Get a filing by ID
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param filingID path string true "Filing ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/filings/{filingID} [get]
+func (h *ComplianceHandler) GetFilingByID(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	filingIDStr := chi.URLParam(r, "filingID")
+	filingID, err := uuid.Parse(filingIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid filing ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	filing, err := h.complianceService.GetFilingByID(ctx, filingID)
+	if err != nil {
+		h.logger.Error("failed to get filing", zap.Error(err))
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	// optional: verify that filing belongs to a return of the company
+	// we could fetch the return, but for brevity we trust the service
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    filing,
+	})
+}
+
+// UpdateFilingStatus godoc
+// @Summary Update filing status (e.g., accepted/rejected by tax authority)
+// @Tags compliance
+// @Param companyID path string true "Company ID"
+// @Param filingID path string true "Filing ID"
+// @Param request body updateFilingStatusRequest true "Status update"
+// @Success 200 {object} map[string]interface{}
+// @Router /companies/{companyID}/compliance/filings/{filingID}/status [patch]
+func (h *ComplianceHandler) UpdateFilingStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	filingIDStr := chi.URLParam(r, "filingID")
+	filingID, err := uuid.Parse(filingIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid filing ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "compliance:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req updateFilingStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.complianceService.UpdateFilingStatus(ctx, filingID, req.Status, req.ErrorMessage); err != nil {
+		h.logger.Error("failed to update filing status", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Filing status updated",
+	})
+}
+
+
+
+================================================================================
+FILE: ./handler/journal_handler.go
+================================================================================
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/repository"
+	"auth-service/internal/accounting/service"
+)
+
+type JournalHandler struct {
+	journalService service.JournalService
+	logger         *zap.Logger
+}
+
+func NewJournalHandler(journalService service.JournalService, logger *zap.Logger) *JournalHandler {
+	return &JournalHandler{
+		journalService: journalService,
+		logger:         logger.Named("journal_handler"),
+	}
+}
+
+// Request/Response types
+
+type createJournalRequest struct {
+	JournalType string               `json:"journal_type"`
+	EntryDate   time.Time            `json:"entry_date"`
+	Reference   *string              `json:"reference,omitempty"`
+	Description *string              `json:"description,omitempty"`
+	Lines       []journalLineRequest `json:"lines"`
+	SourceType  *string              `json:"source_type,omitempty"`
+	SourceID    *uuid.UUID           `json:"source_id,omitempty"`
+}
+
+type journalLineRequest struct {
+	AccountID    uuid.UUID       `json:"account_id"`
+	DebitAmount  decimal.Decimal `json:"debit_amount"`
+	CreditAmount decimal.Decimal `json:"credit_amount"`
+	Description  *string         `json:"description,omitempty"`
+}
+
+type updateJournalRequest struct {
+	EntryDate   *time.Time           `json:"entry_date,omitempty"`
+	Reference   *string              `json:"reference,omitempty"`
+	Description *string              `json:"description,omitempty"`
+	Lines       []journalLineRequest `json:"lines,omitempty"`
+}
+
+type reverseJournalRequest struct {
+	Reason string `json:"reason"`
+}
+
+type listJournalsQuery struct {
+	CompanyID   string     `json:"-"`
+	JournalType *string    `json:"journal_type,omitempty"`
+	Status      *string    `json:"status,omitempty"`
+	FromDate    *time.Time `json:"from_date,omitempty"`
+	ToDate      *time.Time `json:"to_date,omitempty"`
+	Limit       int        `json:"limit,omitempty"`
+	Offset      int        `json:"offset,omitempty"`
+}
+
+// Helper functions
+
+func (h *JournalHandler) getUserID(ctx context.Context) (uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("user ID not found in context")
+	}
+	return uuid.Parse(userIDStr)
+}
+
+func (h *JournalHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
+	// Implement real permission check or delegate to RBAC service
+	return true
+}
+
+// Handlers
+
+// Create godoc
+// @Summary Create a new journal entry
+// @Tags journals
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param request body createJournalRequest true "Journal data"
+// @Success 201 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals [post]
+func (h *JournalHandler) Create(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createJournalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validate lines
+	if len(req.Lines) == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "at least one journal line is required")
+		return
+	}
+
+	// Build service request
+	lines := make([]service.JournalLineRequest, len(req.Lines))
+	for i, l := range req.Lines {
+		lines[i] = service.JournalLineRequest{
+			AccountID:    l.AccountID,
+			DebitAmount:  l.DebitAmount,
+			CreditAmount: l.CreditAmount,
+			Description:  l.Description,
+		}
+	}
+
+	svcReq := service.CreateJournalRequest{
+		CompanyID:   companyID,
+		JournalType: req.JournalType,
+		EntryDate:   req.EntryDate,
+		Reference:   req.Reference,
+		Description: req.Description,
+		Lines:       lines,
+		CreatedBy:   &userID,
+		UpdatedBy:   &userID,
+		SourceType:  req.SourceType,
+		SourceID:    req.SourceID,
+	}
+
+	journal, err := h.journalService.Create(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to create journal", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    journal,
+		"message": "Journal entry created successfully",
+	})
+}
+
+// Update godoc
+// @Summary Update a draft journal entry
+// @Tags journals
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Journal Entry ID"
+// @Param request body updateJournalRequest true "Update data"
+// @Success 200 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals/{id} [put]
+func (h *JournalHandler) Update(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	journalID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal entry ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req updateJournalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Build service request
+	var lines []service.JournalLineRequest
+	if req.Lines != nil {
+		lines = make([]service.JournalLineRequest, len(req.Lines))
+		for i, l := range req.Lines {
+			lines[i] = service.JournalLineRequest{
+				AccountID:    l.AccountID,
+				DebitAmount:  l.DebitAmount,
+				CreditAmount: l.CreditAmount,
+				Description:  l.Description,
+			}
+		}
+	}
+
+	svcReq := service.UpdateJournalRequest{
+		JournalEntryID: journalID,
+		EntryDate:      req.EntryDate,
+		Reference:      req.Reference,
+		Description:    req.Description,
+		Lines:          lines,
+		UpdatedBy:      &userID,
+	}
+
+	journal, err := h.journalService.Update(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to update journal", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Verify ownership
+	if journal.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    journal,
+		"message": "Journal entry updated successfully",
+	})
+}
+
+// Post godoc
+// @Summary Post a journal entry (move to ledger)
+// @Tags journals
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Journal Entry ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals/{id}/post [post]
+func (h *JournalHandler) Post(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	journalID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal entry ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:post") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	// Optional: verify journal belongs to company before posting
+	journal, err := h.journalService.GetByID(ctx, journalID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if journal.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		return
+	}
+
+	if err := h.journalService.Post(ctx, journalID, &userID); err != nil {
+		h.logger.Error("failed to post journal", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Journal entry posted successfully",
+	})
+}
+
+// Reverse godoc
+// @Summary Reverse a posted journal entry
+// @Tags journals
+// @Accept json
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Journal Entry ID"
+// @Param request body reverseJournalRequest true "Reason for reversal"
+// @Success 200 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals/{id}/reverse [post]
+func (h *JournalHandler) Reverse(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	journalID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal entry ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:reverse") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req reverseJournalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		h.respondWithError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+
+	// Verify ownership
+	journal, err := h.journalService.GetByID(ctx, journalID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if journal.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		return
+	}
+
+	if err := h.journalService.Reverse(ctx, journalID, req.Reason, &userID); err != nil {
+		h.logger.Error("failed to reverse journal", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Journal entry reversed successfully",
+	})
+}
+
+// GetByID godoc
+// @Summary Get journal entry by ID
+// @Tags journals
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Journal Entry ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals/{id} [get]
+func (h *JournalHandler) GetByID(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	journalID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal entry ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	journal, err := h.journalService.GetByID(ctx, journalID)
+	if err != nil {
+		h.logger.Error("failed to get journal", zap.Error(err))
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	if journal.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    journal,
+	})
+}
+
+// List godoc
+// @Summary List journal entries
+// @Tags journals
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param journal_type query string false "Filter by journal type"
+// @Param status query string false "Filter by status"
+// @Param from_date query string false "Filter from date (RFC3339)"
+// @Param to_date query string false "Filter to date (RFC3339)"
+// @Param limit query int false "Page size" default(50)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals [get]
+func (h *JournalHandler) List(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	query := r.URL.Query()
+
+	filter := repository.JournalFilter{
+		CompanyID: companyID,
+	}
+	if journalType := query.Get("journal_type"); journalType != "" {
+		filter.JournalType = journalType
+	}
+	if status := query.Get("status"); status != "" {
+		filter.Status = status
+	}
+	if fromDateStr := query.Get("from_date"); fromDateStr != "" {
+		if t, err := time.Parse(time.RFC3339, fromDateStr); err == nil {
+			filter.FromDate = &t
+		}
+	}
+	if toDateStr := query.Get("to_date"); toDateStr != "" {
+		if t, err := time.Parse(time.RFC3339, toDateStr); err == nil {
+			filter.ToDate = &t
+		}
+	}
+
+	limit := 50
+	if limitStr := query.Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	offset := 0
+	if offsetStr := query.Get("offset"); offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+			offset = o
+		}
+	}
+
+	journals, total, err := h.journalService.List(ctx, filter, service.Pagination{Limit: limit, Offset: offset})
+	if err != nil {
+		h.logger.Error("failed to list journals", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve journals")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"items":  journals,
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		},
+	})
+}
+
+// Delete godoc
+// @Summary Soft-delete a draft journal entry
+// @Tags journals
+// @Produce json
+// @Param companyID path string true "Company ID"
+// @Param id path string true "Journal Entry ID"
+// @Success 200 {object} map[string]interface{}
+// @Router /api/v1/companies/{companyID}/journals/{id} [delete]
+func (h *JournalHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	journalID, err := uuid.Parse(idStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal entry ID")
+		return
+	}
+
+	userID, err := h.getUserID(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "journal:delete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	// Verify ownership
+	journal, err := h.journalService.GetByID(ctx, journalID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if journal.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		return
+	}
+
+	if err := h.journalService.Delete(ctx, journalID, &userID); err != nil {
+		h.logger.Error("failed to delete journal", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Journal entry deleted successfully",
+	})
+}
+
+// Helper response methods
+
+func (h *JournalHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode JSON response", zap.Error(err))
+	}
+}
+
+func (h *JournalHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+
+
+================================================================================
+FILE: ./handler/tax_handler.go
+================================================================================
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/models/tax"
+	"auth-service/internal/accounting/repository"
+	"auth-service/internal/accounting/service"
+)
+
+type TaxHandler struct {
+	taxSvc service.TaxEngineService
+	logger *zap.Logger
+}
+
+func NewTaxHandler(taxSvc service.TaxEngineService, logger *zap.Logger) *TaxHandler {
+	return &TaxHandler{
+		taxSvc: taxSvc,
+		logger: logger.Named("tax_handler"),
+	}
+}
+
+// ---------------------------------------------------------------------
+// Tax Rates
+// ---------------------------------------------------------------------
+
+type createTaxRateRequest struct {
+	TaxName        string          `json:"tax_name"`
+	RatePercentage decimal.Decimal `json:"rate_percentage"`
+	EffectiveFrom  time.Time       `json:"effective_from"`
+	EffectiveTo    *time.Time      `json:"effective_to,omitempty"`
+	IsActive       bool            `json:"is_active"`
+}
+
+func (h *TaxHandler) CreateTaxRate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rate:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createTaxRateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	rate := &tax.TaxRate{
+		TaxRateID:      uuid.New(),
+		CompanyID:      companyID,
+		TaxName:        req.TaxName,
+		RatePercentage: req.RatePercentage,
+		EffectiveFrom:  req.EffectiveFrom,
+		EffectiveTo:    req.EffectiveTo,
+		IsActive:       req.IsActive,
+		CreatedBy:      &userID,
+		UpdatedBy:      &userID,
+	}
+
+	if err := h.taxSvc.CreateTaxRate(ctx, rate); err != nil {
+		h.logger.Error("failed to create tax rate", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    rate,
+		"message": "Tax rate created successfully",
+	})
+}
+
+type updateTaxRateRequest struct {
+	TaxName        *string          `json:"tax_name,omitempty"`
+	RatePercentage *decimal.Decimal `json:"rate_percentage,omitempty"`
+	EffectiveFrom  *time.Time       `json:"effective_from,omitempty"`
+	EffectiveTo    *time.Time       `json:"effective_to,omitempty"`
+	IsActive       *bool            `json:"is_active,omitempty"`
+}
+
+func (h *TaxHandler) UpdateTaxRate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rateID, err := uuid.Parse(chi.URLParam(r, "rateID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax rate ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rate:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	// Fetch existing rate
+	filter := repository.TaxRateFilter{CompanyID: companyID}
+	rates, _, err := h.taxSvc.ListTaxRates(ctx, filter, repository.Pagination{Limit: 100}, repository.Sort{})
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to fetch tax rate")
+		return
+	}
+	var existing *tax.TaxRate
+	for _, r := range rates {
+		if r.TaxRateID == rateID {
+			existing = r
+			break
+		}
+	}
+	if existing == nil {
+		h.respondWithError(w, http.StatusNotFound, "tax rate not found")
+		return
+	}
+
+	var req updateTaxRateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.TaxName != nil {
+		existing.TaxName = *req.TaxName
+	}
+	if req.RatePercentage != nil {
+		existing.RatePercentage = *req.RatePercentage
+	}
+	if req.EffectiveFrom != nil {
+		existing.EffectiveFrom = *req.EffectiveFrom
+	}
+	if req.EffectiveTo != nil {
+		existing.EffectiveTo = req.EffectiveTo
+	}
+	if req.IsActive != nil {
+		existing.IsActive = *req.IsActive
+	}
+	existing.UpdatedBy = &userID
+
+	if err := h.taxSvc.UpdateTaxRate(ctx, existing); err != nil {
+		h.logger.Error("failed to update tax rate", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    existing,
+		"message": "Tax rate updated successfully",
+	})
+}
+
+func (h *TaxHandler) ListTaxRates(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rate:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	query := r.URL.Query()
+	filter := repository.TaxRateFilter{CompanyID: companyID}
+	if taxName := query.Get("tax_name"); taxName != "" {
+		filter.TaxName = taxName // string, not pointer
+	}
+	if activeStr := query.Get("is_active"); activeStr != "" {
+		active, _ := strconv.ParseBool(activeStr)
+		filter.IsActive = &active
+	}
+	// Note: EffectiveDate filter not directly supported; you can extend repository or filter in memory
+	// For now, we ignore date filtering.
+
+	pagination := parsePagination(query)
+	sort := parseSort(query)
+
+	rates, total, err := h.taxSvc.ListTaxRates(ctx, filter, pagination, sort)
+	if err != nil {
+		h.logger.Error("failed to list tax rates", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve tax rates")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"items":  rates,
+			"total":  total,
+			"limit":  pagination.Limit,
+			"offset": pagination.Offset,
+		},
+	})
+}
+
+func (h *TaxHandler) DeleteTaxRate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rateID, err := uuid.Parse(chi.URLParam(r, "rateID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax rate ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rate:delete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.taxSvc.DeleteTaxRate(ctx, rateID, &userID); err != nil {
+		h.logger.Error("failed to delete tax rate", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Tax rate deleted successfully",
+	})
+}
+
+func (h *TaxHandler) CloseOpenRates(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rate:close") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req struct {
+		TaxName    string    `json:"tax_name"`
+		BeforeDate time.Time `json:"before_date"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.taxSvc.CloseOpenRates(ctx, companyID, req.TaxName, req.BeforeDate); err != nil {
+		h.logger.Error("failed to close open rates", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Open rates closed successfully",
+	})
+}
+
+// ---------------------------------------------------------------------
+// Tax Rules
+// ---------------------------------------------------------------------
+
+type createTaxRuleRequest struct {
+	RuleName   string             `json:"rule_name"`
+	AppliesTo  string             `json:"applies_to"`
+	Priority   int                `json:"priority"`
+	IsActive   bool               `json:"is_active"`
+	Conditions []tax.TaxCondition `json:"conditions,omitempty"`
+	Actions    []tax.TaxAction    `json:"actions,omitempty"`
+}
+
+func (h *TaxHandler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rule:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createTaxRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	rule := &tax.TaxRule{
+		TaxRuleID: uuid.New(),
+		CompanyID: companyID,
+		RuleName:  req.RuleName,
+		AppliesTo: req.AppliesTo,
+		Priority:  req.Priority,
+		IsActive:  req.IsActive,
+		CreatedBy: &userID,
+		UpdatedBy: &userID,
+	}
+
+	// Convert to pointer slices
+	conditions := make([]*tax.TaxCondition, len(req.Conditions))
+	for i := range req.Conditions {
+		req.Conditions[i].ConditionID = uuid.New()
+		req.Conditions[i].TaxRuleID = rule.TaxRuleID
+		conditions[i] = &req.Conditions[i]
+	}
+	actions := make([]*tax.TaxAction, len(req.Actions))
+	for i := range req.Actions {
+		req.Actions[i].ActionID = uuid.New()
+		req.Actions[i].TaxRuleID = rule.TaxRuleID
+		actions[i] = &req.Actions[i]
+	}
+
+	if err := h.taxSvc.CreateTaxRule(ctx, rule, conditions, actions); err != nil {
+		h.logger.Error("failed to create tax rule", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    rule,
+		"message": "Tax rule created successfully",
+	})
+}
+
+type updateTaxRuleRequest struct {
+	RuleName   *string            `json:"rule_name,omitempty"`
+	AppliesTo  *string            `json:"applies_to,omitempty"`
+	Priority   *int               `json:"priority,omitempty"`
+	IsActive   *bool              `json:"is_active,omitempty"`
+	Conditions []tax.TaxCondition `json:"conditions,omitempty"`
+	Actions    []tax.TaxAction    `json:"actions,omitempty"`
+}
+
+func (h *TaxHandler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax rule ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rule:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	// Fetch existing rule bundle
+	bundle, err := h.taxSvc.GetRuleBundle(ctx, ruleID)
+	if err != nil || bundle == nil || bundle.Rule.CompanyID != companyID {
+		h.respondWithError(w, http.StatusNotFound, "tax rule not found")
+		return
+	}
+	rule := bundle.Rule
+
+	var req updateTaxRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.RuleName != nil {
+		rule.RuleName = *req.RuleName
+	}
+	if req.AppliesTo != nil {
+		rule.AppliesTo = *req.AppliesTo
+	}
+	if req.Priority != nil {
+		rule.Priority = *req.Priority
+	}
+	if req.IsActive != nil {
+		rule.IsActive = *req.IsActive
+	}
+	rule.UpdatedBy = &userID
+
+	// Convert to pointer slices
+	conditions := make([]*tax.TaxCondition, len(req.Conditions))
+	for i := range req.Conditions {
+		req.Conditions[i].ConditionID = uuid.New()
+		req.Conditions[i].TaxRuleID = rule.TaxRuleID
+		conditions[i] = &req.Conditions[i]
+	}
+	actions := make([]*tax.TaxAction, len(req.Actions))
+	for i := range req.Actions {
+		req.Actions[i].ActionID = uuid.New()
+		req.Actions[i].TaxRuleID = rule.TaxRuleID
+		actions[i] = &req.Actions[i]
+	}
+
+	if err := h.taxSvc.UpdateTaxRule(ctx, rule, conditions, actions); err != nil {
+		h.logger.Error("failed to update tax rule", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    rule,
+		"message": "Tax rule updated successfully",
+	})
+}
+
+func (h *TaxHandler) DeleteTaxRule(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax rule ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rule:delete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.taxSvc.DeleteTaxRule(ctx, ruleID, &userID); err != nil {
+		h.logger.Error("failed to delete tax rule", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Tax rule deleted successfully",
+	})
+}
+
+func (h *TaxHandler) GetRuleBundle(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax rule ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:rule:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	bundle, err := h.taxSvc.GetRuleBundle(ctx, ruleID)
+	if err != nil || bundle == nil || bundle.Rule.CompanyID != companyID {
+		h.respondWithError(w, http.StatusNotFound, "tax rule not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    bundle,
+	})
+}
+
+// ---------------------------------------------------------------------
+// Tax Profiles
+// ---------------------------------------------------------------------
+
+type createTaxProfileRequest struct {
+	TaxRegime          string     `json:"tax_regime"`
+	Jurisdiction       string     `json:"jurisdiction"`
+	RegistrationNumber *string    `json:"registration_number,omitempty"`
+	DefaultTaxRateID   *uuid.UUID `json:"default_tax_rate_id,omitempty"`
+	Settings           []byte     `json:"settings,omitempty"`
+	IsActive           bool       `json:"is_active"`
+}
+
+func (h *TaxHandler) CreateTaxProfile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:profile:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createTaxProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	profile := &tax.TaxProfile{
+		TaxProfileID:       uuid.New(),
+		CompanyID:          companyID,
+		TaxRegime:          req.TaxRegime,
+		Jurisdiction:       req.Jurisdiction,
+		RegistrationNumber: req.RegistrationNumber,
+		DefaultTaxRateID:   req.DefaultTaxRateID,
+		Settings:           req.Settings,
+		IsActive:           req.IsActive,
+		CreatedBy:          &userID,
+		UpdatedBy:          &userID,
+	}
+
+	if err := h.taxSvc.CreateTaxProfile(ctx, profile); err != nil {
+		h.logger.Error("failed to create tax profile", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    profile,
+		"message": "Tax profile created successfully",
+	})
+}
+
+type updateTaxProfileRequest struct {
+	TaxRegime          *string    `json:"tax_regime,omitempty"`
+	Jurisdiction       *string    `json:"jurisdiction,omitempty"`
+	RegistrationNumber *string    `json:"registration_number,omitempty"`
+	DefaultTaxRateID   *uuid.UUID `json:"default_tax_rate_id,omitempty"`
+	Settings           []byte     `json:"settings,omitempty"`
+	IsActive           *bool      `json:"is_active,omitempty"`
+}
+
+func (h *TaxHandler) UpdateTaxProfile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax profile ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:profile:update") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	profiles, err := h.taxSvc.ListTaxProfiles(ctx, companyID)
+	if err != nil {
+		h.respondWithError(w, http.StatusInternalServerError, "failed to fetch profile")
+		return
+	}
+	var profile *tax.TaxProfile
+	for _, p := range profiles {
+		if p.TaxProfileID == profileID {
+			profile = p
+			break
+		}
+	}
+	if profile == nil {
+		h.respondWithError(w, http.StatusNotFound, "tax profile not found")
+		return
+	}
+
+	var req updateTaxProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.TaxRegime != nil {
+		profile.TaxRegime = *req.TaxRegime
+	}
+	if req.Jurisdiction != nil {
+		profile.Jurisdiction = *req.Jurisdiction
+	}
+	if req.RegistrationNumber != nil {
+		profile.RegistrationNumber = req.RegistrationNumber
+	}
+	if req.DefaultTaxRateID != nil {
+		profile.DefaultTaxRateID = req.DefaultTaxRateID
+	}
+	if req.Settings != nil {
+		profile.Settings = req.Settings
+	}
+	if req.IsActive != nil {
+		profile.IsActive = *req.IsActive
+	}
+	profile.UpdatedBy = &userID
+
+	if err := h.taxSvc.UpdateTaxProfile(ctx, profile); err != nil {
+		h.logger.Error("failed to update tax profile", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    profile,
+		"message": "Tax profile updated successfully",
+	})
+}
+
+func (h *TaxHandler) ListTaxProfiles(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:profile:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	profiles, err := h.taxSvc.ListTaxProfiles(ctx, companyID)
+	if err != nil {
+		h.logger.Error("failed to list tax profiles", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve tax profiles")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    profiles,
+	})
+}
+
+func (h *TaxHandler) SetDefaultTaxProfile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax profile ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:profile:set_default") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.taxSvc.SetDefaultTaxProfile(ctx, companyID, profileID); err != nil {
+		h.logger.Error("failed to set default tax profile", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Default tax profile set successfully",
+	})
+}
+
+func (h *TaxHandler) DeleteTaxProfile(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid tax profile ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:profile:delete") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.taxSvc.DeleteTaxProfile(ctx, profileID, &userID); err != nil {
+		h.logger.Error("failed to delete tax profile", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Tax profile deleted successfully",
+	})
+}
+
+// ---------------------------------------------------------------------
+// Tax Transactions
+// ---------------------------------------------------------------------
+
+type createTaxTransactionRequest struct {
+	TransactionType    string          `json:"transaction_type"`
+	TransactionID      uuid.UUID       `json:"transaction_id"`
+	TaxRuleID          *uuid.UUID      `json:"tax_rule_id,omitempty"`
+	TaxRateID          *uuid.UUID      `json:"tax_rate_id,omitempty"`
+	TaxableAmount      decimal.Decimal `json:"taxable_amount"`
+	TaxAmount          decimal.Decimal `json:"tax_amount"`
+	Currency           string          `json:"currency"`
+	ExchangeRate       decimal.Decimal `json:"exchange_rate"`
+	BaseCurrencyAmount decimal.Decimal `json:"base_currency_amount"`
+	TransactionDate    time.Time       `json:"transaction_date"`
+}
+
+func (h *TaxHandler) CreateTaxTransaction(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:transaction:create") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req createTaxTransactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	svcReq := service.CreateTaxTransactionRequest{
+		CompanyID:          companyID,
+		TransactionType:    req.TransactionType,
+		TransactionID:      req.TransactionID,
+		TaxRuleID:          req.TaxRuleID,
+		TaxRateID:          req.TaxRateID,
+		TaxableAmount:      req.TaxableAmount,
+		TaxAmount:          req.TaxAmount,
+		Currency:           req.Currency,
+		ExchangeRate:       req.ExchangeRate,
+		BaseCurrencyAmount: req.BaseCurrencyAmount,
+		TransactionDate:    req.TransactionDate,
+	}
+
+	tx, err := h.taxSvc.CreateTaxTransaction(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to create tax transaction", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    tx,
+		"message": "Tax transaction created successfully",
+	})
+}
+
+func (h *TaxHandler) GetTransactionTaxBreakdown(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	transactionType := chi.URLParam(r, "transactionType")
+	transactionIDStr := chi.URLParam(r, "transactionID")
+	transactionID, err := uuid.Parse(transactionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid transaction ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:transaction:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	transactions, err := h.taxSvc.GetTransactionTaxBreakdown(ctx, transactionType, transactionID)
+	if err != nil {
+		h.logger.Error("failed to get tax breakdown", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve tax breakdown")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    transactions,
+	})
+}
+
+func (h *TaxHandler) VoidTaxTransaction(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	transactionType := chi.URLParam(r, "transactionType")
+	transactionIDStr := chi.URLParam(r, "transactionID")
+	transactionID, err := uuid.Parse(transactionIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid transaction ID")
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:transaction:void") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.taxSvc.VoidTaxTransaction(ctx, transactionType, transactionID, req.Reason); err != nil {
+		h.logger.Error("failed to void tax transaction", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Tax transaction voided successfully",
+	})
+}
+
+// ---------------------------------------------------------------------
+// Tax Computation
+// ---------------------------------------------------------------------
+
+type computeTaxRequest struct {
+	Amount          decimal.Decimal        `json:"amount"`
+	Currency        string                 `json:"currency"`
+	TransactionType string                 `json:"transaction_type"`
+	ProductType     string                 `json:"product_type"`
+	CustomerType    string                 `json:"customer_type"`
+	Jurisdiction    string                 `json:"jurisdiction"`
+	Date            time.Time              `json:"date"`
+	Metadata        map[string]interface{} `json:"metadata,omitempty"`
+}
+
+func (h *TaxHandler) ComputeTax(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:compute") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req computeTaxRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	input := service.TaxComputationInput{
+		Amount:          req.Amount,
+		Currency:        req.Currency,
+		TransactionType: req.TransactionType,
+		ProductType:     req.ProductType,
+		CustomerType:    req.CustomerType,
+		Jurisdiction:    req.Jurisdiction,
+		Date:            req.Date,
+		Metadata:        req.Metadata,
+	}
+
+	result, err := h.taxSvc.ComputeTaxBreakdown(ctx, companyID, input)
+	if err != nil {
+		h.logger.Error("failed to compute tax", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    result,
+	})
+}
+
+type evaluateRulesRequest struct {
+	AppliesTo string                 `json:"applies_to"`
+	Data      map[string]interface{} `json:"data"`
+}
+
+func (h *TaxHandler) EvaluateRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:evaluate") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req evaluateRulesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	results, err := h.taxSvc.EvaluateRules(ctx, companyID, req.AppliesTo, req.Data)
+	if err != nil {
+		h.logger.Error("failed to evaluate rules", zap.Error(err))
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    results,
+	})
+}
+
+// ---------------------------------------------------------------------
+// Tax Return / Summary
+// ---------------------------------------------------------------------
+
+func (h *TaxHandler) GenerateTaxReturn(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:return:generate") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+	if fromStr == "" || toStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "from and to query parameters are required")
+		return
+	}
+	from, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid from date format (use YYYY-MM-DD)")
+		return
+	}
+	to, err := time.Parse("2006-01-02", toStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid to date format (use YYYY-MM-DD)")
+		return
+	}
+
+	taxReturn, err := h.taxSvc.GenerateTaxReturn(ctx, companyID, from, to)
+	if err != nil {
+		h.logger.Error("failed to generate tax return", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to generate tax return")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    taxReturn,
+	})
+}
+
+func (h *TaxHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "tax:summary:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+	if fromStr == "" || toStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "from and to query parameters are required")
+		return
+	}
+	from, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid from date format (use YYYY-MM-DD)")
+		return
+	}
+	to, err := time.Parse("2006-01-02", toStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid to date format (use YYYY-MM-DD)")
+		return
+	}
+
+	summary, err := h.taxSvc.GetTaxSummary(ctx, companyID, from, to)
+	if err != nil {
+		h.logger.Error("failed to get tax summary", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve tax summary")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    summary,
+	})
+}
+
+// ---------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------
+
+func parseCompanyID(r *http.Request) (uuid.UUID, error) {
+	companyIDStr := chi.URLParam(r, "companyID")
+	return uuid.Parse(companyIDStr)
+}
+
+func parsePagination(query map[string][]string) repository.Pagination {
+	limit := 10
+	if l, err := strconv.Atoi(getQueryParam(query, "limit")); err == nil && l > 0 {
+		limit = l
+	}
+	offset := 0
+	if o, err := strconv.Atoi(getQueryParam(query, "offset")); err == nil && o >= 0 {
+		offset = o
+	}
+	return repository.Pagination{Limit: limit, Offset: offset}
+}
+
+func parseSort(query map[string][]string) repository.Sort {
+	field := getQueryParam(query, "sort_field")
+	if field == "" {
+		field = "created_at"
+	}
+	direction := getQueryParam(query, "sort_order")
+	if direction == "" {
+		direction = "desc"
+	}
+	return repository.Sort{Field: field, Direction: direction}
+}
+
+func getQueryParam(query map[string][]string, key string) string {
+	if vals, ok := query[key]; ok && len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+func (h *TaxHandler) hasPermission(ctx context.Context, companyID, userID uuid.UUID, permission string) bool {
+	// TODO: integrate real RBAC
+	return true
+}
+
+func (h *TaxHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		h.logger.Error("failed to encode JSON response", zap.Error(err))
+	}
+}
+
+func (h *TaxHandler) respondWithError(w http.ResponseWriter, status int, message string) {
+	h.respondWithJSON(w, status, map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
+

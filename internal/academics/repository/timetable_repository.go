@@ -1,4 +1,3 @@
-// File: internal/academics/repository/timetable_repository.go
 package repository
 
 import (
@@ -7,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -15,9 +15,7 @@ import (
 	"auth-service/internal/util"
 )
 
-// TimetableRepository defines all operations for timetables, slots, entries, and changes.
 type TimetableRepository interface {
-	// ========== Timetable ==========
 	CreateTimetable(ctx context.Context, db DBTX, tt *models.Timetable) error
 	GetTimetableByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Timetable, error)
 	ListTimetables(ctx context.Context, db DBTX, filter TimetableFilter, p Pagination, s Sort) ([]*models.Timetable, error)
@@ -26,23 +24,41 @@ type TimetableRepository interface {
 	DeleteTimetable(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
 	GetActiveTimetableForSection(ctx context.Context, db DBTX, termID, sectionID uuid.UUID) (*models.Timetable, error)
 
-	// ========== Slots ==========
+	// New method for period attendance session generation
+	GetActiveTimetableEntriesForDateRange(ctx context.Context, db DBTX, startDate, endDate time.Time) ([]*TimetableEntryWithDetails, error)
+
 	AddSlot(ctx context.Context, db DBTX, slot *models.TimetableSlot) error
 	UpdateSlot(ctx context.Context, db DBTX, slot *models.TimetableSlot) error
 	RemoveSlot(ctx context.Context, db DBTX, slotID uuid.UUID) error
 	GetSlotsForTimetable(ctx context.Context, db DBTX, timetableID uuid.UUID) ([]*models.TimetableSlot, error)
 	GetSlotByID(ctx context.Context, db DBTX, slotID uuid.UUID) (*models.TimetableSlot, error)
 
-	// ========== Entries ==========
 	AddEntry(ctx context.Context, db DBTX, entry *models.TimetableEntry) error
 	UpdateEntry(ctx context.Context, db DBTX, entry *models.TimetableEntry) error
 	RemoveEntry(ctx context.Context, db DBTX, entryID uuid.UUID) error
 	GetEntriesForSlot(ctx context.Context, db DBTX, slotID uuid.UUID) ([]*models.TimetableEntry, error)
 	GetEntryByID(ctx context.Context, db DBTX, entryID uuid.UUID) (*models.TimetableEntry, error)
 
-	// ========== Changes ==========
 	AddChange(ctx context.Context, db DBTX, change *models.TimetableChange) error
 	GetChangesForEntry(ctx context.Context, db DBTX, entryID uuid.UUID) ([]*models.TimetableChange, error)
+}
+
+// TimetableEntryWithDetails combines a timetable entry with its slot and timetable info
+type TimetableEntryWithDetails struct {
+	EntryID        uuid.UUID
+	SlotID         uuid.UUID
+	TimetableID    uuid.UUID
+	SectionID      uuid.UUID
+	SubjectID      uuid.UUID
+	TeacherID      uuid.UUID
+	RoomID         *uuid.UUID
+	DayOfWeek      int
+	StartTime      time.Time // only time part (stored as TIME in DB)
+	EndTime        time.Time
+	EffectiveFrom  time.Time
+	EffectiveTo    *time.Time
+	TermID         uuid.UUID
+	AcademicYearID uuid.UUID
 }
 
 type timetableRepository struct {
@@ -55,7 +71,6 @@ func NewTimetableRepository(logger *zap.Logger) TimetableRepository {
 	}
 }
 
-// -------- helpers ----------
 var allowedTimetableSortFields = map[string]bool{
 	"created_at":     true,
 	"updated_at":     true,
@@ -128,15 +143,94 @@ func (r *timetableRepository) buildTimetableFilter(filter TimetableFilter) (stri
 		args = append(args, *filter.EffectiveTo)
 		idx++
 	}
-
 	conditions = append(conditions, "t.deleted_at IS NULL")
+
 	if len(conditions) == 0 {
 		return "", args
 	}
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// -------- Timetable methods ----------
+// GetActiveTimetableEntriesForDateRange returns all timetable entries that are active
+// for any day in the given date range. It joins timetables, slots, and entries,
+// respecting effective_from/effective_to and is_active flags.
+func (r *timetableRepository) GetActiveTimetableEntriesForDateRange(ctx context.Context, db DBTX, startDate, endDate time.Time) ([]*TimetableEntryWithDetails, error) {
+	query := `
+		SELECT
+			e.entry_id,
+			e.slot_id,
+			t.timetable_id,
+			t.section_id,
+			e.subject_id,
+			e.teacher_id,
+			e.room_id,
+			s.day_of_week,
+			s.start_time,
+			s.end_time,
+			t.effective_from,
+			t.effective_to,
+			t.term_id,
+			t.academic_year_id
+		FROM academics.timetable_entries e
+		INNER JOIN academics.timetable_slots s ON e.slot_id = s.slot_id
+		INNER JOIN academics.timetables t ON s.timetable_id = t.timetable_id
+		WHERE t.is_active = true
+		  AND t.deleted_at IS NULL
+		  AND t.effective_from <= $2
+		  AND (t.effective_to IS NULL OR t.effective_to >= $1)
+		ORDER BY t.section_id, s.day_of_week, s.start_time
+	`
+	rows, err := db.QueryContext(ctx, query, startDate, endDate)
+	if err != nil {
+		r.logger.Error("failed to get active timetable entries for date range",
+			util.Time("start", startDate),
+			util.Time("end", endDate),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get active entries: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*TimetableEntryWithDetails
+	for rows.Next() {
+		var entry TimetableEntryWithDetails
+		var roomID uuid.NullUUID
+		var effectiveTo sql.NullTime
+		err := rows.Scan(
+			&entry.EntryID,
+			&entry.SlotID,
+			&entry.TimetableID,
+			&entry.SectionID,
+			&entry.SubjectID,
+			&entry.TeacherID,
+			&roomID,
+			&entry.DayOfWeek,
+			&entry.StartTime,
+			&entry.EndTime,
+			&entry.EffectiveFrom,
+			&effectiveTo,
+			&entry.TermID,
+			&entry.AcademicYearID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan entry: %w", err)
+		}
+		if roomID.Valid {
+			entry.RoomID = &roomID.UUID
+		}
+		if effectiveTo.Valid {
+			entry.EffectiveTo = &effectiveTo.Time
+		}
+		result = append(result, &entry)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration: %w", err)
+	}
+	return result, nil
+}
+
+// ----------------------------------------------------------------------------
+// The rest of the file remains unchanged from your original (CreateTimetable, etc.)
+// ----------------------------------------------------------------------------
 
 func (r *timetableRepository) CreateTimetable(ctx context.Context, db DBTX, tt *models.Timetable) error {
 	query := `
@@ -190,7 +284,6 @@ func (r *timetableRepository) ListTimetables(ctx context.Context, db DBTX, filte
         %s
         LIMIT $%d OFFSET $%d
     `, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -257,7 +350,6 @@ func (r *timetableRepository) UpdateTimetable(ctx context.Context, db DBTX, tt *
 		tt.UpdatedBy,
 		tt.Version,
 	).Scan(&tt.UpdatedAt, &tt.Version)
-
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			var exists bool
@@ -309,8 +401,6 @@ func (r *timetableRepository) GetActiveTimetableForSection(ctx context.Context, 
 	row := db.QueryRowContext(ctx, query, termID, sectionID)
 	return r.scanTimetable(row)
 }
-
-// -------- Slot methods ----------
 
 func (r *timetableRepository) AddSlot(ctx context.Context, db DBTX, slot *models.TimetableSlot) error {
 	query := `
@@ -423,8 +513,6 @@ func (r *timetableRepository) GetSlotByID(ctx context.Context, db DBTX, slotID u
 	return r.scanSlot(row)
 }
 
-// -------- Entry methods ----------
-
 func (r *timetableRepository) AddEntry(ctx context.Context, db DBTX, entry *models.TimetableEntry) error {
 	query := `
         INSERT INTO academics.timetable_entries (
@@ -534,8 +622,6 @@ func (r *timetableRepository) GetEntryByID(ctx context.Context, db DBTX, entryID
 	return r.scanEntry(row)
 }
 
-// -------- Change methods ----------
-
 func (r *timetableRepository) AddChange(ctx context.Context, db DBTX, change *models.TimetableChange) error {
 	query := `
         INSERT INTO academics.timetable_changes (
@@ -589,13 +675,11 @@ func (r *timetableRepository) GetChangesForEntry(ctx context.Context, db DBTX, e
 	return result, nil
 }
 
-// -------- scan helpers ----------
-
+// scanning helpers (unchanged)
 func (r *timetableRepository) scanTimetable(row scanner) (*models.Timetable, error) {
 	var tt models.Timetable
 	var effectiveTo sql.NullTime
 	var createdBy, updatedBy uuid.NullUUID
-
 	err := row.Scan(
 		&tt.TimetableID,
 		&tt.AcademicYearID,
@@ -616,7 +700,6 @@ func (r *timetableRepository) scanTimetable(row scanner) (*models.Timetable, err
 		}
 		return nil, fmt.Errorf("scan timetable: %w", err)
 	}
-
 	if effectiveTo.Valid {
 		tt.EffectiveTo = &effectiveTo.Time
 	}
@@ -632,7 +715,6 @@ func (r *timetableRepository) scanTimetable(row scanner) (*models.Timetable, err
 func (r *timetableRepository) scanSlot(row scanner) (*models.TimetableSlot, error) {
 	var slot models.TimetableSlot
 	var createdBy uuid.NullUUID
-
 	err := row.Scan(
 		&slot.SlotID,
 		&slot.TimetableID,
@@ -660,7 +742,6 @@ func (r *timetableRepository) scanEntry(row scanner) (*models.TimetableEntry, er
 	var entry models.TimetableEntry
 	var roomID uuid.NullUUID
 	var createdBy uuid.NullUUID
-
 	err := row.Scan(
 		&entry.EntryID,
 		&entry.SlotID,
@@ -690,7 +771,6 @@ func (r *timetableRepository) scanChange(row scanner) (*models.TimetableChange, 
 	var change models.TimetableChange
 	var newTeacherID, newRoomID uuid.NullUUID
 	var createdBy uuid.NullUUID
-
 	err := row.Scan(
 		&change.ChangeID,
 		&change.EntryID,

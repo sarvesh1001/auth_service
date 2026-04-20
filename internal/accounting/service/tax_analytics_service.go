@@ -1,0 +1,184 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/accounting/events"
+	"auth-service/internal/accounting/models/analytics"
+	"auth-service/internal/accounting/repository"
+)
+
+type TaxAnalyticsService interface {
+	ProcessTaxEvent(ctx context.Context, eventType string, payload []byte) error
+}
+
+type taxAnalyticsService struct {
+	analyticsRepo repository.AnalyticsRepository
+	db            repository.DBTX
+	logger        *zap.Logger
+}
+
+func NewTaxAnalyticsService(
+	repo repository.AnalyticsRepository,
+	db repository.DBTX,
+	logger *zap.Logger,
+) TaxAnalyticsService {
+	return &taxAnalyticsService{
+		analyticsRepo: repo,
+		db:            db,
+		logger:        logger.Named("tax_analytics"),
+	}
+}
+
+func (s *taxAnalyticsService) ProcessTaxEvent(ctx context.Context, eventType string, payload []byte) error {
+	switch eventType {
+	case events.EventTaxTransactionCreated:
+		return s.handleTaxTransactionCreated(ctx, payload)
+
+	case events.EventTaxRateCreated, events.EventTaxRateUpdated:
+		return s.handleTaxRateChange(ctx, payload)
+
+	case events.EventTaxRuleCreated, events.EventTaxRuleUpdated:
+		return s.handleTaxRuleChange(ctx, payload)
+
+	case events.EventTaxProfileCreated, events.EventTaxProfileUpdated:
+		return s.handleTaxProfileChange(ctx, payload)
+
+	default:
+		s.logger.Debug("ignored tax event", zap.String("event_type", eventType))
+		return nil
+	}
+}
+
+// handleTaxTransactionCreated updates daily tax summaries.
+func (s *taxAnalyticsService) handleTaxTransactionCreated(ctx context.Context, payload []byte) error {
+	var taxPayload events.TaxTransactionPayload
+	if err := json.Unmarshal(payload, &taxPayload); err != nil {
+		return err
+	}
+
+	companyID, err := uuid.Parse(taxPayload.CompanyID)
+	if err != nil {
+		s.logger.Error("invalid company_id", zap.String("company_id", taxPayload.CompanyID), zap.Error(err))
+		return err
+	}
+
+	taxableAmount, err := decimal.NewFromString(taxPayload.TaxableAmount)
+	if err != nil {
+		s.logger.Error("invalid taxable_amount", zap.String("amount", taxPayload.TaxableAmount), zap.Error(err))
+		return err
+	}
+
+	taxAmount, err := decimal.NewFromString(taxPayload.TaxAmount)
+	if err != nil {
+		s.logger.Error("invalid tax_amount", zap.String("amount", taxPayload.TaxAmount), zap.Error(err))
+		return err
+	}
+
+	// TaxTransactionPayload does not contain TaxRateID; set to nil.
+	// If you need the tax rate, extend the payload or fetch from the transaction later.
+	summary := &analytics.TaxSummary{
+		SummaryID:        uuid.New(),
+		CompanyID:        companyID,
+		TaxRateID:        nil,
+		Date:             taxPayload.TransactionDate,
+		TotalTaxable:     taxableAmount,
+		TotalTax:         taxAmount,
+		TransactionCount: 1,
+		CreatedAt:        time.Now(),
+	}
+
+	if err := s.analyticsRepo.UpsertTaxSummary(ctx, s.db, summary); err != nil {
+		s.logger.Error("failed to upsert tax summary", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// handleTaxRateChange invalidates tax summaries affected by a rate change.
+func (s *taxAnalyticsService) handleTaxRateChange(ctx context.Context, payload []byte) error {
+	var ratePayload events.TaxRatePayload
+	if err := json.Unmarshal(payload, &ratePayload); err != nil {
+		return err
+	}
+
+	companyID, err := uuid.Parse(ratePayload.CompanyID)
+	if err != nil {
+		s.logger.Error("invalid company_id in tax rate event", zap.String("company_id", ratePayload.CompanyID), zap.Error(err))
+		return err
+	}
+
+	// Invalidate summaries from the effective_from date onward.
+	fromDate := ratePayload.EffectiveFrom
+	// Note: InvalidateTaxSummaries expects *time.Time; pass pointer and nil for toDate.
+	if err := s.analyticsRepo.InvalidateTaxSummaries(ctx, s.db, companyID, &fromDate, nil); err != nil {
+		s.logger.Error("failed to invalidate tax summaries after rate change",
+			zap.String("company_id", companyID.String()),
+			zap.Time("from_date", fromDate),
+			zap.Error(err))
+		return err
+	}
+
+	s.logger.Info("invalidated tax summaries due to tax rate change",
+		zap.String("rate_id", ratePayload.RateID),
+		zap.String("company_id", companyID.String()),
+		zap.Time("effective_from", fromDate))
+	return nil
+}
+
+// handleTaxRuleChange invalidates tax summaries for periods where the rule applied.
+func (s *taxAnalyticsService) handleTaxRuleChange(ctx context.Context, payload []byte) error {
+	var rulePayload events.TaxRulePayload
+	if err := json.Unmarshal(payload, &rulePayload); err != nil {
+		return err
+	}
+
+	companyID, err := uuid.Parse(rulePayload.CompanyID)
+	if err != nil {
+		s.logger.Error("invalid company_id in tax rule event", zap.String("company_id", rulePayload.CompanyID), zap.Error(err))
+		return err
+	}
+
+	// For simplicity, invalidate the last 30 days.
+	fromDate := time.Now().AddDate(0, 0, -30)
+	if err := s.analyticsRepo.InvalidateTaxSummaries(ctx, s.db, companyID, &fromDate, nil); err != nil {
+		s.logger.Error("failed to invalidate tax summaries after rule change",
+			zap.String("company_id", companyID.String()),
+			zap.Error(err))
+		return err
+	}
+
+	s.logger.Info("invalidated tax summaries due to tax rule change",
+		zap.String("rule_id", rulePayload.RuleID),
+		zap.String("company_id", companyID.String()))
+	return nil
+}
+
+// handleTaxProfileChange may affect default rates or jurisdictions.
+func (s *taxAnalyticsService) handleTaxProfileChange(ctx context.Context, payload []byte) error {
+	var profilePayload events.TaxProfilePayload
+	if err := json.Unmarshal(payload, &profilePayload); err != nil {
+		return err
+	}
+
+	companyID, err := uuid.Parse(profilePayload.CompanyID)
+	if err != nil {
+		s.logger.Error("invalid company_id in tax profile event", zap.String("company_id", profilePayload.CompanyID), zap.Error(err))
+		return err
+	}
+
+	// Profile changes may affect future tax calculations, but historical summaries remain valid.
+	// We do not invalidate past summaries unless the default rate changed.
+	// For simplicity, log only.
+	s.logger.Info("tax profile changed",
+		zap.String("profile_id", profilePayload.ProfileID),
+		zap.String("company_id", companyID.String()),
+		zap.String("regime", profilePayload.TaxRegime))
+	return nil
+}

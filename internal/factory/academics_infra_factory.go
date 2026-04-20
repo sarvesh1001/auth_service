@@ -40,7 +40,7 @@ func (k *kafkaEventPublisher) Publish(ctx context.Context, topic string, key str
 }
 
 // ---------------------------------------------------------------------
-// Interface adapters (retained for compatibility, but only EventPublisher adapter is used)
+// Interface adapters (retained for compatibility)
 // ---------------------------------------------------------------------
 
 type auditLoggerAdapter struct {
@@ -130,6 +130,16 @@ type AcademicsInfraFactory struct {
 	timetableRepo            repository.TimetableRepository
 	transportRepo            repository.TransportRepository
 
+	// New repositories for period attendance & biometric
+	academicSessionRepo   repository.AcademicSessionRepository
+	studentSessionAttRepo repository.StudentSessionAttendanceRepository
+	attendanceSessionRepo repository.AttendanceSessionRepository
+	biometricMappingRepo  repository.StudentBiometricMappingRepository
+
+	// New repositories for student sync
+	studentFaceEmbeddingRepo repository.StudentFaceEmbeddingRepository
+	deviceEmbeddingSyncRepo  repository.DeviceEmbeddingSyncRepository
+
 	// Idempotency & Outbox
 	idempotencyStore         idempotency.Store
 	outboxRepo               outbox.Repository
@@ -162,30 +172,43 @@ type AcademicsInfraFactory struct {
 	assignmentService   academicsvc.AssignmentService
 	feeService          academicsvc.FeeService
 
+	// New services for period attendance, biometric, session generation
+	periodAttendanceService  academicsvc.PeriodAttendanceService
+	biometricService         academicsvc.BiometricService
+	studentBiometricService  academicsvc.StudentBiometricService
+	sessionGenerationService academicsvc.SessionGenerationService
+
+	// New service for student biometric sync
+	studentBiometricSyncService academicsvc.StudentBiometricSyncService
+
 	// Handlers
-	academicYearHandler *handler.AcademicYearHandler
-	sectionHandler      *handler.SectionHandler
-	enrollmentHandler   *handler.EnrollmentHandler
-	guardianHandler     *handler.GuardianHandler
-	examHandler         *handler.ExamHandler
-	notificationHandler *handler.NotificationHandler
-	submissionHandler   *handler.SubmissionHandler
-	teacherHandler      *handler.TeacherHandler
-	transportHandler    *handler.TransportHandler
-	gradingHandler      *handler.GradingHandler
-	courseHandler       *handler.CourseHandler
-	timetableHandler    *handler.TimetableHandler
-	libraryHandler      *handler.LibraryHandler
-	studentHandler      *handler.StudentHandler
-	roomHandler         *handler.RoomHandler
-	subjectHandler      *handler.SubjectHandler
-	feeHandler          *handler.FeeHandler
-	assignmentHandler   *handler.AssignmentHandler
-	attendanceHandler   *handler.AttendanceHandler
-	admissionHandler    *handler.AdmissionHandler
-	termHandler         *handler.TermHandler
-	analyticsHandler    *handler.AnalyticsHandler
-	curriculumHandler   *handler.CurriculumHandler
+	academicYearHandler      *handler.AcademicYearHandler
+	sectionHandler           *handler.SectionHandler
+	enrollmentHandler        *handler.EnrollmentHandler
+	guardianHandler          *handler.GuardianHandler
+	examHandler              *handler.ExamHandler
+	notificationHandler      *handler.NotificationHandler
+	submissionHandler        *handler.SubmissionHandler
+	teacherHandler           *handler.TeacherHandler
+	transportHandler         *handler.TransportHandler
+	gradingHandler           *handler.GradingHandler
+	courseHandler            *handler.CourseHandler
+	timetableHandler         *handler.TimetableHandler
+	libraryHandler           *handler.LibraryHandler
+	studentHandler           *handler.StudentHandler
+	roomHandler              *handler.RoomHandler
+	subjectHandler           *handler.SubjectHandler
+	feeHandler               *handler.FeeHandler
+	assignmentHandler        *handler.AssignmentHandler
+	attendanceHandler        *handler.AttendanceHandler
+	admissionHandler         *handler.AdmissionHandler
+	termHandler              *handler.TermHandler
+	analyticsHandler         *handler.AnalyticsHandler
+	curriculumHandler        *handler.CurriculumHandler
+	sessionGenerationHandler *handler.SessionGenerationHandler
+
+	// New handler for student biometric sync
+	studentBiometricSyncHandler *handler.StudentBiometricSyncHandler
 }
 
 // NewAcademicsInfraFactory constructor
@@ -240,6 +263,12 @@ func NewAcademicsInfraFactory(
 	af.termRepo = repository.NewTermRepository(af.log)
 	af.timetableRepo = repository.NewTimetableRepository(af.log)
 	af.transportRepo = repository.NewTransportRepository(af.log)
+
+	// New repositories
+	af.academicSessionRepo = repository.NewAcademicSessionRepository(af.log)
+	af.studentSessionAttRepo = repository.NewStudentSessionAttendanceRepository(af.log)
+	af.attendanceSessionRepo = repository.NewAttendanceSessionRepository(af.log)
+	af.biometricMappingRepo = repository.NewStudentBiometricMappingRepository(af.log)
 
 	// Outbox
 	if kafkaProducer != nil {
@@ -342,6 +371,33 @@ func (af *AcademicsInfraFactory) IdempotencyStore() idempotency.Store {
 }
 func (af *AcademicsInfraFactory) OutboxRepository() outbox.Repository {
 	return af.outboxRepo
+}
+func (af *AcademicsInfraFactory) AcademicSessionRepo() repository.AcademicSessionRepository {
+	return af.academicSessionRepo
+}
+func (af *AcademicsInfraFactory) StudentSessionAttRepo() repository.StudentSessionAttendanceRepository {
+	return af.studentSessionAttRepo
+}
+func (af *AcademicsInfraFactory) AttendanceSessionRepo() repository.AttendanceSessionRepository {
+	return af.attendanceSessionRepo
+}
+func (af *AcademicsInfraFactory) BiometricMappingRepo() repository.StudentBiometricMappingRepository {
+	return af.biometricMappingRepo
+}
+
+// New repository getters for student sync
+func (af *AcademicsInfraFactory) StudentFaceEmbeddingRepository() repository.StudentFaceEmbeddingRepository {
+	if af.studentFaceEmbeddingRepo == nil {
+		af.studentFaceEmbeddingRepo = repository.NewStudentFaceEmbeddingRepository(af.postgresClient, af.log)
+	}
+	return af.studentFaceEmbeddingRepo
+}
+
+func (af *AcademicsInfraFactory) DeviceEmbeddingSyncRepository() repository.DeviceEmbeddingSyncRepository {
+	if af.deviceEmbeddingSyncRepo == nil {
+		af.deviceEmbeddingSyncRepo = repository.NewDeviceEmbeddingSyncRepository(af.postgresClient, af.log)
+	}
+	return af.deviceEmbeddingSyncRepo
 }
 
 // ================================
@@ -614,7 +670,7 @@ func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService
 		af.timetableService = academicsvc.NewTimetableService(
 			af.TimetableRepo(),
 			af.SectionRepo(),
-			af.CourseRepo(), // ✅ Added CourseRepository
+			af.CourseRepo(),
 			af.SubjectRepo(),
 			af.TeacherRepo(),
 			af.RoomRepo(),
@@ -624,10 +680,12 @@ func (af *AcademicsInfraFactory) TimetableService() academicsvc.TimetableService
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
+			af.AcademicSessionRepo(), // ✅ added missing argument
 		)
 	}
 	return af.timetableService
 }
+
 func (af *AcademicsInfraFactory) CourseService() academicsvc.CourseService {
 	if af.courseService == nil {
 		af.courseService = academicsvc.NewCourseService(
@@ -701,6 +759,10 @@ func (af *AcademicsInfraFactory) AttendanceService() academicsvc.AttendanceServi
 			af.idempotencyStore,
 			af.auditService,
 			af.outboxRepo,
+			af.AcademicSessionRepo(),
+			af.StudentSessionAttRepo(),
+			af.AttendanceSessionRepo(),
+			af.BiometricMappingRepo(),
 		)
 	}
 	return af.attendanceService
@@ -717,7 +779,7 @@ func (af *AcademicsInfraFactory) AssignmentService() academicsvc.AssignmentServi
 			af.postgresClient,
 			af.log,
 			af.NotificationService(),
-			&eventPublisherAdapter{pub: af.eventPublisher}, // EventPublisher
+			&eventPublisherAdapter{pub: af.eventPublisher},
 			af.idempotencyStore,
 			af.auditService,
 			af.outboxRepo,
@@ -745,7 +807,93 @@ func (af *AcademicsInfraFactory) FeeService() academicsvc.FeeService {
 }
 
 // ================================
-// Handler Getters (unchanged)
+// New Service Getters (period attendance, biometric, session generation)
+// ================================
+
+func (af *AcademicsInfraFactory) PeriodAttendanceService() academicsvc.PeriodAttendanceService {
+	if af.periodAttendanceService == nil {
+		af.periodAttendanceService = academicsvc.NewPeriodAttendanceService(
+			af.AcademicSessionRepo(),
+			af.StudentSessionAttRepo(),
+			af.AttendanceSessionRepo(),
+			af.EnrollmentRepo(),
+			af.SectionRepo(),
+			af.TeacherRepo(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
+			af.postgresClient,
+			af.log,
+		)
+	}
+	return af.periodAttendanceService
+}
+
+func (af *AcademicsInfraFactory) BiometricService() academicsvc.BiometricService {
+	if af.biometricService == nil {
+		af.biometricService = academicsvc.NewBiometricService(
+			af.BiometricMappingRepo(),
+			af.AcademicSessionRepo(),
+			af.EnrollmentRepo(),
+			af.PeriodAttendanceService(),
+			af.AttendanceService(), // ✅ added – full‑day attendance service
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
+			af.postgresClient,
+			af.log,
+		)
+	}
+	return af.biometricService
+}
+
+func (af *AcademicsInfraFactory) StudentBiometricService() academicsvc.StudentBiometricService {
+	if af.studentBiometricService == nil {
+		af.studentBiometricService = academicsvc.NewStudentBiometricService(
+			af.BiometricMappingRepo(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
+			af.postgresClient,
+			af.log,
+		)
+	}
+	return af.studentBiometricService
+}
+
+func (af *AcademicsInfraFactory) SessionGenerationService() academicsvc.SessionGenerationService {
+	if af.sessionGenerationService == nil {
+		af.sessionGenerationService = academicsvc.NewSessionGenerationService(
+			af.TimetableService(),
+			af.idempotencyStore,
+			af.auditService,
+			af.outboxRepo,
+			af.postgresClient,
+			af.log,
+		)
+	}
+	return af.sessionGenerationService
+}
+
+// New service getter for student biometric sync
+func (af *AcademicsInfraFactory) StudentBiometricSyncService() academicsvc.StudentBiometricSyncService {
+	if af.studentBiometricSyncService == nil {
+		af.studentBiometricSyncService = academicsvc.NewStudentBiometricSyncService(
+			af.StudentFaceEmbeddingRepository(),
+			af.DeviceEmbeddingSyncRepository(),
+			af.postgresClient,
+			af.log,
+			af.idempotencyStore,
+			af.outboxRepo,
+			af.auditService,
+			af.NotificationService(), // or a dedicated device notification service
+		)
+	}
+	return af.studentBiometricSyncService
+}
+
+// ================================
+// Handler Getters
 // ================================
 
 func (af *AcademicsInfraFactory) AcademicYearHandler() *handler.AcademicYearHandler {
@@ -881,7 +1029,13 @@ func (af *AcademicsInfraFactory) AssignmentHandler() *handler.AssignmentHandler 
 
 func (af *AcademicsInfraFactory) AttendanceHandler() *handler.AttendanceHandler {
 	if af.attendanceHandler == nil {
-		af.attendanceHandler = handler.NewAttendanceHandler(af.AttendanceService(), af.log)
+		af.attendanceHandler = handler.NewAttendanceHandler(
+			af.AttendanceService(),
+			af.PeriodAttendanceService(),
+			af.BiometricService(),
+			af.StudentBiometricService(),
+			af.log,
+		)
 	}
 	return af.attendanceHandler
 }
@@ -912,6 +1066,27 @@ func (af *AcademicsInfraFactory) CurriculumHandler() *handler.CurriculumHandler 
 		af.curriculumHandler = handler.NewCurriculumHandler(af.CurriculumService(), af.log)
 	}
 	return af.curriculumHandler
+}
+
+func (af *AcademicsInfraFactory) SessionGenerationHandler() *handler.SessionGenerationHandler {
+	if af.sessionGenerationHandler == nil {
+		af.sessionGenerationHandler = handler.NewSessionGenerationHandler(
+			af.SessionGenerationService(),
+			af.log,
+		)
+	}
+	return af.sessionGenerationHandler
+}
+
+// New handler getter for student biometric sync
+func (af *AcademicsInfraFactory) StudentBiometricSyncHandler() *handler.StudentBiometricSyncHandler {
+	if af.studentBiometricSyncHandler == nil {
+		af.studentBiometricSyncHandler = handler.NewStudentBiometricSyncHandler(
+			af.StudentBiometricSyncService(),
+			af.log,
+		)
+	}
+	return af.studentBiometricSyncHandler
 }
 
 // ================================
@@ -946,6 +1121,9 @@ func (af *AcademicsInfraFactory) RegisterRoutes(r chi.Router, jwtService *mainse
 		af.TermHandler(),
 		af.TimetableHandler(),
 		af.TransportHandler(),
+		af.SessionGenerationHandler(),
+		af.StudentBiometricSyncHandler(), // <-- ADD THIS LINE
+		// ✅ added
 	)
 }
 

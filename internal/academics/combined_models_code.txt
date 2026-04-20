@@ -661,7 +661,7 @@ type AssignmentSubmission struct {
 	GradedAt       *time.Time       `json:"graded_at,omitempty"`
 	CreatedAt      time.Time        `json:"created_at"`
 	UpdatedAt      time.Time        `json:"updated_at"`
-	CreatedBy      *uuid.UUID       `json:"created_by,omitempty"`
+	// CreatedBy removed – student is identified via student_id
 }
 
 
@@ -805,6 +805,7 @@ type Notification struct {
 FILE: ./models/attendance.go
 ================================================================================
 
+// models/attendance.go
 package models
 
 import (
@@ -824,6 +825,16 @@ const (
 	StatusExempted AttendanceStatus = "exempted"
 )
 
+// AttendanceSourceType defines how the attendance was marked
+type AttendanceSourceType string
+
+const (
+	SourceWeb       AttendanceSourceType = "web"
+	SourceBiometric AttendanceSourceType = "biometric"
+	SourceManual    AttendanceSourceType = "manual"
+	SourceClassroom AttendanceSourceType = "classroom"
+)
+
 func IsValidAttendanceStatus(s string) bool {
 	switch AttendanceStatus(s) {
 	case StatusPresent, StatusAbsent, StatusLate, StatusHalfDay, StatusHoliday, StatusExempted:
@@ -835,15 +846,17 @@ func IsValidAttendanceStatus(s string) bool {
 
 // StudentAttendance represents daily attendance record for a student in a section.
 type StudentAttendance struct {
-	AttendanceID   uuid.UUID        `json:"attendance_id"`
-	EnrollmentID   uuid.UUID        `json:"enrollment_id"`
-	AttendanceDate time.Time        `json:"attendance_date"`
-	Status         AttendanceStatus `json:"status"`
-	MarkedBy       *uuid.UUID       `json:"marked_by,omitempty"`
-	Remarks        string           `json:"remarks,omitempty"`
-	CreatedAt      time.Time        `json:"created_at"`
-	UpdatedAt      time.Time        `json:"updated_at"`
-	CreatedBy      *uuid.UUID       `json:"created_by,omitempty"`
+	AttendanceID   uuid.UUID             `json:"attendance_id"`
+	EnrollmentID   uuid.UUID             `json:"enrollment_id"`
+	AttendanceDate time.Time             `json:"attendance_date"`
+	Status         AttendanceStatus      `json:"status"`
+	MarkedBy       *uuid.UUID            `json:"marked_by,omitempty"`
+	Remarks        string                `json:"remarks,omitempty"`
+	SourceType     *AttendanceSourceType `json:"source_type,omitempty"` // web, biometric, manual, classroom
+	DeviceID       *string               `json:"device_id,omitempty"`   // device identifier
+	CreatedAt      time.Time             `json:"created_at"`
+	UpdatedAt      time.Time             `json:"updated_at"`
+	CreatedBy      *uuid.UUID            `json:"created_by,omitempty"`
 }
 
 // StudentAttendanceSummary represents aggregated attendance summary.
@@ -919,6 +932,46 @@ type LibraryIssue struct {
 	CreatedAt    time.Time   `json:"created_at"`
 	UpdatedAt    time.Time   `json:"updated_at"`
 	CreatedBy    *uuid.UUID  `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_session_attendance.go
+================================================================================
+
+// models/student_session_attendance.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type SessionAttendanceStatus string
+
+const (
+	SessionPresent SessionAttendanceStatus = "present"
+	SessionAbsent  SessionAttendanceStatus = "absent"
+	SessionLate    SessionAttendanceStatus = "late"
+	SessionExcused SessionAttendanceStatus = "excused"
+)
+
+// StudentSessionAttendance represents period-wise attendance per student.
+type StudentSessionAttendance struct {
+	AttendanceID uuid.UUID               `json:"attendance_id"`
+	SessionID    uuid.UUID               `json:"session_id"`
+	EnrollmentID uuid.UUID               `json:"enrollment_id"`
+	Status       SessionAttendanceStatus `json:"status"`
+	MarkedAt     time.Time               `json:"marked_at"`
+	MarkedBy     *uuid.UUID              `json:"marked_by,omitempty"`
+	SourceType   AttendanceSourceType    `json:"source_type"` // web, biometric, manual, classroom
+	DeviceID     *string                 `json:"device_id,omitempty"`
+	IsAuto       bool                    `json:"is_auto"` // true = biometric auto-mark
+	Remarks      string                  `json:"remarks,omitempty"`
+	CreatedAt    time.Time               `json:"created_at"`
+	UpdatedAt    time.Time               `json:"updated_at"`
 }
 
 
@@ -1189,6 +1242,49 @@ type Assignment struct {
 
 
 ================================================================================
+FILE: ./models/academic_session.go
+================================================================================
+
+// models/academic_session.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AcademicSessionStatus string
+
+const (
+	SessionScheduled AcademicSessionStatus = "scheduled"
+	SessionOngoing   AcademicSessionStatus = "ongoing"
+	SessionCompleted AcademicSessionStatus = "completed"
+	SessionCancelled AcademicSessionStatus = "cancelled"
+)
+
+// AcademicSession represents one real class instance generated from timetable.
+type AcademicSession struct {
+	SessionID        uuid.UUID             `json:"session_id"`
+	TimetableEntryID uuid.UUID             `json:"timetable_entry_id"`
+	SessionDate      time.Time             `json:"session_date"`
+	StartTime        time.Time             `json:"start_time"` // TIME stored as timestamp (date part ignored)
+	EndTime          time.Time             `json:"end_time"`   // TIME stored as timestamp
+	TeacherID        *uuid.UUID            `json:"teacher_id,omitempty"`
+	RoomID           *uuid.UUID            `json:"room_id,omitempty"`
+	Status           AcademicSessionStatus `json:"status"`
+	SectionID        uuid.UUID             `json:"section_id"`
+	SubjectID        uuid.UUID             `json:"subject_id"`
+	SlotID           uuid.UUID             `json:"slot_id"`
+	CreatedAt        time.Time             `json:"created_at"`
+	UpdatedAt        time.Time             `json:"updated_at"`
+	CreatedBy        *uuid.UUID            `json:"created_by,omitempty"`
+	UpdatedBy        *uuid.UUID            `json:"updated_by,omitempty"`
+}
+
+
+
+================================================================================
 FILE: ./models/teacher_schedule_preference.go
 ================================================================================
 
@@ -1227,14 +1323,41 @@ import (
 )
 
 type AssignmentGrade struct {
-	GradeID      uuid.UUID  `json:"grade_id"`
-	SubmissionID uuid.UUID  `json:"submission_id"`
-	Marks        float64    `json:"marks"`
-	GradedBy     uuid.UUID  `json:"graded_by"`
-	GradedAt     time.Time  `json:"graded_at"`
-	Remarks      string     `json:"remarks,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+	GradeID      uuid.UUID `json:"grade_id"`
+	SubmissionID uuid.UUID `json:"submission_id"`
+	Marks        float64   `json:"marks"`
+	GradedBy     uuid.UUID `json:"graded_by"`
+	GradedAt     time.Time `json:"graded_at"`
+	Remarks      string    `json:"remarks,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	// CreatedBy removed – actor is graded_by
+}
+
+
+
+================================================================================
+FILE: ./models/student_biometric_mapping.go
+================================================================================
+
+// models/student_biometric_mapping.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentBiometricMapping links a student to a biometric device user code.
+type StudentBiometricMapping struct {
+	MappingID      uuid.UUID  `json:"mapping_id"`
+	StudentID      uuid.UUID  `json:"student_id"`
+	CompanyID      uuid.UUID  `json:"company_id"`
+	DeviceID       string     `json:"device_id"` // references public.attendance_devices.device_id
+	DeviceUserCode string     `json:"device_user_code"`
+	IsActive       bool       `json:"is_active"`
+	EnrolledAt     time.Time  `json:"enrolled_at"`
+	EnrolledBy     *uuid.UUID `json:"enrolled_by,omitempty"`
 }
 
 
@@ -1328,6 +1451,37 @@ type ExamResultAudit struct {
 	OldMarks   *float64   `json:"old_marks,omitempty"`
 	NewMarks   *float64   `json:"new_marks,omitempty"`
 	ChangedAt  time.Time  `json:"changed_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/attendance_session.go
+================================================================================
+
+// models/attendance_session.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type AttendanceSessionStatus string
+
+const (
+	AttendanceSessionCompleted AttendanceSessionStatus = "completed"
+)
+
+// AttendanceSession prevents duplicate marking of the same session.
+type AttendanceSession struct {
+	SessionMarkID uuid.UUID               `json:"session_mark_id"`
+	SessionID     uuid.UUID               `json:"session_id"`
+	MarkedBy      *uuid.UUID              `json:"marked_by,omitempty"`
+	SourceType    *AttendanceSourceType   `json:"source_type,omitempty"`
+	Status        AttendanceSessionStatus `json:"status"`
+	CreatedAt     time.Time               `json:"created_at"`
 }
 
 
@@ -1437,12 +1591,12 @@ import (
 )
 
 type AssignmentComment struct {
-	CommentID    uuid.UUID  `json:"comment_id"`
-	SubmissionID uuid.UUID  `json:"submission_id"`
-	CommentBy    uuid.UUID  `json:"comment_by"`
-	Comment      string     `json:"comment"`
-	CreatedAt    time.Time  `json:"created_at"`
-	CreatedBy    *uuid.UUID `json:"created_by,omitempty"`
+	CommentID    uuid.UUID `json:"comment_id"`
+	SubmissionID uuid.UUID `json:"submission_id"`
+	CommentBy    uuid.UUID `json:"comment_by"`
+	Comment      string    `json:"comment"`
+	CreatedAt    time.Time `json:"created_at"`
+	// CreatedBy removed – actor is comment_by
 }
 
 
@@ -1479,6 +1633,35 @@ type NotificationTarget struct {
 	TargetEntityID       uuid.UUID  `json:"target_entity_id"`
 	CreatedAt            time.Time  `json:"created_at"`
 	CreatedBy            *uuid.UUID `json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/student_face_embeddings.go
+================================================================================
+
+// models/student_face_embeddings.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// StudentFaceEmbeddings stores face vectors for students (optional).
+type StudentFaceEmbeddings struct {
+	EmbeddingID     uuid.UUID  `json:"embedding_id"`
+	StudentID       uuid.UUID  `json:"student_id"`
+	CompanyID       uuid.UUID  `json:"company_id"`
+	EmbeddingVector []float64  `json:"embedding_vector"` // stored as DOUBLE PRECISION[]
+	ModelVersion    string     `json:"model_version"`
+	EmbeddingDim    int        `json:"embedding_dim"` // 128 or 512
+	IsActive        bool       `json:"is_active"`
+	CreatedAt       time.Time  `json:"created_at"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 
@@ -1629,6 +1812,24 @@ type StudentAuth struct {
 	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
 	UpdatedBy *uuid.UUID `json:"updated_by,omitempty"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/device_scoped_student_embedding.go
+================================================================================
+
+package models
+
+import "time"
+
+type DeviceScopedStudentEmbedding struct {
+	DeviceUserCode  string    `json:"device_user_code"`
+	EmbeddingVector []float64 `json:"embedding_vector"`
+	EmbeddingDim    int       `json:"embedding_dim"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	IsActive        bool      `json:"is_active"`
 }
 
 
@@ -1861,7 +2062,14 @@ type AcademicYearMetrics struct {
 	ActiveEnrollments      int       `db:"active_enrollments" json:"active_enrollments"`
 	CompletedEnrollments   int       `db:"completed_enrollments" json:"completed_enrollments"`
 	WithdrawnEnrollments   int       `db:"withdrawn_enrollments" json:"withdrawn_enrollments"`
-	LastUpdated            time.Time `db:"last_updated" json:"last_updated"`
+
+	// Period‑attendance (session) metrics
+	TotalSessionsGenerated       int `db:"total_sessions_generated" json:"total_sessions_generated"`
+	TotalPeriodAttendances       int `db:"total_period_attendances" json:"total_period_attendances"`
+	TotalBiometricAttendances    int `db:"total_biometric_attendances" json:"total_biometric_attendances"`
+	TotalManualPeriodAttendances int `db:"total_manual_period_attendances" json:"total_manual_period_attendances"`
+
+	LastUpdated time.Time `db:"last_updated" json:"last_updated"`
 }
 
 type AcademicYearMetricsUpdate struct {
@@ -1889,6 +2097,70 @@ type AcademicYearMetricsUpdate struct {
 	DeltaActiveEnrollments     int
 	DeltaCompletedEnrollments  int
 	DeltaWithdrawnEnrollments  int
+	// Period‑attendance deltas
+	DeltaSessionsGenerated       int
+	DeltaPeriodAttendances       int
+	DeltaBiometricAttendances    int
+	DeltaManualPeriodAttendances int
+}
+
+// -----------------------------------------------------------------------------
+// Student Session Summary (period attendance per student per term/year)
+// -----------------------------------------------------------------------------
+
+type StudentSessionSummary struct {
+	StudentID            uuid.UUID  `db:"student_id" json:"student_id"`
+	AcademicYearID       uuid.UUID  `db:"academic_year_id" json:"academic_year_id"`
+	TermID               *uuid.UUID `db:"term_id" json:"term_id,omitempty"`
+	TotalSessions        int        `db:"total_sessions" json:"total_sessions"`
+	PresentSessions      int        `db:"present_sessions" json:"present_sessions"`
+	AbsentSessions       int        `db:"absent_sessions" json:"absent_sessions"`
+	LateSessions         int        `db:"late_sessions" json:"late_sessions"`
+	ExcusedSessions      int        `db:"excused_sessions" json:"excused_sessions"`
+	AttendancePercentage float64    `db:"attendance_percentage" json:"attendance_percentage"` // generated
+	LastUpdated          time.Time  `db:"last_updated" json:"last_updated"`
+}
+
+// -----------------------------------------------------------------------------
+// Section Session Metrics (daily metrics per section)
+// -----------------------------------------------------------------------------
+
+type SectionSessionMetrics struct {
+	SectionID         uuid.UUID `db:"section_id" json:"section_id"`
+	SessionDate       time.Time `db:"session_date" json:"session_date"`
+	TotalEnrolled     int       `db:"total_enrolled" json:"total_enrolled"`
+	PresentCount      int       `db:"present_count" json:"present_count"`
+	AbsentCount       int       `db:"absent_count" json:"absent_count"`
+	LateCount         int       `db:"late_count" json:"late_count"`
+	MarkedByTeacher   *int      `db:"marked_by_teacher" json:"marked_by_teacher,omitempty"`     // count marked manually
+	MarkedByBiometric *int      `db:"marked_by_biometric" json:"marked_by_biometric,omitempty"` // count auto‑marked
+}
+
+// -----------------------------------------------------------------------------
+// Teacher Session Metrics (teacher performance on marking attendance)
+// -----------------------------------------------------------------------------
+
+type TeacherSessionMetrics struct {
+	TeacherID             uuid.UUID `db:"teacher_id" json:"teacher_id"`
+	AcademicYearID        uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalSessionsTaught   int       `db:"total_sessions_taught" json:"total_sessions_taught"`
+	SessionsMarked        int       `db:"sessions_marked" json:"sessions_marked"`                 // teacher marked at least one student
+	SessionsWithBiometric int       `db:"sessions_with_biometric" json:"sessions_with_biometric"` // biometric used
+	LastUpdated           time.Time `db:"last_updated" json:"last_updated"`
+}
+
+// -----------------------------------------------------------------------------
+// Biometric Device Usage Analytics
+// -----------------------------------------------------------------------------
+
+type BiometricUsageMetrics struct {
+	DeviceID          string    `db:"device_id" json:"device_id"`
+	CompanyID         uuid.UUID `db:"company_id" json:"company_id"`
+	Date              time.Time `db:"date" json:"date"`
+	TotalPunches      int       `db:"total_punches" json:"total_punches"`
+	SuccessfulMatches int       `db:"successful_matches" json:"successful_matches"`
+	FailedMatches     int       `db:"failed_matches" json:"failed_matches"`
+	UniqueStudents    int       `db:"unique_students" json:"unique_students"`
 }
 
 // -----------------------------------------------------------------------------

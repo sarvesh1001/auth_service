@@ -140,13 +140,22 @@ const (
 	EventLibraryFineCreated EventType = "library_fine.created"
 	EventLibraryFinePaid    EventType = "library_fine.paid"
 
-	EventGradingPolicyCreated EventType = "grading_policy.created"
-	EventGradingPolicyUpdated EventType = "grading_policy.updated"
-	EventGradingPolicyDeleted EventType = "grading_policy.deleted"
-	EventGradeBoundaryCreated EventType = "grade_boundary.created"
-	EventGradeBoundaryUpdated EventType = "grade_boundary.updated"
-	EventGradeBoundaryDeleted EventType = "grade_boundary.deleted"
+	EventGradingPolicyCreated   EventType = "grading_policy.created"
+	EventGradingPolicyUpdated   EventType = "grading_policy.updated"
+	EventGradingPolicyDeleted   EventType = "grading_policy.deleted"
+	EventGradeBoundaryCreated   EventType = "grade_boundary.created"
+	EventGradeBoundaryUpdated   EventType = "grade_boundary.updated"
+	EventGradeBoundaryDeleted   EventType = "grade_boundary.deleted"
+	EventPeriodAttendanceMarked           = "period_attendance.marked"
+	EventSessionsGenerated      EventType = "academic_sessions.generated"
+	// Add to existing event.go
 
+	EventBiometricPunchProcessed EventType = "biometric_punch.processed"
+
+	EventBiometricMappingCreated   EventType = "biometric_mapping.created"
+	EventBiometricMappingUpdated   EventType = "biometric_mapping.updated"
+	EventBiometricMappingDeleted   EventType = "biometric_mapping.deleted"
+	EventBiometricMappingActivated EventType = "biometric_mapping.activated"
 	// Transport events
 	EventTransportRouteCreated             EventType = "transport.route.created"
 	EventTransportRouteUpdated             EventType = "transport.route.updated"
@@ -164,6 +173,12 @@ const (
 	EventTransportStudentAssignmentUpdated EventType = "transport.student_assignment.updated"
 	EventTransportStudentAssignmentDeleted EventType = "transport.student_assignment.deleted"
 	// add others as needed
+	EventStudentFaceEmbeddingCreated     EventType = "student_face_embedding.created"
+	EventStudentFaceEmbeddingUpdated     EventType = "student_face_embedding.updated"
+	EventStudentFaceEmbeddingDeleted     EventType = "student_face_embedding.deleted"
+	EventStudentFaceEmbeddingDeactivated EventType = "student_face_embedding.deactivated"
+
+	EventBiometricFullPunchProcessed = "biometric_full_punch.processed"
 )
 
 type Event struct {

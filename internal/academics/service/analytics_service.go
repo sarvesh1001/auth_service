@@ -85,7 +85,10 @@ type AnalyticsService interface {
 	ProcessGradingPolicyDeleted(ctx context.Context, payload []byte) error
 	ProcessGradeBoundaryCreated(ctx context.Context, payload []byte) error
 	ProcessGradeBoundaryDeleted(ctx context.Context, payload []byte) error
-
+	// Period attendance & session generation processors
+	ProcessSessionsGenerated(ctx context.Context, payload []byte) error
+	ProcessPeriodAttendanceMarked(ctx context.Context, payload []byte) error
+	ProcessBiometricPunchProcessed(ctx context.Context, payload []byte) error
 	// New processors for Guardian domain
 	ProcessGuardianCreated(ctx context.Context, payload []byte) error
 	ProcessGuardianUpdated(ctx context.Context, payload []byte) error
@@ -200,6 +203,26 @@ type AnalyticsService interface {
 	ProcessTransportStudentAssignmentCreated(ctx context.Context, payload []byte) error
 	ProcessTransportStudentAssignmentUpdated(ctx context.Context, payload []byte) error
 	ProcessTransportStudentAssignmentDeleted(ctx context.Context, payload []byte) error
+	// StudentSessionSummary
+	GetStudentSessionSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*models.StudentSessionSummary, error)
+	ListStudentSessionSummaries(ctx context.Context, filter StudentSessionSummaryFilter, p repository.Pagination, s repository.Sort) ([]*models.StudentSessionSummary, error)
+	RefreshStudentSessionSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error
+
+	// SectionSessionMetrics
+	GetSectionSessionMetrics(ctx context.Context, sectionID uuid.UUID, sessionDate time.Time) (*models.SectionSessionMetrics, error)
+	ListSectionSessionMetrics(ctx context.Context, filter SectionSessionMetricsFilter, p repository.Pagination, s repository.Sort) ([]*models.SectionSessionMetrics, error)
+	RefreshSectionSessionMetrics(ctx context.Context, sectionID uuid.UUID, sessionDate time.Time) error
+
+	// TeacherSessionMetrics
+	GetTeacherSessionMetrics(ctx context.Context, teacherID, academicYearID uuid.UUID) (*models.TeacherSessionMetrics, error)
+	ListTeacherSessionMetrics(ctx context.Context, filter TeacherSessionMetricsFilter, p repository.Pagination, s repository.Sort) ([]*models.TeacherSessionMetrics, error)
+	RefreshTeacherSessionMetrics(ctx context.Context, teacherID, academicYearID uuid.UUID) error
+
+	// BiometricUsageMetrics
+	GetBiometricUsageMetrics(ctx context.Context, deviceID string, date time.Time) (*models.BiometricUsageMetrics, error)
+	ListBiometricUsageMetrics(ctx context.Context, filter BiometricUsageMetricsFilter, p repository.Pagination, s repository.Sort) ([]*models.BiometricUsageMetrics, error)
+
+	RefreshBiometricUsageMetrics(ctx context.Context, deviceID string, date time.Time) error
 }
 
 type analyticsService struct {
@@ -4347,4 +4370,399 @@ func (s *analyticsService) getStudentAssignmentByID(ctx context.Context, assignm
 		return nil, err
 	}
 	return &sa, nil
+}
+
+// =============================================================================
+// Filter structs for the new metrics
+// =============================================================================
+
+type StudentSessionSummaryFilter struct {
+	StudentID      *uuid.UUID
+	AcademicYearID *uuid.UUID
+	TermID         *uuid.UUID
+}
+
+type SectionSessionMetricsFilter struct {
+	SectionID *uuid.UUID
+	FromDate  *time.Time
+	ToDate    *time.Time
+}
+
+type TeacherSessionMetricsFilter struct {
+	TeacherID      *uuid.UUID
+	AcademicYearID *uuid.UUID
+}
+
+type BiometricUsageMetricsFilter struct {
+	DeviceID  *string
+	CompanyID *uuid.UUID
+	FromDate  *time.Time
+	ToDate    *time.Time
+}
+
+// =============================================================================
+// StudentSessionSummary
+// =============================================================================
+
+func (s *analyticsService) GetStudentSessionSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*models.StudentSessionSummary, error) {
+	return s.repo.GetStudentSessionSummary(ctx, s.pgClient.DB, studentID, academicYearID, termID)
+}
+
+func (s *analyticsService) ListStudentSessionSummaries(ctx context.Context, filter StudentSessionSummaryFilter, p repository.Pagination, sort repository.Sort) ([]*models.StudentSessionSummary, error) {
+	repoFilter := repository.StudentSessionSummaryFilter{
+		StudentID:      filter.StudentID,
+		AcademicYearID: filter.AcademicYearID,
+		TermID:         filter.TermID,
+	}
+	return s.repo.ListStudentSessionSummaries(ctx, s.pgClient.DB, repoFilter, p, sort)
+}
+
+func (s *analyticsService) RefreshStudentSessionSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error {
+	idempotencyKey := fmt.Sprintf("refresh:student_session_summary:%s:%s:%v", studentID.String(), academicYearID.String(), termID)
+	exists, err := s.idempotencyStore.Exists(ctx, nil, idempotencyKey)
+	if err != nil {
+		s.logger.Warn("idempotency check failed", zap.Error(err))
+	}
+	if exists {
+		s.logger.Debug("student session summary refresh already performed", zap.String("key", idempotencyKey))
+		return nil
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.repo.RefreshStudentSessionSummary(ctx, tx, studentID, academicYearID, termID); err != nil {
+		return fmt.Errorf("refresh student session summary: %w", err)
+	}
+
+	if s.auditService != nil {
+		metadata := map[string]interface{}{
+			"student_id":       studentID,
+			"academic_year_id": academicYearID,
+			"term_id":          termID,
+			"operation":        "refresh",
+		}
+		_ = s.auditService.LogAction(ctx, tx, nil, "analytics", "refresh", "student_session_summary",
+			nil, "system", nil, nil, nil, metadata)
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency key", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
+// =============================================================================
+// SectionSessionMetrics
+// =============================================================================
+
+func (s *analyticsService) GetSectionSessionMetrics(ctx context.Context, sectionID uuid.UUID, sessionDate time.Time) (*models.SectionSessionMetrics, error) {
+	return s.repo.GetSectionSessionMetrics(ctx, s.pgClient.DB, sectionID, sessionDate)
+}
+
+func (s *analyticsService) ListSectionSessionMetrics(ctx context.Context, filter SectionSessionMetricsFilter, p repository.Pagination, sort repository.Sort) ([]*models.SectionSessionMetrics, error) {
+	repoFilter := repository.SectionSessionMetricsFilter{
+		SectionID: filter.SectionID,
+		FromDate:  filter.FromDate,
+		ToDate:    filter.ToDate,
+	}
+	return s.repo.ListSectionSessionMetrics(ctx, s.pgClient.DB, repoFilter, p, sort)
+}
+
+func (s *analyticsService) RefreshSectionSessionMetrics(ctx context.Context, sectionID uuid.UUID, sessionDate time.Time) error {
+	idempotencyKey := fmt.Sprintf("refresh:section_session_metrics:%s:%s", sectionID.String(), sessionDate.Format("2006-01-02"))
+	exists, err := s.idempotencyStore.Exists(ctx, nil, idempotencyKey)
+	if err != nil {
+		s.logger.Warn("idempotency check failed", zap.Error(err))
+	}
+	if exists {
+		s.logger.Debug("section session metrics refresh already performed", zap.String("key", idempotencyKey))
+		return nil
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.repo.RefreshSectionSessionMetrics(ctx, tx, sectionID, sessionDate); err != nil {
+		return fmt.Errorf("refresh section session metrics: %w", err)
+	}
+
+	if s.auditService != nil {
+		metadata := map[string]interface{}{
+			"section_id":   sectionID,
+			"session_date": sessionDate,
+			"operation":    "refresh",
+		}
+		_ = s.auditService.LogAction(ctx, tx, nil, "analytics", "refresh", "section_session_metrics",
+			nil, "system", nil, nil, nil, metadata)
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency key", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
+// =============================================================================
+// TeacherSessionMetrics
+// =============================================================================
+
+func (s *analyticsService) GetTeacherSessionMetrics(ctx context.Context, teacherID, academicYearID uuid.UUID) (*models.TeacherSessionMetrics, error) {
+	return s.repo.GetTeacherSessionMetrics(ctx, s.pgClient.DB, teacherID, academicYearID)
+}
+
+func (s *analyticsService) ListTeacherSessionMetrics(ctx context.Context, filter TeacherSessionMetricsFilter, p repository.Pagination, sort repository.Sort) ([]*models.TeacherSessionMetrics, error) {
+	repoFilter := repository.TeacherSessionMetricsFilter{
+		TeacherID:      filter.TeacherID,
+		AcademicYearID: filter.AcademicYearID,
+	}
+	return s.repo.ListTeacherSessionMetrics(ctx, s.pgClient.DB, repoFilter, p, sort)
+}
+
+func (s *analyticsService) RefreshTeacherSessionMetrics(ctx context.Context, teacherID, academicYearID uuid.UUID) error {
+	idempotencyKey := fmt.Sprintf("refresh:teacher_session_metrics:%s:%s", teacherID.String(), academicYearID.String())
+	exists, err := s.idempotencyStore.Exists(ctx, nil, idempotencyKey)
+	if err != nil {
+		s.logger.Warn("idempotency check failed", zap.Error(err))
+	}
+	if exists {
+		s.logger.Debug("teacher session metrics refresh already performed", zap.String("key", idempotencyKey))
+		return nil
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.repo.RefreshTeacherSessionMetrics(ctx, tx, teacherID, academicYearID); err != nil {
+		return fmt.Errorf("refresh teacher session metrics: %w", err)
+	}
+
+	if s.auditService != nil {
+		metadata := map[string]interface{}{
+			"teacher_id":       teacherID,
+			"academic_year_id": academicYearID,
+			"operation":        "refresh",
+		}
+		_ = s.auditService.LogAction(ctx, tx, nil, "analytics", "refresh", "teacher_session_metrics",
+			nil, "system", nil, nil, nil, metadata)
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency key", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
+// =============================================================================
+// BiometricUsageMetrics
+// =============================================================================
+
+func (s *analyticsService) GetBiometricUsageMetrics(ctx context.Context, deviceID string, date time.Time) (*models.BiometricUsageMetrics, error) {
+	return s.repo.GetBiometricUsageMetrics(ctx, s.pgClient.DB, deviceID, date)
+}
+
+func (s *analyticsService) ListBiometricUsageMetrics(ctx context.Context, filter BiometricUsageMetricsFilter, p repository.Pagination, sort repository.Sort) ([]*models.BiometricUsageMetrics, error) {
+	repoFilter := repository.BiometricUsageMetricsFilter{
+		DeviceID:  filter.DeviceID,
+		CompanyID: filter.CompanyID,
+		FromDate:  filter.FromDate,
+		ToDate:    filter.ToDate,
+	}
+	return s.repo.ListBiometricUsageMetrics(ctx, s.pgClient.DB, repoFilter, p, sort)
+}
+
+func (s *analyticsService) RefreshBiometricUsageMetrics(ctx context.Context, deviceID string, date time.Time) error {
+	idempotencyKey := fmt.Sprintf("refresh:biometric_usage:%s:%s", deviceID, date.Format("2006-01-02"))
+	exists, err := s.idempotencyStore.Exists(ctx, nil, idempotencyKey)
+	if err != nil {
+		s.logger.Warn("idempotency check failed", zap.Error(err))
+	}
+	if exists {
+		s.logger.Debug("biometric usage metrics refresh already performed", zap.String("key", idempotencyKey))
+		return nil
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.repo.RefreshBiometricUsageMetrics(ctx, tx, deviceID, date); err != nil {
+		return fmt.Errorf("refresh biometric usage metrics: %w", err)
+	}
+
+	if s.auditService != nil {
+		metadata := map[string]interface{}{
+			"device_id": deviceID,
+			"date":      date,
+			"operation": "refresh",
+		}
+		_ = s.auditService.LogAction(ctx, tx, nil, "analytics", "refresh", "biometric_usage_metrics",
+			nil, "system", nil, nil, nil, metadata)
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency key", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
+// =============================================================================
+// Period attendance & session generation event processors
+// =============================================================================
+
+func (s *analyticsService) ProcessSessionsGenerated(ctx context.Context, payload []byte) error {
+	var data struct {
+		JobID       string    `json:"job_id"`
+		StartDate   time.Time `json:"start_date"`
+		EndDate     time.Time `json:"end_date"`
+		Count       int       `json:"count"`
+		GeneratedAt time.Time `json:"generated_at"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("unmarshal sessions generated: %w", err)
+	}
+
+	// For each academic year that overlaps with the date range, update total_sessions_generated.
+	// Find academic years intersecting [start_date, end_date]
+	rows, err := s.pgClient.DB.QueryContext(ctx, `
+        SELECT academic_year_id FROM academics.academic_year
+        WHERE deleted_at IS NULL
+          AND start_date <= $2 AND end_date >= $1
+    `, data.StartDate, data.EndDate)
+	if err != nil {
+		return fmt.Errorf("query academic years for session generation: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ayID uuid.UUID
+		if err := rows.Scan(&ayID); err != nil {
+			return err
+		}
+		update := &models.AcademicYearMetricsUpdate{
+			AcademicYearID:         ayID,
+			DeltaSessionsGenerated: data.Count,
+		}
+		if err := s.applyAcademicUpdate(ctx, update, "academic_sessions.generated", uuid.Nil); err != nil {
+			s.logger.Error("failed to update academic year metrics for session generation",
+				zap.String("academic_year_id", ayID.String()),
+				zap.Error(err))
+		}
+	}
+	return nil
+}
+
+// ProcessPeriodAttendanceMarked handles period attendance marked events.
+func (s *analyticsService) ProcessPeriodAttendanceMarked(ctx context.Context, payload []byte) error {
+	var att models.StudentSessionAttendance
+	if err := json.Unmarshal(payload, &att); err != nil {
+		return fmt.Errorf("unmarshal period attendance: %w", err)
+	}
+
+	// Determine academic year from session
+	var academicYearID uuid.UUID
+	err := s.pgClient.DB.QueryRowContext(ctx, `
+		SELECT tt.academic_year_id
+		FROM academics.academic_session a
+		JOIN academics.timetable_entries te ON te.entry_id = a.timetable_entry_id
+		JOIN academics.timetable_slots ts ON ts.slot_id = te.slot_id
+		JOIN academics.timetables tt ON tt.timetable_id = ts.timetable_id
+		WHERE a.session_id = $1
+	`, att.SessionID).Scan(&academicYearID)
+	if err != nil {
+		return fmt.Errorf("get academic year for session %s: %w", att.SessionID, err)
+	}
+
+	update := &models.AcademicYearMetricsUpdate{
+		AcademicYearID:         academicYearID,
+		DeltaPeriodAttendances: 1,
+	}
+	if att.SourceType == models.SourceBiometric {
+		update.DeltaBiometricAttendances = 1
+	} else {
+		update.DeltaManualPeriodAttendances = 1
+	}
+	if err := s.applyAcademicUpdate(ctx, update, "period_attendance.marked", att.AttendanceID); err != nil {
+		return err
+	}
+
+	// Asynchronously refresh related session summary tables
+	go func() {
+		ctxBg := context.Background()
+
+		// 1) Refresh student session summary
+		var termID *uuid.UUID
+		if err := s.pgClient.DB.QueryRowContext(ctxBg, `
+			SELECT term_id FROM academics.section WHERE section_id = (
+				SELECT section_id FROM academics.academic_session WHERE session_id = $1
+			)
+		`, att.SessionID).Scan(&termID); err == nil {
+			var enrollment struct {
+				StudentID      uuid.UUID
+				AcademicYearID uuid.UUID
+			}
+			if err := s.pgClient.DB.QueryRowContext(ctxBg, `
+				SELECT student_id, academic_year_id FROM academics.enrollments WHERE enrollment_id = $1
+			`, att.EnrollmentID).Scan(&enrollment.StudentID, &enrollment.AcademicYearID); err == nil {
+				_ = s.RefreshStudentSessionSummary(ctxBg, enrollment.StudentID, enrollment.AcademicYearID, termID)
+			}
+		}
+
+		// 2) Refresh section session metrics for that section and date
+		var sectionID uuid.UUID
+		if err := s.pgClient.DB.QueryRowContext(ctxBg, `
+			SELECT section_id FROM academics.academic_session WHERE session_id = $1
+		`, att.SessionID).Scan(&sectionID); err == nil {
+			var sessionDate time.Time
+			if err := s.pgClient.DB.QueryRowContext(ctxBg, `
+				SELECT session_date FROM academics.academic_session WHERE session_id = $1
+			`, att.SessionID).Scan(&sessionDate); err == nil {
+				_ = s.RefreshSectionSessionMetrics(ctxBg, sectionID, sessionDate)
+			}
+		}
+
+		// 3) Refresh teacher session metrics for the teacher of that session
+		var teacherID uuid.UUID
+		if err := s.pgClient.DB.QueryRowContext(ctxBg, `
+			SELECT teacher_id FROM academics.academic_session WHERE session_id = $1
+		`, att.SessionID).Scan(&teacherID); err == nil {
+			_ = s.RefreshTeacherSessionMetrics(ctxBg, teacherID, academicYearID)
+		}
+	}()
+
+	return nil
+}
+
+func (s *analyticsService) ProcessBiometricPunchProcessed(ctx context.Context, payload []byte) error {
+	// The payload should contain the same structure as a period attendance marked event,
+	// because after processing the punch, a period attendance record is created.
+	// So we can reuse ProcessPeriodAttendanceMarked.
+	return s.ProcessPeriodAttendanceMarked(ctx, payload)
 }

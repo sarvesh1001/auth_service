@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"strconv"
 
+	"auth-service/internal/academics/repository"
+	"auth-service/internal/academics/service"
+	"time"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-
-	"auth-service/internal/academics/service"
 )
 
 // AnalyticsHandler handles HTTP requests for analytics metrics.
@@ -1452,5 +1454,594 @@ func (h *AnalyticsHandler) respondWithError(w http.ResponseWriter, status int, m
 	h.respondWithJSON(w, status, map[string]interface{}{
 		"success": false,
 		"error":   message,
+	})
+}
+
+// ---------------------------------------------------------------------
+// Student Session Summary
+// ---------------------------------------------------------------------
+
+// GetStudentSessionSummary returns session attendance summary for a student.
+// GET /api/v1/companies/{companyID}/academics/analytics/students/{studentID}/session-summary
+func (h *AnalyticsHandler) GetStudentSessionSummary(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	studentID, err := parseUUIDParam(r, "studentID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid student ID")
+		return
+	}
+
+	academicYearID, err := parseUUIDParam(r, "academicYearID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid academic year ID")
+		return
+	}
+
+	var termID *uuid.UUID
+	if termIDStr := r.URL.Query().Get("term_id"); termIDStr != "" {
+		if id, err := uuid.Parse(termIDStr); err == nil {
+			termID = &id
+		}
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	summary, err := h.analyticsService.GetStudentSessionSummary(ctx, studentID, academicYearID, termID)
+	if err != nil {
+		h.logger.Error("failed to get student session summary", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve summary")
+		return
+	}
+	if summary == nil {
+		h.respondWithError(w, http.StatusNotFound, "summary not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    summary,
+	})
+}
+
+// ListStudentSessionSummaries returns paginated student session summaries.
+// GET /api/v1/companies/{companyID}/academics/analytics/students/session-summaries
+func (h *AnalyticsHandler) ListStudentSessionSummaries(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	limit, offset := parsePagination(r)
+	// You can add query filters here if needed
+	filter := service.StudentSessionSummaryFilter{
+		StudentID:      nil,
+		AcademicYearID: nil,
+		TermID:         nil,
+	}
+	pag := repository.Pagination{Limit: limit, Offset: offset}
+	sort := repository.Sort{Field: "last_updated", Direction: "DESC"}
+
+	summaries, err := h.analyticsService.ListStudentSessionSummaries(ctx, filter, pag, sort)
+	if err != nil {
+		h.logger.Error("failed to list student session summaries", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list summaries")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"summaries": summaries,
+			"limit":     limit,
+			"offset":    offset,
+		},
+	})
+}
+
+// RefreshStudentSessionSummary triggers a full refresh of a student's session summary.
+// POST /api/v1/companies/{companyID}/academics/analytics/students/{studentID}/academic-years/{academicYearID}/session-summary/refresh
+func (h *AnalyticsHandler) RefreshStudentSessionSummary(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	studentID, err := parseUUIDParam(r, "studentID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid student ID")
+		return
+	}
+
+	academicYearID, err := parseUUIDParam(r, "academicYearID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid academic year ID")
+		return
+	}
+
+	var termID *uuid.UUID
+	if termIDStr := r.URL.Query().Get("term_id"); termIDStr != "" {
+		if id, err := uuid.Parse(termIDStr); err == nil {
+			termID = &id
+		}
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.analyticsService.RefreshStudentSessionSummary(ctx, studentID, academicYearID, termID); err != nil {
+		h.logger.Error("failed to refresh student session summary", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to refresh summary")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "student session summary refreshed successfully",
+	})
+}
+
+// ---------------------------------------------------------------------
+// Section Session Metrics
+// ---------------------------------------------------------------------
+
+// GetSectionSessionMetrics returns metrics for a section on a specific date.
+// GET /api/v1/companies/{companyID}/academics/analytics/sections/{sectionID}/session-metrics?date=YYYY-MM-DD
+func (h *AnalyticsHandler) GetSectionSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	sectionID, err := parseUUIDParam(r, "sectionID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid section ID")
+		return
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "missing date parameter")
+		return
+	}
+	sessionDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid date format (use YYYY-MM-DD)")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	metrics, err := h.analyticsService.GetSectionSessionMetrics(ctx, sectionID, sessionDate)
+	if err != nil {
+		h.logger.Error("failed to get section session metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve metrics")
+		return
+	}
+	if metrics == nil {
+		h.respondWithError(w, http.StatusNotFound, "metrics not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    metrics,
+	})
+}
+
+// ListSectionSessionMetrics returns paginated section session metrics.
+// GET /api/v1/companies/{companyID}/academics/analytics/sections/session-metrics
+func (h *AnalyticsHandler) ListSectionSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	limit, offset := parsePagination(r)
+	// Optional filters from query parameters
+	filter := service.SectionSessionMetricsFilter{
+		SectionID: nil,
+		FromDate:  nil,
+		ToDate:    nil,
+	}
+	if sectionIDStr := r.URL.Query().Get("section_id"); sectionIDStr != "" {
+		if id, err := uuid.Parse(sectionIDStr); err == nil {
+			filter.SectionID = &id
+		}
+	}
+	if fromStr := r.URL.Query().Get("from_date"); fromStr != "" {
+		if t, err := time.Parse("2006-01-02", fromStr); err == nil {
+			filter.FromDate = &t
+		}
+	}
+	if toStr := r.URL.Query().Get("to_date"); toStr != "" {
+		if t, err := time.Parse("2006-01-02", toStr); err == nil {
+			filter.ToDate = &t
+		}
+	}
+
+	pag := repository.Pagination{Limit: limit, Offset: offset}
+	sort := repository.Sort{Field: "session_date", Direction: "DESC"}
+
+	metricsList, err := h.analyticsService.ListSectionSessionMetrics(ctx, filter, pag, sort)
+	if err != nil {
+		h.logger.Error("failed to list section session metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list metrics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"metrics": metricsList,
+			"limit":   limit,
+			"offset":  offset,
+		},
+	})
+}
+
+// RefreshSectionSessionMetrics triggers a full refresh for a section on a given date.
+// POST /api/v1/companies/{companyID}/academics/analytics/sections/{sectionID}/session-metrics/refresh?date=YYYY-MM-DD
+func (h *AnalyticsHandler) RefreshSectionSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	sectionID, err := parseUUIDParam(r, "sectionID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid section ID")
+		return
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "missing date parameter")
+		return
+	}
+	sessionDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid date format (use YYYY-MM-DD)")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.analyticsService.RefreshSectionSessionMetrics(ctx, sectionID, sessionDate); err != nil {
+		h.logger.Error("failed to refresh section session metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to refresh metrics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "section session metrics refreshed successfully",
+	})
+}
+
+// ---------------------------------------------------------------------
+// Teacher Session Metrics
+// ---------------------------------------------------------------------
+
+// GetTeacherSessionMetrics returns session metrics for a teacher.
+// GET /api/v1/companies/{companyID}/academics/analytics/teachers/{teacherID}/academic-years/{academicYearID}/session-metrics
+func (h *AnalyticsHandler) GetTeacherSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	teacherID, err := parseUUIDParam(r, "teacherID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid teacher ID")
+		return
+	}
+
+	academicYearID, err := parseUUIDParam(r, "academicYearID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid academic year ID")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	metrics, err := h.analyticsService.GetTeacherSessionMetrics(ctx, teacherID, academicYearID)
+	if err != nil {
+		h.logger.Error("failed to get teacher session metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve metrics")
+		return
+	}
+	if metrics == nil {
+		h.respondWithError(w, http.StatusNotFound, "metrics not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    metrics,
+	})
+}
+
+// ListTeacherSessionMetrics returns paginated teacher session metrics.
+// GET /api/v1/companies/{companyID}/academics/analytics/teachers/session-metrics
+func (h *AnalyticsHandler) ListTeacherSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	limit, offset := parsePagination(r)
+	filter := service.TeacherSessionMetricsFilter{
+		TeacherID:      nil,
+		AcademicYearID: nil,
+	}
+	if teacherIDStr := r.URL.Query().Get("teacher_id"); teacherIDStr != "" {
+		if id, err := uuid.Parse(teacherIDStr); err == nil {
+			filter.TeacherID = &id
+		}
+	}
+	if ayIDStr := r.URL.Query().Get("academic_year_id"); ayIDStr != "" {
+		if id, err := uuid.Parse(ayIDStr); err == nil {
+			filter.AcademicYearID = &id
+		}
+	}
+
+	pag := repository.Pagination{Limit: limit, Offset: offset}
+	sort := repository.Sort{Field: "last_updated", Direction: "DESC"}
+
+	metricsList, err := h.analyticsService.ListTeacherSessionMetrics(ctx, filter, pag, sort)
+	if err != nil {
+		h.logger.Error("failed to list teacher session metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list metrics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"metrics": metricsList,
+			"limit":   limit,
+			"offset":  offset,
+		},
+	})
+}
+
+// RefreshTeacherSessionMetrics triggers a full refresh for a teacher.
+// POST /api/v1/companies/{companyID}/academics/analytics/teachers/{teacherID}/academic-years/{academicYearID}/session-metrics/refresh
+func (h *AnalyticsHandler) RefreshTeacherSessionMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	teacherID, err := parseUUIDParam(r, "teacherID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid teacher ID")
+		return
+	}
+
+	academicYearID, err := parseUUIDParam(r, "academicYearID")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid academic year ID")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.analyticsService.RefreshTeacherSessionMetrics(ctx, teacherID, academicYearID); err != nil {
+		h.logger.Error("failed to refresh teacher session metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to refresh metrics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "teacher session metrics refreshed successfully",
+	})
+}
+
+// ---------------------------------------------------------------------
+// Biometric Usage Metrics
+// ---------------------------------------------------------------------
+
+// GetBiometricUsageMetrics returns metrics for a biometric device on a specific date.
+// GET /api/v1/companies/{companyID}/academics/analytics/biometric-usage?device_id=xxx&date=YYYY-MM-DD
+func (h *AnalyticsHandler) GetBiometricUsageMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "missing device_id parameter")
+		return
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "missing date parameter")
+		return
+	}
+	date, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid date format (use YYYY-MM-DD)")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	metrics, err := h.analyticsService.GetBiometricUsageMetrics(ctx, deviceID, date)
+	if err != nil {
+		h.logger.Error("failed to get biometric usage metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve metrics")
+		return
+	}
+	if metrics == nil {
+		h.respondWithError(w, http.StatusNotFound, "metrics not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    metrics,
+	})
+}
+
+// ListBiometricUsageMetrics returns paginated biometric usage metrics.
+// GET /api/v1/companies/{companyID}/academics/analytics/biometric-usage/list
+func (h *AnalyticsHandler) ListBiometricUsageMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	limit, offset := parsePagination(r)
+	filter := service.BiometricUsageMetricsFilter{
+		DeviceID:  nil,
+		CompanyID: &companyID,
+		FromDate:  nil,
+		ToDate:    nil,
+	}
+	if deviceID := r.URL.Query().Get("device_id"); deviceID != "" {
+		filter.DeviceID = &deviceID
+	}
+	if fromStr := r.URL.Query().Get("from_date"); fromStr != "" {
+		if t, err := time.Parse("2006-01-02", fromStr); err == nil {
+			filter.FromDate = &t
+		}
+	}
+	if toStr := r.URL.Query().Get("to_date"); toStr != "" {
+		if t, err := time.Parse("2006-01-02", toStr); err == nil {
+			filter.ToDate = &t
+		}
+	}
+
+	pag := repository.Pagination{Limit: limit, Offset: offset}
+	sort := repository.Sort{Field: "date", Direction: "DESC"}
+
+	metricsList, err := h.analyticsService.ListBiometricUsageMetrics(ctx, filter, pag, sort)
+	if err != nil {
+		h.logger.Error("failed to list biometric usage metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to list metrics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"metrics": metricsList,
+			"limit":   limit,
+			"offset":  offset,
+		},
+	})
+}
+
+// RefreshBiometricUsageMetrics triggers a full refresh for a device on a given date.
+// POST /api/v1/companies/{companyID}/academics/analytics/biometric-usage/refresh?device_id=xxx&date=YYYY-MM-DD
+func (h *AnalyticsHandler) RefreshBiometricUsageMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	deviceID := r.URL.Query().Get("device_id")
+	if deviceID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "missing device_id parameter")
+		return
+	}
+
+	dateStr := r.URL.Query().Get("date")
+	if dateStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "missing date parameter")
+		return
+	}
+	date, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid date format (use YYYY-MM-DD)")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, "analytics:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	if err := h.analyticsService.RefreshBiometricUsageMetrics(ctx, deviceID, date); err != nil {
+		h.logger.Error("failed to refresh biometric usage metrics", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to refresh metrics")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "biometric usage metrics refreshed successfully",
 	})
 }

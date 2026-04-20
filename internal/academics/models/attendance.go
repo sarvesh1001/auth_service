@@ -1,3 +1,4 @@
+// models/attendance.go
 package models
 
 import (
@@ -17,6 +18,16 @@ const (
 	StatusExempted AttendanceStatus = "exempted"
 )
 
+// AttendanceSourceType defines how the attendance was marked
+type AttendanceSourceType string
+
+const (
+	SourceWeb       AttendanceSourceType = "web"
+	SourceBiometric AttendanceSourceType = "biometric"
+	SourceManual    AttendanceSourceType = "manual"
+	SourceClassroom AttendanceSourceType = "classroom"
+)
+
 func IsValidAttendanceStatus(s string) bool {
 	switch AttendanceStatus(s) {
 	case StatusPresent, StatusAbsent, StatusLate, StatusHalfDay, StatusHoliday, StatusExempted:
@@ -28,15 +39,17 @@ func IsValidAttendanceStatus(s string) bool {
 
 // StudentAttendance represents daily attendance record for a student in a section.
 type StudentAttendance struct {
-	AttendanceID   uuid.UUID        `json:"attendance_id"`
-	EnrollmentID   uuid.UUID        `json:"enrollment_id"`
-	AttendanceDate time.Time        `json:"attendance_date"`
-	Status         AttendanceStatus `json:"status"`
-	MarkedBy       *uuid.UUID       `json:"marked_by,omitempty"`
-	Remarks        string           `json:"remarks,omitempty"`
-	CreatedAt      time.Time        `json:"created_at"`
-	UpdatedAt      time.Time        `json:"updated_at"`
-	CreatedBy      *uuid.UUID       `json:"created_by,omitempty"`
+	AttendanceID   uuid.UUID             `json:"attendance_id"`
+	EnrollmentID   uuid.UUID             `json:"enrollment_id"`
+	AttendanceDate time.Time             `json:"attendance_date"`
+	Status         AttendanceStatus      `json:"status"`
+	MarkedBy       *uuid.UUID            `json:"marked_by,omitempty"`
+	Remarks        string                `json:"remarks,omitempty"`
+	SourceType     *AttendanceSourceType `json:"source_type,omitempty"` // web, biometric, manual, classroom
+	DeviceID       *string               `json:"device_id,omitempty"`   // device identifier
+	CreatedAt      time.Time             `json:"created_at"`
+	UpdatedAt      time.Time             `json:"updated_at"`
+	CreatedBy      *uuid.UUID            `json:"created_by,omitempty"`
 }
 
 // StudentAttendanceSummary represents aggregated attendance summary.

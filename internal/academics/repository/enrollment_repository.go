@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -28,6 +29,10 @@ type EnrollmentRepository interface {
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, id uuid.UUID) (*models.Enrollment, error)
 	GetByStudentAndYear(ctx context.Context, db DBTX, companyID, studentID, academicYearID uuid.UUID) (*models.Enrollment, error)
 	GetActiveByStudent(ctx context.Context, db DBTX, companyID, studentID uuid.UUID) (*models.Enrollment, error)
+
+	// New method for period attendance: find active enrollment on a specific date
+	GetActiveEnrollmentByStudentOnDate(ctx context.Context, db DBTX, companyID, studentID uuid.UUID, date time.Time) (*models.Enrollment, error)
+
 	List(ctx context.Context, db DBTX, filter EnrollmentFilter, p Pagination, s Sort) ([]*models.Enrollment, error)
 	ListByStudent(ctx context.Context, db DBTX, companyID, studentID uuid.UUID) ([]*models.Enrollment, error)
 	ListBySection(ctx context.Context, db DBTX, companyID, sectionID uuid.UUID) ([]*models.Enrollment, error)
@@ -110,6 +115,7 @@ func (r *enrollmentRepository) buildEnrollmentFilter(filter EnrollmentFilter) (s
 	var conditions []string
 	var args []interface{}
 	idx := 1
+
 	if filter.CompanyID != uuid.Nil {
 		conditions = append(conditions, fmt.Sprintf("s.company_id = $%d", idx))
 		args = append(args, filter.CompanyID)
@@ -150,18 +156,42 @@ func (r *enrollmentRepository) buildEnrollmentFilter(filter EnrollmentFilter) (s
 		args = append(args, "%"+filter.Search+"%")
 		idx++
 	}
+
 	if len(conditions) == 0 {
 		return "", args
 	}
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// ---------- Helper to scan a single row into an Enrollment ----------
+// GetActiveEnrollmentByStudentOnDate returns the enrollment that is active for the student on the given date.
+// It uses the academic year's start/end dates to determine validity.
+func (r *enrollmentRepository) GetActiveEnrollmentByStudentOnDate(ctx context.Context, db DBTX, companyID, studentID uuid.UUID, date time.Time) (*models.Enrollment, error) {
+	query := `
+		SELECT e.enrollment_id, e.student_id, e.academic_year_id, e.section_id,
+		       e.enrollment_date, e.roll_number, e.status, e.version,
+		       e.created_at, e.updated_at, e.created_by, e.updated_by
+		FROM academics.enrollments e
+		JOIN academics.academic_year ay ON e.academic_year_id = ay.academic_year_id
+		JOIN academics.students s ON e.student_id = s.student_id
+		WHERE s.company_id = $1
+		  AND e.student_id = $2
+		  AND e.status = $3
+		  AND ay.start_date <= $4
+		  AND ay.end_date >= $4
+		LIMIT 1
+	`
+	row := db.QueryRowContext(ctx, query, companyID, studentID, EnrollmentStatusActive, date)
+	return r.scanEnrollment(row)
+}
+
+// ----------------------------------------------------------------------------
+// The rest of the file remains unchanged from your original
+// ----------------------------------------------------------------------------
+
 func (r *enrollmentRepository) scanEnrollment(row scannable) (*models.Enrollment, error) {
 	var e models.Enrollment
 	var rollNumber sql.NullString
 	var createdBy, updatedBy uuid.NullUUID
-
 	err := row.Scan(
 		&e.EnrollmentID, &e.StudentID, &e.AcademicYearID, &e.SectionID,
 		&e.EnrollmentDate, &rollNumber, &e.Status, &e.Version,
@@ -170,7 +200,7 @@ func (r *enrollmentRepository) scanEnrollment(row scannable) (*models.Enrollment
 	if err != nil {
 		return nil, err
 	}
-	e.RollNumber = rollNumber.String // empty string if NULL
+	e.RollNumber = rollNumber.String
 	if createdBy.Valid {
 		e.CreatedBy = &createdBy.UUID
 	}
@@ -179,8 +209,6 @@ func (r *enrollmentRepository) scanEnrollment(row scannable) (*models.Enrollment
 	}
 	return &e, nil
 }
-
-// ---------- Implementation ----------
 
 func (r *enrollmentRepository) Create(ctx context.Context, db DBTX, e *models.Enrollment) error {
 	query := `
@@ -356,8 +384,8 @@ func (r *enrollmentRepository) List(ctx context.Context, db DBTX, filter Enrollm
 		%s %s
 		LIMIT $%d OFFSET $%d
 	`, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
+
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to list enrollments",
@@ -671,7 +699,6 @@ func (r *enrollmentRepository) BulkAssignRollNumbers(ctx context.Context, db DBT
 		args = append(args, rollNumbers[i])
 	}
 	caseWhen += " END"
-
 	query := fmt.Sprintf(`
 		UPDATE academics.enrollments
 		SET roll_number = %s, updated_by = $1, updated_at = NOW(),
@@ -1030,7 +1057,6 @@ func (r *enrollmentRepository) GetByIDForUpdateUnsafe(ctx context.Context, tx *s
 	return r.scanEnrollment(row)
 }
 
-// scannable is an interface that matches both *sql.Row and *sql.Rows
 type scannable interface {
 	Scan(dest ...interface{}) error
 }

@@ -18,11 +18,11 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// ---------------------------------------------------------------------
-// Event types (matching outbox pattern)
-// ---------------------------------------------------------------------
-
+// -------------------------------
+// AttendanceService interface
+// -------------------------------
 type AttendanceService interface {
+	// Full‑day attendance
 	MarkAttendance(ctx context.Context, req MarkAttendanceRequest, idempotencyKey string) (*models.StudentAttendance, error)
 	BulkMarkAttendance(ctx context.Context, req BulkMarkAttendanceRequest) ([]*models.StudentAttendance, error)
 	GetAttendanceByID(ctx context.Context, id uuid.UUID) (*models.StudentAttendance, error)
@@ -35,24 +35,30 @@ type AttendanceService interface {
 	UpdateExemption(ctx context.Context, req UpdateAttendanceExemptionRequest) (*models.StudentAttendanceExemption, error)
 	DeleteExemption(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
 	ListExemptions(ctx context.Context, studentID *uuid.UUID, fromDate, toDate *time.Time, limit, offset int) ([]*models.StudentAttendanceExemption, error)
+
+	// Period attendance
+	MarkPeriodAttendance(ctx context.Context, req MarkPeriodAttendanceRequest) (*models.StudentSessionAttendance, error)
+	MarkPeriodAttendanceBiometric(ctx context.Context, req BiometricPunchRequest) (*models.StudentSessionAttendance, error)
+	GetPeriodAttendanceBySession(ctx context.Context, sessionID uuid.UUID) ([]*models.StudentSessionAttendance, error)
 }
 
-// ---------------------------------------------------------------------
-// Service implementation
-// ---------------------------------------------------------------------
-
+// -------------------------------
+// attendanceService implementation
+// -------------------------------
 type attendanceService struct {
-	repo            repository.AttendanceRepository
-	enrollmentRepo  repository.EnrollmentRepository
-	studentRepo     repository.StudentRepository
-	pgClient        *client.PostgresClient
-	logger          *zap.Logger
-	notificationSvc NotificationService
-
-	// Infrastructure dependencies (same pattern as assignment service)
-	idempotencyStore idempotency.Store
-	auditService     *audit.AuditService
-	outboxRepo       outbox.Repository
+	repo                  repository.AttendanceRepository
+	enrollmentRepo        repository.EnrollmentRepository
+	studentRepo           repository.StudentRepository
+	pgClient              *client.PostgresClient
+	logger                *zap.Logger
+	notificationSvc       NotificationService
+	idempotencyStore      idempotency.Store
+	auditService          *audit.AuditService
+	outboxRepo            outbox.Repository
+	academicSessionRepo   repository.AcademicSessionRepository
+	studentSessionAttRepo repository.StudentSessionAttendanceRepository
+	attendanceSessionRepo repository.AttendanceSessionRepository
+	biometricMappingRepo  repository.StudentBiometricMappingRepository
 }
 
 func NewAttendanceService(
@@ -65,50 +71,36 @@ func NewAttendanceService(
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
 	outboxRepo outbox.Repository,
+	academicSessionRepo repository.AcademicSessionRepository,
+	studentSessionAttRepo repository.StudentSessionAttendanceRepository,
+	attendanceSessionRepo repository.AttendanceSessionRepository,
+	biometricMappingRepo repository.StudentBiometricMappingRepository,
 ) AttendanceService {
 	return &attendanceService{
-		repo:             repo,
-		enrollmentRepo:   enrollmentRepo,
-		studentRepo:      studentRepo,
-		pgClient:         pgClient,
-		logger:           logger.Named("attendance_service"),
-		notificationSvc:  notificationSvc,
-		idempotencyStore: idempotencyStore,
-		auditService:     auditService,
-		outboxRepo:       outboxRepo,
+		repo:                  repo,
+		enrollmentRepo:        enrollmentRepo,
+		studentRepo:           studentRepo,
+		pgClient:              pgClient,
+		logger:                logger.Named("attendance_service"),
+		notificationSvc:       notificationSvc,
+		idempotencyStore:      idempotencyStore,
+		auditService:          auditService,
+		outboxRepo:            outboxRepo,
+		academicSessionRepo:   academicSessionRepo,
+		studentSessionAttRepo: studentSessionAttRepo,
+		attendanceSessionRepo: attendanceSessionRepo,
+		biometricMappingRepo:  biometricMappingRepo,
 	}
 }
 
-// ---------------------------------------------------------------------
-// Helper: store outbox event for attendance
-// ---------------------------------------------------------------------
-
-func (s *attendanceService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
-	var data []byte
-	var err error
-	if payload != nil {
-		data, err = json.Marshal(payload)
-		if err != nil {
-			return fmt.Errorf("marshal outbox payload: %w", err)
-		}
-	}
-
-	outboxEvent := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "attendance",
-		AggregateID:   aggregateID.String(),
-		EventType:     string(eventType),
-		Payload:       data,
-		Headers:       map[string]string{},
-		Status:        "pending",
-	}
-	return s.outboxRepo.Store(ctx, tx, outboxEvent)
+// Helper to determine if an attendance source is auto (biometric)
+func isAutoSource(source models.AttendanceSourceType) bool {
+	return source == models.SourceBiometric
 }
 
-// ---------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------
-
+// -------------------------------
+// Helper functions
+// -------------------------------
 func (s *attendanceService) validateAttendanceInput(req MarkAttendanceRequest) error {
 	if req.EnrollmentID == uuid.Nil {
 		return fmt.Errorf("%w: enrollment_id is required", ErrInvalidInput)
@@ -125,10 +117,30 @@ func (s *attendanceService) validateAttendanceInput(req MarkAttendanceRequest) e
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// MarkAttendance (with idempotency, audit, outbox)
-// ---------------------------------------------------------------------
+func (s *attendanceService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType string, aggregateID uuid.UUID, payload interface{}) error {
+	var data []byte
+	var err error
+	if payload != nil {
+		data, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal outbox payload: %w", err)
+		}
+	}
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "attendance",
+		AggregateID:   aggregateID.String(),
+		EventType:     eventType,
+		Payload:       data,
+		Headers:       map[string]string{},
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, outboxEvent)
+}
 
+// -------------------------------
+// Full‑day attendance implementation
+// -------------------------------
 func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendanceRequest, idempotencyKey string) (*models.StudentAttendance, error) {
 	logger := s.logger.With(
 		zap.String("method", "MarkAttendance"),
@@ -148,7 +160,6 @@ func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendan
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (same pattern as assignment service)
 	if idempotencyKey != "" {
 		var existing models.StudentAttendance
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.AttendanceID != uuid.Nil {
@@ -164,20 +175,20 @@ func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendan
 		MarkedBy:       req.MarkedBy,
 		Remarks:        req.Remarks,
 		CreatedBy:      req.CreatedBy,
+		SourceType:     req.SourceType,
+		DeviceID:       req.DeviceID,
 	}
 
 	if err := s.repo.Upsert(ctx, tx, attendance); err != nil {
 		return nil, err
 	}
 
-	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, attendance); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
 
-	// Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "upsert", "attendance",
 			&attendance.AttendanceID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -187,8 +198,8 @@ func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendan
 			})
 	}
 
-	// Outbox event
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceMarked, attendance.AttendanceID, attendance); err != nil {
+	// Cast event constant to string (assuming EventAttendanceMarked is of type EventType)
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceMarked), attendance.AttendanceID, attendance); err != nil {
 		return nil, fmt.Errorf("outbox store: %w", err)
 	}
 
@@ -196,21 +207,17 @@ func (s *attendanceService) MarkAttendance(ctx context.Context, req MarkAttendan
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Async notifications (unchanged)
 	go s.createAttendanceNotification(context.Background(), req.EnrollmentID, req.Date, req.Status, req.MarkedBy)
 
 	logger.Info("attendance marked", zap.String("attendance_id", attendance.AttendanceID.String()))
 	return attendance, nil
 }
 
-// ---------------------------------------------------------------------
-// BulkMarkAttendance (no idempotency, but uses outbox + audit)
-// ---------------------------------------------------------------------
-
 func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMarkAttendanceRequest) ([]*models.StudentAttendance, error) {
 	if len(req.Attendances) == 0 {
 		return nil, nil
 	}
+
 	logger := s.logger.With(zap.String("method", "BulkMarkAttendance"), zap.Int("count", len(req.Attendances)))
 
 	for i, r := range req.Attendances {
@@ -234,6 +241,8 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 			MarkedBy:       r.MarkedBy,
 			Remarks:        r.Remarks,
 			CreatedBy:      r.CreatedBy,
+			SourceType:     r.SourceType,
+			DeviceID:       r.DeviceID,
 		}
 		attendances = append(attendances, a)
 	}
@@ -242,7 +251,6 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 		return nil, err
 	}
 
-	// Audit for each
 	for _, a := range attendances {
 		if s.auditService != nil {
 			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_upsert", "attendance",
@@ -252,8 +260,7 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 					"status":        a.Status,
 				})
 		}
-		// Outbox event per attendance (or one batch event – here per record)
-		if err := s.storeOutboxEvent(ctx, tx, EventAttendanceBulkMarked, a.AttendanceID, a); err != nil {
+		if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceBulkMarked), a.AttendanceID, a); err != nil {
 			return nil, fmt.Errorf("outbox store for %s: %w", a.AttendanceID, err)
 		}
 	}
@@ -262,7 +269,6 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Async notifications
 	for _, a := range attendances {
 		if a.Status == models.StatusAbsent || a.Status == models.StatusLate {
 			go s.createAttendanceNotification(context.Background(), a.EnrollmentID, a.AttendanceDate, a.Status, a.MarkedBy)
@@ -272,10 +278,6 @@ func (s *attendanceService) BulkMarkAttendance(ctx context.Context, req BulkMark
 	logger.Info("bulk attendance marked", zap.Int("count", len(attendances)))
 	return attendances, nil
 }
-
-// ---------------------------------------------------------------------
-// GetAttendanceByID, ListAttendance, DeleteAttendance (simpler)
-// ---------------------------------------------------------------------
 
 func (s *attendanceService) GetAttendanceByID(ctx context.Context, id uuid.UUID) (*models.StudentAttendance, error) {
 	a, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
@@ -289,6 +291,13 @@ func (s *attendanceService) GetAttendanceByID(ctx context.Context, id uuid.UUID)
 }
 
 func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAttendanceRequest) ([]*models.StudentAttendance, int64, error) {
+	// Convert Status from *models.AttendanceStatus to *string
+	var statusPtr *string
+	if filter.Status != nil {
+		s := string(*filter.Status)
+		statusPtr = &s
+	}
+
 	repoFilter := repository.AttendanceFilter{
 		EnrollmentID:   filter.EnrollmentID,
 		StudentID:      filter.StudentID,
@@ -297,7 +306,7 @@ func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAtten
 		AcademicYearID: filter.AcademicYearID,
 		FromDate:       filter.FromDate,
 		ToDate:         filter.ToDate,
-		Status:         filter.Status,
+		Status:         statusPtr,
 		MarkedBy:       filter.MarkedBy,
 	}
 	limit := filter.Limit
@@ -321,7 +330,6 @@ func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAtten
 		sortDir = "DESC"
 	}
 	srt := repository.Sort{Field: sortField, Direction: sortDir}
-
 	attendances, err := s.repo.List(ctx, s.pgClient.DB, repoFilter, pag, srt)
 	if err != nil {
 		return nil, 0, err
@@ -335,13 +343,11 @@ func (s *attendanceService) ListAttendance(ctx context.Context, filter ListAtten
 
 func (s *attendanceService) DeleteAttendance(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteAttendance"), zap.String("attendance_id", id.String()))
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	existing, err := s.repo.GetByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -349,34 +355,25 @@ func (s *attendanceService) DeleteAttendance(ctx context.Context, id uuid.UUID, 
 	if existing == nil {
 		return fmt.Errorf("%w: attendance %s", ErrNotFound, id)
 	}
-
 	if err := s.repo.Delete(ctx, tx, id); err != nil {
 		return err
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "attendance",
 			&id, "user", deletedBy, nil, nil, nil)
 	}
-
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceMarked+".deleted", id, map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceMarked)+".deleted", id, map[string]interface{}{
 		"attendance_id": id,
 		"deleted_by":    deletedBy,
 	}); err != nil {
 		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("attendance deleted")
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Summary methods (with outbox)
-// ---------------------------------------------------------------------
 
 func (s *attendanceService) GetSummary(ctx context.Context, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*AttendanceSummaryResponse, error) {
 	summary, err := s.repo.GetSummary(ctx, s.pgClient.DB, studentID, academicYearID, termID)
@@ -408,30 +405,24 @@ func (s *attendanceService) RecalculateSummary(ctx context.Context, studentID, a
 		zap.String("student_id", studentID.String()),
 		zap.String("academic_year_id", academicYearID.String()),
 	)
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	if err := s.repo.RecalculateSummary(ctx, tx, studentID, academicYearID, termID); err != nil {
 		return err
 	}
-
-	// Use a placeholder aggregate ID (e.g., studentID) for outbox
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceSummaryUpdated, studentID, map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceSummaryUpdated), studentID, map[string]interface{}{
 		"student_id":       studentID,
 		"academic_year_id": academicYearID,
 		"term_id":          termID,
 	}); err != nil {
 		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("summary recalculated")
 	return nil
 }
@@ -445,37 +436,27 @@ func (s *attendanceService) BulkRecalcSummaries(ctx context.Context, studentIDs 
 		zap.Int("count", len(studentIDs)),
 		zap.String("academic_year_id", academicYearID.String()),
 	)
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	if err := s.repo.BulkRecalcSummaries(ctx, tx, studentIDs, academicYearID, termID); err != nil {
 		return err
 	}
-
-	// One outbox event for the bulk operation
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceSummaryUpdated, uuid.Nil, map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceSummaryUpdated), uuid.Nil, map[string]interface{}{
 		"student_ids":      studentIDs,
 		"academic_year_id": academicYearID,
 		"term_id":          termID,
 	}); err != nil {
 		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("bulk summaries recalculated")
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Exemption methods (with idempotency, audit, outbox)
-// ---------------------------------------------------------------------
 
 func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAttendanceExemptionRequest, idempotencyKey string) (*models.StudentAttendanceExemption, error) {
 	logger := s.logger.With(
@@ -485,7 +466,6 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 		zap.Time("to", req.ToDate),
 		zap.String("idempotency_key", idempotencyKey),
 	)
-
 	if req.StudentID == uuid.Nil {
 		return nil, fmt.Errorf("%w: student_id is required", ErrInvalidInput)
 	}
@@ -495,14 +475,11 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 	if req.FromDate.After(req.ToDate) {
 		return nil, fmt.Errorf("%w: from_date must be before to_date", ErrInvalidInput)
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Idempotency check
 	if idempotencyKey != "" {
 		var existing models.StudentAttendanceExemption
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.ExemptionID != uuid.Nil {
@@ -510,7 +487,6 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 			return &existing, nil
 		}
 	}
-
 	exemption := &models.StudentAttendanceExemption{
 		StudentID:  req.StudentID,
 		FromDate:   req.FromDate,
@@ -519,17 +495,14 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 		ApprovedBy: req.ApprovedBy,
 		CreatedBy:  req.CreatedBy,
 	}
-
 	if err := s.repo.CreateExemption(ctx, tx, exemption); err != nil {
 		return nil, err
 	}
-
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, exemption); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "attendance_exemption",
 			&exemption.ExemptionID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -538,22 +511,18 @@ func (s *attendanceService) CreateExemption(ctx context.Context, req CreateAtten
 				"to_date":    exemption.ToDate,
 			})
 	}
-
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceExemptionCreated, exemption.ExemptionID, exemption); err != nil {
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceExemptionCreated), exemption.ExemptionID, exemption); err != nil {
 		return nil, fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("exemption created", zap.String("exemption_id", exemption.ExemptionID.String()))
 	return exemption, nil
 }
 
 func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAttendanceExemptionRequest) (*models.StudentAttendanceExemption, error) {
 	logger := s.logger.With(zap.String("method", "UpdateExemption"), zap.String("exemption_id", req.ExemptionID.String()))
-
 	if req.ExemptionID == uuid.Nil {
 		return nil, fmt.Errorf("%w: exemption_id is required", ErrInvalidInput)
 	}
@@ -563,13 +532,11 @@ func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAtten
 	if req.FromDate.After(req.ToDate) {
 		return nil, fmt.Errorf("%w: from_date must be before to_date", ErrInvalidInput)
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	existing, err := s.repo.GetExemptionByID(ctx, tx, req.ExemptionID)
 	if err != nil {
 		return nil, err
@@ -577,16 +544,13 @@ func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAtten
 	if existing == nil {
 		return nil, fmt.Errorf("%w: exemption %s", ErrNotFound, req.ExemptionID)
 	}
-
 	existing.FromDate = req.FromDate
 	existing.ToDate = req.ToDate
 	existing.Reason = req.Reason
 	existing.ApprovedBy = req.ApprovedBy
-
 	if err := s.repo.UpdateExemption(ctx, tx, existing); err != nil {
 		return nil, err
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "update", "attendance_exemption",
 			&req.ExemptionID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
@@ -594,28 +558,23 @@ func (s *attendanceService) UpdateExemption(ctx context.Context, req UpdateAtten
 				"new_from_date": req.FromDate,
 			})
 	}
-
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceExemptionUpdated, existing.ExemptionID, existing); err != nil {
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceExemptionUpdated), existing.ExemptionID, existing); err != nil {
 		return nil, fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("exemption updated")
 	return existing, nil
 }
 
 func (s *attendanceService) DeleteExemption(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteExemption"), zap.String("exemption_id", id.String()))
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	ex, err := s.repo.GetExemptionByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -623,27 +582,22 @@ func (s *attendanceService) DeleteExemption(ctx context.Context, id uuid.UUID, d
 	if ex == nil {
 		return fmt.Errorf("%w: exemption %s", ErrNotFound, id)
 	}
-
 	if err := s.repo.DeleteExemption(ctx, tx, id); err != nil {
 		return err
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "delete", "attendance_exemption",
 			&id, "user", deletedBy, nil, nil, nil)
 	}
-
-	if err := s.storeOutboxEvent(ctx, tx, EventAttendanceExemptionDeleted, id, map[string]interface{}{
+	if err := s.storeOutboxEvent(ctx, tx, string(EventAttendanceExemptionDeleted), id, map[string]interface{}{
 		"exemption_id": id,
 		"deleted_by":   deletedBy,
 	}); err != nil {
 		return fmt.Errorf("outbox store: %w", err)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	logger.Info("exemption deleted")
 	return nil
 }
@@ -662,10 +616,238 @@ func (s *attendanceService) ListExemptions(ctx context.Context, studentID *uuid.
 	return s.repo.ListExemptions(ctx, s.pgClient.DB, studentID, fromDate, toDate, pag)
 }
 
-// ---------------------------------------------------------------------
-// Notification helper (unchanged, kept for completeness)
-// ---------------------------------------------------------------------
+// -------------------------------
+// Period attendance implementation
+// -------------------------------
+func (s *attendanceService) MarkPeriodAttendance(ctx context.Context, req MarkPeriodAttendanceRequest) (*models.StudentSessionAttendance, error) {
+	logger := s.logger.With(
+		zap.String("method", "MarkPeriodAttendance"),
+		zap.String("session_id", req.SessionID.String()),
+		zap.String("enrollment_id", req.EnrollmentID.String()),
+	)
 
+	if req.SessionID == uuid.Nil || req.EnrollmentID == uuid.Nil {
+		return nil, fmt.Errorf("%w: session_id and enrollment_id are required", ErrInvalidInput)
+	}
+	if req.Status == "" {
+		return nil, fmt.Errorf("%w: status is required", ErrInvalidInput)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Create attendance_session lock if not exists
+	exists, err := s.attendanceSessionRepo.ExistsBySessionID(ctx, tx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		attSession := &models.AttendanceSession{
+			SessionID:  req.SessionID,
+			MarkedBy:   req.MarkedBy,
+			SourceType: &req.SourceType,
+			Status:     models.AttendanceSessionCompleted,
+		}
+		if err := s.attendanceSessionRepo.Create(ctx, tx, attSession); err != nil {
+			return nil, fmt.Errorf("failed to create attendance session lock: %w", err)
+		}
+	}
+
+	// 2. Get existing attendance (if any) for override policy
+	existing, _ := s.studentSessionAttRepo.GetBySessionAndEnrollment(ctx, tx, req.SessionID, req.EnrollmentID)
+
+	// Override policy: manual (is_auto=false) overrides auto (biometric)
+	if existing != nil {
+		isManualOverride := !existing.IsAuto && isAutoSource(req.SourceType) // biometric trying to override manual? ignore
+		isAutoOverridden := existing.IsAuto && !isAutoSource(req.SourceType) // manual overrides auto
+		if isManualOverride {
+			logger.Info("biometric ignored because manual attendance already exists")
+			return existing, nil
+		}
+		if isAutoOverridden {
+			logger.Info("manual override of auto attendance",
+				zap.String("old_status", string(existing.Status)),
+				zap.String("new_status", string(req.Status)))
+		}
+	}
+
+	// 3. Upsert attendance
+	now := time.Now()
+	att := &models.StudentSessionAttendance{
+		SessionID:    req.SessionID,
+		EnrollmentID: req.EnrollmentID,
+		Status:       req.Status,
+		MarkedAt:     now,
+		MarkedBy:     req.MarkedBy,
+		SourceType:   req.SourceType,
+		DeviceID:     req.DeviceID,
+		IsAuto:       isAutoSource(req.SourceType),
+		Remarks:      req.Remarks,
+	}
+	if err := s.studentSessionAttRepo.Upsert(ctx, tx, att); err != nil {
+		return nil, err
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "mark", "period_attendance",
+			&att.AttendanceID, "user", req.MarkedBy, nil, nil, map[string]interface{}{
+				"session_id":    req.SessionID,
+				"enrollment_id": req.EnrollmentID,
+				"status":        req.Status,
+			})
+	}
+
+	if err := s.storeOutboxEvent(ctx, tx, string(EventPeriodAttendanceMarked), att.AttendanceID, att); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("period attendance marked", zap.String("status", string(req.Status)))
+	return att, nil
+}
+
+func (s *attendanceService) MarkPeriodAttendanceBiometric(ctx context.Context, req BiometricPunchRequest) (*models.StudentSessionAttendance, error) {
+	logger := s.logger.With(
+		zap.String("method", "MarkPeriodAttendanceBiometric"),
+		zap.String("device_id", req.DeviceID),
+		zap.String("user_code", req.DeviceUserCode),
+	)
+
+	// 1. Resolve student from biometric mapping
+	mapping, err := s.biometricMappingRepo.GetByDeviceAndUserCode(ctx, s.pgClient.DB, req.DeviceID, req.DeviceUserCode)
+	if err != nil {
+		return nil, fmt.Errorf("biometric mapping not found: %w", err)
+	}
+	if mapping == nil {
+		return nil, fmt.Errorf("no active mapping for device %s user %s", req.DeviceID, req.DeviceUserCode)
+	}
+
+	// 2. Find active academic session for this student at punch time
+	session, err := s.academicSessionRepo.GetActiveSessionForStudentAtTime(ctx, s.pgClient.DB,
+		mapping.StudentID, req.CompanyID, req.PunchTime, req.PunchTime)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find active session: %w", err)
+	}
+	if session == nil {
+		return nil, fmt.Errorf("no active session found for student at %v", req.PunchTime)
+	}
+
+	// 3. Get enrollment for this student in the current academic year
+	enrollment, err := s.enrollmentRepo.GetActiveEnrollmentByStudentOnDate(ctx, s.pgClient.DB,
+		req.CompanyID, mapping.StudentID, req.PunchTime)
+	if err != nil || enrollment == nil {
+		return nil, fmt.Errorf("no active enrollment found for student on date %v", req.PunchTime)
+	}
+
+	// 4. Mark attendance using the same logic as web marking (with transaction)
+	markReq := MarkPeriodAttendanceRequest{
+		SessionID:    session.SessionID,
+		EnrollmentID: enrollment.EnrollmentID,
+		Status:       models.SessionPresent,
+		SourceType:   models.SourceBiometric,
+		DeviceID:     &req.DeviceID,
+	}
+	// Use a new transaction for consistency
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	att, err := s.markPeriodAttendanceInternal(ctx, tx, markReq)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("biometric period attendance recorded", zap.String("session_id", session.SessionID.String()))
+	return att, nil
+}
+
+// markPeriodAttendanceInternal is a helper that executes the same logic as MarkPeriodAttendance
+// but uses an existing transaction. This avoids double transaction overhead for biometric calls.
+func (s *attendanceService) markPeriodAttendanceInternal(ctx context.Context, tx *sql.Tx, req MarkPeriodAttendanceRequest) (*models.StudentSessionAttendance, error) {
+	// 1. Create attendance_session lock if not exists
+	exists, err := s.attendanceSessionRepo.ExistsBySessionID(ctx, tx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		attSession := &models.AttendanceSession{
+			SessionID:  req.SessionID,
+			MarkedBy:   req.MarkedBy,
+			SourceType: &req.SourceType,
+			Status:     models.AttendanceSessionCompleted,
+		}
+		if err := s.attendanceSessionRepo.Create(ctx, tx, attSession); err != nil {
+			return nil, fmt.Errorf("failed to create attendance session lock: %w", err)
+		}
+	}
+
+	// 2. Override policy check
+	existing, _ := s.studentSessionAttRepo.GetBySessionAndEnrollment(ctx, tx, req.SessionID, req.EnrollmentID)
+	if existing != nil {
+		if existing.IsAuto && !isAutoSource(req.SourceType) {
+			// manual overrides auto – proceed
+		} else if !existing.IsAuto && isAutoSource(req.SourceType) {
+			// biometric cannot override manual
+			return existing, nil
+		}
+	}
+
+	// 3. Upsert
+	now := time.Now()
+	att := &models.StudentSessionAttendance{
+		SessionID:    req.SessionID,
+		EnrollmentID: req.EnrollmentID,
+		Status:       req.Status,
+		MarkedAt:     now,
+		MarkedBy:     req.MarkedBy,
+		SourceType:   req.SourceType,
+		DeviceID:     req.DeviceID,
+		IsAuto:       isAutoSource(req.SourceType),
+		Remarks:      req.Remarks,
+	}
+	if err := s.studentSessionAttRepo.Upsert(ctx, tx, att); err != nil {
+		return nil, err
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "mark", "period_attendance",
+			&att.AttendanceID, "user", req.MarkedBy, nil, nil, map[string]interface{}{
+				"session_id":    req.SessionID,
+				"enrollment_id": req.EnrollmentID,
+				"status":        req.Status,
+			})
+	}
+	if err := s.storeOutboxEvent(ctx, tx, string(EventPeriodAttendanceMarked), att.AttendanceID, att); err != nil {
+		return nil, fmt.Errorf("outbox store: %w", err)
+	}
+	return att, nil
+}
+
+func (s *attendanceService) GetPeriodAttendanceBySession(ctx context.Context, sessionID uuid.UUID) ([]*models.StudentSessionAttendance, error) {
+	filter := repository.StudentSessionAttendanceFilter{
+		SessionID: &sessionID,
+	}
+	attendances, err := s.studentSessionAttRepo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: 1000}, repository.Sort{Field: "marked_at", Direction: "ASC"})
+	if err != nil {
+		return nil, err
+	}
+	return attendances, nil
+}
+
+// -------------------------------
+// Notification helper (unchanged)
+// -------------------------------
 func (s *attendanceService) createAttendanceNotification(ctx context.Context, enrollmentID uuid.UUID, date time.Time, status models.AttendanceStatus, markedBy *uuid.UUID) {
 	enrollment, err := s.enrollmentRepo.GetByIDUnsafe(ctx, s.pgClient.DB, enrollmentID)
 	if err != nil || enrollment == nil {

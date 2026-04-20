@@ -1,0 +1,475 @@
+
+================================================================================
+FILE: ./models/warehouse.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Warehouse struct {
+	WarehouseID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"warehouseId"`
+	CompanyID   uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	Code        string     `gorm:"type:varchar(50);not null" json:"code"`
+	Name        string     `gorm:"type:varchar(255);not null" json:"name"`
+	Location    *string    `gorm:"type:text" json:"location,omitempty"`
+	IsActive    bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt   time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt   time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy   *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/reservation.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Reservation struct {
+	ReservationID   uuid.UUID  `db:"reservation_id" json:"reservation_id" gorm:"primaryKey"`
+	CompanyID       uuid.UUID  `db:"company_id" json:"company_id"`
+	ReservationType string     `db:"reservation_type" json:"reservation_type"`
+	ReferenceID     uuid.UUID  `db:"reference_id" json:"reference_id"`
+	WarehouseID     uuid.UUID  `db:"warehouse_id" json:"warehouse_id"`
+	ItemID          uuid.UUID  `db:"item_id" json:"item_id"`
+	BatchID         *uuid.UUID `db:"batch_id" json:"batch_id"`
+	Quantity        float64    `db:"quantity" json:"quantity"`
+	Status          string     `db:"status" json:"status"` // active, fulfilled, cancelled
+	CreatedAt       time.Time  `db:"created_at" json:"created_at"`
+	ExpiresAt       *time.Time `db:"expires_at" json:"expires_at"`
+	CreatedBy       *uuid.UUID `db:"created_by" json:"created_by"`
+	FulfilledAt     *time.Time `db:"fulfilled_at" json:"fulfilled_at"`
+	CancelledAt     *time.Time `db:"cancelled_at" json:"cancelled_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/movement.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/inventory/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StockMovement struct {
+	MovementID      uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"movementId"`
+	CompanyID       uuid.UUID          `gorm:"type:uuid;not null" json:"companyId"`
+	MovementType    enums.MovementType `gorm:"type:movement_type;not null" json:"movementType"`
+	ReferenceType   *string            `gorm:"type:varchar(50)" json:"referenceType,omitempty"`
+	ReferenceID     *uuid.UUID         `gorm:"type:uuid" json:"referenceId,omitempty"`
+	MovementDate    time.Time          `gorm:"type:date;not null" json:"movementDate"`
+	WarehouseID     uuid.UUID          `gorm:"type:uuid;not null" json:"warehouseId"`
+	FromWarehouseID *uuid.UUID         `gorm:"type:uuid" json:"fromWarehouseId,omitempty"`
+	ItemID          uuid.UUID          `gorm:"type:uuid;not null" json:"itemId"`
+	BatchID         *uuid.UUID         `gorm:"type:uuid" json:"batchId,omitempty"`
+	QuantityIn      float64            `gorm:"type:numeric(14,4);not null;default:0" json:"quantityIn"`
+	QuantityOut     float64            `gorm:"type:numeric(14,4);not null;default:0" json:"quantityOut"`
+	UnitCost        float64            `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalCost       float64            `gorm:"->;-:migration" json:"totalCost"` // generated
+	Reason          *string            `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt       time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	CreatedBy       *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/bom_item.go
+================================================================================
+
+// models/bom_item.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type BOMItem struct {
+	BOMItemID       uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"bomItemId"`
+	BOMID           uuid.UUID `gorm:"type:uuid;not null" json:"bomId"`
+	ComponentItemID uuid.UUID `gorm:"type:uuid;not null" json:"componentItemId"`
+	Quantity        float64   `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	ScrapPercentage *float64  `gorm:"type:numeric(5,2);default:0" json:"scrapPercentage,omitempty"`
+	CreatedAt       time.Time `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/batch.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Batch struct {
+	BatchID          uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"batchId"`
+	CompanyID        uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	ItemID           uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
+	BatchNumber      string     `gorm:"type:varchar(100);not null" json:"batchNumber"`
+	SupplierBatch    *string    `gorm:"type:varchar(100)" json:"supplierBatch,omitempty"`
+	ManufacturedDate *time.Time `gorm:"type:date" json:"manufacturedDate,omitempty"`
+	ExpiryDate       *time.Time `gorm:"type:date" json:"expiryDate,omitempty"`
+	ReceivedDate     *time.Time `gorm:"type:date" json:"receivedDate,omitempty"`
+	Quantity         float64    `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	RemainingQty     float64    `gorm:"type:numeric(14,4);not null" json:"remainingQty"`
+	CostPerUnit      float64    `gorm:"type:numeric(14,4);not null" json:"costPerUnit"`
+	IsActive         bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt        time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy        *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy        *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/stock_ledger.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StockLedger struct {
+	LedgerID        uuid.UUID  `db:"ledger_id" json:"ledger_id" gorm:"primaryKey"`
+	CompanyID       uuid.UUID  `db:"company_id" json:"company_id"`
+	ItemID          uuid.UUID  `db:"item_id" json:"item_id"`
+	BatchID         *uuid.UUID `db:"batch_id" json:"batch_id"`
+	MovementID      uuid.UUID  `db:"movement_id" json:"movement_id"`
+	TransactionDate time.Time  `db:"transaction_date" json:"transaction_date"`
+	QuantityIn      float64    `db:"quantity_in" json:"quantity_in"`
+	QuantityOut     float64    `db:"quantity_out" json:"quantity_out"`
+	UnitCost        float64    `db:"unit_cost" json:"unit_cost"`
+	RunningBalance  float64    `db:"running_balance" json:"running_balance"`
+	CreatedAt       time.Time  `db:"created_at" json:"created_at"`
+}
+
+
+
+================================================================================
+FILE: ./models/stock_allocation.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StockAllocation struct {
+	AllocationID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"allocationId"`
+	CompanyID      uuid.UUID `gorm:"type:uuid;not null" json:"companyId"`
+	MovementID     uuid.UUID `gorm:"type:uuid;not null" json:"movementId"`
+	SourceLedgerID uuid.UUID `gorm:"type:uuid;not null" json:"sourceLedgerId"`
+	Quantity       float64   `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitCost       float64   `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	CreatedAt      time.Time `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/bom.go
+================================================================================
+
+// models/bom.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type BOM struct {
+	BOMID         uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"bomId"`
+	CompanyID     uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	ProductItemID uuid.UUID  `gorm:"type:uuid;not null" json:"productItemId"`
+	BOMCode       string     `gorm:"type:varchar(100);not null" json:"bomCode"`
+	Name          string     `gorm:"type:varchar(255);not null" json:"name"`
+	Version       int        `gorm:"not null;default:1" json:"version"`
+	Quantity      float64    `gorm:"type:numeric(14,4);not null;default:1" json:"quantity"`
+	IsActive      bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy     *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy     *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/valuation.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/inventory/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type InventoryValuation struct {
+	ValuationID     uuid.UUID             `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"valuationId"`
+	CompanyID       uuid.UUID             `gorm:"type:uuid;not null" json:"companyId"`
+	ValuationDate   time.Time             `gorm:"type:date;not null" json:"valuationDate"`
+	ItemID          uuid.UUID             `gorm:"type:uuid;not null" json:"itemId"`
+	WarehouseID     *uuid.UUID            `gorm:"type:uuid" json:"warehouseId,omitempty"`
+	Quantity        float64               `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitCost        float64               `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalValue      float64               `gorm:"->;-:migration" json:"totalValue"` // generated
+	ValuationMethod enums.ValuationMethod `gorm:"type:valuation_method;not null" json:"valuationMethod"`
+	CreatedAt       time.Time             `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/stock_balance.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type StockBalance struct {
+	StockBalanceID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"stockBalanceId"`
+	CompanyID      uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	WarehouseID    uuid.UUID  `gorm:"type:uuid;not null" json:"warehouseId"`
+	ItemID         uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
+	BatchID        *uuid.UUID `gorm:"type:uuid" json:"batchId,omitempty"`
+	QuantityOnHand float64    `gorm:"type:numeric(14,4);not null;default:0" json:"quantityOnHand"`
+	ReservedQty    float64    `gorm:"type:numeric(14,4);not null;default:0" json:"reservedQty"`
+	AvailableQty   float64    `gorm:"->;-:migration" json:"availableQty"` // generated column, read-only
+	LastMovementAt *time.Time `gorm:"type:timestamptz" json:"lastMovementAt,omitempty"`
+	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/item.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/inventory/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Item struct {
+	ItemID          uuid.UUID             `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"itemId"`
+	CompanyID       uuid.UUID             `gorm:"type:uuid;not null" json:"companyId"`
+	SKU             string                `gorm:"type:varchar(100);not null" json:"sku"`
+	Name            string                `gorm:"type:varchar(255);not null" json:"name"`
+	Description     *string               `gorm:"type:text" json:"description,omitempty"`
+	ItemType        enums.ItemType        `gorm:"type:item_type;not null" json:"itemType"`
+	UnitOfMeasure   string                `gorm:"type:varchar(20);not null" json:"unitOfMeasure"`
+	ValuationMethod enums.ValuationMethod `gorm:"type:valuation_method;not null;default:'weighted_average'" json:"valuationMethod"`
+	StandardCost    *float64              `gorm:"type:numeric(14,4);default:0" json:"standardCost,omitempty"`
+	SellingPrice    *float64              `gorm:"type:numeric(14,4);default:0" json:"sellingPrice,omitempty"`
+	ReorderLevel    *float64              `gorm:"type:numeric(14,4);default:0" json:"reorderLevel,omitempty"`
+	ReorderQuantity *float64              `gorm:"type:numeric(14,4);default:0" json:"reorderQuantity,omitempty"`
+	IsActive        bool                  `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time             `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time             `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy       *uuid.UUID            `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy       *uuid.UUID            `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/enums/movement_type.go
+================================================================================
+
+package enums
+
+type MovementType string
+
+const (
+	MovementTypePurchaseIn    MovementType = "purchase_in"
+	MovementTypeSalesOut      MovementType = "sales_out"
+	MovementTypeProductionIn  MovementType = "production_in"
+	MovementTypeReturnIn      MovementType = "return_in"
+	MovementTypeReturnOut     MovementType = "return_out"
+	MovementTypeAdjustmentIn  MovementType = "adjustment_in"
+	MovementTypeAdjustmentOut MovementType = "adjustment_out"
+	MovementTypeTransfer      MovementType = "transfer"
+)
+
+// ValidMovementTypes returns all valid movement types.
+func ValidMovementTypes() []MovementType {
+	return []MovementType{
+		MovementTypePurchaseIn,
+		MovementTypeSalesOut,
+		MovementTypeProductionIn,
+		MovementTypeReturnIn,
+		MovementTypeReturnOut,
+		MovementTypeAdjustmentIn,
+		MovementTypeAdjustmentOut,
+		MovementTypeTransfer,
+	}
+}
+
+// IsValid checks if the movement type is valid.
+func (m MovementType) IsValid() bool {
+	switch m {
+	case MovementTypePurchaseIn, MovementTypeSalesOut, MovementTypeProductionIn,
+		MovementTypeReturnIn, MovementTypeReturnOut, MovementTypeAdjustmentIn,
+		MovementTypeAdjustmentOut, MovementTypeTransfer:
+		return true
+	}
+	return false
+}
+
+// IsInbound returns true if the movement increases stock.
+func (m MovementType) IsInbound() bool {
+	switch m {
+	case MovementTypePurchaseIn, MovementTypeProductionIn, MovementTypeReturnIn, MovementTypeAdjustmentIn:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsOutbound returns true if the movement decreases stock.
+func (m MovementType) IsOutbound() bool {
+	switch m {
+	case MovementTypeSalesOut, MovementTypeReturnOut, MovementTypeAdjustmentOut, MovementTypeTransfer:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m MovementType) String() string {
+	return string(m)
+}
+
+
+
+================================================================================
+FILE: ./models/enums/item_type.go
+================================================================================
+
+package enums
+
+type ItemType string
+
+const (
+	ItemTypeRawMaterial  ItemType = "raw_material"
+	ItemTypeFinishedGood ItemType = "finished_good"
+	ItemTypeSubAssembly  ItemType = "sub_assembly"
+	ItemTypeConsumable   ItemType = "consumable"
+	ItemTypeService      ItemType = "service"
+)
+
+// ValidItemTypes returns all valid item types.
+func ValidItemTypes() []ItemType {
+	return []ItemType{
+		ItemTypeRawMaterial,
+		ItemTypeFinishedGood,
+		ItemTypeSubAssembly,
+		ItemTypeConsumable,
+		ItemTypeService,
+	}
+}
+
+// IsValid checks if the item type is valid.
+func (t ItemType) IsValid() bool {
+	switch t {
+	case ItemTypeRawMaterial, ItemTypeFinishedGood, ItemTypeSubAssembly, ItemTypeConsumable, ItemTypeService:
+		return true
+	}
+	return false
+}
+
+func (t ItemType) String() string {
+	return string(t)
+}
+
+
+
+================================================================================
+FILE: ./models/enums/valuation_method.go
+================================================================================
+
+package enums
+
+type ValuationMethod string
+
+const (
+	ValuationMethodFIFO            ValuationMethod = "fifo"
+	ValuationMethodLIFO            ValuationMethod = "lifo"
+	ValuationMethodWeightedAverage ValuationMethod = "weighted_average"
+	ValuationMethodStandardCost    ValuationMethod = "standard_cost"
+)
+
+// ValidValuationMethods returns all valid valuation methods.
+func ValidValuationMethods() []ValuationMethod {
+	return []ValuationMethod{
+		ValuationMethodFIFO,
+		ValuationMethodLIFO,
+		ValuationMethodWeightedAverage,
+		ValuationMethodStandardCost,
+	}
+}
+
+// IsValid checks if the valuation method is valid.
+func (v ValuationMethod) IsValid() bool {
+	switch v {
+	case ValuationMethodFIFO, ValuationMethodLIFO, ValuationMethodWeightedAverage, ValuationMethodStandardCost:
+		return true
+	}
+	return false
+}
+
+func (v ValuationMethod) String() string {
+	return string(v)
+}
+
+

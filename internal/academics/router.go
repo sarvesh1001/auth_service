@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 )
 
+// RegisterAcademicRoutes registers all academic-related routes with their permission middleware.
 func RegisterAcademicRoutes(
 	r chi.Router,
 	academicYearHandler *handler.AcademicYearHandler,
@@ -29,7 +30,6 @@ func RegisterAcademicRoutes(
 	sectionHandler *handler.SectionHandler,
 	logger *zap.Logger,
 	jwtService *service.JWTService,
-	// New handlers
 	studentHandler *handler.StudentHandler,
 	subjectHandler *handler.SubjectHandler,
 	submissionHandler *handler.SubmissionHandler,
@@ -37,11 +37,11 @@ func RegisterAcademicRoutes(
 	termHandler *handler.TermHandler,
 	timetableHandler *handler.TimetableHandler,
 	transportHandler *handler.TransportHandler,
+	sessionGenerationHandler *handler.SessionGenerationHandler,
+	studentBiometricSyncHandler *handler.StudentBiometricSyncHandler, // <-- NEW
 ) {
 	r.Route("/academics", func(r chi.Router) {
-		// ========== Existing routes (unchanged) ==========
-
-		// Existing routes for academic-years
+		// ========== Academic Years ==========
 		r.Route("/academic-years", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.academic_year.read", logger)).
 				Get("/", academicYearHandler.List)
@@ -59,8 +59,6 @@ func RegisterAcademicRoutes(
 				Post("/upsert", academicYearHandler.Upsert)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.academic_year.read", logger)).
 				Post("/validate-overlap", academicYearHandler.ValidateOverlap)
-
-			// 👇 Added missing routes (must be before /{id})
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.academic_year.read", logger)).
 				Get("/by-name", academicYearHandler.GetByName)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.academic_year.read", logger)).
@@ -79,7 +77,8 @@ func RegisterAcademicRoutes(
 					Delete("/", academicYearHandler.Delete)
 			})
 		})
-		// Existing routes for admissions
+
+		// ========== Admissions ==========
 		r.Route("/admissions", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.admission.read", logger)).
 				Get("/", admissionHandler.List)
@@ -99,7 +98,6 @@ func RegisterAcademicRoutes(
 			})
 		})
 
-		// Existing routes for students/admissions
 		r.Route("/students/{studentID}/admissions", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.admission.read", logger)).
 				Get("/", admissionHandler.GetByStudentID)
@@ -107,13 +105,12 @@ func RegisterAcademicRoutes(
 				Get("/academic-years/{academicYearID}", admissionHandler.GetByStudentAndYear)
 		})
 
-		// Existing routes for academic-years/admissions
 		r.Route("/academic-years/{academicYearID}/admissions", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.admission.read", logger)).
 				Get("/", admissionHandler.GetByAcademicYearID)
 		})
 
-		// Existing routes for assignments
+		// ========== Assignments ==========
 		r.Route("/assignments", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.assignment.read", logger)).
 				Get("/", assignmentHandler.List)
@@ -133,8 +130,9 @@ func RegisterAcademicRoutes(
 			})
 		})
 
-		// Existing routes for analytics
+		// ========== ANALYTICS ==========
 		r.Route("/analytics", func(r chi.Router) {
+			// Academic Year Metrics
 			r.Route("/academic-years", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetAcademicYearMetrics)
@@ -145,36 +143,48 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/refresh-all", analyticsHandler.RefreshAllAcademicYearMetrics)
 			})
+
+			// Exam Metrics
 			r.Route("/exams", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetExamMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/metrics", analyticsHandler.ListExamMetrics)
 			})
+
+			// Fee Metrics
 			r.Route("/fees", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetFeeMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/metrics", analyticsHandler.ListFeeMetrics)
 			})
+
+			// Grading Metrics
 			r.Route("/grading", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetGradingMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/metrics", analyticsHandler.ListGradingMetrics)
 			})
+
+			// Guardian Metrics
 			r.Route("/guardians", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetGuardianMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/metrics", analyticsHandler.ListGuardianMetrics)
 			})
+
+			// Library Metrics
 			r.Route("/library", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetLibraryMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/metrics", analyticsHandler.ListLibraryMetrics)
 			})
+
+			// Room Metrics
 			r.Route("/rooms", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetRoomMetrics)
@@ -183,14 +193,8 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshRoomMetrics)
 			})
-			r.Route("/sections", func(r chi.Router) {
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
-					Get("/{academicYearID}/metrics", analyticsHandler.GetSectionMetrics)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
-					Get("/metrics", analyticsHandler.ListSectionMetrics)
-				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
-					Post("/{academicYearID}/refresh", analyticsHandler.RefreshSectionMetrics)
-			})
+
+			// Students Metrics
 			r.Route("/students", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetStudentMetrics)
@@ -198,7 +202,31 @@ func RegisterAcademicRoutes(
 					Get("/metrics", analyticsHandler.ListStudentMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshStudentMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/{studentID}/academic-years/{academicYearID}/session-summary", analyticsHandler.GetStudentSessionSummary)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/session-summaries", analyticsHandler.ListStudentSessionSummaries)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
+					Post("/{studentID}/academic-years/{academicYearID}/session-summary/refresh", analyticsHandler.RefreshStudentSessionSummary)
 			})
+
+			// Sections Metrics
+			r.Route("/sections", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/{academicYearID}/metrics", analyticsHandler.GetSectionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/metrics", analyticsHandler.ListSectionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
+					Post("/{academicYearID}/refresh", analyticsHandler.RefreshSectionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/{sectionID}/session-metrics", analyticsHandler.GetSectionSessionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/session-metrics", analyticsHandler.ListSectionSessionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
+					Post("/{sectionID}/session-metrics/refresh", analyticsHandler.RefreshSectionSessionMetrics)
+			})
+
+			// Subject Metrics
 			r.Route("/subjects", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetSubjectMetrics)
@@ -207,6 +235,8 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshSubjectMetrics)
 			})
+
+			// Submission Metrics
 			r.Route("/submissions", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetSubmissionMetrics)
@@ -215,6 +245,8 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshSubmissionMetrics)
 			})
+
+			// Teachers Metrics
 			r.Route("/teachers", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetTeacherMetrics)
@@ -222,7 +254,15 @@ func RegisterAcademicRoutes(
 					Get("/metrics", analyticsHandler.ListTeacherMetrics)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshTeacherMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/{teacherID}/academic-years/{academicYearID}/session-metrics", analyticsHandler.GetTeacherSessionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/session-metrics", analyticsHandler.ListTeacherSessionMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
+					Post("/{teacherID}/academic-years/{academicYearID}/session-metrics/refresh", analyticsHandler.RefreshTeacherSessionMetrics)
 			})
+
+			// Timetable Metrics
 			r.Route("/timetables", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetTimetableMetrics)
@@ -231,6 +271,8 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshTimetableMetrics)
 			})
+
+			// Transport Metrics
 			r.Route("/transport", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
 					Get("/{academicYearID}/metrics", analyticsHandler.GetTransportMetrics)
@@ -239,10 +281,21 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
 					Post("/{academicYearID}/refresh", analyticsHandler.RefreshTransportMetrics)
 			})
+
+			// Biometric Device Usage Metrics
+			r.Route("/biometric-usage", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/", analyticsHandler.GetBiometricUsageMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.read", logger)).
+					Get("/list", analyticsHandler.ListBiometricUsageMetrics)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.analytics.write", logger)).
+					Post("/refresh", analyticsHandler.RefreshBiometricUsageMetrics)
+			})
 		})
 
-		// --- Existing Routes for Attendance ---
+		// ========== Attendance ==========
 		r.Route("/attendance", func(r chi.Router) {
+			// Full‑day attendance
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.mark", logger)).
 				Post("/", attendanceHandler.MarkAttendance)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.bulk_mark", logger)).
@@ -253,6 +306,7 @@ func RegisterAcademicRoutes(
 				Get("/", attendanceHandler.List)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.delete", logger)).
 				Delete("/{attendanceID}", attendanceHandler.Delete)
+
 			r.Route("/students/{studentID}/academic-years/{academicYearID}", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
 					Get("/summary", attendanceHandler.GetSummary)
@@ -261,6 +315,8 @@ func RegisterAcademicRoutes(
 			})
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.recalculate", logger)).
 				Post("/recalculate/bulk", attendanceHandler.BulkRecalcSummaries)
+
+			// Exemptions
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
 				Post("/exemptions", attendanceHandler.CreateExemption)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
@@ -269,9 +325,41 @@ func RegisterAcademicRoutes(
 				Delete("/exemptions/{exemptionID}", attendanceHandler.DeleteExemption)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
 				Get("/exemptions", attendanceHandler.ListExemptions)
+
+			// Period attendance
+			r.Route("/period", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.mark", logger)).
+					Post("/", attendanceHandler.MarkPeriodAttendance)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.bulk_mark", logger)).
+					Post("/sessions/{sessionID}/bulk", attendanceHandler.BulkMarkPeriodAttendance)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+					Get("/sessions/{sessionID}", attendanceHandler.GetSessionAttendance)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+					Get("/sessions/{sessionID}/students/{enrollmentID}", attendanceHandler.GetStudentPeriodAttendance)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+					Get("/teachers/{teacherID}/sessions", attendanceHandler.GetTeacherSessions)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+					Get("/sections/{sectionID}/sessions", attendanceHandler.GetSectionSessions)
+			})
+
+			// Biometric
+			r.Route("/biometric", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+					Post("/mappings", attendanceHandler.CreateBiometricMapping)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+					Get("/mappings/{mappingID}", attendanceHandler.GetBiometricMappingByID)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+					Get("/mappings", attendanceHandler.ListBiometricMappings)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+					Put("/mappings/{mappingID}", attendanceHandler.UpdateBiometricMapping)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+					Delete("/mappings/{mappingID}", attendanceHandler.DeleteBiometricMapping)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+					Post("/students/{studentID}/deactivate", attendanceHandler.DeactivateStudentBiometricMappings)
+			})
 		})
 
-		// --- Existing Routes for Courses ---
+		// ========== Courses ==========
 		r.Route("/courses", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.course.create", logger)).
 				Post("/", courseHandler.Create)
@@ -292,19 +380,19 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.course.read", logger)).
 				Get("/active", courseHandler.ListActive)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.course.read", logger)).
-				Get("/by-code", courseHandler.GetByCode) // expects code query param
+				Get("/by-code", courseHandler.GetByCode)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.course.read", logger)).
 				Post("/validate-code", courseHandler.ValidateUniqueCode)
 		})
 
-		// --- Existing Routes for Curriculum ---
+		// ========== Curriculum ==========
 		r.Route("/curriculum", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.assign", logger)).
 				Post("/courses/{courseID}/subjects", curriculumHandler.AssignSubject)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.bulk_assign", logger)).
 				Post("/subjects/bulk", curriculumHandler.BulkAssignSubjects)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.read", logger)).
-				Get("/courses/{courseID}/subjects", curriculumHandler.GetSubjectsByCourse) // term_number query param
+				Get("/courses/{courseID}/subjects", curriculumHandler.GetSubjectsByCourse)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.read", logger)).
 				Get("/subjects/{subjectID}/courses", curriculumHandler.GetCoursesBySubject)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.remove", logger)).
@@ -312,12 +400,12 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.remove_all", logger)).
 				Delete("/courses/{courseID}/subjects", curriculumHandler.RemoveAllForCourse)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.read", logger)).
-				Get("/exists", curriculumHandler.Exists) // expects subject_id, term_number query params
+				Get("/exists", curriculumHandler.Exists)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.curriculum.validate", logger)).
 				Post("/courses/{courseID}/validate", curriculumHandler.ValidateCurriculum)
 		})
 
-		// --- Existing Routes for Enrollments ---
+		// ========== Enrollments ==========
 		r.Route("/enrollments", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.enrollment.create", logger)).
 				Post("/", enrollmentHandler.EnrollStudent)
@@ -373,7 +461,6 @@ func RegisterAcademicRoutes(
 				Patch("/{enrollmentID}/status", enrollmentHandler.UpdateStatus)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.enrollment.read", logger)).
 				Get("/count", enrollmentHandler.Count)
-			// Additional endpoints from the handler
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.enrollment.read", logger)).
 				Get("/students/{studentID}", enrollmentHandler.ListByStudent)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.enrollment.read", logger)).
@@ -386,7 +473,7 @@ func RegisterAcademicRoutes(
 				Get("/students/{studentID}/active", enrollmentHandler.GetActiveByStudent)
 		})
 
-		// --- Existing Routes for Exams ---
+		// ========== Exams ==========
 		r.Route("/exams", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.exam.create", logger)).
 				Post("/", examHandler.CreateExam)
@@ -432,7 +519,7 @@ func RegisterAcademicRoutes(
 				Delete("/grades/{gradeID}", examHandler.DeleteExamGrade)
 		})
 
-		// --- Existing Routes for Fees ---
+		// ========== Fees ==========
 		r.Route("/fees", func(r chi.Router) {
 			r.Route("/structures", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.fee.structure.create", logger)).
@@ -463,7 +550,6 @@ func RegisterAcademicRoutes(
 					Get("/", feeHandler.ListInvoices)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.fee.invoice.update", logger)).
 					Patch("/{invoiceID}/status", feeHandler.UpdateInvoiceStatus)
-				// ✅ NEW: Get payments by invoice ID
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.fee.payment.read", logger)).
 					Get("/{invoiceID}/payments", feeHandler.GetPaymentsByInvoice)
 			})
@@ -472,7 +558,6 @@ func RegisterAcademicRoutes(
 					Post("/", feeHandler.CreatePayment)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.fee.payment.read", logger)).
 					Get("/{paymentID}", feeHandler.GetPayment)
-				// Optional: keep or remove the alternative route
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.fee.payment.read", logger)).
 					Get("/invoices/{invoiceID}/payments", feeHandler.GetPaymentsByInvoice)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.fee.payment.read", logger)).
@@ -499,7 +584,8 @@ func RegisterAcademicRoutes(
 					Get("/{receiptNo}", feeHandler.GetReceiptByNumber)
 			})
 		})
-		// --- Existing Routes for Grading ---
+
+		// ========== Grading ==========
 		r.Route("/grading", func(r chi.Router) {
 			r.Route("/policies", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.grading.policy.create", logger)).
@@ -535,7 +621,7 @@ func RegisterAcademicRoutes(
 			})
 		})
 
-		// --- Existing Routes for Guardians ---
+		// ========== Guardians ==========
 		r.Route("/guardians", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.guardian.create", logger)).
 				Post("/", guardianHandler.Create)
@@ -555,11 +641,11 @@ func RegisterAcademicRoutes(
 				Delete("/{guardianID}", guardianHandler.Delete)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.guardian.set_primary", logger)).
 				Post("/students/{studentID}/primary/{guardianID}", guardianHandler.SetPrimary)
-			// ✅ Updated: include studentID in the path
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.guardian.read", logger)).
 				Get("/students/{studentID}/exists", guardianHandler.Exists)
 		})
-		// --- Existing Routes for Library ---
+
+		// ========== Library ==========
 		r.Route("/library", func(r chi.Router) {
 			r.Route("/categories", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("academics.library.category.create", logger)).
@@ -624,7 +710,7 @@ func RegisterAcademicRoutes(
 			r.Get("/students/{studentID}/overdue", libraryHandler.HasOverdueIssues)
 		})
 
-		// --- Existing Routes for Notifications ---
+		// ========== Notifications ==========
 		r.Route("/notifications", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.create", logger)).
 				Post("/", notificationHandler.Create)
@@ -635,13 +721,13 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.delete", logger)).
 				Delete("/{notificationID}", notificationHandler.Delete)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.read", logger)).
-				Get("/user", notificationHandler.ListUserNotifications) // expects types, priorities, etc.
+				Get("/user", notificationHandler.ListUserNotifications)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.read", logger)).
 				Post("/{notificationID}/read", notificationHandler.MarkAsRead)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.read", logger)).
 				Post("/read-all", notificationHandler.MarkAllAsRead)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.read", logger)).
-				Get("/read-statuses", notificationHandler.GetReadStatuses) // expects ids query
+				Get("/read-statuses", notificationHandler.GetReadStatuses)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.read", logger)).
 				Get("/counts", notificationHandler.GetCounts)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.notification.read", logger)).
@@ -656,7 +742,7 @@ func RegisterAcademicRoutes(
 				Get("/{notificationID}/read-count", notificationHandler.GetReadCount)
 		})
 
-		// --- Existing Routes for Rooms ---
+		// ========== Rooms ==========
 		r.Route("/rooms", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.room.create", logger)).
 				Post("/", roomHandler.Create)
@@ -680,7 +766,7 @@ func RegisterAcademicRoutes(
 				Get("/buildings/{building}", roomHandler.ListByBuilding)
 		})
 
-		// --- Existing Routes for Sections ---
+		// ========== Sections (CRUD) ==========
 		r.Route("/sections", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.section.create", logger)).
 				Post("/", sectionHandler.Create)
@@ -708,9 +794,7 @@ func RegisterAcademicRoutes(
 				Post("/{sectionID}/validate-capacity", sectionHandler.ValidateCapacity)
 		})
 
-		// ========== NEW ROUTES (with corrected dot notation) ==========
-
-		// --- Students ---
+		// ========== Students (CRUD + login) ==========
 		r.Route("/students", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("student.create", logger)).
 				Post("/", studentHandler.Create)
@@ -743,20 +827,17 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("student.delete", logger)).
 				Delete("/{studentID}", studentHandler.Delete)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("student.read", logger)).
-				Get("/validate-admission", studentHandler.ValidateAdmissionNumber) // expects admission_no query
+				Get("/validate-admission", studentHandler.ValidateAdmissionNumber)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("student.read", logger)).
-				Get("/search", studentHandler.Search) // expects q query
-			// Login is public, no permission middleware
-			// r.Post("/login", studentHandler.Login)
+				Get("/search", studentHandler.Search)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("student.set_password", logger)).
 				Post("/{studentID}/set-password", studentHandler.SetPassword)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("student.reset_password", logger)).
 				Post("/{studentID}/reset-password", studentHandler.ResetPassword)
-				// Change password uses the logged-in student
 			r.Post("/change-password", studentHandler.ChangePassword)
 		})
 
-		// --- Subjects ---
+		// ========== Subjects ==========
 		r.Route("/subjects", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("subject.create", logger)).
 				Post("/", subjectHandler.Create)
@@ -777,40 +858,30 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("subject.delete", logger)).
 				Delete("/{subjectID}", subjectHandler.Delete)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("subject.read", logger)).
-				Get("/validate-code", subjectHandler.ValidateCode) // expects code query
+				Get("/validate-code", subjectHandler.ValidateCode)
 		})
 
-		// --- Submissions ---
+		// ========== Submissions ==========
 		r.Route("/submissions", func(r chi.Router) {
-			// Create submission under an assignment
 			r.Route("/assignments/{assignmentID}/submissions", func(r chi.Router) {
 				r.Post("/", submissionHandler.CreateSubmission)
 			})
-
-			// Student endpoints – no permission middleware (auth only)
 			r.Get("/{submissionID}", submissionHandler.GetSubmissionByID)
 			r.Get("/assignments/{assignmentID}/students/{studentID}/submission", submissionHandler.GetSubmissionByAssignmentAndStudent)
-
-			// Teacher/Admin endpoints – keep permission middleware
 			r.With(authMiddleware.BitmaskPermissionMiddleware("submission.read", logger)).
 				Get("/", submissionHandler.ListSubmissions)
-
-			// Student update – no permission middleware (already removed)
 			r.Put("/{submissionID}", submissionHandler.UpdateSubmission)
-
-			// Teacher/Admin only
 			r.With(authMiddleware.BitmaskPermissionMiddleware("submission.delete", logger)).
 				Delete("/{submissionID}", submissionHandler.DeleteSubmission)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("submission.grade", logger)).
 				Post("/{submissionID}/grade", submissionHandler.GradeSubmission)
-
-			// Comments – student accessible (no permission middleware)
 			r.Route("/{submissionID}/comments", func(r chi.Router) {
 				r.Post("/", submissionHandler.AddComment)
 				r.Get("/", submissionHandler.GetCommentsBySubmission)
 			})
 		})
-		// --- Teachers ---
+
+		// ========== Teachers ==========
 		r.Route("/teachers", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.create", logger)).
 				Post("/", teacherHandler.Create)
@@ -835,7 +906,6 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.read", logger)).
 				Get("/count", teacherHandler.CountByCompany)
 
-			// Subjects
 			r.Route("/{teacherID}/subjects", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.manage_subjects", logger)).
 					Post("/", teacherHandler.AddSubject)
@@ -851,7 +921,6 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.read", logger)).
 				Get("/subjects/{subjectID}/teachers", teacherHandler.GetTeachersBySubject)
 
-			// Sections
 			r.Route("/{teacherID}/sections", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.manage_sections", logger)).
 					Post("/", teacherHandler.AddSection)
@@ -867,7 +936,6 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.read", logger)).
 				Get("/sections/{sectionID}/teachers", teacherHandler.GetTeachersBySection)
 
-			// Schedule preferences
 			r.Route("/{teacherID}/schedule-preferences", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("teacher.manage_preferences", logger)).
 					Post("/", teacherHandler.SetSchedulePreference)
@@ -884,7 +952,7 @@ func RegisterAcademicRoutes(
 			})
 		})
 
-		// --- Terms (nested under academic years) ---
+		// ========== Terms ==========
 		r.Route("/academic-years/{academicYearID}/terms", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("term.create", logger)).
 				Post("/", termHandler.Create)
@@ -893,7 +961,6 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("term.read", logger)).
 				Get("/current", termHandler.GetCurrent)
 		})
-		// Additional term routes not tied to a specific academic year
 		r.Route("/terms", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("term.read", logger)).
 				Get("/{termID}", termHandler.GetByID)
@@ -907,7 +974,7 @@ func RegisterAcademicRoutes(
 				Delete("/{termID}", termHandler.Delete)
 		})
 
-		// --- Timetables ---
+		// ========== Timetables ==========
 		r.Route("/timetables", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("timetable.create", logger)).
 				Post("/", timetableHandler.CreateTimetable)
@@ -920,9 +987,8 @@ func RegisterAcademicRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("timetable.delete", logger)).
 				Delete("/{timetableID}", timetableHandler.DeleteTimetable)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("timetable.read", logger)).
-				Get("/active", timetableHandler.GetActiveTimetableForSection) // expects term_id, section_id
+				Get("/active", timetableHandler.GetActiveTimetableForSection)
 
-			// Slots
 			r.Route("/{timetableID}/slots", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("timetable.manage_slots", logger)).
 					Post("/", timetableHandler.AddSlot)
@@ -936,7 +1002,6 @@ func RegisterAcademicRoutes(
 					Delete("/", timetableHandler.RemoveSlot)
 			})
 
-			// Entries
 			r.Route("/slots/{slotID}/entries", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("timetable.manage_entries", logger)).
 					Post("/", timetableHandler.AddEntry)
@@ -950,7 +1015,6 @@ func RegisterAcademicRoutes(
 					Delete("/", timetableHandler.RemoveEntry)
 			})
 
-			// Changes
 			r.Route("/entries/{entryID}/changes", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("timetable.manage_changes", logger)).
 					Post("/", timetableHandler.AddChange)
@@ -959,9 +1023,8 @@ func RegisterAcademicRoutes(
 			})
 		})
 
-		// --- Transport ---
+		// ========== Transport ==========
 		r.Route("/transport", func(r chi.Router) {
-			// Routes
 			r.Route("/routes", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.route.create", logger)).
 					Post("/", transportHandler.CreateRoute)
@@ -974,8 +1037,6 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.route.delete", logger)).
 					Delete("/{routeID}", transportHandler.DeleteRoute)
 			})
-
-			// Stops
 			r.Route("/stops", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.stop.read", logger)).
 					Get("/", transportHandler.ListStops)
@@ -986,13 +1047,10 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.stop.delete", logger)).
 					Delete("/{stopID}", transportHandler.DeleteStop)
 			})
-			// Stops under a route
 			r.Route("/routes/{routeID}/stops", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.stop.create", logger)).
 					Post("/", transportHandler.CreateStop)
 			})
-
-			// Vehicles
 			r.Route("/vehicles", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.vehicle.create", logger)).
 					Post("/", transportHandler.CreateVehicle)
@@ -1005,8 +1063,6 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.vehicle.delete", logger)).
 					Delete("/{vehicleID}", transportHandler.DeleteVehicle)
 			})
-
-			// Driver assignments
 			r.Route("/driver-assignments", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.driver.read", logger)).
 					Get("/", transportHandler.ListDriverAssignments)
@@ -1021,8 +1077,6 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.driver.create", logger)).
 					Post("/", transportHandler.CreateDriverAssignment)
 			})
-
-			// Student assignments
 			r.Route("/student-assignments", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.student_assignment.create", logger)).
 					Post("/", transportHandler.CreateStudentAssignment)
@@ -1035,6 +1089,48 @@ func RegisterAcademicRoutes(
 				r.With(authMiddleware.BitmaskPermissionMiddleware("transport.student_assignment.delete", logger)).
 					Delete("/{assignmentID}", transportHandler.DeleteStudentAssignment)
 			})
+		})
+
+		// ========== Session Generation ==========
+		r.Route("/sessions", func(r chi.Router) {
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.recalculate", logger)).
+				Post("/generate", sessionGenerationHandler.GenerateSessions)
+		})
+
+		// ========== Student Face Embeddings (CRUD) ==========
+		// These endpoints are for admin/staff to manage student face embeddings.
+		// They are protected by user JWT (outer middleware) and require specific permissions.
+		// ========== Student Face Embeddings (CRUD) ==========
+		// These endpoints are for admin/staff to manage student face embeddings.
+		// They are protected by user JWT (outer middleware) and require existing permissions.
+		r.Route("/face-embeddings", func(r chi.Router) {
+			// Create a new face embedding
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+				Post("/", studentBiometricSyncHandler.CreateStudentFaceEmbedding)
+
+			// Update an existing face embedding
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+				Put("/{embeddingID}", studentBiometricSyncHandler.UpdateStudentFaceEmbedding)
+
+			// Soft‑delete a face embedding
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+				Delete("/{embeddingID}", studentBiometricSyncHandler.DeleteStudentFaceEmbedding)
+
+			// Get a face embedding by ID
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+				Get("/{embeddingID}", studentBiometricSyncHandler.GetStudentFaceEmbedding)
+
+			// List face embeddings with filters & pagination
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+				Get("/", studentBiometricSyncHandler.ListStudentFaceEmbeddings)
+
+			// Deactivate all embeddings for a student (e.g., when re‑enrolling)
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.manage_exemptions", logger)).
+				Post("/students/{studentID}/deactivate", studentBiometricSyncHandler.DeactivateEmbeddingsForStudent)
+
+			// Get active embedding for a student
+			r.With(authMiddleware.BitmaskPermissionMiddleware("academics.attendance.read", logger)).
+				Get("/students/{studentID}/active", studentBiometricSyncHandler.GetActiveStudentFaceEmbeddingByStudent)
 		})
 	})
 }

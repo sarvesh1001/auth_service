@@ -1,0 +1,639 @@
+
+================================================================================
+FILE: ./models/payment_allocation.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type PaymentAllocation struct {
+	AllocationID uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"allocationId"`
+	PaymentID    uuid.UUID `gorm:"type:uuid;not null" json:"paymentId"`
+	InvoiceID    uuid.UUID `gorm:"type:uuid;not null" json:"invoiceId"`
+	Amount       float64   `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
+	CreatedAt    time.Time `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/order.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Order struct {
+	OrderID            uuid.UUID         `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderId"`
+	CompanyID          uuid.UUID         `gorm:"type:uuid;not null" json:"companyId"`
+	CustomerID         uuid.UUID         `gorm:"type:uuid;not null" json:"customerId"`
+	OrderNumber        string            `gorm:"type:varchar(50);not null" json:"orderNumber"`
+	ExternalRef        *string           `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
+	OrderDate          time.Time         `gorm:"type:date;not null" json:"orderDate"`
+	Status             enums.OrderStatus `gorm:"type:order_status;not null;default:'draft'" json:"status"`
+	Currency           string            `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	Subtotal           float64           `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
+	DiscountTotal      float64           `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
+	TaxTotal           float64           `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
+	GrandTotal         float64           `gorm:"->;-:migration" json:"grandTotal"` // generated
+	Notes              *string           `gorm:"type:text" json:"notes,omitempty"`
+	ShippingAddress    JSONB             `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
+	BillingAddress     JSONB             `gorm:"type:jsonb" json:"billingAddress,omitempty"`
+	ConfirmedAt        *time.Time        `gorm:"type:timestamptz" json:"confirmedAt,omitempty"`
+	ShippedAt          *time.Time        `gorm:"type:timestamptz" json:"shippedAt,omitempty"`
+	DeliveredAt        *time.Time        `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
+	CancelledAt        *time.Time        `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+	CancellationReason *string           `gorm:"type:text" json:"cancellationReason,omitempty"`
+	CreatedAt          time.Time         `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt          time.Time         `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy          *uuid.UUID        `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy          *uuid.UUID        `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/tax_snapshot.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type TaxSnapshot struct {
+	TaxSnapshotID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"taxSnapshotId"`
+	CompanyID     uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	EntityType    string     `gorm:"type:varchar(20);not null" json:"entityType"`
+	EntityID      uuid.UUID  `gorm:"type:uuid;not null" json:"entityId"`
+	LineID        *uuid.UUID `gorm:"type:uuid" json:"lineId,omitempty"`
+	TaxRateID     *uuid.UUID `gorm:"type:uuid" json:"taxRateId,omitempty"`
+	TaxName       *string    `gorm:"type:varchar(100)" json:"taxName,omitempty"`
+	TaxPercentage *float64   `gorm:"type:numeric(5,2)" json:"taxPercentage,omitempty"`
+	TaxableAmount float64    `gorm:"type:numeric(14,4);not null" json:"taxableAmount"`
+	TaxAmount     float64    `gorm:"type:numeric(14,4);not null" json:"taxAmount"`
+	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/invoice.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Invoice struct {
+	InvoiceID     uuid.UUID           `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"invoiceId"`
+	CompanyID     uuid.UUID           `gorm:"type:uuid;not null" json:"companyId"`
+	OrderID       *uuid.UUID          `gorm:"type:uuid" json:"orderId,omitempty"`
+	CustomerID    uuid.UUID           `gorm:"type:uuid;not null" json:"customerId"`
+	InvoiceNumber string              `gorm:"type:varchar(50);not null" json:"invoiceNumber"`
+	ExternalRef   *string             `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
+	InvoiceDate   time.Time           `gorm:"type:date;not null" json:"invoiceDate"`
+	DueDate       time.Time           `gorm:"type:date;not null" json:"dueDate"`
+	Status        enums.InvoiceStatus `gorm:"type:invoice_status;not null;default:'draft'" json:"status"`
+	Currency      string              `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	ExchangeRate  *float64            `gorm:"type:numeric(14,6);default:1" json:"exchangeRate,omitempty"`
+	Subtotal      float64             `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
+	DiscountTotal float64             `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
+	TaxTotal      float64             `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
+	GrandTotal    float64             `gorm:"->;-:migration" json:"grandTotal"` // generated
+	AmountPaid    float64             `gorm:"type:numeric(14,4);not null;default:0" json:"amountPaid"`
+	AmountDue     float64             `gorm:"type:numeric(14,4);not null;default:0" json:"amountDue"`
+	Notes         *string             `gorm:"type:text" json:"notes,omitempty"`
+	IsLocked      bool                `gorm:"default:false" json:"isLocked"`
+	IssuedAt      *time.Time          `gorm:"type:timestamptz" json:"issuedAt,omitempty"`
+	PaidAt        *time.Time          `gorm:"type:timestamptz" json:"paidAt,omitempty"`
+	CancelledAt   *time.Time          `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+	CreatedAt     time.Time           `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time           `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy     *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy     *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/payment.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Payment struct {
+	PaymentID       uuid.UUID           `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"paymentId"`
+	CompanyID       uuid.UUID           `gorm:"type:uuid;not null" json:"companyId"`
+	PaymentNumber   string              `gorm:"type:varchar(50);not null" json:"paymentNumber"`
+	ExternalRef     *string             `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
+	PaymentDate     time.Time           `gorm:"type:date;not null" json:"paymentDate"`
+	Amount          float64             `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
+	PaymentMethod   enums.PaymentMethod `gorm:"type:payment_method;not null" json:"paymentMethod"`
+	Status          enums.PaymentStatus `gorm:"type:payment_status;not null;default:'pending'" json:"status"`
+	ExchangeRate    *float64            `gorm:"type:numeric(14,6);default:1" json:"exchangeRate,omitempty"`
+	Reference       *string             `gorm:"type:varchar(100)" json:"reference,omitempty"`
+	GatewayResponse JSONB               `gorm:"type:jsonb" json:"gatewayResponse,omitempty"`
+	FailureReason   *string             `gorm:"type:text" json:"failureReason,omitempty"`
+	CompletedAt     *time.Time          `gorm:"type:timestamptz" json:"completedAt,omitempty"`
+	RefundedAmount  *float64            `gorm:"type:numeric(14,4);default:0" json:"refundedAmount,omitempty"`
+	CreatedAt       time.Time           `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time           `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy       *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy       *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/return_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type ReturnItem struct {
+	ReturnItemID     uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnItemId"`
+	ReturnID         uuid.UUID  `gorm:"type:uuid;not null" json:"returnId"`
+	OrderItemID      *uuid.UUID `gorm:"type:uuid" json:"orderItemId,omitempty"`
+	ItemID           uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
+	ItemNameSnapshot string     `gorm:"type:varchar(255);not null" json:"itemNameSnapshot"`
+	Quantity         float64    `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice        float64    `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	RefundAmount     float64    `gorm:"type:numeric(14,4);not null" json:"refundAmount"`
+	Reason           *string    `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/return.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Return struct {
+	ReturnID     uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnId"`
+	CompanyID    uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	OrderID      uuid.UUID  `gorm:"type:uuid;not null" json:"orderId"`
+	InvoiceID    *uuid.UUID `gorm:"type:uuid" json:"invoiceId,omitempty"`
+	CreditNoteID *uuid.UUID `gorm:"type:uuid" json:"creditNoteId,omitempty"`
+	ReturnNumber string     `gorm:"type:varchar(50);not null" json:"returnNumber"`
+	ReturnDate   time.Time  `gorm:"type:date;not null" json:"returnDate"`
+	Reason       *string    `gorm:"type:text" json:"reason,omitempty"`
+	Status       string     `gorm:"type:varchar(20);not null;default:'pending'" json:"status"`
+	TotalRefund  float64    `gorm:"type:numeric(14,4);not null;default:0" json:"totalRefund"`
+	ApprovedAt   *time.Time `gorm:"type:timestamptz" json:"approvedAt,omitempty"`
+	CompletedAt  *time.Time `gorm:"type:timestamptz" json:"completedAt,omitempty"`
+	CreatedAt    time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt    time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy    *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy    *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/invoice_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type InvoiceItem struct {
+	InvoiceItemID    uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"invoiceItemId"`
+	InvoiceID        uuid.UUID  `gorm:"type:uuid;not null" json:"invoiceId"`
+	ItemID           *uuid.UUID `gorm:"type:uuid" json:"itemId,omitempty"`
+	ItemNameSnapshot string     `gorm:"type:varchar(255);not null" json:"itemNameSnapshot"`
+	Quantity         float64    `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice        float64    `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount   *float64   `gorm:"type:numeric(14,4);default:0" json:"discountAmount,omitempty"`
+	TaxAmount        *float64   `gorm:"type:numeric(14,4);default:0" json:"taxAmount,omitempty"`
+	TotalPrice       float64    `gorm:"->;-:migration" json:"totalPrice"` // generated
+	Metadata         JSONB      `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/order_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type OrderItem struct {
+	OrderItemID      uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderItemId"`
+	OrderID          uuid.UUID `gorm:"type:uuid;not null" json:"orderId"`
+	ItemID           uuid.UUID `gorm:"type:uuid;not null" json:"itemId"`
+	ItemNameSnapshot string    `gorm:"type:varchar(255);not null" json:"itemNameSnapshot"`
+	Quantity         float64   `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice        float64   `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount   *float64  `gorm:"type:numeric(14,4);default:0" json:"discountAmount,omitempty"`
+	TaxAmount        *float64  `gorm:"type:numeric(14,4);default:0" json:"taxAmount,omitempty"`
+	TotalPrice       float64   `gorm:"->;-:migration" json:"totalPrice"` // generated
+	Metadata         JSONB     `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt        time.Time `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/customer.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Customer struct {
+	CustomerID      uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"customerId"`
+	CompanyID       uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	CustomerCode    string     `gorm:"type:varchar(50);not null" json:"customerCode"`
+	Name            string     `gorm:"type:varchar(255);not null" json:"name"`
+	Email           *string    `gorm:"type:varchar(255)" json:"email,omitempty"`
+	Phone           *string    `gorm:"type:varchar(50)" json:"phone,omitempty"`
+	TaxID           *string    `gorm:"type:varchar(100)" json:"taxId,omitempty"`
+	BillingAddress  JSONB      `gorm:"type:jsonb" json:"billingAddress,omitempty"`
+	ShippingAddress JSONB      `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
+	CreditLimit     *float64   `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
+	IsActive        bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy       *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy       *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+// JSONB is a helper type for PostgreSQL jsonb; you can use datatypes.JSON from gorm.io/datatypes
+type JSONB map[string]interface{}
+
+
+
+================================================================================
+FILE: ./models/enums/invoice_status.go
+================================================================================
+
+package enums
+
+type InvoiceStatus string
+
+const (
+	InvoiceStatusDraft     InvoiceStatus = "draft"
+	InvoiceStatusIssued    InvoiceStatus = "issued"
+	InvoiceStatusPaid      InvoiceStatus = "paid"
+	InvoiceStatusOverdue   InvoiceStatus = "overdue"
+	InvoiceStatusCancelled InvoiceStatus = "cancelled"
+	InvoiceStatusCredited  InvoiceStatus = "credited"
+)
+
+func (s InvoiceStatus) IsValid() bool {
+	switch s {
+	case InvoiceStatusDraft, InvoiceStatusIssued, InvoiceStatusPaid,
+		InvoiceStatusOverdue, InvoiceStatusCancelled, InvoiceStatusCredited:
+		return true
+	}
+	return false
+}
+
+func (s InvoiceStatus) String() string { return string(s) }
+
+
+
+================================================================================
+FILE: ./models/enums/payment_method.go
+================================================================================
+
+package enums
+
+type PaymentMethod string
+
+const (
+	PaymentMethodCash          PaymentMethod = "cash"
+	PaymentMethodCard          PaymentMethod = "card"
+	PaymentMethodBankTransfer  PaymentMethod = "bank_transfer"
+	PaymentMethodDigitalWallet PaymentMethod = "digital_wallet"
+	PaymentMethodCoupon        PaymentMethod = "coupon"
+	PaymentMethodOther         PaymentMethod = "other"
+)
+
+func (m PaymentMethod) IsValid() bool {
+	switch m {
+	case PaymentMethodCash, PaymentMethodCard, PaymentMethodBankTransfer,
+		PaymentMethodDigitalWallet, PaymentMethodCoupon, PaymentMethodOther:
+		return true
+	}
+	return false
+}
+
+func (m PaymentMethod) String() string { return string(m) }
+
+
+
+================================================================================
+FILE: ./models/enums/payment_status.go
+================================================================================
+
+package enums
+
+type PaymentStatus string
+
+const (
+	PaymentStatusPending           PaymentStatus = "pending"
+	PaymentStatusProcessing        PaymentStatus = "processing"
+	PaymentStatusCompleted         PaymentStatus = "completed"
+	PaymentStatusFailed            PaymentStatus = "failed"
+	PaymentStatusRefunded          PaymentStatus = "refunded"
+	PaymentStatusPartiallyRefunded PaymentStatus = "partially_refunded"
+)
+
+func (s PaymentStatus) IsValid() bool {
+	switch s {
+	case PaymentStatusPending, PaymentStatusProcessing, PaymentStatusCompleted,
+		PaymentStatusFailed, PaymentStatusRefunded, PaymentStatusPartiallyRefunded:
+		return true
+	}
+	return false
+}
+
+func (s PaymentStatus) String() string { return string(s) }
+
+
+
+================================================================================
+FILE: ./models/enums/order_status.go
+================================================================================
+
+package enums
+
+type OrderStatus string
+
+const (
+	OrderStatusDraft      OrderStatus = "draft"
+	OrderStatusConfirmed  OrderStatus = "confirmed"
+	OrderStatusProcessing OrderStatus = "processing"
+	OrderStatusShipped    OrderStatus = "shipped"
+	OrderStatusDelivered  OrderStatus = "delivered"
+	OrderStatusCancelled  OrderStatus = "cancelled"
+	OrderStatusRefunded   OrderStatus = "refunded"
+)
+
+func (s OrderStatus) IsValid() bool {
+	switch s {
+	case OrderStatusDraft, OrderStatusConfirmed, OrderStatusProcessing,
+		OrderStatusShipped, OrderStatusDelivered, OrderStatusCancelled, OrderStatusRefunded:
+		return true
+	}
+	return false
+}
+
+func (s OrderStatus) String() string { return string(s) }
+
+
+
+================================================================================
+FILE: ./models/enums/discount_type.go
+================================================================================
+
+package enums
+
+type DiscountType string
+
+const (
+	DiscountTypePercentage DiscountType = "percentage"
+	DiscountTypeFixed      DiscountType = "fixed_amount"
+	DiscountTypeBuyXGetY   DiscountType = "buy_x_get_y"
+)
+
+func (d DiscountType) IsValid() bool {
+	switch d {
+	case DiscountTypePercentage, DiscountTypeFixed, DiscountTypeBuyXGetY:
+		return true
+	}
+	return false
+}
+
+func (d DiscountType) String() string { return string(d) }
+
+
+
+================================================================================
+FILE: ./models/discount/promotion.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Promotion struct {
+	PromotionID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"promotionId"`
+	CompanyID   uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	Name        string     `gorm:"type:varchar(255);not null" json:"name"`
+	Description *string    `gorm:"type:text" json:"description,omitempty"`
+	StartDate   time.Time  `gorm:"type:timestamptz;not null" json:"startDate"`
+	EndDate     time.Time  `gorm:"type:timestamptz;not null" json:"endDate"`
+	IsActive    bool       `gorm:"not null;default:true" json:"isActive"`
+	Priority    *int       `gorm:"type:int;default:0" json:"priority,omitempty"`
+	CreatedAt   time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt   time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy   *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/discount/discount_application.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type DiscountApplication struct {
+	ApplicationID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"applicationId"`
+	OrderID       *uuid.UUID `gorm:"type:uuid" json:"orderId,omitempty"`
+	InvoiceID     *uuid.UUID `gorm:"type:uuid" json:"invoiceId,omitempty"`
+	DiscountType  string     `gorm:"type:varchar(50);not null" json:"discountType"`
+	DiscountID    *uuid.UUID `gorm:"type:uuid" json:"discountId,omitempty"`
+	DiscountName  *string    `gorm:"type:varchar(255)" json:"discountName,omitempty"`
+	Amount        float64    `gorm:"type:numeric(14,4);not null" json:"amount"`
+	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/discount/coupon.go
+================================================================================
+
+package discount
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// JSONB represents a PostgreSQL jsonb field
+type JSONB map[string]interface{}
+
+type Coupon struct {
+	CouponID          uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"couponId"`
+	CompanyID         uuid.UUID          `gorm:"type:uuid;not null" json:"companyId"`
+	Code              string             `gorm:"type:varchar(100);not null" json:"code"`
+	DiscountType      enums.DiscountType `gorm:"type:discount_type;not null" json:"discountType"`
+	DiscountValue     float64            `gorm:"type:numeric(14,4);not null" json:"discountValue"`
+	MaxDiscountAmount *float64           `gorm:"type:numeric(14,4)" json:"maxDiscountAmount,omitempty"`
+	StartDate         time.Time          `gorm:"type:timestamptz;not null" json:"startDate"`
+	EndDate           time.Time          `gorm:"type:timestamptz;not null" json:"endDate"`
+	UsageLimit        *int               `gorm:"type:int" json:"usageLimit,omitempty"`
+	PerUserLimit      *int               `gorm:"type:int;default:1" json:"perUserLimit,omitempty"`
+	MinOrderAmount    *float64           `gorm:"type:numeric(14,4)" json:"minOrderAmount,omitempty"`
+	ApplicableItems   JSONB              `gorm:"type:jsonb" json:"applicableItems,omitempty"`
+	IsActive          bool               `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt         time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt         time.Time          `gorm:"not null;default:now()" json:"updatedAt"`
+	CreatedBy         *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy         *uuid.UUID         `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/discount/coupon_usage.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type CouponUsage struct {
+	UsageID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"usageId"`
+	CouponID       uuid.UUID `gorm:"type:uuid;not null" json:"couponId"`
+	CustomerID     uuid.UUID `gorm:"type:uuid;not null" json:"customerId"`
+	OrderID        uuid.UUID `gorm:"type:uuid;not null" json:"orderId"`
+	DiscountAmount float64   `gorm:"type:numeric(14,4);not null" json:"discountAmount"`
+	UsedAt         time.Time `gorm:"type:timestamptz;not null;default:now()" json:"usedAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/discount/promotion_rule.go
+================================================================================
+
+package discount
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type PromotionRule struct {
+	RuleID        uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"ruleId"`
+	PromotionID   uuid.UUID          `gorm:"type:uuid;not null" json:"promotionId"`
+	RuleType      string             `gorm:"type:varchar(50);not null" json:"ruleType"`
+	RuleConfig    JSONB              `gorm:"type:jsonb;not null" json:"ruleConfig"`
+	DiscountType  enums.DiscountType `gorm:"type:discount_type;not null" json:"discountType"`
+	DiscountValue float64            `gorm:"type:numeric(14,4);not null" json:"discountValue"`
+	MaxDiscount   *float64           `gorm:"type:numeric(14,4)" json:"maxDiscount,omitempty"`
+	CreatedAt     time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/discount/discount_type.go
+================================================================================
+
+package discount
+
+type DiscountType string
+
+const (
+	DiscountTypePercentage DiscountType = "percentage"
+	DiscountTypeFixed      DiscountType = "fixed_amount"
+	DiscountTypeBuyXGetY   DiscountType = "buy_x_get_y"
+)
+
+func (d DiscountType) IsValid() bool {
+	switch d {
+	case DiscountTypePercentage, DiscountTypeFixed, DiscountTypeBuyXGetY:
+		return true
+	}
+	return false
+}
+
+func (d DiscountType) String() string {
+	return string(d)
+}
+
+

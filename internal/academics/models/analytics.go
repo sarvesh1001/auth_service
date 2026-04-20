@@ -35,7 +35,14 @@ type AcademicYearMetrics struct {
 	ActiveEnrollments      int       `db:"active_enrollments" json:"active_enrollments"`
 	CompletedEnrollments   int       `db:"completed_enrollments" json:"completed_enrollments"`
 	WithdrawnEnrollments   int       `db:"withdrawn_enrollments" json:"withdrawn_enrollments"`
-	LastUpdated            time.Time `db:"last_updated" json:"last_updated"`
+
+	// Period‑attendance (session) metrics
+	TotalSessionsGenerated       int `db:"total_sessions_generated" json:"total_sessions_generated"`
+	TotalPeriodAttendances       int `db:"total_period_attendances" json:"total_period_attendances"`
+	TotalBiometricAttendances    int `db:"total_biometric_attendances" json:"total_biometric_attendances"`
+	TotalManualPeriodAttendances int `db:"total_manual_period_attendances" json:"total_manual_period_attendances"`
+
+	LastUpdated time.Time `db:"last_updated" json:"last_updated"`
 }
 
 type AcademicYearMetricsUpdate struct {
@@ -63,6 +70,70 @@ type AcademicYearMetricsUpdate struct {
 	DeltaActiveEnrollments     int
 	DeltaCompletedEnrollments  int
 	DeltaWithdrawnEnrollments  int
+	// Period‑attendance deltas
+	DeltaSessionsGenerated       int
+	DeltaPeriodAttendances       int
+	DeltaBiometricAttendances    int
+	DeltaManualPeriodAttendances int
+}
+
+// -----------------------------------------------------------------------------
+// Student Session Summary (period attendance per student per term/year)
+// -----------------------------------------------------------------------------
+
+type StudentSessionSummary struct {
+	StudentID            uuid.UUID  `db:"student_id" json:"student_id"`
+	AcademicYearID       uuid.UUID  `db:"academic_year_id" json:"academic_year_id"`
+	TermID               *uuid.UUID `db:"term_id" json:"term_id,omitempty"`
+	TotalSessions        int        `db:"total_sessions" json:"total_sessions"`
+	PresentSessions      int        `db:"present_sessions" json:"present_sessions"`
+	AbsentSessions       int        `db:"absent_sessions" json:"absent_sessions"`
+	LateSessions         int        `db:"late_sessions" json:"late_sessions"`
+	ExcusedSessions      int        `db:"excused_sessions" json:"excused_sessions"`
+	AttendancePercentage float64    `db:"attendance_percentage" json:"attendance_percentage"` // generated
+	LastUpdated          time.Time  `db:"last_updated" json:"last_updated"`
+}
+
+// -----------------------------------------------------------------------------
+// Section Session Metrics (daily metrics per section)
+// -----------------------------------------------------------------------------
+
+type SectionSessionMetrics struct {
+	SectionID         uuid.UUID `db:"section_id" json:"section_id"`
+	SessionDate       time.Time `db:"session_date" json:"session_date"`
+	TotalEnrolled     int       `db:"total_enrolled" json:"total_enrolled"`
+	PresentCount      int       `db:"present_count" json:"present_count"`
+	AbsentCount       int       `db:"absent_count" json:"absent_count"`
+	LateCount         int       `db:"late_count" json:"late_count"`
+	MarkedByTeacher   *int      `db:"marked_by_teacher" json:"marked_by_teacher,omitempty"`     // count marked manually
+	MarkedByBiometric *int      `db:"marked_by_biometric" json:"marked_by_biometric,omitempty"` // count auto‑marked
+}
+
+// -----------------------------------------------------------------------------
+// Teacher Session Metrics (teacher performance on marking attendance)
+// -----------------------------------------------------------------------------
+
+type TeacherSessionMetrics struct {
+	TeacherID             uuid.UUID `db:"teacher_id" json:"teacher_id"`
+	AcademicYearID        uuid.UUID `db:"academic_year_id" json:"academic_year_id"`
+	TotalSessionsTaught   int       `db:"total_sessions_taught" json:"total_sessions_taught"`
+	SessionsMarked        int       `db:"sessions_marked" json:"sessions_marked"`                 // teacher marked at least one student
+	SessionsWithBiometric int       `db:"sessions_with_biometric" json:"sessions_with_biometric"` // biometric used
+	LastUpdated           time.Time `db:"last_updated" json:"last_updated"`
+}
+
+// -----------------------------------------------------------------------------
+// Biometric Device Usage Analytics
+// -----------------------------------------------------------------------------
+
+type BiometricUsageMetrics struct {
+	DeviceID          string    `db:"device_id" json:"device_id"`
+	CompanyID         uuid.UUID `db:"company_id" json:"company_id"`
+	Date              time.Time `db:"date" json:"date"`
+	TotalPunches      int       `db:"total_punches" json:"total_punches"`
+	SuccessfulMatches int       `db:"successful_matches" json:"successful_matches"`
+	FailedMatches     int       `db:"failed_matches" json:"failed_matches"`
+	UniqueStudents    int       `db:"unique_students" json:"unique_students"`
 }
 
 // -----------------------------------------------------------------------------

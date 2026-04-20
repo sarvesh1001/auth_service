@@ -15,9 +15,7 @@ import (
 	"auth-service/internal/util"
 )
 
-// AttendanceRepository defines operations for attendance records, summaries, and exemptions.
 type AttendanceRepository interface {
-	// Attendance records
 	Upsert(ctx context.Context, db DBTX, a *models.StudentAttendance) error
 	BulkUpsert(ctx context.Context, db DBTX, attendances []*models.StudentAttendance) error
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.StudentAttendance, error)
@@ -25,13 +23,9 @@ type AttendanceRepository interface {
 	List(ctx context.Context, db DBTX, filter AttendanceFilter, p Pagination, s Sort) ([]*models.StudentAttendance, error)
 	Count(ctx context.Context, db DBTX, filter AttendanceFilter) (int64, error)
 	Delete(ctx context.Context, db DBTX, id uuid.UUID) error
-
-	// Summary methods
 	GetSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*models.StudentAttendanceSummary, error)
 	RecalculateSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) error
 	BulkRecalcSummaries(ctx context.Context, db DBTX, studentIDs []uuid.UUID, academicYearID uuid.UUID, termID *uuid.UUID) error
-
-	// Exemptions
 	CreateExemption(ctx context.Context, db DBTX, e *models.StudentAttendanceExemption) error
 	GetExemptionByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.StudentAttendanceExemption, error)
 	ListExemptions(ctx context.Context, db DBTX, studentID *uuid.UUID, fromDate, toDate *time.Time, p Pagination) ([]*models.StudentAttendanceExemption, error)
@@ -86,8 +80,6 @@ func (r *attendanceRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// buildAttendanceFilter builds WHERE clause and args for attendance queries.
-// It may join with enrollments and sections if needed.
 func (r *attendanceRepository) buildAttendanceFilter(filter AttendanceFilter) (string, []interface{}, string, error) {
 	var conditions []string
 	var args []interface{}
@@ -101,7 +93,6 @@ func (r *attendanceRepository) buildAttendanceFilter(filter AttendanceFilter) (s
 	}
 
 	if filter.StudentID != nil || filter.SectionID != nil || filter.TermID != nil || filter.AcademicYearID != nil {
-		// Join enrollments – include both active and completed records for historical data
 		fromClause += " JOIN academics.enrollments e ON a.enrollment_id = e.enrollment_id AND e.status IN ('active', 'completed')"
 		if filter.StudentID != nil {
 			conditions = append(conditions, fmt.Sprintf("e.student_id = $%d", idx))
@@ -114,7 +105,6 @@ func (r *attendanceRepository) buildAttendanceFilter(filter AttendanceFilter) (s
 			idx++
 		}
 		if filter.TermID != nil {
-			// Need section table to filter by term
 			fromClause += " JOIN academics.section sec ON e.section_id = sec.section_id AND sec.deleted_at IS NULL"
 			conditions = append(conditions, fmt.Sprintf("sec.term_id = $%d", idx))
 			args = append(args, *filter.TermID)
@@ -155,23 +145,24 @@ func (r *attendanceRepository) buildAttendanceFilter(filter AttendanceFilter) (s
 	return whereClause, args, fromClause, nil
 }
 
-// --- Attendance Record Methods ------------------------------------------
-
-// Upsert creates or updates an attendance record using ON CONFLICT.
 func (r *attendanceRepository) Upsert(ctx context.Context, db DBTX, a *models.StudentAttendance) error {
 	query := `
         INSERT INTO academics.student_attendance (
-            enrollment_id, attendance_date, status, marked_by, remarks, created_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+            enrollment_id, attendance_date, status, marked_by, remarks,
+            source_type, device_id, created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
         ON CONFLICT (enrollment_id, attendance_date) DO UPDATE SET
             status = EXCLUDED.status,
             marked_by = EXCLUDED.marked_by,
             remarks = EXCLUDED.remarks,
+            source_type = EXCLUDED.source_type,
+            device_id = EXCLUDED.device_id,
             updated_at = NOW()
         RETURNING attendance_id, created_at, updated_at
     `
 	err := db.QueryRowContext(ctx, query,
-		a.EnrollmentID, a.AttendanceDate, a.Status, a.MarkedBy, a.Remarks, a.CreatedBy,
+		a.EnrollmentID, a.AttendanceDate, a.Status, a.MarkedBy, a.Remarks,
+		a.SourceType, a.DeviceID, a.CreatedBy,
 	).Scan(&a.AttendanceID, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to upsert attendance",
@@ -187,6 +178,7 @@ func (r *attendanceRepository) BulkUpsert(ctx context.Context, db DBTX, attendan
 	if len(attendances) == 0 {
 		return nil
 	}
+
 	tx, isOwner, err := beginTxIfNotTx(ctx, db)
 	if err != nil {
 		return err
@@ -200,12 +192,15 @@ func (r *attendanceRepository) BulkUpsert(ctx context.Context, db DBTX, attendan
 
 	stmt, err := tx.PrepareContext(ctx, `
         INSERT INTO academics.student_attendance (
-            enrollment_id, attendance_date, status, marked_by, remarks, created_by, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+            enrollment_id, attendance_date, status, marked_by, remarks,
+            source_type, device_id, created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
         ON CONFLICT (enrollment_id, attendance_date) DO UPDATE SET
             status = EXCLUDED.status,
             marked_by = EXCLUDED.marked_by,
             remarks = EXCLUDED.remarks,
+            source_type = EXCLUDED.source_type,
+            device_id = EXCLUDED.device_id,
             updated_at = NOW()
         RETURNING attendance_id, created_at, updated_at
     `)
@@ -216,7 +211,8 @@ func (r *attendanceRepository) BulkUpsert(ctx context.Context, db DBTX, attendan
 
 	for _, a := range attendances {
 		err := stmt.QueryRowContext(ctx,
-			a.EnrollmentID, a.AttendanceDate, a.Status, a.MarkedBy, a.Remarks, a.CreatedBy,
+			a.EnrollmentID, a.AttendanceDate, a.Status, a.MarkedBy, a.Remarks,
+			a.SourceType, a.DeviceID, a.CreatedBy,
 		).Scan(&a.AttendanceID, &a.CreatedAt, &a.UpdatedAt)
 		if err != nil {
 			r.logger.Error("bulk upsert attendance failed",
@@ -238,7 +234,8 @@ func (r *attendanceRepository) BulkUpsert(ctx context.Context, db DBTX, attendan
 
 func (r *attendanceRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.StudentAttendance, error) {
 	query := `
-        SELECT attendance_id, enrollment_id, attendance_date, status, marked_by, remarks, created_at, updated_at, created_by
+        SELECT attendance_id, enrollment_id, attendance_date, status, marked_by, remarks,
+               source_type, device_id, created_at, updated_at, created_by
         FROM academics.student_attendance
         WHERE attendance_id = $1
     `
@@ -248,7 +245,8 @@ func (r *attendanceRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUI
 
 func (r *attendanceRepository) GetByEnrollmentAndDate(ctx context.Context, db DBTX, enrollmentID uuid.UUID, date time.Time) (*models.StudentAttendance, error) {
 	query := `
-        SELECT attendance_id, enrollment_id, attendance_date, status, marked_by, remarks, created_at, updated_at, created_by
+        SELECT attendance_id, enrollment_id, attendance_date, status, marked_by, remarks,
+               source_type, device_id, created_at, updated_at, created_by
         FROM academics.student_attendance
         WHERE enrollment_id = $1 AND attendance_date = $2
     `
@@ -268,7 +266,8 @@ func (r *attendanceRepository) List(ctx context.Context, db DBTX, filter Attenda
 	limit, offset := r.validatePagination(p)
 
 	query := fmt.Sprintf(`
-        SELECT a.attendance_id, a.enrollment_id, a.attendance_date, a.status, a.marked_by, a.remarks, a.created_at, a.updated_at, a.created_by
+        SELECT a.attendance_id, a.enrollment_id, a.attendance_date, a.status, a.marked_by, a.remarks,
+               a.source_type, a.device_id, a.created_at, a.updated_at, a.created_by
         %s
         %s
         %s
@@ -276,7 +275,6 @@ func (r *attendanceRepository) List(ctx context.Context, db DBTX, filter Attenda
     `, fromClause, where, orderBy, len(args)+1, len(args)+2)
 
 	args = append(args, limit, offset)
-
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to list attendances",
@@ -336,8 +334,6 @@ func (r *attendanceRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID
 	return nil
 }
 
-// --- Summary Methods ---------------------------------------------------
-
 func (r *attendanceRepository) GetSummary(ctx context.Context, db DBTX, studentID, academicYearID uuid.UUID, termID *uuid.UUID) (*models.StudentAttendanceSummary, error) {
 	var query string
 	var args []interface{}
@@ -360,7 +356,6 @@ func (r *attendanceRepository) GetSummary(ctx context.Context, db DBTX, studentI
         `
 		args = []interface{}{studentID, academicYearID}
 	}
-
 	row := db.QueryRowContext(ctx, query, args...)
 	return r.scanSummary(row)
 }
@@ -379,7 +374,6 @@ func (r *attendanceRepository) RecalculateSummary(ctx context.Context, db DBTX, 
 
 	var query string
 	var args []interface{}
-
 	if termID != nil {
 		query = `
             WITH enrollment_ids AS (
@@ -506,8 +500,6 @@ func (r *attendanceRepository) BulkRecalcSummaries(ctx context.Context, db DBTX,
 	return nil
 }
 
-// --- Exemption Methods -------------------------------------------------
-
 func (r *attendanceRepository) CreateExemption(ctx context.Context, db DBTX, e *models.StudentAttendanceExemption) error {
 	query := `
         INSERT INTO academics.student_attendance_exemptions (
@@ -571,7 +563,6 @@ func (r *attendanceRepository) ListExemptions(ctx context.Context, db DBTX, stud
         ORDER BY from_date DESC
         LIMIT $%d OFFSET $%d
     `, whereClause, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
 
 	rows, err := db.QueryContext(ctx, query, args...)
@@ -638,11 +629,11 @@ func (r *attendanceRepository) DeleteExemption(ctx context.Context, db DBTX, id 
 	return nil
 }
 
-// --- Scanning Helpers --------------------------------------------------
-
 func (r *attendanceRepository) scanAttendance(row scanner) (*models.StudentAttendance, error) {
 	var a models.StudentAttendance
 	var markedBy, createdBy uuid.NullUUID
+	var sourceType sql.NullString
+	var deviceID sql.NullString
 
 	err := row.Scan(
 		&a.AttendanceID,
@@ -651,6 +642,8 @@ func (r *attendanceRepository) scanAttendance(row scanner) (*models.StudentAtten
 		&a.Status,
 		&markedBy,
 		&a.Remarks,
+		&sourceType,
+		&deviceID,
 		&a.CreatedAt,
 		&a.UpdatedAt,
 		&createdBy,
@@ -661,11 +654,19 @@ func (r *attendanceRepository) scanAttendance(row scanner) (*models.StudentAtten
 		}
 		return nil, fmt.Errorf("scan attendance: %w", err)
 	}
+
 	if markedBy.Valid {
 		a.MarkedBy = &markedBy.UUID
 	}
 	if createdBy.Valid {
 		a.CreatedBy = &createdBy.UUID
+	}
+	if sourceType.Valid {
+		st := models.AttendanceSourceType(sourceType.String)
+		a.SourceType = &st
+	}
+	if deviceID.Valid {
+		a.DeviceID = &deviceID.String
 	}
 	return &a, nil
 }
@@ -673,7 +674,6 @@ func (r *attendanceRepository) scanAttendance(row scanner) (*models.StudentAtten
 func (r *attendanceRepository) scanSummary(row scanner) (*models.StudentAttendanceSummary, error) {
 	var s models.StudentAttendanceSummary
 	var termID uuid.NullUUID
-
 	err := row.Scan(
 		&s.SummaryID,
 		&s.StudentID,
@@ -703,7 +703,6 @@ func (r *attendanceRepository) scanSummary(row scanner) (*models.StudentAttendan
 func (r *attendanceRepository) scanExemption(row scanner) (*models.StudentAttendanceExemption, error) {
 	var e models.StudentAttendanceExemption
 	var approvedBy, createdBy uuid.NullUUID
-
 	err := row.Scan(
 		&e.ExemptionID,
 		&e.StudentID,

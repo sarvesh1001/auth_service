@@ -254,69 +254,6 @@ type GuardianFilter struct {
 	Search    string    `json:"search,omitempty"`
 }
 
-type MarkAttendanceRequest struct {
-	EnrollmentID uuid.UUID               `json:"enrollment_id"`
-	Date         time.Time               `json:"date"`
-	Status       models.AttendanceStatus `json:"status"`
-	Remarks      string                  `json:"remarks,omitempty"`
-	MarkedBy     *uuid.UUID              `json:"marked_by,omitempty"`
-	CreatedBy    *uuid.UUID              `json:"created_by,omitempty"`
-}
-
-type BulkMarkAttendanceRequest struct {
-	Attendances []MarkAttendanceRequest `json:"attendances"`
-	CreatedBy   *uuid.UUID              `json:"created_by,omitempty"`
-}
-
-type ListAttendanceRequest struct {
-	EnrollmentID   *uuid.UUID `json:"enrollment_id,omitempty"`
-	StudentID      *uuid.UUID `json:"student_id,omitempty"`
-	SectionID      *uuid.UUID `json:"section_id,omitempty"`
-	TermID         *uuid.UUID `json:"term_id,omitempty"`
-	AcademicYearID *uuid.UUID `json:"academic_year_id,omitempty"`
-	FromDate       *time.Time `json:"from_date,omitempty"`
-	ToDate         *time.Time `json:"to_date,omitempty"`
-	Status         *string    `json:"status,omitempty"`
-	MarkedBy       *uuid.UUID `json:"marked_by,omitempty"`
-	Limit          int        `json:"limit,omitempty"`
-	Offset         int        `json:"offset,omitempty"`
-	SortField      string     `json:"sort_field,omitempty"`
-	SortDirection  string     `json:"sort_direction,omitempty"`
-}
-
-type AttendanceSummaryResponse struct {
-	SummaryID            uuid.UUID  `json:"summary_id"`
-	StudentID            uuid.UUID  `json:"student_id"`
-	AcademicYearID       uuid.UUID  `json:"academic_year_id"`
-	TermID               *uuid.UUID `json:"term_id,omitempty"`
-	TotalPresent         int        `json:"total_present"`
-	TotalAbsent          int        `json:"total_absent"`
-	TotalLate            int        `json:"total_late"`
-	TotalHalfDay         int        `json:"total_half_day"`
-	TotalWorkingDays     int        `json:"total_working_days"`
-	AttendancePercentage float64    `json:"attendance_percentage"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-}
-
-type CreateAttendanceExemptionRequest struct {
-	StudentID  uuid.UUID  `json:"student_id"`
-	FromDate   time.Time  `json:"from_date"`
-	ToDate     time.Time  `json:"to_date"`
-	Reason     string     `json:"reason,omitempty"`
-	ApprovedBy *uuid.UUID `json:"approved_by,omitempty"`
-	CreatedBy  *uuid.UUID `json:"created_by,omitempty"`
-}
-
-type UpdateAttendanceExemptionRequest struct {
-	ExemptionID uuid.UUID  `json:"exemption_id"`
-	FromDate    time.Time  `json:"from_date"`
-	ToDate      time.Time  `json:"to_date"`
-	Reason      string     `json:"reason,omitempty"`
-	ApprovedBy  *uuid.UUID `json:"approved_by,omitempty"`
-	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
-}
-
 type CreateFeeStructureRequest struct {
 	CompanyID        uuid.UUID  `json:"company_id"`
 	AcademicYearID   uuid.UUID  `json:"academic_year_id"`
@@ -562,4 +499,132 @@ type ListAcademicYearMetricsRequest struct {
 type ListAcademicYearMetricsResponse struct {
 	Metrics []*GetAcademicYearMetricsResponse `json:"metrics"`
 	Total   int                               `json:"total"`
+}
+
+type MarkAttendanceRequest struct {
+	EnrollmentID uuid.UUID                    `json:"enrollment_id"`
+	Date         time.Time                    `json:"date"`
+	Status       models.AttendanceStatus      `json:"status"`
+	MarkedBy     *uuid.UUID                   `json:"marked_by,omitempty"`
+	Remarks      string                       `json:"remarks,omitempty"`
+	SourceType   *models.AttendanceSourceType `json:"source_type,omitempty"`
+	DeviceID     *string                      `json:"device_id,omitempty"`
+	CreatedBy    *uuid.UUID                   `json:"created_by,omitempty"`
+}
+
+type BulkMarkAttendanceRequest struct {
+	Attendances []MarkAttendanceRequest `json:"attendances"`
+	CreatedBy   *uuid.UUID              `json:"created_by,omitempty"`
+}
+
+type ListAttendanceRequest struct {
+	EnrollmentID   *uuid.UUID               `json:"enrollment_id,omitempty"`
+	StudentID      *uuid.UUID               `json:"student_id,omitempty"`
+	SectionID      *uuid.UUID               `json:"section_id,omitempty"`
+	TermID         *uuid.UUID               `json:"term_id,omitempty"`
+	AcademicYearID *uuid.UUID               `json:"academic_year_id,omitempty"`
+	FromDate       *time.Time               `json:"from_date,omitempty"`
+	ToDate         *time.Time               `json:"to_date,omitempty"`
+	Status         *models.AttendanceStatus `json:"status,omitempty"`
+	MarkedBy       *uuid.UUID               `json:"marked_by,omitempty"`
+	Limit          int                      `json:"limit,omitempty"`
+	Offset         int                      `json:"offset,omitempty"`
+	SortField      string                   `json:"sort_field,omitempty"`
+	SortDirection  string                   `json:"sort_direction,omitempty"`
+}
+
+type AttendanceSummaryResponse struct {
+	SummaryID            uuid.UUID  `json:"summary_id"`
+	StudentID            uuid.UUID  `json:"student_id"`
+	AcademicYearID       uuid.UUID  `json:"academic_year_id"`
+	TermID               *uuid.UUID `json:"term_id,omitempty"`
+	TotalPresent         int        `json:"total_present"`
+	TotalAbsent          int        `json:"total_absent"`
+	TotalLate            int        `json:"total_late"`
+	TotalHalfDay         int        `json:"total_half_day"`
+	TotalWorkingDays     int        `json:"total_working_days"`
+	AttendancePercentage float64    `json:"attendance_percentage"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
+}
+
+type CreateAttendanceExemptionRequest struct {
+	StudentID  uuid.UUID  `json:"student_id"`
+	FromDate   time.Time  `json:"from_date"`
+	ToDate     time.Time  `json:"to_date"`
+	Reason     string     `json:"reason,omitempty"`
+	ApprovedBy *uuid.UUID `json:"approved_by,omitempty"`
+	CreatedBy  *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type UpdateAttendanceExemptionRequest struct {
+	ExemptionID uuid.UUID  `json:"exemption_id"`
+	FromDate    time.Time  `json:"from_date"`
+	ToDate      time.Time  `json:"to_date"`
+	Reason      string     `json:"reason,omitempty"`
+	ApprovedBy  *uuid.UUID `json:"approved_by,omitempty"`
+	UpdatedBy   *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+// Period attendance requests
+type MarkPeriodAttendanceRequest struct {
+	SessionID    uuid.UUID                      `json:"session_id"`
+	EnrollmentID uuid.UUID                      `json:"enrollment_id"`
+	Status       models.SessionAttendanceStatus `json:"status"`
+	MarkedBy     *uuid.UUID                     `json:"marked_by,omitempty"`
+	Remarks      string                         `json:"remarks,omitempty"`
+	SourceType   models.AttendanceSourceType    `json:"source_type"`
+	DeviceID     *string                        `json:"device_id,omitempty"`
+}
+
+type BiometricPunchRequest struct {
+	DeviceID       string    `json:"device_id"`
+	DeviceUserCode string    `json:"device_user_code"`
+	PunchTime      time.Time `json:"punch_time"`
+	CompanyID      uuid.UUID `json:"company_id"`
+}
+
+// ---------------------------------------------------------------------
+// Student Face Embedding DTOs
+// ---------------------------------------------------------------------
+
+type CreateStudentFaceEmbeddingRequest struct {
+	StudentID       uuid.UUID  `json:"student_id"`
+	CompanyID       uuid.UUID  `json:"company_id"`
+	EmbeddingVector []float64  `json:"embedding_vector"`
+	ModelVersion    string     `json:"model_version"`
+	EmbeddingDim    int        `json:"embedding_dim"`
+	IsActive        bool       `json:"is_active"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type UpdateStudentFaceEmbeddingRequest struct {
+	EmbeddingID     uuid.UUID  `json:"embedding_id"`
+	EmbeddingVector []float64  `json:"embedding_vector,omitempty"`
+	ModelVersion    string     `json:"model_version,omitempty"`
+	EmbeddingDim    int        `json:"embedding_dim,omitempty"`
+	IsActive        bool       `json:"is_active,omitempty"`
+	UpdatedBy       *uuid.UUID `json:"updated_by,omitempty"`
+}
+
+type ListStudentFaceEmbeddingsRequest struct {
+	StudentID    *uuid.UUID `json:"student_id,omitempty"`
+	CompanyID    *uuid.UUID `json:"company_id,omitempty"`
+	ModelVersion *string    `json:"model_version,omitempty"`
+	IsActive     *bool      `json:"is_active,omitempty"`
+	Limit        int        `json:"limit,omitempty"`
+	Offset       int        `json:"offset,omitempty"`
+}
+
+type StudentFaceEmbeddingResponse struct {
+	EmbeddingID     uuid.UUID  `json:"embedding_id"`
+	StudentID       uuid.UUID  `json:"student_id"`
+	CompanyID       uuid.UUID  `json:"company_id"`
+	EmbeddingVector []float64  `json:"embedding_vector"`
+	ModelVersion    string     `json:"model_version"`
+	EmbeddingDim    int        `json:"embedding_dim"`
+	IsActive        bool       `json:"is_active"`
+	CreatedAt       time.Time  `json:"created_at"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }

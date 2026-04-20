@@ -394,6 +394,16 @@ func (c *AnalyticsConsumer) handleEvent(ctx context.Context, eventType string, p
 		return c.analyticsSvc.ProcessTransportStudentAssignmentDeleted(ctx, payload)
 
 	// =========================================================================
+	// Period attendance & session generation events (NEW)
+	// =========================================================================
+	case "academic_sessions.generated":
+		return c.analyticsSvc.ProcessSessionsGenerated(ctx, payload)
+	case "period_attendance.marked":
+		return c.analyticsSvc.ProcessPeriodAttendanceMarked(ctx, payload)
+	case "biometric_punch.processed":
+		return c.analyticsSvc.ProcessBiometricPunchProcessed(ctx, payload)
+
+	// =========================================================================
 	// Ignored events
 	// =========================================================================
 	default:

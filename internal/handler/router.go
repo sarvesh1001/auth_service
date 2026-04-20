@@ -27,29 +27,31 @@ import (
 
 // AcademicHandlers groups all handlers required by academics.RegisterAcademicRoutes
 type AcademicHandlers struct {
-	AcademicYearHandler *academichandler.AcademicYearHandler
-	AdmissionHandler    *academichandler.AdmissionHandler
-	AnalyticsHandler    *academichandler.AnalyticsHandler
-	AssignmentHandler   *academichandler.AssignmentHandler
-	AttendanceHandler   *academichandler.AttendanceHandler
-	CourseHandler       *academichandler.CourseHandler
-	CurriculumHandler   *academichandler.CurriculumHandler
-	EnrollmentHandler   *academichandler.EnrollmentHandler
-	ExamHandler         *academichandler.ExamHandler
-	FeeHandler          *academichandler.FeeHandler
-	GradingHandler      *academichandler.GradingHandler
-	GuardianHandler     *academichandler.GuardianHandler
-	LibraryHandler      *academichandler.LibraryHandler
-	NotificationHandler *academichandler.NotificationHandler
-	RoomHandler         *academichandler.RoomHandler
-	SectionHandler      *academichandler.SectionHandler
-	StudentHandler      *academichandler.StudentHandler
-	SubjectHandler      *academichandler.SubjectHandler
-	SubmissionHandler   *academichandler.SubmissionHandler
-	TeacherHandler      *academichandler.TeacherHandler
-	TermHandler         *academichandler.TermHandler
-	TimetableHandler    *academichandler.TimetableHandler
-	TransportHandler    *academichandler.TransportHandler
+	AcademicYearHandler         *academichandler.AcademicYearHandler
+	AdmissionHandler            *academichandler.AdmissionHandler
+	AnalyticsHandler            *academichandler.AnalyticsHandler
+	AssignmentHandler           *academichandler.AssignmentHandler
+	AttendanceHandler           *academichandler.AttendanceHandler
+	CourseHandler               *academichandler.CourseHandler
+	CurriculumHandler           *academichandler.CurriculumHandler
+	EnrollmentHandler           *academichandler.EnrollmentHandler
+	ExamHandler                 *academichandler.ExamHandler
+	FeeHandler                  *academichandler.FeeHandler
+	GradingHandler              *academichandler.GradingHandler
+	GuardianHandler             *academichandler.GuardianHandler
+	LibraryHandler              *academichandler.LibraryHandler
+	NotificationHandler         *academichandler.NotificationHandler
+	RoomHandler                 *academichandler.RoomHandler
+	SectionHandler              *academichandler.SectionHandler
+	StudentHandler              *academichandler.StudentHandler
+	SubjectHandler              *academichandler.SubjectHandler
+	SubmissionHandler           *academichandler.SubmissionHandler
+	TeacherHandler              *academichandler.TeacherHandler
+	TermHandler                 *academichandler.TermHandler
+	TimetableHandler            *academichandler.TimetableHandler
+	TransportHandler            *academichandler.TransportHandler
+	SessionGenerationHandler    *academichandler.SessionGenerationHandler
+	StudentBiometricSyncHandler *academichandler.StudentBiometricSyncHandler
 }
 
 // NewRouter creates the main HTTP router with all application routes including academics.
@@ -189,13 +191,25 @@ func NewRouter(
 				r.Get("/{batch_ref}/status", attendanceBatchHandler.GetBatchStatus)
 				r.Get("/{batch_ref}/failures", attendanceBatchHandler.GetBatchFailures)
 			})
-			r.With(
-				deviceAuthMiddleware.MiddlewareForDeviceOnly,
-				middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger),
-			).Post("/device/heartbeat", deviceHeartbeatHandler.Heartbeat)
+			r.With(deviceAuthMiddleware.MiddlewareForDeviceOnly, middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger)).
+				Post("/device/heartbeat", deviceHeartbeatHandler.Heartbeat)
+
+			// Biometric punch for period attendance (college mode)
+			r.Route("/biometric", func(r chi.Router) {
+				r.Use(deviceAuthMiddleware.Middleware)
+				r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
+				r.Post("/punch", academicHandlers.AttendanceHandler.ProcessBiometricPunch)
+			})
+
+			// Biometric punch for full‑day attendance (school mode)
+			r.Route("/full-day", func(r chi.Router) {
+				r.Use(deviceAuthMiddleware.Middleware)
+				r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
+				r.Post("/punch", academicHandlers.AttendanceHandler.ProcessBiometricFullDayPunch)
+			})
 		})
 
-		// Biometric device routes
+		// Biometric device routes (HR)
 		r.Route("/companies/{companyID}/biometric-device", func(r chi.Router) {
 			r.Use(deviceAuthMiddleware.Middleware)
 			r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
@@ -205,6 +219,17 @@ func NewRouter(
 			r.Post("/reset/{deviceID}", biometricSyncHandler.ForceDeviceResync)
 			r.Get("/health", biometricSyncHandler.HealthCheck)
 		})
+
+		// ========== STUDENT BIOMETRIC SYNC (DEVICE AUTHENTICATED) ==========
+		r.Route("/companies/{companyID}/academics/biometric-device", func(r chi.Router) {
+			r.Use(deviceAuthMiddleware.Middleware)
+			r.Use(middle.CompanyAccessMiddlewareWithDeviceSupport(jwtService, logger))
+			r.Post("/sync", academicHandlers.StudentBiometricSyncHandler.SyncEmbeddings)
+			r.Post("/full/{deviceID}", academicHandlers.StudentBiometricSyncHandler.FullSync)
+			r.Post("/reset/{deviceID}", academicHandlers.StudentBiometricSyncHandler.ForceResync)
+		})
+
+		// Student login (public)
 		r.Post("/companies/{companyID}/academics/students/login", academicHandlers.StudentHandler.Login)
 
 		// Protected routes (JWT required)
@@ -232,7 +257,7 @@ func NewRouter(
 			// Main company‑scoped routes
 			r.Route("/companies/{companyID}", func(r chi.Router) {
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
-				r.Use(IdempotencyMiddleware) // <-- add this line
+				r.Use(IdempotencyMiddleware)
 
 				// Company info
 				r.Get("/", adminHandler.GetCompany)
@@ -1315,10 +1340,8 @@ func NewRouter(
 				})
 
 				// ========== ACADEMIC ROUTES ==========
-				// Register all academics endpoints under this company‑scoped router.
-				// The academics package will mount routes under "/academics".
 				academics.RegisterAcademicRoutes(
-					r, // subrouter already scoped to /companies/{companyID}
+					r,
 					academicHandlers.AcademicYearHandler,
 					academicHandlers.AdmissionHandler,
 					academicHandlers.AnalyticsHandler,
@@ -1344,7 +1367,13 @@ func NewRouter(
 					academicHandlers.TermHandler,
 					academicHandlers.TimetableHandler,
 					academicHandlers.TransportHandler,
+					academicHandlers.SessionGenerationHandler,
+					academicHandlers.StudentBiometricSyncHandler,
 				)
+
+				// NOTE: The student biometric sync routes have been moved OUTSIDE the JWT group,
+				// to the public device-authenticated section (above the student login route).
+				// They are now defined at the /api/v1/companies/{companyID}/academics/biometric-device path.
 			}) // end /companies/{companyID}
 
 			// Internal leave resolution (not company-scoped)
