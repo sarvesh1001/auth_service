@@ -30,6 +30,7 @@ type JournalService interface {
 	CreateWithTx(ctx context.Context, tx *sql.Tx, req CreateJournalRequest) (*models.JournalEntry, error)
 	Update(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error)
 	Post(ctx context.Context, id uuid.UUID, postedBy *uuid.UUID) error
+	PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error // ✅ ADD THIS
 	Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error
 	GetByID(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error)
 	GetSummary(ctx context.Context, id uuid.UUID) (*repository.JournalSummary, error)
@@ -384,70 +385,9 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 		}
 	}
 
-	entry, err := s.repo.GetByIDForUpdate(ctx, tx, id)
-	if err != nil {
-		return fmt.Errorf("get entry: %w", err)
-	}
-	if entry == nil {
-		return fmt.Errorf("%w: journal entry %s", repository.ErrNotFound, id)
-	}
-	if entry.Status == enums.JournalStatusPosted {
-		return fmt.Errorf("journal entry already posted")
-	}
-	if entry.Status != enums.JournalStatusDraft {
-		return fmt.Errorf("cannot post journal with status %s", entry.Status)
-	}
-	if err := s.repo.ValidateBeforePost(ctx, tx, id); err != nil {
+	// Use the internal method to do the actual work
+	if err := s.postWithTxInternal(ctx, tx, id, postedBy); err != nil {
 		return err
-	}
-
-	lines, err := s.repo.GetLines(ctx, tx, id)
-	if err != nil {
-		return fmt.Errorf("get lines: %w", err)
-	}
-
-	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, entry, lines); err != nil {
-		return err
-	}
-
-	logger.Info("calling PostJournalToLedger")
-	if err := s.ledgerService.PostJournalToLedger(ctx, tx, entry, lines); err != nil {
-		logger.Error("PostJournalToLedger failed", zap.Error(err))
-		return fmt.Errorf("post to ledger: %w", err)
-	}
-	logger.Info("PostJournalToLedger completed successfully")
-
-	var ledgerCount int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.ledger_entries WHERE journal_entry_id = $1`, id).Scan(&ledgerCount)
-	if err != nil {
-		logger.Error("failed to query ledger count", zap.Error(err))
-	} else {
-		logger.Info("ledger entries count after PostJournalToLedger", zap.Int("count", ledgerCount))
-	}
-
-	if err := s.repo.ValidateLedgerExists(ctx, tx, id); err != nil {
-		logger.Error("ValidateLedgerExists failed", zap.Error(err))
-		return fmt.Errorf("ledger validation failed: %w", err)
-	}
-	logger.Info("ValidateLedgerExists passed")
-
-	if err := s.repo.Post(ctx, tx, id, postedBy); err != nil {
-		return fmt.Errorf("post journal entry: %w", err)
-	}
-	logger.Info("journal status updated to posted")
-
-	payload := s.buildJournalEventPayload(entry, lines)
-	outboxEvent := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "journal_entry",
-		AggregateID:   id.String(),
-		EventType:     events.EventJournalPosted,
-		Topic:         TopicAccountingEvents,
-		Payload:       payload,
-		Status:        "pending",
-	}
-	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
-		return fmt.Errorf("store outbox event: %w", err)
 	}
 
 	if idempotencyKey != "" {
@@ -462,15 +402,9 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	if s.auditService != nil {
-		_ = s.auditService.LogAction(ctx, nil, &entry.CompanyID, "accounting", "post", "journal_entry",
-			&id, "user", postedBy, nil, nil, nil)
-	}
-
 	logger.Info("journal entry posted")
 	return nil
 }
-
 func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error {
 	logger := s.logger.With(
 		zap.String("method", "Reverse"),
@@ -857,4 +791,119 @@ func (s *journalService) validatePagination(p Pagination) (int, int) {
 
 func stringPtr(s string) *string {
 	return &s
+}
+
+// postWithTxInternal performs the actual posting logic using an existing transaction.
+// It does NOT commit or rollback – the caller is responsible for the transaction.
+func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "postWithTxInternal"), zap.String("journal_id", id.String()))
+
+	// 1. Get entry for update (with row lock)
+	entry, err := s.repo.GetByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("get entry: %w", err)
+	}
+	if entry == nil {
+		return fmt.Errorf("%w: journal entry %s", repository.ErrNotFound, id)
+	}
+	if entry.Status == enums.JournalStatusPosted {
+		return fmt.Errorf("journal entry already posted")
+	}
+	if entry.Status != enums.JournalStatusDraft {
+		return fmt.Errorf("cannot post journal with status %s", entry.Status)
+	}
+
+	// 2. Validate before post (e.g., lines exist, balanced)
+	if err := s.repo.ValidateBeforePost(ctx, tx, id); err != nil {
+		return err
+	}
+
+	// 3. Get journal lines
+	lines, err := s.repo.GetLines(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("get lines: %w", err)
+	}
+
+	// 4. Run rule engine validations
+	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, entry, lines); err != nil {
+		return err
+	}
+
+	// 5. Post to ledger (this uses the same transaction)
+	logger.Info("calling PostJournalToLedger")
+	if err := s.ledgerService.PostJournalToLedger(ctx, tx, entry, lines); err != nil {
+		logger.Error("PostJournalToLedger failed", zap.Error(err))
+		return fmt.Errorf("post to ledger: %w", err)
+	}
+	logger.Info("PostJournalToLedger completed successfully")
+
+	// 6. Verify ledger entries were created (optional but safe)
+	var ledgerCount int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.ledger_entries WHERE journal_entry_id = $1`, id).Scan(&ledgerCount)
+	if err != nil {
+		logger.Error("failed to query ledger count", zap.Error(err))
+	} else {
+		logger.Info("ledger entries count after PostJournalToLedger", zap.Int("count", ledgerCount))
+	}
+
+	if err := s.repo.ValidateLedgerExists(ctx, tx, id); err != nil {
+		logger.Error("ValidateLedgerExists failed", zap.Error(err))
+		return fmt.Errorf("ledger validation failed: %w", err)
+	}
+	logger.Info("ValidateLedgerExists passed")
+
+	// 7. Update journal status to 'posted'
+	if err := s.repo.Post(ctx, tx, id, postedBy); err != nil {
+		return fmt.Errorf("post journal entry: %w", err)
+	}
+	logger.Info("journal status updated to posted")
+
+	// 8. Outbox event
+	payload := s.buildJournalEventPayload(entry, lines)
+	outboxEvent := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "journal_entry",
+		AggregateID:   id.String(),
+		EventType:     events.EventJournalPosted,
+		Topic:         TopicAccountingEvents,
+		Payload:       payload,
+		Status:        "pending",
+	}
+	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
+		return fmt.Errorf("store outbox event: %w", err)
+	}
+
+	// 9. Audit log (note: we pass nil for the request field because we don't have one)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &entry.CompanyID, "accounting", "post", "journal_entry",
+			&id, "user", postedBy, nil, nil, nil)
+	}
+
+	return nil
+} // PostWithTx posts a journal entry using an existing transaction.
+// The caller must commit or rollback the transaction.
+func (s *journalService) PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error {
+	// Idempotency check (optional – if you want idempotency inside the caller's transaction)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			s.logger.Info("idempotent request, already posted (PostWithTx)", zap.String("journal_id", id.String()))
+			return nil
+		}
+	}
+
+	if err := s.postWithTxInternal(ctx, tx, id, postedBy); err != nil {
+		return err
+	}
+
+	if idempotencyKey != "" {
+		type postResult struct {
+			JournalID uuid.UUID `json:"journal_id"`
+			Status    string    `json:"status"`
+		}
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, postResult{JournalID: id, Status: "posted"})
+	}
+
+	return nil
 }

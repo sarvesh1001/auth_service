@@ -956,6 +956,10 @@ func (s *reconciliationService) CreateDifference(ctx context.Context, req Create
 // ----------------------------------------------
 // ResolveDifference (mutating) – with idempotency
 // ----------------------------------------------
+// ResolveDifference marks a reconciliation difference as resolved.
+// If adjustmentReq.CreateAdjustment is true, it creates a journal entry,
+// posts it to the ledger, and records a reconciliation adjustment –
+// all inside the same transaction.
 func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uuid.UUID, resolvedBy *uuid.UUID, adjustmentReq *ResolveDifferenceAdjustmentRequest) error {
 	logger := s.logger.With(zap.String("method", "ResolveDifference"), zap.String("diff_id", diffID.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -966,6 +970,7 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 	}
 	defer tx.Rollback()
 
+	// Idempotency check
 	if idempotencyKey != "" {
 		var cached bool
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
@@ -974,6 +979,7 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		}
 	}
 
+	// Fetch difference (with lock)
 	diff, err := s.repo.GetDifferenceByID(ctx, tx, diffID)
 	if err != nil {
 		return fmt.Errorf("get difference: %w", err)
@@ -985,6 +991,7 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		return fmt.Errorf("%w: difference already resolved", ErrInvalidState)
 	}
 
+	// Fetch batch (for company ID and audit)
 	batch, err := s.repo.GetBatchByID(ctx, tx, diff.BatchID)
 	if err != nil {
 		return fmt.Errorf("get batch: %w", err)
@@ -994,8 +1001,12 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 	}
 
 	var adjustmentID *uuid.UUID
+
+	// Create adjustment journal entry if requested
 	if adjustmentReq != nil && adjustmentReq.CreateAdjustment {
 		amountDiff := diff.ExpectedAmount.Sub(diff.ActualAmount).Abs()
+
+		// Build journal request
 		journalReq := CreateJournalRequest{
 			CompanyID:   batch.CompanyID,
 			JournalType: "general",
@@ -1017,28 +1028,40 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 			CreatedBy: resolvedBy,
 			UpdatedBy: resolvedBy,
 		}
-		journalEntry, err := s.journalService.Create(ctx, journalReq)
+
+		// CREATE journal entry (DRAFT) using the same transaction
+		// tx is already *sql.Tx, no cast needed
+		journalEntry, err := s.journalService.CreateWithTx(ctx, tx, journalReq)
 		if err != nil {
 			return fmt.Errorf("create adjustment journal entry: %w", err)
 		}
-		adjReq := CreateAdjustmentRequest{
+
+		// POST the journal entry (updates ledger) using the same transaction
+		if err := s.journalService.PostWithTx(ctx, tx, journalEntry.JournalEntryID, resolvedBy); err != nil {
+			return fmt.Errorf("post adjustment journal entry: %w", err)
+		}
+
+		// Create reconciliation adjustment record (inline to stay in same transaction)
+		adj := &models.ReconciliationAdjustment{
+			AdjustmentID:     uuid.New(),
 			BatchID:          diff.BatchID,
 			JournalEntryID:   journalEntry.JournalEntryID,
 			Reason:           stringPtr(fmt.Sprintf("Auto-adjustment for difference %s", diffID.String())),
 			AdjustmentAmount: amountDiff,
 			CreatedBy:        resolvedBy,
 		}
-		adj, err := s.CreateAdjustment(ctx, adjReq)
-		if err != nil {
+		if err := s.repo.AddAdjustment(ctx, tx, adj); err != nil {
 			return fmt.Errorf("create adjustment record: %w", err)
 		}
 		adjustmentID = &adj.AdjustmentID
 	}
 
+	// Mark difference as resolved
 	if err := s.repo.ResolveDifference(ctx, tx, diffID, resolvedBy); err != nil {
 		return fmt.Errorf("resolve difference: %w", err)
 	}
 
+	// Update analytics trends (non‑critical, log error only)
 	expectedFloat, _ := diff.ExpectedAmount.Float64()
 	actualFloat, _ := diff.ActualAmount.Float64()
 	trend := &analytics.ReconciliationDiffTrends{
@@ -1055,15 +1078,18 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		logger.Error("failed to insert resolution trend", zap.Error(err))
 	}
 
+	// Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "resolve_difference", "reconciliation_difference",
 			&diffID, "user", resolvedBy, nil, nil, map[string]interface{}{"adjustment_created": adjustmentID != nil})
 	}
 
+	// Idempotency storage
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 
+	// Commit everything atomically
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
