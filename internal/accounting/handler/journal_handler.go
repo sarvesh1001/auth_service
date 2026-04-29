@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -29,7 +30,7 @@ func NewJournalHandler(journalService service.JournalService, logger *zap.Logger
 	}
 }
 
-// Request/Response types
+// ========== REQUEST TYPES ==========
 
 type createJournalRequest struct {
 	JournalType string               `json:"journal_type"`
@@ -69,7 +70,15 @@ type listJournalsQuery struct {
 	Offset      int        `json:"offset,omitempty"`
 }
 
-// Helper functions
+// ========== HELPERS ==========
+
+func (h *JournalHandler) withIdempotency(ctx context.Context, r *http.Request) context.Context {
+	key := r.Header.Get("Idempotency-Key")
+	if key != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
 
 func (h *JournalHandler) getUserID(ctx context.Context) (uuid.UUID, error) {
 	userIDStr, ok := ctx.Value("user_id").(string)
@@ -80,23 +89,14 @@ func (h *JournalHandler) getUserID(ctx context.Context) (uuid.UUID, error) {
 }
 
 func (h *JournalHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// Implement real permission check or delegate to RBAC service
+	// TODO: implement actual permission check (e.g., via auth client)
 	return true
 }
 
-// Handlers
+// ========== CREATE ==========
 
-// Create godoc
-// @Summary Create a new journal entry
-// @Tags journals
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param request body createJournalRequest true "Journal data"
-// @Success 201 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals [post]
 func (h *JournalHandler) Create(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.withIdempotency(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -122,13 +122,45 @@ func (h *JournalHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate lines
-	if len(req.Lines) == 0 {
-		h.respondWithError(w, http.StatusBadRequest, "at least one journal line is required")
+	// --- validation (fail fast) ---
+	if len(req.Lines) < 2 {
+		h.respondWithError(w, http.StatusBadRequest, "journal must have at least 2 lines (double-entry)")
 		return
 	}
 
-	// Build service request
+	var totalDebit, totalCredit decimal.Decimal
+	for i, line := range req.Lines {
+		if line.AccountID == uuid.Nil {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("line %d: account_id is required", i+1))
+			return
+		}
+		if line.DebitAmount.IsNegative() || line.CreditAmount.IsNegative() {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("line %d: amounts cannot be negative", i+1))
+			return
+		}
+		if line.DebitAmount.IsZero() && line.CreditAmount.IsZero() {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("line %d: both debit and credit cannot be zero", i+1))
+			return
+		}
+		if !line.DebitAmount.IsZero() && !line.CreditAmount.IsZero() {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("line %d: cannot have both debit and credit", i+1))
+			return
+		}
+		totalDebit = totalDebit.Add(line.DebitAmount)
+		totalCredit = totalCredit.Add(line.CreditAmount)
+	}
+	if !totalDebit.Equal(totalCredit) {
+		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("total debits (%s) must equal total credits (%s)", totalDebit.String(), totalCredit.String()))
+		return
+	}
+	// -------------------------------
+
+	h.logger.Info("create journal request",
+		zap.String("company_id", companyID.String()),
+		zap.String("journal_type", req.JournalType),
+		zap.Int("lines", len(req.Lines)),
+	)
+
 	lines := make([]service.JournalLineRequest, len(req.Lines))
 	for i, l := range req.Lines {
 		lines[i] = service.JournalLineRequest{
@@ -155,7 +187,8 @@ func (h *JournalHandler) Create(w http.ResponseWriter, r *http.Request) {
 	journal, err := h.journalService.Create(ctx, svcReq)
 	if err != nil {
 		h.logger.Error("failed to create journal", zap.Error(err))
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 
@@ -166,18 +199,10 @@ func (h *JournalHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Update godoc
-// @Summary Update a draft journal entry
-// @Tags journals
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Journal Entry ID"
-// @Param request body updateJournalRequest true "Update data"
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals/{id} [put]
+// ========== UPDATE ==========
+
 func (h *JournalHandler) Update(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.withIdempotency(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -204,13 +229,24 @@ func (h *JournalHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fetch existing to check company ownership early
+	existing, err := h.journalService.GetByID(ctx, journalID)
+	if err != nil {
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	if existing.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		return
+	}
+
 	var req updateJournalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Build service request
 	var lines []service.JournalLineRequest
 	if req.Lines != nil {
 		lines = make([]service.JournalLineRequest, len(req.Lines))
@@ -236,13 +272,8 @@ func (h *JournalHandler) Update(w http.ResponseWriter, r *http.Request) {
 	journal, err := h.journalService.Update(ctx, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update journal", zap.Error(err))
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// Verify ownership
-	if journal.CompanyID != companyID {
-		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 
@@ -253,16 +284,10 @@ func (h *JournalHandler) Update(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Post godoc
-// @Summary Post a journal entry (move to ledger)
-// @Tags journals
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Journal Entry ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals/{id}/post [post]
+// ========== POST ==========
+
 func (h *JournalHandler) Post(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.withIdempotency(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -289,10 +314,10 @@ func (h *JournalHandler) Post(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional: verify journal belongs to company before posting
 	journal, err := h.journalService.GetByID(ctx, journalID)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 	if journal.CompanyID != companyID {
@@ -302,7 +327,8 @@ func (h *JournalHandler) Post(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.journalService.Post(ctx, journalID, &userID); err != nil {
 		h.logger.Error("failed to post journal", zap.Error(err))
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 
@@ -312,18 +338,10 @@ func (h *JournalHandler) Post(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Reverse godoc
-// @Summary Reverse a posted journal entry
-// @Tags journals
-// @Accept json
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Journal Entry ID"
-// @Param request body reverseJournalRequest true "Reason for reversal"
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals/{id}/reverse [post]
+// ========== REVERSE ==========
+
 func (h *JournalHandler) Reverse(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.withIdempotency(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -360,10 +378,10 @@ func (h *JournalHandler) Reverse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify ownership
 	journal, err := h.journalService.GetByID(ctx, journalID)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 	if journal.CompanyID != companyID {
@@ -373,7 +391,8 @@ func (h *JournalHandler) Reverse(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.journalService.Reverse(ctx, journalID, req.Reason, &userID); err != nil {
 		h.logger.Error("failed to reverse journal", zap.Error(err))
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 
@@ -383,14 +402,8 @@ func (h *JournalHandler) Reverse(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetByID godoc
-// @Summary Get journal entry by ID
-// @Tags journals
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Journal Entry ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals/{id} [get]
+// ========== GET BY ID ==========
+
 func (h *JournalHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -421,11 +434,10 @@ func (h *JournalHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 
 	journal, err := h.journalService.GetByID(ctx, journalID)
 	if err != nil {
-		h.logger.Error("failed to get journal", zap.Error(err))
-		h.respondWithError(w, http.StatusNotFound, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
-
 	if journal.CompanyID != companyID {
 		h.respondWithError(w, http.StatusForbidden, "journal entry does not belong to this company")
 		return
@@ -437,19 +449,8 @@ func (h *JournalHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// List godoc
-// @Summary List journal entries
-// @Tags journals
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param journal_type query string false "Filter by journal type"
-// @Param status query string false "Filter by status"
-// @Param from_date query string false "Filter from date (RFC3339)"
-// @Param to_date query string false "Filter to date (RFC3339)"
-// @Param limit query int false "Page size" default(50)
-// @Param offset query int false "Offset" default(0)
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals [get]
+// ========== LIST ==========
+
 func (h *JournalHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -472,10 +473,8 @@ func (h *JournalHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
+	filter := repository.JournalFilter{CompanyID: companyID}
 
-	filter := repository.JournalFilter{
-		CompanyID: companyID,
-	}
 	if journalType := query.Get("journal_type"); journalType != "" {
 		filter.JournalType = journalType
 	}
@@ -524,16 +523,10 @@ func (h *JournalHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Delete godoc
-// @Summary Soft-delete a draft journal entry
-// @Tags journals
-// @Produce json
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Journal Entry ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /api/v1/companies/{companyID}/journals/{id} [delete]
+// ========== DELETE ==========
+
 func (h *JournalHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := h.withIdempotency(r.Context(), r)
 
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
@@ -560,10 +553,10 @@ func (h *JournalHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify ownership
 	journal, err := h.journalService.GetByID(ctx, journalID)
 	if err != nil {
-		h.respondWithError(w, http.StatusNotFound, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 	if journal.CompanyID != companyID {
@@ -573,7 +566,8 @@ func (h *JournalHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.journalService.Delete(ctx, journalID, &userID); err != nil {
 		h.logger.Error("failed to delete journal", zap.Error(err))
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
 		return
 	}
 
@@ -583,7 +577,7 @@ func (h *JournalHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Helper response methods
+// ========== HELPERS: RESPONSE & ERROR MAPPING ==========
 
 func (h *JournalHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -598,4 +592,17 @@ func (h *JournalHandler) respondWithError(w http.ResponseWriter, status int, mes
 		"success": false,
 		"error":   message,
 	})
+}
+
+func (h *JournalHandler) mapServiceError(err error) (status int, message string) {
+	switch {
+	case errors.Is(err, repository.ErrNotFound):
+		return http.StatusNotFound, err.Error()
+	case errors.Is(err, service.ErrInvalidInput):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, service.ErrInvalidState):
+		return http.StatusConflict, err.Error()
+	default:
+		return http.StatusBadRequest, err.Error()
+	}
 }

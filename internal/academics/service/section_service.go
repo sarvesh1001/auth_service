@@ -199,6 +199,7 @@ func (s *sectionService) Create(ctx context.Context, req CreateSectionRequest) (
 		AggregateType: "section",
 		AggregateID:   section.SectionID.String(),
 		EventType:     string(EventSectionCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -357,6 +358,7 @@ func (s *sectionService) BulkCreate(ctx context.Context, reqs []CreateSectionReq
 			AggregateType: "section",
 			AggregateID:   sec.SectionID.String(),
 			EventType:     string(EventSectionCreated),
+			Topic:         TopicStudent,
 			Payload:       payload,
 			Status:        "pending",
 		}
@@ -444,6 +446,7 @@ func (s *sectionService) Upsert(ctx context.Context, req CreateSectionRequest) (
 		AggregateType: "section",
 		AggregateID:   section.SectionID.String(),
 		EventType:     string(EventSectionUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -579,6 +582,7 @@ func (s *sectionService) Update(ctx context.Context, req UpdateSectionRequest) (
 		AggregateType: "section",
 		AggregateID:   section.SectionID.String(),
 		EventType:     string(EventSectionUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -641,6 +645,7 @@ func (s *sectionService) UpdateCapacity(ctx context.Context, sectionID uuid.UUID
 		AggregateType: "section",
 		AggregateID:   sectionID.String(),
 		EventType:     string(EventSectionUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -696,6 +701,7 @@ func (s *sectionService) Activate(ctx context.Context, id uuid.UUID, updatedBy *
 		AggregateType: "section",
 		AggregateID:   id.String(),
 		EventType:     string(EventSectionUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -751,6 +757,7 @@ func (s *sectionService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy
 		AggregateType: "section",
 		AggregateID:   id.String(),
 		EventType:     string(EventSectionUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -818,6 +825,7 @@ func (s *sectionService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		AggregateType: "section",
 		AggregateID:   id.String(),
 		EventType:     string(EventSectionDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}

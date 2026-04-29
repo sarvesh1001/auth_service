@@ -17,7 +17,6 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// AcademicYearService defines the business operations for academic years.
 type AcademicYearService interface {
 	Create(ctx context.Context, req CreateAcademicYearRequest) (*models.AcademicYear, error)
 	BulkCreate(ctx context.Context, req []CreateAcademicYearRequest) ([]*models.AcademicYear, error)
@@ -36,7 +35,6 @@ type AcademicYearService interface {
 	ValidateOverlap(ctx context.Context, companyID uuid.UUID, start, end time.Time) error
 }
 
-// academicYearService is the concrete implementation.
 type academicYearService struct {
 	repo                repository.AcademicYearRepository
 	pgClient            *client.PostgresClient
@@ -47,7 +45,6 @@ type academicYearService struct {
 	notificationService NotificationService
 }
 
-// NewAcademicYearService creates a new service instance.
 func NewAcademicYearService(
 	repo repository.AcademicYearRepository,
 	pgClient *client.PostgresClient,
@@ -67,10 +64,6 @@ func NewAcademicYearService(
 		notificationService: notificationService,
 	}
 }
-
-// ---------------------------------------------------------------------
-// Helper for notification creation
-// ---------------------------------------------------------------------
 
 func (s *academicYearService) buildNotificationRequest(
 	ay *models.AcademicYear,
@@ -127,10 +120,6 @@ func (s *academicYearService) buildNotificationRequest(
 	}
 }
 
-// ---------------------------------------------------------------------
-// Core CRUD Operations
-// ---------------------------------------------------------------------
-
 func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYearRequest) (*models.AcademicYear, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
@@ -138,7 +127,6 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		zap.String("name", req.Name),
 	)
 
-	// Extract idempotency key once
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateInput(req.CompanyID, req.Name, req.StartDate, req.EndDate); err != nil {
@@ -151,7 +139,6 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (inside transaction)
 	if idempotencyKey != "" {
 		var existing *models.AcademicYear
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
@@ -160,7 +147,6 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		}
 	}
 
-	// Overlap check
 	overlap, err := s.repo.CheckOverlap(ctx, tx, req.CompanyID, req.StartDate, req.EndDate, uuid.Nil)
 	if err != nil {
 		return nil, fmt.Errorf("overlap check: %w", err)
@@ -169,7 +155,6 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		return nil, fmt.Errorf("%w: academic year dates overlap with an existing year", ErrOverlap)
 	}
 
-	// Duplicate name check
 	exists, err := s.repo.Exists(ctx, tx, req.CompanyID, req.Name)
 	if err != nil {
 		return nil, fmt.Errorf("check existence: %w", err)
@@ -178,7 +163,6 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		return nil, fmt.Errorf("%w: academic year name %s already exists", ErrDuplicate, req.Name)
 	}
 
-	// If this year should be current, unset any existing current year
 	if req.IsCurrent {
 		if err := s.repo.UnsetCurrent(ctx, tx, req.CompanyID, req.UpdatedBy); err != nil {
 			return nil, fmt.Errorf("unset current: %w", err)
@@ -199,21 +183,19 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 		return nil, err
 	}
 
-	// Store idempotency key after successful insert (before commit)
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, ay); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
-			// Continue – data already inserted; idempotency not critical for correctness
 		}
 	}
 
-	// Outbox event
 	payload, _ := json.Marshal(ay)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "academic_year",
 		AggregateID:   ay.AcademicYearID.String(),
 		EventType:     string(EventAcademicYearCreated),
+		Topic:         TopicAcademicYear, // <-- NEW
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",
@@ -228,14 +210,12 @@ func (s *academicYearService) Create(ctx context.Context, req CreateAcademicYear
 
 	logger.Info("academic year created", zap.String("id", ay.AcademicYearID.String()))
 
-	// Audit logging (after commit – no transaction)
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "academics", "create", "academic_year",
 			&ay.AcademicYearID, "user", req.CreatedBy, nil, nil,
 			map[string]interface{}{"name": ay.Name})
 	}
 
-	// Create notification
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(ay, "created", req.CreatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -260,7 +240,6 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 	}
 	defer tx.Rollback()
 
-	// Idempotency check (entire bulk operation)
 	if idempotencyKey != "" {
 		var existing []*models.AcademicYear
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
@@ -269,7 +248,6 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 		}
 	}
 
-	// Pre-load existing years to avoid duplicate name checks per company
 	companyIDs := make(map[uuid.UUID]struct{})
 	for _, req := range reqs {
 		companyIDs[req.CompanyID] = struct{}{}
@@ -292,7 +270,6 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
 
-		// Check duplicate name in batch
 		if batchByName[req.CompanyID] == nil {
 			batchByName[req.CompanyID] = make(map[string]bool)
 		}
@@ -301,14 +278,12 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 		}
 		batchByName[req.CompanyID][req.Name] = true
 
-		// Check against existing DB records (name)
 		for _, ay := range existingByCompany[req.CompanyID] {
 			if ay.Name == req.Name {
 				return nil, fmt.Errorf("item %d: %w: name %s already exists", i, ErrDuplicate, req.Name)
 			}
 		}
 
-		// Overlap check in memory (combine existing + already validated in this batch)
 		tempExisting := make([]*models.AcademicYear, 0, len(existingByCompany[req.CompanyID])+len(years))
 		tempExisting = append(tempExisting, existingByCompany[req.CompanyID]...)
 		for _, ay := range years {
@@ -332,19 +307,16 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 		years = append(years, ay)
 	}
 
-	// Bulk insert
 	if err := s.repo.BulkCreate(ctx, tx, years); err != nil {
 		return nil, err
 	}
 
-	// Store idempotency key after successful insert
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, years); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
 
-	// Store outbox events for each created year
 	for _, ay := range years {
 		payload, _ := json.Marshal(ay)
 		outboxEvent := &outbox.Event{
@@ -352,6 +324,7 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 			AggregateType: "academic_year",
 			AggregateID:   ay.AcademicYearID.String(),
 			EventType:     string(EventAcademicYearCreated),
+			Topic:         TopicAcademicYear, // <-- NEW
 			Payload:       payload,
 			Status:        "pending",
 		}
@@ -366,7 +339,6 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 
 	logger.Info("bulk created academic years", zap.Int("count", len(years)))
 
-	// Audit each (optional)
 	if s.auditService != nil {
 		for _, ay := range years {
 			_ = s.auditService.LogAction(ctx, nil, &ay.CompanyID, "academics", "bulk_create", "academic_year",
@@ -374,7 +346,6 @@ func (s *academicYearService) BulkCreate(ctx context.Context, reqs []CreateAcade
 		}
 	}
 
-	// Create notifications
 	if s.notificationService != nil {
 		for _, ay := range years {
 			notifReq := s.buildNotificationRequest(ay, "created", ay.CreatedBy)
@@ -395,6 +366,7 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 		zap.String("company_id", req.CompanyID.String()),
 		zap.String("name", req.Name),
 	)
+
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateInput(req.CompanyID, req.Name, req.StartDate, req.EndDate); err != nil {
@@ -407,7 +379,6 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 	}
 	defer tx.Rollback()
 
-	// Idempotency check
 	if idempotencyKey != "" {
 		var existing *models.AcademicYear
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
@@ -417,6 +388,7 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 	}
 
 	existing, _ := s.repo.GetByName(ctx, tx, req.CompanyID, req.Name)
+
 	excludeID := uuid.Nil
 	if existing != nil {
 		excludeID = existing.AcademicYearID
@@ -454,7 +426,6 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 		return nil, err
 	}
 
-	// Store idempotency key after successful upsert
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, ay); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
@@ -467,6 +438,7 @@ func (s *academicYearService) Upsert(ctx context.Context, req CreateAcademicYear
 		AggregateType: "academic_year",
 		AggregateID:   ay.AcademicYearID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicAcademicYear, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -568,7 +540,6 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 	}
 	defer tx.Rollback()
 
-	// Idempotency check
 	if idempotencyKey != "" {
 		var existing *models.AcademicYear
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
@@ -613,7 +584,6 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 		return nil, err
 	}
 
-	// Store idempotency key after successful update
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, existing); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
@@ -626,6 +596,7 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 		AggregateType: "academic_year",
 		AggregateID:   existing.AcademicYearID.String(),
 		EventType:     string(EventAcademicYearUpdated),
+		Topic:         TopicAcademicYear, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -656,8 +627,6 @@ func (s *academicYearService) Update(ctx context.Context, req UpdateAcademicYear
 
 func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, start, end time.Time, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "UpdateDates"), zap.String("id", id.String()))
-	// Idempotency not implemented for this method because it's a partial update.
-	// Could be added if needed.
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -699,6 +668,7 @@ func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, sta
 		AggregateType: "academic_year",
 		AggregateID:   updatedAy.AcademicYearID.String(),
 		EventType:     string(EventAcademicYearUpdated),
+		Topic:         TopicAcademicYear, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -729,7 +699,6 @@ func (s *academicYearService) UpdateDates(ctx context.Context, id uuid.UUID, sta
 
 func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academicYearID uuid.UUID, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "SetCurrent"), zap.String("company_id", companyID.String()), zap.String("id", academicYearID.String()))
-	// Idempotency not critical for this operation.
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -755,6 +724,7 @@ func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academi
 		AggregateType: "academic_year",
 		AggregateID:   ay.AcademicYearID.String(),
 		EventType:     string(EventAcademicYearSetCurrent),
+		Topic:         TopicAcademicYear, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -785,7 +755,6 @@ func (s *academicYearService) SetCurrent(ctx context.Context, companyID, academi
 
 func (s *academicYearService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("id", id.String()))
-	// Idempotency not needed for delete (deleting twice should be harmless or return not found).
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -811,6 +780,7 @@ func (s *academicYearService) Delete(ctx context.Context, id uuid.UUID, deletedB
 		AggregateType: "academic_year",
 		AggregateID:   ay.AcademicYearID.String(),
 		EventType:     string(EventAcademicYearDeleted),
+		Topic:         TopicAcademicYear, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}

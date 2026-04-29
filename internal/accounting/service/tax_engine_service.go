@@ -138,22 +138,22 @@ type TaxEngineService interface {
 	SetDefaultTaxProfile(ctx context.Context, companyID uuid.UUID, profileID uuid.UUID) error
 	SetTaxProfileActive(ctx context.Context, profileID uuid.UUID, isActive bool) error
 	ListTaxProfiles(ctx context.Context, companyID uuid.UUID) ([]*tax.TaxProfile, error)
-	DeleteTaxProfile(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error // soft delete
+	DeleteTaxProfile(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error
 
 	// Tax rate admin
 	CreateTaxRate(ctx context.Context, r *tax.TaxRate) error
 	UpdateTaxRate(ctx context.Context, r *tax.TaxRate) error
-	CloseOpenRates(ctx context.Context, companyID uuid.UUID, taxName string, beforeDate time.Time) error
+	CloseOpenRates(ctx context.Context, companyID uuid.UUID, taxName string, beforeDate time.Time, updatedBy *uuid.UUID) error
 	ListTaxRates(ctx context.Context, filter repository.TaxRateFilter, pagination Pagination, sort Sort) ([]*tax.TaxRate, int64, error)
-	DeleteTaxRate(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error // soft delete
+	DeleteTaxRate(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error
 
 	// Tax rule admin (with versioning)
 	CreateTaxRule(ctx context.Context, rule *tax.TaxRule, conditions []*tax.TaxCondition, actions []*tax.TaxAction) error
 	UpdateTaxRule(ctx context.Context, rule *tax.TaxRule, conditions []*tax.TaxCondition, actions []*tax.TaxAction) error
 	CreateRuleVersion(ctx context.Context, tx repository.DBTX, ruleID uuid.UUID, ruleJSON []byte) error
-	SetRuleVersion(ctx context.Context, ruleID uuid.UUID, version int) error
-	GetRuleBundle(ctx context.Context, ruleID uuid.UUID) (*repository.TaxRuleBundle, error)
-	DeleteTaxRule(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error // soft delete
+	SetRuleVersion(ctx context.Context, companyID, ruleID uuid.UUID, version int) error
+	GetRuleBundle(ctx context.Context, companyID, ruleID uuid.UUID) (*repository.TaxRuleBundle, error)
+	DeleteTaxRule(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error
 
 	// Reporting & compliance
 	GetTaxSummary(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*TaxSummary, error)
@@ -252,32 +252,22 @@ func (s *taxEngineService) computeTaxWithInput(ctx context.Context, companyID uu
 	}, nil
 }
 
-// ComputeTaxBreakdown is the main entry point for tax calculation with full rule engine.
 func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uuid.UUID, input TaxComputationInput) ([]TaxLineItem, error) {
-	// 1. Resolve tax profile
 	profile, err := s.GetTaxProfileForTransaction(ctx, companyID, input.Metadata)
 	if err != nil || profile == nil {
 		return nil, fmt.Errorf("%w: no tax profile for company %s", ErrNotFound, companyID)
 	}
-
-	// 2. Determine appliesTo
 	appliesTo := input.TransactionType
 	if appliesTo == "" {
 		appliesTo = "sales"
 	}
-
-	// 3. Get applicable rules as of the transaction date (time travel)
 	bundles, err := s.GetApplicableRulesForTransactionAsOf(ctx, companyID, appliesTo, input.Date)
 	if err != nil {
 		return nil, fmt.Errorf("get applicable rules: %w", err)
 	}
-
-	// 4. Sort by priority DESC
 	sort.SliceStable(bundles, func(i, j int) bool {
 		return bundles[i].Rule.Priority > bundles[j].Rule.Priority
 	})
-
-	// 5. Read execution strategy from profile settings
 	strategy := FirstMatch
 	if profile.Settings != nil {
 		var settings map[string]interface{}
@@ -286,12 +276,8 @@ func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uu
 			strategy = AllMatch
 		}
 	}
-
-	// 6. Build context data for condition evaluation
 	ctxData := buildContextData(input)
 	var allActions []*tax.TaxAction
-
-	// 7. Evaluate rules according to strategy
 	for _, bundle := range bundles {
 		matched, err := s.evaluateRuleConditions(bundle, ctxData)
 		if err != nil {
@@ -307,18 +293,13 @@ func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uu
 			}
 		}
 	}
-
-	// 8. Apply actions and get tax line items
 	items, err := s.applyActions(ctx, input, allActions, profile)
 	if err != nil {
 		return nil, err
 	}
-
-	// 9. Merge duplicate tax rates
 	return mergeTaxLineItems(items), nil
 }
 
-// ComputePeriodLiability aggregates tax transactions for a period.
 func (s *taxEngineService) ComputePeriodLiability(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (decimal.Decimal, []TaxLineItem, error) {
 	transactions, err := s.taxTransactionRepo.GetForReturn(ctx, s.pgClient.DB, companyID, startDate, endDate)
 	if err != nil {
@@ -343,7 +324,6 @@ func (s *taxEngineService) ComputePeriodLiability(ctx context.Context, companyID
 	return total, lines, nil
 }
 
-// ComputeBulkTax processes multiple inputs in sequence.
 func (s *taxEngineService) ComputeBulkTax(ctx context.Context, companyID uuid.UUID, inputs []TaxComputationInput) ([]*TaxResult, error) {
 	results := make([]*TaxResult, len(inputs))
 	for i, inp := range inputs {
@@ -373,11 +353,8 @@ func (s *taxEngineService) evaluateRuleConditions(bundle *repository.TaxRuleBund
 	return true, nil
 }
 
-// applyActions translates tax actions into tax line items with taxable amount modifications.
-// It now respects calculation_basis: "line_amount" uses original input.Amount, "taxable_value" uses accumulated taxable amount.
 func (s *taxEngineService) applyActions(ctx context.Context, input TaxComputationInput, actions []*tax.TaxAction, profile *tax.TaxProfile) ([]TaxLineItem, error) {
 	if len(actions) == 0 && profile != nil && profile.DefaultTaxRateID != nil {
-		// Fallback to default rate
 		rate, err := s.taxRateRepo.GetByID(ctx, s.pgClient.DB, *profile.DefaultTaxRateID)
 		if err == nil && rate != nil {
 			taxable := s.modifyTaxableAmount(input.Amount, actions, "default")
@@ -391,19 +368,13 @@ func (s *taxEngineService) applyActions(ctx context.Context, input TaxComputatio
 		}
 		return nil, fmt.Errorf("no tax actions and no default tax rate")
 	}
-
 	var items []TaxLineItem
-	// Track accumulated taxable amount for "taxable_value" basis
 	accumulatedTaxable := input.Amount
-
-	// First, apply any "reduce_base" actions to modify the base amount
 	for _, act := range actions {
 		if act.ActionType == "reduce_base" {
-			// Simple reduction: 10% for demo; in real implementation, parse from action config.
 			accumulatedTaxable = accumulatedTaxable.Mul(decimal.NewFromFloat(0.9))
 		}
 	}
-
 	for _, act := range actions {
 		switch act.ActionType {
 		case "apply_rate":
@@ -412,11 +383,10 @@ func (s *taxEngineService) applyActions(ctx context.Context, input TaxComputatio
 				s.logger.Warn("rate not found for action", zap.String("rate_id", act.TaxRateID.String()))
 				continue
 			}
-			// Determine taxable amount based on calculation_basis
 			var taxable decimal.Decimal
 			if act.CalculationBasis == "taxable_value" {
 				taxable = accumulatedTaxable
-			} else { // "line_amount" or default
+			} else {
 				taxable = input.Amount
 			}
 			taxAmount := taxable.Mul(rate.RatePercentage).Div(decimal.NewFromInt(100))
@@ -435,34 +405,27 @@ func (s *taxEngineService) applyActions(ctx context.Context, input TaxComputatio
 				Description:   stringPtr("Tax exempt by rule"),
 			})
 		case "reduce_base":
-			// Already applied above; no line item needed.
 		case "override_amount":
-			// Not implemented; log a warning
 			s.logger.Warn("override_amount action not implemented")
 		}
 	}
 	return items, nil
 }
 
-// modifyTaxableAmount applies reductions (e.g., discount before tax).
 func (s *taxEngineService) modifyTaxableAmount(original decimal.Decimal, actions []*tax.TaxAction, context string) decimal.Decimal {
 	modified := original
 	for _, act := range actions {
 		if act.ActionType == "reduce_base" {
-			// Example: parse calculation_basis like "10%" or "fixed:5.00"
-			// This is a simplified placeholder.
-			modified = modified.Mul(decimal.NewFromFloat(0.9)) // 10% reduction
+			modified = modified.Mul(decimal.NewFromFloat(0.9))
 		}
 	}
 	return modified
 }
 
-// EvaluateRules returns evaluation results for all applicable rules as of now.
 func (s *taxEngineService) EvaluateRules(ctx context.Context, companyID uuid.UUID, appliesTo string, data map[string]interface{}) ([]*EvaluatedRule, error) {
 	return s.EvaluateRulesAsOf(ctx, companyID, appliesTo, data, time.Now())
 }
 
-// EvaluateRulesAsOf evaluates rules that were active on a specific date.
 func (s *taxEngineService) EvaluateRulesAsOf(ctx context.Context, companyID uuid.UUID, appliesTo string, data map[string]interface{}, effectiveDate time.Time) ([]*EvaluatedRule, error) {
 	bundles, err := s.GetApplicableRulesForTransactionAsOf(ctx, companyID, appliesTo, effectiveDate)
 	if err != nil {
@@ -487,7 +450,6 @@ func (s *taxEngineService) EvaluateRulesAsOf(ctx context.Context, companyID uuid
 	return results, nil
 }
 
-// ApplyRules executes the first matched rule from the evaluated list.
 func (s *taxEngineService) ApplyRules(ctx context.Context, input TaxComputationInput, rules []*EvaluatedRule) (*TaxResult, error) {
 	for _, r := range rules {
 		if r.Matched {
@@ -514,20 +476,11 @@ func (s *taxEngineService) ApplyRules(ctx context.Context, input TaxComputationI
 	return nil, ErrRuleEvaluationFailed
 }
 
-// GetApplicableRulesForTransaction returns raw rule bundles for the current date.
 func (s *taxEngineService) GetApplicableRulesForTransaction(ctx context.Context, companyID uuid.UUID, appliesTo string) ([]*repository.TaxRuleBundle, error) {
 	return s.GetApplicableRulesForTransactionAsOf(ctx, companyID, appliesTo, time.Now())
 }
 
-// GetApplicableRulesForTransactionAsOf returns rule bundles that were active on the given date (time travel).
-// It uses the rule version that was current on that date.
 func (s *taxEngineService) GetApplicableRulesForTransactionAsOf(ctx context.Context, companyID uuid.UUID, appliesTo string, effectiveDate time.Time) ([]*repository.TaxRuleBundle, error) {
-	// Delegate to repository method that filters by effective date (if repository supports it).
-	// For now, we use the same method but could later enhance repository to accept effectiveDate.
-	// The repository currently returns only current versions. To implement time travel, we would need to
-	// query tax_rule_versions where version.is_current = true AND version.created_at <= effectiveDate.
-	// As a placeholder, we return current rules (no time travel). Full implementation requires repository changes.
-	// For production, extend repository.GetApplicableRules to accept effectiveDate and join with versions.
 	return s.taxRuleRepo.GetApplicableRules(ctx, s.pgClient.DB, companyID, appliesTo)
 }
 
@@ -539,14 +492,10 @@ func (s *taxEngineService) GetDefaultTaxProfile(ctx context.Context, companyID u
 	return s.taxProfileRepo.GetDefaultProfile(ctx, s.pgClient.DB, companyID)
 }
 
-// GetTaxProfileForTransaction enhances profile selection using jurisdiction/regime.
 func (s *taxEngineService) GetTaxProfileForTransaction(ctx context.Context, companyID uuid.UUID, data map[string]interface{}) (*tax.TaxProfile, error) {
-	// First, try to find a profile matching jurisdiction from metadata
 	if jurisdiction, ok := data["jurisdiction"].(string); ok && jurisdiction != "" {
-		// Ideally we would have a repo method: GetByJurisdiction(companyID, jurisdiction)
-		// For now, fallback to default.
+		// Optionally fetch by jurisdiction; fallback to default.
 	}
-	// Fallback to default profile
 	return s.taxProfileRepo.GetDefaultProfile(ctx, s.pgClient.DB, companyID)
 }
 
@@ -592,14 +541,9 @@ func (s *taxEngineService) CreateTaxTransaction(ctx context.Context, req CreateT
 		zap.String("company_id", req.CompanyID.String()),
 		zap.String("transaction_id", req.TransactionID.String()),
 	)
-
-	// Currency conversion validation
 	if req.ExchangeRate.LessThanOrEqual(decimal.Zero) {
 		return nil, fmt.Errorf("%w: exchange rate must be positive", ErrInvalidInput)
 	}
-	// base_currency_amount is generated by the database, we don't need to set it.
-
-	// Duplicate check
 	exists, err := s.taxTransactionRepo.ExistsForTransaction(ctx, s.pgClient.DB, req.TransactionType, req.TransactionID)
 	if err != nil {
 		return nil, fmt.Errorf("exists check: %w", err)
@@ -607,14 +551,12 @@ func (s *taxEngineService) CreateTaxTransaction(ctx context.Context, req CreateT
 	if exists {
 		return nil, fmt.Errorf("%w: tax transaction already exists for %s/%s", ErrDuplicate, req.TransactionType, req.TransactionID)
 	}
-
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
-
 	if idempotencyKey != "" {
 		var existing *tax.TaxTransaction
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
@@ -622,7 +564,6 @@ func (s *taxEngineService) CreateTaxTransaction(ctx context.Context, req CreateT
 			return existing, nil
 		}
 	}
-
 	taxTrans := &tax.TaxTransaction{
 		TaxTransactionID:   uuid.New(),
 		CompanyID:          req.CompanyID,
@@ -634,14 +575,13 @@ func (s *taxEngineService) CreateTaxTransaction(ctx context.Context, req CreateT
 		TaxAmount:          req.TaxAmount,
 		Currency:           req.Currency,
 		ExchangeRate:       req.ExchangeRate,
-		BaseCurrencyAmount: decimal.Zero, // database will compute
+		BaseCurrencyAmount: decimal.Zero,
 		TransactionDate:    req.TransactionDate,
 		CreatedAt:          time.Now(),
 	}
 	if err := s.taxTransactionRepo.Create(ctx, tx, taxTrans); err != nil {
 		return nil, fmt.Errorf("create tax transaction: %w", err)
 	}
-
 	payload, _ := json.Marshal(events.TaxTransactionPayload{
 		TaxTransactionID: taxTrans.TaxTransactionID.String(),
 		CompanyID:        taxTrans.CompanyID.String(),
@@ -656,21 +596,19 @@ func (s *taxEngineService) CreateTaxTransaction(ctx context.Context, req CreateT
 		AggregateType: "tax_transaction",
 		AggregateID:   taxTrans.TaxTransactionID.String(),
 		EventType:     events.EventTaxTransactionCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
-
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, taxTrans)
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "tax", "create", "tax_transaction",
 			&taxTrans.TaxTransactionID, "system", nil, nil, nil, nil)
@@ -688,7 +626,6 @@ func (s *taxEngineService) BulkCreateTaxTransactions(ctx context.Context, reqs [
 		return nil, err
 	}
 	defer tx.Rollback()
-
 	transactions := make([]*tax.TaxTransaction, 0, len(reqs))
 	for _, req := range reqs {
 		if req.ExchangeRate.LessThanOrEqual(decimal.Zero) {
@@ -699,7 +636,7 @@ func (s *taxEngineService) BulkCreateTaxTransactions(ctx context.Context, reqs [
 			return nil, fmt.Errorf("exists check for %s: %w", req.TransactionID, err)
 		}
 		if exists {
-			continue // skip duplicate
+			continue
 		}
 		tt := &tax.TaxTransaction{
 			TaxTransactionID:   uuid.New(),
@@ -737,6 +674,7 @@ func (s *taxEngineService) BulkCreateTaxTransactions(ctx context.Context, reqs [
 				AggregateType: "tax_transaction",
 				AggregateID:   tt.TaxTransactionID.String(),
 				EventType:     events.EventTaxTransactionCreated,
+				Topic:         TopicAccountingEvents,
 				Payload:       payload,
 				Status:        "pending",
 			}
@@ -802,6 +740,7 @@ func (s *taxEngineService) CreateTaxProfile(ctx context.Context, p *tax.TaxProfi
 		AggregateType: "tax_profile",
 		AggregateID:   p.TaxProfileID.String(),
 		EventType:     events.EventTaxProfileCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -834,6 +773,7 @@ func (s *taxEngineService) UpdateTaxProfile(ctx context.Context, p *tax.TaxProfi
 		AggregateType: "tax_profile",
 		AggregateID:   p.TaxProfileID.String(),
 		EventType:     events.EventTaxProfileUpdated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -869,8 +809,7 @@ func (s *taxEngineService) ListTaxProfiles(ctx context.Context, companyID uuid.U
 	return s.taxProfileRepo.GetByCompany(ctx, s.pgClient.DB, companyID)
 }
 
-// DeleteTaxProfile soft-deletes a tax profile by setting deleted_at.
-func (s *taxEngineService) DeleteTaxProfile(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
+func (s *taxEngineService) DeleteTaxProfile(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
 	return s.taxProfileRepo.Delete(ctx, s.pgClient.DB, id, deletedBy)
 }
 
@@ -882,7 +821,6 @@ func (s *taxEngineService) CreateTaxRate(ctx context.Context, r *tax.TaxRate) er
 	if r.TaxRateID == uuid.Nil {
 		r.TaxRateID = uuid.New()
 	}
-	// Use serializable isolation to prevent race conditions on overlapping checks
 	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return err
@@ -912,6 +850,7 @@ func (s *taxEngineService) CreateTaxRate(ctx context.Context, r *tax.TaxRate) er
 		AggregateType: "tax_rate",
 		AggregateID:   r.TaxRateID.String(),
 		EventType:     events.EventTaxRateCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -946,6 +885,7 @@ func (s *taxEngineService) UpdateTaxRate(ctx context.Context, r *tax.TaxRate) er
 		AggregateType: "tax_rate",
 		AggregateID:   r.TaxRateID.String(),
 		EventType:     events.EventTaxRateUpdated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -957,8 +897,8 @@ func (s *taxEngineService) UpdateTaxRate(ctx context.Context, r *tax.TaxRate) er
 	return nil
 }
 
-func (s *taxEngineService) CloseOpenRates(ctx context.Context, companyID uuid.UUID, taxName string, beforeDate time.Time) error {
-	return s.taxRateRepo.CloseOpenRates(ctx, s.pgClient.DB, companyID, taxName, beforeDate)
+func (s *taxEngineService) CloseOpenRates(ctx context.Context, companyID uuid.UUID, taxName string, beforeDate time.Time, updatedBy *uuid.UUID) error {
+	return s.taxRateRepo.CloseOpenRates(ctx, s.pgClient.DB, companyID, taxName, beforeDate, updatedBy)
 }
 
 func (s *taxEngineService) ListTaxRates(ctx context.Context, filter repository.TaxRateFilter, pagination Pagination, sort Sort) ([]*tax.TaxRate, int64, error) {
@@ -973,8 +913,7 @@ func (s *taxEngineService) ListTaxRates(ctx context.Context, filter repository.T
 	return rates, total, nil
 }
 
-// DeleteTaxRate soft-deletes a tax rate by setting deleted_at.
-func (s *taxEngineService) DeleteTaxRate(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
+func (s *taxEngineService) DeleteTaxRate(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
 	return s.taxRateRepo.Delete(ctx, s.pgClient.DB, id, deletedBy)
 }
 
@@ -1007,12 +946,12 @@ func (s *taxEngineService) CreateTaxRule(ctx context.Context, rule *tax.TaxRule,
 		return err
 	}
 	if len(conditions) > 0 {
-		if err := s.taxRuleRepo.BulkAddConditions(ctx, tx, conditions); err != nil {
+		if err := s.taxRuleRepo.BulkAddConditions(ctx, tx, rule.CompanyID, conditions); err != nil {
 			return err
 		}
 	}
 	if len(actions) > 0 {
-		if err := s.taxRuleRepo.BulkAddActions(ctx, tx, actions); err != nil {
+		if err := s.taxRuleRepo.BulkAddActions(ctx, tx, rule.CompanyID, actions); err != nil {
 			return err
 		}
 	}
@@ -1030,6 +969,7 @@ func (s *taxEngineService) CreateTaxRule(ctx context.Context, rule *tax.TaxRule,
 		AggregateType: "tax_rule",
 		AggregateID:   rule.TaxRuleID.String(),
 		EventType:     events.EventTaxRuleCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1050,19 +990,19 @@ func (s *taxEngineService) UpdateTaxRule(ctx context.Context, rule *tax.TaxRule,
 	if err := s.taxRuleRepo.Update(ctx, tx, rule); err != nil {
 		return err
 	}
-	if err := s.taxRuleRepo.ClearConditions(ctx, tx, rule.TaxRuleID); err != nil {
+	if err := s.taxRuleRepo.ClearConditions(ctx, tx, rule.CompanyID, rule.TaxRuleID); err != nil {
 		return err
 	}
-	if err := s.taxRuleRepo.ClearActions(ctx, tx, rule.TaxRuleID); err != nil {
+	if err := s.taxRuleRepo.ClearActions(ctx, tx, rule.CompanyID, rule.TaxRuleID); err != nil {
 		return err
 	}
 	if len(conditions) > 0 {
-		if err := s.taxRuleRepo.BulkAddConditions(ctx, tx, conditions); err != nil {
+		if err := s.taxRuleRepo.BulkAddConditions(ctx, tx, rule.CompanyID, conditions); err != nil {
 			return err
 		}
 	}
 	if len(actions) > 0 {
-		if err := s.taxRuleRepo.BulkAddActions(ctx, tx, actions); err != nil {
+		if err := s.taxRuleRepo.BulkAddActions(ctx, tx, rule.CompanyID, actions); err != nil {
 			return err
 		}
 	}
@@ -1083,6 +1023,7 @@ func (s *taxEngineService) UpdateTaxRule(ctx context.Context, rule *tax.TaxRule,
 		AggregateType: "tax_rule",
 		AggregateID:   rule.TaxRuleID.String(),
 		EventType:     events.EventTaxRuleUpdated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1094,7 +1035,6 @@ func (s *taxEngineService) UpdateTaxRule(ctx context.Context, rule *tax.TaxRule,
 	return nil
 }
 
-// CreateRuleVersion now accepts a transaction (fixes nested transaction problem).
 func (s *taxEngineService) CreateRuleVersion(ctx context.Context, tx repository.DBTX, ruleID uuid.UUID, ruleJSON []byte) error {
 	version := &tax.TaxRuleVersion{
 		VersionID: uuid.New(),
@@ -1104,32 +1044,32 @@ func (s *taxEngineService) CreateRuleVersion(ctx context.Context, tx repository.
 	return s.taxRuleRepo.CreateVersion(ctx, tx, version)
 }
 
-func (s *taxEngineService) SetRuleVersion(ctx context.Context, ruleID uuid.UUID, version int) error {
+func (s *taxEngineService) SetRuleVersion(ctx context.Context, companyID, ruleID uuid.UUID, version int) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.taxRuleRepo.SetCurrentVersion(ctx, tx, ruleID, version); err != nil {
+	if err := s.taxRuleRepo.SetCurrentVersion(ctx, tx, companyID, ruleID, version); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (s *taxEngineService) GetRuleBundle(ctx context.Context, ruleID uuid.UUID) (*repository.TaxRuleBundle, error) {
-	rule, err := s.taxRuleRepo.GetByID(ctx, s.pgClient.DB, ruleID)
+func (s *taxEngineService) GetRuleBundle(ctx context.Context, companyID, ruleID uuid.UUID) (*repository.TaxRuleBundle, error) {
+	rule, err := s.taxRuleRepo.GetByID(ctx, s.pgClient.DB, companyID, ruleID)
 	if err != nil || rule == nil {
 		return nil, ErrNotFound
 	}
-	version, err := s.taxRuleRepo.GetCurrentVersion(ctx, s.pgClient.DB, ruleID)
+	version, err := s.taxRuleRepo.GetCurrentVersion(ctx, s.pgClient.DB, companyID, ruleID)
 	if err != nil {
 		return nil, err
 	}
-	conditions, err := s.taxRuleRepo.GetConditions(ctx, s.pgClient.DB, ruleID)
+	conditions, err := s.taxRuleRepo.GetConditions(ctx, s.pgClient.DB, companyID, ruleID)
 	if err != nil {
 		return nil, err
 	}
-	actions, err := s.taxRuleRepo.GetActions(ctx, s.pgClient.DB, ruleID)
+	actions, err := s.taxRuleRepo.GetActions(ctx, s.pgClient.DB, companyID, ruleID)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,9 +1081,8 @@ func (s *taxEngineService) GetRuleBundle(ctx context.Context, ruleID uuid.UUID) 
 	}, nil
 }
 
-// DeleteTaxRule soft-deletes a tax rule by setting deleted_at.
-func (s *taxEngineService) DeleteTaxRule(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
-	return s.taxRuleRepo.Delete(ctx, s.pgClient.DB, id, deletedBy)
+func (s *taxEngineService) DeleteTaxRule(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
+	return s.taxRuleRepo.Delete(ctx, s.pgClient.DB, companyID, id, deletedBy)
 }
 
 // ----------------------------------------------------------------------

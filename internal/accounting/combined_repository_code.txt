@@ -57,6 +57,7 @@ type JournalRepository interface {
 	Count(ctx context.Context, db DBTX, filter JournalFilter) (int64, error)
 
 	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
+	ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (bool, error)
 
 	// =====================================================
 	// STATUS / LIFECYCLE
@@ -160,7 +161,7 @@ func (r *journalRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// buildJournalFilter constructs WHERE clause and arguments
+// buildJournalFilter constructs WHERE clause and arguments, excluding soft‑deleted rows
 func (r *journalRepository) buildJournalFilter(filter JournalFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
@@ -198,10 +199,8 @@ func (r *journalRepository) buildJournalFilter(filter JournalFilter) (string, []
 		idx += 2
 	}
 
-	// If AccountID filter is provided, we need to join with journal_lines.
-	// This cannot be done in the main WHERE clause because it's a separate table.
-	// We'll handle it in List() separately by using a subquery or join.
-	// For now, we leave it out; List() will override if AccountID is present.
+	// 🔥 Always exclude soft‑deleted entries
+	conditions = append(conditions, "deleted_at IS NULL")
 
 	if len(conditions) == 0 {
 		return "", args
@@ -220,13 +219,14 @@ func (r *journalRepository) scanJournalEntry(scanner interface {
 	var sourceID uuid.NullUUID
 	var postedAt sql.NullTime
 	var postedBy, createdBy, updatedBy uuid.NullUUID
+	var deletedAt sql.NullTime
 
 	err := scanner.Scan(
 		&j.JournalEntryID, &j.CompanyID, &j.JournalType, &j.EntryDate,
 		&reference, &description, &j.Status, &reversalOf,
 		&sourceType, &sourceID,
 		&j.CreatedAt, &postedAt, &postedBy,
-		&createdBy, &j.UpdatedAt, &updatedBy,
+		&createdBy, &j.UpdatedAt, &updatedBy, &deletedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -259,20 +259,23 @@ func (r *journalRepository) scanJournalEntry(scanner interface {
 	if updatedBy.Valid {
 		j.UpdatedBy = &updatedBy.UUID
 	}
+	if deletedAt.Valid {
+		j.DeletedAt = &deletedAt.Time
+	}
 	return &j, nil
 }
 
 // Create inserts a new journal entry
 func (r *journalRepository) Create(ctx context.Context, db DBTX, j *models.JournalEntry) error {
 	query := `
-		INSERT INTO accounting.journal_entries (
-			journal_entry_id, company_id, journal_type, entry_date,
-			reference, description, status, reversal_of,
-			source_type, source_id,
-			created_at, posted_at, posted_by, created_by, updated_at, updated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12, NOW(), $13)
-		RETURNING created_at, updated_at
-	`
+        INSERT INTO accounting.journal_entries (
+            journal_entry_id, company_id, journal_type, entry_date,
+            reference, description, status, reversal_of,
+            source_type, source_id,
+            created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12, $13, NOW(), $14, NULL)
+        RETURNING created_at, updated_at
+    `
 	err := db.QueryRowContext(ctx, query,
 		j.JournalEntryID, j.CompanyID, j.JournalType, j.EntryDate,
 		j.Reference, j.Description, j.Status, j.ReversalOf,
@@ -289,17 +292,21 @@ func (r *journalRepository) Create(ctx context.Context, db DBTX, j *models.Journ
 	return nil
 }
 
-// Update updates an existing journal entry (only allowed for draft entries)
+// Update updates an existing journal entry (only allowed for draft entries, not soft‑deleted)
 func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.JournalEntry) error {
-	// First check if status is draft
+	// First check if status is draft and not deleted
 	var status string
-	checkQuery := `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`
-	err := db.QueryRowContext(ctx, checkQuery, j.JournalEntryID).Scan(&status)
+	var deletedAt sql.NullTime
+	checkQuery := `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`
+	err := db.QueryRowContext(ctx, checkQuery, j.JournalEntryID).Scan(&status, &deletedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("journal entry %s not found", j.JournalEntryID)
 		}
 		return fmt.Errorf("check journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot update a soft‑deleted journal entry")
 	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot update journal entry with status %s", status)
@@ -313,7 +320,7 @@ func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.Journ
 		    journal_type = $5,
 		    updated_by = $6,
 		    updated_at = NOW()
-		WHERE journal_entry_id = $1 AND status = 'draft'
+		WHERE journal_entry_id = $1 AND status = 'draft' AND deleted_at IS NULL
 		RETURNING updated_at
 	`
 	err = db.QueryRowContext(ctx, query,
@@ -322,7 +329,7 @@ func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.Journ
 	).Scan(&j.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("journal entry %s not found or not in draft status", j.JournalEntryID)
+			return fmt.Errorf("journal entry %s not found, not in draft, or soft‑deleted", j.JournalEntryID)
 		}
 		r.logger.Error("failed to update journal entry",
 			util.String("id", j.JournalEntryID.String()),
@@ -332,20 +339,21 @@ func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.Journ
 	return nil
 }
 
-// GetByID retrieves a journal entry by ID
+// GetByID retrieves a journal entry by ID (only non‑deleted)
+// Returns ErrNotFound if no row exists.
 func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
 		       reference, description, status, reversal_of,
 		       source_type, source_id,
-		       created_at, posted_at, posted_by, created_by, updated_at, updated_by
+		       created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
 		FROM accounting.journal_entries
-		WHERE journal_entry_id = $1
+		WHERE journal_entry_id = $1 AND deleted_at IS NULL
 	`
 	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal entry by ID",
 			util.String("id", id.String()),
@@ -355,21 +363,22 @@ func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	return j, nil
 }
 
-// GetByIDForUpdate retrieves a journal entry with row-level lock
+// GetByIDForUpdate retrieves a journal entry with row‑level lock (only non‑deleted)
+// Returns ErrNotFound if no row exists.
 func (r *journalRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
 		       reference, description, status, reversal_of,
 		       source_type, source_id,
-		       created_at, posted_at, posted_by, created_by, updated_at, updated_by
+		       created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
 		FROM accounting.journal_entries
-		WHERE journal_entry_id = $1
+		WHERE journal_entry_id = $1 AND deleted_at IS NULL
 		FOR UPDATE
 	`
 	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal entry for update",
 			util.String("id", id.String()),
@@ -379,20 +388,21 @@ func (r *journalRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	return j, nil
 }
 
-// GetBySource retrieves a journal entry by its source (e.g., invoice ID)
+// GetBySource retrieves a journal entry by its source (only non‑deleted)
+// Returns ErrNotFound if no row exists.
 func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
 		       reference, description, status, reversal_of,
 		       source_type, source_id,
-		       created_at, posted_at, posted_by, created_by, updated_at, updated_by
+		       created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
 		FROM accounting.journal_entries
-		WHERE company_id = $1 AND source_type = $2 AND source_id = $3
+		WHERE company_id = $1 AND source_type = $2 AND source_id = $3 AND deleted_at IS NULL
 	`
 	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, companyID, sourceType, sourceID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal entry by source",
 			util.String("company_id", companyID.String()),
@@ -404,28 +414,26 @@ func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID 
 	return j, nil
 }
 
-// List returns a paginated list of journal entries matching the filter
+// List returns a paginated list of journal entries matching the filter (non‑deleted only)
 func (r *journalRepository) List(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*models.JournalEntry, error) {
-	where, args := r.buildJournalFilter(filter)
+	where, args := r.buildJournalFilter(filter) // already includes deleted_at IS NULL
 	orderBy, err := r.validateSort(s)
 	if err != nil {
 		return nil, err
 	}
 	limit, offset := r.validatePagination(p)
 
-	// If AccountID filter is present, we need to join with journal_lines
 	var query string
 	if filter.AccountID != nil {
-		// Subquery approach: select distinct entries that have a line with the account
 		subWhere := where
 		if subWhere == "" {
-			subWhere = "WHERE 1=1"
+			subWhere = "WHERE 1=1 AND deleted_at IS NULL"
 		}
 		query = fmt.Sprintf(`
 			SELECT DISTINCT je.journal_entry_id, je.company_id, je.journal_type, je.entry_date,
 			       je.reference, je.description, je.status, je.reversal_of,
 			       je.source_type, je.source_id,
-			       je.created_at, je.posted_at, je.posted_by, je.created_by, je.updated_at, je.updated_by
+			       je.created_at, je.posted_at, je.posted_by, je.created_by, je.updated_at, je.updated_by, je.deleted_at
 			FROM accounting.journal_entries je
 			INNER JOIN accounting.journal_lines jl ON je.journal_entry_id = jl.journal_entry_id
 			%s AND jl.account_id = $%d
@@ -435,13 +443,13 @@ func (r *journalRepository) List(ctx context.Context, db DBTX, filter JournalFil
 		args = append(args, *filter.AccountID, limit, offset)
 	} else {
 		if where == "" {
-			where = "WHERE 1=1"
+			where = "WHERE deleted_at IS NULL"
 		}
 		query = fmt.Sprintf(`
 			SELECT journal_entry_id, company_id, journal_type, entry_date,
 			       reference, description, status, reversal_of,
 			       source_type, source_id,
-			       created_at, posted_at, posted_by, created_by, updated_at, updated_by
+			       created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
 			FROM accounting.journal_entries
 			%s
 			%s
@@ -478,14 +486,14 @@ func (r *journalRepository) ListByCompany(ctx context.Context, db DBTX, companyI
 	return r.List(ctx, db, JournalFilter{CompanyID: companyID}, Pagination{Limit: 1000}, Sort{Field: "entry_date", Direction: "DESC"})
 }
 
-// Count returns the number of journal entries matching the filter
+// Count returns the number of journal entries matching the filter (non‑deleted only)
 func (r *journalRepository) Count(ctx context.Context, db DBTX, filter JournalFilter) (int64, error) {
-	where, args := r.buildJournalFilter(filter)
+	where, args := r.buildJournalFilter(filter) // includes deleted_at IS NULL
 	var query string
 	if filter.AccountID != nil {
 		subWhere := where
 		if subWhere == "" {
-			subWhere = "WHERE 1=1"
+			subWhere = "WHERE deleted_at IS NULL"
 		}
 		query = fmt.Sprintf(`
 			SELECT COUNT(DISTINCT je.journal_entry_id)
@@ -496,7 +504,7 @@ func (r *journalRepository) Count(ctx context.Context, db DBTX, filter JournalFi
 		args = append(args, *filter.AccountID)
 	} else {
 		if where == "" {
-			where = "WHERE 1=1"
+			where = "WHERE deleted_at IS NULL"
 		}
 		query = fmt.Sprintf("SELECT COUNT(*) FROM accounting.journal_entries %s", where)
 	}
@@ -511,50 +519,76 @@ func (r *journalRepository) Count(ctx context.Context, db DBTX, filter JournalFi
 	return count, nil
 }
 
-// Delete soft-deletes a journal entry (only allowed if status = draft)
-// Note: actual deletion is not typical; we set status to 'deleted'? But schema has no deleted_at.
-// We'll implement as hard delete only for draft entries.
+// Delete performs a soft delete: sets deleted_at and status = 'deleted'
 func (r *journalRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
-	// Check status is draft
+	// Check status is draft and not already deleted
 	var status string
-	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`, id).Scan(&status)
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, id).Scan(&status, &deletedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("journal entry %s not found", id)
 		}
 		return fmt.Errorf("check journal status: %w", err)
 	}
+	if deletedAt.Valid {
+		return fmt.Errorf("journal entry %s is already soft‑deleted", id)
+	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot delete journal entry with status %s", status)
 	}
 
-	// Delete lines first (cascade should handle, but explicit for safety)
-	_, err = db.ExecContext(ctx, `DELETE FROM accounting.journal_lines WHERE journal_entry_id = $1`, id)
+	// Soft delete: set deleted_at and status = 'deleted'
+	query := `
+		UPDATE accounting.journal_entries
+		SET deleted_at = NOW(), status = 'deleted', updated_by = $2, updated_at = NOW()
+		WHERE journal_entry_id = $1 AND status = 'draft' AND deleted_at IS NULL
+	`
+	result, err := db.ExecContext(ctx, query, id, deletedBy)
 	if err != nil {
-		return fmt.Errorf("delete journal lines: %w", err)
-	}
-
-	// Delete entry
-	result, err := db.ExecContext(ctx, `DELETE FROM accounting.journal_entries WHERE journal_entry_id = $1 AND status = 'draft'`, id)
-	if err != nil {
-		r.logger.Error("failed to delete journal entry",
+		r.logger.Error("failed to soft delete journal entry",
 			util.String("id", id.String()),
 			util.ErrorField(err))
-		return fmt.Errorf("delete journal entry: %w", err)
+		return fmt.Errorf("soft delete journal entry: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("journal entry %s not found or not in draft status", id)
+		return fmt.Errorf("journal entry %s not found, not in draft, or already deleted", id)
 	}
 	return nil
 }
 
-// UpdateStatus changes the status of a journal entry
+// ExistsBySource checks if a journal entry already exists for the given source (excluding soft‑deleted)
+func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM accounting.journal_entries
+			WHERE company_id = $1
+			  AND source_type = $2
+			  AND source_id = $3
+			  AND deleted_at IS NULL
+		)
+	`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, sourceType, sourceID).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check existence by source",
+			zap.String("company_id", companyID.String()),
+			zap.String("source_type", sourceType),
+			zap.String("source_id", sourceID.String()),
+			zap.Error(err))
+		return false, fmt.Errorf("exists by source: %w", err)
+	}
+	return exists, nil
+}
+
+// UpdateStatus changes the status of a journal entry (only if not soft‑deleted)
 func (r *journalRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.journal_entries
 		SET status = $2, updated_by = $3, updated_at = NOW()
-		WHERE journal_entry_id = $1
+		WHERE journal_entry_id = $1 AND deleted_at IS NULL
 	`
 	result, err := db.ExecContext(ctx, query, id, status, updatedBy)
 	if err != nil {
@@ -566,23 +600,27 @@ func (r *journalRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.U
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("journal entry %s not found", id)
+		return fmt.Errorf("journal entry %s not found or soft‑deleted", id)
 	}
 	return nil
 }
 
-// Post marks a journal entry as posted (only if draft and balanced)
+// Post marks a journal entry as posted (only if draft and not soft‑deleted)
 func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, postedBy *uuid.UUID) error {
 	// Lock the journal to prevent concurrent modifications
 	if err := r.LockJournal(ctx, db, id); err != nil {
 		return err
 	}
 
-	// Check current status
+	// Check current status and deleted_at
 	var currentStatus string
-	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`, id).Scan(&currentStatus)
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, id).Scan(&currentStatus, &deletedAt)
 	if err != nil {
 		return fmt.Errorf("get journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot post a soft‑deleted journal entry")
 	}
 	if currentStatus != enums.JournalStatusDraft {
 		return fmt.Errorf("journal entry %s cannot be posted: current status is %s", id, currentStatus)
@@ -597,14 +635,14 @@ func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, pos
 	query := `
 		UPDATE accounting.journal_entries
 		SET status = 'posted', posted_at = NOW(), posted_by = $2, updated_at = NOW()
-		WHERE journal_entry_id = $1 AND status = 'draft'
+		WHERE journal_entry_id = $1 AND status = 'draft' AND deleted_at IS NULL
 		RETURNING posted_at
 	`
 	var postedAt time.Time
 	err = db.QueryRowContext(ctx, query, id, postedBy).Scan(&postedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("journal entry %s not found or not in draft status", id)
+			return fmt.Errorf("journal entry %s not found, not in draft, or soft‑deleted", id)
 		}
 		r.logger.Error("failed to post journal entry",
 			util.String("id", id.String()),
@@ -622,11 +660,15 @@ func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uui
 		return err
 	}
 
-	// Check original status
+	// Check original status and not deleted
 	var originalStatus string
-	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`, originalID).Scan(&originalStatus)
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, originalID).Scan(&originalStatus, &deletedAt)
 	if err != nil {
 		return fmt.Errorf("get original journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot reverse a soft‑deleted journal entry")
 	}
 	if originalStatus != enums.JournalStatusPosted {
 		return fmt.Errorf("only posted journal entries can be reversed, current status: %s", originalStatus)
@@ -642,7 +684,6 @@ func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uui
 
 	// Insert reversal lines (caller should have provided lines; we could copy them, but assume caller did)
 	// If caller didn't add lines, we can copy from original and swap debits/credits.
-	// For safety, we'll check that reversal has lines.
 	hasLines, err := r.HasLines(ctx, db, reversal.JournalEntryID)
 	if err != nil {
 		return err
@@ -675,7 +716,7 @@ func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uui
 	_, err = db.ExecContext(ctx, `
 		UPDATE accounting.journal_entries
 		SET status = 'reversed', updated_at = NOW()
-		WHERE journal_entry_id = $1
+		WHERE journal_entry_id = $1 AND deleted_at IS NULL
 	`, originalID)
 	if err != nil {
 		return fmt.Errorf("update original journal status: %w", err)
@@ -683,13 +724,17 @@ func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uui
 	return nil
 }
 
-// AddLine adds a single journal line (only allowed if entry status is draft)
+// AddLine adds a single journal line (only allowed if entry status is draft and not soft‑deleted)
 func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.JournalLine) error {
-	// Verify journal entry is draft
+	// Verify journal entry is draft and not deleted
 	var status string
-	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`, line.JournalEntryID).Scan(&status)
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, line.JournalEntryID).Scan(&status, &deletedAt)
 	if err != nil {
 		return fmt.Errorf("get journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot add line to a soft‑deleted journal entry")
 	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot add line to journal entry with status %s", status)
@@ -715,17 +760,21 @@ func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.J
 	return nil
 }
 
-// BulkAddLines adds multiple lines in a single batch (only allowed if entry is draft)
+// BulkAddLines adds multiple lines in a single batch (only allowed if entry is draft and not soft‑deleted)
 func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*models.JournalLine) error {
 	if len(lines) == 0 {
 		return nil
 	}
-	// Verify all lines belong to same journal entry and that entry is draft
+	// Verify all lines belong to same journal entry and that entry is draft and not deleted
 	journalID := lines[0].JournalEntryID
 	var status string
-	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`, journalID).Scan(&status)
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, journalID).Scan(&status, &deletedAt)
 	if err != nil {
 		return fmt.Errorf("get journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot add lines to a soft‑deleted journal entry")
 	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot add lines to journal entry with status %s", status)
@@ -757,7 +806,7 @@ func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*
 	return nil
 }
 
-// GetLines retrieves all lines for a journal entry
+// GetLines retrieves all lines for a journal entry (even if entry is soft‑deleted, lines are kept)
 func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uuid.UUID) ([]*models.JournalLine, error) {
 	query := `
 		SELECT journal_line_id, journal_entry_id, account_id, line_number,
@@ -796,20 +845,25 @@ func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uui
 	return lines, nil
 }
 
-// UpdateLine updates a single journal line (only allowed if entry is draft)
+// UpdateLine updates a single journal line (only allowed if entry is draft and not soft‑deleted)
 func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *models.JournalLine) error {
-	// Verify journal entry is draft
+	// Verify journal entry is draft and not deleted
 	var status string
+	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `
-		SELECT je.status FROM accounting.journal_entries je
+		SELECT je.status, je.deleted_at
+		FROM accounting.journal_entries je
 		INNER JOIN accounting.journal_lines jl ON je.journal_entry_id = jl.journal_entry_id
 		WHERE jl.journal_line_id = $1
-	`, line.JournalLineID).Scan(&status)
+	`, line.JournalLineID).Scan(&status, &deletedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("journal line %s not found", line.JournalLineID)
 		}
 		return fmt.Errorf("get journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot update line of a soft‑deleted journal entry")
 	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot update line in journal entry with status %s", status)
@@ -839,20 +893,25 @@ func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *model
 	return nil
 }
 
-// DeleteLine deletes a single journal line (only allowed if entry is draft)
+// DeleteLine deletes a single journal line (only allowed if entry is draft and not soft‑deleted)
 func (r *journalRepository) DeleteLine(ctx context.Context, db DBTX, lineID uuid.UUID) error {
-	// Verify journal entry is draft
+	// Verify journal entry is draft and not deleted
 	var status string
+	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `
-		SELECT je.status FROM accounting.journal_entries je
+		SELECT je.status, je.deleted_at
+		FROM accounting.journal_entries je
 		INNER JOIN accounting.journal_lines jl ON je.journal_entry_id = jl.journal_entry_id
 		WHERE jl.journal_line_id = $1
-	`, lineID).Scan(&status)
+	`, lineID).Scan(&status, &deletedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("journal line %s not found", lineID)
 		}
 		return fmt.Errorf("get journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot delete line from a soft‑deleted journal entry")
 	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot delete line from journal entry with status %s", status)
@@ -872,13 +931,17 @@ func (r *journalRepository) DeleteLine(ctx context.Context, db DBTX, lineID uuid
 	return nil
 }
 
-// ClearLines removes all lines from a journal entry (only allowed if draft)
+// ClearLines removes all lines from a journal entry (only allowed if draft and not soft‑deleted)
 func (r *journalRepository) ClearLines(ctx context.Context, db DBTX, journalID uuid.UUID) error {
-	// Verify entry is draft
+	// Verify entry is draft and not deleted
 	var status string
-	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1`, journalID).Scan(&status)
+	var deletedAt sql.NullTime
+	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, journalID).Scan(&status, &deletedAt)
 	if err != nil {
 		return fmt.Errorf("get journal status: %w", err)
+	}
+	if deletedAt.Valid {
+		return fmt.Errorf("cannot clear lines from a soft‑deleted journal entry")
 	}
 	if status != enums.JournalStatusDraft {
 		return fmt.Errorf("cannot clear lines from journal entry with status %s", status)
@@ -943,13 +1006,13 @@ func (r *journalRepository) HasLines(ctx context.Context, db DBTX, journalID uui
 	return count > 0, nil
 }
 
-// LockJournal acquires a row-level lock on a journal entry
+// LockJournal acquires a row-level lock on a journal entry (only if not soft‑deleted)
 func (r *journalRepository) LockJournal(ctx context.Context, db DBTX, journalID uuid.UUID) error {
 	var id uuid.UUID
-	err := db.QueryRowContext(ctx, `SELECT journal_entry_id FROM accounting.journal_entries WHERE journal_entry_id = $1 FOR UPDATE`, journalID).Scan(&id)
+	err := db.QueryRowContext(ctx, `SELECT journal_entry_id FROM accounting.journal_entries WHERE journal_entry_id = $1 AND deleted_at IS NULL FOR UPDATE`, journalID).Scan(&id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("journal entry %s not found", journalID)
+			return fmt.Errorf("journal entry %s not found or soft‑deleted", journalID)
 		}
 		return fmt.Errorf("lock journal entry: %w", err)
 	}
@@ -958,7 +1021,7 @@ func (r *journalRepository) LockJournal(ctx context.Context, db DBTX, journalID 
 
 // ListWithLines returns journal entries with their lines in a single query (optimized for reporting)
 func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*JournalWithLines, error) {
-	// First get entries using List
+	// First get entries using List (which excludes soft‑deleted)
 	entries, err := r.List(ctx, db, filter, p, s)
 	if err != nil {
 		return nil, err
@@ -1028,6 +1091,7 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 }
 
 // ListByAccount returns all journal lines for a given account within a date range (used for ledger)
+// Only includes lines from posted, non‑deleted journal entries.
 func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) ([]*models.JournalLine, error) {
 	query := `
 		SELECT jl.journal_line_id, jl.journal_entry_id, jl.account_id, jl.line_number,
@@ -1037,6 +1101,7 @@ func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountI
 		INNER JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
 		WHERE jl.account_id = $1
 		  AND je.status = 'posted'
+		  AND je.deleted_at IS NULL
 		  AND je.entry_date BETWEEN $2 AND $3
 		ORDER BY je.entry_date, jl.line_number
 	`
@@ -1069,7 +1134,7 @@ func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountI
 	return lines, nil
 }
 
-// SumByAccount returns total debit and credit for an account within a date range (posted entries only)
+// SumByAccount returns total debit and credit for an account within a date range (posted, non‑deleted entries only)
 func (r *journalRepository) SumByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) (debit float64, credit float64, err error) {
 	query := `
 		SELECT COALESCE(SUM(jl.debit_amount), 0), COALESCE(SUM(jl.credit_amount), 0)
@@ -1077,6 +1142,7 @@ func (r *journalRepository) SumByAccount(ctx context.Context, db DBTX, accountID
 		INNER JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
 		WHERE jl.account_id = $1
 		  AND je.status = 'posted'
+		  AND je.deleted_at IS NULL
 		  AND je.entry_date BETWEEN $2 AND $3
 	`
 	err = db.QueryRowContext(ctx, query, accountID, from, to).Scan(&debit, &credit)
@@ -1334,6 +1400,7 @@ func (r *taxRuleRepository) Update(ctx context.Context, db DBTX, rule *tax.TaxRu
 	return nil
 }
 
+// GetByID returns a tax rule by ID. Returns ErrNotFound if not found.
 func (r *taxRuleRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxRule, error) {
 	query := `
 		SELECT tax_rule_id, company_id, rule_name, applies_to, priority,
@@ -1352,7 +1419,7 @@ func (r *taxRuleRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound // CHANGED: return ErrNotFound instead of nil,nil
 		}
 		r.logger.Error("failed to get tax rule by ID",
 			util.String("id", id.String()),
@@ -1371,6 +1438,7 @@ func (r *taxRuleRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	return &rule, nil
 }
 
+// GetByIDForUpdate returns a tax rule with row lock. Returns ErrNotFound if not found.
 func (r *taxRuleRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxRule, error) {
 	query := `
 		SELECT tax_rule_id, company_id, rule_name, applies_to, priority,
@@ -1390,7 +1458,7 @@ func (r *taxRuleRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound // CHANGED: return ErrNotFound instead of nil,nil
 		}
 		r.logger.Error("failed to get tax rule for update",
 			util.String("id", id.String()),
@@ -1572,6 +1640,7 @@ func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.T
 	return nil
 }
 
+// GetCurrentVersion returns the current version of a tax rule. Returns ErrNotFound if no version exists.
 func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, taxRuleID uuid.UUID) (*tax.TaxRuleVersion, error) {
 	query := `
 		SELECT version_id, tax_rule_id, version, rule_json, is_current,
@@ -1587,7 +1656,7 @@ func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, taxR
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound // CHANGED: return ErrNotFound instead of nil,nil
 		}
 		r.logger.Error("failed to get current version",
 			util.String("rule_id", taxRuleID.String()),
@@ -2009,6 +2078,8 @@ import (
 	"auth-service/internal/util"
 )
 
+// ErrNotFound is returned when a requested resource does not exist.
+
 // AccountingSettingsRepository defines the interface for company accounting settings.
 type AccountingSettingsRepository interface {
 	// Core singleton operations per company
@@ -2100,7 +2171,7 @@ func (r *accountingSettingsRepository) Upsert(ctx context.Context, db DBTX, s *s
 	return nil
 }
 
-// GetByCompany retrieves settings for a company. Returns nil if not found.
+// GetByCompany retrieves settings for a company. Returns ErrNotFound if not found.
 func (r *accountingSettingsRepository) GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) (*settings.AccountingSettings, error) {
 	query := `
 		SELECT company_id, fiscal_year_start_month, currency_code, tax_scheme,
@@ -2119,7 +2190,7 @@ func (r *accountingSettingsRepository) GetByCompany(ctx context.Context, db DBTX
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get accounting settings",
 			util.String("company_id", companyID.String()),
@@ -2135,7 +2206,7 @@ func (r *accountingSettingsRepository) GetByCompany(ctx context.Context, db DBTX
 	return &s, nil
 }
 
-// GetByCompanyForUpdate retrieves settings with row-level lock for update.
+// GetByCompanyForUpdate retrieves settings with row-level lock for update. Returns ErrNotFound if not found.
 func (r *accountingSettingsRepository) GetByCompanyForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID) (*settings.AccountingSettings, error) {
 	query := `
 		SELECT company_id, fiscal_year_start_month, currency_code, tax_scheme,
@@ -2155,7 +2226,7 @@ func (r *accountingSettingsRepository) GetByCompanyForUpdate(ctx context.Context
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get accounting settings for update",
 			util.String("company_id", companyID.String()),
@@ -2317,12 +2388,10 @@ func (r *accountingSettingsRepository) Exists(ctx context.Context, db DBTX, comp
 func (r *accountingSettingsRepository) GetFiscalYear(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time) (fiscalYear int, period int, err error) {
 	settings, err := r.GetByCompany(ctx, db, companyID)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return 0, 0, fmt.Errorf("accounting settings not found for company %s", companyID)
+		}
 		return 0, 0, fmt.Errorf("get settings for fiscal year: %w", err)
-	}
-	if settings == nil {
-		// No settings defined – you may return default or error.
-		// Here we return an explicit error because accounting cannot proceed without settings.
-		return 0, 0, fmt.Errorf("accounting settings not found for company %s", companyID)
 	}
 	startMonth := settings.FiscalYearStartMonth
 	year, period := calculateFiscalYear(startMonth, date)
@@ -2366,6 +2435,8 @@ import (
 	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/util"
 )
+
+// ErrNotFound is returned when a requested resource does not exist.
 
 // =====================================================
 // SUPPORTING TYPES
@@ -2419,6 +2490,7 @@ type LedgerRepository interface {
 	GetBalancesByAccount(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear int) ([]*models.AccountBalance, error)
 	GetBalancesByCompany(ctx context.Context, db DBTX, companyID uuid.UUID, fiscalYear, period int) ([]*models.AccountBalance, error)
 	MarkRecomputed(ctx context.Context, db DBTX, companyID uuid.UUID, fiscalYear, period int) error
+	EnsureBalance(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) error
 
 	// Computation (from journal)
 	ComputeAccountBalance(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, from, to time.Time) (opening float64, debit float64, credit float64, closing float64, err error)
@@ -2496,12 +2568,12 @@ func (r *ledgerRepository) UpsertBalance(ctx context.Context, db DBTX, b *models
 // GetBalance retrieves a stored balance snapshot for a specific account and period.
 func (r *ledgerRepository) GetBalance(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) (*models.AccountBalance, error) {
 	query := `
-		SELECT balance_id, company_id, account_id, fiscal_year, period,
-		       opening_balance, closing_balance, is_recomputed,
-		       created_at, updated_at
-		FROM accounting.account_balances
-		WHERE company_id = $1 AND account_id = $2 AND fiscal_year = $3 AND period = $4
-	`
+        SELECT balance_id, company_id, account_id, fiscal_year, period,
+               opening_balance, closing_balance, is_recomputed,
+               created_at, updated_at
+        FROM accounting.account_balances
+        WHERE company_id = $1 AND account_id = $2 AND fiscal_year = $3 AND period = $4
+    `
 	var b models.AccountBalance
 	err := db.QueryRowContext(ctx, query, companyID, accountID, fiscalYear, period).Scan(
 		&b.BalanceID, &b.CompanyID, &b.AccountID, &b.FiscalYear, &b.Period,
@@ -2510,7 +2582,7 @@ func (r *ledgerRepository) GetBalance(ctx context.Context, db DBTX, companyID, a
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get balance",
 			util.String("company_id", companyID.String()),
@@ -3077,6 +3149,34 @@ func (r *ledgerRepository) SumAccountMovement(ctx context.Context, db DBTX, acco
 	return debit, credit, nil
 }
 
+// EnsureBalance creates a zero balance record if none exists for the account and period.
+// It is safe to call even if the record already exists.
+func (r *ledgerRepository) EnsureBalance(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) error {
+	query := `
+        INSERT INTO accounting.account_balances (
+            balance_id, company_id, account_id, fiscal_year, period,
+            opening_balance, closing_balance, is_recomputed,
+            created_at, updated_at
+        ) VALUES (
+            gen_random_uuid(), $1, $2, $3, $4,
+            0, 0, false,
+            NOW(), NOW()
+        )
+        ON CONFLICT (company_id, account_id, fiscal_year, period) DO NOTHING
+    `
+	_, err := db.ExecContext(ctx, query, companyID, accountID, fiscalYear, period)
+	if err != nil {
+		r.logger.Error("failed to ensure balance",
+			util.String("company_id", companyID.String()),
+			util.String("account_id", accountID.String()),
+			util.Int("fiscal_year", fiscalYear),
+			util.Int("period", period),
+			util.ErrorField(err))
+		return fmt.Errorf("ensure balance: %w", err)
+	}
+	return nil
+}
+
 
 
 ================================================================================
@@ -3099,6 +3199,8 @@ import (
 	"auth-service/internal/accounting/models/compliance"
 	"auth-service/internal/util"
 )
+
+// ErrNotFound is returned when a requested resource does not exist
 
 // ComplianceReturnFilter defines filter criteria for listing compliance returns
 type ComplianceReturnFilter struct {
@@ -3426,7 +3528,7 @@ func (r *complianceRepository) GetReturnByID(ctx context.Context, db DBTX, retur
 	ret, err := r.scanReturn(db.QueryRowContext(ctx, query, returnID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get compliance return by ID",
 			util.String("id", returnID.String()),
@@ -3449,7 +3551,7 @@ func (r *complianceRepository) GetReturnByIDForUpdate(ctx context.Context, db DB
 	ret, err := r.scanReturn(db.QueryRowContext(ctx, query, returnID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get compliance return for update",
 			util.String("id", returnID.String()),
@@ -3999,6 +4101,7 @@ func (r *complianceRepository) UpdateReturnTotals(ctx context.Context, db DBTX, 
 	}
 	return nil
 }
+
 func (r *complianceRepository) GetFilingByID(ctx context.Context, db DBTX, filingID uuid.UUID) (*compliance.ComplianceFiling, error) {
 	query := `
         SELECT filing_id, return_id, submission_date, acknowledgement_no,
@@ -4017,7 +4120,7 @@ func (r *complianceRepository) GetFilingByID(ctx context.Context, db DBTX, filin
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get filing by ID",
 			util.String("filing_id", filingID.String()),
@@ -4065,6 +4168,8 @@ import (
 	"auth-service/internal/util"
 )
 
+// ErrNotFound is returned when a requested resource does not exist.
+
 // ReconciliationFilter for listing batches
 type ReconciliationFilter struct {
 	CompanyID          uuid.UUID
@@ -4093,6 +4198,7 @@ type ReconciliationRepository interface {
 	UpdateBatchStats(ctx context.Context, db DBTX, batchID uuid.UUID, total, matched, unmatched int) error
 	CompleteBatch(ctx context.Context, db DBTX, batchID uuid.UUID, completedAt time.Time) error
 	DeleteBatch(ctx context.Context, db DBTX, batchID uuid.UUID) error
+	UpdateItemMatch(ctx context.Context, db DBTX, itemID uuid.UUID, status string, journalEntryID uuid.NullUUID, score *decimal.Decimal) error
 
 	// Items
 	AddItem(ctx context.Context, db DBTX, item *models.ReconciliationItem) error
@@ -4407,7 +4513,7 @@ func (r *reconciliationRepository) GetBatchByID(ctx context.Context, db DBTX, ba
 	batch, err := r.scanBatch(db.QueryRowContext(ctx, query, batchID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get batch by ID",
 			util.String("batch_id", batchID.String()),
@@ -4429,7 +4535,7 @@ func (r *reconciliationRepository) GetBatchByIDForUpdate(ctx context.Context, db
 	batch, err := r.scanBatch(db.QueryRowContext(ctx, query, batchID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get batch for update",
 			util.String("batch_id", batchID.String()),
@@ -4631,7 +4737,7 @@ func (r *reconciliationRepository) UpdateItem(ctx context.Context, db DBTX, item
 	).Scan(&item.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("item %s not found", item.ItemID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to update reconciliation item",
 			util.String("item_id", item.ItemID.String()),
@@ -4652,7 +4758,7 @@ func (r *reconciliationRepository) GetItemByID(ctx context.Context, db DBTX, ite
 	item, err := r.scanItem(db.QueryRowContext(ctx, query, itemID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get item by ID",
 			util.String("item_id", itemID.String()),
@@ -4897,7 +5003,7 @@ func (r *reconciliationRepository) GetDifferenceByID(ctx context.Context, db DBT
 	diff, err := r.scanDifference(db.QueryRowContext(ctx, query, diffID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get difference by ID",
 			util.String("diff_id", diffID.String()),
@@ -5030,7 +5136,7 @@ func (r *reconciliationRepository) GetAdjustmentByID(ctx context.Context, db DBT
 	adj, err := r.scanAdjustment(db.QueryRowContext(ctx, query, adjID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get adjustment by ID",
 			util.String("adj_id", adjID.String()),
@@ -5047,6 +5153,26 @@ func (r *reconciliationRepository) DeleteAdjustment(ctx context.Context, db DBTX
 			util.String("adj_id", adjID.String()),
 			util.ErrorField(err))
 		return fmt.Errorf("delete adjustment: %w", err)
+	}
+	return nil
+}
+
+func (r *reconciliationRepository) UpdateItemMatch(ctx context.Context, db DBTX, itemID uuid.UUID, status string, journalEntryID uuid.NullUUID, score *decimal.Decimal) error {
+	query := `
+		UPDATE accounting.reconciliation_items
+		SET match_status = $2,
+		    journal_entry_id = $3,
+		    match_score = $4,
+		    updated_at = NOW()
+		WHERE item_id = $1
+	`
+	_, err := db.ExecContext(ctx, query, itemID, status, journalEntryID, score)
+	if err != nil {
+		r.logger.Error("failed to update item match status",
+			zap.String("item_id", itemID.String()),
+			zap.String("status", status),
+			zap.Error(err))
+		return fmt.Errorf("update item match: %w", err)
 	}
 	return nil
 }
@@ -5072,6 +5198,8 @@ import (
 	"auth-service/internal/accounting/models/tax"
 	"auth-service/internal/util"
 )
+
+// ErrNotFound is returned when a requested resource does not exist
 
 // TaxProfileRepository defines the interface for tax profile data access
 type TaxProfileRepository interface {
@@ -5236,7 +5364,7 @@ func (r *taxProfileRepository) Update(ctx context.Context, db DBTX, p *tax.TaxPr
 	).Scan(&p.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("tax profile %s not found or deleted", p.TaxProfileID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to update tax profile",
 			util.String("id", p.TaxProfileID.String()),
@@ -5269,7 +5397,7 @@ func (r *taxProfileRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUI
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax profile by ID",
 			util.String("id", id.String()),
@@ -5322,7 +5450,7 @@ func (r *taxProfileRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax profile for update",
 			util.String("id", id.String()),
@@ -5440,7 +5568,7 @@ func (r *taxProfileRepository) GetByRegimeAndJurisdiction(ctx context.Context, d
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get profile by regime and jurisdiction",
 			util.String("company_id", companyID.String()),
@@ -5474,7 +5602,7 @@ func (r *taxProfileRepository) GetByRegimeAndJurisdiction(ctx context.Context, d
 // GetDefaultProfile returns a single default profile for the company.
 // The default is determined by scanning the settings JSON for a "is_default" flag.
 // If multiple profiles have is_default=true, the first one is returned.
-// If none, returns nil.
+// If none, returns nil (no error) – this is a valid business condition.
 func (r *taxProfileRepository) GetDefaultProfile(ctx context.Context, db DBTX, companyID uuid.UUID) (*tax.TaxProfile, error) {
 	// First fetch all active profiles (we need to inspect their settings)
 	profiles, err := r.GetActiveProfiles(ctx, db, companyID)
@@ -5520,7 +5648,7 @@ func (r *taxProfileRepository) SetActive(ctx context.Context, db DBTX, id uuid.U
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or deleted", id)
+		return ErrNotFound
 	}
 	return nil
 }
@@ -5541,7 +5669,7 @@ func (r *taxProfileRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or already deleted", id)
+		return ErrNotFound
 	}
 	return nil
 }
@@ -5609,7 +5737,7 @@ func (r *taxProfileRepository) UpdateSettings(ctx context.Context, db DBTX, prof
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or deleted", profileID)
+		return ErrNotFound
 	}
 	return nil
 }
@@ -5630,7 +5758,7 @@ func (r *taxProfileRepository) UpdateDefaultTaxRate(ctx context.Context, db DBTX
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or deleted", profileID)
+		return ErrNotFound
 	}
 	return nil
 }
@@ -5657,6 +5785,9 @@ import (
 	"auth-service/internal/accounting/models/tax"
 	"auth-service/internal/util"
 )
+
+// ErrNotFound is returned when a requested resource does not exist.
+// If you have a central repository/errors.go, remove this line.
 
 // TaxTransactionFilter defines filter criteria for listing tax transactions
 type TaxTransactionFilter struct {
@@ -5946,7 +6077,7 @@ func (r *taxTransactionRepository) GetByID(ctx context.Context, db DBTX, id uuid
 	tt, err := r.scanTaxTransaction(db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound // ✅ changed from nil, nil
 		}
 		r.logger.Error("failed to get tax transaction by ID",
 			util.String("id", id.String()),
@@ -6597,7 +6728,8 @@ func (r *accountRepository) Delete(ctx context.Context, db DBTX, accountID uuid.
 	return nil
 }
 
-// GetByID retrieves an account by its ID
+// GetByID retrieves an account by its ID.
+// Returns ErrNotFound if no active account exists with the given ID.
 func (r *accountRepository) GetByID(ctx context.Context, db DBTX, accountID uuid.UUID) (*models.Account, error) {
 	query := `
 		SELECT account_id, company_id, account_code, account_name, account_type,
@@ -6618,7 +6750,7 @@ func (r *accountRepository) GetByID(ctx context.Context, db DBTX, accountID uuid
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get account by ID",
 			util.String("id", accountID.String()),
@@ -6640,7 +6772,8 @@ func (r *accountRepository) GetByID(ctx context.Context, db DBTX, accountID uuid
 	return &a, nil
 }
 
-// GetByIDForUpdate retrieves an account with row-level locking for update
+// GetByIDForUpdate retrieves an account with row-level locking for update.
+// Returns ErrNotFound if no active account exists with the given ID.
 func (r *accountRepository) GetByIDForUpdate(ctx context.Context, db DBTX, accountID uuid.UUID) (*models.Account, error) {
 	query := `
 		SELECT account_id, company_id, account_code, account_name, account_type,
@@ -6662,7 +6795,7 @@ func (r *accountRepository) GetByIDForUpdate(ctx context.Context, db DBTX, accou
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get account for update",
 			util.String("id", accountID.String()),
@@ -6684,7 +6817,8 @@ func (r *accountRepository) GetByIDForUpdate(ctx context.Context, db DBTX, accou
 	return &a, nil
 }
 
-// GetByCode retrieves an account by company and account code
+// GetByCode retrieves an account by company and account code.
+// Returns ErrNotFound if no active account matches.
 func (r *accountRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Account, error) {
 	query := `
 		SELECT account_id, company_id, account_code, account_name, account_type,
@@ -6705,7 +6839,7 @@ func (r *accountRepository) GetByCode(ctx context.Context, db DBTX, companyID uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get account by code",
 			util.String("company_id", companyID.String()),
@@ -6952,7 +7086,7 @@ func (r *accountRepository) LockAccount(ctx context.Context, db DBTX, accountID 
 	err := db.QueryRowContext(ctx, query, accountID).Scan(&id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("account %s not found", accountID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to lock account",
 			util.String("account_id", accountID.String()),
@@ -7264,7 +7398,7 @@ func (r *taxRateRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax rate by ID",
 			util.String("id", id.String()),
@@ -7308,7 +7442,7 @@ func (r *taxRateRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax rate for update",
 			util.String("id", id.String()),
@@ -7358,7 +7492,7 @@ func (r *taxRateRepository) GetApplicableRate(ctx context.Context, db DBTX, comp
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get applicable tax rate",
 			util.String("company_id", companyID.String()),
@@ -7532,9 +7666,6 @@ func (r *taxRateRepository) CheckOverlappingRates(ctx context.Context, db DBTX, 
 		)
 	`
 	var exists bool
-	// Use the new rate's from date for the overlap check:
-	// - Existing rate's effective_from <= new_rate.effective_to (if new_rate.effective_to is set, else always true)
-	// - Existing rate's effective_to >= new_rate.effective_from (if existing rate has no end, it overlaps)
 	var effectiveToArg interface{} = to
 	if to == nil {
 		effectiveToArg = nil
@@ -7627,6 +7758,8 @@ import (
 	"auth-service/internal/util"
 )
 
+// ErrNotFound is returned when a requested resource does not exist.
+
 // =====================================================
 // FILTERS
 // =====================================================
@@ -7711,6 +7844,8 @@ type AnalyticsRepository interface {
 	DeleteTaxSummary(ctx context.Context, db DBTX, summaryID uuid.UUID) error
 	DeleteTaxSummariesByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) error
 	CalculateAndStoreSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
+	// NEW: Bulk version for better performance
+	CalculateAndStoreSnapshotBulk(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
 
 	// Reconciliation Batch Metrics
 	GetReconciliationBatchMetrics(ctx context.Context, db DBTX, batchID uuid.UUID) (*analytics.ReconciliationBatchMetrics, error)
@@ -7870,7 +8005,7 @@ func (r *analyticsRepository) GetDailySummary(ctx context.Context, db DBTX, summ
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get daily summary",
 			util.String("summary_id", summaryID.String()),
@@ -7894,7 +8029,7 @@ func (r *analyticsRepository) GetDailySummaryByKey(ctx context.Context, db DBTX,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get daily summary by key",
 			util.String("company_id", companyID.String()),
@@ -8048,7 +8183,7 @@ func (r *analyticsRepository) GetSnapshot(ctx context.Context, db DBTX, snapshot
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get snapshot",
 			util.String("snapshot_id", snapshotID.String()),
@@ -8072,7 +8207,7 @@ func (r *analyticsRepository) GetSnapshotByKey(ctx context.Context, db DBTX, com
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get snapshot by key",
 			util.String("company_id", companyID.String()),
@@ -8240,7 +8375,7 @@ func (r *analyticsRepository) GetJournalMetric(ctx context.Context, db DBTX, met
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal metric",
 			util.String("metric_id", metricID.String()),
@@ -8264,7 +8399,7 @@ func (r *analyticsRepository) GetJournalMetricByKey(ctx context.Context, db DBTX
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal metric by key",
 			util.String("company_id", companyID.String()),
@@ -8418,7 +8553,7 @@ func (r *analyticsRepository) GetTaxSummary(ctx context.Context, db DBTX, summar
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax summary",
 			util.String("summary_id", summaryID.String()),
@@ -8442,7 +8577,7 @@ func (r *analyticsRepository) GetTaxSummaryByKey(ctx context.Context, db DBTX, c
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax summary by key",
 			util.String("company_id", companyID.String()),
@@ -8590,7 +8725,7 @@ func (r *analyticsRepository) GetCashflow(ctx context.Context, db DBTX, cashflow
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get cashflow",
 			util.String("cashflow_id", cashflowID.String()),
@@ -8612,7 +8747,7 @@ func (r *analyticsRepository) GetCashflowByKey(ctx context.Context, db DBTX, com
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get cashflow by key",
 			util.String("company_id", companyID.String()),
@@ -8712,6 +8847,7 @@ func (r *analyticsRepository) buildCashflowFilter(filter CashflowFilter) (string
 }
 
 // CalculateAndStoreSnapshot computes account balances up to snapshotDate and stores them as snapshots.
+// This is the original per‑account loop version (kept for backward compatibility).
 func (r *analyticsRepository) CalculateAndStoreSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error {
 	// Get all distinct accounts that have activity up to snapshotDate
 	query := `
@@ -8771,6 +8907,51 @@ func (r *analyticsRepository) CalculateAndStoreSnapshot(ctx context.Context, db 
 }
 
 // =====================================================
+// NEW: BULK SNAPSHOT CALCULATION (OPTIMISED)
+// =====================================================
+// CalculateAndStoreSnapshotBulk computes account balances up to snapshotDate for ALL accounts
+// in a single INSERT … SELECT statement, respecting account type direction.
+func (r *analyticsRepository) CalculateAndStoreSnapshotBulk(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error {
+	// Single query: compute cumulative balance for every account of the company,
+	// then upsert into snapshots table.
+	query := `
+		INSERT INTO accounting.analytics_account_snapshots (snapshot_id, company_id, account_id, snapshot_date, balance, created_at)
+		SELECT
+			gen_random_uuid(),
+			$1,
+			a.account_id,
+			$2,
+			COALESCE(SUM(
+				CASE
+					WHEN a.account_type IN ('asset', 'expense') THEN jl.debit_amount - jl.credit_amount
+					ELSE jl.credit_amount - jl.debit_amount
+				END
+			), 0) AS balance,
+			NOW()
+		FROM accounting.accounts a
+		LEFT JOIN accounting.journal_lines jl ON a.account_id = jl.account_id
+		LEFT JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
+			AND je.status = 'posted'
+			AND je.entry_date <= $2
+		WHERE a.company_id = $1 AND a.deleted_at IS NULL
+		GROUP BY a.account_id
+		ON CONFLICT (company_id, account_id, snapshot_date)
+		DO UPDATE SET
+			balance = EXCLUDED.balance,
+			created_at = NOW()
+	`
+	_, err := db.ExecContext(ctx, query, companyID, snapshotDate)
+	if err != nil {
+		r.logger.Error("failed to calculate and store snapshots in bulk",
+			zap.String("company_id", companyID.String()),
+			zap.Time("snapshot_date", snapshotDate),
+			zap.Error(err))
+		return fmt.Errorf("bulk snapshot calculation: %w", err)
+	}
+	return nil
+}
+
+// =====================================================
 // 6. RECONCILIATION BATCH METRICS
 // =====================================================
 
@@ -8794,7 +8975,7 @@ func (r *analyticsRepository) GetReconciliationBatchMetrics(ctx context.Context,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get reconciliation batch metrics: %w", err)
 	}
@@ -8905,7 +9086,7 @@ func (r *analyticsRepository) GetReconciliationDailyStats(ctx context.Context, d
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get reconciliation daily stats: %w", err)
 	}
@@ -9021,5 +9202,19 @@ func (r *analyticsRepository) InvalidateTaxSummaries(ctx context.Context, db DBT
 	}
 	return nil
 }
+
+
+
+================================================================================
+FILE: ./repository/errors.go
+================================================================================
+
+package repository
+
+import "errors"
+
+var (
+	ErrNotFound = errors.New("resource not found")
+)
 
 

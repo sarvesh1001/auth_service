@@ -220,6 +220,7 @@ func (s *guardianService) Create(ctx context.Context, req CreateGuardianRequest)
 		AggregateType: "guardian",
 		AggregateID:   guardian.GuardianID.String(),
 		EventType:     string(EventGuardianCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",
@@ -327,6 +328,7 @@ func (s *guardianService) BulkCreate(ctx context.Context, reqs []CreateGuardianR
 			AggregateType: "guardian",
 			AggregateID:   g.GuardianID.String(),
 			EventType:     string(EventGuardianCreated),
+			Topic:         TopicStudent,
 			Payload:       payload,
 			Status:        "pending",
 		}
@@ -492,6 +494,7 @@ func (s *guardianService) Update(ctx context.Context, req UpdateGuardianRequest)
 		AggregateType: "guardian",
 		AggregateID:   existing.GuardianID.String(),
 		EventType:     string(EventGuardianUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -569,6 +572,7 @@ func (s *guardianService) Delete(ctx context.Context, id uuid.UUID, deletedBy *u
 		AggregateType: "guardian",
 		AggregateID:   id.String(),
 		EventType:     string(EventGuardianDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -662,6 +666,7 @@ func (s *guardianService) SetPrimary(ctx context.Context, studentID, guardianID 
 		AggregateType: "guardian",
 		AggregateID:   guardianID.String(),
 		EventType:     string(EventGuardianPrimarySet),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}

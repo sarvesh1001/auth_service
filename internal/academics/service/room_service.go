@@ -97,6 +97,7 @@ func (s *roomService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventTyp
 		AggregateType: "room",
 		AggregateID:   aggregateID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicStudent,
 		Payload:       data,
 		Headers:       map[string]string{},
 		Status:        "pending",

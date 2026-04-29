@@ -9,13 +9,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting/models/compliance"
+	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/util"
 )
 
-// ComplianceReturnFilter defines filter criteria for listing compliance returns
 type ComplianceReturnFilter struct {
 	CompanyID   uuid.UUID
 	ReturnType  string
@@ -23,92 +24,52 @@ type ComplianceReturnFilter struct {
 	PeriodStart *time.Time
 	PeriodEnd   *time.Time
 	IsLocked    *bool
-	Search      string // searches return_type, description? (no description field, maybe reference?)
+	Search      string
 }
 
-// ComplianceRepository defines the interface for compliance data access
 type ComplianceRepository interface {
-	// =====================================================
-	// RETURNS (CORE)
-	// =====================================================
 	CreateReturn(ctx context.Context, db DBTX, r *compliance.ComplianceReturn) error
 	UpdateReturn(ctx context.Context, db DBTX, r *compliance.ComplianceReturn) error
-
 	GetReturnByID(ctx context.Context, db DBTX, returnID uuid.UUID) (*compliance.ComplianceReturn, error)
 	GetReturnByIDForUpdate(ctx context.Context, db DBTX, returnID uuid.UUID) (*compliance.ComplianceReturn, error)
-
 	ListReturns(ctx context.Context, db DBTX, filter ComplianceReturnFilter, p Pagination, s Sort) ([]*compliance.ComplianceReturn, error)
 	ListReturnsByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*compliance.ComplianceReturn, error)
-
 	CountReturns(ctx context.Context, db DBTX, filter ComplianceReturnFilter) (int64, error)
 	GetFilingByID(ctx context.Context, db DBTX, filingID uuid.UUID) (*compliance.ComplianceFiling, error)
-
 	DeleteReturn(ctx context.Context, db DBTX, returnID uuid.UUID, deletedBy *uuid.UUID) error
-
-	// =====================================================
-	// RETURN STATUS / LIFECYCLE
-	// =====================================================
-	UpdateReturnStatus(ctx context.Context, db DBTX, returnID uuid.UUID, status string, updatedBy *uuid.UUID) error
+	UpdateReturnStatus(ctx context.Context, db DBTX, returnID uuid.UUID, status enums.ComplianceReturnStatus, updatedBy *uuid.UUID) error
 	LockReturn(ctx context.Context, db DBTX, returnID uuid.UUID, updatedBy *uuid.UUID) error
 	UnlockReturn(ctx context.Context, db DBTX, returnID uuid.UUID, updatedBy *uuid.UUID) error
-
 	MarkAsFiled(ctx context.Context, db DBTX, returnID uuid.UUID, filedBy *uuid.UUID, filedAt time.Time) error
-
-	// =====================================================
-	// RETURN LINES
-	// =====================================================
 	AddReturnLine(ctx context.Context, db DBTX, line *compliance.ComplianceReturnLine) error
 	BulkAddReturnLines(ctx context.Context, db DBTX, lines []*compliance.ComplianceReturnLine) error
-
 	GetReturnLines(ctx context.Context, db DBTX, returnID uuid.UUID) ([]*compliance.ComplianceReturnLine, error)
 	DeleteReturnLine(ctx context.Context, db DBTX, lineID uuid.UUID) error
-
 	ClearReturnLines(ctx context.Context, db DBTX, returnID uuid.UUID) error
-
-	// =====================================================
-	// FILINGS
-	// =====================================================
 	CreateFiling(ctx context.Context, db DBTX, filing *compliance.ComplianceFiling) error
-
 	GetFilingsByReturn(ctx context.Context, db DBTX, returnID uuid.UUID) ([]*compliance.ComplianceFiling, error)
-
-	UpdateFilingStatus(ctx context.Context, db DBTX, filingID uuid.UUID, status string, errorMessage *string) error
-
-	// =====================================================
-	// AUDIT LOG (CRITICAL)
-	// =====================================================
+	UpdateFilingStatus(ctx context.Context, db DBTX, filingID uuid.UUID, status enums.ComplianceFilingStatus, errorMessage *string) error
 	CreateAuditLog(ctx context.Context, db DBTX, log *compliance.ComplianceAuditLog) error
-
 	GetAuditLogs(ctx context.Context, db DBTX, companyID uuid.UUID, returnID *uuid.UUID) ([]*compliance.ComplianceAuditLog, error)
-
-	// =====================================================
-	// VALIDATION / SAFETY
-	// =====================================================
 	ExistsReturnForPeriod(ctx context.Context, db DBTX, companyID uuid.UUID, returnType string, start, end time.Time) (bool, error)
-
+	ExistsReturnForPeriodExcludeSelf(ctx context.Context, db DBTX, companyID uuid.UUID, returnType string, start, end time.Time, excludeReturnID uuid.UUID) (bool, error)
 	IsReturnLocked(ctx context.Context, db DBTX, returnID uuid.UUID) (bool, error)
-
-	// =====================================================
-	// AGGREGATION / TOTALS (IMPORTANT)
-	// =====================================================
-	ComputeReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID) (totalLiability float64, totalPaid float64, err error)
-
-	UpdateReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID, liability float64, paid float64) error
+	ComputeReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID) (totalLiability decimal.Decimal, totalPaid decimal.Decimal, err error)
+	UpdateReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID, liability decimal.Decimal, paid decimal.Decimal) error
+	UpsertReturnTotalsFromLines(ctx context.Context, db DBTX, returnID uuid.UUID) error
+	GetReturnWithLines(ctx context.Context, db DBTX, returnID uuid.UUID) (*compliance.ComplianceReturn, []*compliance.ComplianceReturnLine, error)
 }
 
-// complianceRepository implements ComplianceRepository
 type complianceRepository struct {
 	logger *zap.Logger
 }
 
-// NewComplianceRepository creates a new compliance repository instance
 func NewComplianceRepository(logger *zap.Logger) ComplianceRepository {
 	return &complianceRepository{
 		logger: logger.Named("compliance_repo"),
 	}
 }
 
-// allowed sort fields for compliance returns
 var allowedComplianceReturnSortFields = map[string]bool{
 	"period_start":    true,
 	"period_end":      true,
@@ -185,13 +146,10 @@ func (r *complianceRepository) buildReturnFilter(filter ComplianceReturnFilter) 
 		idx++
 	}
 	if filter.Search != "" {
-		searchPattern := "%" + filter.Search + "%"
-		conditions = append(conditions, fmt.Sprintf("(return_type ILIKE $%d)", idx))
-		args = append(args, searchPattern)
+		conditions = append(conditions, fmt.Sprintf("return_type ILIKE $%d", idx))
+		args = append(args, "%"+filter.Search+"%")
 		idx++
 	}
-
-	// Soft delete condition
 	conditions = append(conditions, "deleted_at IS NULL")
 
 	if len(conditions) == 0 {
@@ -200,24 +158,25 @@ func (r *complianceRepository) buildReturnFilter(filter ComplianceReturnFilter) 
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// scanReturn scans a row into a ComplianceReturn model
 func (r *complianceRepository) scanReturn(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*compliance.ComplianceReturn, error) {
 	var ret compliance.ComplianceReturn
 	var filingDate, filedAt sql.NullTime
-	var createdBy, updatedBy, filedBy uuid.NullUUID
+	var createdBy, updatedBy, filedBy, amendedFrom uuid.NullUUID
 	var deletedAt sql.NullTime
 
 	err := scanner.Scan(
 		&ret.ReturnID, &ret.CompanyID, &ret.ReturnType,
 		&ret.PeriodStart, &ret.PeriodEnd, &ret.DueDate, &filingDate,
 		&ret.Status, &ret.TotalLiability, &ret.TotalPaid, &ret.IsLocked,
-		&ret.CreatedAt, &ret.UpdatedAt, &createdBy, &updatedBy, &filedBy, &filedAt, &deletedAt,
+		&ret.CreatedAt, &ret.UpdatedAt, &createdBy, &updatedBy, &filedBy, &filedAt,
+		&amendedFrom, &deletedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
+
 	if filingDate.Valid {
 		ret.FilingDate = &filingDate.Time
 	}
@@ -233,13 +192,15 @@ func (r *complianceRepository) scanReturn(scanner interface {
 	if filedAt.Valid {
 		ret.FiledAt = &filedAt.Time
 	}
+	if amendedFrom.Valid {
+		ret.AmendedFrom = &amendedFrom.UUID
+	}
 	if deletedAt.Valid {
 		ret.DeletedAt = &deletedAt.Time
 	}
 	return &ret, nil
 }
 
-// scanReturnLine scans a row into a ComplianceReturnLine
 func (r *complianceRepository) scanReturnLine(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*compliance.ComplianceReturnLine, error) {
@@ -264,29 +225,25 @@ func (r *complianceRepository) scanReturnLine(scanner interface {
 	return &line, nil
 }
 
-// =====================================================
-// RETURNS (CORE)
-// =====================================================
-
 func (r *complianceRepository) CreateReturn(ctx context.Context, db DBTX, ret *compliance.ComplianceReturn) error {
 	query := `
 		INSERT INTO accounting.compliance_returns (
 			return_id, company_id, return_type, period_start, period_end,
 			due_date, filing_date, status, total_liability, total_paid,
 			is_locked, created_at, updated_at, created_by, updated_by,
-			filed_by, filed_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW(), $12, $13, $14, $15)
+			filed_by, filed_at, amended_from
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW(), $12, $13, $14, $15, $16)
 		RETURNING created_at, updated_at
 	`
 	err := db.QueryRowContext(ctx, query,
 		ret.ReturnID, ret.CompanyID, ret.ReturnType, ret.PeriodStart, ret.PeriodEnd,
-		ret.DueDate, ret.FilingDate, ret.Status, ret.TotalLiability, ret.TotalPaid,
-		ret.IsLocked, ret.CreatedBy, ret.UpdatedBy, ret.FiledBy, ret.FiledAt,
+		ret.DueDate, ret.FilingDate, string(ret.Status), ret.TotalLiability, ret.TotalPaid,
+		ret.IsLocked, ret.CreatedBy, ret.UpdatedBy, ret.FiledBy, ret.FiledAt, ret.AmendedFrom,
 	).Scan(&ret.CreatedAt, &ret.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create compliance return",
 			util.String("company_id", ret.CompanyID.String()),
-			util.String("return_type", ret.ReturnType),
+			util.String("return_type", string(ret.Status)),
 			util.ErrorField(err))
 		return fmt.Errorf("create compliance return: %w", err)
 	}
@@ -301,25 +258,20 @@ func (r *complianceRepository) UpdateReturn(ctx context.Context, db DBTX, ret *c
 		    period_end = $4,
 		    due_date = $5,
 		    filing_date = $6,
-		    status = $7,
-		    total_liability = $8,
-		    total_paid = $9,
-		    is_locked = $10,
-		    updated_by = $11,
-		    updated_at = NOW(),
-		    filed_by = $12,
-		    filed_at = $13
-		WHERE return_id = $1 AND deleted_at IS NULL
+		    updated_by = $7,
+		    updated_at = NOW()
+		WHERE return_id = $1
+		  AND deleted_at IS NULL
+		  AND is_locked = false
 		RETURNING updated_at
 	`
 	err := db.QueryRowContext(ctx, query,
 		ret.ReturnID, ret.ReturnType, ret.PeriodStart, ret.PeriodEnd,
-		ret.DueDate, ret.FilingDate, ret.Status, ret.TotalLiability, ret.TotalPaid,
-		ret.IsLocked, ret.UpdatedBy, ret.FiledBy, ret.FiledAt,
+		ret.DueDate, ret.FilingDate, ret.UpdatedBy,
 	).Scan(&ret.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("compliance return %s not found or deleted", ret.ReturnID)
+			return fmt.Errorf("compliance return %s not found, deleted, or locked", ret.ReturnID)
 		}
 		r.logger.Error("failed to update compliance return",
 			util.String("id", ret.ReturnID.String()),
@@ -334,14 +286,14 @@ func (r *complianceRepository) GetReturnByID(ctx context.Context, db DBTX, retur
 		SELECT return_id, company_id, return_type, period_start, period_end,
 		       due_date, filing_date, status, total_liability, total_paid,
 		       is_locked, created_at, updated_at, created_by, updated_by,
-		       filed_by, filed_at, deleted_at
+		       filed_by, filed_at, amended_from, deleted_at
 		FROM accounting.compliance_returns
 		WHERE return_id = $1 AND deleted_at IS NULL
 	`
 	ret, err := r.scanReturn(db.QueryRowContext(ctx, query, returnID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get compliance return by ID",
 			util.String("id", returnID.String()),
@@ -356,7 +308,7 @@ func (r *complianceRepository) GetReturnByIDForUpdate(ctx context.Context, db DB
 		SELECT return_id, company_id, return_type, period_start, period_end,
 		       due_date, filing_date, status, total_liability, total_paid,
 		       is_locked, created_at, updated_at, created_by, updated_by,
-		       filed_by, filed_at, deleted_at
+		       filed_by, filed_at, amended_from, deleted_at
 		FROM accounting.compliance_returns
 		WHERE return_id = $1 AND deleted_at IS NULL
 		FOR UPDATE
@@ -364,7 +316,7 @@ func (r *complianceRepository) GetReturnByIDForUpdate(ctx context.Context, db DB
 	ret, err := r.scanReturn(db.QueryRowContext(ctx, query, returnID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get compliance return for update",
 			util.String("id", returnID.String()),
@@ -386,14 +338,14 @@ func (r *complianceRepository) ListReturns(ctx context.Context, db DBTX, filter 
 		SELECT return_id, company_id, return_type, period_start, period_end,
 		       due_date, filing_date, status, total_liability, total_paid,
 		       is_locked, created_at, updated_at, created_by, updated_by,
-		       filed_by, filed_at, deleted_at
+		       filed_by, filed_at, amended_from, deleted_at
 		FROM accounting.compliance_returns
 		%s
 		%s
 		LIMIT $%d OFFSET $%d
 	`, where, orderBy, len(args)+1, len(args)+2)
-
 	args = append(args, limit, offset)
+
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("failed to list compliance returns",
@@ -439,7 +391,9 @@ func (r *complianceRepository) DeleteReturn(ctx context.Context, db DBTX, return
 	query := `
 		UPDATE accounting.compliance_returns
 		SET deleted_at = NOW(), updated_by = $2, updated_at = NOW()
-		WHERE return_id = $1 AND deleted_at IS NULL
+		WHERE return_id = $1
+		  AND deleted_at IS NULL
+		  AND is_locked = false
 	`
 	result, err := db.ExecContext(ctx, query, returnID, deletedBy)
 	if err != nil {
@@ -450,22 +404,18 @@ func (r *complianceRepository) DeleteReturn(ctx context.Context, db DBTX, return
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("compliance return %s not found or already deleted", returnID)
+		return fmt.Errorf("compliance return %s not found, locked, or already deleted", returnID)
 	}
 	return nil
 }
 
-// =====================================================
-// RETURN STATUS / LIFECYCLE
-// =====================================================
-
-func (r *complianceRepository) UpdateReturnStatus(ctx context.Context, db DBTX, returnID uuid.UUID, status string, updatedBy *uuid.UUID) error {
+func (r *complianceRepository) UpdateReturnStatus(ctx context.Context, db DBTX, returnID uuid.UUID, status enums.ComplianceReturnStatus, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.compliance_returns
 		SET status = $2, updated_by = $3, updated_at = NOW()
 		WHERE return_id = $1 AND deleted_at IS NULL AND is_locked = false
 	`
-	result, err := db.ExecContext(ctx, query, returnID, status, updatedBy)
+	result, err := db.ExecContext(ctx, query, returnID, string(status), updatedBy)
 	if err != nil {
 		r.logger.Error("failed to update return status",
 			util.String("id", returnID.String()),
@@ -528,7 +478,10 @@ func (r *complianceRepository) MarkAsFiled(ctx context.Context, db DBTX, returnI
 		    filed_at = $4,
 		    is_locked = true,
 		    updated_at = NOW()
-		WHERE return_id = $1 AND deleted_at IS NULL
+		WHERE return_id = $1
+		  AND deleted_at IS NULL
+		  AND status = 'submitted'
+		  AND is_locked = false
 	`
 	result, err := db.ExecContext(ctx, query, returnID, filedAt, filedBy, filedAt)
 	if err != nil {
@@ -539,14 +492,10 @@ func (r *complianceRepository) MarkAsFiled(ctx context.Context, db DBTX, returnI
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("return %s not found or deleted", returnID)
+		return fmt.Errorf("return %s not found, deleted, not in 'submitted' state, or already locked", returnID)
 	}
 	return nil
 }
-
-// =====================================================
-// RETURN LINES
-// =====================================================
 
 func (r *complianceRepository) AddReturnLine(ctx context.Context, db DBTX, line *compliance.ComplianceReturnLine) error {
 	query := `
@@ -656,10 +605,6 @@ func (r *complianceRepository) ClearReturnLines(ctx context.Context, db DBTX, re
 	return nil
 }
 
-// =====================================================
-// FILINGS
-// =====================================================
-
 func (r *complianceRepository) CreateFiling(ctx context.Context, db DBTX, filing *compliance.ComplianceFiling) error {
 	query := `
 		INSERT INTO accounting.compliance_filings (
@@ -670,7 +615,7 @@ func (r *complianceRepository) CreateFiling(ctx context.Context, db DBTX, filing
 	`
 	err := db.QueryRowContext(ctx, query,
 		filing.FilingID, filing.ReturnID, filing.SubmissionDate,
-		filing.AcknowledgementNo, filing.FilingStatus, filing.ErrorMessage,
+		filing.AcknowledgementNo, string(filing.FilingStatus), filing.ErrorMessage,
 		filing.Metadata, filing.CreatedBy,
 	).Scan(&filing.SubmissionDate)
 	if err != nil {
@@ -705,14 +650,16 @@ func (r *complianceRepository) GetFilingsByReturn(ctx context.Context, db DBTX, 
 		var ackNo, errMsg sql.NullString
 		var metadata []byte
 		var createdBy uuid.NullUUID
+		var statusStr string
 
 		err = rows.Scan(
 			&f.FilingID, &f.ReturnID, &f.SubmissionDate, &ackNo,
-			&f.FilingStatus, &errMsg, &metadata, &createdBy,
+			&statusStr, &errMsg, &metadata, &createdBy,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan filing: %w", err)
 		}
+		f.FilingStatus = string(enums.ComplianceFilingStatus(statusStr))
 		if ackNo.Valid {
 			f.AcknowledgementNo = &ackNo.String
 		}
@@ -730,13 +677,13 @@ func (r *complianceRepository) GetFilingsByReturn(ctx context.Context, db DBTX, 
 	return result, nil
 }
 
-func (r *complianceRepository) UpdateFilingStatus(ctx context.Context, db DBTX, filingID uuid.UUID, status string, errorMessage *string) error {
+func (r *complianceRepository) UpdateFilingStatus(ctx context.Context, db DBTX, filingID uuid.UUID, status enums.ComplianceFilingStatus, errorMessage *string) error {
 	query := `
 		UPDATE accounting.compliance_filings
 		SET filing_status = $2, error_message = $3
 		WHERE filing_id = $1
 	`
-	_, err := db.ExecContext(ctx, query, filingID, status, errorMessage)
+	_, err := db.ExecContext(ctx, query, filingID, string(status), errorMessage)
 	if err != nil {
 		r.logger.Error("failed to update filing status",
 			util.String("filing_id", filingID.String()),
@@ -745,10 +692,6 @@ func (r *complianceRepository) UpdateFilingStatus(ctx context.Context, db DBTX, 
 	}
 	return nil
 }
-
-// =====================================================
-// AUDIT LOG (CRITICAL)
-// =====================================================
 
 func (r *complianceRepository) CreateAuditLog(ctx context.Context, db DBTX, log *compliance.ComplianceAuditLog) error {
 	query := `
@@ -803,7 +746,6 @@ func (r *complianceRepository) GetAuditLogs(ctx context.Context, db DBTX, compan
 		var oldState, newState []byte
 		var actedBy uuid.NullUUID
 		var ipAddress sql.NullString
-
 		err = rows.Scan(
 			&log.AuditID, &log.CompanyID, &returnIDNull, &log.Action,
 			&oldState, &newState, &actedBy, &log.ActedAt, &ipAddress,
@@ -831,10 +773,6 @@ func (r *complianceRepository) GetAuditLogs(ctx context.Context, db DBTX, compan
 	return result, nil
 }
 
-// =====================================================
-// VALIDATION / SAFETY
-// =====================================================
-
 func (r *complianceRepository) ExistsReturnForPeriod(ctx context.Context, db DBTX, companyID uuid.UUID, returnType string, start, end time.Time) (bool, error) {
 	query := `
 		SELECT EXISTS(
@@ -857,6 +795,29 @@ func (r *complianceRepository) ExistsReturnForPeriod(ctx context.Context, db DBT
 	return exists, nil
 }
 
+func (r *complianceRepository) ExistsReturnForPeriodExcludeSelf(ctx context.Context, db DBTX, companyID uuid.UUID, returnType string, start, end time.Time, excludeReturnID uuid.UUID) (bool, error) {
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM accounting.compliance_returns
+			WHERE company_id = $1
+			  AND return_type = $2
+			  AND period_start <= $4
+			  AND period_end >= $3
+			  AND return_id != $5
+			  AND deleted_at IS NULL
+		)
+	`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, returnType, start, end, excludeReturnID).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check existing return for period with exclusion",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists return for period exclude self: %w", err)
+	}
+	return exists, nil
+}
+
 func (r *complianceRepository) IsReturnLocked(ctx context.Context, db DBTX, returnID uuid.UUID) (bool, error) {
 	query := `SELECT is_locked FROM accounting.compliance_returns WHERE return_id = $1 AND deleted_at IS NULL`
 	var locked bool
@@ -873,29 +834,24 @@ func (r *complianceRepository) IsReturnLocked(ctx context.Context, db DBTX, retu
 	return locked, nil
 }
 
-// =====================================================
-// AGGREGATION / TOTALS (IMPORTANT)
-// =====================================================
-
-func (r *complianceRepository) ComputeReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID) (totalLiability float64, totalPaid float64, err error) {
-	// Sum tax_amount as total liability. Paid amount would come from a payment table; for now we set to 0.
+func (r *complianceRepository) ComputeReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID) (decimal.Decimal, decimal.Decimal, error) {
 	query := `
 		SELECT COALESCE(SUM(tax_amount), 0) as total_liability
 		FROM accounting.compliance_return_lines
 		WHERE return_id = $1
 	`
-	err = db.QueryRowContext(ctx, query, returnID).Scan(&totalLiability)
+	var totalLiability decimal.Decimal
+	err := db.QueryRowContext(ctx, query, returnID).Scan(&totalLiability)
 	if err != nil {
 		r.logger.Error("failed to compute return totals",
 			util.String("return_id", returnID.String()),
 			util.ErrorField(err))
-		return 0, 0, fmt.Errorf("compute return totals: %w", err)
+		return decimal.Zero, decimal.Zero, fmt.Errorf("compute return totals: %w", err)
 	}
-	// totalPaid remains 0 for now, but you can implement payment aggregation later.
-	return totalLiability, 0, nil
+	return totalLiability, decimal.Zero, nil
 }
 
-func (r *complianceRepository) UpdateReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID, liability float64, paid float64) error {
+func (r *complianceRepository) UpdateReturnTotals(ctx context.Context, db DBTX, returnID uuid.UUID, liability decimal.Decimal, paid decimal.Decimal) error {
 	query := `
 		UPDATE accounting.compliance_returns
 		SET total_liability = $2, total_paid = $3, updated_at = NOW()
@@ -914,31 +870,59 @@ func (r *complianceRepository) UpdateReturnTotals(ctx context.Context, db DBTX, 
 	}
 	return nil
 }
+
+func (r *complianceRepository) UpsertReturnTotalsFromLines(ctx context.Context, db DBTX, returnID uuid.UUID) error {
+	query := `
+		UPDATE accounting.compliance_returns
+		SET total_liability = (
+			SELECT COALESCE(SUM(tax_amount), 0)
+			FROM accounting.compliance_return_lines
+			WHERE return_id = $1
+		),
+		updated_at = NOW()
+		WHERE return_id = $1 AND deleted_at IS NULL
+	`
+	result, err := db.ExecContext(ctx, query, returnID)
+	if err != nil {
+		r.logger.Error("failed to upsert return totals from lines",
+			util.String("return_id", returnID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("upsert return totals: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("return %s not found or deleted", returnID)
+	}
+	return nil
+}
+
 func (r *complianceRepository) GetFilingByID(ctx context.Context, db DBTX, filingID uuid.UUID) (*compliance.ComplianceFiling, error) {
 	query := `
-        SELECT filing_id, return_id, submission_date, acknowledgement_no,
-               filing_status, error_message, metadata, created_by
-        FROM accounting.compliance_filings
-        WHERE filing_id = $1
-    `
+		SELECT filing_id, return_id, submission_date, acknowledgement_no,
+		       filing_status, error_message, metadata, created_by
+		FROM accounting.compliance_filings
+		WHERE filing_id = $1
+	`
 	var f compliance.ComplianceFiling
 	var ackNo, errMsg sql.NullString
 	var metadata []byte
 	var createdBy uuid.NullUUID
+	var statusStr string
 
 	err := db.QueryRowContext(ctx, query, filingID).Scan(
 		&f.FilingID, &f.ReturnID, &f.SubmissionDate, &ackNo,
-		&f.FilingStatus, &errMsg, &metadata, &createdBy,
+		&statusStr, &errMsg, &metadata, &createdBy,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get filing by ID",
 			util.String("filing_id", filingID.String()),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get filing by ID: %w", err)
 	}
+	f.FilingStatus = string(enums.ComplianceFilingStatus(statusStr))
 	if ackNo.Valid {
 		f.AcknowledgementNo = &ackNo.String
 	}
@@ -952,4 +936,16 @@ func (r *complianceRepository) GetFilingByID(ctx context.Context, db DBTX, filin
 		f.CreatedBy = &createdBy.UUID
 	}
 	return &f, nil
+}
+
+func (r *complianceRepository) GetReturnWithLines(ctx context.Context, db DBTX, returnID uuid.UUID) (*compliance.ComplianceReturn, []*compliance.ComplianceReturnLine, error) {
+	ret, err := r.GetReturnByID(ctx, db, returnID)
+	if err != nil {
+		return nil, nil, err
+	}
+	lines, err := r.GetReturnLines(ctx, db, returnID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ret, lines, nil
 }

@@ -19,19 +19,11 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// ---------------------------------------------------------------------
-// Enrollment status constants (matching repository)
-// ---------------------------------------------------------------------
-
 const (
 	EnrollmentStatusActive    = "active"
 	EnrollmentStatusCompleted = "completed"
 	EnrollmentStatusWithdrawn = "withdrawn"
 )
-
-// ---------------------------------------------------------------------
-// Event types (outbox)
-// ---------------------------------------------------------------------
 
 const (
 	EventEnrollmentCreated     EventType = "enrollment.created"
@@ -44,10 +36,6 @@ const (
 	EventEnrollmentPromoted    EventType = "enrollment.promoted"
 )
 
-// ---------------------------------------------------------------------
-// Request/Response DTOs (unchanged)
-// ---------------------------------------------------------------------
-
 type EnrollStudentRequest struct {
 	StudentID      uuid.UUID  `json:"student_id"`
 	AcademicYearID uuid.UUID  `json:"academic_year_id"`
@@ -57,6 +45,7 @@ type EnrollStudentRequest struct {
 	CreatedBy      *uuid.UUID `json:"created_by,omitempty"`
 	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
 }
+
 type UpdateEnrollmentRequest struct {
 	EnrollmentID   uuid.UUID  `json:"enrollment_id"`
 	SectionID      uuid.UUID  `json:"section_id,omitempty"`
@@ -65,94 +54,78 @@ type UpdateEnrollmentRequest struct {
 	Status         string     `json:"status,omitempty"`
 	UpdatedBy      *uuid.UUID `json:"updated_by,omitempty"`
 }
+
 type TransferSectionRequest struct {
 	EnrollmentID uuid.UUID  `json:"enrollment_id"`
 	NewSectionID uuid.UUID  `json:"new_section_id"`
 	UpdatedBy    *uuid.UUID `json:"updated_by,omitempty"`
 }
+
 type PromoteStudentRequest struct {
 	StudentID         uuid.UUID  `json:"student_id"`
 	NewSectionID      uuid.UUID  `json:"new_section_id"`
 	NewAcademicYearID uuid.UUID  `json:"new_academic_year_id"`
 	UpdatedBy         *uuid.UUID `json:"updated_by,omitempty"`
 }
+
 type BulkEnrollmentStatusUpdateRequest struct {
 	EnrollmentIDs []uuid.UUID `json:"enrollment_ids"`
 	Status        string      `json:"status"`
 	UpdatedBy     *uuid.UUID  `json:"updated_by,omitempty"`
 }
+
 type BulkRollNumberRequest struct {
 	RollNumbers map[uuid.UUID]string `json:"roll_numbers"`
 	UpdatedBy   *uuid.UUID           `json:"updated_by,omitempty"`
 }
 
-// ---------------------------------------------------------------------
-// Service interface (all write methods now have idempotencyKey)
-// ---------------------------------------------------------------------
-
 type EnrollmentService interface {
 	EnrollStudent(ctx context.Context, req EnrollStudentRequest, idempotencyKey string) (*models.Enrollment, error)
 	BulkEnroll(ctx context.Context, reqs []EnrollStudentRequest, idempotencyKey string) ([]*models.Enrollment, error)
 	UpsertEnrollment(ctx context.Context, req EnrollStudentRequest, idempotencyKey string) (*models.Enrollment, error)
-
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Enrollment, error)
 	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*models.Enrollment, error)
 	GetByStudentAndYear(ctx context.Context, studentID, academicYearID uuid.UUID) (*models.Enrollment, error)
 	GetActiveByStudent(ctx context.Context, studentID uuid.UUID) (*models.Enrollment, error)
-
 	List(ctx context.Context, filter repository.EnrollmentFilter, p repository.Pagination, s repository.Sort) ([]*models.Enrollment, error)
 	ListByStudent(ctx context.Context, studentID uuid.UUID) ([]*models.Enrollment, error)
 	ListBySection(ctx context.Context, sectionID uuid.UUID) ([]*models.Enrollment, error)
 	ListByAcademicYear(ctx context.Context, academicYearID uuid.UUID) ([]*models.Enrollment, error)
-
 	Count(ctx context.Context, filter repository.EnrollmentFilter) (int64, error)
 	ValidateEnrollment(ctx context.Context, req EnrollStudentRequest) error
 	ValidateCapacity(ctx context.Context, sectionID uuid.UUID) error
 	ValidateStudentEligibility(ctx context.Context, studentID uuid.UUID) error
 	ValidateDuplicateEnrollment(ctx context.Context, studentID, academicYearID uuid.UUID) error
 	Exists(ctx context.Context, studentID, academicYearID uuid.UUID) (bool, error)
-
 	Activate(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	Deactivate(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	Complete(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	Withdraw(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	UpdateStatus(ctx context.Context, enrollmentID uuid.UUID, status string, updatedBy *uuid.UUID, idempotencyKey string) error
-
 	Update(ctx context.Context, req UpdateEnrollmentRequest, idempotencyKey string) (*models.Enrollment, error)
 	UpdateRollNumber(ctx context.Context, enrollmentID uuid.UUID, rollNumber string, updatedBy *uuid.UUID, idempotencyKey string) error
 	TransferSection(ctx context.Context, req TransferSectionRequest, idempotencyKey string) (*models.Enrollment, error)
 	BulkTransferSection(ctx context.Context, reqs []TransferSectionRequest, idempotencyKey string) error
 	SwapSections(ctx context.Context, enrollmentID1, enrollmentID2 uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-
 	PromoteStudent(ctx context.Context, req PromoteStudentRequest, idempotencyKey string) (*models.Enrollment, error)
 	BulkPromote(ctx context.Context, reqs []PromoteStudentRequest, idempotencyKey string) error
 	PromoteSection(ctx context.Context, sectionID, nextSectionID uuid.UUID, academicYearID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	RollOverAcademicYear(ctx context.Context, fromYearID, toYearID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-
 	GraduateStudent(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
 	MarkAlumni(ctx context.Context, studentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-
 	BulkUpdateStatus(ctx context.Context, req BulkEnrollmentStatusUpdateRequest, idempotencyKey string) error
 	BulkAssignRollNumbers(ctx context.Context, req BulkRollNumberRequest, idempotencyKey string) error
-
 	Search(ctx context.Context, query string, companyID uuid.UUID, p repository.Pagination) ([]*models.Enrollment, error)
 	GetSectionStrength(ctx context.Context, sectionID uuid.UUID) (int64, error)
 	GetAcademicYearStrength(ctx context.Context, academicYearID uuid.UUID) (int64, error)
 	GetDropoutCount(ctx context.Context, academicYearID uuid.UUID) (int64, error)
 	GetPromotionStats(ctx context.Context, academicYearID uuid.UUID) (map[string]int64, error)
-
 	RebuildEnrollments(ctx context.Context, academicYearID uuid.UUID) error
 	FixDuplicateEnrollments(ctx context.Context, academicYearID uuid.UUID) error
-
-	// Publishing methods (optional, kept as is)
 	PublishEnrollmentCreated(ctx context.Context, enrollment *models.Enrollment) error
 	PublishEnrollmentUpdated(ctx context.Context, enrollment *models.Enrollment) error
 	PublishEnrollmentDeleted(ctx context.Context, enrollmentID uuid.UUID) error
 }
-
-// ---------------------------------------------------------------------
-// Service implementation
-// ---------------------------------------------------------------------
 
 type enrollmentService struct {
 	repo                repository.EnrollmentRepository
@@ -164,12 +137,10 @@ type enrollmentService struct {
 	pgClient            *client.PostgresClient
 	logger              *zap.Logger
 	notificationService NotificationService
-
-	// Infrastructure dependencies (same pattern as assignment service)
-	idempotencyStore idempotency.Store
-	auditService     *audit.AuditService
-	outboxRepo       outbox.Repository
-	eventPublisher   EventPublisher // kept for compatibility
+	idempotencyStore    idempotency.Store
+	auditService        *audit.AuditService
+	outboxRepo          outbox.Repository
+	eventPublisher      EventPublisher
 }
 
 func NewEnrollmentService(
@@ -204,10 +175,8 @@ func NewEnrollmentService(
 	}
 }
 
-// ---------------------------------------------------------------------
-// Helper: store outbox event for enrollment
-// ---------------------------------------------------------------------
-
+// storeOutboxEvent creates and stores an outbox event. All enrollment events
+// are published to the "student-events" topic (TopicStudent).
 func (s *enrollmentService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, aggregateID uuid.UUID, payload interface{}) error {
 	var data []byte
 	var err error
@@ -217,22 +186,18 @@ func (s *enrollmentService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, ev
 			return fmt.Errorf("marshal outbox payload: %w", err)
 		}
 	}
-
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "enrollment",
 		AggregateID:   aggregateID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicStudent, // <-- NEW: required field, using student-events topic
 		Payload:       data,
 		Headers:       map[string]string{},
 		Status:        "pending",
 	}
 	return s.outboxRepo.Store(ctx, tx, outboxEvent)
 }
-
-// ---------------------------------------------------------------------
-// Helper methods (unchanged logic, but now use transaction)
-// ---------------------------------------------------------------------
 
 func (s *enrollmentService) getCompanyIDFromStudent(ctx context.Context, db repository.DBTX, studentID uuid.UUID) (uuid.UUID, error) {
 	student, err := s.studentRepo.GetByID(ctx, db, studentID)
@@ -342,10 +307,6 @@ func (s *enrollmentService) updateStatusWithValidation(ctx context.Context, tx *
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Notification helper (unchanged)
-// ---------------------------------------------------------------------
-
 func (s *enrollmentService) buildNotificationRequest(
 	enrollment *models.Enrollment,
 	student *models.Student,
@@ -425,9 +386,9 @@ func (s *enrollmentService) buildNotificationRequest(
 	}
 }
 
-// ---------------------------------------------------------------------
-// Public methods (updated with idempotency, audit, outbox)
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Business Methods
+// ----------------------------------------------------------------------------
 
 func (s *enrollmentService) EnrollStudent(ctx context.Context, req EnrollStudentRequest, idempotencyKey string) (*models.Enrollment, error) {
 	logger := s.logger.With(
@@ -447,7 +408,6 @@ func (s *enrollmentService) EnrollStudent(ctx context.Context, req EnrollStudent
 	}
 	defer tx.Rollback()
 
-	// Idempotency check
 	if idempotencyKey != "" {
 		var existing models.Enrollment
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.EnrollmentID != uuid.Nil {
@@ -483,6 +443,7 @@ func (s *enrollmentService) EnrollStudent(ctx context.Context, req EnrollStudent
 		CreatedBy:      req.CreatedBy,
 		UpdatedBy:      req.UpdatedBy,
 	}
+
 	if err := s.repo.Create(ctx, tx, enrollment); err != nil {
 		return nil, err
 	}
@@ -531,6 +492,7 @@ func (s *enrollmentService) BulkEnroll(ctx context.Context, reqs []EnrollStudent
 	if len(reqs) == 0 {
 		return nil, nil
 	}
+
 	logger := s.logger.With(
 		zap.String("method", "BulkEnroll"),
 		zap.Int("count", len(reqs)),
@@ -551,7 +513,6 @@ func (s *enrollmentService) BulkEnroll(ctx context.Context, reqs []EnrollStudent
 		}
 	}
 
-	// Validate inputs and group by section for capacity check
 	sectionCounts := make(map[uuid.UUID]int)
 	studentIDs := make([]uuid.UUID, 0, len(reqs))
 	for i, req := range reqs {
@@ -573,11 +534,13 @@ func (s *enrollmentService) BulkEnroll(ctx context.Context, reqs []EnrollStudent
 
 	enrollments := make([]*models.Enrollment, 0, len(reqs))
 	seen := make(map[string]bool)
+
 	for i, req := range reqs {
 		student, ok := studentMap[req.StudentID]
 		if !ok {
 			return nil, fmt.Errorf("item %d: %w: student %s", i, ErrNotFound, req.StudentID)
 		}
+
 		key := fmt.Sprintf("%s:%s", req.StudentID, req.AcademicYearID)
 		if seen[key] {
 			return nil, fmt.Errorf("item %d: duplicate student %s in same academic year", i, req.StudentID)
@@ -604,7 +567,6 @@ func (s *enrollmentService) BulkEnroll(ctx context.Context, reqs []EnrollStudent
 		})
 	}
 
-	// Validate capacity per section
 	for sectionID, count := range sectionCounts {
 		if err := s.checkCapacity(ctx, tx, sectionID); err != nil {
 			return nil, err
@@ -789,10 +751,6 @@ func (s *enrollmentService) UpsertEnrollment(ctx context.Context, req EnrollStud
 	return enrollment, nil
 }
 
-// ---------------------------------------------------------------------
-// Read methods (no idempotency/audit/outbox needed)
-// ---------------------------------------------------------------------
-
 func (s *enrollmentService) GetByID(ctx context.Context, id uuid.UUID) (*models.Enrollment, error) {
 	return s.repo.GetByIDUnsafe(ctx, s.pgClient.DB, id)
 }
@@ -946,10 +904,6 @@ func (s *enrollmentService) Exists(ctx context.Context, studentID, academicYearI
 	return s.repo.Exists(ctx, s.pgClient.DB, studentID, academicYearID)
 }
 
-// ---------------------------------------------------------------------
-// Status change methods (with idempotency)
-// ---------------------------------------------------------------------
-
 func (s *enrollmentService) Activate(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(
 		zap.String("method", "Activate"),
@@ -982,10 +936,12 @@ func (s *enrollmentService) Activate(ctx context.Context, enrollmentID uuid.UUID
 	}
 
 	enrollment, _ := s.internalGetByIDForUpdate(ctx, tx, enrollmentID)
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "activate", "enrollment",
 			&enrollmentID, "user", updatedBy, nil, nil, nil)
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentActivated, enrollmentID, map[string]interface{}{
 		"enrollment_id": enrollmentID,
 		"updated_by":    updatedBy,
@@ -1048,10 +1004,12 @@ func (s *enrollmentService) Complete(ctx context.Context, enrollmentID uuid.UUID
 	}
 
 	enrollment, _ := s.internalGetByIDForUpdate(ctx, tx, enrollmentID)
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "complete", "enrollment",
 			&enrollmentID, "user", updatedBy, nil, nil, nil)
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentCompleted, enrollmentID, map[string]interface{}{
 		"enrollment_id": enrollmentID,
 		"updated_by":    updatedBy,
@@ -1110,10 +1068,12 @@ func (s *enrollmentService) Withdraw(ctx context.Context, enrollmentID uuid.UUID
 	}
 
 	enrollment, _ := s.internalGetByIDForUpdate(ctx, tx, enrollmentID)
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "withdraw", "enrollment",
 			&enrollmentID, "user", updatedBy, nil, nil, nil)
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentWithdrawn, enrollmentID, map[string]interface{}{
 		"enrollment_id": enrollmentID,
 		"updated_by":    updatedBy,
@@ -1173,12 +1133,15 @@ func (s *enrollmentService) UpdateStatus(ctx context.Context, enrollmentID uuid.
 	if enrollment == nil {
 		return fmt.Errorf("%w: enrollment %s", ErrNotFound, enrollmentID)
 	}
+
 	if enrollment.Status == status {
 		return nil
 	}
+
 	if err := s.validateStatusTransition(enrollment.Status, status); err != nil {
 		return err
 	}
+
 	if err := s.repo.UpdateStatus(ctx, tx, enrollmentID, status, updatedBy); err != nil {
 		return err
 	}
@@ -1196,6 +1159,7 @@ func (s *enrollmentService) UpdateStatus(ctx context.Context, enrollmentID uuid.
 				"new_status": status,
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentUpdated, enrollmentID, map[string]interface{}{
 		"enrollment_id": enrollmentID,
 		"old_status":    enrollment.Status,
@@ -1208,12 +1172,9 @@ func (s *enrollmentService) UpdateStatus(ctx context.Context, enrollmentID uuid.
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Update operations (with idempotency)
-// ---------------------------------------------------------------------
 
 func (s *enrollmentService) Update(ctx context.Context, req UpdateEnrollmentRequest, idempotencyKey string) (*models.Enrollment, error) {
 	logger := s.logger.With(
@@ -1249,6 +1210,7 @@ func (s *enrollmentService) Update(ctx context.Context, req UpdateEnrollmentRequ
 	}
 
 	old := *enrollment
+
 	if req.SectionID != uuid.Nil && req.SectionID != enrollment.SectionID {
 		if err := s.checkCapacity(ctx, tx, req.SectionID); err != nil {
 			return nil, err
@@ -1291,6 +1253,7 @@ func (s *enrollmentService) Update(ctx context.Context, req UpdateEnrollmentRequ
 				"new_status":     enrollment.Status,
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentUpdated, enrollment.EnrollmentID, enrollment); err != nil {
 		return nil, fmt.Errorf("outbox store: %w", err)
 	}
@@ -1342,6 +1305,7 @@ func (s *enrollmentService) UpdateRollNumber(ctx context.Context, enrollmentID u
 	if enrollment == nil {
 		return fmt.Errorf("%w: enrollment %s", ErrNotFound, enrollmentID)
 	}
+
 	if err := s.repo.UpdateRollNumber(ctx, tx, enrollmentID, rollNumber, updatedBy); err != nil {
 		return err
 	}
@@ -1358,6 +1322,7 @@ func (s *enrollmentService) UpdateRollNumber(ctx context.Context, enrollmentID u
 				"new_roll_number": rollNumber,
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentUpdated, enrollmentID, map[string]interface{}{
 		"enrollment_id":   enrollmentID,
 		"new_roll_number": rollNumber,
@@ -1369,6 +1334,7 @@ func (s *enrollmentService) UpdateRollNumber(ctx context.Context, enrollmentID u
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	return nil
 }
 
@@ -1411,12 +1377,15 @@ func (s *enrollmentService) TransferSection(ctx context.Context, req TransferSec
 	if enrollment.SectionID == req.NewSectionID {
 		return enrollment, nil
 	}
+
 	if err := s.checkCapacity(ctx, tx, req.NewSectionID); err != nil {
 		return nil, err
 	}
+
 	old := *enrollment
 	enrollment.SectionID = req.NewSectionID
 	enrollment.UpdatedBy = req.UpdatedBy
+
 	if err := s.repo.Update(ctx, tx, enrollment); err != nil {
 		return nil, err
 	}
@@ -1434,6 +1403,7 @@ func (s *enrollmentService) TransferSection(ctx context.Context, req TransferSec
 				"new_section_id": enrollment.SectionID,
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentTransferred, enrollment.EnrollmentID, enrollment); err != nil {
 		return nil, fmt.Errorf("outbox store: %w", err)
 	}
@@ -1461,6 +1431,7 @@ func (s *enrollmentService) BulkTransferSection(ctx context.Context, reqs []Tran
 	if len(reqs) == 0 {
 		return nil
 	}
+
 	logger := s.logger.With(
 		zap.String("method", "BulkTransferSection"),
 		zap.Int("count", len(reqs)),
@@ -1488,6 +1459,7 @@ func (s *enrollmentService) BulkTransferSection(ctx context.Context, reqs []Tran
 		}
 		sectionCounts[req.NewSectionID]++
 	}
+
 	for sectionID, count := range sectionCounts {
 		if err := s.checkCapacity(ctx, tx, sectionID); err != nil {
 			return err
@@ -1537,6 +1509,7 @@ func (s *enrollmentService) BulkTransferSection(ctx context.Context, reqs []Tran
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentTransferred, uuid.Nil, map[string]interface{}{
 		"count":      len(reqs),
 		"updated_by": reqs[0].UpdatedBy,
@@ -1547,6 +1520,7 @@ func (s *enrollmentService) BulkTransferSection(ctx context.Context, reqs []Tran
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	logger.Info("bulk transfer completed")
 	return nil
 }
@@ -1587,6 +1561,7 @@ func (s *enrollmentService) SwapSections(ctx context.Context, enrollmentID1, enr
 	if e1 == nil {
 		return fmt.Errorf("%w: enrollment %s", ErrNotFound, enrollmentID1)
 	}
+
 	e2, err := s.internalGetByIDForUpdate(ctx, tx, enrollmentID2)
 	if err != nil {
 		return err
@@ -1594,14 +1569,18 @@ func (s *enrollmentService) SwapSections(ctx context.Context, enrollmentID1, enr
 	if e2 == nil {
 		return fmt.Errorf("%w: enrollment %s", ErrNotFound, enrollmentID2)
 	}
+
 	if e1.Status != EnrollmentStatusActive || e2.Status != EnrollmentStatusActive {
 		return ErrInactiveEnrollment
 	}
+
 	old1 := *e1
 	old2 := *e2
+
 	e1.SectionID, e2.SectionID = e2.SectionID, e1.SectionID
 	e1.UpdatedBy = updatedBy
 	e2.UpdatedBy = updatedBy
+
 	if err := s.repo.Update(ctx, tx, e1); err != nil {
 		return err
 	}
@@ -1627,6 +1606,7 @@ func (s *enrollmentService) SwapSections(ctx context.Context, enrollmentID1, enr
 				"new_section_id": e2.SectionID,
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentUpdated, uuid.Nil, map[string]interface{}{
 		"enrollment_id1": enrollmentID1,
 		"enrollment_id2": enrollmentID2,
@@ -1638,12 +1618,9 @@ func (s *enrollmentService) SwapSections(ctx context.Context, enrollmentID1, enr
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Promotion methods
-// ---------------------------------------------------------------------
 
 func (s *enrollmentService) PromoteStudent(ctx context.Context, req PromoteStudentRequest, idempotencyKey string) (*models.Enrollment, error) {
 	logger := s.logger.With(
@@ -1696,6 +1673,7 @@ func (s *enrollmentService) PromoteStudent(ctx context.Context, req PromoteStude
 	if section == nil {
 		return nil, fmt.Errorf("%w: section %s", ErrNotFound, req.NewSectionID)
 	}
+
 	term, err := s.termRepo.GetByID(ctx, tx, section.TermID)
 	if err != nil {
 		return nil, err
@@ -1703,6 +1681,7 @@ func (s *enrollmentService) PromoteStudent(ctx context.Context, req PromoteStude
 	if term == nil || term.AcademicYearID != req.NewAcademicYearID {
 		return nil, fmt.Errorf("section does not belong to the new academic year")
 	}
+
 	if err := s.checkCapacity(ctx, tx, req.NewSectionID); err != nil {
 		return nil, err
 	}
@@ -1715,6 +1694,7 @@ func (s *enrollmentService) PromoteStudent(ctx context.Context, req PromoteStude
 	if err != nil {
 		return nil, err
 	}
+
 	newEnrollment, err := s.repo.GetByIDUnsafe(ctx, tx, newEnrollmentID)
 	if err != nil {
 		return nil, err
@@ -1740,6 +1720,7 @@ func (s *enrollmentService) PromoteStudent(ctx context.Context, req PromoteStude
 				"new_academic_year": req.NewAcademicYearID,
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentPromoted, newEnrollment.EnrollmentID, map[string]interface{}{
 		"student_id":           req.StudentID,
 		"old_enrollment_id":    currentEnrollment.EnrollmentID,
@@ -1769,6 +1750,7 @@ func (s *enrollmentService) BulkPromote(ctx context.Context, reqs []PromoteStude
 	if len(reqs) == 0 {
 		return nil
 	}
+
 	logger := s.logger.With(
 		zap.String("method", "BulkPromote"),
 		zap.Int("count", len(reqs)),
@@ -1852,6 +1834,7 @@ func (s *enrollmentService) BulkPromote(ctx context.Context, reqs []PromoteStude
 		if section == nil {
 			return fmt.Errorf("%w: section %s", ErrNotFound, req.NewSectionID)
 		}
+
 		term, err := s.termRepo.GetByID(ctx, tx, section.TermID)
 		if err != nil {
 			return err
@@ -1863,9 +1846,11 @@ func (s *enrollmentService) BulkPromote(ctx context.Context, reqs []PromoteStude
 		if err := s.repo.CompleteActiveEnrollment(ctx, tx, companyID, req.StudentID, currentEnrollment.AcademicYearID, req.UpdatedBy); err != nil {
 			return err
 		}
+
 		if _, err := s.repo.CreateEnrollment(ctx, tx, companyID, req.StudentID, req.NewAcademicYearID, req.NewSectionID, req.UpdatedBy, req.UpdatedBy); err != nil {
 			return err
 		}
+
 		if student.Status != models.StudentActive {
 			if err := s.studentRepo.UpdateStatus(ctx, tx, req.StudentID, string(models.StudentActive), req.UpdatedBy); err != nil {
 				return err
@@ -1878,6 +1863,7 @@ func (s *enrollmentService) BulkPromote(ctx context.Context, reqs []PromoteStude
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentPromoted, uuid.Nil, map[string]interface{}{
 		"count":      len(reqs),
 		"updated_by": reqs[0].UpdatedBy,
@@ -1888,6 +1874,7 @@ func (s *enrollmentService) BulkPromote(ctx context.Context, reqs []PromoteStude
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	logger.Info("bulk promotions completed")
 	return nil
 }
@@ -1900,6 +1887,7 @@ func (s *enrollmentService) PromoteSection(ctx context.Context, sectionID, nextS
 	if len(enrollments) == 0 {
 		return nil
 	}
+
 	reqs := make([]PromoteStudentRequest, len(enrollments))
 	for i, e := range enrollments {
 		reqs[i] = PromoteStudentRequest{
@@ -1918,10 +1906,6 @@ func (s *enrollmentService) RollOverAcademicYear(ctx context.Context, fromYearID
 		zap.String("to_year", toYearID.String()))
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Graduation and alumni
-// ---------------------------------------------------------------------
 
 func (s *enrollmentService) GraduateStudent(ctx context.Context, enrollmentID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(
@@ -1954,9 +1938,11 @@ func (s *enrollmentService) GraduateStudent(ctx context.Context, enrollmentID uu
 	if enrollment.Status != EnrollmentStatusActive {
 		return ErrInactiveEnrollment
 	}
+
 	if err := s.repo.UpdateStatus(ctx, tx, enrollmentID, EnrollmentStatusCompleted, updatedBy); err != nil {
 		return err
 	}
+
 	if err := s.studentRepo.UpdateStatus(ctx, tx, enrollment.StudentID, string(models.StudentAlumni), updatedBy); err != nil {
 		return err
 	}
@@ -1971,6 +1957,7 @@ func (s *enrollmentService) GraduateStudent(ctx context.Context, enrollmentID uu
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "graduate", "enrollment",
 			&enrollmentID, "user", updatedBy, nil, nil, nil)
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentCompleted, enrollmentID, map[string]interface{}{
 		"enrollment_id": enrollmentID,
 		"student_id":    enrollment.StudentID,
@@ -2026,9 +2013,11 @@ func (s *enrollmentService) MarkAlumni(ctx context.Context, studentID uuid.UUID,
 	if student == nil {
 		return fmt.Errorf("%w: student %s", ErrNotFound, studentID)
 	}
+
 	if err := s.repo.CompleteAllActiveEnrollments(ctx, tx, student.CompanyID, studentID, updatedBy); err != nil {
 		return err
 	}
+
 	if err := s.studentRepo.UpdateStatus(ctx, tx, studentID, string(models.StudentAlumni), updatedBy); err != nil {
 		return err
 	}
@@ -2043,6 +2032,7 @@ func (s *enrollmentService) MarkAlumni(ctx context.Context, studentID uuid.UUID,
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "mark_alumni", "student",
 			&studentID, "user", updatedBy, nil, nil, nil)
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentCompleted, studentID, map[string]interface{}{
 		"student_id": studentID,
 		"updated_by": updatedBy,
@@ -2078,10 +2068,6 @@ func (s *enrollmentService) MarkAlumni(ctx context.Context, studentID uuid.UUID,
 	return nil
 }
 
-// ---------------------------------------------------------------------
-// Bulk operations
-// ---------------------------------------------------------------------
-
 func (s *enrollmentService) BulkUpdateStatus(ctx context.Context, req BulkEnrollmentStatusUpdateRequest, idempotencyKey string) error {
 	if len(req.EnrollmentIDs) == 0 {
 		return nil
@@ -2089,6 +2075,7 @@ func (s *enrollmentService) BulkUpdateStatus(ctx context.Context, req BulkEnroll
 	if req.Status != EnrollmentStatusActive && req.Status != EnrollmentStatusCompleted && req.Status != EnrollmentStatusWithdrawn {
 		return fmt.Errorf("%w: invalid status", ErrInvalidInput)
 	}
+
 	logger := s.logger.With(
 		zap.String("method", "BulkUpdateStatus"),
 		zap.Int("count", len(req.EnrollmentIDs)),
@@ -2122,6 +2109,7 @@ func (s *enrollmentService) BulkUpdateStatus(ctx context.Context, req BulkEnroll
 			return err
 		}
 	}
+
 	if err := s.repo.BulkUpdateStatus(ctx, tx, req.EnrollmentIDs, req.Status, req.UpdatedBy); err != nil {
 		return err
 	}
@@ -2140,6 +2128,7 @@ func (s *enrollmentService) BulkUpdateStatus(ctx context.Context, req BulkEnroll
 				"count":          len(req.EnrollmentIDs),
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentUpdated, uuid.Nil, map[string]interface{}{
 		"enrollment_ids": req.EnrollmentIDs,
 		"new_status":     req.Status,
@@ -2151,6 +2140,7 @@ func (s *enrollmentService) BulkUpdateStatus(ctx context.Context, req BulkEnroll
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	return nil
 }
 
@@ -2158,6 +2148,7 @@ func (s *enrollmentService) BulkAssignRollNumbers(ctx context.Context, req BulkR
 	if len(req.RollNumbers) == 0 {
 		return nil
 	}
+
 	logger := s.logger.With(
 		zap.String("method", "BulkAssignRollNumbers"),
 		zap.Int("count", len(req.RollNumbers)),
@@ -2187,6 +2178,7 @@ func (s *enrollmentService) BulkAssignRollNumbers(ctx context.Context, req BulkR
 			return fmt.Errorf("%w: enrollment %s", ErrNotFound, id)
 		}
 	}
+
 	if err := s.repo.BulkAssignRollNumbers(ctx, tx, req.RollNumbers, req.UpdatedBy); err != nil {
 		return err
 	}
@@ -2203,6 +2195,7 @@ func (s *enrollmentService) BulkAssignRollNumbers(ctx context.Context, req BulkR
 				"count": len(req.RollNumbers),
 			})
 	}
+
 	if err := s.storeOutboxEvent(ctx, tx, EventEnrollmentUpdated, uuid.Nil, map[string]interface{}{
 		"roll_numbers_assigned": len(req.RollNumbers),
 		"updated_by":            req.UpdatedBy,
@@ -2213,12 +2206,9 @@ func (s *enrollmentService) BulkAssignRollNumbers(ctx context.Context, req BulkR
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Search and statistics (read-only, unchanged)
-// ---------------------------------------------------------------------
 
 func (s *enrollmentService) Search(ctx context.Context, query string, companyID uuid.UUID, p repository.Pagination) ([]*models.Enrollment, error) {
 	return s.repo.Search(ctx, s.pgClient.DB, query, companyID, p)
@@ -2257,10 +2247,6 @@ func (s *enrollmentService) GetPromotionStats(ctx context.Context, academicYearI
 	return stats, nil
 }
 
-// ---------------------------------------------------------------------
-// Administrative methods (unchanged)
-// ---------------------------------------------------------------------
-
 func (s *enrollmentService) RebuildEnrollments(ctx context.Context, academicYearID uuid.UUID) error {
 	s.logger.Warn("RebuildEnrollments called but not implemented", zap.String("academic_year_id", academicYearID.String()))
 	return nil
@@ -2274,15 +2260,18 @@ func (s *enrollmentService) FixDuplicateEnrollments(ctx context.Context, academi
 	if len(duplicates) == 0 {
 		return nil
 	}
+
 	studentMap := make(map[uuid.UUID][]*models.Enrollment)
 	for _, e := range duplicates {
 		studentMap[e.StudentID] = append(studentMap[e.StudentID], e)
 	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
 	for _, enrollments := range studentMap {
 		var keep *models.Enrollment
 		for _, e := range enrollments {
@@ -2305,15 +2294,12 @@ func (s *enrollmentService) FixDuplicateEnrollments(ctx context.Context, academi
 			}
 		}
 	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	return nil
 }
-
-// ---------------------------------------------------------------------
-// Publishing methods (kept for compatibility)
-// ---------------------------------------------------------------------
 
 func (s *enrollmentService) PublishEnrollmentCreated(ctx context.Context, enrollment *models.Enrollment) error {
 	return s.eventPublisher.Publish(ctx, Event{Type: EventType(EventEnrollmentCreated), Data: enrollment})
@@ -2329,7 +2315,6 @@ func (s *enrollmentService) PublishEnrollmentDeleted(ctx context.Context, enroll
 	}})
 }
 
-// Helper
 func stringPtr(s string) *string {
 	return &s
 }

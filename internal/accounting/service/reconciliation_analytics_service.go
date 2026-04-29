@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"auth-service/internal/accounting/models/analytics"
@@ -12,9 +13,24 @@ import (
 	"go.uber.org/zap"
 )
 
+// ReconciliationAnalyticsService defines the interface for processing reconciliation events
+// (refreshing daily stats and difference trends) and for querying reconciliation analytics.
 type ReconciliationAnalyticsService interface {
+	// -----------------------------------------------------------------
+	// Event processing / refresh methods (existing)
+	// -----------------------------------------------------------------
 	RefreshDailyStats(ctx context.Context, targetDate time.Time) error
 	RefreshDifferenceTrends(ctx context.Context, companyID uuid.UUID, date time.Time) error
+
+	// -----------------------------------------------------------------
+	// Query methods (new)
+	// -----------------------------------------------------------------
+	// Daily Stats queries
+	ListReconciliationDailyStats(ctx context.Context, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDailyStats, error)
+	GetReconciliationDailyStats(ctx context.Context, companyID uuid.UUID, reconciliationType string, date time.Time) (*analytics.ReconciliationDailyStats, error)
+
+	// Difference Trends queries
+	ListReconciliationDiffTrends(ctx context.Context, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDiffTrends, error)
 }
 
 type reconciliationAnalyticsService struct {
@@ -23,6 +39,7 @@ type reconciliationAnalyticsService struct {
 	logger        *zap.Logger
 }
 
+// NewReconciliationAnalyticsService creates a new reconciliation analytics service.
 func NewReconciliationAnalyticsService(
 	analyticsRepo repository.AnalyticsRepository,
 	pgClient *client.PostgresClient,
@@ -34,6 +51,10 @@ func NewReconciliationAnalyticsService(
 		logger:        logger.Named("reconciliation_analytics"),
 	}
 }
+
+// ---------------------------------------------------------------------
+// Refresh methods (existing)
+// ---------------------------------------------------------------------
 
 // RefreshDailyStats aggregates batch metrics into daily stats.
 func (s *reconciliationAnalyticsService) RefreshDailyStats(ctx context.Context, targetDate time.Time) error {
@@ -162,12 +183,38 @@ func (s *reconciliationAnalyticsService) RefreshDifferenceTrends(ctx context.Con
 			IssueType:           issueType,
 			Date:                date,
 			Count:               count,
-			TotalExpectedAmount: totalExpected, // float64
-			TotalActualAmount:   totalActual,   // float64
+			TotalExpectedAmount: totalExpected,
+			TotalActualAmount:   totalActual,
 		}
 		if err := s.analyticsRepo.InsertReconciliationDiffTrend(ctx, s.pgClient.DB, trend); err != nil {
 			logger.Error("failed to insert difference trend", zap.Error(err))
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------
+// Query methods (new)
+// ---------------------------------------------------------------------
+
+// Daily Stats queries
+func (s *reconciliationAnalyticsService) ListReconciliationDailyStats(ctx context.Context, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDailyStats, error) {
+	return s.analyticsRepo.ListReconciliationDailyStats(ctx, s.pgClient.DB, companyID, fromDate, toDate)
+}
+
+func (s *reconciliationAnalyticsService) GetReconciliationDailyStats(ctx context.Context, companyID uuid.UUID, reconciliationType string, date time.Time) (*analytics.ReconciliationDailyStats, error) {
+	stats, err := s.analyticsRepo.GetReconciliationDailyStats(ctx, s.pgClient.DB, companyID, reconciliationType, date)
+	if err != nil {
+		return nil, err
+	}
+	// Authorisation: ensure stats belong to the company (already ensured by query, but double-check)
+	if stats.CompanyID != companyID {
+		return nil, fmt.Errorf("unauthorized: reconciliation stats do not belong to company")
+	}
+	return stats, nil
+}
+
+// Difference Trends queries
+func (s *reconciliationAnalyticsService) ListReconciliationDiffTrends(ctx context.Context, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDiffTrends, error) {
+	return s.analyticsRepo.ListReconciliationDiffTrends(ctx, s.pgClient.DB, companyID, fromDate, toDate)
 }

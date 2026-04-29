@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/accounting/models/settings"
 	"auth-service/internal/util"
 )
@@ -19,6 +21,7 @@ type AccountingSettingsRepository interface {
 	// Core singleton operations per company
 	Create(ctx context.Context, db DBTX, s *settings.AccountingSettings) error
 	Upsert(ctx context.Context, db DBTX, s *settings.AccountingSettings) error
+	UpsertForUpdate(ctx context.Context, db DBTX, s *settings.AccountingSettings) error
 	GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) (*settings.AccountingSettings, error)
 	GetByCompanyForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID) (*settings.AccountingSettings, error)
 	Update(ctx context.Context, db DBTX, s *settings.AccountingSettings) error
@@ -29,10 +32,11 @@ type AccountingSettingsRepository interface {
 	UpdateTaxScheme(ctx context.Context, db DBTX, companyID uuid.UUID, taxScheme string, updatedBy *uuid.UUID) error
 	UpdateFlags(ctx context.Context, db DBTX, companyID uuid.UUID, allowIntercompany, autoReversal bool, updatedBy *uuid.UUID) error
 
-	// Validation
+	// Validation & utility
 	Exists(ctx context.Context, db DBTX, companyID uuid.UUID) (bool, error)
+	GetFiscalStartMonth(ctx context.Context, db DBTX, companyID uuid.UUID) (int, error)
 
-	// Utility – critical for accounting periods
+	// Fiscal computation – uses DB function compute_fiscal_fields
 	GetFiscalYear(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time) (fiscalYear int, period int, err error)
 }
 
@@ -50,6 +54,9 @@ func NewAccountingSettingsRepository(logger *zap.Logger) AccountingSettingsRepos
 
 // Create inserts new accounting settings for a company.
 func (r *accountingSettingsRepository) Create(ctx context.Context, db DBTX, s *settings.AccountingSettings) error {
+	// Normalize currency code
+	s.CurrencyCode = strings.ToUpper(s.CurrencyCode)
+
 	query := `
 		INSERT INTO accounting.accounting_settings (
 			company_id, fiscal_year_start_month, currency_code, tax_scheme,
@@ -74,6 +81,9 @@ func (r *accountingSettingsRepository) Create(ctx context.Context, db DBTX, s *s
 
 // Upsert creates or replaces settings for a company (safe for onboarding).
 func (r *accountingSettingsRepository) Upsert(ctx context.Context, db DBTX, s *settings.AccountingSettings) error {
+	// Normalize currency code
+	s.CurrencyCode = strings.ToUpper(s.CurrencyCode)
+
 	query := `
 		INSERT INTO accounting.accounting_settings (
 			company_id, fiscal_year_start_month, currency_code, tax_scheme,
@@ -105,7 +115,21 @@ func (r *accountingSettingsRepository) Upsert(ctx context.Context, db DBTX, s *s
 	return nil
 }
 
-// GetByCompany retrieves settings for a company. Returns nil if not found.
+// UpsertForUpdate locks the row (if exists) before upserting to avoid concurrency issues during onboarding.
+func (r *accountingSettingsRepository) UpsertForUpdate(ctx context.Context, db DBTX, s *settings.AccountingSettings) error {
+	// Lock existing row if any
+	_, err := db.ExecContext(ctx, `
+		SELECT 1 FROM accounting.accounting_settings
+		WHERE company_id = $1
+		FOR UPDATE
+	`, s.CompanyID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("acquire lock for upsert: %w", err)
+	}
+	return r.Upsert(ctx, db, s)
+}
+
+// GetByCompany retrieves settings for a company. Returns ErrNotFound if not found.
 func (r *accountingSettingsRepository) GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) (*settings.AccountingSettings, error) {
 	query := `
 		SELECT company_id, fiscal_year_start_month, currency_code, tax_scheme,
@@ -124,7 +148,7 @@ func (r *accountingSettingsRepository) GetByCompany(ctx context.Context, db DBTX
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get accounting settings",
 			util.String("company_id", companyID.String()),
@@ -140,7 +164,7 @@ func (r *accountingSettingsRepository) GetByCompany(ctx context.Context, db DBTX
 	return &s, nil
 }
 
-// GetByCompanyForUpdate retrieves settings with row-level lock for update.
+// GetByCompanyForUpdate retrieves settings with row-level lock for update. Returns ErrNotFound if not found.
 func (r *accountingSettingsRepository) GetByCompanyForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID) (*settings.AccountingSettings, error) {
 	query := `
 		SELECT company_id, fiscal_year_start_month, currency_code, tax_scheme,
@@ -160,7 +184,7 @@ func (r *accountingSettingsRepository) GetByCompanyForUpdate(ctx context.Context
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get accounting settings for update",
 			util.String("company_id", companyID.String()),
@@ -178,6 +202,9 @@ func (r *accountingSettingsRepository) GetByCompanyForUpdate(ctx context.Context
 
 // Update performs a full update of settings (use partial updates when possible).
 func (r *accountingSettingsRepository) Update(ctx context.Context, db DBTX, s *settings.AccountingSettings) error {
+	// Normalize currency code
+	s.CurrencyCode = strings.ToUpper(s.CurrencyCode)
+
 	query := `
 		UPDATE accounting.accounting_settings
 		SET fiscal_year_start_month = $2,
@@ -197,7 +224,7 @@ func (r *accountingSettingsRepository) Update(ctx context.Context, db DBTX, s *s
 	).Scan(&s.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("accounting settings for company %s not found", s.CompanyID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to update accounting settings",
 			util.String("company_id", s.CompanyID.String()),
@@ -226,13 +253,14 @@ func (r *accountingSettingsRepository) UpdateFiscalYear(ctx context.Context, db 
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("accounting settings for company %s not found", companyID)
+		return ErrNotFound
 	}
 	return nil
 }
 
 // UpdateCurrency changes the functional currency (ISO code).
 func (r *accountingSettingsRepository) UpdateCurrency(ctx context.Context, db DBTX, companyID uuid.UUID, currencyCode string, updatedBy *uuid.UUID) error {
+	currencyCode = strings.ToUpper(currencyCode)
 	if len(currencyCode) != 3 {
 		return fmt.Errorf("currency code must be ISO 4217 (3 letters), got %s", currencyCode)
 	}
@@ -250,15 +278,15 @@ func (r *accountingSettingsRepository) UpdateCurrency(ctx context.Context, db DB
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("accounting settings for company %s not found", companyID)
+		return ErrNotFound
 	}
 	return nil
 }
 
-// UpdateTaxScheme changes the tax scheme (accrual or cash).
+// UpdateTaxScheme changes the tax scheme (accrual or cash). Uses enums.
 func (r *accountingSettingsRepository) UpdateTaxScheme(ctx context.Context, db DBTX, companyID uuid.UUID, taxScheme string, updatedBy *uuid.UUID) error {
-	if taxScheme != "accrual" && taxScheme != "cash" {
-		return fmt.Errorf("tax scheme must be 'accrual' or 'cash', got %s", taxScheme)
+	if taxScheme != enums.TaxSchemeAccrual && taxScheme != enums.TaxSchemeCash {
+		return fmt.Errorf("tax scheme must be '%s' or '%s', got %s", enums.TaxSchemeAccrual, enums.TaxSchemeCash, taxScheme)
 	}
 	query := `
 		UPDATE accounting.accounting_settings
@@ -274,7 +302,7 @@ func (r *accountingSettingsRepository) UpdateTaxScheme(ctx context.Context, db D
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("accounting settings for company %s not found", companyID)
+		return ErrNotFound
 	}
 	return nil
 }
@@ -298,7 +326,7 @@ func (r *accountingSettingsRepository) UpdateFlags(ctx context.Context, db DBTX,
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("accounting settings for company %s not found", companyID)
+		return ErrNotFound
 	}
 	return nil
 }
@@ -317,33 +345,42 @@ func (r *accountingSettingsRepository) Exists(ctx context.Context, db DBTX, comp
 	return exists, nil
 }
 
-// GetFiscalYear returns the fiscal year and period for a given date based on company settings.
-// It fetches the settings (or uses a cached version) and applies the fiscal calendar logic.
-func (r *accountingSettingsRepository) GetFiscalYear(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time) (fiscalYear int, period int, err error) {
-	settings, err := r.GetByCompany(ctx, db, companyID)
+// GetFiscalStartMonth returns only the fiscal_year_start_month for a company.
+func (r *accountingSettingsRepository) GetFiscalStartMonth(ctx context.Context, db DBTX, companyID uuid.UUID) (int, error) {
+	query := `SELECT fiscal_year_start_month FROM accounting.accounting_settings WHERE company_id = $1`
+	var startMonth int
+	err := db.QueryRowContext(ctx, query, companyID).Scan(&startMonth)
 	if err != nil {
-		return 0, 0, fmt.Errorf("get settings for fiscal year: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		r.logger.Error("failed to get fiscal start month",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("get fiscal start month: %w", err)
 	}
-	if settings == nil {
-		// No settings defined – you may return default or error.
-		// Here we return an explicit error because accounting cannot proceed without settings.
-		return 0, 0, fmt.Errorf("accounting settings not found for company %s", companyID)
-	}
-	startMonth := settings.FiscalYearStartMonth
-	year, period := calculateFiscalYear(startMonth, date)
-	return year, period, nil
+	return startMonth, nil
 }
 
-// calculateFiscalYear computes fiscal year and period number (1‑based) given start month.
-// Example: startMonth=4 (April), date=2026-03-15 → year=2025, period=12.
-func calculateFiscalYear(startMonth int, date time.Time) (year int, period int) {
-	month := int(date.Month())
-	year = date.Year()
-
-	if month < startMonth {
-		year--
+// GetFiscalYear computes fiscal year and period using the database function accounting.compute_fiscal_fields.
+// This ensures consistency with ledger entry triggers.
+func (r *accountingSettingsRepository) GetFiscalYear(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time) (fiscalYear int, period int, err error) {
+	query := `
+		SELECT fy.fiscal_year, fy.period
+		FROM accounting.accounting_settings s,
+		     LATERAL accounting.compute_fiscal_fields($2::date, s.fiscal_year_start_month) fy
+		WHERE s.company_id = $1
+	`
+	err = db.QueryRowContext(ctx, query, companyID, date).Scan(&fiscalYear, &period)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, ErrNotFound
+		}
+		r.logger.Error("failed to compute fiscal year via DB function",
+			util.String("company_id", companyID.String()),
+			util.Time("date", date),
+			util.ErrorField(err))
+		return 0, 0, fmt.Errorf("compute fiscal year: %w", err)
 	}
-	// period = 1 for startMonth, then increments.
-	period = ((month - startMonth + 12) % 12) + 1
-	return
+	return fiscalYear, period, nil
 }

@@ -3,24 +3,25 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/accounting/repository"
 	"auth-service/internal/accounting/service"
 )
 
-// LedgerHandler handles HTTP requests for ledger operations.
 type LedgerHandler struct {
 	ledgerService service.LedgerService
 	logger        *zap.Logger
 }
 
-// NewLedgerHandler creates a new LedgerHandler.
 func NewLedgerHandler(ledgerService service.LedgerService, logger *zap.Logger) *LedgerHandler {
 	return &LedgerHandler{
 		ledgerService: ledgerService,
@@ -28,14 +29,7 @@ func NewLedgerHandler(ledgerService service.LedgerService, logger *zap.Logger) *
 	}
 }
 
-// ----------------------------
-// Request / Response structs
-// ----------------------------
-
-type getAccountBalanceRequest struct {
-	FiscalYear int `json:"fiscal_year"`
-	Period     int `json:"period"`
-}
+// ========== REQUEST/RESPONSE TYPES ==========
 
 type getAccountBalanceResponse struct {
 	AccountID      string `json:"account_id"`
@@ -51,15 +45,30 @@ type recomputeBalancesResponse struct {
 	Message string `json:"message"`
 }
 
-// ----------------------------
-// Handlers
-// ----------------------------
+// ========== HELPERS ==========
 
-// GetAccountBalance handles GET /companies/{companyID}/ledger/balance?account_id=...&fiscal_year=...&period=...
+func (h *LedgerHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
+	// TODO: implement actual permission check
+	return true
+}
+
+func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
+	userIDStr, ok := ctx.Value("user_id").(string)
+	if !ok {
+		return uuid.Nil, fmt.Errorf("user ID not found in context")
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid user ID in context: %v", err)
+	}
+	return userID, nil
+}
+
+// ========== EXISTING ENDPOINTS (kept as-is but improved error handling) ==========
+
 func (h *LedgerHandler) GetAccountBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -67,7 +76,6 @@ func (h *LedgerHandler) GetAccountBalance(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Parse account ID from query parameter
 	accountIDStr := r.URL.Query().Get("account_id")
 	if accountIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "account_id query parameter is required")
@@ -79,7 +87,6 @@ func (h *LedgerHandler) GetAccountBalance(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Parse fiscal year and period
 	fiscalYearStr := r.URL.Query().Get("fiscal_year")
 	if fiscalYearStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "fiscal_year query parameter is required")
@@ -102,45 +109,41 @@ func (h *LedgerHandler) GetAccountBalance(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Authenticate user
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
-	// Permission check
 	if !h.hasPermission(ctx, companyID, userID, "ledger:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Call service
 	balance, err := h.ledgerService.GetAccountBalance(ctx, companyID, accountID, fiscalYear, period)
 	if err != nil {
 		h.logger.Error("failed to get account balance", zap.Error(err))
+		if errors.Is(err, repository.ErrNotFound) {
+			h.respondWithError(w, http.StatusNotFound, "account balance not found")
+			return
+		}
 		h.respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Build response
 	resp := getAccountBalanceResponse{
 		AccountID:      balance.AccountID.String(),
 		OpeningBalance: balance.OpeningBalance.String(),
 		ClosingBalance: balance.ClosingBalance.String(),
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
 	})
 }
 
-// RecomputeBalances handles POST /companies/{companyID}/ledger/recompute
 func (h *LedgerHandler) RecomputeBalances(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse company ID from URL
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -148,32 +151,26 @@ func (h *LedgerHandler) RecomputeBalances(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Parse request body
 	var req recomputeBalancesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.FiscalYear <= 0 {
 		h.respondWithError(w, http.StatusBadRequest, "fiscal_year must be a positive integer")
 		return
 	}
 
-	// Authenticate user
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
-	// Permission check
 	if !h.hasPermission(ctx, companyID, userID, "ledger:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Call service
 	err = h.ledgerService.RecomputeBalances(ctx, companyID, req.FiscalYear)
 	if err != nil {
 		h.logger.Error("failed to recompute balances", zap.Error(err))
@@ -189,19 +186,160 @@ func (h *LedgerHandler) RecomputeBalances(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// ----------------------------
-// Helper functions (same pattern as AcademicYearHandler)
-// ----------------------------
+// ========== NEW REPORT ENDPOINTS ==========
 
-// hasPermission is a placeholder for real RBAC logic.
-// In production, implement actual permission checks using your RBAC service.
-func (h *LedgerHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Integrate with actual permission service
-	// For now, allow all requests (as in the academic example)
-	return true
+// TrialBalance returns the trial balance for a date range.
+// GET /api/v1/companies/{companyID}/ledger/trial-balance?from=...&to=...
+func (h *LedgerHandler) TrialBalance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "ledger:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+	if fromStr == "" || toStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "both from and to query parameters are required (RFC3339 format)")
+		return
+	}
+	from, err := time.Parse(time.RFC3339, fromStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid from date format, use RFC3339")
+		return
+	}
+	to, err := time.Parse(time.RFC3339, toStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid to date format, use RFC3339")
+		return
+	}
+
+	data, err := h.ledgerService.ComputeTrialBalance(ctx, companyID, from, to)
+	if err != nil {
+		h.logger.Error("failed to compute trial balance", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    data,
+	})
 }
 
-// respondWithJSON sends a JSON response with the given status code and data.
+// ProfitAndLoss returns the P&L statement for a date range.
+// GET /api/v1/companies/{companyID}/ledger/profit-and-loss?from=...&to=...
+func (h *LedgerHandler) ProfitAndLoss(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "ledger:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+	if fromStr == "" || toStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "both from and to query parameters are required (RFC3339 format)")
+		return
+	}
+	from, err := time.Parse(time.RFC3339, fromStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid from date format, use RFC3339")
+		return
+	}
+	to, err := time.Parse(time.RFC3339, toStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid to date format, use RFC3339")
+		return
+	}
+
+	data, err := h.ledgerService.ComputePAndL(ctx, companyID, from, to)
+	if err != nil {
+		h.logger.Error("failed to compute profit and loss", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    data,
+	})
+}
+
+// BalanceSheet returns the balance sheet as of a specific date.
+// GET /api/v1/companies/{companyID}/ledger/balance-sheet?as_of=...
+func (h *LedgerHandler) BalanceSheet(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyIDStr := chi.URLParam(r, "companyID")
+	companyID, err := uuid.Parse(companyIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid company ID")
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "ledger:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	asOfStr := r.URL.Query().Get("as_of")
+	if asOfStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "as_of query parameter is required (RFC3339 format)")
+		return
+	}
+	asOf, err := time.Parse(time.RFC3339, asOfStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid as_of date format, use RFC3339")
+		return
+	}
+
+	data, err := h.ledgerService.ComputeBalanceSheet(ctx, companyID, asOf)
+	if err != nil {
+		h.logger.Error("failed to compute balance sheet", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    data,
+	})
+}
+
+// ========== RESPONSE HELPERS ==========
+
 func (h *LedgerHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -210,24 +348,9 @@ func (h *LedgerHandler) respondWithJSON(w http.ResponseWriter, status int, data 
 	}
 }
 
-// respondWithError sends an error response in the standard format.
 func (h *LedgerHandler) respondWithError(w http.ResponseWriter, status int, message string) {
 	h.respondWithJSON(w, status, map[string]interface{}{
 		"success": false,
 		"error":   message,
 	})
-}
-
-// getUserIDFromContext extracts the user ID from the request context.
-// Assumes the context has been populated by authentication middleware.
-func getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	userID, err := uuid.Parse(userIDStr)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid user ID in context: %v", err)
-	}
-	return userID, nil
 }

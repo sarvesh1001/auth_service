@@ -29,9 +29,9 @@ func NewTaxHandler(taxSvc service.TaxEngineService, logger *zap.Logger) *TaxHand
 	}
 }
 
-// ---------------------------------------------------------------------
-// Tax Rates
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Tax Rate handlers
+// ----------------------------------------------------------------------------
 
 type createTaxRateRequest struct {
 	TaxName        string          `json:"tax_name"`
@@ -48,11 +48,13 @@ func (h *TaxHandler) CreateTaxRate(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rate:create") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -61,6 +63,16 @@ func (h *TaxHandler) CreateTaxRate(w http.ResponseWriter, r *http.Request) {
 	var req createTaxRateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validation
+	if req.RatePercentage.LessThanOrEqual(decimal.Zero) {
+		h.respondWithError(w, http.StatusBadRequest, "rate percentage must be greater than 0")
+		return
+	}
+	if req.TaxName == "" {
+		h.respondWithError(w, http.StatusBadRequest, "tax name is required")
 		return
 	}
 
@@ -75,6 +87,9 @@ func (h *TaxHandler) CreateTaxRate(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:      &userID,
 		UpdatedBy:      &userID,
 	}
+
+	// Idempotency
+	ctx = withIdempotencyKey(ctx, r)
 
 	if err := h.taxSvc.CreateTaxRate(ctx, rate); err != nil {
 		h.logger.Error("failed to create tax rate", zap.Error(err))
@@ -104,28 +119,33 @@ func (h *TaxHandler) UpdateTaxRate(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	rateID, err := uuid.Parse(chi.URLParam(r, "rateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax rate ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rate:update") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Fetch existing rate
+	// Fetch directly – service should provide GetByID; fallback to list+scan (inefficient but safe)
+	// For production, implement GetTaxRateByID in service.
 	filter := repository.TaxRateFilter{CompanyID: companyID}
-	rates, _, err := h.taxSvc.ListTaxRates(ctx, filter, repository.Pagination{Limit: 100}, repository.Sort{})
+	rates, _, err := h.taxSvc.ListTaxRates(ctx, filter, repository.Pagination{Limit: 1000}, repository.Sort{})
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, "failed to fetch tax rate")
 		return
 	}
+
 	var existing *tax.TaxRate
 	for _, r := range rates {
 		if r.TaxRateID == rateID {
@@ -148,6 +168,10 @@ func (h *TaxHandler) UpdateTaxRate(w http.ResponseWriter, r *http.Request) {
 		existing.TaxName = *req.TaxName
 	}
 	if req.RatePercentage != nil {
+		if req.RatePercentage.LessThanOrEqual(decimal.Zero) {
+			h.respondWithError(w, http.StatusBadRequest, "rate percentage must be > 0")
+			return
+		}
 		existing.RatePercentage = *req.RatePercentage
 	}
 	if req.EffectiveFrom != nil {
@@ -160,6 +184,8 @@ func (h *TaxHandler) UpdateTaxRate(w http.ResponseWriter, r *http.Request) {
 		existing.IsActive = *req.IsActive
 	}
 	existing.UpdatedBy = &userID
+
+	ctx = withIdempotencyKey(ctx, r)
 
 	if err := h.taxSvc.UpdateTaxRate(ctx, existing); err != nil {
 		h.logger.Error("failed to update tax rate", zap.Error(err))
@@ -181,11 +207,13 @@ func (h *TaxHandler) ListTaxRates(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rate:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -194,14 +222,12 @@ func (h *TaxHandler) ListTaxRates(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	filter := repository.TaxRateFilter{CompanyID: companyID}
 	if taxName := query.Get("tax_name"); taxName != "" {
-		filter.TaxName = taxName // string, not pointer
+		filter.TaxName = taxName
 	}
 	if activeStr := query.Get("is_active"); activeStr != "" {
 		active, _ := strconv.ParseBool(activeStr)
 		filter.IsActive = &active
 	}
-	// Note: EffectiveDate filter not directly supported; you can extend repository or filter in memory
-	// For now, we ignore date filtering.
 
 	pagination := parsePagination(query)
 	sort := parseSort(query)
@@ -231,22 +257,28 @@ func (h *TaxHandler) DeleteTaxRate(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	rateID, err := uuid.Parse(chi.URLParam(r, "rateID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax rate ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rate:delete") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	if err := h.taxSvc.DeleteTaxRate(ctx, rateID, &userID); err != nil {
+	ctx = withIdempotencyKey(ctx, r)
+
+	// ✅ FIXED: added companyID parameter
+	if err := h.taxSvc.DeleteTaxRate(ctx, companyID, rateID, &userID); err != nil {
 		h.logger.Error("failed to delete tax rate", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -265,11 +297,13 @@ func (h *TaxHandler) CloseOpenRates(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rate:close") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -284,7 +318,10 @@ func (h *TaxHandler) CloseOpenRates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.taxSvc.CloseOpenRates(ctx, companyID, req.TaxName, req.BeforeDate); err != nil {
+	ctx = withIdempotencyKey(ctx, r)
+
+	// ✅ FIXED: added updatedBy parameter
+	if err := h.taxSvc.CloseOpenRates(ctx, companyID, req.TaxName, req.BeforeDate, &userID); err != nil {
 		h.logger.Error("failed to close open rates", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -296,9 +333,9 @@ func (h *TaxHandler) CloseOpenRates(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------------------------------------------------------
-// Tax Rules
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Tax Rule handlers
+// ----------------------------------------------------------------------------
 
 type createTaxRuleRequest struct {
 	RuleName   string             `json:"rule_name"`
@@ -316,11 +353,13 @@ func (h *TaxHandler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rule:create") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -343,19 +382,21 @@ func (h *TaxHandler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		UpdatedBy: &userID,
 	}
 
-	// Convert to pointer slices
 	conditions := make([]*tax.TaxCondition, len(req.Conditions))
 	for i := range req.Conditions {
 		req.Conditions[i].ConditionID = uuid.New()
 		req.Conditions[i].TaxRuleID = rule.TaxRuleID
 		conditions[i] = &req.Conditions[i]
 	}
+
 	actions := make([]*tax.TaxAction, len(req.Actions))
 	for i := range req.Actions {
 		req.Actions[i].ActionID = uuid.New()
 		req.Actions[i].TaxRuleID = rule.TaxRuleID
 		actions[i] = &req.Actions[i]
 	}
+
+	ctx = withIdempotencyKey(ctx, r)
 
 	if err := h.taxSvc.CreateTaxRule(ctx, rule, conditions, actions); err != nil {
 		h.logger.Error("failed to create tax rule", zap.Error(err))
@@ -386,24 +427,27 @@ func (h *TaxHandler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax rule ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rule:update") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Fetch existing rule bundle
-	bundle, err := h.taxSvc.GetRuleBundle(ctx, ruleID)
-	if err != nil || bundle == nil || bundle.Rule.CompanyID != companyID {
+	// ✅ FIXED: added companyID parameter
+	bundle, err := h.taxSvc.GetRuleBundle(ctx, companyID, ruleID)
+	if err != nil || bundle == nil {
 		h.respondWithError(w, http.StatusNotFound, "tax rule not found")
 		return
 	}
@@ -429,19 +473,21 @@ func (h *TaxHandler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 	}
 	rule.UpdatedBy = &userID
 
-	// Convert to pointer slices
 	conditions := make([]*tax.TaxCondition, len(req.Conditions))
 	for i := range req.Conditions {
 		req.Conditions[i].ConditionID = uuid.New()
 		req.Conditions[i].TaxRuleID = rule.TaxRuleID
 		conditions[i] = &req.Conditions[i]
 	}
+
 	actions := make([]*tax.TaxAction, len(req.Actions))
 	for i := range req.Actions {
 		req.Actions[i].ActionID = uuid.New()
 		req.Actions[i].TaxRuleID = rule.TaxRuleID
 		actions[i] = &req.Actions[i]
 	}
+
+	ctx = withIdempotencyKey(ctx, r)
 
 	if err := h.taxSvc.UpdateTaxRule(ctx, rule, conditions, actions); err != nil {
 		h.logger.Error("failed to update tax rule", zap.Error(err))
@@ -463,22 +509,28 @@ func (h *TaxHandler) DeleteTaxRule(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax rule ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rule:delete") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	if err := h.taxSvc.DeleteTaxRule(ctx, ruleID, &userID); err != nil {
+	ctx = withIdempotencyKey(ctx, r)
+
+	// ✅ FIXED: added companyID parameter
+	if err := h.taxSvc.DeleteTaxRule(ctx, companyID, ruleID, &userID); err != nil {
 		h.logger.Error("failed to delete tax rule", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -497,23 +549,27 @@ func (h *TaxHandler) GetRuleBundle(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	ruleID, err := uuid.Parse(chi.URLParam(r, "ruleID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax rule ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:rule:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	bundle, err := h.taxSvc.GetRuleBundle(ctx, ruleID)
-	if err != nil || bundle == nil || bundle.Rule.CompanyID != companyID {
+	// ✅ FIXED: added companyID parameter
+	bundle, err := h.taxSvc.GetRuleBundle(ctx, companyID, ruleID)
+	if err != nil || bundle == nil {
 		h.respondWithError(w, http.StatusNotFound, "tax rule not found")
 		return
 	}
@@ -524,9 +580,9 @@ func (h *TaxHandler) GetRuleBundle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------------------------------------------------------
-// Tax Profiles
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Tax Profile handlers
+// ----------------------------------------------------------------------------
 
 type createTaxProfileRequest struct {
 	TaxRegime          string     `json:"tax_regime"`
@@ -544,11 +600,13 @@ func (h *TaxHandler) CreateTaxProfile(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:profile:create") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -572,6 +630,8 @@ func (h *TaxHandler) CreateTaxProfile(w http.ResponseWriter, r *http.Request) {
 		CreatedBy:          &userID,
 		UpdatedBy:          &userID,
 	}
+
+	ctx = withIdempotencyKey(ctx, r)
 
 	if err := h.taxSvc.CreateTaxProfile(ctx, profile); err != nil {
 		h.logger.Error("failed to create tax profile", zap.Error(err))
@@ -602,21 +662,25 @@ func (h *TaxHandler) UpdateTaxProfile(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax profile ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:profile:update") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
+	// Fetch existing profile
 	profiles, err := h.taxSvc.ListTaxProfiles(ctx, companyID)
 	if err != nil {
 		h.respondWithError(w, http.StatusInternalServerError, "failed to fetch profile")
@@ -660,6 +724,8 @@ func (h *TaxHandler) UpdateTaxProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	profile.UpdatedBy = &userID
 
+	ctx = withIdempotencyKey(ctx, r)
+
 	if err := h.taxSvc.UpdateTaxProfile(ctx, profile); err != nil {
 		h.logger.Error("failed to update tax profile", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -680,11 +746,13 @@ func (h *TaxHandler) ListTaxProfiles(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:profile:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -710,20 +778,25 @@ func (h *TaxHandler) SetDefaultTaxProfile(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax profile ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:profile:set_default") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
+
+	ctx = withIdempotencyKey(ctx, r)
 
 	if err := h.taxSvc.SetDefaultTaxProfile(ctx, companyID, profileID); err != nil {
 		h.logger.Error("failed to set default tax profile", zap.Error(err))
@@ -744,22 +817,28 @@ func (h *TaxHandler) DeleteTaxProfile(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	profileID, err := uuid.Parse(chi.URLParam(r, "profileID"))
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax profile ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:profile:delete") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	if err := h.taxSvc.DeleteTaxProfile(ctx, profileID, &userID); err != nil {
+	ctx = withIdempotencyKey(ctx, r)
+
+	// ✅ FIXED: added companyID parameter
+	if err := h.taxSvc.DeleteTaxProfile(ctx, companyID, profileID, &userID); err != nil {
 		h.logger.Error("failed to delete tax profile", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -771,9 +850,9 @@ func (h *TaxHandler) DeleteTaxProfile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------------------------------------------------------
-// Tax Transactions
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Tax Transaction handlers
+// ----------------------------------------------------------------------------
 
 type createTaxTransactionRequest struct {
 	TransactionType    string          `json:"transaction_type"`
@@ -795,11 +874,13 @@ func (h *TaxHandler) CreateTaxTransaction(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:transaction:create") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -825,6 +906,8 @@ func (h *TaxHandler) CreateTaxTransaction(w http.ResponseWriter, r *http.Request
 		TransactionDate:    req.TransactionDate,
 	}
 
+	ctx = withIdempotencyKey(ctx, r)
+
 	tx, err := h.taxSvc.CreateTaxTransaction(ctx, svcReq)
 	if err != nil {
 		h.logger.Error("failed to create tax transaction", zap.Error(err))
@@ -846,6 +929,7 @@ func (h *TaxHandler) GetTransactionTaxBreakdown(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	transactionType := chi.URLParam(r, "transactionType")
 	transactionIDStr := chi.URLParam(r, "transactionID")
 	transactionID, err := uuid.Parse(transactionIDStr)
@@ -853,11 +937,13 @@ func (h *TaxHandler) GetTransactionTaxBreakdown(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, "invalid transaction ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:transaction:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -868,6 +954,14 @@ func (h *TaxHandler) GetTransactionTaxBreakdown(w http.ResponseWriter, r *http.R
 		h.logger.Error("failed to get tax breakdown", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve tax breakdown")
 		return
+	}
+
+	// Security: verify all returned transactions belong to the company
+	for _, tx := range transactions {
+		if tx.CompanyID != companyID {
+			h.respondWithError(w, http.StatusForbidden, "cross-company data access denied")
+			return
+		}
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -883,6 +977,7 @@ func (h *TaxHandler) VoidTaxTransaction(w http.ResponseWriter, r *http.Request) 
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	transactionType := chi.URLParam(r, "transactionType")
 	transactionIDStr := chi.URLParam(r, "transactionID")
 	transactionID, err := uuid.Parse(transactionIDStr)
@@ -890,11 +985,13 @@ func (h *TaxHandler) VoidTaxTransaction(w http.ResponseWriter, r *http.Request) 
 		h.respondWithError(w, http.StatusBadRequest, "invalid transaction ID")
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:transaction:void") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -908,6 +1005,8 @@ func (h *TaxHandler) VoidTaxTransaction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	ctx = withIdempotencyKey(ctx, r)
+
 	if err := h.taxSvc.VoidTaxTransaction(ctx, transactionType, transactionID, req.Reason); err != nil {
 		h.logger.Error("failed to void tax transaction", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -920,9 +1019,9 @@ func (h *TaxHandler) VoidTaxTransaction(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// ---------------------------------------------------------------------
-// Tax Computation
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Computation & evaluation handlers
+// ----------------------------------------------------------------------------
 
 type computeTaxRequest struct {
 	Amount          decimal.Decimal        `json:"amount"`
@@ -942,11 +1041,13 @@ func (h *TaxHandler) ComputeTax(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:compute") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -994,11 +1095,13 @@ func (h *TaxHandler) EvaluateRules(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:evaluate") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1023,9 +1126,9 @@ func (h *TaxHandler) EvaluateRules(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------------------------------------------------------
-// Tax Return / Summary
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Reporting handlers
+// ----------------------------------------------------------------------------
 
 func (h *TaxHandler) GenerateTaxReturn(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -1034,11 +1137,13 @@ func (h *TaxHandler) GenerateTaxReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:return:generate") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1050,6 +1155,7 @@ func (h *TaxHandler) GenerateTaxReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "from and to query parameters are required")
 		return
 	}
+
 	from, err := time.Parse("2006-01-02", fromStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid from date format (use YYYY-MM-DD)")
@@ -1081,11 +1187,13 @@ func (h *TaxHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:summary:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1097,6 +1205,7 @@ func (h *TaxHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "from and to query parameters are required")
 		return
 	}
+
 	from, err := time.Parse("2006-01-02", fromStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid from date format (use YYYY-MM-DD)")
@@ -1121,9 +1230,9 @@ func (h *TaxHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Helper functions
-// ---------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 func parseCompanyID(r *http.Request) (uuid.UUID, error) {
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -1161,10 +1270,20 @@ func getQueryParam(query map[string][]string, key string) string {
 	return ""
 }
 
+// Placeholder – replace with actual auth/permission logic
 func (h *TaxHandler) hasPermission(ctx context.Context, companyID, userID uuid.UUID, permission string) bool {
-	// TODO: integrate real RBAC
 	return true
 }
+
+// Helper to inject idempotency key into context
+func withIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
+
+// Placeholder – replace with actual user extraction from JWT, etc.
 
 func (h *TaxHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"auth-service/internal/accounting"
 	"auth-service/internal/bucketing"
 	"auth-service/internal/client"
 	"auth-service/internal/config"
@@ -230,11 +231,14 @@ type Factory struct {
 	payslipHandler                    *payrollhandler.PayslipHandler
 	reportingHandler                  *payrollhandler.ReportingHandler
 	taxDeclarationHandler             *payrollhandler.TaxDeclarationHandler
-	academicsInfra                    *AcademicsInfraFactory // <-- new
+	academicsInfra                    *AcademicsInfraFactory  // <-- new
+	accountingInfra                   *AccountingInfraFactory // <-- ADD THIS
 	analyticsConsumer                 *consumer.AnalyticsConsumer
 	analyticsConsumerCancel           context.CancelFunc
 	studentConsumer                   *consumer.StudentConsumer
 	studentConsumerCancel             context.CancelFunc
+	accountingConsumer                *consumer.AccountingConsumer
+	accountingConsumerCancel          context.CancelFunc
 
 	// Email sender for notifications
 	emailSender email.Sender
@@ -349,6 +353,23 @@ func NewFactory() (*Factory, error) {
 		logger.Warn("Email sender not configured, emails will not be sent")
 	}
 
+	// ============================================================
+	// Initialize Accounting Infrastructure Factory
+	// ============================================================
+	accountingInfra, err := NewAccountingInfraFactory(
+		f.PostgresClient(),
+		f.RedisClient(),
+		f.KafkaProducer(),
+		&kafkaEventPublisher{producer: f.KafkaProducer()},
+		f.GetAuditService(),
+		f.GetSessionService(),
+		f.logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize accounting infra factory: %w", err)
+	}
+	f.accountingInfra = accountingInfra
+
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
@@ -393,11 +414,11 @@ func NewFactory() (*Factory, error) {
 	f.initializePayrollWorker()
 
 	// ============================================================
-	// Initialize analytics and student consumers
+	// Initialize analytics, student, and accounting consumers
 	// ============================================================
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
 		// Analytics consumer – listens to academics-events topic
-		analyticsTopic := "academics-events" // or make configurable
+		analyticsTopic := "academics-events"
 		analyticsKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
 			analyticsTopic,
@@ -427,8 +448,8 @@ func NewFactory() (*Factory, error) {
 			f.logger.Info("Analytics consumer started", zap.String("topic", analyticsTopic))
 		}
 
-		// Student consumer – listens to the same topic (can be extended)
-		studentTopics := []string{"academics-events"} // can add more if needed
+		// Student consumer – listens to academics-events topic
+		studentTopics := []string{"academics-events"}
 		studentConsumers := make(map[string]*client.KafkaConsumer)
 		for _, topic := range studentTopics {
 			kc, err := client.NewKafkaConsumer(
@@ -456,13 +477,45 @@ func NewFactory() (*Factory, error) {
 		} else {
 			f.logger.Warn("No Kafka consumers created for student consumer – disabled")
 		}
+
+		// ============================================================
+		// NEW: Accounting consumer – listens to accounting-events topic
+		// ============================================================
+		accountingTopic := "accounting-events"
+		accountingKafkaConsumer, err := client.NewKafkaConsumer(
+			f.config,
+			accountingTopic,
+			"accounting-consumer-group",
+			f.logger,
+		)
+		if err != nil {
+			f.logger.Error("Failed to create accounting Kafka consumer", zap.Error(err))
+		} else {
+			f.accountingConsumer = consumer.NewAccountingConsumer(
+				f.accountingInfra.AccountingAnalyticsService(),
+				f.accountingInfra.ComplianceAnalyticsService(),
+				f.accountingInfra.TaxAnalyticsService(),
+				f.accountingInfra.AnalyticsRepo(), // ✅ repository for idempotency
+				f.postgresClient.DB,               // ✅ *sql.DB for transactions
+				f.logger,
+				accountingKafkaConsumer,
+				accountingTopic,
+				f.config.Kafka.Brokers,
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			f.accountingConsumerCancel = cancel
+			go func() {
+				f.accountingConsumer.Start(ctx)
+				f.logger.Info("Accounting consumer stopped")
+			}()
+			f.logger.Info("Accounting consumer started", zap.String("topic", accountingTopic))
+		}
 	} else {
-		f.logger.Warn("Kafka not available – analytics and student consumers disabled")
+		f.logger.Warn("Kafka not available – analytics, student, and accounting consumers disabled")
 	}
 
 	return f, nil
 }
-
 func (f *Factory) PayrollJobRepository() payrollrepo.PayrollJobRepository {
 	if f.payrollJobRepo == nil {
 		f.payrollJobRepo = payrollrepo.NewPayrollJobRepository(
@@ -2757,34 +2810,48 @@ func (f *Factory) InitializeHandlers() error {
 	payslipHandler := f.GetPayslipHandler()
 	reportingHandler := f.GetReportingHandler()
 	taxDeclarationHandler := f.GetTaxDeclarationHandler()
+
 	// Build academic handlers struct
 	academicHandlers := &handler.AcademicHandlers{
-		AcademicYearHandler:      f.academicsInfra.AcademicYearHandler(),
-		AdmissionHandler:         f.academicsInfra.AdmissionHandler(),
-		AnalyticsHandler:         f.academicsInfra.AnalyticsHandler(),
-		AssignmentHandler:        f.academicsInfra.AssignmentHandler(),
-		AttendanceHandler:        f.academicsInfra.AttendanceHandler(),
-		CourseHandler:            f.academicsInfra.CourseHandler(),
-		CurriculumHandler:        f.academicsInfra.CurriculumHandler(),
-		EnrollmentHandler:        f.academicsInfra.EnrollmentHandler(),
-		ExamHandler:              f.academicsInfra.ExamHandler(),
-		FeeHandler:               f.academicsInfra.FeeHandler(),
-		GradingHandler:           f.academicsInfra.GradingHandler(),
-		GuardianHandler:          f.academicsInfra.GuardianHandler(),
-		LibraryHandler:           f.academicsInfra.LibraryHandler(),
-		NotificationHandler:      f.academicsInfra.NotificationHandler(),
-		RoomHandler:              f.academicsInfra.RoomHandler(),
-		SectionHandler:           f.academicsInfra.SectionHandler(),
-		StudentHandler:           f.academicsInfra.StudentHandler(),
-		SubjectHandler:           f.academicsInfra.SubjectHandler(),
-		SubmissionHandler:        f.academicsInfra.SubmissionHandler(),
-		TeacherHandler:           f.academicsInfra.TeacherHandler(),
-		TermHandler:              f.academicsInfra.TermHandler(),
-		TimetableHandler:         f.academicsInfra.TimetableHandler(),
-		TransportHandler:         f.academicsInfra.TransportHandler(),
-		SessionGenerationHandler: f.academicsInfra.SessionGenerationHandler(),
-		// ✅ ADD THIS LINE:
+		AcademicYearHandler:         f.academicsInfra.AcademicYearHandler(),
+		AdmissionHandler:            f.academicsInfra.AdmissionHandler(),
+		AnalyticsHandler:            f.academicsInfra.AnalyticsHandler(),
+		AssignmentHandler:           f.academicsInfra.AssignmentHandler(),
+		AttendanceHandler:           f.academicsInfra.AttendanceHandler(),
+		CourseHandler:               f.academicsInfra.CourseHandler(),
+		CurriculumHandler:           f.academicsInfra.CurriculumHandler(),
+		EnrollmentHandler:           f.academicsInfra.EnrollmentHandler(),
+		ExamHandler:                 f.academicsInfra.ExamHandler(),
+		FeeHandler:                  f.academicsInfra.FeeHandler(),
+		GradingHandler:              f.academicsInfra.GradingHandler(),
+		GuardianHandler:             f.academicsInfra.GuardianHandler(),
+		LibraryHandler:              f.academicsInfra.LibraryHandler(),
+		NotificationHandler:         f.academicsInfra.NotificationHandler(),
+		RoomHandler:                 f.academicsInfra.RoomHandler(),
+		SectionHandler:              f.academicsInfra.SectionHandler(),
+		StudentHandler:              f.academicsInfra.StudentHandler(),
+		SubjectHandler:              f.academicsInfra.SubjectHandler(),
+		SubmissionHandler:           f.academicsInfra.SubmissionHandler(),
+		TeacherHandler:              f.academicsInfra.TeacherHandler(),
+		TermHandler:                 f.academicsInfra.TermHandler(),
+		TimetableHandler:            f.academicsInfra.TimetableHandler(),
+		TransportHandler:            f.academicsInfra.TransportHandler(),
+		SessionGenerationHandler:    f.academicsInfra.SessionGenerationHandler(),
 		StudentBiometricSyncHandler: f.academicsInfra.StudentBiometricSyncHandler(),
+	}
+
+	// Build accounting handlers struct
+	accountingHandlers := &accounting.AccountingHandlers{
+		AccountHandler:            f.accountingInfra.AccountHandler(), // ✅ ADD THIS
+		LedgerHandler:             f.accountingInfra.LedgerHandler(),
+		ReconciliationHandler:     f.accountingInfra.ReconciliationHandler(),
+		ReportHandler:             f.accountingInfra.ReportHandler(),
+		ComplianceHandler:         f.accountingInfra.ComplianceHandler(),
+		JournalHandler:            f.accountingInfra.JournalHandler(),
+		TaxHandler:                f.accountingInfra.TaxHandler(),
+		AccountingSettingsHandler: f.accountingInfra.AccountingSettingsHandler(),
+		AnalyticsHandler:          f.accountingInfra.AnalyticsHandler(),  // ✅ ADD THIS LINE
+		PeriodLockHandler:         f.accountingInfra.PeriodLockHandler(), // 👈 NEW
 	}
 	f.router = handler.NewRouter(
 		otpHandler,
@@ -2838,10 +2905,11 @@ func (f *Factory) InitializeHandlers() error {
 		payslipHandler,
 		reportingHandler,
 		taxDeclarationHandler,
-		academicHandlers, // <-- added
+		academicHandlers,
+		accountingHandlers, // <-- NEW: accounting handlers as last argument
 	)
 
-	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, and biometric systems")
+	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, and accounting systems")
 	return nil
 }
 
@@ -2961,6 +3029,22 @@ func (f *Factory) Close() error {
 			if err := f.studentConsumer.Close(); err != nil {
 				f.logger.Error("Failed to close student consumer", zap.Error(err))
 			}
+		}
+
+		// Shutdown accounting consumer
+		if f.accountingConsumerCancel != nil {
+			f.logger.Info("Stopping accounting consumer...")
+			f.accountingConsumerCancel()
+		}
+		if f.accountingConsumer != nil {
+			if err := f.accountingConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close accounting consumer", zap.Error(err))
+			}
+		}
+
+		// Close accounting infra (outbox processor)
+		if f.accountingInfra != nil {
+			f.accountingInfra.Close()
 		}
 
 		if f.postgresClient != nil {

@@ -190,6 +190,7 @@ func (s *studentBiometricSyncService) SyncEmbeddings(ctx context.Context, input 
 		AggregateType: "student_biometric_sync",
 		AggregateID:   input.DeviceID,
 		EventType:     syncType,
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -274,6 +275,7 @@ func (s *studentBiometricSyncService) FullSync(ctx context.Context, companyID uu
 		AggregateType: "student_biometric_sync",
 		AggregateID:   deviceID,
 		EventType:     EventStudentBiometricSyncFull,
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -327,6 +329,7 @@ func (s *studentBiometricSyncService) IncrementalSync(ctx context.Context, compa
 		AggregateType: "student_biometric_sync",
 		AggregateID:   deviceID,
 		EventType:     EventStudentBiometricSyncIncremental,
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -387,6 +390,7 @@ func (s *studentBiometricSyncService) ForceDeviceResync(ctx context.Context, com
 		AggregateType: "student_biometric_sync",
 		AggregateID:   deviceID,
 		EventType:     EventStudentBiometricSyncReset,
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -550,6 +554,7 @@ func (s *studentBiometricSyncService) CreateStudentFaceEmbedding(ctx context.Con
 		AggregateType: "student_face_embedding",
 		AggregateID:   embedding.EmbeddingID.String(),
 		EventType:     string(EventStudentFaceEmbeddingCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -650,6 +655,7 @@ func (s *studentBiometricSyncService) UpdateStudentFaceEmbedding(ctx context.Con
 		AggregateType: "student_face_embedding",
 		AggregateID:   existing.EmbeddingID.String(),
 		EventType:     string(EventStudentFaceEmbeddingUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -721,6 +727,7 @@ func (s *studentBiometricSyncService) DeleteStudentFaceEmbedding(ctx context.Con
 		AggregateType: "student_face_embedding",
 		AggregateID:   embeddingID.String(),
 		EventType:     string(EventStudentFaceEmbeddingDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -868,6 +875,7 @@ func (s *studentBiometricSyncService) DeactivateEmbeddingsForStudent(ctx context
 		AggregateType: "student_face_embedding",
 		AggregateID:   studentID.String(),
 		EventType:     string(EventStudentFaceEmbeddingDeactivated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}

@@ -133,6 +133,7 @@ func (s *submissionService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, ev
 		AggregateType: "submission",
 		AggregateID:   aggregateID.String(),
 		EventType:     eventType,
+		Topic:         TopicStudent,
 		Payload:       data,
 		Headers:       map[string]string{},
 		Status:        "pending",

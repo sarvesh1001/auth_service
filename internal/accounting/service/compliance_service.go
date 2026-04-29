@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -11,7 +12,9 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting/events"
+	"auth-service/internal/accounting/models"
 	"auth-service/internal/accounting/models/compliance"
+	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/accounting/repository"
 	"auth-service/internal/client"
 	"auth-service/internal/infrastructure/audit"
@@ -19,23 +22,91 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
+// -----------------------------------------------------------------------------
+// Custom errors for compliance domain
+// -----------------------------------------------------------------------------
+
+var (
+	ErrOverpayment = fmt.Errorf("overpayment: total paid exceeds liability")
+)
+
+// TopicAccountingEvents must be defined elsewhere (e.g., constants.go)
+// If not, define it here:
+// const TopicAccountingEvents = "accounting.events"
+
+// -----------------------------------------------------------------------------
+// Request DTOs (must match those used in the service)
+// -----------------------------------------------------------------------------
+
+type CreateReturnRequest struct {
+	CompanyID   uuid.UUID
+	ReturnType  string
+	PeriodStart time.Time
+	PeriodEnd   time.Time
+	DueDate     time.Time
+	CreatedBy   *uuid.UUID
+	UpdatedBy   *uuid.UUID
+}
+
+type UpdateReturnRequest struct {
+	ReturnID  uuid.UUID
+	DueDate   *time.Time
+	UpdatedBy *uuid.UUID
+}
+
+type FileReturnRequest struct {
+	AcknowledgementNo   *string
+	PaymentAmount       *decimal.Decimal
+	TaxPayableAccountID uuid.UUID
+	BankAccountID       uuid.UUID
+	Metadata            []byte
+	FiledBy             *uuid.UUID
+}
+
+type AmendReturnRequest struct {
+	AmendedBy *uuid.UUID
+}
+
+// Pagination is already defined in repository; we alias it for convenience.
+
+// -----------------------------------------------------------------------------
+// TransactionalJournalService – allows journal creation within an existing tx
+// -----------------------------------------------------------------------------
+
+type TransactionalJournalService interface {
+	CreateWithTx(ctx context.Context, tx *sql.Tx, req CreateJournalRequest) (*models.JournalEntry, error)
+	// Other journal methods can be added if needed
+}
+
+// CreateJournalRequest and JournalLineRequest must be defined elsewhere
+// (they come from the journal service). For completeness, we include minimal
+// definitions here if not already present.
+
+// -----------------------------------------------------------------------------
+// ComplianceService interface
+// -----------------------------------------------------------------------------
+
 type ComplianceService interface {
 	CreateReturn(ctx context.Context, req CreateReturnRequest) (*compliance.ComplianceReturn, error)
 	UpdateReturn(ctx context.Context, req UpdateReturnRequest) (*compliance.ComplianceReturn, error)
 	SubmitReturn(ctx context.Context, id uuid.UUID, submittedBy *uuid.UUID) error
-	FileReturn(ctx context.Context, id uuid.UUID, filingReq FileReturnRequest) (*compliance.ComplianceFiling, error)
+	FileReturn(ctx context.Context, id uuid.UUID, req FileReturnRequest) (*compliance.ComplianceFiling, error)
 	AmendReturn(ctx context.Context, id uuid.UUID, req AmendReturnRequest) (*compliance.ComplianceReturn, error)
 	DeleteReturn(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
 	GetReturnByID(ctx context.Context, id uuid.UUID) (*compliance.ComplianceReturn, error)
 	ListReturns(ctx context.Context, filter repository.ComplianceReturnFilter, p Pagination) ([]*compliance.ComplianceReturn, int64, error)
 	GetFilingByID(ctx context.Context, id uuid.UUID) (*compliance.ComplianceFiling, error)
-	UpdateFilingStatus(ctx context.Context, filingID uuid.UUID, status string, errorMessage *string) error
+	UpdateFilingStatus(ctx context.Context, filingID uuid.UUID, status enums.ComplianceFilingStatus, errorMessage *string) error
 }
+
+// -----------------------------------------------------------------------------
+// complianceService implementation
+// -----------------------------------------------------------------------------
 
 type complianceService struct {
 	repo             repository.ComplianceRepository
 	taxEngine        TaxEngineService
-	journalService   JournalService
+	journalService   TransactionalJournalService
 	pgClient         *client.PostgresClient
 	logger           *zap.Logger
 	outboxRepo       outbox.Repository
@@ -46,7 +117,7 @@ type complianceService struct {
 func NewComplianceService(
 	repo repository.ComplianceRepository,
 	taxEngine TaxEngineService,
-	journalService JournalService,
+	journalService TransactionalJournalService,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 	outboxRepo outbox.Repository,
@@ -65,9 +136,10 @@ func NewComplianceService(
 	}
 }
 
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // CreateReturn
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) CreateReturn(ctx context.Context, req CreateReturnRequest) (*compliance.ComplianceReturn, error) {
 	logger := s.logger.With(zap.String("method", "CreateReturn"), zap.String("company_id", req.CompanyID.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -90,6 +162,14 @@ func (s *complianceService) CreateReturn(ctx context.Context, req CreateReturnRe
 		}
 	}
 
+	exists, err := s.repo.ExistsReturnForPeriod(ctx, tx, req.CompanyID, req.ReturnType, req.PeriodStart, req.PeriodEnd)
+	if err != nil {
+		return nil, fmt.Errorf("check period uniqueness: %w", err)
+	}
+	if exists {
+		return nil, ErrConflict
+	}
+
 	liability, lines, err := s.taxEngine.ComputePeriodLiability(ctx, req.CompanyID, req.PeriodStart, req.PeriodEnd)
 	if err != nil {
 		return nil, fmt.Errorf("compute liability: %w", err)
@@ -102,12 +182,13 @@ func (s *complianceService) CreateReturn(ctx context.Context, req CreateReturnRe
 		PeriodStart:    req.PeriodStart,
 		PeriodEnd:      req.PeriodEnd,
 		DueDate:        req.DueDate,
-		Status:         "draft",
+		Status:         string(enums.ReturnStatusDraft),
 		TotalLiability: liability,
 		TotalPaid:      decimal.Zero,
 		IsLocked:       false,
 		CreatedBy:      req.CreatedBy,
 		UpdatedBy:      req.UpdatedBy,
+		AmendedFrom:    nil,
 	}
 
 	if err := s.repo.CreateReturn(ctx, tx, ret); err != nil {
@@ -146,6 +227,7 @@ func (s *complianceService) CreateReturn(ctx context.Context, req CreateReturnRe
 		AggregateType: "compliance_return",
 		AggregateID:   ret.ReturnID.String(),
 		EventType:     events.EventReturnCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -161,11 +243,6 @@ func (s *complianceService) CreateReturn(ctx context.Context, req CreateReturnRe
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Write audit log – marshal the new state to JSON
-	newStateJSON, _ := json.Marshal(ret)
-	if err := s.writeAuditLog(ctx, nil, ret.CompanyID, ret.ReturnID, "create", nil, newStateJSON, req.CreatedBy); err != nil {
-		logger.Warn("failed to write audit log", zap.Error(err))
-	}
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "compliance", "create", "compliance_return",
 			&ret.ReturnID, "user", req.CreatedBy, nil, nil, nil)
@@ -175,9 +252,10 @@ func (s *complianceService) CreateReturn(ctx context.Context, req CreateReturnRe
 	return ret, nil
 }
 
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // UpdateReturn
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) UpdateReturn(ctx context.Context, req UpdateReturnRequest) (*compliance.ComplianceReturn, error) {
 	logger := s.logger.With(zap.String("method", "UpdateReturn"), zap.String("return_id", req.ReturnID.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -203,11 +281,12 @@ func (s *complianceService) UpdateReturn(ctx context.Context, req UpdateReturnRe
 	if oldReturn == nil {
 		return nil, fmt.Errorf("%w: return %s", ErrNotFound, req.ReturnID)
 	}
-	if oldReturn.Status != "draft" {
+
+	// Only draft returns can be updated
+	if oldReturn.Status != string(enums.ReturnStatusDraft) {
 		return nil, fmt.Errorf("%w: cannot update return in status %s", ErrInvalidState, oldReturn.Status)
 	}
 
-	// Capture old state for audit
 	oldStateJSON, _ := json.Marshal(oldReturn)
 
 	if req.DueDate != nil {
@@ -235,6 +314,7 @@ func (s *complianceService) UpdateReturn(ctx context.Context, req UpdateReturnRe
 		AggregateType: "compliance_return",
 		AggregateID:   oldReturn.ReturnID.String(),
 		EventType:     events.EventReturnUpdated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -250,23 +330,20 @@ func (s *complianceService) UpdateReturn(ctx context.Context, req UpdateReturnRe
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Write audit log
 	newStateJSON, _ := json.Marshal(oldReturn)
-	if err := s.writeAuditLog(ctx, nil, oldReturn.CompanyID, oldReturn.ReturnID, "update", oldStateJSON, newStateJSON, req.UpdatedBy); err != nil {
-		logger.Warn("failed to write audit log", zap.Error(err))
-	}
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &oldReturn.CompanyID, "compliance", "update", "compliance_return",
-			&oldReturn.ReturnID, "user", req.UpdatedBy, nil, nil, nil)
+			&oldReturn.ReturnID, "user", req.UpdatedBy, oldStateJSON, newStateJSON, nil)
 	}
 
 	logger.Info("compliance return updated")
 	return oldReturn, nil
 }
 
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // SubmitReturn
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) SubmitReturn(ctx context.Context, id uuid.UUID, submittedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "SubmitReturn"), zap.String("return_id", id.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -292,18 +369,16 @@ func (s *complianceService) SubmitReturn(ctx context.Context, id uuid.UUID, subm
 	if ret == nil {
 		return fmt.Errorf("%w: return %s", ErrNotFound, id)
 	}
-	if ret.Status != "draft" {
+	if ret.Status != string(enums.ReturnStatusDraft) {
 		return fmt.Errorf("%w: cannot submit return in status %s", ErrInvalidState, ret.Status)
 	}
 
 	oldStateJSON, _ := json.Marshal(ret)
 
-	if err := s.repo.UpdateReturnStatus(ctx, tx, id, "submitted", submittedBy); err != nil {
+	if err := s.repo.UpdateReturnStatus(ctx, tx, id, enums.ReturnStatusSubmitted, submittedBy); err != nil {
 		return fmt.Errorf("update status: %w", err)
 	}
-
-	// Refresh ret after status update
-	ret.Status = "submitted"
+	ret.Status = string(enums.ReturnStatusSubmitted)
 
 	payload, _ := json.Marshal(events.ComplianceReturnPayload{
 		ReturnID:       ret.ReturnID.String(),
@@ -312,7 +387,7 @@ func (s *complianceService) SubmitReturn(ctx context.Context, id uuid.UUID, subm
 		PeriodStart:    ret.PeriodStart,
 		PeriodEnd:      ret.PeriodEnd,
 		DueDate:        ret.DueDate,
-		Status:         "submitted",
+		Status:         ret.Status,
 		TotalLiability: ret.TotalLiability.String(),
 		TotalPaid:      ret.TotalPaid.String(),
 	})
@@ -321,6 +396,7 @@ func (s *complianceService) SubmitReturn(ctx context.Context, id uuid.UUID, subm
 		AggregateType: "compliance_return",
 		AggregateID:   ret.ReturnID.String(),
 		EventType:     events.EventReturnSubmitted,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -336,23 +412,20 @@ func (s *complianceService) SubmitReturn(ctx context.Context, id uuid.UUID, subm
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Write audit log
 	newStateJSON, _ := json.Marshal(ret)
-	if err := s.writeAuditLog(ctx, nil, ret.CompanyID, ret.ReturnID, "submit", oldStateJSON, newStateJSON, submittedBy); err != nil {
-		logger.Warn("failed to write audit log", zap.Error(err))
-	}
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &ret.CompanyID, "compliance", "submit", "compliance_return",
-			&id, "user", submittedBy, nil, nil, nil)
+			&id, "user", submittedBy, oldStateJSON, newStateJSON, nil)
 	}
 
 	logger.Info("compliance return submitted")
 	return nil
 }
 
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // FileReturn
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req FileReturnRequest) (*compliance.ComplianceFiling, error) {
 	logger := s.logger.With(zap.String("method", "FileReturn"), zap.String("return_id", id.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -378,38 +451,35 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 	if ret == nil {
 		return nil, fmt.Errorf("%w: return %s", ErrNotFound, id)
 	}
-	if ret.Status != "submitted" {
+	if ret.Status != string(enums.ReturnStatusSubmitted) {
 		return nil, fmt.Errorf("%w: cannot file return in status %s", ErrInvalidState, ret.Status)
 	}
 
 	oldStateJSON, _ := json.Marshal(ret)
 
 	if req.PaymentAmount != nil && !req.PaymentAmount.IsZero() {
+		newTotalPaid := ret.TotalPaid.Add(*req.PaymentAmount)
+		if newTotalPaid.GreaterThan(ret.TotalLiability) {
+			return nil, ErrOverpayment
+		}
+
 		journalReq := CreateJournalRequest{
 			CompanyID:   ret.CompanyID,
-			JournalType: "payment",
+			JournalType: enums.JournalTypePayment,
 			EntryDate:   time.Now(),
 			Reference:   stringPtr(fmt.Sprintf("Tax payment for return %s", ret.ReturnID.String())),
 			Description: stringPtr(fmt.Sprintf("Payment of %s for period %s to %s", req.PaymentAmount.String(), ret.PeriodStart.Format("2006-01-02"), ret.PeriodEnd.Format("2006-01-02"))),
 			Lines: []JournalLineRequest{
-				{
-					AccountID:    req.TaxPayableAccountID,
-					DebitAmount:  *req.PaymentAmount,
-					CreditAmount: decimal.Zero,
-				},
-				{
-					AccountID:    req.BankAccountID,
-					DebitAmount:  decimal.Zero,
-					CreditAmount: *req.PaymentAmount,
-				},
+				{AccountID: req.TaxPayableAccountID, DebitAmount: *req.PaymentAmount, CreditAmount: decimal.Zero},
+				{AccountID: req.BankAccountID, DebitAmount: decimal.Zero, CreditAmount: *req.PaymentAmount},
 			},
 			CreatedBy: req.FiledBy,
 			UpdatedBy: req.FiledBy,
 		}
-		if _, err := s.journalService.Create(ctx, journalReq); err != nil {
+		if _, err := s.journalService.CreateWithTx(ctx, tx, journalReq); err != nil {
 			return nil, fmt.Errorf("create payment journal: %w", err)
 		}
-		ret.TotalPaid = ret.TotalPaid.Add(*req.PaymentAmount)
+		ret.TotalPaid = newTotalPaid
 		if err := s.repo.UpdateReturn(ctx, tx, ret); err != nil {
 			return nil, fmt.Errorf("update paid amount: %w", err)
 		}
@@ -420,7 +490,7 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 		ReturnID:          ret.ReturnID,
 		SubmissionDate:    time.Now(),
 		AcknowledgementNo: req.AcknowledgementNo,
-		FilingStatus:      "submitted",
+		FilingStatus:      string(enums.FilingStatusPending),
 		ErrorMessage:      nil,
 		Metadata:          req.Metadata,
 		CreatedBy:         req.FiledBy,
@@ -429,10 +499,7 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 		return nil, fmt.Errorf("create filing: %w", err)
 	}
 
-	if err := s.repo.MarkAsFiled(ctx, tx, id, req.FiledBy, time.Now()); err != nil {
-		return nil, fmt.Errorf("mark as filed: %w", err)
-	}
-
+	// Outbox events
 	returnPayload, _ := json.Marshal(events.ComplianceReturnPayload{
 		ReturnID:       ret.ReturnID.String(),
 		CompanyID:      ret.CompanyID.String(),
@@ -440,7 +507,7 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 		PeriodStart:    ret.PeriodStart,
 		PeriodEnd:      ret.PeriodEnd,
 		DueDate:        ret.DueDate,
-		Status:         "filed",
+		Status:         ret.Status,
 		TotalLiability: ret.TotalLiability.String(),
 		TotalPaid:      ret.TotalPaid.String(),
 	})
@@ -449,13 +516,12 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 		ReturnID:          filing.ReturnID.String(),
 		SubmissionDate:    filing.SubmissionDate,
 		AcknowledgementNo: getStringValue(filing.AcknowledgementNo),
-		FilingStatus:      filing.FilingStatus,
+		FilingStatus:      string(filing.FilingStatus),
 		ErrorMessage:      getStringValue(filing.ErrorMessage),
 	})
-
 	for _, evt := range []*outbox.Event{
-		{EventID: uuid.New().String(), AggregateType: "compliance_return", AggregateID: ret.ReturnID.String(), EventType: events.EventReturnFiled, Payload: returnPayload, Status: "pending"},
-		{EventID: uuid.New().String(), AggregateType: "compliance_filing", AggregateID: filing.FilingID.String(), EventType: events.EventFilingCreated, Payload: filingPayload, Status: "pending"},
+		{EventID: uuid.New().String(), AggregateType: "compliance_return", AggregateID: ret.ReturnID.String(), EventType: events.EventReturnFiled, Payload: returnPayload, Status: "pending", Topic: TopicAccountingEvents},
+		{EventID: uuid.New().String(), AggregateType: "compliance_filing", AggregateID: filing.FilingID.String(), EventType: events.EventFilingCreated, Payload: filingPayload, Status: "pending", Topic: TopicAccountingEvents},
 	} {
 		if err := s.outboxRepo.Store(ctx, tx, evt); err != nil {
 			return nil, fmt.Errorf("store outbox event: %w", err)
@@ -470,25 +536,22 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Write audit log
 	newStateJSON, _ := json.Marshal(ret)
-	if err := s.writeAuditLog(ctx, nil, ret.CompanyID, ret.ReturnID, "file", oldStateJSON, newStateJSON, req.FiledBy); err != nil {
-		logger.Warn("failed to write audit log", zap.Error(err))
-	}
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &ret.CompanyID, "compliance", "file", "compliance_return",
-			&id, "user", req.FiledBy, nil, nil, map[string]interface{}{"acknowledgement_no": req.AcknowledgementNo})
+			&id, "user", req.FiledBy, oldStateJSON, newStateJSON, map[string]interface{}{"acknowledgement_no": req.AcknowledgementNo})
 	}
 
-	logger.Info("compliance return filed", zap.String("filing_id", filing.FilingID.String()))
+	logger.Info("compliance return filing initiated", zap.String("filing_id", filing.FilingID.String()))
 	return filing, nil
 }
 
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // AmendReturn
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) AmendReturn(ctx context.Context, id uuid.UUID, req AmendReturnRequest) (*compliance.ComplianceReturn, error) {
-	logger := s.logger.With(zap.String("method", "AmendReturn"), zap.String("return_id", id.String()))
+	logger := s.logger.With(zap.String("method", "AmendReturn"), zap.String("original_return_id", id.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -512,7 +575,7 @@ func (s *complianceService) AmendReturn(ctx context.Context, id uuid.UUID, req A
 	if original == nil {
 		return nil, fmt.Errorf("%w: return %s", ErrNotFound, id)
 	}
-	if original.Status != "filed" {
+	if original.Status != string(enums.ReturnStatusFiled) {
 		return nil, fmt.Errorf("%w: only filed returns can be amended", ErrInvalidState)
 	}
 
@@ -530,13 +593,15 @@ func (s *complianceService) AmendReturn(ctx context.Context, id uuid.UUID, req A
 		PeriodStart:    original.PeriodStart,
 		PeriodEnd:      original.PeriodEnd,
 		DueDate:        original.DueDate,
-		Status:         "draft",
+		Status:         string(enums.ReturnStatusDraft),
 		TotalLiability: liability,
 		TotalPaid:      original.TotalPaid,
 		IsLocked:       false,
 		CreatedBy:      req.AmendedBy,
 		UpdatedBy:      req.AmendedBy,
+		AmendedFrom:    &original.ReturnID,
 	}
+
 	if err := s.repo.CreateReturn(ctx, tx, amended); err != nil {
 		return nil, fmt.Errorf("create amended return: %w", err)
 	}
@@ -557,8 +622,7 @@ func (s *complianceService) AmendReturn(ctx context.Context, id uuid.UUID, req A
 		return nil, fmt.Errorf("add lines: %w", err)
 	}
 
-	// Mark original as amended
-	if err := s.repo.UpdateReturnStatus(ctx, tx, original.ReturnID, "amended", req.AmendedBy); err != nil {
+	if err := s.repo.UpdateReturnStatus(ctx, tx, original.ReturnID, enums.ReturnStatusAmended, req.AmendedBy); err != nil {
 		return nil, fmt.Errorf("update original status to amended: %w", err)
 	}
 
@@ -578,6 +642,7 @@ func (s *complianceService) AmendReturn(ctx context.Context, id uuid.UUID, req A
 		AggregateType: "compliance_return",
 		AggregateID:   amended.ReturnID.String(),
 		EventType:     events.EventReturnAmended,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -593,26 +658,20 @@ func (s *complianceService) AmendReturn(ctx context.Context, id uuid.UUID, req A
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Write audit logs: one for original status change, one for creation of amended
 	newStateJSON, _ := json.Marshal(amended)
-	if err := s.writeAuditLog(ctx, nil, original.CompanyID, original.ReturnID, "amend", oldStateJSON, nil, req.AmendedBy); err != nil {
-		logger.Warn("failed to write audit log for original", zap.Error(err))
-	}
-	if err := s.writeAuditLog(ctx, nil, amended.CompanyID, amended.ReturnID, "create_amended", nil, newStateJSON, req.AmendedBy); err != nil {
-		logger.Warn("failed to write audit log for amended", zap.Error(err))
-	}
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &original.CompanyID, "compliance", "amend", "compliance_return",
-			&id, "user", req.AmendedBy, nil, nil, map[string]interface{}{"amended_return_id": amended.ReturnID.String()})
+			&id, "user", req.AmendedBy, oldStateJSON, newStateJSON, map[string]interface{}{"amended_return_id": amended.ReturnID.String()})
 	}
 
 	logger.Info("compliance return amended", zap.String("amended_id", amended.ReturnID.String()))
 	return amended, nil
 }
 
-// --------------------------------------------------------------------------
-// DeleteReturn (soft delete)
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// DeleteReturn
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) DeleteReturn(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteReturn"), zap.String("return_id", id.String()))
 
@@ -629,48 +688,40 @@ func (s *complianceService) DeleteReturn(ctx context.Context, id uuid.UUID, dele
 	if ret == nil {
 		return fmt.Errorf("%w: return %s", ErrNotFound, id)
 	}
-	if ret.Status == "filed" {
+	if ret.Status == string(enums.ReturnStatusFiled) {
 		return fmt.Errorf("%w: cannot delete a filed return", ErrInvalidState)
+	}
+	if ret.IsLocked {
+		return fmt.Errorf("%w: cannot delete a locked return", ErrInvalidState)
 	}
 
 	oldStateJSON, _ := json.Marshal(ret)
 
-	// Soft delete: set deleted_at and update status to 'deleted'
 	if err := s.repo.DeleteReturn(ctx, tx, id, deletedBy); err != nil {
 		return fmt.Errorf("delete return: %w", err)
-	}
-	// Also update status to 'deleted' (repository's DeleteReturn only sets deleted_at, we need status change)
-	if err := s.repo.UpdateReturnStatus(ctx, tx, id, "deleted", deletedBy); err != nil {
-		return fmt.Errorf("update status to deleted: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Write audit log
-	newStateJSON, _ := json.Marshal(&compliance.ComplianceReturn{ReturnID: id, Status: "deleted"})
-	if err := s.writeAuditLog(ctx, nil, ret.CompanyID, ret.ReturnID, "delete", oldStateJSON, newStateJSON, deletedBy); err != nil {
-		logger.Warn("failed to write audit log", zap.Error(err))
-	}
+	newStateJSON, _ := json.Marshal(map[string]interface{}{"deleted": true})
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &ret.CompanyID, "compliance", "delete", "compliance_return",
-			&id, "user", deletedBy, nil, nil, nil)
+			&id, "user", deletedBy, oldStateJSON, newStateJSON, nil)
 	}
-
 	logger.Info("compliance return soft-deleted")
 	return nil
 }
 
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // UpdateFilingStatus
-// --------------------------------------------------------------------------
-func (s *complianceService) UpdateFilingStatus(ctx context.Context, filingID uuid.UUID, status string, errorMessage *string) error {
+// -----------------------------------------------------------------------------
+
+func (s *complianceService) UpdateFilingStatus(ctx context.Context, filingID uuid.UUID, status enums.ComplianceFilingStatus, errorMessage *string) error {
 	logger := s.logger.With(zap.String("method", "UpdateFilingStatus"), zap.String("filing_id", filingID.String()))
 
-	// Validate status
-	validStatuses := map[string]bool{"submitted": true, "accepted": true, "rejected": true, "pending": true}
-	if !validStatuses[status] {
+	if status != enums.FilingStatusAccepted && status != enums.FilingStatusRejected && status != enums.FilingStatusPending {
 		return fmt.Errorf("%w: invalid filing status %s", ErrInvalidInput, status)
 	}
 
@@ -680,21 +731,40 @@ func (s *complianceService) UpdateFilingStatus(ctx context.Context, filingID uui
 	}
 	defer tx.Rollback()
 
+	filing, err := s.repo.GetFilingByID(ctx, tx, filingID)
+	if err != nil {
+		return fmt.Errorf("get filing: %w", err)
+	}
+	if filing == nil {
+		return fmt.Errorf("%w: filing %s", ErrNotFound, filingID)
+	}
+
 	if err := s.repo.UpdateFilingStatus(ctx, tx, filingID, status, errorMessage); err != nil {
 		return fmt.Errorf("update filing status: %w", err)
+	}
+
+	if status == enums.FilingStatusAccepted {
+		if err := s.repo.UpdateReturnStatus(ctx, tx, filing.ReturnID, enums.ReturnStatusFiled, nil); err != nil {
+			return fmt.Errorf("update return status to filed: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	logger.Info("filing status updated", zap.String("status", status))
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, nil, "compliance", "update_filing_status", "compliance_filing",
+			&filingID, "system", nil, nil, nil, map[string]interface{}{"status": status, "error_message": errorMessage})
+	}
+	logger.Info("filing status updated", zap.String("status", string(status)))
 	return nil
 }
 
-// --------------------------------------------------------------------------
-// GetReturnByID
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Query methods
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) GetReturnByID(ctx context.Context, id uuid.UUID) (*compliance.ComplianceReturn, error) {
 	ret, err := s.repo.GetReturnByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -706,9 +776,6 @@ func (s *complianceService) GetReturnByID(ctx context.Context, id uuid.UUID) (*c
 	return ret, nil
 }
 
-// --------------------------------------------------------------------------
-// ListReturns
-// --------------------------------------------------------------------------
 func (s *complianceService) ListReturns(ctx context.Context, filter repository.ComplianceReturnFilter, p Pagination) ([]*compliance.ComplianceReturn, int64, error) {
 	limit, offset := s.validatePagination(p)
 	sort := repository.Sort{Field: "period_start", Direction: "DESC"}
@@ -723,9 +790,6 @@ func (s *complianceService) ListReturns(ctx context.Context, filter repository.C
 	return items, total, nil
 }
 
-// --------------------------------------------------------------------------
-// GetFilingByID
-// --------------------------------------------------------------------------
 func (s *complianceService) GetFilingByID(ctx context.Context, id uuid.UUID) (*compliance.ComplianceFiling, error) {
 	filing, err := s.repo.GetFilingByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -737,9 +801,10 @@ func (s *complianceService) GetFilingByID(ctx context.Context, id uuid.UUID) (*c
 	return filing, nil
 }
 
-// --------------------------------------------------------------------------
-// Helper Methods
-// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Helper functions
+// -----------------------------------------------------------------------------
+
 func (s *complianceService) validateReturnRequest(req CreateReturnRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", ErrInvalidInput)
@@ -774,54 +839,13 @@ func (s *complianceService) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// writeAuditLog writes an entry to compliance_audit_logs.
-func (s *complianceService) writeAuditLog(ctx context.Context, tx repository.DBTX, companyID, returnID uuid.UUID, action string, oldState, newState []byte, actedBy *uuid.UUID) error {
-	if tx == nil {
-		tx = s.pgClient.DB
+// stringPtr is already defined in journal_service.go; we reuse it.
+// If not available, uncomment below:
+// func stringPtr(s string) *string { return &s }
+
+func getStringValue(s *string) string {
+	if s == nil {
+		return ""
 	}
-	logEntry := &compliance.ComplianceAuditLog{
-		AuditID:   uuid.New(),
-		CompanyID: companyID,
-		ReturnID:  &returnID,
-		Action:    action,
-		OldState:  oldState,
-		NewState:  newState,
-		ActedBy:   actedBy,
-		ActedAt:   time.Now(),
-		IPAddress: nil, // can be extracted from ctx if needed
-	}
-	return s.repo.CreateAuditLog(ctx, tx, logEntry)
-}
-
-// --------------------------------------------------------------------------
-// Request/Response Types
-// --------------------------------------------------------------------------
-type CreateReturnRequest struct {
-	CompanyID   uuid.UUID
-	ReturnType  string
-	PeriodStart time.Time
-	PeriodEnd   time.Time
-	DueDate     time.Time
-	CreatedBy   *uuid.UUID
-	UpdatedBy   *uuid.UUID
-}
-
-type UpdateReturnRequest struct {
-	ReturnID    uuid.UUID
-	DueDate     *time.Time
-	Description *string
-	UpdatedBy   *uuid.UUID
-}
-
-type FileReturnRequest struct {
-	AcknowledgementNo   *string
-	PaymentAmount       *decimal.Decimal
-	TaxPayableAccountID uuid.UUID
-	BankAccountID       uuid.UUID
-	Metadata            []byte
-	FiledBy             *uuid.UUID
-}
-
-type AmendReturnRequest struct {
-	AmendedBy *uuid.UUID
+	return *s
 }

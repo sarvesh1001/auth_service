@@ -123,9 +123,6 @@ func (s *courseService) buildNotificationRequest(
 	}
 }
 
-// ============================================================================
-// CREATE
-// ============================================================================
 func (s *courseService) Create(ctx context.Context, req CreateCourseRequest) (*models.Course, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
@@ -133,8 +130,8 @@ func (s *courseService) Create(ctx context.Context, req CreateCourseRequest) (*m
 		zap.String("code", req.Code),
 	)
 
-	// Idempotency: check before any work (read-only, no transaction needed)
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	if idempotencyKey != "" {
 		var existing *models.Course
 		if err := s.idempotencyStore.Get(ctx, nil, idempotencyKey, &existing); err == nil && existing != nil {
@@ -153,7 +150,6 @@ func (s *courseService) Create(ctx context.Context, req CreateCourseRequest) (*m
 	}
 	defer tx.Rollback()
 
-	// Check existence
 	exists, err := s.repo.Exists(ctx, tx, req.CompanyID, req.Code)
 	if err != nil {
 		return nil, err
@@ -177,20 +173,19 @@ func (s *courseService) Create(ctx context.Context, req CreateCourseRequest) (*m
 		return nil, err
 	}
 
-	// --- Store idempotency key INSIDE transaction (before commit) ---
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, course); err != nil {
 			logger.Error("failed to store idempotency response", zap.Error(err))
 		}
 	}
 
-	// Outbox event
 	payload, _ := json.Marshal(course)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "course",
 		AggregateID:   course.CourseID.String(),
 		EventType:     string(EventCourseCreated),
+		Topic:         TopicCourse, // <-- ADDED
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",
@@ -205,12 +200,12 @@ func (s *courseService) Create(ctx context.Context, req CreateCourseRequest) (*m
 
 	logger.Info("course created", zap.String("id", course.CourseID.String()))
 
-	// Async side effects (audit, notifications)
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "academics", "create", "course",
 			&course.CourseID, "user", req.CreatedBy, nil, nil,
 			map[string]interface{}{"code": course.Code, "name": course.Name})
 	}
+
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(course, "created", req.CreatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
@@ -221,16 +216,14 @@ func (s *courseService) Create(ctx context.Context, req CreateCourseRequest) (*m
 	return course, nil
 }
 
-// ============================================================================
-// BULK CREATE
-// ============================================================================
 func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseRequest) ([]*models.Course, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
-	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("batch_size", len(reqs)))
 
+	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("batch_size", len(reqs)))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	if idempotencyKey != "" {
 		var existing []*models.Course
 		if err := s.idempotencyStore.Get(ctx, nil, idempotencyKey, &existing); err == nil && existing != nil {
@@ -239,7 +232,6 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 		}
 	}
 
-	// Pre‑load existing courses for all company/code pairs
 	type companyCode struct {
 		CompanyID uuid.UUID
 		Code      string
@@ -248,6 +240,7 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 	for _, req := range reqs {
 		toFetch[companyCode{CompanyID: req.CompanyID, Code: req.Code}] = true
 	}
+
 	existingMap := make(map[companyCode]*models.Course)
 	if len(toFetch) > 0 {
 		keys := make([]struct {
@@ -283,14 +276,17 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 		if err := s.validateInput(req); err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
+
 		key := companyCode{CompanyID: req.CompanyID, Code: req.Code}
 		if seenInBatch[key] {
 			return nil, fmt.Errorf("item %d: %w: duplicate code %s in batch", i, ErrDuplicate, req.Code)
 		}
 		seenInBatch[key] = true
+
 		if existingMap[key] != nil {
 			return nil, fmt.Errorf("item %d: %w: code %s already exists", i, ErrDuplicate, req.Code)
 		}
+
 		courses = append(courses, &models.Course{
 			CompanyID:   req.CompanyID,
 			Code:        req.Code,
@@ -307,14 +303,12 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 		return nil, err
 	}
 
-	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, courses); err != nil {
 			logger.Error("failed to store idempotency response", zap.Error(err))
 		}
 	}
 
-	// Outbox events for each course
 	for _, course := range courses {
 		payload, _ := json.Marshal(course)
 		outboxEvent := &outbox.Event{
@@ -322,6 +316,7 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 			AggregateType: "course",
 			AggregateID:   course.CourseID.String(),
 			EventType:     string(EventCourseCreated),
+			Topic:         TopicCourse, // <-- ADDED
 			Payload:       payload,
 			Status:        "pending",
 		}
@@ -336,13 +331,13 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 
 	logger.Info("bulk created courses", zap.Int("count", len(courses)))
 
-	// Async side effects
 	if s.auditService != nil {
 		for _, course := range courses {
 			_ = s.auditService.LogAction(ctx, nil, &course.CompanyID, "academics", "bulk_create", "course",
 				&course.CourseID, "user", course.CreatedBy, nil, nil, nil)
 		}
 	}
+
 	if s.notificationService != nil {
 		for _, course := range courses {
 			notifReq := s.buildNotificationRequest(course, "created", course.CreatedBy)
@@ -353,12 +348,10 @@ func (s *courseService) BulkCreate(ctx context.Context, reqs []CreateCourseReque
 			}
 		}
 	}
+
 	return courses, nil
 }
 
-// ============================================================================
-// UPSERT
-// ============================================================================
 func (s *courseService) Upsert(ctx context.Context, req CreateCourseRequest) (*models.Course, error) {
 	logger := s.logger.With(
 		zap.String("method", "Upsert"),
@@ -367,6 +360,7 @@ func (s *courseService) Upsert(ctx context.Context, req CreateCourseRequest) (*m
 	)
 
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	if idempotencyKey != "" {
 		var existing *models.Course
 		if err := s.idempotencyStore.Get(ctx, nil, idempotencyKey, &existing); err == nil && existing != nil {
@@ -386,6 +380,7 @@ func (s *courseService) Upsert(ctx context.Context, req CreateCourseRequest) (*m
 	defer tx.Rollback()
 
 	existing, _ := s.repo.GetByCode(ctx, tx, req.CompanyID, req.Code)
+
 	course := &models.Course{
 		CompanyID:   req.CompanyID,
 		Code:        req.Code,
@@ -408,7 +403,6 @@ func (s *courseService) Upsert(ctx context.Context, req CreateCourseRequest) (*m
 		return nil, err
 	}
 
-	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, course); err != nil {
 			logger.Error("failed to store idempotency response", zap.Error(err))
@@ -421,6 +415,7 @@ func (s *courseService) Upsert(ctx context.Context, req CreateCourseRequest) (*m
 		AggregateType: "course",
 		AggregateID:   course.CourseID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicCourse, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -438,18 +433,17 @@ func (s *courseService) Upsert(ctx context.Context, req CreateCourseRequest) (*m
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "academics", "upsert", "course",
 			&course.CourseID, "user", req.CreatedBy, nil, nil, map[string]interface{}{"code": course.Code})
 	}
+
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(course, operation, req.CreatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
 	}
+
 	return course, nil
 }
 
-// ============================================================================
-// GETTERS (no idempotency needed, but kept as is)
-// ============================================================================
 func (s *courseService) GetByID(ctx context.Context, id uuid.UUID) (*models.Course, error) {
 	c, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -488,9 +482,6 @@ func (s *courseService) Exists(ctx context.Context, companyID uuid.UUID, code st
 	return s.repo.Exists(ctx, s.pgClient.DB, companyID, code)
 }
 
-// ============================================================================
-// UPDATE
-// ============================================================================
 func (s *courseService) Update(ctx context.Context, req UpdateCourseRequest) (*models.Course, error) {
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("course_id", req.CourseID.String()))
 
@@ -517,7 +508,6 @@ func (s *courseService) Update(ctx context.Context, req UpdateCourseRequest) (*m
 		return nil, fmt.Errorf("%w: course %s", ErrNotFound, req.CourseID)
 	}
 
-	// Check code uniqueness if changed
 	if req.Code != course.Code {
 		exists, err := s.repo.Exists(ctx, tx, course.CompanyID, req.Code)
 		if err != nil {
@@ -540,7 +530,6 @@ func (s *courseService) Update(ctx context.Context, req UpdateCourseRequest) (*m
 		return nil, err
 	}
 
-	// Store idempotency key inside transaction
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, course); err != nil {
 			logger.Error("failed to store idempotency response", zap.Error(err))
@@ -556,6 +545,7 @@ func (s *courseService) Update(ctx context.Context, req UpdateCourseRequest) (*m
 		AggregateType: "course",
 		AggregateID:   course.CourseID.String(),
 		EventType:     string(EventCourseUpdated),
+		Topic:         TopicCourse, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -573,20 +563,20 @@ func (s *courseService) Update(ctx context.Context, req UpdateCourseRequest) (*m
 		_ = s.auditService.LogAction(ctx, nil, &course.CompanyID, "academics", "update", "course",
 			&course.CourseID, "user", req.UpdatedBy, nil, nil, nil)
 	}
+
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(course, "updated", req.UpdatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
 	}
+
 	return course, nil
 }
 
-// ============================================================================
-// ACTIVATE / DEACTIVATE
-// ============================================================================
 func (s *courseService) Activate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Activate"), zap.String("course_id", id.String()))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -611,6 +601,7 @@ func (s *courseService) Activate(ctx context.Context, id uuid.UUID, updatedBy *u
 		AggregateType: "course",
 		AggregateID:   id.String(),
 		EventType:     string(EventCourseUpdated),
+		Topic:         TopicCourse, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -628,17 +619,20 @@ func (s *courseService) Activate(ctx context.Context, id uuid.UUID, updatedBy *u
 		_ = s.auditService.LogAction(ctx, nil, &course.CompanyID, "academics", "activate", "course",
 			&id, "user", updatedBy, nil, nil, nil)
 	}
+
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(course, "activated", updatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
 	}
+
 	return nil
 }
 
 func (s *courseService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Deactivate"), zap.String("course_id", id.String()))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -663,6 +657,7 @@ func (s *courseService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy 
 		AggregateType: "course",
 		AggregateID:   id.String(),
 		EventType:     string(EventCourseUpdated),
+		Topic:         TopicCourse, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -680,27 +675,26 @@ func (s *courseService) Deactivate(ctx context.Context, id uuid.UUID, updatedBy 
 		_ = s.auditService.LogAction(ctx, nil, &course.CompanyID, "academics", "deactivate", "course",
 			&id, "user", updatedBy, nil, nil, nil)
 	}
+
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(course, "deactivated", updatedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
 	}
+
 	return nil
 }
 
-// ============================================================================
-// DELETE
-// ============================================================================
 func (s *courseService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("course_id", id.String()))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Check dependencies (sections)
 	sections, err := s.sectionRepo.ListByCourse(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("check sections: %w", err)
@@ -730,6 +724,7 @@ func (s *courseService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uui
 		AggregateType: "course",
 		AggregateID:   id.String(),
 		EventType:     string(EventCourseDeleted),
+		Topic:         TopicCourse, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -747,18 +742,17 @@ func (s *courseService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uui
 		_ = s.auditService.LogAction(ctx, nil, &course.CompanyID, "academics", "delete", "course",
 			&id, "user", deletedBy, nil, nil, nil)
 	}
+
 	if s.notificationService != nil {
 		notifReq := s.buildNotificationRequest(course, "deleted", deletedBy)
 		if _, err := s.notificationService.Create(ctx, notifReq, uuid.New().String()); err != nil {
 			logger.Error("failed to create notification", zap.Error(err))
 		}
 	}
+
 	return nil
 }
 
-// ============================================================================
-// VALIDATE UNIQUE CODE
-// ============================================================================
 func (s *courseService) ValidateUniqueCode(ctx context.Context, companyID uuid.UUID, code string) error {
 	exists, err := s.repo.Exists(ctx, s.pgClient.DB, companyID, code)
 	if err != nil {
@@ -770,9 +764,6 @@ func (s *courseService) ValidateUniqueCode(ctx context.Context, companyID uuid.U
 	return nil
 }
 
-// ============================================================================
-// INPUT VALIDATION
-// ============================================================================
 func (s *courseService) validateInput(req CreateCourseRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id is required", ErrInvalidInput)

@@ -14,6 +14,7 @@ import (
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
+	"auth-service/internal/accounting/models"
 	"auth-service/internal/accounting/models/analytics"
 	"auth-service/internal/util"
 )
@@ -22,7 +23,6 @@ import (
 // FILTERS
 // =====================================================
 
-// DailySummaryFilter for querying daily account summaries
 type DailySummaryFilter struct {
 	CompanyID uuid.UUID
 	AccountID *uuid.UUID
@@ -30,7 +30,6 @@ type DailySummaryFilter struct {
 	ToDate    *time.Time
 }
 
-// SnapshotFilter for querying account snapshots
 type SnapshotFilter struct {
 	CompanyID    uuid.UUID
 	AccountID    *uuid.UUID
@@ -41,7 +40,6 @@ type SnapshotFilter struct {
 	Period       *int
 }
 
-// JournalMetricFilter for querying journal metrics
 type JournalMetricFilter struct {
 	CompanyID   uuid.UUID
 	JournalType *string
@@ -49,7 +47,6 @@ type JournalMetricFilter struct {
 	ToDate      *time.Time
 }
 
-// TaxSummaryFilter for querying tax summaries
 type TaxSummaryFilter struct {
 	CompanyID uuid.UUID
 	TaxRateID *uuid.UUID
@@ -57,7 +54,6 @@ type TaxSummaryFilter struct {
 	ToDate    *time.Time
 }
 
-// CashflowFilter for querying cashflow analytics
 type CashflowFilter struct {
 	CompanyID uuid.UUID
 	FromDate  *time.Time
@@ -76,7 +72,7 @@ type AnalyticsRepository interface {
 	ListDailySummaries(ctx context.Context, db DBTX, filter DailySummaryFilter, p Pagination, s Sort) ([]*analytics.DailyAccountSummary, error)
 	DeleteDailySummary(ctx context.Context, db DBTX, summaryID uuid.UUID) error
 	DeleteDailySummariesByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) error
-	InvalidateTaxSummaries(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate *time.Time) error
+	InvalidateDailySummaries(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate *time.Time) error
 
 	// Account Snapshots
 	UpsertSnapshot(ctx context.Context, db DBTX, snapshot *analytics.AccountSnapshot) error
@@ -101,22 +97,8 @@ type AnalyticsRepository interface {
 	ListTaxSummaries(ctx context.Context, db DBTX, filter TaxSummaryFilter, p Pagination, s Sort) ([]*analytics.TaxSummary, error)
 	DeleteTaxSummary(ctx context.Context, db DBTX, summaryID uuid.UUID) error
 	DeleteTaxSummariesByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) error
-	CalculateAndStoreSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
-	// NEW: Bulk version for better performance
-	CalculateAndStoreSnapshotBulk(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
+	InvalidateTaxSummaries(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate *time.Time) error
 
-	// Reconciliation Batch Metrics
-	GetReconciliationBatchMetrics(ctx context.Context, db DBTX, batchID uuid.UUID) (*analytics.ReconciliationBatchMetrics, error)
-	ListReconciliationBatchMetrics(ctx context.Context, db DBTX, companyID uuid.UUID, limit, offset int) ([]*analytics.ReconciliationBatchMetrics, error)
-
-	// Reconciliation Daily Stats
-	UpsertReconciliationDailyStats(ctx context.Context, db DBTX, stats *analytics.ReconciliationDailyStats) error
-	GetReconciliationDailyStats(ctx context.Context, db DBTX, companyID uuid.UUID, reconciliationType string, date time.Time) (*analytics.ReconciliationDailyStats, error)
-	ListReconciliationDailyStats(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDailyStats, error)
-
-	// Reconciliation Difference Trends
-	InsertReconciliationDiffTrend(ctx context.Context, db DBTX, trend *analytics.ReconciliationDiffTrends) error
-	ListReconciliationDiffTrends(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDiffTrends, error)
 	// Cashflow
 	UpsertCashflow(ctx context.Context, db DBTX, cashflow *analytics.Cashflow) error
 	GetCashflow(ctx context.Context, db DBTX, cashflowID uuid.UUID) (*analytics.Cashflow, error)
@@ -124,6 +106,28 @@ type AnalyticsRepository interface {
 	ListCashflows(ctx context.Context, db DBTX, filter CashflowFilter, p Pagination, s Sort) ([]*analytics.Cashflow, error)
 	DeleteCashflow(ctx context.Context, db DBTX, cashflowID uuid.UUID) error
 	DeleteCashflowsByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) error
+	TryMarkEventProcessed(
+		ctx context.Context,
+		db DBTX,
+		eventID string,
+		consumerGroup string,
+	) (bool, error) // Snapshot Calculation
+	CalculateAndStoreSnapshotBulk(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
+
+	// Reconciliation Analytics
+	GetReconciliationBatchMetrics(ctx context.Context, db DBTX, batchID uuid.UUID) (*analytics.ReconciliationBatchMetrics, error)
+	ListReconciliationBatchMetrics(ctx context.Context, db DBTX, companyID uuid.UUID, limit, offset int) ([]*analytics.ReconciliationBatchMetrics, error)
+	UpsertReconciliationDailyStats(ctx context.Context, db DBTX, stats *analytics.ReconciliationDailyStats) error
+	GetReconciliationDailyStats(ctx context.Context, db DBTX, companyID uuid.UUID, reconciliationType string, date time.Time) (*analytics.ReconciliationDailyStats, error)
+	ListReconciliationDailyStats(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDailyStats, error)
+	InsertReconciliationDiffTrend(ctx context.Context, db DBTX, trend *analytics.ReconciliationDiffTrends) error
+	ListReconciliationDiffTrends(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate time.Time) ([]*analytics.ReconciliationDiffTrends, error)
+
+	// === NEW METHODS (Source of truth from ledger) ===
+	GetAccountBalanceFromLedger(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, asOf time.Time) (decimal.Decimal, error)
+	GetTrialBalance(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate time.Time) ([]*models.TrialBalanceRow, error)
+	GetAccountBalanceByFiscalPeriod(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) (decimal.Decimal, error)
+	RecomputeRunningBalance(ctx context.Context, db DBTX, accountID uuid.UUID) error
 }
 
 // =====================================================
@@ -134,7 +138,6 @@ type analyticsRepository struct {
 	logger *zap.Logger
 }
 
-// NewAnalyticsRepository creates a new analytics repository instance
 func NewAnalyticsRepository(logger *zap.Logger) AnalyticsRepository {
 	return &analyticsRepository{
 		logger: logger.Named("analytics_repo"),
@@ -142,10 +145,9 @@ func NewAnalyticsRepository(logger *zap.Logger) AnalyticsRepository {
 }
 
 // =====================================================
-// HELPERS
+// HELPERS (sort & pagination)
 // =====================================================
 
-// allowed sort fields for each entity
 var allowedDailySummarySortFields = map[string]bool{
 	"date":         true,
 	"total_debit":  true,
@@ -230,8 +232,7 @@ func (r *analyticsRepository) UpsertDailySummary(ctx context.Context, db DBTX, s
 		DO UPDATE SET
 			total_debit = EXCLUDED.total_debit,
 			total_credit = EXCLUDED.total_credit,
-			transaction_count = EXCLUDED.transaction_count,
-			created_at = NOW()
+			transaction_count = EXCLUDED.transaction_count
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -263,7 +264,7 @@ func (r *analyticsRepository) GetDailySummary(ctx context.Context, db DBTX, summ
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get daily summary",
 			util.String("summary_id", summaryID.String()),
@@ -287,7 +288,7 @@ func (r *analyticsRepository) GetDailySummaryByKey(ctx context.Context, db DBTX,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get daily summary by key",
 			util.String("company_id", companyID.String()),
@@ -363,6 +364,25 @@ func (r *analyticsRepository) DeleteDailySummariesByCompany(ctx context.Context,
 	return nil
 }
 
+func (r *analyticsRepository) InvalidateDailySummaries(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate *time.Time) error {
+	query := `
+		DELETE FROM accounting.analytics_daily_account_summary
+		WHERE company_id = $1
+		  AND ($2::date IS NULL OR date >= $2)
+		  AND ($3::date IS NULL OR date <= $3)
+	`
+	_, err := db.ExecContext(ctx, query, companyID, fromDate, toDate)
+	if err != nil {
+		r.logger.Error("failed to invalidate daily summaries",
+			util.String("company_id", companyID.String()),
+			util.Any("from_date", fromDate),
+			util.Any("to_date", toDate),
+			util.ErrorField(err))
+		return fmt.Errorf("invalidate daily summaries: %w", err)
+	}
+	return nil
+}
+
 func (r *analyticsRepository) buildDailySummaryFilter(filter DailySummaryFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
@@ -408,8 +428,7 @@ func (r *analyticsRepository) UpsertSnapshot(ctx context.Context, db DBTX, s *an
 		DO UPDATE SET
 			balance = EXCLUDED.balance,
 			fiscal_year = EXCLUDED.fiscal_year,
-			period = EXCLUDED.period,
-			created_at = NOW()
+			period = EXCLUDED.period
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -441,7 +460,7 @@ func (r *analyticsRepository) GetSnapshot(ctx context.Context, db DBTX, snapshot
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get snapshot",
 			util.String("snapshot_id", snapshotID.String()),
@@ -465,7 +484,7 @@ func (r *analyticsRepository) GetSnapshotByKey(ctx context.Context, db DBTX, com
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get snapshot by key",
 			util.String("company_id", companyID.String()),
@@ -600,8 +619,7 @@ func (r *analyticsRepository) UpsertJournalMetric(ctx context.Context, db DBTX, 
 		ON CONFLICT (company_id, journal_type, date)
 		DO UPDATE SET
 			total_entries = EXCLUDED.total_entries,
-			total_amount = EXCLUDED.total_amount,
-			created_at = NOW()
+			total_amount = EXCLUDED.total_amount
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -609,9 +627,13 @@ func (r *analyticsRepository) UpsertJournalMetric(ctx context.Context, db DBTX, 
 		m.TotalEntries, m.TotalAmount,
 	).Scan(&m.CreatedAt)
 	if err != nil {
+		journalTypeLog := "nil"
+		if m.JournalType != nil {
+			journalTypeLog = *m.JournalType
+		}
 		r.logger.Error("failed to upsert journal metric",
 			util.String("company_id", m.CompanyID.String()),
-			util.String("journal_type", *m.JournalType),
+			util.String("journal_type", journalTypeLog),
 			util.Time("date", m.Date),
 			util.ErrorField(err))
 		return fmt.Errorf("upsert journal metric: %w", err)
@@ -633,7 +655,7 @@ func (r *analyticsRepository) GetJournalMetric(ctx context.Context, db DBTX, met
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal metric",
 			util.String("metric_id", metricID.String()),
@@ -657,7 +679,7 @@ func (r *analyticsRepository) GetJournalMetricByKey(ctx context.Context, db DBTX
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal metric by key",
 			util.String("company_id", companyID.String()),
@@ -778,8 +800,7 @@ func (r *analyticsRepository) UpsertTaxSummary(ctx context.Context, db DBTX, s *
 		DO UPDATE SET
 			total_taxable = EXCLUDED.total_taxable,
 			total_tax = EXCLUDED.total_tax,
-			transaction_count = EXCLUDED.transaction_count,
-			created_at = NOW()
+			transaction_count = EXCLUDED.transaction_count
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -787,9 +808,13 @@ func (r *analyticsRepository) UpsertTaxSummary(ctx context.Context, db DBTX, s *
 		s.TotalTaxable, s.TotalTax, s.TransactionCount,
 	).Scan(&s.CreatedAt)
 	if err != nil {
+		taxRateLog := "nil"
+		if s.TaxRateID != nil {
+			taxRateLog = s.TaxRateID.String()
+		}
 		r.logger.Error("failed to upsert tax summary",
 			util.String("company_id", s.CompanyID.String()),
-			util.String("tax_rate_id", s.TaxRateID.String()),
+			util.String("tax_rate_id", taxRateLog),
 			util.Time("date", s.Date),
 			util.ErrorField(err))
 		return fmt.Errorf("upsert tax summary: %w", err)
@@ -811,7 +836,7 @@ func (r *analyticsRepository) GetTaxSummary(ctx context.Context, db DBTX, summar
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax summary",
 			util.String("summary_id", summaryID.String()),
@@ -835,11 +860,15 @@ func (r *analyticsRepository) GetTaxSummaryByKey(ctx context.Context, db DBTX, c
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
+		}
+		taxRateLog := "nil"
+		if taxRateID != nil {
+			taxRateLog = taxRateID.String()
 		}
 		r.logger.Error("failed to get tax summary by key",
 			util.String("company_id", companyID.String()),
-			util.String("tax_rate_id", taxRateID.String()),
+			util.String("tax_rate_id", taxRateLog),
 			util.Time("date", date),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get tax summary by key: %w", err)
@@ -911,6 +940,25 @@ func (r *analyticsRepository) DeleteTaxSummariesByCompany(ctx context.Context, d
 	return nil
 }
 
+func (r *analyticsRepository) InvalidateTaxSummaries(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate *time.Time) error {
+	query := `
+		DELETE FROM accounting.analytics_tax_summary
+		WHERE company_id = $1
+		  AND ($2::date IS NULL OR date >= $2)
+		  AND ($3::date IS NULL OR date <= $3)
+	`
+	_, err := db.ExecContext(ctx, query, companyID, fromDate, toDate)
+	if err != nil {
+		r.logger.Error("failed to invalidate tax summaries",
+			util.String("company_id", companyID.String()),
+			util.Any("from_date", fromDate),
+			util.Any("to_date", toDate),
+			util.ErrorField(err))
+		return fmt.Errorf("invalidate tax summaries: %w", err)
+	}
+	return nil
+}
+
 func (r *analyticsRepository) buildTaxSummaryFilter(filter TaxSummaryFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
@@ -954,8 +1002,7 @@ func (r *analyticsRepository) UpsertCashflow(ctx context.Context, db DBTX, c *an
 		ON CONFLICT (company_id, date)
 		DO UPDATE SET
 			inflow = EXCLUDED.inflow,
-			outflow = EXCLUDED.outflow,
-			created_at = NOW()
+			outflow = EXCLUDED.outflow
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -983,7 +1030,7 @@ func (r *analyticsRepository) GetCashflow(ctx context.Context, db DBTX, cashflow
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get cashflow",
 			util.String("cashflow_id", cashflowID.String()),
@@ -1005,7 +1052,7 @@ func (r *analyticsRepository) GetCashflowByKey(ctx context.Context, db DBTX, com
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get cashflow by key",
 			util.String("company_id", companyID.String()),
@@ -1104,79 +1151,18 @@ func (r *analyticsRepository) buildCashflowFilter(filter CashflowFilter) (string
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// CalculateAndStoreSnapshot computes account balances up to snapshotDate and stores them as snapshots.
-// This is the original per‑account loop version (kept for backward compatibility).
-func (r *analyticsRepository) CalculateAndStoreSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error {
-	// Get all distinct accounts that have activity up to snapshotDate
-	query := `
-		SELECT DISTINCT account_id
-		FROM accounting.analytics_daily_account_summary
-		WHERE company_id = $1 AND date <= $2
-	`
-	rows, err := db.QueryContext(ctx, query, companyID, snapshotDate)
-	if err != nil {
-		return fmt.Errorf("fetch accounts for snapshot: %w", err)
-	}
-	defer rows.Close()
-
-	var accountIDs []uuid.UUID
-	for rows.Next() {
-		var aid uuid.UUID
-		if err := rows.Scan(&aid); err != nil {
-			return err
-		}
-		accountIDs = append(accountIDs, aid)
-	}
-	if err = rows.Err(); err != nil {
-		return err
-	}
-
-	// For each account, compute cumulative balance up to snapshotDate
-	for _, accID := range accountIDs {
-		balanceQuery := `
-			SELECT COALESCE(SUM(total_debit - total_credit), 0)
-			FROM accounting.analytics_daily_account_summary
-			WHERE company_id = $1 AND account_id = $2 AND date <= $3
-		`
-		var balance decimal.Decimal
-		err = db.QueryRowContext(ctx, balanceQuery, companyID, accID, snapshotDate).Scan(&balance)
-		if err != nil {
-			r.logger.Error("failed to compute balance for account",
-				zap.String("account_id", accID.String()),
-				zap.Error(err))
-			continue
-		}
-
-		snapshot := &analytics.AccountSnapshot{
-			SnapshotID:   uuid.New(),
-			CompanyID:    companyID,
-			AccountID:    accID,
-			SnapshotDate: snapshotDate,
-			Balance:      balance,
-			// FiscalYear and Period can be derived if needed – skip for now
-		}
-		if err := r.UpsertSnapshot(ctx, db, snapshot); err != nil {
-			r.logger.Error("failed to upsert snapshot",
-				zap.String("account_id", accID.String()),
-				zap.Error(err))
-		}
-	}
-	return nil
-}
-
 // =====================================================
-// NEW: BULK SNAPSHOT CALCULATION (OPTIMISED)
+// 6. BULK SNAPSHOT CALCULATION (CORRECTED)
 // =====================================================
+
 // CalculateAndStoreSnapshotBulk computes account balances up to snapshotDate for ALL accounts
-// in a single INSERT … SELECT statement, respecting account type direction.
+// using a single INSERT ... SELECT with proper account‑type logic and posted filtering.
 func (r *analyticsRepository) CalculateAndStoreSnapshotBulk(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error {
-	// Single query: compute cumulative balance for every account of the company,
-	// then upsert into snapshots table.
 	query := `
 		INSERT INTO accounting.analytics_account_snapshots (snapshot_id, company_id, account_id, snapshot_date, balance, created_at)
 		SELECT
 			gen_random_uuid(),
-			$1,
+			a.company_id,
 			a.account_id,
 			$2,
 			COALESCE(SUM(
@@ -1187,12 +1173,14 @@ func (r *analyticsRepository) CalculateAndStoreSnapshotBulk(ctx context.Context,
 			), 0) AS balance,
 			NOW()
 		FROM accounting.accounts a
-		LEFT JOIN accounting.journal_lines jl ON a.account_id = jl.account_id
-		LEFT JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
+		JOIN accounting.journal_lines jl ON a.account_id = jl.account_id
+		JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
+			AND je.company_id = a.company_id
 			AND je.status = 'posted'
 			AND je.entry_date <= $2
-		WHERE a.company_id = $1 AND a.deleted_at IS NULL
-		GROUP BY a.account_id
+		WHERE a.company_id = $1
+		  AND a.deleted_at IS NULL
+		GROUP BY a.company_id, a.account_id
 		ON CONFLICT (company_id, account_id, snapshot_date)
 		DO UPDATE SET
 			balance = EXCLUDED.balance,
@@ -1201,16 +1189,16 @@ func (r *analyticsRepository) CalculateAndStoreSnapshotBulk(ctx context.Context,
 	_, err := db.ExecContext(ctx, query, companyID, snapshotDate)
 	if err != nil {
 		r.logger.Error("failed to calculate and store snapshots in bulk",
-			zap.String("company_id", companyID.String()),
-			zap.Time("snapshot_date", snapshotDate),
-			zap.Error(err))
+			util.String("company_id", companyID.String()),
+			util.Time("snapshot_date", snapshotDate),
+			util.ErrorField(err))
 		return fmt.Errorf("bulk snapshot calculation: %w", err)
 	}
 	return nil
 }
 
 // =====================================================
-// 6. RECONCILIATION BATCH METRICS
+// 7. RECONCILIATION BATCH METRICS
 // =====================================================
 
 func (r *analyticsRepository) GetReconciliationBatchMetrics(ctx context.Context, db DBTX, batchID uuid.UUID) (*analytics.ReconciliationBatchMetrics, error) {
@@ -1233,7 +1221,7 @@ func (r *analyticsRepository) GetReconciliationBatchMetrics(ctx context.Context,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get reconciliation batch metrics: %w", err)
 	}
@@ -1277,7 +1265,7 @@ func (r *analyticsRepository) ListReconciliationBatchMetrics(ctx context.Context
 }
 
 // =====================================================
-// 7. RECONCILIATION DAILY STATS
+// 8. RECONCILIATION DAILY STATS
 // =====================================================
 
 func (r *analyticsRepository) UpsertReconciliationDailyStats(ctx context.Context, db DBTX, stats *analytics.ReconciliationDailyStats) error {
@@ -1344,7 +1332,7 @@ func (r *analyticsRepository) GetReconciliationDailyStats(ctx context.Context, d
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get reconciliation daily stats: %w", err)
 	}
@@ -1391,7 +1379,7 @@ func (r *analyticsRepository) ListReconciliationDailyStats(ctx context.Context, 
 }
 
 // =====================================================
-// 8. RECONCILIATION DIFFERENCE TRENDS
+// 9. RECONCILIATION DIFFERENCE TRENDS (UPDATED TO DECIMAL)
 // =====================================================
 
 func (r *analyticsRepository) InsertReconciliationDiffTrend(ctx context.Context, db DBTX, trend *analytics.ReconciliationDiffTrends) error {
@@ -1440,23 +1428,167 @@ func (r *analyticsRepository) ListReconciliationDiffTrends(ctx context.Context, 
 	return results, nil
 }
 
-// InvalidateTaxSummaries deletes tax summaries for a company within an optional date range.
-// If toDate is nil, deletes from fromDate to the latest date present.
-func (r *analyticsRepository) InvalidateTaxSummaries(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate *time.Time) error {
+// =====================================================
+// 10. NEW METHODS (Source of truth from ledger)
+// =====================================================
+
+// GetAccountBalanceFromLedger returns the net balance of an account up to a given date,
+// respecting the account type direction.
+func (r *analyticsRepository) GetAccountBalanceFromLedger(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, asOf time.Time) (decimal.Decimal, error) {
 	query := `
-		DELETE FROM accounting.analytics_tax_summary
-		WHERE company_id = $1
-		  AND ($2::date IS NULL OR date >= $2)
-		  AND ($3::date IS NULL OR date <= $3)
+		SELECT COALESCE(SUM(
+			CASE
+				WHEN a.account_type IN ('asset', 'expense') THEN le.debit_amount - le.credit_amount
+				ELSE le.credit_amount - le.debit_amount
+			END
+		), 0)
+		FROM accounting.ledger_entries le
+		JOIN accounting.accounts a ON le.account_id = a.account_id
+		WHERE le.company_id = $1
+		  AND le.account_id = $2
+		  AND le.entry_date <= $3
 	`
-	_, err := db.ExecContext(ctx, query, companyID, fromDate, toDate)
+	var balance decimal.Decimal
+	err := db.QueryRowContext(ctx, query, companyID, accountID, asOf).Scan(&balance)
 	if err != nil {
-		r.logger.Error("failed to invalidate tax summaries",
-			zap.String("company_id", companyID.String()),
-			zap.Any("from_date", fromDate),
-			zap.Any("to_date", toDate),
-			zap.Error(err))
-		return fmt.Errorf("invalidate tax summaries: %w", err)
+		r.logger.Error("failed to get account balance from ledger",
+			util.String("company_id", companyID.String()),
+			util.String("account_id", accountID.String()),
+			util.Time("as_of", asOf),
+			util.ErrorField(err))
+		return decimal.Zero, fmt.Errorf("get account balance from ledger: %w", err)
+	}
+	return balance, nil
+}
+
+// GetTrialBalance returns debit/credit totals per account for a period.
+func (r *analyticsRepository) GetTrialBalance(ctx context.Context, db DBTX, companyID uuid.UUID, fromDate, toDate time.Time) ([]*models.TrialBalanceRow, error) {
+	query := `
+		SELECT
+			a.account_id,
+			a.account_name,
+			COALESCE(SUM(jl.debit_amount), 0) AS debit_total,
+			COALESCE(SUM(jl.credit_amount), 0) AS credit_total,
+			CASE
+				WHEN a.account_type IN ('asset', 'expense') THEN
+					COALESCE(SUM(jl.debit_amount), 0) - COALESCE(SUM(jl.credit_amount), 0)
+				ELSE
+					COALESCE(SUM(jl.credit_amount), 0) - COALESCE(SUM(jl.debit_amount), 0)
+			END AS balance
+		FROM accounting.accounts a
+		LEFT JOIN accounting.journal_lines jl ON a.account_id = jl.account_id
+		LEFT JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
+			AND je.status = 'posted'
+			AND je.entry_date BETWEEN $2 AND $3
+		WHERE a.company_id = $1 AND a.deleted_at IS NULL
+		GROUP BY a.account_id, a.account_name, a.account_type
+		ORDER BY a.account_code
+	`
+	rows, err := db.QueryContext(ctx, query, companyID, fromDate, toDate)
+	if err != nil {
+		r.logger.Error("failed to get trial balance",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get trial balance: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*models.TrialBalanceRow
+	for rows.Next() {
+		var row models.TrialBalanceRow
+		err := rows.Scan(&row.AccountID, &row.AccountName, &row.DebitTotal, &row.CreditTotal, &row.Balance)
+		if err != nil {
+			return nil, fmt.Errorf("scan trial balance row: %w", err)
+		}
+		results = append(results, &row)
+	}
+	return results, nil
+}
+
+// GetAccountBalanceByFiscalPeriod returns balance for a specific fiscal year and period.
+func (r *analyticsRepository) GetAccountBalanceByFiscalPeriod(ctx context.Context, db DBTX, companyID, accountID uuid.UUID, fiscalYear, period int) (decimal.Decimal, error) {
+	query := `
+		SELECT closing_balance
+		FROM accounting.account_balances
+		WHERE company_id = $1 AND account_id = $2 AND fiscal_year = $3 AND period = $4
+	`
+	var balance decimal.Decimal
+	err := db.QueryRowContext(ctx, query, companyID, accountID, fiscalYear, period).Scan(&balance)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return decimal.Zero, nil // no balance recorded yet, treat as zero
+		}
+		r.logger.Error("failed to get balance by fiscal period",
+			util.String("company_id", companyID.String()),
+			util.String("account_id", accountID.String()),
+			util.Int("fiscal_year", fiscalYear),
+			util.Int("period", period),
+			util.ErrorField(err))
+		return decimal.Zero, fmt.Errorf("get balance by fiscal period: %w", err)
+	}
+	return balance, nil
+}
+
+// RecomputeRunningBalance recomputes the running_balance column for a given account
+// over all its ledger entries, ordered by entry_date and created_at.
+func (r *analyticsRepository) RecomputeRunningBalance(ctx context.Context, db DBTX, accountID uuid.UUID) error {
+	query := `
+		WITH ordered AS (
+			SELECT ledger_entry_id,
+			       debit_amount,
+			       credit_amount,
+			       ROW_NUMBER() OVER (ORDER BY entry_date, created_at, ledger_entry_id) AS rn
+			FROM accounting.ledger_entries
+			WHERE account_id = $1
+		),
+		balanced AS (
+			SELECT ledger_entry_id,
+			       debit_amount,
+			       credit_amount,
+			       SUM(debit_amount - credit_amount) OVER (ORDER BY rn) AS running
+			FROM ordered
+		)
+		UPDATE accounting.ledger_entries
+		SET running_balance = balanced.running
+		FROM balanced
+		WHERE ledger_entries.ledger_entry_id = balanced.ledger_entry_id
+	`
+	_, err := db.ExecContext(ctx, query, accountID)
+	if err != nil {
+		r.logger.Error("failed to recompute running balance",
+			util.String("account_id", accountID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("recompute running balance: %w", err)
 	}
 	return nil
+}
+
+// =====================================================
+// 11. KAFKA IDEMPOTENCY
+// =====================================================
+func (r *analyticsRepository) TryMarkEventProcessed(
+	ctx context.Context,
+	db DBTX,
+	eventID string,
+	consumerGroup string,
+) (bool, error) {
+
+	query := `
+		INSERT INTO accounting.processed_events (event_id, consumer_group)
+		VALUES ($1, $2)
+		ON CONFLICT (event_id, consumer_group) DO NOTHING
+		RETURNING event_id
+	`
+
+	var id string
+	err := db.QueryRowContext(ctx, query, eventID, consumerGroup).Scan(&id)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil // already processed
+		}
+		return false, err
+	}
+
+	return true, nil // first time
 }

@@ -240,6 +240,7 @@ func (s *examService) CreateExam(ctx context.Context, req CreateExamRequest) (*m
 		AggregateType: "exam",
 		AggregateID:   exam.ExamID.String(),
 		EventType:     string(EventExamCreated),
+		Topic:         TopicExam, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -372,6 +373,7 @@ func (s *examService) UpdateExam(ctx context.Context, req UpdateExamRequest) (*m
 		AggregateType: "exam",
 		AggregateID:   exam.ExamID.String(),
 		EventType:     string(EventExamUpdated),
+		Topic:         TopicExam, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -425,6 +427,7 @@ func (s *examService) DeleteExam(ctx context.Context, id uuid.UUID, deletedBy *u
 		AggregateType: "exam",
 		AggregateID:   id.String(),
 		EventType:     string(EventExamDeleted),
+		Topic:         TopicExam, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -522,6 +525,7 @@ func (s *examService) CreateExamSchedule(ctx context.Context, req CreateExamSche
 		AggregateType: "exam_schedule",
 		AggregateID:   schedule.ScheduleID.String(),
 		EventType:     string(EventExamScheduleCreated),
+		Topic:         TopicExamSchedule, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -636,6 +640,7 @@ func (s *examService) UpdateExamSchedule(ctx context.Context, req UpdateExamSche
 		AggregateType: "exam_schedule",
 		AggregateID:   schedule.ScheduleID.String(),
 		EventType:     string(EventExamScheduleUpdated),
+		Topic:         TopicExamSchedule, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -680,6 +685,7 @@ func (s *examService) DeleteExamSchedule(ctx context.Context, id uuid.UUID) erro
 		AggregateType: "exam_schedule",
 		AggregateID:   id.String(),
 		EventType:     string(EventExamScheduleDeleted),
+		Topic:         TopicExamSchedule, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -792,6 +798,7 @@ func (s *examService) CreateExamResult(ctx context.Context, req CreateExamResult
 		AggregateType: "exam_result",
 		AggregateID:   result.ResultID.String(),
 		EventType:     string(EventExamResultCreated),
+		Topic:         TopicExamResult, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -929,6 +936,7 @@ func (s *examService) BulkCreateExamResults(ctx context.Context, reqs []CreateEx
 			AggregateType: "exam_result",
 			AggregateID:   res.ResultID.String(),
 			EventType:     string(EventExamResultCreated),
+			Topic:         TopicExamResult, // <-- ADDED
 			Payload:       payload,
 			Status:        "pending",
 		}
@@ -1038,6 +1046,7 @@ func (s *examService) UpdateExamResult(ctx context.Context, req UpdateExamResult
 		AggregateType: "exam_result",
 		AggregateID:   res.ResultID.String(),
 		EventType:     string(EventExamResultUpdated),
+		Topic:         TopicExamResult, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1082,6 +1091,7 @@ func (s *examService) DeleteExamResult(ctx context.Context, id uuid.UUID) error 
 		AggregateType: "exam_result",
 		AggregateID:   id.String(),
 		EventType:     string(EventExamResultDeleted),
+		Topic:         TopicExamResult, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1168,6 +1178,7 @@ func (s *examService) CreateExamGrade(ctx context.Context, req CreateExamGradeRe
 		AggregateType: "exam_grade",
 		AggregateID:   grade.GradeID.String(),
 		EventType:     string(EventExamGradeCreated),
+		Topic:         TopicExamGrade, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1269,6 +1280,7 @@ func (s *examService) UpdateExamGrade(ctx context.Context, req UpdateExamGradeRe
 		AggregateType: "exam_grade",
 		AggregateID:   grade.GradeID.String(),
 		EventType:     string(EventExamGradeUpdated),
+		Topic:         TopicExamGrade, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1313,6 +1325,7 @@ func (s *examService) DeleteExamGrade(ctx context.Context, id uuid.UUID) error {
 		AggregateType: "exam_grade",
 		AggregateID:   id.String(),
 		EventType:     string(EventExamGradeDeleted),
+		Topic:         TopicExamGrade, // <-- ADDED
 		Payload:       payload,
 		Status:        "pending",
 	}

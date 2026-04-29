@@ -15,6 +15,13 @@ import (
 	"auth-service/internal/accounting/service"
 )
 
+// APIResponse standardises all HTTP responses
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
 type ReportHandler struct {
 	querySvc *service.AccountingQueryService
 	logger   *zap.Logger
@@ -28,13 +35,8 @@ func NewReportHandler(querySvc *service.AccountingQueryService, logger *zap.Logg
 }
 
 // ------------------------------
-// Trial Balance
+// Trial Balance (GET with query params)
 // ------------------------------
-type trialBalanceRequest struct {
-	FiscalYear int `json:"fiscal_year"`
-	Period     int `json:"period"`
-}
-
 func (h *ReportHandler) GetTrialBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := h.parseCompanyID(r)
@@ -48,27 +50,22 @@ func (h *ReportHandler) GetTrialBalance(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var req trialBalanceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+	fiscalYear, period, err := h.parseYearPeriod(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if req.FiscalYear == 0 || req.Period == 0 {
-		h.respondWithError(w, http.StatusBadRequest, "fiscal_year and period are required")
-		return
-	}
-
-	entries, totalDebit, totalCredit, err := h.querySvc.GetTrialBalance(ctx, companyID, req.FiscalYear, req.Period)
+	entries, totalDebit, totalCredit, err := h.querySvc.GetTrialBalance(ctx, companyID, fiscalYear, period)
 	if err != nil {
 		h.logger.Error("failed to get trial balance", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve trial balance")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"entries":      entries,
 			"total_debit":  totalDebit.String(),
 			"total_credit": totalCredit.String(),
@@ -77,7 +74,7 @@ func (h *ReportHandler) GetTrialBalance(w http.ResponseWriter, r *http.Request) 
 }
 
 // ------------------------------
-// General Ledger
+// General Ledger (with optional end_date)
 // ------------------------------
 func (h *ReportHandler) GetGeneralLedger(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -108,9 +105,19 @@ func (h *ReportHandler) GetGeneralLedger(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid start_date")
 		return
 	}
-	endDate, err := h.parseDateParam(r, "end_date")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+
+	// end_date is optional: default to today
+	endDate := time.Now()
+	if endDateStr := r.URL.Query().Get("end_date"); endDateStr != "" {
+		endDate, err = time.Parse("2006-01-02", endDateStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+			return
+		}
+	}
+
+	if endDate.Before(startDate) {
+		h.respondWithError(w, http.StatusBadRequest, "end_date must be after start_date")
 		return
 	}
 
@@ -121,9 +128,9 @@ func (h *ReportHandler) GetGeneralLedger(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"opening_balance": openingBalance.String(),
 			"entries":         entries,
 		},
@@ -159,9 +166,9 @@ func (h *ReportHandler) GetBalanceSheet(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"assets":            assets,
 			"liabilities":       liabilities,
 			"equity":            equity,
@@ -173,13 +180,8 @@ func (h *ReportHandler) GetBalanceSheet(w http.ResponseWriter, r *http.Request) 
 }
 
 // ------------------------------
-// Income Statement
+// Income Statement (GET with query params)
 // ------------------------------
-type incomeStatementRequest struct {
-	FiscalYear int `json:"fiscal_year"`
-	Period     int `json:"period"`
-}
-
 func (h *ReportHandler) GetIncomeStatement(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := h.parseCompanyID(r)
@@ -193,27 +195,22 @@ func (h *ReportHandler) GetIncomeStatement(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	var req incomeStatementRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+	fiscalYear, period, err := h.parseYearPeriod(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if req.FiscalYear == 0 || req.Period == 0 {
-		h.respondWithError(w, http.StatusBadRequest, "fiscal_year and period are required")
-		return
-	}
-
-	revenues, expenses, totalRevenue, totalExpense, netIncome, err := h.querySvc.GetIncomeStatement(ctx, companyID, req.FiscalYear, req.Period)
+	revenues, expenses, totalRevenue, totalExpense, netIncome, err := h.querySvc.GetIncomeStatement(ctx, companyID, fiscalYear, period)
 	if err != nil {
 		h.logger.Error("failed to get income statement", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve income statement")
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"revenues":      revenues,
 			"expenses":      expenses,
 			"total_revenue": totalRevenue.String(),
@@ -224,7 +221,7 @@ func (h *ReportHandler) GetIncomeStatement(w http.ResponseWriter, r *http.Reques
 }
 
 // ------------------------------
-// Cash Flow Statement
+// Cash Flow Statement (optional end_date)
 // ------------------------------
 func (h *ReportHandler) GetCashFlowStatement(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -244,9 +241,18 @@ func (h *ReportHandler) GetCashFlowStatement(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid start_date")
 		return
 	}
-	endDate, err := h.parseDateParam(r, "end_date")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+
+	endDate := time.Now()
+	if endDateStr := r.URL.Query().Get("end_date"); endDateStr != "" {
+		endDate, err = time.Parse("2006-01-02", endDateStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid end_date")
+			return
+		}
+	}
+
+	if endDate.Before(startDate) {
+		h.respondWithError(w, http.StatusBadRequest, "end_date must be after start_date")
 		return
 	}
 
@@ -257,9 +263,9 @@ func (h *ReportHandler) GetCashFlowStatement(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"operating": operating.String(),
 			"investing": investing.String(),
 			"financing": financing.String(),
@@ -294,6 +300,11 @@ func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if endDate.Before(startDate) {
+		h.respondWithError(w, http.StatusBadRequest, "end_date must be after start_date")
+		return
+	}
+
 	results, totalTax, err := h.querySvc.GetTaxSummary(ctx, companyID, startDate, endDate)
 	if err != nil {
 		h.logger.Error("failed to get tax summary", zap.Error(err))
@@ -301,9 +312,9 @@ func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"breakdown": results,
 			"total_tax": totalTax.String(),
 		},
@@ -341,9 +352,9 @@ func (h *ReportHandler) ListComplianceReturns(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
 			"items":  summaries,
 			"total":  total,
 			"limit":  limit,
@@ -353,7 +364,78 @@ func (h *ReportHandler) ListComplianceReturns(w http.ResponseWriter, r *http.Req
 }
 
 // ------------------------------
-// Helpers (same as AcademicYearHandler)
+// NEW: Get Journal with Lines
+// ------------------------------
+// GetJournal retrieves a single journal entry with its lines.
+func (h *ReportHandler) GetJournal(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// FIXED: Use "id" instead of "journalID" to match the route parameter.
+	journalIDStr := chi.URLParam(r, "id")
+	journalID, err := uuid.Parse(journalIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid journal id")
+		return
+	}
+
+	entry, lines, err := h.querySvc.GetJournalEntryWithLines(ctx, journalID)
+	if err != nil {
+		h.logger.Error("failed to get journal", zap.Error(err))
+		h.respondWithError(w, http.StatusNotFound, "journal not found")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"entry": entry,
+			"lines": lines,
+		},
+	})
+}
+
+// ------------------------------
+// NEW: Get Account Balance
+// ------------------------------
+func (h *ReportHandler) GetAccountBalance(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	companyID, err := h.parseCompanyID(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	accountIDStr := r.URL.Query().Get("account_id")
+	accountID, err := uuid.Parse(accountIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid account_id")
+		return
+	}
+
+	asOf, err := h.parseDateParam(r, "as_of")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid as_of")
+		return
+	}
+
+	balance, err := h.querySvc.GetAccountBalance(ctx, companyID, accountID, asOf)
+	if err != nil {
+		h.logger.Error("failed to get account balance", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "failed to get balance")
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"balance": balance.String(),
+		},
+	})
+}
+
+// ------------------------------
+// Helpers
 // ------------------------------
 func (h *ReportHandler) parseCompanyID(r *http.Request) (uuid.UUID, error) {
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -369,6 +451,25 @@ func (h *ReportHandler) parseDateParam(r *http.Request, param string) (time.Time
 		return time.Time{}, fmt.Errorf("missing %s", param)
 	}
 	return time.Parse("2006-01-02", val)
+}
+
+// parseYearPeriod extracts fiscal_year and period from query params
+func (h *ReportHandler) parseYearPeriod(r *http.Request) (int, int, error) {
+	yearStr := r.URL.Query().Get("fiscal_year")
+	periodStr := r.URL.Query().Get("period")
+
+	fiscalYear, err := strconv.Atoi(yearStr)
+	if err != nil || fiscalYear == 0 {
+		return 0, 0, fmt.Errorf("invalid or missing fiscal_year")
+	}
+	period, err := strconv.Atoi(periodStr)
+	if err != nil || period == 0 {
+		return 0, 0, fmt.Errorf("invalid or missing period")
+	}
+	if period < 1 || period > 12 {
+		return 0, 0, fmt.Errorf("period must be between 1 and 12")
+	}
+	return fiscalYear, period, nil
 }
 
 func (h *ReportHandler) parsePagination(r *http.Request) (limit, offset int) {
@@ -388,7 +489,7 @@ func (h *ReportHandler) parsePagination(r *http.Request) (limit, offset int) {
 }
 
 func (h *ReportHandler) checkPermission(ctx context.Context, companyID uuid.UUID, permission string) error {
-	// In real implementation, fetch user from context and check RBAC.
+	// TODO: Implement RBAC with user from context.
 	// For now, stub returning nil (allowed).
 	return nil
 }
@@ -402,8 +503,8 @@ func (h *ReportHandler) respondWithJSON(w http.ResponseWriter, status int, data 
 }
 
 func (h *ReportHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
+	h.respondWithJSON(w, status, APIResponse{
+		Success: false,
+		Error:   message,
 	})
 }

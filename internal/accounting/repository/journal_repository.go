@@ -9,12 +9,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq" // for PostgreSQL error codes
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting/models"
 	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/util"
 )
+
+// =============================================================================
+// Custom errors are now defined in errors.go (shared with service)
+// =============================================================================
 
 // JournalFilter defines filter criteria for listing journal entries
 type JournalFilter struct {
@@ -33,18 +39,28 @@ type JournalWithLines struct {
 	Lines []*models.JournalLine
 }
 
+// JournalSummary aggregates info for a journal (avoid multiple queries)
+type JournalSummary struct {
+	TotalLines  int
+	TotalDebit  decimal.Decimal
+	TotalCredit decimal.Decimal
+	IsBalanced  bool
+}
+
 // JournalRepository defines the interface for journal data access
 type JournalRepository interface {
 	// =====================================================
 	// JOURNAL ENTRY (HEADER)
 	// =====================================================
 	Create(ctx context.Context, db DBTX, j *models.JournalEntry) error
+	CreateOrGetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID, builder func() *models.JournalEntry) (*models.JournalEntry, bool, error)
+
 	Update(ctx context.Context, db DBTX, j *models.JournalEntry) error
 
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error)
-
 	GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error)
+	GetBySourceForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error)
 
 	List(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*models.JournalEntry, error)
 	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.JournalEntry, error)
@@ -62,6 +78,12 @@ type JournalRepository interface {
 	Post(ctx context.Context, db DBTX, id uuid.UUID, postedBy *uuid.UUID) error
 	Reverse(ctx context.Context, db DBTX, originalID uuid.UUID, reversal *models.JournalEntry) error
 
+	// Optimised status checks
+	EnsureDraft(ctx context.Context, db DBTX, id uuid.UUID) error
+	EnsurePosted(ctx context.Context, db DBTX, id uuid.UUID) error
+
+	HasReversal(ctx context.Context, db DBTX, originalID uuid.UUID) (bool, error)
+
 	// =====================================================
 	// JOURNAL LINES
 	// =====================================================
@@ -76,30 +98,37 @@ type JournalRepository interface {
 	ClearLines(ctx context.Context, db DBTX, journalID uuid.UUID) error
 
 	// =====================================================
-	// VALIDATION (CRITICAL)
+	// VALIDATION (DB‑driven, repo provides helpers)
 	// =====================================================
-	IsBalanced(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, float64, float64, error)
+	IsBalanced(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, decimal.Decimal, decimal.Decimal, error)
 
 	ValidateBeforePost(ctx context.Context, db DBTX, journalID uuid.UUID) error
 
 	HasLines(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, error)
 
+	HasLedgerEntries(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, error)
+	ValidateLedgerExists(ctx context.Context, db DBTX, journalID uuid.UUID) error
+
 	// =====================================================
-	// LOCKING (VERY IMPORTANT)
+	// AGGREGATION / PERFORMANCE HELPERS
+	// =====================================================
+	GetJournalSummary(ctx context.Context, db DBTX, journalID uuid.UUID) (*JournalSummary, error)
+
+	// =====================================================
+	// LOCKING
 	// =====================================================
 	LockJournal(ctx context.Context, db DBTX, journalID uuid.UUID) error
+	GetAndLock(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error)
 
 	// =====================================================
-	// SEARCH / REPORT SUPPORT
+	// POSTING / REPORTING
 	// =====================================================
+	GetForPosting(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, []*models.JournalLine, error)
+
 	ListWithLines(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*JournalWithLines, error)
-
 	ListByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) ([]*models.JournalLine, error)
 
-	// =====================================================
-	// AGGREGATION (USED BY LEDGER)
-	// =====================================================
-	SumByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) (debit float64, credit float64, err error)
+	SumByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) (debit decimal.Decimal, credit decimal.Decimal, err error)
 }
 
 // journalRepository implements JournalRepository
@@ -114,7 +143,48 @@ func NewJournalRepository(logger *zap.Logger) JournalRepository {
 	}
 }
 
-// allowed sort fields for journal entries
+// =============================================================================
+// DB error mapping (centralised, uses PostgreSQL error codes when possible)
+// =============================================================================
+func (r *journalRepository) mapDBError(err error, operation string) error {
+	if err == nil {
+		return nil
+	}
+	// Try to extract PostgreSQL error
+	if pqErr, ok := err.(*pq.Error); ok {
+		switch pqErr.Constraint {
+		case "unique_source":
+			return ErrDuplicateSource
+		case "trg_ensure_ledger_on_post":
+			return ErrLedgerMissing
+		case "trg_validate_journal_before_post":
+			return ErrJournalNotBalanced
+		case "trg_no_delete_posted":
+			return ErrCannotDeletePosted
+		case "trg_no_update_posted_lines":
+			return ErrCannotModifyPosted
+		}
+	}
+	// Fallback to string matching
+	errMsg := err.Error()
+	switch {
+	case strings.Contains(errMsg, "unique_source"):
+		return ErrDuplicateSource
+	case strings.Contains(errMsg, "ledger_entries missing"):
+		return ErrLedgerMissing
+	case strings.Contains(errMsg, "not balanced"):
+		return ErrJournalNotBalanced
+	case strings.Contains(errMsg, "Cannot delete posted"):
+		return ErrCannotDeletePosted
+	case strings.Contains(errMsg, "Cannot modify or delete"):
+		return ErrCannotModifyPosted
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+// =============================================================================
+// SORT / PAGINATION / FILTER BUILDERS (unchanged)
+// =============================================================================
 var allowedJournalSortFields = map[string]bool{
 	"entry_date":   true,
 	"created_at":   true,
@@ -124,7 +194,6 @@ var allowedJournalSortFields = map[string]bool{
 	"reference":    true,
 }
 
-// validateSort returns a safe ORDER BY clause
 func (r *journalRepository) validateSort(s Sort) (string, error) {
 	field := s.Field
 	if field == "" {
@@ -140,7 +209,6 @@ func (r *journalRepository) validateSort(s Sort) (string, error) {
 	return fmt.Sprintf("ORDER BY %s %s", field, dir), nil
 }
 
-// validatePagination returns sanitized limit and offset
 func (r *journalRepository) validatePagination(p Pagination) (int, int) {
 	limit := p.Limit
 	if limit <= 0 {
@@ -156,7 +224,6 @@ func (r *journalRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// buildJournalFilter constructs WHERE clause and arguments, excluding soft‑deleted rows
 func (r *journalRepository) buildJournalFilter(filter JournalFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
@@ -194,16 +261,14 @@ func (r *journalRepository) buildJournalFilter(filter JournalFilter) (string, []
 		idx += 2
 	}
 
-	// 🔥 Always exclude soft‑deleted entries
 	conditions = append(conditions, "deleted_at IS NULL")
-
 	if len(conditions) == 0 {
 		return "", args
 	}
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// scanJournalEntry scans a row into a JournalEntry model
+// scanJournalEntry unchanged
 func (r *journalRepository) scanJournalEntry(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*models.JournalEntry, error) {
@@ -260,36 +325,54 @@ func (r *journalRepository) scanJournalEntry(scanner interface {
 	return &j, nil
 }
 
-// Create inserts a new journal entry
+// =============================================================================
+// CREATE (with duplicate source handling)
+// =============================================================================
 func (r *journalRepository) Create(ctx context.Context, db DBTX, j *models.JournalEntry) error {
 	query := `
-		INSERT INTO accounting.journal_entries (
-			journal_entry_id, company_id, journal_type, entry_date,
-			reference, description, status, reversal_of,
-			source_type, source_id,
-			created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12, NOW(), $13, NULL)
-		RETURNING created_at, updated_at
-	`
+        INSERT INTO accounting.journal_entries (
+            journal_entry_id, company_id, journal_type, entry_date,
+            reference, description, status, reversal_of,
+            source_type, source_id,
+            created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12, $13, NOW(), $14, NULL)
+        RETURNING created_at, updated_at
+    `
 	err := db.QueryRowContext(ctx, query,
 		j.JournalEntryID, j.CompanyID, j.JournalType, j.EntryDate,
 		j.Reference, j.Description, j.Status, j.ReversalOf,
 		j.SourceType, j.SourceID,
 		j.PostedAt, j.PostedBy, j.CreatedBy, j.UpdatedBy,
 	).Scan(&j.CreatedAt, &j.UpdatedAt)
+
 	if err != nil {
-		r.logger.Error("failed to create journal entry",
-			util.String("company_id", j.CompanyID.String()),
-			util.String("journal_type", j.JournalType),
-			util.ErrorField(err))
-		return fmt.Errorf("create journal entry: %w", err)
+		return r.mapDBError(err, "create journal entry")
 	}
 	return nil
 }
 
-// Update updates an existing journal entry (only allowed for draft entries, not soft‑deleted)
+// CreateOrGetBySource – idempotent creation
+func (r *journalRepository) CreateOrGetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID, builder func() *models.JournalEntry) (*models.JournalEntry, bool, error) {
+	existing, err := r.GetBySourceForUpdate(ctx, db, companyID, sourceType, sourceID)
+	if err == nil {
+		return existing, false, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+
+	newEntry := builder()
+	if newEntry.CompanyID != companyID || (newEntry.SourceType == nil || *newEntry.SourceType != sourceType) || (newEntry.SourceID == nil || *newEntry.SourceID != sourceID) {
+		return nil, false, errors.New("builder must produce entry with matching company_id, source_type, source_id")
+	}
+	if err := r.Create(ctx, db, newEntry); err != nil {
+		return nil, false, err
+	}
+	return newEntry, true, nil
+}
+
+// Update
 func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.JournalEntry) error {
-	// First check if status is draft and not deleted
 	var status string
 	var deletedAt sql.NullTime
 	checkQuery := `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`
@@ -334,7 +417,7 @@ func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.Journ
 	return nil
 }
 
-// GetByID retrieves a journal entry by ID (only non‑deleted)
+// GetByID, GetByIDForUpdate, GetBySource, GetBySourceForUpdate unchanged
 func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
@@ -347,7 +430,7 @@ func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal entry by ID",
 			util.String("id", id.String()),
@@ -357,7 +440,6 @@ func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	return j, nil
 }
 
-// GetByIDForUpdate retrieves a journal entry with row‑level lock (only non‑deleted)
 func (r *journalRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
@@ -371,7 +453,7 @@ func (r *journalRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal entry for update",
 			util.String("id", id.String()),
@@ -381,7 +463,6 @@ func (r *journalRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	return j, nil
 }
 
-// GetBySource retrieves a journal entry by its source (only non‑deleted)
 func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
@@ -394,7 +475,7 @@ func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID 
 	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, companyID, sourceType, sourceID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get journal entry by source",
 			util.String("company_id", companyID.String()),
@@ -406,9 +487,34 @@ func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID 
 	return j, nil
 }
 
-// List returns a paginated list of journal entries matching the filter (non‑deleted only)
+func (r *journalRepository) GetBySourceForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error) {
+	query := `
+		SELECT journal_entry_id, company_id, journal_type, entry_date,
+		       reference, description, status, reversal_of,
+		       source_type, source_id,
+		       created_at, posted_at, posted_by, created_by, updated_at, updated_by, deleted_at
+		FROM accounting.journal_entries
+		WHERE company_id = $1 AND source_type = $2 AND source_id = $3 AND deleted_at IS NULL
+		FOR UPDATE
+	`
+	j, err := r.scanJournalEntry(db.QueryRowContext(ctx, query, companyID, sourceType, sourceID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		r.logger.Error("failed to get journal entry by source with lock",
+			util.String("company_id", companyID.String()),
+			util.String("source_type", sourceType),
+			util.String("source_id", sourceID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get journal entry by source for update: %w", err)
+	}
+	return j, nil
+}
+
+// List unchanged
 func (r *journalRepository) List(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*models.JournalEntry, error) {
-	where, args := r.buildJournalFilter(filter) // already includes deleted_at IS NULL
+	where, args := r.buildJournalFilter(filter)
 	orderBy, err := r.validateSort(s)
 	if err != nil {
 		return nil, err
@@ -473,14 +579,12 @@ func (r *journalRepository) List(ctx context.Context, db DBTX, filter JournalFil
 	return result, nil
 }
 
-// ListByCompany returns all journal entries for a company (convenience wrapper)
 func (r *journalRepository) ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.JournalEntry, error) {
 	return r.List(ctx, db, JournalFilter{CompanyID: companyID}, Pagination{Limit: 1000}, Sort{Field: "entry_date", Direction: "DESC"})
 }
 
-// Count returns the number of journal entries matching the filter (non‑deleted only)
 func (r *journalRepository) Count(ctx context.Context, db DBTX, filter JournalFilter) (int64, error) {
-	where, args := r.buildJournalFilter(filter) // includes deleted_at IS NULL
+	where, args := r.buildJournalFilter(filter)
 	var query string
 	if filter.AccountID != nil {
 		subWhere := where
@@ -511,9 +615,8 @@ func (r *journalRepository) Count(ctx context.Context, db DBTX, filter JournalFi
 	return count, nil
 }
 
-// Delete performs a soft delete: sets deleted_at and status = 'deleted'
+// Delete
 func (r *journalRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
-	// Check status is draft and not already deleted
 	var status string
 	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, id).Scan(&status, &deletedAt)
@@ -530,27 +633,18 @@ func (r *journalRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, d
 		return fmt.Errorf("cannot delete journal entry with status %s", status)
 	}
 
-	// Soft delete: set deleted_at and status = 'deleted'
 	query := `
 		UPDATE accounting.journal_entries
 		SET deleted_at = NOW(), status = 'deleted', updated_by = $2, updated_at = NOW()
 		WHERE journal_entry_id = $1 AND status = 'draft' AND deleted_at IS NULL
 	`
-	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	_, err = db.ExecContext(ctx, query, id, deletedBy)
 	if err != nil {
-		r.logger.Error("failed to soft delete journal entry",
-			util.String("id", id.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("soft delete journal entry: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("journal entry %s not found, not in draft, or already deleted", id)
+		return r.mapDBError(err, "delete journal entry")
 	}
 	return nil
 }
 
-// ExistsBySource checks if a journal entry already exists for the given source (excluding soft‑deleted)
 func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (bool, error) {
 	query := `
 		SELECT EXISTS (
@@ -575,18 +669,55 @@ func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, company
 	return exists, nil
 }
 
-// UpdateStatus changes the status of a journal entry (only if not soft‑deleted)
-func (r *journalRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, updatedBy *uuid.UUID) error {
+// =============================================================================
+// STATUS TRANSITIONS (uses package-level error)
+// =============================================================================
+var validTransitions = map[string]map[string]bool{
+	enums.JournalStatusDraft: {
+		enums.JournalStatusPosted:  true,
+		enums.JournalStatusDeleted: true,
+	},
+	enums.JournalStatusPosted: {
+		enums.JournalStatusReversed: true,
+	},
+	enums.JournalStatusReversed: {},
+	enums.JournalStatusDeleted:  {},
+}
+
+func isValidStatusTransition(from, to string) bool {
+	if from == to {
+		return true
+	}
+	allowed, ok := validTransitions[from]
+	if !ok {
+		return false
+	}
+	return allowed[to]
+}
+
+func (r *journalRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, newStatus string, updatedBy *uuid.UUID) error {
+	var currentStatus string
+	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1 AND deleted_at IS NULL`, id).Scan(&currentStatus)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("journal entry %s not found", id)
+		}
+		return fmt.Errorf("get status: %w", err)
+	}
+	if !isValidStatusTransition(currentStatus, newStatus) {
+		return fmt.Errorf("%w: %s -> %s", ErrInvalidStatusTransition, currentStatus, newStatus)
+	}
+
 	query := `
 		UPDATE accounting.journal_entries
 		SET status = $2, updated_by = $3, updated_at = NOW()
 		WHERE journal_entry_id = $1 AND deleted_at IS NULL
 	`
-	result, err := db.ExecContext(ctx, query, id, status, updatedBy)
+	result, err := db.ExecContext(ctx, query, id, newStatus, updatedBy)
 	if err != nil {
 		r.logger.Error("failed to update journal status",
 			util.String("id", id.String()),
-			util.String("status", status),
+			util.String("new_status", newStatus),
 			util.ErrorField(err))
 		return fmt.Errorf("update journal status: %w", err)
 	}
@@ -597,14 +728,12 @@ func (r *journalRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.U
 	return nil
 }
 
-// Post marks a journal entry as posted (only if draft and not soft‑deleted)
+// Post (with IsBalanced error handling)
 func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, postedBy *uuid.UUID) error {
-	// Lock the journal to prevent concurrent modifications
 	if err := r.LockJournal(ctx, db, id); err != nil {
 		return err
 	}
 
-	// Check current status and deleted_at
 	var currentStatus string
 	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, id).Scan(&currentStatus, &deletedAt)
@@ -618,12 +747,14 @@ func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, pos
 		return fmt.Errorf("journal entry %s cannot be posted: current status is %s", id, currentStatus)
 	}
 
-	// Validate balance and lines exist
-	if err := r.ValidateBeforePost(ctx, db, id); err != nil {
+	balanced, _, _, err := r.IsBalanced(ctx, db, id)
+	if err != nil {
 		return err
 	}
+	if !balanced {
+		return ErrJournalNotBalanced
+	}
 
-	// Update status to posted, set posted_at and posted_by
 	query := `
 		UPDATE accounting.journal_entries
 		SET status = 'posted', posted_at = NOW(), posted_by = $2, updated_at = NOW()
@@ -633,29 +764,28 @@ func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, pos
 	var postedAt time.Time
 	err = db.QueryRowContext(ctx, query, id, postedBy).Scan(&postedAt)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("journal entry %s not found, not in draft, or soft‑deleted", id)
-		}
-		r.logger.Error("failed to post journal entry",
-			util.String("id", id.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("post journal entry: %w", err)
+		return r.mapDBError(err, "post journal entry")
 	}
 	return nil
 }
 
-// Reverse creates a reversal journal entry for the given original entry.
-// It inserts the reversal entry (already populated with swapped lines) and updates the original status to 'reversed'.
+// Reverse (with HasReversal guard)
 func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uuid.UUID, reversal *models.JournalEntry) error {
-	// Lock original entry
 	if err := r.LockJournal(ctx, db, originalID); err != nil {
 		return err
 	}
 
-	// Check original status and not deleted
+	hasRev, err := r.HasReversal(ctx, db, originalID)
+	if err != nil {
+		return err
+	}
+	if hasRev {
+		return ErrReversalAlreadyExists
+	}
+
 	var originalStatus string
 	var deletedAt sql.NullTime
-	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, originalID).Scan(&originalStatus, &deletedAt)
+	err = db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, originalID).Scan(&originalStatus, &deletedAt)
 	if err != nil {
 		return fmt.Errorf("get original journal status: %w", err)
 	}
@@ -666,45 +796,14 @@ func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uui
 		return fmt.Errorf("only posted journal entries can be reversed, current status: %s", originalStatus)
 	}
 
-	// Insert reversal entry (caller must have set ReversalOf = &originalID)
 	if reversal.ReversalOf == nil || *reversal.ReversalOf != originalID {
 		return errors.New("reversal entry must have ReversalOf set to original journal ID")
 	}
+
 	if err := r.Create(ctx, db, reversal); err != nil {
 		return fmt.Errorf("create reversal entry: %w", err)
 	}
 
-	// Insert reversal lines (caller should have provided lines; we could copy them, but assume caller did)
-	// If caller didn't add lines, we can copy from original and swap debits/credits.
-	hasLines, err := r.HasLines(ctx, db, reversal.JournalEntryID)
-	if err != nil {
-		return err
-	}
-	if !hasLines {
-		// Auto-copy lines from original and swap
-		originalLines, err := r.GetLines(ctx, db, originalID)
-		if err != nil {
-			return fmt.Errorf("get original lines for reversal: %w", err)
-		}
-		var reversalLines []*models.JournalLine
-		for i, line := range originalLines {
-			revLine := &models.JournalLine{
-				JournalLineID:  uuid.New(),
-				JournalEntryID: reversal.JournalEntryID,
-				AccountID:      line.AccountID,
-				LineNumber:     i + 1,
-				DebitAmount:    line.CreditAmount,
-				CreditAmount:   line.DebitAmount,
-				Description:    line.Description,
-			}
-			reversalLines = append(reversalLines, revLine)
-		}
-		if err := r.BulkAddLines(ctx, db, reversalLines); err != nil {
-			return fmt.Errorf("add reversal lines: %w", err)
-		}
-	}
-
-	// Update original entry status to 'reversed'
 	_, err = db.ExecContext(ctx, `
 		UPDATE accounting.journal_entries
 		SET status = 'reversed', updated_at = NOW()
@@ -716,9 +815,51 @@ func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uui
 	return nil
 }
 
-// AddLine adds a single journal line (only allowed if entry status is draft and not soft‑deleted)
+// EnsureDraft, EnsurePosted
+func (r *journalRepository) EnsureDraft(ctx context.Context, db DBTX, id uuid.UUID) error {
+	var status string
+	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1 AND deleted_at IS NULL`, id).Scan(&status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("journal entry %s not found", id)
+		}
+		return err
+	}
+	if status != enums.JournalStatusDraft {
+		return fmt.Errorf("journal entry %s is not in draft status", id)
+	}
+	return nil
+}
+
+func (r *journalRepository) EnsurePosted(ctx context.Context, db DBTX, id uuid.UUID) error {
+	var status string
+	err := db.QueryRowContext(ctx, `SELECT status FROM accounting.journal_entries WHERE journal_entry_id = $1 AND deleted_at IS NULL`, id).Scan(&status)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("journal entry %s not found", id)
+		}
+		return err
+	}
+	if status != enums.JournalStatusPosted {
+		return fmt.Errorf("journal entry %s is not posted", id)
+	}
+	return nil
+}
+
+// HasReversal
+func (r *journalRepository) HasReversal(ctx context.Context, db DBTX, originalID uuid.UUID) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.journal_entries WHERE reversal_of = $1 AND deleted_at IS NULL`, originalID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check reversal existence: %w", err)
+	}
+	return count > 0, nil
+}
+
+// =============================================================================
+// LINES
+// =============================================================================
 func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.JournalLine) error {
-	// Verify journal entry is draft and not deleted
 	var status string
 	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, line.JournalEntryID).Scan(&status, &deletedAt)
@@ -752,12 +893,11 @@ func (r *journalRepository) AddLine(ctx context.Context, db DBTX, line *models.J
 	return nil
 }
 
-// BulkAddLines adds multiple lines in a single batch (only allowed if entry is draft and not soft‑deleted)
+// BulkAddLines – multi‑insert without RETURNING
 func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*models.JournalLine) error {
 	if len(lines) == 0 {
 		return nil
 	}
-	// Verify all lines belong to same journal entry and that entry is draft and not deleted
 	journalID := lines[0].JournalEntryID
 	var status string
 	var deletedAt sql.NullTime
@@ -772,33 +912,32 @@ func (r *journalRepository) BulkAddLines(ctx context.Context, db DBTX, lines []*
 		return fmt.Errorf("cannot add lines to journal entry with status %s", status)
 	}
 
-	stmt, err := db.PrepareContext(ctx, `
+	valueStrings := make([]string, 0, len(lines))
+	args := make([]interface{}, 0, len(lines)*7)
+	for i, l := range lines {
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, NOW(), NOW())",
+			i*7+1, i*7+2, i*7+3, i*7+4, i*7+5, i*7+6, i*7+7))
+		args = append(args, l.JournalLineID, l.JournalEntryID, l.AccountID, l.LineNumber,
+			l.DebitAmount, l.CreditAmount, l.Description)
+	}
+	query := fmt.Sprintf(`
 		INSERT INTO accounting.journal_lines (
 			journal_line_id, journal_entry_id, account_id, line_number,
 			debit_amount, credit_amount, description, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare bulk insert lines: %w", err)
-	}
-	defer stmt.Close()
+		) VALUES %s
+	`, strings.Join(valueStrings, ","))
 
-	for _, line := range lines {
-		_, err = stmt.ExecContext(ctx,
-			line.JournalLineID, line.JournalEntryID, line.AccountID, line.LineNumber,
-			line.DebitAmount, line.CreditAmount, line.Description,
-		)
-		if err != nil {
-			r.logger.Error("bulk add line failed",
-				util.String("journal_id", line.JournalEntryID.String()),
-				util.ErrorField(err))
-			return fmt.Errorf("bulk add journal line: %w", err)
-		}
+	_, err = db.ExecContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("bulk add lines failed",
+			util.String("journal_id", journalID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("bulk add journal lines: %w", err)
 	}
 	return nil
 }
 
-// GetLines retrieves all lines for a journal entry (even if entry is soft‑deleted, lines are kept)
+// GetLines
 func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uuid.UUID) ([]*models.JournalLine, error) {
 	query := `
 		SELECT journal_line_id, journal_entry_id, account_id, line_number,
@@ -837,9 +976,7 @@ func (r *journalRepository) GetLines(ctx context.Context, db DBTX, journalID uui
 	return lines, nil
 }
 
-// UpdateLine updates a single journal line (only allowed if entry is draft and not soft‑deleted)
 func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *models.JournalLine) error {
-	// Verify journal entry is draft and not deleted
 	var status string
 	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `
@@ -874,20 +1011,12 @@ func (r *journalRepository) UpdateLine(ctx context.Context, db DBTX, line *model
 		line.DebitAmount, line.CreditAmount, line.Description,
 	).Scan(&line.UpdatedAt)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("journal line %s not found", line.JournalLineID)
-		}
-		r.logger.Error("failed to update journal line",
-			util.String("line_id", line.JournalLineID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("update journal line: %w", err)
+		return r.mapDBError(err, "update journal line")
 	}
 	return nil
 }
 
-// DeleteLine deletes a single journal line (only allowed if entry is draft and not soft‑deleted)
 func (r *journalRepository) DeleteLine(ctx context.Context, db DBTX, lineID uuid.UUID) error {
-	// Verify journal entry is draft and not deleted
 	var status string
 	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `
@@ -909,23 +1038,14 @@ func (r *journalRepository) DeleteLine(ctx context.Context, db DBTX, lineID uuid
 		return fmt.Errorf("cannot delete line from journal entry with status %s", status)
 	}
 
-	result, err := db.ExecContext(ctx, `DELETE FROM accounting.journal_lines WHERE journal_line_id = $1`, lineID)
+	_, err = db.ExecContext(ctx, `DELETE FROM accounting.journal_lines WHERE journal_line_id = $1`, lineID)
 	if err != nil {
-		r.logger.Error("failed to delete journal line",
-			util.String("line_id", lineID.String()),
-			util.ErrorField(err))
-		return fmt.Errorf("delete journal line: %w", err)
-	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("journal line %s not found", lineID)
+		return r.mapDBError(err, "delete journal line")
 	}
 	return nil
 }
 
-// ClearLines removes all lines from a journal entry (only allowed if draft and not soft‑deleted)
 func (r *journalRepository) ClearLines(ctx context.Context, db DBTX, journalID uuid.UUID) error {
-	// Verify entry is draft and not deleted
 	var status string
 	var deletedAt sql.NullTime
 	err := db.QueryRowContext(ctx, `SELECT status, deleted_at FROM accounting.journal_entries WHERE journal_entry_id = $1`, journalID).Scan(&status, &deletedAt)
@@ -949,9 +1069,11 @@ func (r *journalRepository) ClearLines(ctx context.Context, db DBTX, journalID u
 	return nil
 }
 
-// IsBalanced checks if the journal entry's total debits equal total credits
-func (r *journalRepository) IsBalanced(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, float64, float64, error) {
-	var totalDebit, totalCredit float64
+// =============================================================================
+// VALIDATION
+// =============================================================================
+func (r *journalRepository) IsBalanced(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, decimal.Decimal, decimal.Decimal, error) {
+	var totalDebit, totalCredit decimal.Decimal
 	query := `
 		SELECT COALESCE(SUM(debit_amount), 0), COALESCE(SUM(credit_amount), 0)
 		FROM accounting.journal_lines
@@ -960,16 +1082,14 @@ func (r *journalRepository) IsBalanced(ctx context.Context, db DBTX, journalID u
 	err := db.QueryRowContext(ctx, query, journalID).Scan(&totalDebit, &totalCredit)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return true, 0, 0, nil
+			return true, decimal.Zero, decimal.Zero, nil
 		}
-		return false, 0, 0, fmt.Errorf("calculate balance: %w", err)
+		return false, decimal.Zero, decimal.Zero, fmt.Errorf("calculate balance: %w", err)
 	}
-	return totalDebit == totalCredit, totalDebit, totalCredit, nil
+	return totalDebit.Equal(totalCredit), totalDebit, totalCredit, nil
 }
 
-// ValidateBeforePost performs all pre-posting checks: has lines, is balanced, no negative amounts (handled by DB check)
 func (r *journalRepository) ValidateBeforePost(ctx context.Context, db DBTX, journalID uuid.UUID) error {
-	// Check if lines exist
 	hasLines, err := r.HasLines(ctx, db, journalID)
 	if err != nil {
 		return err
@@ -977,18 +1097,16 @@ func (r *journalRepository) ValidateBeforePost(ctx context.Context, db DBTX, jou
 	if !hasLines {
 		return fmt.Errorf("journal entry %s has no lines", journalID)
 	}
-	// Check balance
 	balanced, debit, credit, err := r.IsBalanced(ctx, db, journalID)
 	if err != nil {
 		return err
 	}
 	if !balanced {
-		return fmt.Errorf("journal entry %s is not balanced: debit=%.2f, credit=%.2f", journalID, debit, credit)
+		return fmt.Errorf("journal entry %s is not balanced: debit=%s, credit=%s", journalID, debit.String(), credit.String())
 	}
 	return nil
 }
 
-// HasLines returns true if the journal entry has at least one line
 func (r *journalRepository) HasLines(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, error) {
 	var count int
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.journal_lines WHERE journal_entry_id = $1`, journalID).Scan(&count)
@@ -998,7 +1116,50 @@ func (r *journalRepository) HasLines(ctx context.Context, db DBTX, journalID uui
 	return count > 0, nil
 }
 
-// LockJournal acquires a row-level lock on a journal entry (only if not soft‑deleted)
+func (r *journalRepository) HasLedgerEntries(ctx context.Context, db DBTX, journalID uuid.UUID) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.ledger_entries WHERE journal_entry_id = $1`, journalID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check ledger entries existence: %w", err)
+	}
+	return count > 0, nil
+}
+
+func (r *journalRepository) ValidateLedgerExists(ctx context.Context, db DBTX, journalID uuid.UUID) error {
+	exists, err := r.HasLedgerEntries(ctx, db, journalID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrLedgerMissing
+	}
+	return nil
+}
+
+// =============================================================================
+// AGGREGATION / PERFORMANCE
+// =============================================================================
+func (r *journalRepository) GetJournalSummary(ctx context.Context, db DBTX, journalID uuid.UUID) (*JournalSummary, error) {
+	var summary JournalSummary
+	row := db.QueryRowContext(ctx, `
+		SELECT 
+			COUNT(*) AS total_lines,
+			COALESCE(SUM(debit_amount), 0) AS total_debit,
+			COALESCE(SUM(credit_amount), 0) AS total_credit
+		FROM accounting.journal_lines
+		WHERE journal_entry_id = $1
+	`, journalID)
+	err := row.Scan(&summary.TotalLines, &summary.TotalDebit, &summary.TotalCredit)
+	if err != nil {
+		return nil, fmt.Errorf("get journal summary: %w", err)
+	}
+	summary.IsBalanced = summary.TotalDebit.Equal(summary.TotalCredit)
+	return &summary, nil
+}
+
+// =============================================================================
+// LOCKING
+// =============================================================================
 func (r *journalRepository) LockJournal(ctx context.Context, db DBTX, journalID uuid.UUID) error {
 	var id uuid.UUID
 	err := db.QueryRowContext(ctx, `SELECT journal_entry_id FROM accounting.journal_entries WHERE journal_entry_id = $1 AND deleted_at IS NULL FOR UPDATE`, journalID).Scan(&id)
@@ -1011,9 +1172,29 @@ func (r *journalRepository) LockJournal(ctx context.Context, db DBTX, journalID 
 	return nil
 }
 
-// ListWithLines returns journal entries with their lines in a single query (optimized for reporting)
+func (r *journalRepository) GetAndLock(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
+	return r.GetByIDForUpdate(ctx, db, id)
+}
+
+// =============================================================================
+// POSTING HELPER
+// =============================================================================
+func (r *journalRepository) GetForPosting(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, []*models.JournalLine, error) {
+	entry, err := r.GetByIDForUpdate(ctx, db, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	lines, err := r.GetLines(ctx, db, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return entry, lines, nil
+}
+
+// =============================================================================
+// REPORTING
+// =============================================================================
 func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*JournalWithLines, error) {
-	// First get entries using List (which excludes soft‑deleted)
 	entries, err := r.List(ctx, db, filter, p, s)
 	if err != nil {
 		return nil, err
@@ -1022,12 +1203,10 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 		return []*JournalWithLines{}, nil
 	}
 
-	// Fetch all lines for these entries in one batch
 	entryIDs := make([]uuid.UUID, len(entries))
 	for i, e := range entries {
 		entryIDs[i] = e.JournalEntryID
 	}
-	// Build placeholders
 	placeholders := make([]string, len(entryIDs))
 	args := make([]interface{}, len(entryIDs))
 	for i, id := range entryIDs {
@@ -1049,7 +1228,6 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 	}
 	defer rows.Close()
 
-	// Map lines to entries
 	linesMap := make(map[uuid.UUID][]*models.JournalLine)
 	for rows.Next() {
 		var line models.JournalLine
@@ -1082,8 +1260,6 @@ func (r *journalRepository) ListWithLines(ctx context.Context, db DBTX, filter J
 	return result, nil
 }
 
-// ListByAccount returns all journal lines for a given account within a date range (used for ledger)
-// Only includes lines from posted, non‑deleted journal entries.
 func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) ([]*models.JournalLine, error) {
 	query := `
 		SELECT jl.journal_line_id, jl.journal_entry_id, jl.account_id, jl.line_number,
@@ -1126,8 +1302,7 @@ func (r *journalRepository) ListByAccount(ctx context.Context, db DBTX, accountI
 	return lines, nil
 }
 
-// SumByAccount returns total debit and credit for an account within a date range (posted, non‑deleted entries only)
-func (r *journalRepository) SumByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) (debit float64, credit float64, err error) {
+func (r *journalRepository) SumByAccount(ctx context.Context, db DBTX, accountID uuid.UUID, from, to time.Time) (debit decimal.Decimal, credit decimal.Decimal, err error) {
 	query := `
 		SELECT COALESCE(SUM(jl.debit_amount), 0), COALESCE(SUM(jl.credit_amount), 0)
 		FROM accounting.journal_lines jl
@@ -1142,7 +1317,7 @@ func (r *journalRepository) SumByAccount(ctx context.Context, db DBTX, accountID
 		r.logger.Error("failed to sum by account",
 			util.String("account_id", accountID.String()),
 			util.ErrorField(err))
-		return 0, 0, fmt.Errorf("sum by account: %w", err)
+		return decimal.Zero, decimal.Zero, fmt.Errorf("sum by account: %w", err)
 	}
 	return debit, credit, nil
 }

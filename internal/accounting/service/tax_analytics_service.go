@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,8 +15,19 @@ import (
 	"auth-service/internal/accounting/repository"
 )
 
+// TaxAnalyticsService defines the interface for processing tax events
+// and for querying tax-related analytics (tax summaries).
 type TaxAnalyticsService interface {
+	// -----------------------------------------------------------------
+	// Event processing (existing)
+	// -----------------------------------------------------------------
 	ProcessTaxEvent(ctx context.Context, eventType string, payload []byte) error
+
+	// -----------------------------------------------------------------
+	// Query methods (new)
+	// -----------------------------------------------------------------
+	ListTaxSummaries(ctx context.Context, companyID uuid.UUID, filter repository.TaxSummaryFilter, p repository.Pagination, s repository.Sort) ([]*analytics.TaxSummary, error)
+	GetTaxSummary(ctx context.Context, companyID, summaryID uuid.UUID) (*analytics.TaxSummary, error)
 }
 
 type taxAnalyticsService struct {
@@ -24,6 +36,7 @@ type taxAnalyticsService struct {
 	logger        *zap.Logger
 }
 
+// NewTaxAnalyticsService creates a new tax analytics service.
 func NewTaxAnalyticsService(
 	repo repository.AnalyticsRepository,
 	db repository.DBTX,
@@ -35,6 +48,10 @@ func NewTaxAnalyticsService(
 		logger:        logger.Named("tax_analytics"),
 	}
 }
+
+// ---------------------------------------------------------------------
+// Event processing (existing)
+// ---------------------------------------------------------------------
 
 func (s *taxAnalyticsService) ProcessTaxEvent(ctx context.Context, eventType string, payload []byte) error {
 	switch eventType {
@@ -81,8 +98,6 @@ func (s *taxAnalyticsService) handleTaxTransactionCreated(ctx context.Context, p
 		return err
 	}
 
-	// TaxTransactionPayload does not contain TaxRateID; set to nil.
-	// If you need the tax rate, extend the payload or fetch from the transaction later.
 	summary := &analytics.TaxSummary{
 		SummaryID:        uuid.New(),
 		CompanyID:        companyID,
@@ -114,9 +129,7 @@ func (s *taxAnalyticsService) handleTaxRateChange(ctx context.Context, payload [
 		return err
 	}
 
-	// Invalidate summaries from the effective_from date onward.
 	fromDate := ratePayload.EffectiveFrom
-	// Note: InvalidateTaxSummaries expects *time.Time; pass pointer and nil for toDate.
 	if err := s.analyticsRepo.InvalidateTaxSummaries(ctx, s.db, companyID, &fromDate, nil); err != nil {
 		s.logger.Error("failed to invalidate tax summaries after rate change",
 			zap.String("company_id", companyID.String()),
@@ -145,7 +158,6 @@ func (s *taxAnalyticsService) handleTaxRuleChange(ctx context.Context, payload [
 		return err
 	}
 
-	// For simplicity, invalidate the last 30 days.
 	fromDate := time.Now().AddDate(0, 0, -30)
 	if err := s.analyticsRepo.InvalidateTaxSummaries(ctx, s.db, companyID, &fromDate, nil); err != nil {
 		s.logger.Error("failed to invalidate tax summaries after rule change",
@@ -173,12 +185,31 @@ func (s *taxAnalyticsService) handleTaxProfileChange(ctx context.Context, payloa
 		return err
 	}
 
-	// Profile changes may affect future tax calculations, but historical summaries remain valid.
-	// We do not invalidate past summaries unless the default rate changed.
-	// For simplicity, log only.
 	s.logger.Info("tax profile changed",
 		zap.String("profile_id", profilePayload.ProfileID),
 		zap.String("company_id", companyID.String()),
 		zap.String("regime", profilePayload.TaxRegime))
 	return nil
+}
+
+// ---------------------------------------------------------------------
+// Query methods (new)
+// ---------------------------------------------------------------------
+
+// ListTaxSummaries returns tax summaries for a company, with filtering, pagination, and sorting.
+func (s *taxAnalyticsService) ListTaxSummaries(ctx context.Context, companyID uuid.UUID, filter repository.TaxSummaryFilter, p repository.Pagination, sort repository.Sort) ([]*analytics.TaxSummary, error) {
+	filter.CompanyID = companyID
+	return s.analyticsRepo.ListTaxSummaries(ctx, s.db, filter, p, sort)
+}
+
+// GetTaxSummary returns a single tax summary by ID, ensuring it belongs to the company.
+func (s *taxAnalyticsService) GetTaxSummary(ctx context.Context, companyID, summaryID uuid.UUID) (*analytics.TaxSummary, error) {
+	summary, err := s.analyticsRepo.GetTaxSummary(ctx, s.db, summaryID)
+	if err != nil {
+		return nil, err
+	}
+	if summary.CompanyID != companyID {
+		return nil, fmt.Errorf("unauthorized: tax summary does not belong to company")
+	}
+	return summary, nil
 }

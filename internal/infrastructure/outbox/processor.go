@@ -9,27 +9,28 @@ import (
 	"go.uber.org/zap"
 )
 
+// Processor publishes outbox events to Kafka using topic from DB.
 type Processor struct {
 	repo      Repository
 	producer  *client.KafkaProducer
 	logger    *zap.Logger
 	batchSize int
-	topic     string // single topic for all events
 }
 
-// NewProcessor creates a new outbox processor.
-// topic: the Kafka topic to publish all events to (e.g., "academics-events").
-func NewProcessor(repo Repository, producer *client.KafkaProducer, logger *zap.Logger, topic string) *Processor {
+func NewProcessor(
+	repo Repository,
+	producer *client.KafkaProducer,
+	logger *zap.Logger,
+) *Processor {
 	return &Processor{
 		repo:      repo,
 		producer:  producer,
 		logger:    logger,
 		batchSize: 50,
-		topic:     topic,
 	}
 }
 
-// Start begins polling the outbox table and publishing events.
+// Start polling loop
 func (p *Processor) Start(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -52,16 +53,21 @@ func (p *Processor) processBatch(ctx context.Context) {
 	}
 
 	for _, e := range events {
-		// Prepare headers: include event type, aggregate type, etc.
+
+		// 🔥 USE topic from DB (NO routing logic)
+		topic := e.Topic
+
+		// Prepare headers
 		headers := make(map[string]string)
 		if e.Headers != nil {
-			// Copy existing headers if any
 			for k, v := range e.Headers {
 				headers[k] = v
 			}
 		}
-		// Add event type header (required by consumer)
+
+		headers["event_id"] = e.EventID
 		headers["event_type"] = e.EventType
+
 		if e.AggregateType != "" {
 			headers["aggregate_type"] = e.AggregateType
 		}
@@ -71,8 +77,8 @@ func (p *Processor) processBatch(ctx context.Context) {
 
 		err := p.producer.ProduceMessage(
 			ctx,
-			p.topic,               // single topic
-			[]byte(e.AggregateID), // message key (optional)
+			topic,
+			[]byte(e.AggregateID), // partition key
 			e.Payload,
 			headers,
 		)
@@ -80,15 +86,15 @@ func (p *Processor) processBatch(ctx context.Context) {
 		if err != nil {
 			p.logger.Error("failed to publish event",
 				zap.String("event_id", e.EventID),
+				zap.String("topic", topic),
 				zap.String("event_type", e.EventType),
 				zap.Error(err),
 			)
-			// Increment retry count
+
 			_ = p.repo.MarkFailed(ctx, e.EventID, e.RetryCount+1)
 			continue
 		}
 
-		// Mark as processed
 		_ = p.repo.MarkProcessed(ctx, e.EventID)
 	}
 }

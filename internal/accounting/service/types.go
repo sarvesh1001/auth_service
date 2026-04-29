@@ -1,11 +1,25 @@
 package service
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+
+	accErrors "auth-service/internal/accounting/errors"
+)
+
+// Re-export errors from shared package for backward compatibility and convenience.
+var (
+	ErrNotFound             = accErrors.ErrNotFound
+	ErrInvalidInput         = accErrors.ErrInvalidInput
+	ErrInvalidState         = accErrors.ErrInvalidState
+	ErrDuplicate            = accErrors.ErrDuplicate
+	ErrOverlap              = accErrors.ErrOverlap
+	ErrVersionConflict      = accErrors.ErrVersionConflict
+	ErrConflict             = accErrors.ErrConflict
+	ErrInUse                = accErrors.ErrInUse
+	ErrRuleEvaluationFailed = accErrors.ErrRuleEvaluationFailed
 )
 
 // CreateJournalRequest
@@ -59,16 +73,3 @@ type UpdateJournalRequest struct {
 	Lines          []JournalLineRequest // if nil, keep existing; if empty slice, delete all
 	UpdatedBy      *uuid.UUID
 }
-
-// Common errors
-var (
-	ErrNotFound             = fmt.Errorf("resource not found")
-	ErrInvalidInput         = fmt.Errorf("invalid input")
-	ErrInvalidState         = fmt.Errorf("invalid state")
-	ErrDuplicate            = fmt.Errorf("duplicate entry")
-	ErrOverlap              = fmt.Errorf("date overlap")
-	ErrVersionConflict      = fmt.Errorf("version conflict")
-	ErrConflict             = fmt.Errorf("conflict")
-	ErrInUse                = fmt.Errorf("resource in use")
-	ErrRuleEvaluationFailed = fmt.Errorf("rule evaluation failed")
-)

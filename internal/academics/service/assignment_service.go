@@ -20,10 +20,6 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// ================================
-// Request & Response Types
-// ================================
-
 type CreateAssignmentRequest struct {
 	SectionID     uuid.UUID  `json:"section_id"`
 	SubjectID     uuid.UUID  `json:"subject_id"`
@@ -52,10 +48,6 @@ type UpdateAssignmentRequest struct {
 	UpdatedBy     *uuid.UUID `json:"updated_by,omitempty"`
 }
 
-// ================================
-// Service Interface
-// ================================
-
 type AssignmentService interface {
 	Create(ctx context.Context, req CreateAssignmentRequest, idempotencyKey string) (*models.Assignment, error)
 	BulkCreate(ctx context.Context, reqs []CreateAssignmentRequest, idempotencyKey string) ([]*models.Assignment, error)
@@ -66,10 +58,6 @@ type AssignmentService interface {
 	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
 	Publish(ctx context.Context, id uuid.UUID, published bool, updatedBy *uuid.UUID) error
 }
-
-// ================================
-// Service Implementation
-// ================================
 
 type assignmentService struct {
 	repo             repository.AssignmentRepository
@@ -116,9 +104,6 @@ func NewAssignmentService(
 	}
 }
 
-// ------------------------------
-// Create (single)
-// ------------------------------
 func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequest, idempotencyKey string) (*models.Assignment, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
@@ -131,6 +116,7 @@ func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequ
 
 	req.Title = strings.TrimSpace(req.Title)
 	req.Description = strings.TrimSpace(req.Description)
+
 	if err := s.validateCreate(req); err != nil {
 		return nil, err
 	}
@@ -141,7 +127,6 @@ func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequ
 	}
 	defer tx.Rollback()
 
-	// Idempotency check
 	if idempotencyKey != "" {
 		var existing models.Assignment
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing.AssignmentID != uuid.Nil {
@@ -172,14 +157,12 @@ func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequ
 		return nil, err
 	}
 
-	// Store idempotency response
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, assignment); err != nil {
 			logger.Error("failed to store idempotency key", zap.Error(err))
 		}
 	}
 
-	// Audit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "assignment",
 			&assignment.AssignmentID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -192,7 +175,6 @@ func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequ
 			})
 	}
 
-	// Outbox
 	if err := s.storeOutboxEvent(ctx, tx, EventAssignmentCreated, assignment, nil); err != nil {
 		return nil, fmt.Errorf("outbox store: %w", err)
 	}
@@ -203,7 +185,6 @@ func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequ
 
 	logger.Info("assignment created", zap.String("assignment_id", assignment.AssignmentID.String()))
 
-	// Async notifications
 	if assignment.IsPublished {
 		s.sendAssignmentNotification(ctx, assignment, "created and published", req.CreatedBy)
 	} else {
@@ -213,9 +194,6 @@ func (s *assignmentService) Create(ctx context.Context, req CreateAssignmentRequ
 	return assignment, nil
 }
 
-// ------------------------------
-// Bulk Create (with idempotency)
-// ------------------------------
 func (s *assignmentService) BulkCreate(ctx context.Context, reqs []CreateAssignmentRequest, idempotencyKey string) ([]*models.Assignment, error) {
 	if len(reqs) == 0 {
 		return nil, nil
@@ -223,7 +201,6 @@ func (s *assignmentService) BulkCreate(ctx context.Context, reqs []CreateAssignm
 
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("count", len(reqs)), zap.String("idempotency_key", idempotencyKey))
 
-	// Validate all requests
 	for i, req := range reqs {
 		req.Title = strings.TrimSpace(req.Title)
 		req.Description = strings.TrimSpace(req.Description)
@@ -238,7 +215,6 @@ func (s *assignmentService) BulkCreate(ctx context.Context, reqs []CreateAssignm
 	}
 	defer tx.Rollback()
 
-	// Idempotency check for bulk
 	if idempotencyKey != "" {
 		var existing []*models.Assignment
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
@@ -271,14 +247,12 @@ func (s *assignmentService) BulkCreate(ctx context.Context, reqs []CreateAssignm
 		return nil, err
 	}
 
-	// Store idempotency response
 	if idempotencyKey != "" {
 		if err := s.idempotencyStore.Store(ctx, tx, idempotencyKey, assignments); err != nil {
 			logger.Error("failed to store idempotency key for bulk", zap.Error(err))
 		}
 	}
 
-	// Audit & outbox for each assignment
 	for _, a := range assignments {
 		if s.auditService != nil {
 			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_create", "assignment",
@@ -297,7 +271,6 @@ func (s *assignmentService) BulkCreate(ctx context.Context, reqs []CreateAssignm
 
 	logger.Info("bulk created assignments", zap.Int("count", len(assignments)))
 
-	// Async notifications
 	for _, a := range assignments {
 		if a.IsPublished {
 			s.sendAssignmentNotification(ctx, a, "created and published", a.CreatedBy)
@@ -309,9 +282,6 @@ func (s *assignmentService) BulkCreate(ctx context.Context, reqs []CreateAssignm
 	return assignments, nil
 }
 
-// ------------------------------
-// GetByID
-// ------------------------------
 func (s *assignmentService) GetByID(ctx context.Context, id uuid.UUID) (*models.Assignment, error) {
 	a, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -323,28 +293,20 @@ func (s *assignmentService) GetByID(ctx context.Context, id uuid.UUID) (*models.
 	return a, nil
 }
 
-// ------------------------------
-// List
-// ------------------------------
 func (s *assignmentService) List(ctx context.Context, filter repository.AssignmentFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.Assignment, error) {
 	return s.repo.List(ctx, s.pgClient.DB, filter, pagination, sort)
 }
 
-// ------------------------------
-// Count
-// ------------------------------
 func (s *assignmentService) Count(ctx context.Context, filter repository.AssignmentFilter) (int64, error) {
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
 
-// ------------------------------
-// Update
-// ------------------------------
 func (s *assignmentService) Update(ctx context.Context, req UpdateAssignmentRequest) (*models.Assignment, error) {
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("assignment_id", req.AssignmentID.String()))
 
 	req.Title = strings.TrimSpace(req.Title)
 	req.Description = strings.TrimSpace(req.Description)
+
 	if err := s.validateUpdate(req); err != nil {
 		return nil, err
 	}
@@ -424,9 +386,6 @@ func (s *assignmentService) Update(ctx context.Context, req UpdateAssignmentRequ
 	return updated, nil
 }
 
-// ------------------------------
-// Delete
-// ------------------------------
 func (s *assignmentService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("assignment_id", id.String()))
 
@@ -465,9 +424,6 @@ func (s *assignmentService) Delete(ctx context.Context, id uuid.UUID, deletedBy 
 	return nil
 }
 
-// ------------------------------
-// Publish
-// ------------------------------
 func (s *assignmentService) Publish(ctx context.Context, id uuid.UUID, published bool, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(
 		zap.String("method", "Publish"),
@@ -524,12 +480,9 @@ func (s *assignmentService) Publish(ctx context.Context, id uuid.UUID, published
 	} else {
 		s.sendTeacherNotification(ctx, existing, "unpublished", updatedBy)
 	}
+
 	return nil
 }
-
-// ================================
-// Helper Functions
-// ================================
 
 func (s *assignmentService) validateCreate(req CreateAssignmentRequest) error {
 	if req.SectionID == uuid.Nil {
@@ -608,12 +561,16 @@ func (s *assignmentService) validateDomain(ctx context.Context, db repository.DB
 	if teacher == nil {
 		return fmt.Errorf("%w: teacher %s", ErrNotFound, teacherID)
 	}
+
 	return nil
 }
 
+// storeOutboxEvent creates and stores an outbox event for the assignment.
+// It uses the constant TopicAssignment as the topic.
 func (s *assignmentService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, eventType EventType, assignment *models.Assignment, extraData interface{}) error {
 	var payload []byte
 	var err error
+
 	if extraData != nil {
 		payload, err = json.Marshal(extraData)
 	} else {
@@ -622,15 +579,18 @@ func (s *assignmentService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, ev
 	if err != nil {
 		return fmt.Errorf("marshal outbox payload: %w", err)
 	}
+
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "assignment",
 		AggregateID:   assignment.AssignmentID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicAssignment, // <-- NEW: Required topic field
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",
 	}
+
 	return s.outboxRepo.Store(ctx, tx, outboxEvent)
 }
 
@@ -642,6 +602,7 @@ func (s *assignmentService) getCompanyIDForSection(ctx context.Context, db repos
 	if section == nil {
 		return uuid.Nil, fmt.Errorf("%w: section %s", ErrNotFound, sectionID)
 	}
+
 	course, err := s.courseRepo.GetByID(ctx, db, section.CourseID)
 	if err != nil {
 		return uuid.Nil, err
@@ -656,11 +617,13 @@ func (s *assignmentService) sendAssignmentNotification(ctx context.Context, a *m
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		companyID, err := s.getCompanyIDForSection(notifyCtx, s.pgClient.DB, a.SectionID)
 		if err != nil {
 			s.logger.Error("failed to get company ID for section", zap.String("section_id", a.SectionID.String()), zap.Error(err))
 			return
 		}
+
 		notifReq := CreateNotificationRequest{
 			CompanyID: companyID,
 			Title:     fmt.Sprintf("New Assignment: %s", a.Title),
@@ -685,11 +648,13 @@ func (s *assignmentService) sendTeacherNotification(ctx context.Context, a *mode
 	go func() {
 		notifyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		teacher, err := s.teacherRepo.GetByID(notifyCtx, s.pgClient.DB, a.TeacherID)
 		if err != nil || teacher == nil {
 			s.logger.Error("failed to fetch teacher for notification", zap.String("teacher_id", a.TeacherID.String()), zap.Error(err))
 			return
 		}
+
 		notifReq := CreateNotificationRequest{
 			CompanyID: teacher.CompanyID,
 			Title:     fmt.Sprintf("Assignment %s: %s", action, a.Title),

@@ -17,6 +17,7 @@ type ReconciliationBatch struct {
 	Status             string     `db:"status" json:"status"` // pending, in_progress, completed, failed
 	TotalRecords       int        `db:"total_records" json:"total_records"`
 	MatchedRecords     int        `db:"matched_records" json:"matched_records"`
+	FailureReason      *string    `db:"failure_reason" json:"failure_reason,omitempty"`
 	UnmatchedRecords   int        `db:"unmatched_records" json:"unmatched_records"`
 	CreatedAt          time.Time  `db:"created_at" json:"created_at"`
 	CompletedAt        *time.Time `db:"completed_at" json:"completed_at,omitempty"`

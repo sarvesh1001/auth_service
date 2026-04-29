@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting/models"
@@ -28,7 +29,7 @@ type AccountFilter struct {
 	AccountType     *string
 	IsActive        *bool
 	ParentAccountID *uuid.UUID
-	Search          string // searches account_code and account_name
+	Search          string
 }
 
 // Pagination holds limit and offset for paginated queries
@@ -65,6 +66,7 @@ type AccountRepository interface {
 	GetByIDForUpdate(ctx context.Context, db DBTX, accountID uuid.UUID) (*models.Account, error)
 	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Account, error)
 	ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error)
+	ExistsByID(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error)
 	List(ctx context.Context, db DBTX, filter AccountFilter, p Pagination, s Sort) ([]*models.Account, error)
 	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Account, error)
 	Count(ctx context.Context, db DBTX, filter AccountFilter) (int64, error)
@@ -73,10 +75,19 @@ type AccountRepository interface {
 	GetChildren(ctx context.Context, db DBTX, parentID uuid.UUID) ([]*models.Account, error)
 	GetTree(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*AccountTreeNode, error)
 	HasChildren(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error)
+	CountChildren(ctx context.Context, db DBTX, accountID uuid.UUID) (int, error)
+	IsLeafAccount(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error)
+	GetLeafAccountsByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Account, error)
 
 	// Validation / safety
 	CheckCircularReference(ctx context.Context, db DBTX, accountID uuid.UUID, parentID *uuid.UUID) (bool, error)
-	CheckUsageInJournal(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error)
+	CheckUsageInLedger(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error)
+	GetAccountType(ctx context.Context, db DBTX, accountID uuid.UUID) (string, error)
+
+	// Bulk reads with company isolation
+	GetByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]*models.Account, error)
+	GetActiveByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]*models.Account, error)
+	ValidateAccountIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) error
 
 	// Locking
 	LockAccount(ctx context.Context, db DBTX, accountID uuid.UUID) error
@@ -158,7 +169,7 @@ func (r *accountRepository) buildAccountFilter(filter AccountFilter) (string, []
 	}
 	if filter.ParentAccountID != nil {
 		if *filter.ParentAccountID == uuid.Nil {
-			conditions = append(conditions, fmt.Sprintf("parent_account_id IS NULL"))
+			conditions = append(conditions, "parent_account_id IS NULL")
 		} else {
 			conditions = append(conditions, fmt.Sprintf("parent_account_id = $%d", idx))
 			args = append(args, *filter.ParentAccountID)
@@ -172,7 +183,6 @@ func (r *accountRepository) buildAccountFilter(filter AccountFilter) (string, []
 		idx += 2
 	}
 
-	// Soft delete condition
 	conditions = append(conditions, "deleted_at IS NULL")
 
 	if len(conditions) == 0 {
@@ -274,7 +284,7 @@ func (r *accountRepository) BulkCreate(ctx context.Context, db DBTX, accounts []
 	return nil
 }
 
-// Upsert inserts or updates an account based on unique constraint (company_id, account_code)
+// Upsert inserts or updates an account but NEVER changes account_type or parent_account_id after creation.
 func (r *accountRepository) Upsert(ctx context.Context, db DBTX, a *models.Account) error {
 	query := `
 		INSERT INTO accounting.accounts (
@@ -285,10 +295,8 @@ func (r *accountRepository) Upsert(ctx context.Context, db DBTX, a *models.Accou
 		ON CONFLICT (company_id, account_code) WHERE deleted_at IS NULL
 		DO UPDATE SET
 			account_name = EXCLUDED.account_name,
-			account_type = EXCLUDED.account_type,
-			parent_account_id = EXCLUDED.parent_account_id,
-			is_active = EXCLUDED.is_active,
 			description = EXCLUDED.description,
+			is_active = EXCLUDED.is_active,
 			updated_by = EXCLUDED.updated_by,
 			updated_at = NOW()
 		RETURNING created_at, updated_at
@@ -308,7 +316,9 @@ func (r *accountRepository) Upsert(ctx context.Context, db DBTX, a *models.Accou
 	return nil
 }
 
-// Update updates an existing account (full update except ID and timestamps)
+// Update updates an existing account, but prevents changes to account_type and parent_account_id
+// if the account is already used in ledger_entries (immutable after first use).
+// Returns a specific error when the account is immutable.
 func (r *accountRepository) Update(ctx context.Context, db DBTX, a *models.Account) error {
 	query := `
 		UPDATE accounting.accounts
@@ -319,7 +329,13 @@ func (r *accountRepository) Update(ctx context.Context, db DBTX, a *models.Accou
 		    description = $6,
 		    updated_by = $7,
 		    updated_at = NOW()
-		WHERE account_id = $1 AND deleted_at IS NULL
+		WHERE account_id = $1 
+		  AND deleted_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM accounting.ledger_entries le
+			WHERE le.account_id = $1
+			LIMIT 1
+		  )
 		RETURNING updated_at
 	`
 	err := db.QueryRowContext(ctx, query,
@@ -329,7 +345,16 @@ func (r *accountRepository) Update(ctx context.Context, db DBTX, a *models.Accou
 	).Scan(&a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("account %s not found or already deleted", a.AccountID)
+			// Check if the account exists at all
+			exists, checkErr := r.ExistsByID(ctx, db, a.AccountID)
+			if checkErr != nil {
+				return fmt.Errorf("update account: failed to check existence: %w", checkErr)
+			}
+			if !exists {
+				return fmt.Errorf("account %s not found or already deleted", a.AccountID)
+			}
+			// Account exists but is used in ledger → immutable
+			return fmt.Errorf("account %s is used in ledger entries and cannot be modified (type/parent immutable)", a.AccountID)
 		}
 		r.logger.Error("failed to update account",
 			util.String("id", a.AccountID.String()),
@@ -339,7 +364,7 @@ func (r *accountRepository) Update(ctx context.Context, db DBTX, a *models.Accou
 	return nil
 }
 
-// UpdateStatus toggles the active status of an account
+// UpdateStatus toggles the active status of an account (allowed even if used in ledger)
 func (r *accountRepository) UpdateStatus(ctx context.Context, db DBTX, accountID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.accounts
@@ -355,17 +380,23 @@ func (r *accountRepository) UpdateStatus(ctx context.Context, db DBTX, accountID
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("account %s not found or already deleted", accountID)
+		return ErrNotFound
 	}
 	return nil
 }
 
-// UpdateParent changes the parent account of an account
+// UpdateParent changes the parent account of an account (only allowed if account not used in ledger)
 func (r *accountRepository) UpdateParent(ctx context.Context, db DBTX, accountID uuid.UUID, parentID *uuid.UUID, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.accounts
 		SET parent_account_id = $2, updated_by = $3, updated_at = NOW()
-		WHERE account_id = $1 AND deleted_at IS NULL
+		WHERE account_id = $1 
+		  AND deleted_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM accounting.ledger_entries le
+			WHERE le.account_id = $1
+			LIMIT 1
+		  )
 	`
 	result, err := db.ExecContext(ctx, query, accountID, parentID, updatedBy)
 	if err != nil {
@@ -376,13 +407,35 @@ func (r *accountRepository) UpdateParent(ctx context.Context, db DBTX, accountID
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("account %s not found or already deleted", accountID)
+		exists, _ := r.ExistsByID(ctx, db, accountID)
+		if !exists {
+			return ErrNotFound
+		}
+		return fmt.Errorf("account %s is used in ledger entries and cannot change parent", accountID)
 	}
 	return nil
 }
 
-// Delete soft-deletes an account by setting deleted_at
+// Delete soft-deletes an account only if it has no children and is NOT referenced in ledger_entries.
 func (r *accountRepository) Delete(ctx context.Context, db DBTX, accountID uuid.UUID, deletedBy *uuid.UUID) error {
+	// Check children first
+	hasChildren, err := r.HasChildren(ctx, db, accountID)
+	if err != nil {
+		return fmt.Errorf("check children before delete: %w", err)
+	}
+	if hasChildren {
+		return fmt.Errorf("cannot delete account %s: has child accounts", accountID)
+	}
+
+	// Prevent deletion if account is used in ledger
+	used, err := r.CheckUsageInLedger(ctx, db, accountID)
+	if err != nil {
+		return fmt.Errorf("check ledger usage before delete: %w", err)
+	}
+	if used {
+		return fmt.Errorf("cannot delete account %s: used in ledger entries", accountID)
+	}
+
 	query := `
 		UPDATE accounting.accounts
 		SET deleted_at = NOW(), updated_by = $2, updated_at = NOW()
@@ -397,12 +450,12 @@ func (r *accountRepository) Delete(ctx context.Context, db DBTX, accountID uuid.
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		return fmt.Errorf("account %s not found or already deleted", accountID)
+		return ErrNotFound
 	}
 	return nil
 }
 
-// GetByID retrieves an account by its ID
+// GetByID retrieves an account by its ID.
 func (r *accountRepository) GetByID(ctx context.Context, db DBTX, accountID uuid.UUID) (*models.Account, error) {
 	query := `
 		SELECT account_id, company_id, account_code, account_name, account_type,
@@ -423,7 +476,7 @@ func (r *accountRepository) GetByID(ctx context.Context, db DBTX, accountID uuid
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get account by ID",
 			util.String("id", accountID.String()),
@@ -445,7 +498,7 @@ func (r *accountRepository) GetByID(ctx context.Context, db DBTX, accountID uuid
 	return &a, nil
 }
 
-// GetByIDForUpdate retrieves an account with row-level locking for update
+// GetByIDForUpdate retrieves an account with row-level locking for update.
 func (r *accountRepository) GetByIDForUpdate(ctx context.Context, db DBTX, accountID uuid.UUID) (*models.Account, error) {
 	query := `
 		SELECT account_id, company_id, account_code, account_name, account_type,
@@ -467,7 +520,7 @@ func (r *accountRepository) GetByIDForUpdate(ctx context.Context, db DBTX, accou
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get account for update",
 			util.String("id", accountID.String()),
@@ -489,7 +542,7 @@ func (r *accountRepository) GetByIDForUpdate(ctx context.Context, db DBTX, accou
 	return &a, nil
 }
 
-// GetByCode retrieves an account by company and account code
+// GetByCode retrieves an account by company and account code.
 func (r *accountRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Account, error) {
 	query := `
 		SELECT account_id, company_id, account_code, account_name, account_type,
@@ -510,7 +563,7 @@ func (r *accountRepository) GetByCode(ctx context.Context, db DBTX, companyID uu
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get account by code",
 			util.String("company_id", companyID.String()),
@@ -544,6 +597,20 @@ func (r *accountRepository) ExistsByCode(ctx context.Context, db DBTX, companyID
 			util.String("code", code),
 			util.ErrorField(err))
 		return false, fmt.Errorf("exists by code: %w", err)
+	}
+	return exists, nil
+}
+
+// ExistsByID checks if an account exists (not deleted) by ID.
+func (r *accountRepository) ExistsByID(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM accounting.accounts WHERE account_id = $1 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, accountID).Scan(&exists)
+	if err != nil {
+		r.logger.Error("failed to check existence by ID",
+			util.String("id", accountID.String()),
+			util.ErrorField(err))
+		return false, fmt.Errorf("exists by ID: %w", err)
 	}
 	return exists, nil
 }
@@ -641,47 +708,47 @@ func (r *accountRepository) GetChildren(ctx context.Context, db DBTX, parentID u
 	return children, nil
 }
 
-// GetTree returns the full account hierarchy tree for a company
+// GetTree returns the full account hierarchy tree for a company.
 func (r *accountRepository) GetTree(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*AccountTreeNode, error) {
-	// Fetch all accounts for the company
 	all, err := r.ListByCompany(ctx, db, companyID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Build map of account pointers
-	accountMap := make(map[uuid.UUID]*models.Account)
-	for _, acc := range all {
-		accountMap[acc.AccountID] = acc
+	if len(all) == 0 {
+		return []*AccountTreeNode{}, nil
 	}
 
-	// Build map of children
+	// Build children map
 	childrenMap := make(map[uuid.UUID][]*models.Account)
+	roots := []*models.Account{}
+
 	for _, acc := range all {
-		if acc.ParentAccountID != nil {
+		if acc.ParentAccountID == nil {
+			roots = append(roots, acc)
+		} else {
 			parentID := *acc.ParentAccountID
 			childrenMap[parentID] = append(childrenMap[parentID], acc)
 		}
 	}
 
-	// Recursive function to build tree nodes
-	var buildTree func(parentID *uuid.UUID) []*AccountTreeNode
-	buildTree = func(parentID *uuid.UUID) []*AccountTreeNode {
-		var nodes []*AccountTreeNode
-		for _, acc := range all {
-			if (parentID == nil && acc.ParentAccountID == nil) ||
-				(parentID != nil && acc.ParentAccountID != nil && *acc.ParentAccountID == *parentID) {
-				node := &AccountTreeNode{
-					Account:  acc,
-					Children: buildTree(&acc.AccountID),
-				}
-				nodes = append(nodes, node)
-			}
+	// Recursive builder using childrenMap
+	var build func(parent *models.Account) *AccountTreeNode
+	build = func(parent *models.Account) *AccountTreeNode {
+		node := &AccountTreeNode{
+			Account:  parent,
+			Children: []*AccountTreeNode{},
 		}
-		return nodes
+		for _, child := range childrenMap[parent.AccountID] {
+			node.Children = append(node.Children, build(child))
+		}
+		return node
 	}
 
-	return buildTree(nil), nil
+	trees := make([]*AccountTreeNode, len(roots))
+	for i, root := range roots {
+		trees[i] = build(root)
+	}
+	return trees, nil
 }
 
 // HasChildren checks if an account has any child accounts
@@ -698,18 +765,75 @@ func (r *accountRepository) HasChildren(ctx context.Context, db DBTX, accountID 
 	return exists, nil
 }
 
+// CountChildren returns the number of direct child accounts.
+func (r *accountRepository) CountChildren(ctx context.Context, db DBTX, accountID uuid.UUID) (int, error) {
+	query := `SELECT COUNT(*) FROM accounting.accounts WHERE parent_account_id = $1 AND deleted_at IS NULL`
+	var count int
+	err := db.QueryRowContext(ctx, query, accountID).Scan(&count)
+	if err != nil {
+		r.logger.Error("failed to count children",
+			util.String("account_id", accountID.String()),
+			util.ErrorField(err))
+		return 0, fmt.Errorf("count children: %w", err)
+	}
+	return count, nil
+}
+
+// IsLeafAccount checks if an account has no child accounts.
+func (r *accountRepository) IsLeafAccount(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error) {
+	hasChildren, err := r.HasChildren(ctx, db, accountID)
+	if err != nil {
+		return false, err
+	}
+	return !hasChildren, nil
+}
+
+// GetLeafAccountsByCompany returns all accounts that have no children.
+func (r *accountRepository) GetLeafAccountsByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Account, error) {
+	query := `
+		SELECT account_id, company_id, account_code, account_name, account_type,
+		       parent_account_id, is_active, description,
+		       created_at, updated_at, created_by, updated_by, deleted_at
+		FROM accounting.accounts a
+		WHERE company_id = $1
+		  AND deleted_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM accounting.accounts child
+			WHERE child.parent_account_id = a.account_id
+			  AND child.deleted_at IS NULL
+		  )
+		ORDER BY account_code
+	`
+	rows, err := db.QueryContext(ctx, query, companyID)
+	if err != nil {
+		r.logger.Error("failed to get leaf accounts",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get leaf accounts: %w", err)
+	}
+	defer rows.Close()
+
+	var leaves []*models.Account
+	for rows.Next() {
+		a, err := r.scanAccount(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan leaf account: %w", err)
+		}
+		leaves = append(leaves, a)
+	}
+	return leaves, nil
+}
+
 // CheckCircularReference detects if setting parent_id would create a cycle in the hierarchy
 func (r *accountRepository) CheckCircularReference(ctx context.Context, db DBTX, accountID uuid.UUID, parentID *uuid.UUID) (bool, error) {
 	if parentID == nil {
 		return false, nil
 	}
-	// Traverse up from parentID, if we ever reach accountID, it's a cycle
 	current := *parentID
 	for current != uuid.Nil {
 		if current == accountID {
 			return true, nil
 		}
-		// Get parent of current
 		query := `SELECT parent_account_id FROM accounting.accounts WHERE account_id = $1 AND deleted_at IS NULL`
 		var nextParent uuid.NullUUID
 		err := db.QueryRowContext(ctx, query, current).Scan(&nextParent)
@@ -730,34 +854,165 @@ func (r *accountRepository) CheckCircularReference(ctx context.Context, db DBTX,
 	return false, nil
 }
 
-// CheckUsageInJournal checks if the account is referenced in any journal line (posted entries)
-func (r *accountRepository) CheckUsageInJournal(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error) {
+// CheckUsageInLedger checks if the account is referenced in the ledger_entries table.
+func (r *accountRepository) CheckUsageInLedger(ctx context.Context, db DBTX, accountID uuid.UUID) (bool, error) {
 	query := `
 		SELECT EXISTS(
-			SELECT 1 FROM accounting.journal_lines jl
-			INNER JOIN accounting.journal_entries je ON jl.journal_entry_id = je.journal_entry_id
-			WHERE jl.account_id = $1 AND je.status = 'posted' AND je.deleted_at IS NULL
+			SELECT 1 FROM accounting.ledger_entries
+			WHERE account_id = $1
+			LIMIT 1
 		)
 	`
 	var exists bool
 	err := db.QueryRowContext(ctx, query, accountID).Scan(&exists)
 	if err != nil {
-		r.logger.Error("failed to check journal usage",
+		r.logger.Error("failed to check ledger usage",
 			util.String("account_id", accountID.String()),
 			util.ErrorField(err))
-		return false, fmt.Errorf("check usage in journal: %w", err)
+		return false, fmt.Errorf("check usage in ledger: %w", err)
 	}
 	return exists, nil
 }
 
-// LockAccount acquires a row-level lock on an account (for use within a transaction)
+// GetAccountType returns the account_type for a given account ID.
+func (r *accountRepository) GetAccountType(ctx context.Context, db DBTX, accountID uuid.UUID) (string, error) {
+	query := `SELECT account_type FROM accounting.accounts WHERE account_id = $1 AND deleted_at IS NULL`
+	var accType string
+	err := db.QueryRowContext(ctx, query, accountID).Scan(&accType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("get account type: %w", err)
+	}
+	return accType, nil
+}
+
+// GetByIDs returns a map of account ID -> Account for the given IDs, restricted to one company.
+func (r *accountRepository) GetByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]*models.Account, error) {
+	if len(ids) == 0 {
+		return map[uuid.UUID]*models.Account{}, nil
+	}
+	// Deduplicate IDs
+	unique := make(map[uuid.UUID]struct{})
+	for _, id := range ids {
+		unique[id] = struct{}{}
+	}
+	deduped := make([]uuid.UUID, 0, len(unique))
+	for id := range unique {
+		deduped = append(deduped, id)
+	}
+
+	query := `
+		SELECT account_id, company_id, account_code, account_name, account_type,
+		       parent_account_id, is_active, description,
+		       created_at, updated_at, created_by, updated_by, deleted_at
+		FROM accounting.accounts
+		WHERE company_id = $1 AND account_id = ANY($2) AND deleted_at IS NULL
+	`
+	rows, err := db.QueryContext(ctx, query, companyID, pq.Array(deduped))
+	if err != nil {
+		r.logger.Error("failed to get accounts by IDs",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get by IDs: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID]*models.Account, len(deduped))
+	for rows.Next() {
+		a, err := r.scanAccount(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan account in GetByIDs: %w", err)
+		}
+		result[a.AccountID] = a
+	}
+	return result, nil
+}
+
+// GetActiveByIDs returns a map of only active accounts for the given IDs, restricted to one company.
+func (r *accountRepository) GetActiveByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) (map[uuid.UUID]*models.Account, error) {
+	if len(ids) == 0 {
+		return map[uuid.UUID]*models.Account{}, nil
+	}
+	unique := make(map[uuid.UUID]struct{})
+	for _, id := range ids {
+		unique[id] = struct{}{}
+	}
+	deduped := make([]uuid.UUID, 0, len(unique))
+	for id := range unique {
+		deduped = append(deduped, id)
+	}
+
+	query := `
+		SELECT account_id, company_id, account_code, account_name, account_type,
+		       parent_account_id, is_active, description,
+		       created_at, updated_at, created_by, updated_by, deleted_at
+		FROM accounting.accounts
+		WHERE company_id = $1 AND account_id = ANY($2) AND deleted_at IS NULL AND is_active = true
+	`
+	rows, err := db.QueryContext(ctx, query, companyID, pq.Array(deduped))
+	if err != nil {
+		r.logger.Error("failed to get active accounts by IDs",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return nil, fmt.Errorf("get active by IDs: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID]*models.Account)
+	for rows.Next() {
+		a, err := r.scanAccount(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan account in GetActiveByIDs: %w", err)
+		}
+		result[a.AccountID] = a
+	}
+	return result, nil
+}
+
+// ValidateAccountIDs checks that all provided IDs exist, are not deleted, and belong to the same company.
+// Returns an error if any ID is invalid.
+func (r *accountRepository) ValidateAccountIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	// Deduplicate
+	unique := make(map[uuid.UUID]struct{})
+	for _, id := range ids {
+		unique[id] = struct{}{}
+	}
+	deduped := make([]uuid.UUID, 0, len(unique))
+	for id := range unique {
+		deduped = append(deduped, id)
+	}
+	query := `
+		SELECT COUNT(*) = $2
+		FROM (
+			SELECT DISTINCT account_id
+			FROM accounting.accounts
+			WHERE company_id = $1 AND account_id = ANY($3) AND deleted_at IS NULL
+		) t
+	`
+	var valid bool
+	err := db.QueryRowContext(ctx, query, companyID, len(deduped), pq.Array(deduped)).Scan(&valid)
+	if err != nil {
+		return fmt.Errorf("validate account IDs: %w", err)
+	}
+	if !valid {
+		return fmt.Errorf("one or more account IDs are invalid, deleted, or belong to a different company")
+	}
+	return nil
+}
+
+// LockAccount acquires a row-level lock on an active account (for use within a transaction).
 func (r *accountRepository) LockAccount(ctx context.Context, db DBTX, accountID uuid.UUID) error {
-	query := `SELECT account_id FROM accounting.accounts WHERE account_id = $1 FOR UPDATE`
+	query := `SELECT account_id FROM accounting.accounts WHERE account_id = $1 AND deleted_at IS NULL FOR UPDATE`
 	var id uuid.UUID
 	err := db.QueryRowContext(ctx, query, accountID).Scan(&id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("account %s not found", accountID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to lock account",
 			util.String("account_id", accountID.String()),

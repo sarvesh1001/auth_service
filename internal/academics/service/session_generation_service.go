@@ -149,6 +149,7 @@ func (s *sessionGenerationService) GenerateSessions(ctx context.Context, startDa
 		AggregateType: "academic_sessions",
 		AggregateID:   jobID, // jobID is a UUID string, matches database column type
 		EventType:     string(EventSessionsGenerated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",

@@ -7,14 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chiMiddleware "github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
-	"github.com/google/uuid"
-	"go.uber.org/zap"
-
 	academics "auth-service/internal/academics"
 	academichandler "auth-service/internal/academics/handler"
+	"auth-service/internal/accounting" // <-- NEW
 	biometricHandler "auth-service/internal/hr/biometric/handler"
 	hrHandler "auth-service/internal/hr/handler"
 	leavehandler "auth-service/internal/hr/leave/handler"
@@ -23,6 +18,12 @@ import (
 	a "auth-service/internal/infrastructure/audit"
 	authMiddleware "auth-service/internal/middleware"
 	"auth-service/internal/service"
+
+	"github.com/go-chi/chi/v5"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // AcademicHandlers groups all handlers required by academics.RegisterAcademicRoutes
@@ -109,6 +110,7 @@ func NewRouter(
 	taxDeclarationHandler *payrollhandler.TaxDeclarationHandler,
 	// ACADEMIC HANDLERS (grouped)
 	academicHandlers *AcademicHandlers,
+	accountingHandlers *accounting.AccountingHandlers, // <-- NEW
 ) chi.Router {
 	router := chi.NewRouter()
 
@@ -1370,6 +1372,7 @@ func NewRouter(
 					academicHandlers.SessionGenerationHandler,
 					academicHandlers.StudentBiometricSyncHandler,
 				)
+				accounting.RegisterAccountingRoutes(r, accountingHandlers, logger, jwtService)
 
 				// NOTE: The student biometric sync routes have been moved OUTSIDE the JWT group,
 				// to the public device-authenticated section (above the student login route).

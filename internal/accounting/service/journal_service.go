@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -20,20 +21,30 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// JournalService defines the journal entry operations
+// =============================================================================
+// Interfaces
+// =============================================================================
+
 type JournalService interface {
 	Create(ctx context.Context, req CreateJournalRequest) (*models.JournalEntry, error)
+	CreateWithTx(ctx context.Context, tx *sql.Tx, req CreateJournalRequest) (*models.JournalEntry, error)
 	Update(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error)
 	Post(ctx context.Context, id uuid.UUID, postedBy *uuid.UUID) error
 	Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error
 	GetByID(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error)
+	GetSummary(ctx context.Context, id uuid.UUID) (*repository.JournalSummary, error)
 	List(ctx context.Context, filter repository.JournalFilter, p Pagination) ([]*models.JournalEntry, int64, error)
 	Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error
 }
 
+// =============================================================================
+// Implementation
+// =============================================================================
+
 type journalService struct {
 	repo             repository.JournalRepository
 	ledgerService    LedgerService
+	ruleEngine       AccountingRuleEngine
 	pgClient         *client.PostgresClient
 	logger           *zap.Logger
 	outboxRepo       outbox.Repository
@@ -41,10 +52,10 @@ type journalService struct {
 	auditService     *audit.AuditService
 }
 
-// NewJournalService creates a new journal service instance
 func NewJournalService(
 	repo repository.JournalRepository,
 	ledgerService LedgerService,
+	ruleEngine AccountingRuleEngine,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 	outboxRepo outbox.Repository,
@@ -54,6 +65,7 @@ func NewJournalService(
 	return &journalService{
 		repo:             repo,
 		ledgerService:    ledgerService,
+		ruleEngine:       ruleEngine,
 		pgClient:         pgClient,
 		logger:           logger.Named("journal_service"),
 		outboxRepo:       outboxRepo,
@@ -62,58 +74,115 @@ func NewJournalService(
 	}
 }
 
-// Create creates a new draft journal entry with source tracking and uniqueness enforcement
+// =============================================================================
+// Public Methods
+// =============================================================================
+
 func (s *journalService) Create(ctx context.Context, req CreateJournalRequest) (*models.JournalEntry, error) {
 	logger := s.logger.With(zap.String("method", "Create"), zap.String("company_id", req.CompanyID.String()))
-	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
-
-	if err := s.validateJournal(req); err != nil {
-		return nil, err
-	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	entry, err := s.createWithTxInternal(ctx, tx, req, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("journal entry created", zap.String("journal_id", entry.JournalEntryID.String()))
+	return entry, nil
+}
+
+func (s *journalService) CreateWithTx(ctx context.Context, tx *sql.Tx, req CreateJournalRequest) (*models.JournalEntry, error) {
+	logger := s.logger.With(zap.String("method", "CreateWithTx"), zap.String("company_id", req.CompanyID.String()))
+	return s.createWithTxInternal(ctx, tx, req, logger)
+}
+
+func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, req CreateJournalRequest, logger *zap.Logger) (*models.JournalEntry, error) {
+	// 1. Basic validation (double‑entry, non‑negative, etc.)
+	if err := s.validateJournal(req); err != nil {
+		return nil, err
+	}
+
+	// 2. RULE ENGINE VALIDATION (advanced business rules)
+	if err := s.ruleEngine.ValidateJournal(ctx, tx, req); err != nil {
+		return nil, err
+	}
+
+	// 3. DUPLICATE DETECTION
+	dup, err := s.ruleEngine.IsDuplicate(ctx, tx, req)
+	if err != nil {
+		return nil, err
+	}
+	if dup {
+		s.logger.Warn("duplicate transaction detected", zap.Any("req", req))
+		return nil, ErrDuplicateTransaction
+	}
+
+	// 4. Idempotency check
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	if idempotencyKey != "" {
-		var existing *models.JournalEntry
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+		var existing models.JournalEntry
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil {
 			logger.Info("idempotent request, returning cached response")
-			return existing, nil
+			return &existing, nil
 		}
 	}
 
-	// Enforce source uniqueness
+	// 5. Create journal entry (with or without source)
+	var journal *models.JournalEntry
+	var created bool
+
 	if req.SourceType != nil && req.SourceID != nil {
-		exists, err := s.repo.ExistsBySource(ctx, tx, req.CompanyID, *req.SourceType, *req.SourceID)
+		journal, created, err = s.repo.CreateOrGetBySource(
+			ctx, tx, req.CompanyID, *req.SourceType, *req.SourceID,
+			func() *models.JournalEntry {
+				return &models.JournalEntry{
+					JournalEntryID: uuid.New(),
+					CompanyID:      req.CompanyID,
+					JournalType:    req.JournalType,
+					EntryDate:      req.EntryDate,
+					Reference:      req.Reference,
+					Description:    req.Description,
+					Status:         enums.JournalStatusDraft,
+					CreatedBy:      req.CreatedBy,
+					UpdatedBy:      req.UpdatedBy,
+					SourceType:     req.SourceType,
+					SourceID:       req.SourceID,
+				}
+			},
+		)
 		if err != nil {
-			return nil, fmt.Errorf("check source uniqueness: %w", err)
+			return nil, fmt.Errorf("create or get by source: %w", err)
 		}
-		if exists {
-			return nil, fmt.Errorf("%w: journal already exists for source %s/%s", ErrDuplicate, *req.SourceType, req.SourceID.String())
+		if !created {
+			_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, journal)
+			return journal, nil
+		}
+	} else {
+		journal = &models.JournalEntry{
+			JournalEntryID: uuid.New(),
+			CompanyID:      req.CompanyID,
+			JournalType:    req.JournalType,
+			EntryDate:      req.EntryDate,
+			Reference:      req.Reference,
+			Description:    req.Description,
+			Status:         enums.JournalStatusDraft,
+			CreatedBy:      req.CreatedBy,
+			UpdatedBy:      req.UpdatedBy,
+		}
+		if err := s.repo.Create(ctx, tx, journal); err != nil {
+			return nil, fmt.Errorf("create entry: %w", err)
 		}
 	}
 
-	journal := &models.JournalEntry{
-		JournalEntryID: uuid.New(),
-		CompanyID:      req.CompanyID,
-		JournalType:    req.JournalType,
-		EntryDate:      req.EntryDate,
-		Reference:      req.Reference,
-		Description:    req.Description,
-		Status:         enums.JournalStatusDraft,
-		CreatedBy:      req.CreatedBy,
-		UpdatedBy:      req.UpdatedBy,
-		SourceType:     req.SourceType,
-		SourceID:       req.SourceID,
-	}
-
-	if err := s.repo.Create(ctx, tx, journal); err != nil {
-		return nil, fmt.Errorf("create entry: %w", err)
-	}
-
+	// 6. Add journal lines
 	lines := make([]*models.JournalLine, len(req.Lines))
 	for i, lineReq := range req.Lines {
 		lines[i] = &models.JournalLine{
@@ -130,21 +199,14 @@ func (s *journalService) Create(ctx context.Context, req CreateJournalRequest) (
 		return nil, fmt.Errorf("create lines: %w", err)
 	}
 
-	payload, _ := json.Marshal(events.JournalEventPayload{
-		JournalEntryID: journal.JournalEntryID.String(),
-		CompanyID:      journal.CompanyID.String(),
-		JournalType:    journal.JournalType,
-		EntryDate:      journal.EntryDate,
-		TotalDebit:     req.TotalDebit().String(),
-		TotalCredit:    req.TotalCredit().String(),
-		Status:         journal.Status,
-	})
-
+	// 7. Outbox event
+	payload := s.buildJournalEventPayload(journal, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "journal_entry",
 		AggregateID:   journal.JournalEntryID.String(),
 		EventType:     events.EventJournalCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -152,24 +214,24 @@ func (s *journalService) Create(ctx context.Context, req CreateJournalRequest) (
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
+	// 8. Idempotency storage
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, journal)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit tx: %w", err)
-	}
-
+	// 9. Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "accounting", "create", "journal_entry",
 			&journal.JournalEntryID, "user", req.CreatedBy, nil, nil, nil)
 	}
 
-	logger.Info("journal entry created", zap.String("journal_id", journal.JournalEntryID.String()))
 	return journal, nil
 }
 
-// Update modifies a draft journal entry (source fields are immutable)
+// =============================================================================
+// UPDATE - FIXED with validation
+// =============================================================================
+
 func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error) {
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("journal_id", req.JournalEntryID.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -203,6 +265,29 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		return nil, fmt.Errorf("%w: cannot update journal entry in status %s", ErrInvalidState, existing.Status)
 	}
 
+	// ----- FIX START: Apply full validation if lines are being updated -----
+	if req.Lines != nil {
+		// Build a CreateJournalRequest from the existing journal data + new lines
+		validationReq := CreateJournalRequest{
+			CompanyID:   existing.CompanyID,
+			JournalType: existing.JournalType,
+			EntryDate:   existing.EntryDate,
+			Reference:   existing.Reference,
+			Description: existing.Description,
+			Lines:       req.Lines,
+		}
+		// 1. Basic double‑entry validation
+		if err := s.validateJournal(validationReq); err != nil {
+			return nil, err
+		}
+		// 2. Advanced business rule validation (account types, period locks, etc.)
+		if err := s.ruleEngine.ValidateJournal(ctx, tx, validationReq); err != nil {
+			return nil, err
+		}
+	}
+	// ----- FIX END -----
+
+	// Apply updates
 	if req.EntryDate != nil {
 		existing.EntryDate = *req.EntryDate
 	}
@@ -218,11 +303,12 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		return nil, fmt.Errorf("update entry: %w", err)
 	}
 
+	var lines []*models.JournalLine
 	if req.Lines != nil {
 		if err := s.repo.ClearLines(ctx, tx, existing.JournalEntryID); err != nil {
 			return nil, fmt.Errorf("delete old lines: %w", err)
 		}
-		lines := make([]*models.JournalLine, len(req.Lines))
+		lines = make([]*models.JournalLine, len(req.Lines))
 		for i, lineReq := range req.Lines {
 			lines[i] = &models.JournalLine{
 				JournalLineID:  uuid.New(),
@@ -237,21 +323,21 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		if err := s.repo.BulkAddLines(ctx, tx, lines); err != nil {
 			return nil, fmt.Errorf("create new lines: %w", err)
 		}
+	} else {
+		lines, err = s.repo.GetLines(ctx, tx, existing.JournalEntryID)
+		if err != nil {
+			return nil, fmt.Errorf("get lines for event: %w", err)
+		}
 	}
 
-	payload, _ := json.Marshal(events.JournalEventPayload{
-		JournalEntryID: existing.JournalEntryID.String(),
-		CompanyID:      existing.CompanyID.String(),
-		JournalType:    existing.JournalType,
-		EntryDate:      existing.EntryDate,
-		Status:         existing.Status,
-	})
-
+	// Outbox event for update
+	payload := s.buildJournalEventPayload(existing, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "journal_entry",
 		AggregateID:   existing.JournalEntryID.String(),
 		EventType:     events.EventJournalUpdated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -276,7 +362,10 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 	return existing, nil
 }
 
-// Post changes status from draft to posted and updates ledger balances
+// =============================================================================
+// Other methods (Post, Reverse, Delete, GetByID, etc.) remain unchanged
+// =============================================================================
+
 func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Post"), zap.String("journal_id", id.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -300,54 +389,60 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 		return fmt.Errorf("get entry: %w", err)
 	}
 	if entry == nil {
-		return fmt.Errorf("%w: journal entry %s", ErrNotFound, id)
+		return fmt.Errorf("%w: journal entry %s", repository.ErrNotFound, id)
+	}
+	if entry.Status == enums.JournalStatusPosted {
+		return fmt.Errorf("journal entry already posted")
 	}
 	if entry.Status != enums.JournalStatusDraft {
-		return fmt.Errorf("%w: journal entry already %s", ErrInvalidState, entry.Status)
+		return fmt.Errorf("cannot post journal with status %s", entry.Status)
+	}
+	if err := s.repo.ValidateBeforePost(ctx, tx, id); err != nil {
+		return err
 	}
 
 	lines, err := s.repo.GetLines(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get lines: %w", err)
 	}
-	if len(lines) == 0 {
-		return fmt.Errorf("%w: journal entry has no lines", ErrInvalidState)
+
+	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, entry, lines); err != nil {
+		return err
 	}
 
-	totalDebit := decimal.Zero
-	totalCredit := decimal.Zero
-	for _, line := range lines {
-		totalDebit = totalDebit.Add(line.DebitAmount)
-		totalCredit = totalCredit.Add(line.CreditAmount)
+	logger.Info("calling PostJournalToLedger")
+	if err := s.ledgerService.PostJournalToLedger(ctx, tx, entry, lines); err != nil {
+		logger.Error("PostJournalToLedger failed", zap.Error(err))
+		return fmt.Errorf("post to ledger: %w", err)
 	}
-	if !totalDebit.Equal(totalCredit) {
-		return fmt.Errorf("%w: total debits %s do not equal total credits %s", ErrInvalidState, totalDebit, totalCredit)
+	logger.Info("PostJournalToLedger completed successfully")
+
+	var ledgerCount int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.ledger_entries WHERE journal_entry_id = $1`, id).Scan(&ledgerCount)
+	if err != nil {
+		logger.Error("failed to query ledger count", zap.Error(err))
+	} else {
+		logger.Info("ledger entries count after PostJournalToLedger", zap.Int("count", ledgerCount))
 	}
+
+	if err := s.repo.ValidateLedgerExists(ctx, tx, id); err != nil {
+		logger.Error("ValidateLedgerExists failed", zap.Error(err))
+		return fmt.Errorf("ledger validation failed: %w", err)
+	}
+	logger.Info("ValidateLedgerExists passed")
 
 	if err := s.repo.Post(ctx, tx, id, postedBy); err != nil {
 		return fmt.Errorf("post journal entry: %w", err)
 	}
+	logger.Info("journal status updated to posted")
 
-	entry, _ = s.repo.GetByID(ctx, tx, id)
-	if err := s.ledgerService.PostJournalToLedger(ctx, tx, entry, lines); err != nil {
-		return fmt.Errorf("post to ledger: %w", err)
-	}
-
-	payload, _ := json.Marshal(events.JournalEventPayload{
-		JournalEntryID: entry.JournalEntryID.String(),
-		CompanyID:      entry.CompanyID.String(),
-		JournalType:    entry.JournalType,
-		EntryDate:      entry.EntryDate,
-		TotalDebit:     totalDebit.String(),
-		TotalCredit:    totalCredit.String(),
-		Status:         entry.Status,
-	})
-
+	payload := s.buildJournalEventPayload(entry, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "journal_entry",
-		AggregateID:   entry.JournalEntryID.String(),
+		AggregateID:   id.String(),
 		EventType:     events.EventJournalPosted,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -356,7 +451,11 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 	}
 
 	if idempotencyKey != "" {
-		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+		type postResult struct {
+			JournalID uuid.UUID `json:"journal_id"`
+			Status    string    `json:"status"`
+		}
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, postResult{JournalID: id, Status: "posted"})
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -372,9 +471,12 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 	return nil
 }
 
-// Reverse creates a reversing entry for a posted journal and marks original as reversed
 func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "Reverse"), zap.String("journal_id", id.String()))
+	logger := s.logger.With(
+		zap.String("method", "Reverse"),
+		zap.String("journal_id", id.String()),
+	)
+
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -383,6 +485,9 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 	}
 	defer tx.Rollback()
 
+	// -------------------------------
+	// Idempotency check
+	// -------------------------------
 	if idempotencyKey != "" {
 		var processed bool
 		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
@@ -391,141 +496,168 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		}
 	}
 
-	original, err := s.repo.GetByIDForUpdate(ctx, tx, id)
+	// -------------------------------
+	// Check existing reversal
+	// -------------------------------
+	hasRev, err := s.repo.HasReversal(ctx, tx, id)
 	if err != nil {
-		return fmt.Errorf("get entry: %w", err)
+		return fmt.Errorf("check reversal existence: %w", err)
 	}
-	if original == nil {
-		return fmt.Errorf("%w: journal entry %s", ErrNotFound, id)
-	}
-	if original.Status != enums.JournalStatusPosted {
-		return fmt.Errorf("%w: only posted entries can be reversed, current status: %s", ErrInvalidState, original.Status)
+	if hasRev {
+		return repository.ErrReversalAlreadyExists
 	}
 
+	// -------------------------------
+	// Lock & fetch original
+	// -------------------------------
+	original, err := s.repo.GetByIDForUpdate(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("get original entry: %w", err)
+	}
+	if original == nil {
+		return fmt.Errorf("%w: journal entry %s", repository.ErrNotFound, id)
+	}
+	if original.Status != enums.JournalStatusPosted {
+		return fmt.Errorf("only posted entries can be reversed, status: %s", original.Status)
+	}
+
+	// -------------------------------
+	// Fetch original lines
+	// -------------------------------
+	originalLines, err := s.repo.GetLines(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("get original lines: %w", err)
+	}
+	if len(originalLines) == 0 {
+		return fmt.Errorf("original journal has no lines")
+	}
+
+	// -------------------------------
+	// Create reversal entry (DRAFT)
+	// -------------------------------
 	reversal := &models.JournalEntry{
 		JournalEntryID: uuid.New(),
 		CompanyID:      original.CompanyID,
 		JournalType:    enums.JournalTypeContra,
 		EntryDate:      time.Now(),
-		Reference:      stringPtr(fmt.Sprintf("Reversal of %s", original.JournalEntryID.String())),
+		Reference:      stringPtr(fmt.Sprintf("REV-%s", original.JournalEntryID.String())),
 		Description:    stringPtr(fmt.Sprintf("Reversal: %s", reason)),
 		Status:         enums.JournalStatusDraft,
 		ReversalOf:     &original.JournalEntryID,
 		CreatedBy:      reversedBy,
 		UpdatedBy:      reversedBy,
 	}
-	if err := s.repo.Create(ctx, tx, reversal); err != nil {
-		return fmt.Errorf("create reversal entry: %w", err)
+
+	// Create reversal entry
+	if err := s.repo.Reverse(ctx, tx, id, reversal); err != nil {
+		return fmt.Errorf("reverse journal: %w", err)
 	}
 
-	originalLines, err := s.repo.GetLines(ctx, tx, id)
-	if err != nil {
-		return fmt.Errorf("get original lines: %w", err)
-	}
-
+	// -------------------------------
+	// Create reversed lines (swap debit/credit)
+	// -------------------------------
 	reversalLines := make([]*models.JournalLine, len(originalLines))
-	for i, line := range originalLines {
+
+	for i, l := range originalLines {
 		reversalLines[i] = &models.JournalLine{
 			JournalLineID:  uuid.New(),
 			JournalEntryID: reversal.JournalEntryID,
-			AccountID:      line.AccountID,
+			AccountID:      l.AccountID,
 			LineNumber:     i + 1,
-			DebitAmount:    line.CreditAmount,
-			CreditAmount:   line.DebitAmount,
-			Description:    stringPtr(fmt.Sprintf("Reversal: %s", getStringValue(line.Description))),
+			DebitAmount:    l.CreditAmount, // 🔁 swap
+			CreditAmount:   l.DebitAmount,  // 🔁 swap
+			Description:    l.Description,
 		}
 	}
+
+	// Insert reversed lines
 	if err := s.repo.BulkAddLines(ctx, tx, reversalLines); err != nil {
 		return fmt.Errorf("create reversal lines: %w", err)
 	}
 
-	if err := s.repo.Post(ctx, tx, reversal.JournalEntryID, reversedBy); err != nil {
-		return fmt.Errorf("post reversal: %w", err)
+	// -------------------------------
+	// Rule validation before post
+	// -------------------------------
+	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, reversal, reversalLines); err != nil {
+		return err
 	}
 
+	// -------------------------------
+	// Post to ledger FIRST
+	// -------------------------------
 	if err := s.ledgerService.PostJournalToLedger(ctx, tx, reversal, reversalLines); err != nil {
 		return fmt.Errorf("post reversal to ledger: %w", err)
 	}
 
-	if err := s.repo.UpdateStatus(ctx, tx, original.JournalEntryID, enums.JournalStatusReversed, reversedBy); err != nil {
-		return fmt.Errorf("update original status: %w", err)
+	// -------------------------------
+	// Then mark as POSTED
+	// -------------------------------
+	if err := s.repo.Post(ctx, tx, reversal.JournalEntryID, reversedBy); err != nil {
+		return fmt.Errorf("post reversal entry: %w", err)
 	}
 
-	payload, _ := json.Marshal(events.JournalEventPayload{
-		JournalEntryID: reversal.JournalEntryID.String(),
-		CompanyID:      reversal.CompanyID.String(),
-		JournalType:    reversal.JournalType,
-		EntryDate:      reversal.EntryDate,
-		Status:         reversal.Status,
-		ReversalOf:     original.JournalEntryID.String(),
-	})
+	// -------------------------------
+	// Outbox event
+	// -------------------------------
+	payload := s.buildJournalEventPayload(reversal, reversalLines)
 
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "journal_entry",
 		AggregateID:   reversal.JournalEntryID.String(),
 		EventType:     events.EventJournalReversed,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
+
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
+	// -------------------------------
+	// Idempotency store
+	// -------------------------------
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 
+	// -------------------------------
+	// Commit
+	// -------------------------------
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
+	// -------------------------------
+	// Audit log
+	// -------------------------------
 	if s.auditService != nil {
-		_ = s.auditService.LogAction(ctx, nil, &original.CompanyID, "accounting", "reverse", "journal_entry",
-			&id, "user", reversedBy, nil, nil, map[string]interface{}{"reason": reason, "reversal_id": reversal.JournalEntryID.String()})
+		_ = s.auditService.LogAction(
+			ctx,
+			nil,
+			&original.CompanyID,
+			"accounting",
+			"reverse",
+			"journal_entry",
+			&id,
+			"user",
+			reversedBy,
+			nil,
+			nil,
+			map[string]interface{}{
+				"reason":      reason,
+				"reversal_id": reversal.JournalEntryID.String(),
+			},
+		)
 	}
 
-	logger.Info("journal entry reversed", zap.String("reversal_id", reversal.JournalEntryID.String()))
+	logger.Info("journal entry reversed successfully",
+		zap.String("reversal_id", reversal.JournalEntryID.String()))
+
 	return nil
 }
 
-// GetByID retrieves a journal entry with its lines
-func (s *journalService) GetByID(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error) {
-	logger := s.logger.With(zap.String("method", "GetByID"), zap.String("id", id.String()))
-	entry, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
-	if err != nil {
-		return nil, err
-	}
-	if entry == nil {
-		return nil, fmt.Errorf("%w: journal entry %s", ErrNotFound, id)
-	}
-	lines, err := s.repo.GetLines(ctx, s.pgClient.DB, id)
-	if err != nil {
-		return nil, fmt.Errorf("get lines: %w", err)
-	}
-	logger.Debug("journal entry retrieved", zap.Int("line_count", len(lines)))
-	return entry, nil
-}
-
-// List returns paginated journal entries matching the filter
-func (s *journalService) List(ctx context.Context, filter repository.JournalFilter, p Pagination) ([]*models.JournalEntry, int64, error) {
-	logger := s.logger.With(zap.String("method", "List"))
-	limit, offset := s.validatePagination(p)
-	sort := repository.Sort{Field: "entry_date", Direction: "DESC"}
-
-	entries, err := s.repo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: limit, Offset: offset}, sort)
-	if err != nil {
-		return nil, 0, fmt.Errorf("list entries: %w", err)
-	}
-	total, err := s.repo.Count(ctx, s.pgClient.DB, filter)
-	if err != nil {
-		return nil, 0, fmt.Errorf("count entries: %w", err)
-	}
-	logger.Debug("listed journal entries", zap.Int("count", len(entries)), zap.Int64("total", total))
-	return entries, total, nil
-}
-
-// Delete performs a soft delete on a draft journal entry
 func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("journal_id", id.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
@@ -549,31 +681,28 @@ func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 		return fmt.Errorf("get entry: %w", err)
 	}
 	if entry == nil {
-		return fmt.Errorf("%w: journal entry %s", ErrNotFound, id)
+		return fmt.Errorf("%w: journal entry %s", repository.ErrNotFound, id)
 	}
 	if entry.Status != enums.JournalStatusDraft {
 		return fmt.Errorf("%w: cannot delete journal entry in status %s", ErrInvalidState, entry.Status)
 	}
 
-	// Repository Delete performs soft delete (sets deleted_at and status = 'deleted')
+	lines, err := s.repo.GetLines(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("get lines for event: %w", err)
+	}
+
 	if err := s.repo.Delete(ctx, tx, id, deletedBy); err != nil {
 		return fmt.Errorf("delete entry: %w", err)
 	}
 
-	// Emit deletion event
-	payload, _ := json.Marshal(events.JournalEventPayload{
-		JournalEntryID: entry.JournalEntryID.String(),
-		CompanyID:      entry.CompanyID.String(),
-		JournalType:    entry.JournalType,
-		EntryDate:      entry.EntryDate,
-		Status:         "deleted",
-	})
-
+	payload := s.buildJournalEventPayload(entry, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "journal_entry",
-		AggregateID:   entry.JournalEntryID.String(),
+		AggregateID:   id.String(),
 		EventType:     events.EventJournalDeleted,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -598,7 +727,79 @@ func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	return nil
 }
 
-// validateJournal performs business validation on a create request
+func (s *journalService) GetByID(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error) {
+	entry, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("%w: journal entry %s", repository.ErrNotFound, id)
+	}
+	return entry, nil
+}
+
+func (s *journalService) GetSummary(ctx context.Context, id uuid.UUID) (*repository.JournalSummary, error) {
+	return s.repo.GetJournalSummary(ctx, s.pgClient.DB, id)
+}
+
+func (s *journalService) List(ctx context.Context, filter repository.JournalFilter, p Pagination) ([]*models.JournalEntry, int64, error) {
+	logger := s.logger.With(zap.String("method", "List"))
+	limit, offset := s.validatePagination(p)
+	sort := repository.Sort{Field: "entry_date", Direction: "DESC"}
+	entries, err := s.repo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: limit, Offset: offset}, sort)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list entries: %w", err)
+	}
+	total, err := s.repo.Count(ctx, s.pgClient.DB, filter)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count entries: %w", err)
+	}
+	logger.Debug("listed journal entries", zap.Int("count", len(entries)), zap.Int64("total", total))
+	return entries, total, nil
+}
+
+// =============================================================================
+// Private Helpers
+// =============================================================================
+
+func (s *journalService) buildJournalEventPayload(entry *models.JournalEntry, lines []*models.JournalLine) []byte {
+	type linePayload struct {
+		AccountID string `json:"account_id"`
+		Debit     string `json:"debit"`
+		Credit    string `json:"credit"`
+	}
+	payloadLines := make([]linePayload, len(lines))
+	for i, l := range lines {
+		payloadLines[i] = linePayload{
+			AccountID: l.AccountID.String(),
+			Debit:     l.DebitAmount.String(),
+			Credit:    l.CreditAmount.String(),
+		}
+	}
+	payload := struct {
+		JournalEntryID string        `json:"journal_entry_id"`
+		CompanyID      string        `json:"company_id"`
+		JournalType    string        `json:"journal_type"`
+		EntryDate      time.Time     `json:"entry_date"`
+		Status         string        `json:"status"`
+		ReversalOf     *string       `json:"reversal_of,omitempty"`
+		Lines          []linePayload `json:"lines"`
+	}{
+		JournalEntryID: entry.JournalEntryID.String(),
+		CompanyID:      entry.CompanyID.String(),
+		JournalType:    entry.JournalType,
+		EntryDate:      entry.EntryDate,
+		Status:         entry.Status,
+		Lines:          payloadLines,
+	}
+	if entry.ReversalOf != nil {
+		rev := entry.ReversalOf.String()
+		payload.ReversalOf = &rev
+	}
+	data, _ := json.Marshal(payload)
+	return data
+}
+
 func (s *journalService) validateJournal(req CreateJournalRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id is required", ErrInvalidInput)
@@ -611,6 +812,9 @@ func (s *journalService) validateJournal(req CreateJournalRequest) error {
 	}
 	if len(req.Lines) == 0 {
 		return fmt.Errorf("%w: at least one journal line is required", ErrInvalidInput)
+	}
+	if len(req.Lines) < 2 {
+		return fmt.Errorf("%w: journal must have at least 2 lines (double‑entry)", ErrInvalidInput)
 	}
 	totalDebit := decimal.Zero
 	totalCredit := decimal.Zero
@@ -636,7 +840,6 @@ func (s *journalService) validateJournal(req CreateJournalRequest) error {
 	return nil
 }
 
-// validatePagination returns sanitized limit and offset
 func (s *journalService) validatePagination(p Pagination) (int, int) {
 	limit := p.Limit
 	if limit <= 0 {
@@ -652,14 +855,6 @@ func (s *journalService) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// Helper functions
 func stringPtr(s string) *string {
 	return &s
-}
-
-func getStringValue(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }

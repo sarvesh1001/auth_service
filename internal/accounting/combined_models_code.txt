@@ -71,23 +71,39 @@ import (
 )
 
 type JournalEntry struct {
-	JournalEntryID uuid.UUID  `db:"journal_entry_id" json:"journal_entry_id"`
-	CompanyID      uuid.UUID  `db:"company_id" json:"company_id"`
-	JournalType    string     `db:"journal_type" json:"journal_type"`
-	EntryDate      time.Time  `db:"entry_date" json:"entry_date"`
-	Reference      *string    `db:"reference" json:"reference,omitempty"`
-	Description    *string    `db:"description" json:"description,omitempty"`
-	Status         string     `db:"status" json:"status"`
-	ReversalOf     *uuid.UUID `db:"reversal_of" json:"reversal_of,omitempty"`
-	SourceType     *string    `db:"source_type" json:"source_type,omitempty"`
-	SourceID       *uuid.UUID `db:"source_id" json:"source_id,omitempty"`
-	CreatedAt      time.Time  `db:"created_at" json:"created_at"`
-	PostedAt       *time.Time `db:"posted_at" json:"posted_at,omitempty"`
-	PostedBy       *uuid.UUID `db:"posted_by" json:"posted_by,omitempty"`
-	CreatedBy      *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
-	UpdatedAt      time.Time  `db:"updated_at" json:"updated_at"`
-	UpdatedBy      *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
-	DeletedAt      *time.Time `db:"deleted_at" json:"deleted_at,omitempty"` // ✅ ADD THIS LINE
+	JournalEntryID uuid.UUID `db:"journal_entry_id" json:"journal_entry_id"`
+	CompanyID      uuid.UUID `db:"company_id" json:"company_id"`
+
+	JournalType string    `db:"journal_type" json:"journal_type"`
+	EntryDate   time.Time `db:"entry_date" json:"entry_date"`
+
+	Reference   *string `db:"reference" json:"reference,omitempty"`
+	Description *string `db:"description" json:"description,omitempty"`
+
+	Status string `db:"status" json:"status"`
+
+	ReversalOf *uuid.UUID `db:"reversal_of" json:"reversal_of,omitempty"`
+
+	SourceType *string    `db:"source_type" json:"source_type,omitempty"`
+	SourceID   *uuid.UUID `db:"source_id" json:"source_id,omitempty"`
+
+	CreatedAt time.Time  `db:"created_at" json:"created_at"`
+	PostedAt  *time.Time `db:"posted_at" json:"posted_at,omitempty"`
+	PostedBy  *uuid.UUID `db:"posted_by" json:"posted_by,omitempty"`
+
+	CreatedBy *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+	UpdatedAt time.Time  `db:"updated_at" json:"updated_at"`
+	UpdatedBy *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
+
+	DeletedAt *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+
+	// ✅ Derived field (not stored in DB)
+	IsReversal bool `json:"is_reversal"`
+}
+type PostJournalResult struct {
+	JournalEntryID uuid.UUID `json:"journal_entry_id"`
+	LedgerEntries  int       `json:"ledger_entries"`
+	PostedAt       time.Time `json:"posted_at"`
 }
 
 
@@ -105,17 +121,46 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// AccountBalance = cached monthly balance (NOT source of truth)
 type AccountBalance struct {
-	BalanceID      uuid.UUID       `db:"balance_id" json:"balance_id"`
-	CompanyID      uuid.UUID       `db:"company_id" json:"company_id"`
-	AccountID      uuid.UUID       `db:"account_id" json:"account_id"`
-	FiscalYear     int             `db:"fiscal_year" json:"fiscal_year"`
-	Period         int             `db:"period" json:"period"` // 1-12
+	BalanceID uuid.UUID `db:"balance_id" json:"balance_id"`
+	CompanyID uuid.UUID `db:"company_id" json:"company_id"`
+	AccountID uuid.UUID `db:"account_id" json:"account_id"`
+
+	FiscalYear int `db:"fiscal_year" json:"fiscal_year"`
+	Period     int `db:"period" json:"period"` // 1-12
+
 	OpeningBalance decimal.Decimal `db:"opening_balance" json:"opening_balance"`
 	ClosingBalance decimal.Decimal `db:"closing_balance" json:"closing_balance"`
-	IsRecomputed   bool            `db:"is_recomputed" json:"is_recomputed"`
-	CreatedAt      time.Time       `db:"created_at" json:"created_at"`
-	UpdatedAt      time.Time       `db:"updated_at" json:"updated_at"`
+
+	IsRecomputed   bool       `db:"is_recomputed" json:"is_recomputed"`
+	LastComputedAt *time.Time `db:"last_computed_at" json:"last_computed_at,omitempty"`
+
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
+}
+type TrialBalanceRow struct {
+	AccountID   uuid.UUID       `json:"account_id"`
+	AccountName string          `json:"account_name"`
+	DebitTotal  decimal.Decimal `json:"debit_total"`
+	CreditTotal decimal.Decimal `json:"credit_total"`
+	Balance     decimal.Decimal `json:"balance"`
+}
+type AccountLedgerSummary struct {
+	AccountID      uuid.UUID       `json:"account_id"`
+	OpeningBalance decimal.Decimal `json:"opening_balance"`
+	TotalDebit     decimal.Decimal `json:"total_debit"`
+	TotalCredit    decimal.Decimal `json:"total_credit"`
+	ClosingBalance decimal.Decimal `json:"closing_balance"`
+}
+type CostCenter struct {
+	CostCenterID uuid.UUID `db:"cost_center_id"`
+	Name         string
+}
+
+type Department struct {
+	DepartmentID uuid.UUID `db:"department_id"`
+	Name         string
 }
 
 
@@ -169,10 +214,68 @@ type ReconciliationBatch struct {
 	Status             string     `db:"status" json:"status"` // pending, in_progress, completed, failed
 	TotalRecords       int        `db:"total_records" json:"total_records"`
 	MatchedRecords     int        `db:"matched_records" json:"matched_records"`
+	FailureReason      *string    `db:"failure_reason" json:"failure_reason,omitempty"`
 	UnmatchedRecords   int        `db:"unmatched_records" json:"unmatched_records"`
 	CreatedAt          time.Time  `db:"created_at" json:"created_at"`
 	CompletedAt        *time.Time `db:"completed_at" json:"completed_at,omitempty"`
 	CreatedBy          *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/ledger_entry.go
+================================================================================
+
+// models/ledger_entry.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type LedgerEntry struct {
+	LedgerEntryID  uuid.UUID `db:"ledger_entry_id" json:"ledger_entry_id"`
+	CompanyID      uuid.UUID `db:"company_id" json:"company_id"`
+	JournalEntryID uuid.UUID `db:"journal_entry_id" json:"journal_entry_id"`
+	JournalLineID  uuid.UUID `db:"journal_line_id" json:"journal_line_id"`
+	AccountID      uuid.UUID `db:"account_id" json:"account_id"`
+
+	EntryDate time.Time `db:"entry_date" json:"entry_date"`
+
+	DebitAmount  decimal.Decimal `db:"debit_amount" json:"debit_amount"`
+	CreditAmount decimal.Decimal `db:"credit_amount" json:"credit_amount"`
+
+	FiscalYear int `db:"fiscal_year" json:"fiscal_year"`
+	Period     int `db:"period" json:"period"`
+
+	RunningBalance *decimal.Decimal `db:"running_balance" json:"running_balance,omitempty"`
+
+	CostCenterID *uuid.UUID `db:"cost_center_id" json:"cost_center_id,omitempty"`
+	DepartmentID *uuid.UUID `db:"department_id" json:"department_id,omitempty"`
+
+	IsReversal bool `db:"is_reversal" json:"is_reversal"`
+
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+}
+
+// models/ledger_view.go
+type LedgerView struct {
+	EntryDate   time.Time `json:"entry_date"`
+	AccountID   uuid.UUID `json:"account_id"`
+	AccountName string    `json:"account_name"`
+
+	DebitAmount  decimal.Decimal `json:"debit_amount"`
+	CreditAmount decimal.Decimal `json:"credit_amount"`
+
+	RunningBalance decimal.Decimal `json:"running_balance"`
+
+	JournalEntryID uuid.UUID `json:"journal_entry_id"`
+	Reference      *string   `json:"reference,omitempty"`
+	Description    *string   `json:"description,omitempty"`
 }
 
 
@@ -266,6 +369,31 @@ type AccountingSettings struct {
 
 
 ================================================================================
+FILE: ./models/enums/compliance.go
+================================================================================
+
+package enums
+
+type ComplianceReturnStatus string
+
+const (
+	ReturnStatusDraft     ComplianceReturnStatus = "draft"
+	ReturnStatusSubmitted ComplianceReturnStatus = "submitted"
+	ReturnStatusFiled     ComplianceReturnStatus = "filed"
+	ReturnStatusAmended   ComplianceReturnStatus = "amended"
+)
+
+type ComplianceFilingStatus string
+
+const (
+	FilingStatusPending  ComplianceFilingStatus = "pending"
+	FilingStatusAccepted ComplianceFilingStatus = "accepted"
+	FilingStatusRejected ComplianceFilingStatus = "rejected"
+)
+
+
+
+================================================================================
 FILE: ./models/enums/reconciliation.go
 ================================================================================
 
@@ -353,20 +481,22 @@ const (
 	JournalStatusDraft    = "draft"
 	JournalStatusPosted   = "posted"
 	JournalStatusReversed = "reversed"
+	JournalStatusDeleted  = "deleted" // ADD THIS
 
 	ComplianceStatusDraft     = "draft"
 	ComplianceStatusSubmitted = "submitted"
 	ComplianceStatusFiled     = "filed"
 	ComplianceStatusAmended   = "amended"
 
-	FilingStatusSubmitted = "submitted"
-	FilingStatusAccepted  = "accepted"
-	FilingStatusRejected  = "rejected"
-	FilingStatusPending   = "pending"
-
+	FilingStatusSubmitted  = "submitted"
 	TaxActionApplyTax      = "apply_tax"
 	TaxActionExempt        = "exempt"
 	TaxActionReverseCharge = "reverse_charge"
+)
+
+const (
+	TaxSchemeAccrual = "accrual"
+	TaxSchemeCash    = "cash"
 )
 
 
@@ -403,6 +533,11 @@ var ValidAccountTypes = []string{
 	AccountTypeAsset, AccountTypeLiability, AccountTypeEquity,
 	AccountTypeRevenue, AccountTypeExpense,
 }
+
+const (
+	LedgerTypeNormal   = "normal"
+	LedgerTypeReversal = "reversal"
+)
 
 
 
@@ -492,7 +627,7 @@ type TaxTransaction struct {
 	TaxAmount          decimal.Decimal `db:"tax_amount" json:"tax_amount"`
 	Currency           string          `db:"currency" json:"currency"`
 	ExchangeRate       decimal.Decimal `db:"exchange_rate" json:"exchange_rate"`
-	BaseCurrencyAmount decimal.Decimal `db:"base_currency_amount" json:"base_currency_amount"` // generated column
+	BaseCurrencyAmount decimal.Decimal `db:"base_currency_amount" json:"base_currency_amount,omitempty"`
 	TransactionDate    time.Time       `db:"transaction_date" json:"transaction_date"`
 	CreatedAt          time.Time       `db:"created_at" json:"created_at"`
 }
@@ -682,7 +817,7 @@ type ComplianceReturn struct {
 	PeriodEnd      time.Time       `db:"period_end" json:"period_end"`
 	DueDate        time.Time       `db:"due_date" json:"due_date"`
 	FilingDate     *time.Time      `db:"filing_date" json:"filing_date,omitempty"`
-	Status         string          `db:"status" json:"status"` // draft, submitted, filed, amended
+	Status         string          `db:"status" json:"status"`
 	TotalLiability decimal.Decimal `db:"total_liability" json:"total_liability"`
 	TotalPaid      decimal.Decimal `db:"total_paid" json:"total_paid"`
 	IsLocked       bool            `db:"is_locked" json:"is_locked"`
@@ -693,6 +828,7 @@ type ComplianceReturn struct {
 	FiledBy        *uuid.UUID      `db:"filed_by" json:"filed_by,omitempty"`
 	FiledAt        *time.Time      `db:"filed_at" json:"filed_at,omitempty"`
 	DeletedAt      *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
+	AmendedFrom    *uuid.UUID      `db:"amended_from" json:"amended_from,omitempty"`
 }
 
 

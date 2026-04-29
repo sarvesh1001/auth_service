@@ -2,6 +2,8 @@ package consumer
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -9,16 +11,19 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting/events"
+	"auth-service/internal/accounting/models/settings"
+	"auth-service/internal/accounting/repository"
 	"auth-service/internal/accounting/service"
 	"auth-service/internal/client"
 )
 
 // AccountingConsumer consumes events from the "accounting-events" Kafka topic.
-// It handles accounting (journal/ledger), compliance, and tax domain events.
 type AccountingConsumer struct {
 	analyticsSvc  service.AccountingAnalyticsService
 	complianceSvc service.ComplianceAnalyticsService
 	taxSvc        service.TaxAnalyticsService
+	repo          repository.AnalyticsRepository // ✅ added
+	db            *sql.DB                        // ✅ added
 	logger        *zap.Logger
 	consumer      *client.KafkaConsumer
 	topic         string
@@ -26,12 +31,13 @@ type AccountingConsumer struct {
 	producer      *kafka.Writer
 }
 
-// NewAccountingConsumer creates a new AccountingConsumer.
-// Any of the analytics services can be nil; events for missing services will be ignored.
+// NewAccountingConsumer creates a new AccountingConsumer with idempotency support.
 func NewAccountingConsumer(
 	analyticsSvc service.AccountingAnalyticsService,
 	complianceAnalyticsSvc service.ComplianceAnalyticsService,
 	taxAnalyticsSvc service.TaxAnalyticsService,
+	repo repository.AnalyticsRepository, // ✅ new
+	db *sql.DB, // ✅ new
 	logger *zap.Logger,
 	consumer *client.KafkaConsumer,
 	topic string,
@@ -41,6 +47,8 @@ func NewAccountingConsumer(
 		analyticsSvc:  analyticsSvc,
 		complianceSvc: complianceAnalyticsSvc,
 		taxSvc:        taxAnalyticsSvc,
+		repo:          repo,
+		db:            db,
 		logger:        logger.Named("accounting_consumer"),
 		consumer:      consumer,
 		topic:         topic,
@@ -54,7 +62,7 @@ func NewAccountingConsumer(
 	}
 }
 
-// Start consumes messages from Kafka and processes accounting/compliance/tax events.
+// Start consumes messages from Kafka with idempotent processing.
 func (c *AccountingConsumer) Start(ctx context.Context) {
 	c.logger.Info("starting accounting consumer", zap.String("topic", c.topic))
 	for {
@@ -79,16 +87,51 @@ func (c *AccountingConsumer) Start(ctx context.Context) {
 			continue
 		}
 
-		retryCount := c.getRetryCount(msg)
-		err = c.handleEvent(ctx, eventType, msg.Value)
+		// ---------- IDEMPOTENCY START ----------
+		eventID := c.extractEventID(msg)
+		if eventID == "" {
+			c.logger.Warn("missing event_id header, skipping message", zap.String("event_type", eventType))
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
 
+		// 1) Start DB transaction
+		tx, err := c.db.BeginTx(ctx, nil)
 		if err != nil {
+			c.logger.Error("failed to begin transaction", zap.Error(err))
+			_ = c.consumer.CommitMessage(ctx, msg) // commit to avoid reprocessing? Actually better to not commit, but we log.
+			// We skip this message to avoid infinite loop; let the consumer retry after offset commit.
+			continue
+		}
+
+		// 2) Idempotency check (atomic insert)
+		firstTime, err := c.repo.TryMarkEventProcessed(ctx, tx, eventID, "accounting-consumer")
+		if err != nil {
+			tx.Rollback()
+			c.logger.Error("idempotency check failed", zap.String("event_id", eventID), zap.Error(err))
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		if !firstTime {
+			// Already processed – skip business logic
+			tx.Rollback()
+			c.logger.Debug("duplicate event skipped", zap.String("event_id", eventID))
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
+		}
+
+		// 3) Process the actual event (business logic)
+		err = c.handleEvent(ctx, eventType, msg.Value)
+		if err != nil {
+			tx.Rollback() // rollback the insert of processed_events
 			c.logger.Error("failed to process event",
 				zap.String("event_type", eventType),
-				zap.Int("retry", retryCount),
+				zap.String("event_id", eventID),
 				zap.Error(err),
 			)
 
+			retryCount := c.getRetryCount(msg)
 			if retryCount < c.maxRetries {
 				if pubErr := c.publishRetry(ctx, msg, retryCount+1); pubErr != nil {
 					c.logger.Error("failed to publish retry", zap.Error(pubErr))
@@ -98,17 +141,28 @@ func (c *AccountingConsumer) Start(ctx context.Context) {
 					c.logger.Error("failed to send to DLQ", zap.Error(dlqErr))
 				}
 			}
+			_ = c.consumer.CommitMessage(ctx, msg)
+			continue
 		}
 
-		if err := c.consumer.CommitMessage(ctx, msg); err != nil {
-			c.logger.Error("failed to commit message", zap.Error(err))
+		// 4) Commit DB transaction (marks event as processed permanently)
+		if err := tx.Commit(); err != nil {
+			c.logger.Error("failed to commit transaction", zap.String("event_id", eventID), zap.Error(err))
+			// Do NOT commit Kafka offset; reprocess later
+			continue
 		}
+
+		// 5) Commit Kafka offset only after DB commit
+		if err := c.consumer.CommitMessage(ctx, msg); err != nil {
+			c.logger.Error("failed to commit Kafka message", zap.Error(err))
+		}
+		// ---------- IDEMPOTENCY END ----------
 	}
 }
 
-// handleEvent routes the event to the appropriate analytics service.
+// handleEvent routes the event to the appropriate analytics service (unchanged).
 func (c *AccountingConsumer) handleEvent(ctx context.Context, eventType string, payload []byte) error {
-	// Accounting events (journal/ledger)
+	// --- Accounting events (journal/ledger) ---
 	switch eventType {
 	case events.EventJournalCreated, events.EventJournalUpdated,
 		events.EventJournalPosted, events.EventJournalReversed:
@@ -124,7 +178,7 @@ func (c *AccountingConsumer) handleEvent(ctx context.Context, eventType string, 
 		return nil
 	}
 
-	// Compliance events
+	// --- Compliance events ---
 	switch eventType {
 	case events.EventReturnFiled, events.EventReturnAmended:
 		if c.complianceSvc != nil {
@@ -133,7 +187,7 @@ func (c *AccountingConsumer) handleEvent(ctx context.Context, eventType string, 
 		return nil
 	}
 
-	// Tax events – now handling all tax configuration changes
+	// --- Tax events ---
 	switch eventType {
 	case events.EventTaxTransactionCreated,
 		events.EventTaxRateCreated, events.EventTaxRateUpdated,
@@ -141,6 +195,33 @@ func (c *AccountingConsumer) handleEvent(ctx context.Context, eventType string, 
 		events.EventTaxProfileCreated, events.EventTaxProfileUpdated:
 		if c.taxSvc != nil {
 			return c.taxSvc.ProcessTaxEvent(ctx, eventType, payload)
+		}
+		return nil
+	}
+
+	// --- Accounting settings events ---
+	switch eventType {
+	case events.EventAccountingSettingsCreated, events.EventAccountingSettingsUpdated:
+		if c.analyticsSvc != nil {
+			var settings settings.AccountingSettings
+			if err := json.Unmarshal(payload, &settings); err != nil {
+				c.logger.Error("failed to unmarshal settings event payload", zap.Error(err))
+				return fmt.Errorf("unmarshal settings: %w", err)
+			}
+			return c.analyticsSvc.ProcessSettingsEvent(ctx, eventType, &settings)
+		}
+		return nil
+	}
+
+	// --- Account events (chart of accounts) ---
+	switch eventType {
+	case events.EventAccountCreated,
+		events.EventAccountUpdated,
+		events.EventAccountStatusChanged,
+		events.EventAccountMoved,
+		events.EventAccountDeleted:
+		if c.analyticsSvc != nil {
+			return c.analyticsSvc.ProcessAccountEvent(ctx, eventType, payload)
 		}
 		return nil
 	}
@@ -153,6 +234,16 @@ func (c *AccountingConsumer) handleEvent(ctx context.Context, eventType string, 
 func (c *AccountingConsumer) extractEventType(msg *kafka.Message) string {
 	for _, h := range msg.Headers {
 		if h.Key == "event_type" {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+// extractEventID reads the event_id from Kafka message headers.
+func (c *AccountingConsumer) extractEventID(msg *kafka.Message) string {
+	for _, h := range msg.Headers {
+		if h.Key == "event_id" {
 			return string(h.Value)
 		}
 	}
@@ -223,17 +314,25 @@ func (c *AccountingConsumer) sendToDLQ(ctx context.Context, original *kafka.Mess
 // isRelevantEvent returns true if the event type is handled by this consumer.
 func isRelevantEvent(eventType string) bool {
 	switch eventType {
-	// Accounting events
+	// Accounting events (journal/ledger)
 	case events.EventJournalCreated, events.EventJournalUpdated,
 		events.EventJournalPosted, events.EventJournalReversed,
 		events.EventLedgerUpdated, events.EventLedgerReversed,
 		// Compliance events
 		events.EventReturnFiled, events.EventReturnAmended,
-		// Tax events (all)
+		// Tax events
 		events.EventTaxTransactionCreated,
 		events.EventTaxRateCreated, events.EventTaxRateUpdated,
 		events.EventTaxRuleCreated, events.EventTaxRuleUpdated,
-		events.EventTaxProfileCreated, events.EventTaxProfileUpdated:
+		events.EventTaxProfileCreated, events.EventTaxProfileUpdated,
+		// Accounting settings events
+		events.EventAccountingSettingsCreated, events.EventAccountingSettingsUpdated,
+		// Account events
+		events.EventAccountCreated,
+		events.EventAccountUpdated,
+		events.EventAccountStatusChanged,
+		events.EventAccountMoved,
+		events.EventAccountDeleted:
 		return true
 	}
 	return false

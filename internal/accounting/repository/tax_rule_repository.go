@@ -8,21 +8,20 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"go.uber.org/zap"
 
 	"auth-service/internal/accounting/models/tax"
 	"auth-service/internal/util"
 )
 
-// TaxRuleFilter defines filter criteria for listing tax rules
 type TaxRuleFilter struct {
 	CompanyID uuid.UUID
-	AppliesTo string // "sales", "purchase", "both"
+	AppliesTo string
 	IsActive  *bool
-	Search    string // searches rule_name
+	Search    string
 }
 
-// TaxRuleBundle is the execution-ready object containing rule, version, conditions, and actions
 type TaxRuleBundle struct {
 	Rule       *tax.TaxRule
 	Version    *tax.TaxRuleVersion
@@ -30,67 +29,47 @@ type TaxRuleBundle struct {
 	Actions    []*tax.TaxAction
 }
 
-// TaxRuleRepository defines the complete interface for tax rule data access
 type TaxRuleRepository interface {
-	// Core rule operations
-	Create(ctx context.Context, db DBTX, r *tax.TaxRule) error
-	Update(ctx context.Context, db DBTX, r *tax.TaxRule) error
-	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxRule, error)
-	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxRule, error)
+	Create(ctx context.Context, db DBTX, rule *tax.TaxRule) error
+	Update(ctx context.Context, db DBTX, rule *tax.TaxRule) error
+	GetByID(ctx context.Context, db DBTX, companyID, id uuid.UUID) (*tax.TaxRule, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, id uuid.UUID) (*tax.TaxRule, error)
 	List(ctx context.Context, db DBTX, filter TaxRuleFilter, p Pagination, s Sort) ([]*tax.TaxRule, error)
 	Count(ctx context.Context, db DBTX, filter TaxRuleFilter) (int64, error)
 	GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*tax.TaxRule, error)
-
-	// Status / lifecycle
-	SetActive(ctx context.Context, db DBTX, id uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
-	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
-
-	// Versioning (critical)
+	SetActive(ctx context.Context, db DBTX, companyID, id uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
+	Delete(ctx context.Context, db DBTX, companyID, id uuid.UUID, deletedBy *uuid.UUID) error
 	CreateVersion(ctx context.Context, db DBTX, v *tax.TaxRuleVersion) error
-	GetCurrentVersion(ctx context.Context, db DBTX, taxRuleID uuid.UUID) (*tax.TaxRuleVersion, error)
-	GetVersions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) ([]*tax.TaxRuleVersion, error)
-	SetCurrentVersion(ctx context.Context, db DBTX, taxRuleID uuid.UUID, version int) error
-
-	// Conditions
-	AddCondition(ctx context.Context, db DBTX, c *tax.TaxCondition) error
-	BulkAddConditions(ctx context.Context, db DBTX, conditions []*tax.TaxCondition) error
-	GetConditions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) ([]*tax.TaxCondition, error)
-	ClearConditions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) error
-
-	// Actions
-	AddAction(ctx context.Context, db DBTX, a *tax.TaxAction) error
-	BulkAddActions(ctx context.Context, db DBTX, actions []*tax.TaxAction) error
-	GetActions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) ([]*tax.TaxAction, error)
-	ClearActions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) error
-
-	// Execution fetch (very important)
+	GetCurrentVersion(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) (*tax.TaxRuleVersion, error)
+	GetVersions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) ([]*tax.TaxRuleVersion, error)
+	SetCurrentVersion(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID, version int) error
+	CloneVersion(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID, createdBy *uuid.UUID) (*tax.TaxRuleVersion, error)
+	AddCondition(ctx context.Context, db DBTX, companyID uuid.UUID, c *tax.TaxCondition) error
+	BulkAddConditions(ctx context.Context, db DBTX, companyID uuid.UUID, conditions []*tax.TaxCondition) error
+	GetConditions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) ([]*tax.TaxCondition, error)
+	ClearConditions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) error
+	AddAction(ctx context.Context, db DBTX, companyID uuid.UUID, a *tax.TaxAction) error
+	BulkAddActions(ctx context.Context, db DBTX, companyID uuid.UUID, actions []*tax.TaxAction) error
+	GetActions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) ([]*tax.TaxAction, error)
+	ClearActions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) error
 	GetApplicableRules(ctx context.Context, db DBTX, companyID uuid.UUID, appliesTo string) ([]*TaxRuleBundle, error)
-
-	// Validation / safety
+	GetApplicableRulesWithLimit(ctx context.Context, db DBTX, companyID uuid.UUID, appliesTo string, limit int) ([]*TaxRuleBundle, error)
+	BulkGetCurrentVersions(ctx context.Context, db DBTX, companyID uuid.UUID, ruleIDs []uuid.UUID) (map[uuid.UUID]*tax.TaxRuleVersion, error)
 	Exists(ctx context.Context, db DBTX, companyID uuid.UUID, ruleName string) (bool, error)
-	CheckUsage(ctx context.Context, db DBTX, ruleID uuid.UUID) (bool, error)
+	CheckUsage(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (bool, error)
 }
 
-// taxRuleRepository implements TaxRuleRepository
 type taxRuleRepository struct {
 	logger *zap.Logger
 }
 
-// NewTaxRuleRepository creates a new tax rule repository instance
 func NewTaxRuleRepository(logger *zap.Logger) TaxRuleRepository {
-	return &taxRuleRepository{
-		logger: logger.Named("tax_rule_repo"),
-	}
+	return &taxRuleRepository{logger: logger.Named("tax_rule_repo")}
 }
 
-// allowed sort fields for tax rules
 var allowedTaxRuleSortFields = map[string]bool{
-	"rule_name":  true,
-	"applies_to": true,
-	"priority":   true,
-	"is_active":  true,
-	"created_at": true,
-	"updated_at": true,
+	"rule_name": true, "applies_to": true, "priority": true,
+	"is_active": true, "created_at": true, "updated_at": true,
 }
 
 func (r *taxRuleRepository) validateSort(s Sort) (string, error) {
@@ -134,7 +113,7 @@ func (r *taxRuleRepository) buildTaxRuleFilter(filter TaxRuleFilter) (string, []
 		idx++
 	}
 	if filter.AppliesTo != "" {
-		conditions = append(conditions, fmt.Sprintf("applies_to IN ($%d, 'both')", idx))
+		conditions = append(conditions, fmt.Sprintf("(applies_to = $%d OR applies_to = 'both')", idx))
 		args = append(args, filter.AppliesTo)
 		idx++
 	}
@@ -149,7 +128,6 @@ func (r *taxRuleRepository) buildTaxRuleFilter(filter TaxRuleFilter) (string, []
 		idx++
 	}
 	conditions = append(conditions, "deleted_at IS NULL")
-
 	if len(conditions) == 0 {
 		return "", args
 	}
@@ -162,7 +140,6 @@ func (r *taxRuleRepository) scanTaxRule(scanner interface {
 	var rule tax.TaxRule
 	var createdBy, updatedBy uuid.NullUUID
 	var deletedAt sql.NullTime
-
 	err := scanner.Scan(
 		&rule.TaxRuleID, &rule.CompanyID, &rule.RuleName, &rule.AppliesTo,
 		&rule.Priority, &rule.IsActive, &rule.CreatedAt, &rule.UpdatedAt,
@@ -182,10 +159,6 @@ func (r *taxRuleRepository) scanTaxRule(scanner interface {
 	}
 	return &rule, nil
 }
-
-// =====================================================
-// CORE RULE OPERATIONS
-// =====================================================
 
 func (r *taxRuleRepository) Create(ctx context.Context, db DBTX, rule *tax.TaxRule) error {
 	query := `
@@ -218,16 +191,16 @@ func (r *taxRuleRepository) Update(ctx context.Context, db DBTX, rule *tax.TaxRu
 		    is_active = $5,
 		    updated_by = $6,
 		    updated_at = NOW()
-		WHERE tax_rule_id = $1 AND deleted_at IS NULL
+		WHERE tax_rule_id = $1 AND company_id = $7 AND deleted_at IS NULL
 		RETURNING updated_at
 	`
 	err := db.QueryRowContext(ctx, query,
 		rule.TaxRuleID, rule.RuleName, rule.AppliesTo,
-		rule.Priority, rule.IsActive, rule.UpdatedBy,
+		rule.Priority, rule.IsActive, rule.UpdatedBy, rule.CompanyID,
 	).Scan(&rule.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("tax rule %s not found or deleted", rule.TaxRuleID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to update tax rule",
 			util.String("id", rule.TaxRuleID.String()),
@@ -237,25 +210,24 @@ func (r *taxRuleRepository) Update(ctx context.Context, db DBTX, rule *tax.TaxRu
 	return nil
 }
 
-func (r *taxRuleRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxRule, error) {
+func (r *taxRuleRepository) GetByID(ctx context.Context, db DBTX, companyID, id uuid.UUID) (*tax.TaxRule, error) {
 	query := `
 		SELECT tax_rule_id, company_id, rule_name, applies_to, priority,
 		       is_active, created_at, updated_at, created_by, updated_by, deleted_at
 		FROM accounting.tax_rules
-		WHERE tax_rule_id = $1 AND deleted_at IS NULL
+		WHERE tax_rule_id = $1 AND company_id = $2 AND deleted_at IS NULL
 	`
 	var rule tax.TaxRule
 	var createdBy, updatedBy uuid.NullUUID
 	var deletedAt sql.NullTime
-
-	err := db.QueryRowContext(ctx, query, id).Scan(
+	err := db.QueryRowContext(ctx, query, id, companyID).Scan(
 		&rule.TaxRuleID, &rule.CompanyID, &rule.RuleName, &rule.AppliesTo,
 		&rule.Priority, &rule.IsActive, &rule.CreatedAt, &rule.UpdatedAt,
 		&createdBy, &updatedBy, &deletedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax rule by ID",
 			util.String("id", id.String()),
@@ -274,26 +246,25 @@ func (r *taxRuleRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) 
 	return &rule, nil
 }
 
-func (r *taxRuleRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxRule, error) {
+func (r *taxRuleRepository) GetByIDForUpdate(ctx context.Context, db DBTX, companyID, id uuid.UUID) (*tax.TaxRule, error) {
 	query := `
 		SELECT tax_rule_id, company_id, rule_name, applies_to, priority,
 		       is_active, created_at, updated_at, created_by, updated_by, deleted_at
 		FROM accounting.tax_rules
-		WHERE tax_rule_id = $1 AND deleted_at IS NULL
+		WHERE tax_rule_id = $1 AND company_id = $2 AND deleted_at IS NULL
 		FOR UPDATE
 	`
 	var rule tax.TaxRule
 	var createdBy, updatedBy uuid.NullUUID
 	var deletedAt sql.NullTime
-
-	err := db.QueryRowContext(ctx, query, id).Scan(
+	err := db.QueryRowContext(ctx, query, id, companyID).Scan(
 		&rule.TaxRuleID, &rule.CompanyID, &rule.RuleName, &rule.AppliesTo,
 		&rule.Priority, &rule.IsActive, &rule.CreatedAt, &rule.UpdatedAt,
 		&createdBy, &updatedBy, &deletedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax rule for update",
 			util.String("id", id.String()),
@@ -368,76 +339,70 @@ func (r *taxRuleRepository) GetByCompany(ctx context.Context, db DBTX, companyID
 	return r.List(ctx, db, TaxRuleFilter{CompanyID: companyID}, Pagination{Limit: 1000}, Sort{Field: "priority", Direction: "DESC"})
 }
 
-// =====================================================
-// STATUS / LIFECYCLE
-// =====================================================
-
-func (r *taxRuleRepository) SetActive(ctx context.Context, db DBTX, id uuid.UUID, isActive bool, updatedBy *uuid.UUID) error {
+func (r *taxRuleRepository) SetActive(ctx context.Context, db DBTX, companyID, id uuid.UUID, isActive bool, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.tax_rules
 		SET is_active = $2, updated_by = $3, updated_at = NOW()
-		WHERE tax_rule_id = $1 AND deleted_at IS NULL
+		WHERE tax_rule_id = $1 AND company_id = $4 AND deleted_at IS NULL
 	`
-	result, err := db.ExecContext(ctx, query, id, isActive, updatedBy)
+	result, err := db.ExecContext(ctx, query, id, isActive, updatedBy, companyID)
 	if err != nil {
 		r.logger.Error("failed to set tax rule active status",
 			util.String("id", id.String()),
 			util.ErrorField(err))
 		return fmt.Errorf("set tax rule active: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("tax rule %s not found or deleted", id)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-func (r *taxRuleRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
-	// Check usage before soft delete
-	used, err := r.CheckUsage(ctx, db, id)
+func (r *taxRuleRepository) Delete(ctx context.Context, db DBTX, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
+	used, err := r.CheckUsage(ctx, db, companyID, id)
 	if err != nil {
 		return err
 	}
 	if used {
 		return fmt.Errorf("tax rule %s is referenced in tax transactions and cannot be deleted", id)
 	}
-
 	query := `
 		UPDATE accounting.tax_rules
 		SET deleted_at = NOW(), updated_by = $2, updated_at = NOW()
-		WHERE tax_rule_id = $1 AND deleted_at IS NULL
+		WHERE tax_rule_id = $1 AND company_id = $3 AND deleted_at IS NULL
 	`
-	result, err := db.ExecContext(ctx, query, id, deletedBy)
+	result, err := db.ExecContext(ctx, query, id, deletedBy, companyID)
 	if err != nil {
 		r.logger.Error("failed to delete tax rule",
 			util.String("id", id.String()),
 			util.ErrorField(err))
 		return fmt.Errorf("delete tax rule: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("tax rule %s not found or already deleted", id)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-// =====================================================
-// VERSIONING (CRITICAL)
-// =====================================================
-
 func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.TaxRuleVersion) error {
-	// Start a transaction for version creation to ensure atomicity
 	tx, ok := db.(*sql.Tx)
 	if !ok {
 		return fmt.Errorf("CreateVersion requires a transaction")
 	}
 
-	// Get next version number
+	// Lock the tax_rule row to prevent concurrent version creation
+	var dummy int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM accounting.tax_rules WHERE tax_rule_id = $1 FOR UPDATE`, v.TaxRuleID).Scan(&dummy)
+	if err != nil {
+		return fmt.Errorf("lock tax rule: %w", err)
+	}
+
 	var nextVersion int
-	err := tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(version), 0) + 1
 		FROM accounting.tax_rule_versions
 		WHERE tax_rule_id = $1
+		FOR UPDATE
 	`, v.TaxRuleID).Scan(&nextVersion)
 	if err != nil {
 		return fmt.Errorf("get next version: %w", err)
@@ -445,7 +410,7 @@ func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.T
 	v.Version = nextVersion
 	v.IsCurrent = true
 
-	// Set all other versions to not current
+	// Unset current on previous version
 	_, err = tx.ExecContext(ctx, `
 		UPDATE accounting.tax_rule_versions
 		SET is_current = false
@@ -456,26 +421,18 @@ func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.T
 	}
 
 	// Insert new version
-	query := `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO accounting.tax_rule_versions (
 			version_id, tax_rule_id, version, rule_json, is_current, created_at, created_by
 		) VALUES ($1, $2, $3, $4, $5, NOW(), $6)
-		RETURNING created_at
-	`
-	err = tx.QueryRowContext(ctx, query,
-		v.VersionID, v.TaxRuleID, v.Version, v.RuleJSON, v.IsCurrent, v.CreatedBy,
-	).Scan(&v.CreatedAt)
+	`, v.VersionID, v.TaxRuleID, v.Version, v.RuleJSON, v.IsCurrent, v.CreatedBy)
 	if err != nil {
-		r.logger.Error("failed to create tax rule version",
-			util.String("rule_id", v.TaxRuleID.String()),
-			util.Int("version", v.Version),
-			util.ErrorField(err))
-		return fmt.Errorf("create tax rule version: %w", err)
+		return fmt.Errorf("insert version: %w", err)
 	}
 	return nil
 }
 
-func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, taxRuleID uuid.UUID) (*tax.TaxRuleVersion, error) {
+func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) (*tax.TaxRuleVersion, error) {
 	query := `
 		SELECT version_id, tax_rule_id, version, rule_json, is_current,
 		       created_at, created_by
@@ -490,7 +447,7 @@ func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, taxR
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get current version",
 			util.String("rule_id", taxRuleID.String()),
@@ -503,7 +460,7 @@ func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, taxR
 	return &v, nil
 }
 
-func (r *taxRuleRepository) GetVersions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) ([]*tax.TaxRuleVersion, error) {
+func (r *taxRuleRepository) GetVersions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) ([]*tax.TaxRuleVersion, error) {
 	query := `
 		SELECT version_id, tax_rule_id, version, rule_json, is_current,
 		       created_at, created_by
@@ -524,11 +481,10 @@ func (r *taxRuleRepository) GetVersions(ctx context.Context, db DBTX, taxRuleID 
 	for rows.Next() {
 		var v tax.TaxRuleVersion
 		var createdBy uuid.NullUUID
-		err := rows.Scan(
+		if err := rows.Scan(
 			&v.VersionID, &v.TaxRuleID, &v.Version, &v.RuleJSON, &v.IsCurrent,
 			&v.CreatedAt, &createdBy,
-		)
-		if err != nil {
+		); err != nil {
 			return nil, fmt.Errorf("scan version: %w", err)
 		}
 		if createdBy.Valid {
@@ -539,12 +495,11 @@ func (r *taxRuleRepository) GetVersions(ctx context.Context, db DBTX, taxRuleID 
 	return versions, rows.Err()
 }
 
-func (r *taxRuleRepository) SetCurrentVersion(ctx context.Context, db DBTX, taxRuleID uuid.UUID, version int) error {
+func (r *taxRuleRepository) SetCurrentVersion(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID, version int) error {
 	tx, ok := db.(*sql.Tx)
 	if !ok {
 		return fmt.Errorf("SetCurrentVersion requires a transaction")
 	}
-	// First unset all
 	_, err := tx.ExecContext(ctx, `
 		UPDATE accounting.tax_rule_versions
 		SET is_current = false
@@ -553,7 +508,6 @@ func (r *taxRuleRepository) SetCurrentVersion(ctx context.Context, db DBTX, taxR
 	if err != nil {
 		return fmt.Errorf("unset current versions: %w", err)
 	}
-	// Set the specified version as current
 	res, err := tx.ExecContext(ctx, `
 		UPDATE accounting.tax_rule_versions
 		SET is_current = true
@@ -562,18 +516,34 @@ func (r *taxRuleRepository) SetCurrentVersion(ctx context.Context, db DBTX, taxR
 	if err != nil {
 		return fmt.Errorf("set current version: %w", err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("version %d not found for rule %s", version, taxRuleID)
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		// ✅ FIX: return shared ErrNotFound instead of custom error string
+		return ErrNotFound
 	}
 	return nil
 }
 
-// =====================================================
-// CONDITIONS
-// =====================================================
+func (r *taxRuleRepository) CloneVersion(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID, createdBy *uuid.UUID) (*tax.TaxRuleVersion, error) {
+	current, err := r.GetCurrentVersion(ctx, db, companyID, ruleID)
+	if err != nil {
+		return nil, err
+	}
+	clone := &tax.TaxRuleVersion{
+		VersionID: uuid.New(),
+		TaxRuleID: ruleID,
+		RuleJSON:  current.RuleJSON,
+		IsCurrent: false,
+		CreatedBy: createdBy,
+	}
+	if err := r.CreateVersion(ctx, db, clone); err != nil {
+		return nil, err
+	}
+	return clone, nil
+}
 
-func (r *taxRuleRepository) AddCondition(ctx context.Context, db DBTX, c *tax.TaxCondition) error {
+// Conditions
+
+func (r *taxRuleRepository) AddCondition(ctx context.Context, db DBTX, companyID uuid.UUID, c *tax.TaxCondition) error {
 	query := `
 		INSERT INTO accounting.tax_conditions (
 			condition_id, tax_rule_id, field_name, operator,
@@ -594,7 +564,7 @@ func (r *taxRuleRepository) AddCondition(ctx context.Context, db DBTX, c *tax.Ta
 	return nil
 }
 
-func (r *taxRuleRepository) BulkAddConditions(ctx context.Context, db DBTX, conditions []*tax.TaxCondition) error {
+func (r *taxRuleRepository) BulkAddConditions(ctx context.Context, db DBTX, companyID uuid.UUID, conditions []*tax.TaxCondition) error {
 	if len(conditions) == 0 {
 		return nil
 	}
@@ -610,11 +580,10 @@ func (r *taxRuleRepository) BulkAddConditions(ctx context.Context, db DBTX, cond
 	defer stmt.Close()
 
 	for _, c := range conditions {
-		_, err := stmt.ExecContext(ctx,
+		if _, err := stmt.ExecContext(ctx,
 			c.ConditionID, c.TaxRuleID, c.FieldName, c.Operator,
 			c.ValueText, c.ValueNumeric,
-		)
-		if err != nil {
+		); err != nil {
 			r.logger.Error("bulk add condition failed",
 				util.String("rule_id", c.TaxRuleID.String()),
 				util.ErrorField(err))
@@ -624,7 +593,7 @@ func (r *taxRuleRepository) BulkAddConditions(ctx context.Context, db DBTX, cond
 	return nil
 }
 
-func (r *taxRuleRepository) GetConditions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) ([]*tax.TaxCondition, error) {
+func (r *taxRuleRepository) GetConditions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) ([]*tax.TaxCondition, error) {
 	query := `
 		SELECT condition_id, tax_rule_id, field_name, operator,
 		       value_text, value_numeric, created_at
@@ -644,11 +613,8 @@ func (r *taxRuleRepository) GetConditions(ctx context.Context, db DBTX, taxRuleI
 	var conditions []*tax.TaxCondition
 	for rows.Next() {
 		var c tax.TaxCondition
-		err := rows.Scan(
-			&c.ConditionID, &c.TaxRuleID, &c.FieldName, &c.Operator,
-			&c.ValueText, &c.ValueNumeric, &c.CreatedAt,
-		)
-		if err != nil {
+		if err := rows.Scan(&c.ConditionID, &c.TaxRuleID, &c.FieldName, &c.Operator,
+			&c.ValueText, &c.ValueNumeric, &c.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan condition: %w", err)
 		}
 		conditions = append(conditions, &c)
@@ -656,11 +622,8 @@ func (r *taxRuleRepository) GetConditions(ctx context.Context, db DBTX, taxRuleI
 	return conditions, rows.Err()
 }
 
-func (r *taxRuleRepository) ClearConditions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) error {
-	_, err := db.ExecContext(ctx, `
-		DELETE FROM accounting.tax_conditions
-		WHERE tax_rule_id = $1
-	`, taxRuleID)
+func (r *taxRuleRepository) ClearConditions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM accounting.tax_conditions WHERE tax_rule_id = $1`, taxRuleID)
 	if err != nil {
 		r.logger.Error("failed to clear conditions",
 			util.String("rule_id", taxRuleID.String()),
@@ -670,11 +633,9 @@ func (r *taxRuleRepository) ClearConditions(ctx context.Context, db DBTX, taxRul
 	return nil
 }
 
-// =====================================================
-// ACTIONS
-// =====================================================
+// Actions
 
-func (r *taxRuleRepository) AddAction(ctx context.Context, db DBTX, a *tax.TaxAction) error {
+func (r *taxRuleRepository) AddAction(ctx context.Context, db DBTX, companyID uuid.UUID, a *tax.TaxAction) error {
 	query := `
 		INSERT INTO accounting.tax_actions (
 			action_id, tax_rule_id, tax_rate_id, action_type,
@@ -694,7 +655,7 @@ func (r *taxRuleRepository) AddAction(ctx context.Context, db DBTX, a *tax.TaxAc
 	return nil
 }
 
-func (r *taxRuleRepository) BulkAddActions(ctx context.Context, db DBTX, actions []*tax.TaxAction) error {
+func (r *taxRuleRepository) BulkAddActions(ctx context.Context, db DBTX, companyID uuid.UUID, actions []*tax.TaxAction) error {
 	if len(actions) == 0 {
 		return nil
 	}
@@ -710,10 +671,9 @@ func (r *taxRuleRepository) BulkAddActions(ctx context.Context, db DBTX, actions
 	defer stmt.Close()
 
 	for _, a := range actions {
-		_, err := stmt.ExecContext(ctx,
+		if _, err := stmt.ExecContext(ctx,
 			a.ActionID, a.TaxRuleID, a.TaxRateID, a.ActionType, a.CalculationBasis,
-		)
-		if err != nil {
+		); err != nil {
 			r.logger.Error("bulk add action failed",
 				util.String("rule_id", a.TaxRuleID.String()),
 				util.ErrorField(err))
@@ -723,7 +683,7 @@ func (r *taxRuleRepository) BulkAddActions(ctx context.Context, db DBTX, actions
 	return nil
 }
 
-func (r *taxRuleRepository) GetActions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) ([]*tax.TaxAction, error) {
+func (r *taxRuleRepository) GetActions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) ([]*tax.TaxAction, error) {
 	query := `
 		SELECT action_id, tax_rule_id, tax_rate_id, action_type,
 		       calculation_basis, created_at
@@ -743,11 +703,8 @@ func (r *taxRuleRepository) GetActions(ctx context.Context, db DBTX, taxRuleID u
 	var actions []*tax.TaxAction
 	for rows.Next() {
 		var a tax.TaxAction
-		err := rows.Scan(
-			&a.ActionID, &a.TaxRuleID, &a.TaxRateID, &a.ActionType,
-			&a.CalculationBasis, &a.CreatedAt,
-		)
-		if err != nil {
+		if err := rows.Scan(&a.ActionID, &a.TaxRuleID, &a.TaxRateID, &a.ActionType,
+			&a.CalculationBasis, &a.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan action: %w", err)
 		}
 		actions = append(actions, &a)
@@ -755,11 +712,8 @@ func (r *taxRuleRepository) GetActions(ctx context.Context, db DBTX, taxRuleID u
 	return actions, rows.Err()
 }
 
-func (r *taxRuleRepository) ClearActions(ctx context.Context, db DBTX, taxRuleID uuid.UUID) error {
-	_, err := db.ExecContext(ctx, `
-		DELETE FROM accounting.tax_actions
-		WHERE tax_rule_id = $1
-	`, taxRuleID)
+func (r *taxRuleRepository) ClearActions(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM accounting.tax_actions WHERE tax_rule_id = $1`, taxRuleID)
 	if err != nil {
 		r.logger.Error("failed to clear actions",
 			util.String("rule_id", taxRuleID.String()),
@@ -769,12 +723,13 @@ func (r *taxRuleRepository) ClearActions(ctx context.Context, db DBTX, taxRuleID
 	return nil
 }
 
-// =====================================================
-// EXECUTION FETCH (VERY IMPORTANT)
-// =====================================================
+// Applicable rules (with ANY array performance)
 
 func (r *taxRuleRepository) GetApplicableRules(ctx context.Context, db DBTX, companyID uuid.UUID, appliesTo string) ([]*TaxRuleBundle, error) {
-	// Fetch rules with current version in a single query
+	return r.GetApplicableRulesWithLimit(ctx, db, companyID, appliesTo, 0)
+}
+
+func (r *taxRuleRepository) GetApplicableRulesWithLimit(ctx context.Context, db DBTX, companyID uuid.UUID, appliesTo string, limit int) ([]*TaxRuleBundle, error) {
 	query := `
 		SELECT tr.tax_rule_id, tr.company_id, tr.rule_name, tr.applies_to, tr.priority,
 		       tr.is_active, tr.created_at, tr.updated_at, tr.created_by, tr.updated_by, tr.deleted_at,
@@ -788,6 +743,9 @@ func (r *taxRuleRepository) GetApplicableRules(ctx context.Context, db DBTX, com
 		  AND (tr.applies_to = $2 OR tr.applies_to = 'both')
 		ORDER BY tr.priority DESC
 	`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
 	rows, err := db.QueryContext(ctx, query, companyID, appliesTo)
 	if err != nil {
 		r.logger.Error("failed to get applicable rules",
@@ -798,24 +756,23 @@ func (r *taxRuleRepository) GetApplicableRules(ctx context.Context, db DBTX, com
 	}
 	defer rows.Close()
 
-	var bundles []*TaxRuleBundle
+	var rules []*tax.TaxRule
+	var versions []*tax.TaxRuleVersion
+	ruleIDs := []uuid.UUID{}
+
 	for rows.Next() {
-		// Scan rule fields
 		var rule tax.TaxRule
 		var createdBy, updatedBy uuid.NullUUID
 		var deletedAt sql.NullTime
-
-		// Version fields
 		var version tax.TaxRuleVersion
 		var versionCreatedBy uuid.NullUUID
 
-		err := rows.Scan(
+		if err := rows.Scan(
 			&rule.TaxRuleID, &rule.CompanyID, &rule.RuleName, &rule.AppliesTo, &rule.Priority,
 			&rule.IsActive, &rule.CreatedAt, &rule.UpdatedAt, &createdBy, &updatedBy, &deletedAt,
 			&version.VersionID, &version.Version, &version.RuleJSON, &version.IsCurrent,
 			&version.CreatedAt, &versionCreatedBy,
-		)
-		if err != nil {
+		); err != nil {
 			return nil, fmt.Errorf("scan rule bundle: %w", err)
 		}
 		if createdBy.Valid {
@@ -831,42 +788,146 @@ func (r *taxRuleRepository) GetApplicableRules(ctx context.Context, db DBTX, com
 			version.CreatedBy = &versionCreatedBy.UUID
 		}
 		version.TaxRuleID = rule.TaxRuleID
-
-		// Fetch conditions for this rule
-		conditions, err := r.GetConditions(ctx, db, rule.TaxRuleID)
-		if err != nil {
-			r.logger.Warn("failed to fetch conditions for rule",
-				util.String("rule_id", rule.TaxRuleID.String()),
-				util.ErrorField(err))
-			conditions = []*tax.TaxCondition{}
-		}
-		// Fetch actions for this rule
-		actions, err := r.GetActions(ctx, db, rule.TaxRuleID)
-		if err != nil {
-			r.logger.Warn("failed to fetch actions for rule",
-				util.String("rule_id", rule.TaxRuleID.String()),
-				util.ErrorField(err))
-			actions = []*tax.TaxAction{}
-		}
-
-		bundles = append(bundles, &TaxRuleBundle{
-			Rule:       &rule,
-			Version:    &version,
-			Conditions: conditions,
-			Actions:    actions,
-		})
+		rules = append(rules, &rule)
+		versions = append(versions, &version)
+		ruleIDs = append(ruleIDs, rule.TaxRuleID)
 	}
-	return bundles, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(rules) == 0 {
+		return []*TaxRuleBundle{}, nil
+	}
+
+	conditionsMap, err := r.bulkGetConditions(ctx, db, ruleIDs)
+	if err != nil {
+		return nil, fmt.Errorf("bulk get conditions: %w", err)
+	}
+	actionsMap, err := r.bulkGetActions(ctx, db, ruleIDs)
+	if err != nil {
+		return nil, fmt.Errorf("bulk get actions: %w", err)
+	}
+
+	bundles := make([]*TaxRuleBundle, len(rules))
+	for i, rule := range rules {
+		cond := conditionsMap[rule.TaxRuleID]
+		if cond == nil {
+			cond = []*tax.TaxCondition{}
+		}
+		act := actionsMap[rule.TaxRuleID]
+		if act == nil {
+			act = []*tax.TaxAction{}
+		}
+		bundles[i] = &TaxRuleBundle{
+			Rule:       rule,
+			Version:    versions[i],
+			Conditions: cond,
+			Actions:    act,
+		}
+	}
+	return bundles, nil
 }
 
-// =====================================================
-// VALIDATION / SAFETY
-// =====================================================
+func (r *taxRuleRepository) bulkGetConditions(ctx context.Context, db DBTX, ruleIDs []uuid.UUID) (map[uuid.UUID][]*tax.TaxCondition, error) {
+	if len(ruleIDs) == 0 {
+		return map[uuid.UUID][]*tax.TaxCondition{}, nil
+	}
+	query := `
+		SELECT condition_id, tax_rule_id, field_name, operator,
+		       value_text, value_numeric, created_at
+		FROM accounting.tax_conditions
+		WHERE tax_rule_id = ANY($1)
+		ORDER BY tax_rule_id, created_at
+	`
+	rows, err := db.QueryContext(ctx, query, pq.Array(ruleIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID][]*tax.TaxCondition)
+	for rows.Next() {
+		var c tax.TaxCondition
+		if err := rows.Scan(&c.ConditionID, &c.TaxRuleID, &c.FieldName, &c.Operator,
+			&c.ValueText, &c.ValueNumeric, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		result[c.TaxRuleID] = append(result[c.TaxRuleID], &c)
+	}
+	return result, rows.Err()
+}
+
+func (r *taxRuleRepository) bulkGetActions(ctx context.Context, db DBTX, ruleIDs []uuid.UUID) (map[uuid.UUID][]*tax.TaxAction, error) {
+	if len(ruleIDs) == 0 {
+		return map[uuid.UUID][]*tax.TaxAction{}, nil
+	}
+	query := `
+		SELECT action_id, tax_rule_id, tax_rate_id, action_type,
+		       calculation_basis, created_at
+		FROM accounting.tax_actions
+		WHERE tax_rule_id = ANY($1)
+		ORDER BY tax_rule_id, created_at
+	`
+	rows, err := db.QueryContext(ctx, query, pq.Array(ruleIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID][]*tax.TaxAction)
+	for rows.Next() {
+		var a tax.TaxAction
+		if err := rows.Scan(&a.ActionID, &a.TaxRuleID, &a.TaxRateID, &a.ActionType,
+			&a.CalculationBasis, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		result[a.TaxRuleID] = append(result[a.TaxRuleID], &a)
+	}
+	return result, rows.Err()
+}
+
+func (r *taxRuleRepository) BulkGetCurrentVersions(ctx context.Context, db DBTX, companyID uuid.UUID, ruleIDs []uuid.UUID) (map[uuid.UUID]*tax.TaxRuleVersion, error) {
+	if len(ruleIDs) == 0 {
+		return map[uuid.UUID]*tax.TaxRuleVersion{}, nil
+	}
+	query := `
+		SELECT version_id, tax_rule_id, version, rule_json, is_current,
+		       created_at, created_by
+		FROM accounting.tax_rule_versions
+		WHERE tax_rule_id = ANY($1) AND is_current = true
+	`
+	rows, err := db.QueryContext(ctx, query, pq.Array(ruleIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID]*tax.TaxRuleVersion)
+	for rows.Next() {
+		var v tax.TaxRuleVersion
+		var createdBy uuid.NullUUID
+		if err := rows.Scan(&v.VersionID, &v.TaxRuleID, &v.Version, &v.RuleJSON, &v.IsCurrent,
+			&v.CreatedAt, &createdBy); err != nil {
+			return nil, err
+		}
+		if createdBy.Valid {
+			v.CreatedBy = &createdBy.UUID
+		}
+		result[v.TaxRuleID] = &v
+	}
+	return result, rows.Err()
+}
+
+// Utility
 
 func (r *taxRuleRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, ruleName string) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM accounting.tax_rules WHERE company_id = $1 AND rule_name = $2 AND deleted_at IS NULL)`
 	var exists bool
-	err := db.QueryRowContext(ctx, query, companyID, ruleName).Scan(&exists)
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM accounting.tax_rules
+			WHERE company_id = $1 AND rule_name = $2 AND deleted_at IS NULL
+		)
+	`, companyID, ruleName).Scan(&exists)
 	if err != nil {
 		r.logger.Error("failed to check existence",
 			util.String("company_id", companyID.String()),
@@ -877,10 +938,14 @@ func (r *taxRuleRepository) Exists(ctx context.Context, db DBTX, companyID uuid.
 	return exists, nil
 }
 
-func (r *taxRuleRepository) CheckUsage(ctx context.Context, db DBTX, ruleID uuid.UUID) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM accounting.tax_transactions WHERE tax_rule_id = $1)`
+func (r *taxRuleRepository) CheckUsage(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (bool, error) {
 	var exists bool
-	err := db.QueryRowContext(ctx, query, ruleID).Scan(&exists)
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM accounting.tax_transactions
+			WHERE tax_rule_id = $1 AND company_id = $2
+		)
+	`, ruleID, companyID).Scan(&exists)
 	if err != nil {
 		r.logger.Error("failed to check usage",
 			util.String("rule_id", ruleID.String()),

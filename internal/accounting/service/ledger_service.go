@@ -13,6 +13,7 @@ import (
 
 	"auth-service/internal/accounting/events"
 	"auth-service/internal/accounting/models"
+	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/accounting/repository"
 	"auth-service/internal/client"
 	"auth-service/internal/infrastructure/audit"
@@ -20,18 +21,26 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// LedgerService defines ledger operations.
 type LedgerService interface {
 	PostJournalToLedger(ctx context.Context, tx repository.DBTX, entry *models.JournalEntry, lines []*models.JournalLine) error
 	ReverseLedgerEntries(ctx context.Context, tx repository.DBTX, originalEntryID uuid.UUID, reversalEntry *models.JournalEntry) error
 	GetAccountBalance(ctx context.Context, companyID, accountID uuid.UUID, fiscalYear, period int) (*models.AccountBalance, error)
 	RecomputeBalances(ctx context.Context, companyID uuid.UUID, fiscalYear int) error
+
+	// Reporting
+	ComputeTrialBalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.TrialBalanceRow, error)
+	ComputePAndL(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.PAndLRow, error)
+	ComputeBalanceSheet(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*repository.BalanceSheetRow, error)
+	GetAccountLedger(ctx context.Context, companyID, accountID uuid.UUID, from, to time.Time) ([]*repository.LedgerEntry, error)
+	CheckImbalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) error
+	UpdateRunningBalances(ctx context.Context, companyID, accountID uuid.UUID) error
 }
 
 type ledgerService struct {
 	ledgerRepo       repository.LedgerRepository
 	journalRepo      repository.JournalRepository
-	settingsRepo     repository.AccountingSettingsRepository // added
+	settingsRepo     repository.AccountingSettingsRepository
+	periodLockRepo   repository.PeriodLockRepository
 	pgClient         *client.PostgresClient
 	logger           *zap.Logger
 	outboxRepo       outbox.Repository
@@ -39,11 +48,11 @@ type ledgerService struct {
 	auditService     *audit.AuditService
 }
 
-// NewLedgerService creates a new ledger service.
 func NewLedgerService(
 	ledgerRepo repository.LedgerRepository,
 	journalRepo repository.JournalRepository,
-	settingsRepo repository.AccountingSettingsRepository, // new parameter
+	settingsRepo repository.AccountingSettingsRepository,
+	periodLockRepo repository.PeriodLockRepository,
 	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 	outboxRepo outbox.Repository,
@@ -54,6 +63,7 @@ func NewLedgerService(
 		ledgerRepo:       ledgerRepo,
 		journalRepo:      journalRepo,
 		settingsRepo:     settingsRepo,
+		periodLockRepo:   periodLockRepo,
 		pgClient:         pgClient,
 		logger:           logger.Named("ledger_service"),
 		outboxRepo:       outboxRepo,
@@ -62,8 +72,9 @@ func NewLedgerService(
 	}
 }
 
-// PostJournalToLedger updates account balances based on journal lines.
-// Assumes it is called within an existing transaction.
+// --------------------------------------------------------------------------
+// PostJournalToLedger – with period lock final guard and running balance update
+// --------------------------------------------------------------------------
 func (s *ledgerService) PostJournalToLedger(
 	ctx context.Context,
 	tx repository.DBTX,
@@ -75,13 +86,59 @@ func (s *ledgerService) PostJournalToLedger(
 		zap.String("journal_id", entry.JournalEntryID.String()),
 	)
 
-	// Determine fiscal year and period from entry date using company settings
 	fiscalYear, period, err := s.getFiscalPeriod(ctx, entry.CompanyID, entry.EntryDate)
 	if err != nil {
 		return fmt.Errorf("get fiscal period: %w", err)
 	}
 
-	// Prepare event payload
+	locked, err := s.periodLockRepo.IsLocked(ctx, tx, entry.CompanyID, fiscalYear, period)
+	if err != nil {
+		return fmt.Errorf("check period lock: %w", err)
+	}
+	if locked {
+		if s.auditService != nil {
+			_ = s.auditService.LogAction(ctx, nil, &entry.CompanyID, "ledger", "error", "post_blocked_by_lock",
+				&entry.JournalEntryID, "system", nil, nil, nil, map[string]interface{}{
+					"fiscal_year": fiscalYear,
+					"period":      period,
+					"reason":      "period_locked",
+				})
+		}
+		return fmt.Errorf("cannot post to locked period %d-%d", fiscalYear, period)
+	}
+
+	accountIDs := make([]uuid.UUID, len(lines))
+	for i, line := range lines {
+		accountIDs[i] = line.AccountID
+	}
+	accTypeMap, err := s.ledgerRepo.GetAccountTypesMap(ctx, tx, accountIDs)
+	if err != nil {
+		return fmt.Errorf("batch get account types: %w", err)
+	}
+
+	for _, line := range lines {
+		le := &models.LedgerEntry{
+			LedgerEntryID:  uuid.New(),
+			CompanyID:      entry.CompanyID,
+			JournalEntryID: entry.JournalEntryID,
+			JournalLineID:  line.JournalLineID,
+			AccountID:      line.AccountID,
+			EntryDate:      entry.EntryDate,
+			DebitAmount:    line.DebitAmount,
+			CreditAmount:   line.CreditAmount,
+			IsReversal:     entry.ReversalOf != nil,
+		}
+		if err := s.ledgerRepo.CreateLedgerEntry(ctx, tx, le); err != nil {
+			return fmt.Errorf("insert ledger entry for line %s: %w", line.JournalLineID, err)
+		}
+	}
+
+	for _, line := range lines {
+		if err := s.ledgerRepo.EnsureBalance(ctx, tx, entry.CompanyID, line.AccountID, fiscalYear, period); err != nil {
+			return fmt.Errorf("ensure balance for account %s: %w", line.AccountID, err)
+		}
+	}
+
 	eventPayload := events.LedgerEventPayload{
 		CompanyID:   entry.CompanyID.String(),
 		JournalID:   entry.JournalEntryID.String(),
@@ -89,71 +146,60 @@ func (s *ledgerService) PostJournalToLedger(
 		Entries:     []events.LedgerEntryPayload{},
 	}
 
-	// Process each line
 	for _, line := range lines {
-		// Determine amount change: debit increases asset/expense, credit increases liability/equity/revenue.
-		// We'll treat amount as positive for debit, negative for credit.
-		var amountDelta decimal.Decimal
-		if !line.DebitAmount.IsZero() {
-			amountDelta = line.DebitAmount
-		} else {
-			amountDelta = line.CreditAmount.Neg()
+		accType, ok := accTypeMap[line.AccountID]
+		if !ok {
+			return fmt.Errorf("account type not found for %s", line.AccountID)
 		}
 
-		// Get current balance
-		currentBalance, err := s.ledgerRepo.GetBalance(ctx, tx, entry.CompanyID, line.AccountID, fiscalYear, period)
+		var delta decimal.Decimal
+		if accType == enums.AccountTypeAsset || accType == enums.AccountTypeExpense {
+			delta = line.DebitAmount.Sub(line.CreditAmount)
+		} else {
+			delta = line.CreditAmount.Sub(line.DebitAmount)
+		}
+
+		if err := s.ledgerRepo.AtomicAddToBalance(ctx, tx, entry.CompanyID, line.AccountID, fiscalYear, period, delta); err != nil {
+			return fmt.Errorf("atomic add to balance for account %s: %w", line.AccountID, err)
+		}
+
+		balance, err := s.ledgerRepo.GetBalance(ctx, tx, entry.CompanyID, line.AccountID, fiscalYear, period)
 		if err != nil {
-			return fmt.Errorf("get current balance for account %s: %w", line.AccountID, err)
+			return fmt.Errorf("get balance after update for account %s: %w", line.AccountID, err)
 		}
 
-		var newBalance decimal.Decimal
-		var openingBalance decimal.Decimal
-		if currentBalance == nil {
-			// No existing balance – assume opening balance = 0
-			openingBalance = decimal.Zero
-			newBalance = amountDelta
-		} else {
-			openingBalance = currentBalance.ClosingBalance
-			newBalance = currentBalance.ClosingBalance.Add(amountDelta)
-		}
-
-		// Upsert balance
-		balance := &models.AccountBalance{
-			BalanceID:      uuid.New(),
-			CompanyID:      entry.CompanyID,
-			AccountID:      line.AccountID,
-			FiscalYear:     fiscalYear,
-			Period:         period,
-			OpeningBalance: openingBalance,
-			ClosingBalance: newBalance,
-			IsRecomputed:   false,
-		}
-		if err := s.ledgerRepo.UpsertBalance(ctx, tx, balance); err != nil {
-			return fmt.Errorf("upsert balance for account %s: %w", line.AccountID, err)
-		}
-
-		// Append to event payload
 		eventPayload.Entries = append(eventPayload.Entries, events.LedgerEntryPayload{
 			AccountID:     line.AccountID.String(),
-			Amount:        amountDelta.String(),
-			BalanceBefore: openingBalance.String(),
-			BalanceAfter:  newBalance.String(),
+			Amount:        delta.String(),
+			BalanceBefore: balance.OpeningBalance.String(),
+			BalanceAfter:  balance.ClosingBalance.String(),
 			FiscalYear:    fiscalYear,
 			Period:        period,
 		})
 	}
 
-	// Store outbox event for ledger update
-	payloadBytes, _ := json.Marshal(eventPayload)
+	for _, line := range lines {
+		if err := s.ledgerRepo.UpdateRunningBalances(ctx, tx, entry.CompanyID, line.AccountID); err != nil {
+			s.logger.Warn("failed to update running balance",
+				zap.String("account_id", line.AccountID.String()),
+				zap.Error(err))
+		}
+	}
+
 	sqlTx, ok := tx.(*sql.Tx)
 	if !ok {
-		return fmt.Errorf("expected *sql.Tx, got %T", tx)
+		return fmt.Errorf("expected *sql.Tx for outbox, got %T", tx)
+	}
+	payloadBytes, err := json.Marshal(eventPayload)
+	if err != nil {
+		return fmt.Errorf("marshal ledger event payload: %w", err)
 	}
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "ledger",
 		AggregateID:   entry.JournalEntryID.String(),
 		EventType:     events.EventLedgerUpdated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payloadBytes,
 		Status:        "pending",
 	}
@@ -161,11 +207,16 @@ func (s *ledgerService) PostJournalToLedger(
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	logger.Info("posted journal to ledger", zap.Int("line_count", len(lines)))
+	logger.Info("posted journal to ledger (inserted entries, updated balances, running balances)",
+		zap.Int("line_count", len(lines)),
+		zap.Int("fiscal_year", fiscalYear),
+		zap.Int("period", period))
 	return nil
 }
 
-// ReverseLedgerEntries reverts the ledger impact of a reversed journal entry.
+// --------------------------------------------------------------------------
+// ReverseLedgerEntries – reuses PostJournalToLedger
+// --------------------------------------------------------------------------
 func (s *ledgerService) ReverseLedgerEntries(
 	ctx context.Context,
 	tx repository.DBTX,
@@ -178,17 +229,17 @@ func (s *ledgerService) ReverseLedgerEntries(
 		zap.String("reversal_id", reversalEntry.JournalEntryID.String()),
 	)
 
-	// Get reversal lines (the opposite of original)
 	reversalLines, err := s.journalRepo.GetLines(ctx, tx, reversalEntry.JournalEntryID)
 	if err != nil {
 		return fmt.Errorf("get reversal lines: %w", err)
 	}
-
 	logger.Info("reversing ledger entries", zap.Int("line_count", len(reversalLines)))
 	return s.PostJournalToLedger(ctx, tx, reversalEntry, reversalLines)
 }
 
-// GetAccountBalance retrieves the balance for a specific account at a given fiscal period.
+// --------------------------------------------------------------------------
+// GetAccountBalance – direct repository call
+// --------------------------------------------------------------------------
 func (s *ledgerService) GetAccountBalance(
 	ctx context.Context,
 	companyID, accountID uuid.UUID,
@@ -197,22 +248,111 @@ func (s *ledgerService) GetAccountBalance(
 	return s.ledgerRepo.GetBalance(ctx, s.pgClient.DB, companyID, accountID, fiscalYear, period)
 }
 
-// RecomputeBalances recalculates all balances for a company in a fiscal year from journal entries.
+// --------------------------------------------------------------------------
+// RecomputeBalances – full fiscal year recompute
+// --------------------------------------------------------------------------
 func (s *ledgerService) RecomputeBalances(ctx context.Context, companyID uuid.UUID, fiscalYear int) error {
-	s.logger.Info("recomputing balances for company", zap.String("company_id", companyID.String()), zap.Int("fiscal_year", fiscalYear))
+	s.logger.Info("recomputing balances for company",
+		zap.String("company_id", companyID.String()),
+		zap.Int("fiscal_year", fiscalYear))
 	return s.ledgerRepo.RecomputeCompany(ctx, s.pgClient.DB, companyID, fiscalYear)
 }
 
-// getFiscalPeriod returns the fiscal year and period for a given date using the company's accounting settings.
-func (s *ledgerService) getFiscalPeriod(ctx context.Context, companyID uuid.UUID, date time.Time) (int, int, error) {
-	// Use the settings repository to compute fiscal year/period
-	fiscalYear, period, err := s.settingsRepo.GetFiscalYear(ctx, s.pgClient.DB, companyID, date)
+// --------------------------------------------------------------------------
+// Reporting methods
+// --------------------------------------------------------------------------
+func (s *ledgerService) ComputeTrialBalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.TrialBalanceRow, error) {
+	return s.ledgerRepo.ComputeTrialBalance(ctx, s.pgClient.DB, companyID, from, to)
+}
+
+func (s *ledgerService) ComputePAndL(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.PAndLRow, error) {
+	return s.ledgerRepo.ComputePAndL(ctx, s.pgClient.DB, companyID, from, to)
+}
+
+// ComputeBalanceSheet returns assets, liabilities, equity and appends current year earnings (YTD net profit)
+func (s *ledgerService) ComputeBalanceSheet(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*repository.BalanceSheetRow, error) {
+	// 1. Get the base balance sheet (real accounts)
+	rows, err := s.ledgerRepo.ComputeBalanceSheet(ctx, s.pgClient.DB, companyID, asOf)
 	if err != nil {
-		s.logger.Error("failed to get fiscal period",
-			zap.String("company_id", companyID.String()),
-			zap.Time("date", date),
-			zap.Error(err))
-		return 0, 0, fmt.Errorf("get fiscal period: %w", err)
+		return nil, err
 	}
-	return fiscalYear, period, nil
+
+	// 2. Fetch fiscal year start month
+	startMonth, err := s.ledgerRepo.GetFiscalYearStartMonth(ctx, s.pgClient.DB, companyID)
+	if err != nil {
+		s.logger.Warn("failed to get fiscal year start month, skipping current year earnings", zap.Error(err))
+		return rows, nil // fallback: return without synthetic row
+	}
+
+	// 3. Determine fiscal year start date based on asOf
+	fiscalYear := asOf.Year()
+	fiscalStart := time.Date(fiscalYear, time.Month(startMonth), 1, 0, 0, 0, 0, time.UTC)
+	if asOf.Before(fiscalStart) {
+		fiscalYear--
+		fiscalStart = time.Date(fiscalYear, time.Month(startMonth), 1, 0, 0, 0, 0, time.UTC)
+	}
+
+	// 4. Compute YTD net profit (inclusive of asOf date)
+	// Because ComputePAndL uses "entry_date < $3", we pass asOf+1 day to include asOf.
+	asOfInclusive := asOf.AddDate(0, 0, 1)
+	netProfit, err := s.computeNetProfitFromFiscalStart(ctx, companyID, fiscalStart, asOfInclusive)
+	if err != nil {
+		s.logger.Warn("failed to compute net profit for balance sheet", zap.Error(err))
+		return rows, nil
+	}
+
+	// 5. Append synthetic equity row if non-zero
+	if !netProfit.IsZero() {
+		rows = append(rows, &repository.BalanceSheetRow{
+			AccountID:   uuid.Nil, // sentinel
+			AccountName: "Current Year Earnings",
+			AccountType: "equity",
+			Amount:      netProfit,
+		})
+	}
+
+	return rows, nil
+}
+
+// computeNetProfitFromFiscalStart returns YTD net profit (revenue - expense) for interval [fiscalStart, toExclusive)
+func (s *ledgerService) computeNetProfitFromFiscalStart(ctx context.Context, companyID uuid.UUID, fiscalStart, toExclusive time.Time) (decimal.Decimal, error) {
+	pnlRows, err := s.ledgerRepo.ComputePAndL(ctx, s.pgClient.DB, companyID, fiscalStart, toExclusive)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	netProfit := decimal.Zero
+	for _, row := range pnlRows {
+		if row.AccountType == "revenue" {
+			netProfit = netProfit.Add(row.Amount)
+		} else if row.AccountType == "expense" {
+			netProfit = netProfit.Sub(row.Amount)
+		}
+	}
+	return netProfit, nil
+}
+
+func (s *ledgerService) GetAccountLedger(ctx context.Context, companyID, accountID uuid.UUID, from, to time.Time) ([]*repository.LedgerEntry, error) {
+	return s.ledgerRepo.GetAccountLedger(ctx, s.pgClient.DB, companyID, accountID, from, to)
+}
+
+func (s *ledgerService) CheckImbalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) error {
+	imbalance, debit, credit, err := s.ledgerRepo.CheckImbalance(ctx, s.pgClient.DB, companyID, from, to)
+	if err != nil {
+		return err
+	}
+	if imbalance {
+		return fmt.Errorf("ledger imbalance detected: total debit=%s, total credit=%s", debit, credit)
+	}
+	return nil
+}
+
+func (s *ledgerService) UpdateRunningBalances(ctx context.Context, companyID, accountID uuid.UUID) error {
+	return s.ledgerRepo.UpdateRunningBalances(ctx, s.pgClient.DB, companyID, accountID)
+}
+
+// --------------------------------------------------------------------------
+// Helper: get fiscal year/period from company settings
+// --------------------------------------------------------------------------
+func (s *ledgerService) getFiscalPeriod(ctx context.Context, companyID uuid.UUID, date time.Time) (int, int, error) {
+	return s.settingsRepo.GetFiscalYear(ctx, s.pgClient.DB, companyID, date)
 }

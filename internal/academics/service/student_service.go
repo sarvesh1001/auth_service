@@ -114,6 +114,7 @@ func (s *studentService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, event
 		AggregateType: "student",
 		AggregateID:   student.StudentID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",

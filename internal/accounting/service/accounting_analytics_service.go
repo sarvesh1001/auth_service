@@ -15,13 +15,35 @@ import (
 
 	"auth-service/internal/accounting/events"
 	"auth-service/internal/accounting/models/analytics"
+	"auth-service/internal/accounting/models/settings"
 	"auth-service/internal/accounting/repository"
 	"auth-service/internal/client"
 )
 
+// AccountingAnalyticsService defines the interface for processing accounting analytics events
+// and retrieving analytics data.
 type AccountingAnalyticsService interface {
+	// Event processing methods
 	ProcessJournalEvent(ctx context.Context, eventType string, payload []byte) error
 	ProcessLedgerEvent(ctx context.Context, eventType string, payload []byte) error
+	ProcessAccountEvent(ctx context.Context, eventType string, payload []byte) error
+	ProcessSettingsEvent(ctx context.Context, eventType string, settings *settings.AccountingSettings) error
+
+	// Query methods for DailyAccountSummary
+	GetDailySummary(ctx context.Context, companyID, summaryID uuid.UUID) (*analytics.DailyAccountSummary, error)
+	ListDailySummaries(ctx context.Context, companyID uuid.UUID, filter repository.DailySummaryFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.DailyAccountSummary, error)
+
+	// Query methods for AccountSnapshot
+	GetSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID) (*analytics.AccountSnapshot, error)
+	ListSnapshots(ctx context.Context, companyID uuid.UUID, filter repository.SnapshotFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.AccountSnapshot, error)
+
+	// Query methods for JournalMetric
+	GetJournalMetric(ctx context.Context, companyID, metricID uuid.UUID) (*analytics.JournalMetric, error)
+	ListJournalMetrics(ctx context.Context, companyID uuid.UUID, filter repository.JournalMetricFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.JournalMetric, error)
+
+	// Query methods for Cashflow
+	GetCashflow(ctx context.Context, companyID, cashflowID uuid.UUID) (*analytics.Cashflow, error)
+	ListCashflows(ctx context.Context, companyID uuid.UUID, filter repository.CashflowFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.Cashflow, error)
 }
 
 type accountingAnalyticsService struct {
@@ -30,6 +52,7 @@ type accountingAnalyticsService struct {
 	logger        *zap.Logger
 }
 
+// NewAccountingAnalyticsService creates a new accounting analytics service.
 func NewAccountingAnalyticsService(
 	repo repository.AnalyticsRepository,
 	pgClient *client.PostgresClient,
@@ -116,6 +139,7 @@ func (s *accountingAnalyticsService) processJournalLines(
 
 		netMovement := debit.Sub(credit)
 		summary := &analytics.DailyAccountSummary{
+			SummaryID:        uuid.New(),
 			CompanyID:        companyID,
 			AccountID:        accountID,
 			Date:             entryDate,
@@ -148,6 +172,7 @@ func (s *accountingAnalyticsService) updateJournalMetric(
 	}
 
 	metric := &analytics.JournalMetric{
+		MetricID:     uuid.New(),
 		CompanyID:    companyID,
 		JournalType:  &journalType,
 		Date:         date,
@@ -287,4 +312,165 @@ func (s *accountingAnalyticsService) isCashAccount(ctx context.Context, db repos
 	lowerName := strings.ToLower(accountName)
 	return strings.Contains(lowerCode, "cash") || strings.Contains(lowerName, "cash") ||
 		strings.Contains(lowerCode, "bank") || strings.Contains(lowerName, "bank"), nil
+}
+
+// ---------------------------------------------------------------------
+// Accounting Settings event processing
+// ---------------------------------------------------------------------
+
+// ProcessSettingsEvent handles accounting settings events.
+// It logs the change, invalidates affected analytics, and warns about required recomputations.
+func (s *accountingAnalyticsService) ProcessSettingsEvent(
+	ctx context.Context,
+	eventType string,
+	settings *settings.AccountingSettings,
+) error {
+	logger := s.logger.With(
+		zap.String("event_type", eventType),
+		zap.String("company_id", settings.CompanyID.String()),
+		zap.Int("fiscal_year_start_month", settings.FiscalYearStartMonth),
+		zap.String("currency_code", settings.CurrencyCode),
+		zap.String("tax_scheme", settings.TaxScheme),
+		zap.Bool("allow_intercompany_journal", settings.AllowIntercompanyJournal),
+		zap.Bool("auto_generate_reversals", settings.AutoGenerateReversals),
+	)
+
+	logger.Info("processing accounting settings event")
+
+	// Invalidate tax summaries when tax scheme changes (safety: invalidate all)
+	if err := s.analyticsRepo.InvalidateTaxSummaries(ctx, s.pgClient.DB, settings.CompanyID, nil, nil); err != nil {
+		logger.Error("failed to invalidate tax summaries after settings change", zap.Error(err))
+	}
+
+	logger.Warn("fiscal year start month change may require account balance recomputation",
+		zap.Int("new_start_month", settings.FiscalYearStartMonth))
+
+	if settings.CurrencyCode != "" {
+		logger.Info("currency code updated – consider refreshing exchange rates",
+			zap.String("new_currency", settings.CurrencyCode))
+	}
+
+	logger.Debug("settings flags updated",
+		zap.Bool("allow_intercompany_journal", settings.AllowIntercompanyJournal),
+		zap.Bool("auto_generate_reversals", settings.AutoGenerateReversals))
+
+	return nil
+}
+
+// ProcessAccountEvent handles account events (create, update, move, status change, delete).
+func (s *accountingAnalyticsService) ProcessAccountEvent(
+	ctx context.Context,
+	eventType string,
+	payload []byte,
+) error {
+	logger := s.logger.With(zap.String("event_type", eventType))
+
+	var evt events.AccountPayload
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		logger.Error("failed to unmarshal account event payload", zap.Error(err))
+		return fmt.Errorf("unmarshal payload: %w", err)
+	}
+
+	logger.Info("processing account event",
+		zap.String("account_id", evt.AccountID),
+		zap.String("account_code", evt.AccountCode),
+		zap.String("account_type", evt.AccountType),
+		zap.Bool("is_active", evt.IsActive),
+	)
+
+	switch eventType {
+	case events.EventAccountCreated:
+		// No immediate analytics impact – new account has zero balance.
+	case events.EventAccountUpdated:
+		logger.Info("account type may have changed – consider invalidating balance caches",
+			zap.String("account_id", evt.AccountID))
+	case events.EventAccountStatusChanged:
+		logger.Info("account status changed – may affect active account lists")
+	case events.EventAccountMoved:
+		logger.Info("account parent changed – hierarchical roll‑ups may be outdated")
+	case events.EventAccountDeleted:
+		logger.Info("account soft‑deleted – removing from active analytics sets")
+		// Optionally, call a repository method to clean up analytics data for this account.
+		// e.g., s.analyticsRepo.DeleteDailySummariesByAccount(ctx, s.pgClient.DB, accountID)
+	default:
+		logger.Debug("ignored account event type")
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// Query method implementations
+// ---------------------------------------------------------------------
+
+// GetDailySummary retrieves a daily summary by ID (and verifies company ownership).
+func (s *accountingAnalyticsService) GetDailySummary(ctx context.Context, companyID, summaryID uuid.UUID) (*analytics.DailyAccountSummary, error) {
+	summary, err := s.analyticsRepo.GetDailySummary(ctx, s.pgClient.DB, summaryID)
+	if err != nil {
+		return nil, err
+	}
+	if summary.CompanyID != companyID {
+		return nil, fmt.Errorf("daily summary does not belong to company %s", companyID)
+	}
+	return summary, nil
+}
+
+// ListDailySummaries lists daily summaries for a company with filtering, pagination and sorting.
+func (s *accountingAnalyticsService) ListDailySummaries(ctx context.Context, companyID uuid.UUID, filter repository.DailySummaryFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.DailyAccountSummary, error) {
+	filter.CompanyID = companyID
+	return s.analyticsRepo.ListDailySummaries(ctx, s.pgClient.DB, filter, pagination, sort)
+}
+
+// GetSnapshot retrieves an account snapshot by ID (and verifies company ownership).
+func (s *accountingAnalyticsService) GetSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID) (*analytics.AccountSnapshot, error) {
+	snapshot, err := s.analyticsRepo.GetSnapshot(ctx, s.pgClient.DB, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot.CompanyID != companyID {
+		return nil, fmt.Errorf("snapshot does not belong to company %s", companyID)
+	}
+	return snapshot, nil
+}
+
+// ListSnapshots lists account snapshots for a company with filtering, pagination and sorting.
+func (s *accountingAnalyticsService) ListSnapshots(ctx context.Context, companyID uuid.UUID, filter repository.SnapshotFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.AccountSnapshot, error) {
+	filter.CompanyID = companyID
+	return s.analyticsRepo.ListSnapshots(ctx, s.pgClient.DB, filter, pagination, sort)
+}
+
+// GetJournalMetric retrieves a journal metric by ID (and verifies company ownership).
+func (s *accountingAnalyticsService) GetJournalMetric(ctx context.Context, companyID, metricID uuid.UUID) (*analytics.JournalMetric, error) {
+	metric, err := s.analyticsRepo.GetJournalMetric(ctx, s.pgClient.DB, metricID)
+	if err != nil {
+		return nil, err
+	}
+	if metric.CompanyID != companyID {
+		return nil, fmt.Errorf("journal metric does not belong to company %s", companyID)
+	}
+	return metric, nil
+}
+
+// ListJournalMetrics lists journal metrics for a company with filtering, pagination and sorting.
+func (s *accountingAnalyticsService) ListJournalMetrics(ctx context.Context, companyID uuid.UUID, filter repository.JournalMetricFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.JournalMetric, error) {
+	filter.CompanyID = companyID
+	return s.analyticsRepo.ListJournalMetrics(ctx, s.pgClient.DB, filter, pagination, sort)
+}
+
+// GetCashflow retrieves a cashflow record by ID (and verifies company ownership).
+func (s *accountingAnalyticsService) GetCashflow(ctx context.Context, companyID, cashflowID uuid.UUID) (*analytics.Cashflow, error) {
+	cashflow, err := s.analyticsRepo.GetCashflow(ctx, s.pgClient.DB, cashflowID)
+	if err != nil {
+		return nil, err
+	}
+	if cashflow.CompanyID != companyID {
+		return nil, fmt.Errorf("cashflow does not belong to company %s", companyID)
+	}
+	return cashflow, nil
+}
+
+// ListCashflows lists cashflow records for a company with filtering, pagination and sorting.
+func (s *accountingAnalyticsService) ListCashflows(ctx context.Context, companyID uuid.UUID, filter repository.CashflowFilter, pagination repository.Pagination, sort repository.Sort) ([]*analytics.Cashflow, error) {
+	filter.CompanyID = companyID
+	return s.analyticsRepo.ListCashflows(ctx, s.pgClient.DB, filter, pagination, sort)
 }

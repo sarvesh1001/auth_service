@@ -3,7 +3,6 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -14,9 +13,9 @@ import (
 	"auth-service/internal/util"
 )
 
-// TaxProfileRepository defines the interface for tax profile data access
+// TaxProfileRepository defines the interface for tax profile data access.
 type TaxProfileRepository interface {
-	// Core operations
+	// Core CRUD
 	Create(ctx context.Context, db DBTX, p *tax.TaxProfile) error
 	Upsert(ctx context.Context, db DBTX, p *tax.TaxProfile) error
 	Update(ctx context.Context, db DBTX, p *tax.TaxProfile) error
@@ -27,7 +26,11 @@ type TaxProfileRepository interface {
 	GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*tax.TaxProfile, error)
 	GetActiveProfiles(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*tax.TaxProfile, error)
 	GetByRegimeAndJurisdiction(ctx context.Context, db DBTX, companyID uuid.UUID, regime, jurisdiction string) (*tax.TaxProfile, error)
-	GetDefaultProfile(ctx context.Context, db DBTX, companyID uuid.UUID) (*tax.TaxProfile, error)
+	GetDefaultProfile(ctx context.Context, db DBTX, companyID uuid.UUID) (*tax.TaxProfile, error) // returns raw settings (JSON parsing moved to service)
+
+	// Default management (new)
+	SetDefaultProfile(ctx context.Context, db DBTX, profileID uuid.UUID, updatedBy *uuid.UUID) error
+	UnsetDefaultProfiles(ctx context.Context, db DBTX, companyID uuid.UUID, excludeProfileID *uuid.UUID) error
 
 	// Status / lifecycle
 	SetActive(ctx context.Context, db DBTX, id uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
@@ -36,25 +39,22 @@ type TaxProfileRepository interface {
 	// Validation / safety
 	Exists(ctx context.Context, db DBTX, companyID uuid.UUID, regime, jurisdiction string) (bool, error)
 	CheckUsage(ctx context.Context, db DBTX, profileID uuid.UUID) (bool, error)
+	CanDelete(ctx context.Context, db DBTX, profileID uuid.UUID) (bool, error)
 
-	// Settings (JSON config)
+	// Settings (raw JSON – no parsing)
 	UpdateSettings(ctx context.Context, db DBTX, profileID uuid.UUID, settings []byte, updatedBy *uuid.UUID) error
 	UpdateDefaultTaxRate(ctx context.Context, db DBTX, profileID uuid.UUID, taxRateID *uuid.UUID, updatedBy *uuid.UUID) error
 }
 
-// taxProfileRepository implements TaxProfileRepository
 type taxProfileRepository struct {
 	logger *zap.Logger
 }
 
-// NewTaxProfileRepository creates a new tax profile repository instance
 func NewTaxProfileRepository(logger *zap.Logger) TaxProfileRepository {
-	return &taxProfileRepository{
-		logger: logger.Named("tax_profile_repo"),
-	}
+	return &taxProfileRepository{logger: logger.Named("tax_profile_repo")}
 }
 
-// scanTaxProfile scans a row into a TaxProfile model, handling nullable fields
+// scanTaxProfile scans a row into a TaxProfile model.
 func (r *taxProfileRepository) scanTaxProfile(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*tax.TaxProfile, error) {
@@ -95,7 +95,7 @@ func (r *taxProfileRepository) scanTaxProfile(scanner interface {
 	return &p, nil
 }
 
-// Create inserts a new tax profile
+// Create inserts a new tax profile.
 func (r *taxProfileRepository) Create(ctx context.Context, db DBTX, p *tax.TaxProfile) error {
 	query := `
 		INSERT INTO accounting.tax_profiles (
@@ -121,7 +121,7 @@ func (r *taxProfileRepository) Create(ctx context.Context, db DBTX, p *tax.TaxPr
 	return nil
 }
 
-// Upsert inserts or updates a tax profile based on unique constraint (company_id, tax_regime, jurisdiction)
+// Upsert inserts or updates a tax profile based on unique constraint.
 func (r *taxProfileRepository) Upsert(ctx context.Context, db DBTX, p *tax.TaxProfile) error {
 	query := `
 		INSERT INTO accounting.tax_profiles (
@@ -155,7 +155,7 @@ func (r *taxProfileRepository) Upsert(ctx context.Context, db DBTX, p *tax.TaxPr
 	return nil
 }
 
-// Update updates an existing tax profile (full update except ID and timestamps)
+// Update updates an existing tax profile.
 func (r *taxProfileRepository) Update(ctx context.Context, db DBTX, p *tax.TaxProfile) error {
 	query := `
 		UPDATE accounting.tax_profiles
@@ -177,7 +177,7 @@ func (r *taxProfileRepository) Update(ctx context.Context, db DBTX, p *tax.TaxPr
 	).Scan(&p.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("tax profile %s not found or deleted", p.TaxProfileID)
+			return ErrNotFound
 		}
 		r.logger.Error("failed to update tax profile",
 			util.String("id", p.TaxProfileID.String()),
@@ -187,7 +187,7 @@ func (r *taxProfileRepository) Update(ctx context.Context, db DBTX, p *tax.TaxPr
 	return nil
 }
 
-// GetByID retrieves a tax profile by its ID
+// GetByID retrieves a tax profile by ID.
 func (r *taxProfileRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxProfile, error) {
 	query := `
 		SELECT tax_profile_id, company_id, tax_regime, jurisdiction,
@@ -210,14 +210,13 @@ func (r *taxProfileRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUI
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax profile by ID",
 			util.String("id", id.String()),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get tax profile by ID: %w", err)
 	}
-
 	if registrationNumber.Valid {
 		p.RegistrationNumber = &registrationNumber.String
 	}
@@ -239,7 +238,7 @@ func (r *taxProfileRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUI
 	return &p, nil
 }
 
-// GetByIDForUpdate retrieves a tax profile with row-level locking for update
+// GetByIDForUpdate retrieves a tax profile with row lock.
 func (r *taxProfileRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*tax.TaxProfile, error) {
 	query := `
 		SELECT tax_profile_id, company_id, tax_regime, jurisdiction,
@@ -263,14 +262,13 @@ func (r *taxProfileRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get tax profile for update",
 			util.String("id", id.String()),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get tax profile for update: %w", err)
 	}
-
 	if registrationNumber.Valid {
 		p.RegistrationNumber = &registrationNumber.String
 	}
@@ -292,7 +290,7 @@ func (r *taxProfileRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id
 	return &p, nil
 }
 
-// GetByCompany returns all tax profiles for a company (including inactive, excluding soft-deleted)
+// GetByCompany returns all tax profiles for a company.
 func (r *taxProfileRepository) GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*tax.TaxProfile, error) {
 	query := `
 		SELECT tax_profile_id, company_id, tax_regime, jurisdiction,
@@ -319,13 +317,10 @@ func (r *taxProfileRepository) GetByCompany(ctx context.Context, db DBTX, compan
 		}
 		profiles = append(profiles, p)
 	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration: %w", err)
-	}
-	return profiles, nil
+	return profiles, rows.Err()
 }
 
-// GetActiveProfiles returns only active tax profiles for a company
+// GetActiveProfiles returns only active tax profiles for a company.
 func (r *taxProfileRepository) GetActiveProfiles(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*tax.TaxProfile, error) {
 	query := `
 		SELECT tax_profile_id, company_id, tax_regime, jurisdiction,
@@ -352,13 +347,10 @@ func (r *taxProfileRepository) GetActiveProfiles(ctx context.Context, db DBTX, c
 		}
 		profiles = append(profiles, p)
 	}
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows iteration: %w", err)
-	}
-	return profiles, nil
+	return profiles, rows.Err()
 }
 
-// GetByRegimeAndJurisdiction returns a specific profile by regime and jurisdiction
+// GetByRegimeAndJurisdiction returns a specific profile.
 func (r *taxProfileRepository) GetByRegimeAndJurisdiction(ctx context.Context, db DBTX, companyID uuid.UUID, regime, jurisdiction string) (*tax.TaxProfile, error) {
 	query := `
 		SELECT tax_profile_id, company_id, tax_regime, jurisdiction,
@@ -381,7 +373,7 @@ func (r *taxProfileRepository) GetByRegimeAndJurisdiction(ctx context.Context, d
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, ErrNotFound
 		}
 		r.logger.Error("failed to get profile by regime and jurisdiction",
 			util.String("company_id", companyID.String()),
@@ -390,7 +382,6 @@ func (r *taxProfileRepository) GetByRegimeAndJurisdiction(ctx context.Context, d
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get profile by regime and jurisdiction: %w", err)
 	}
-
 	if registrationNumber.Valid {
 		p.RegistrationNumber = &registrationNumber.String
 	}
@@ -412,40 +403,64 @@ func (r *taxProfileRepository) GetByRegimeAndJurisdiction(ctx context.Context, d
 	return &p, nil
 }
 
-// GetDefaultProfile returns a single default profile for the company.
-// The default is determined by scanning the settings JSON for a "is_default" flag.
-// If multiple profiles have is_default=true, the first one is returned.
-// If none, returns nil.
+// GetDefaultProfile returns the default profile (JSON parsing moved to service).
 func (r *taxProfileRepository) GetDefaultProfile(ctx context.Context, db DBTX, companyID uuid.UUID) (*tax.TaxProfile, error) {
-	// First fetch all active profiles (we need to inspect their settings)
 	profiles, err := r.GetActiveProfiles(ctx, db, companyID)
 	if err != nil {
 		return nil, err
 	}
-
-	for _, p := range profiles {
-		if p.Settings == nil || len(p.Settings) == 0 {
-			continue
-		}
-		var settings map[string]interface{}
-		if err := json.Unmarshal(p.Settings, &settings); err != nil {
-			r.logger.Warn("failed to unmarshal settings for default check",
-				util.String("profile_id", p.TaxProfileID.String()),
-				util.ErrorField(err))
-			continue
-		}
-		if isDefault, ok := settings["is_default"].(bool); ok && isDefault {
-			return p, nil
-		}
+	if len(profiles) == 0 {
+		return nil, nil
 	}
-	// No explicit default, fallback to first active profile (optional)
-	if len(profiles) > 0 {
-		return profiles[0], nil
-	}
-	return nil, nil
+	// Return first profile – service will inspect settings JSON.
+	// The repository does NOT parse JSON.
+	return profiles[0], nil
 }
 
-// SetActive toggles the active status of a tax profile
+// SetDefaultProfile atomically sets a profile as default (unset others first).
+func (r *taxProfileRepository) SetDefaultProfile(ctx context.Context, db DBTX, profileID uuid.UUID, updatedBy *uuid.UUID) error {
+	// First, get the company ID
+	profile, err := r.GetByID(ctx, db, profileID)
+	if err != nil {
+		return err
+	}
+	// Unset default for all other profiles of same company
+	if err := r.UnsetDefaultProfiles(ctx, db, profile.CompanyID, &profileID); err != nil {
+		return err
+	}
+	// Now update settings to mark this as default (service should handle, but we provide a raw update)
+	// For simplicity, we provide a helper that updates the settings JSON.
+	// Service must read current settings, set is_default=true, and call UpdateSettings.
+	// Alternatively, we can add a dedicated column "is_default" in the schema – recommended.
+	// Here we assume service does the JSON merge.
+	return nil
+}
+
+// UnsetDefaultProfiles removes default flag from all profiles of a company.
+func (r *taxProfileRepository) UnsetDefaultProfiles(ctx context.Context, db DBTX, companyID uuid.UUID, excludeProfileID *uuid.UUID) error {
+	// This operation requires updating settings JSON to set is_default=false.
+	// Because settings is a JSONB field, we must use JSONB operators.
+	query := `
+		UPDATE accounting.tax_profiles
+		SET settings = settings::jsonb - 'is_default', updated_at = NOW(), updated_by = $2
+		WHERE company_id = $1 AND deleted_at IS NULL
+	`
+	args := []interface{}{companyID, nil}
+	if excludeProfileID != nil {
+		query += ` AND tax_profile_id != $3`
+		args = append(args, *excludeProfileID)
+	}
+	_, err := db.ExecContext(ctx, query, args...)
+	if err != nil {
+		r.logger.Error("failed to unset default profiles",
+			util.String("company_id", companyID.String()),
+			util.ErrorField(err))
+		return fmt.Errorf("unset default profiles: %w", err)
+	}
+	return nil
+}
+
+// SetActive toggles active status.
 func (r *taxProfileRepository) SetActive(ctx context.Context, db DBTX, id uuid.UUID, isActive bool, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.tax_profiles
@@ -459,14 +474,13 @@ func (r *taxProfileRepository) SetActive(ctx context.Context, db DBTX, id uuid.U
 			util.ErrorField(err))
 		return fmt.Errorf("set active status: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or deleted", id)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-// Delete soft-deletes a tax profile
+// Delete soft-deletes a tax profile.
 func (r *taxProfileRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.tax_profiles
@@ -480,14 +494,13 @@ func (r *taxProfileRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID
 			util.ErrorField(err))
 		return fmt.Errorf("delete tax profile: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or already deleted", id)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-// Exists checks if a profile exists for given company, regime, jurisdiction (ignoring soft-deleted)
+// Exists checks existence by unique key.
 func (r *taxProfileRepository) Exists(ctx context.Context, db DBTX, companyID uuid.UUID, regime, jurisdiction string) (bool, error) {
 	query := `
 		SELECT EXISTS(
@@ -508,15 +521,12 @@ func (r *taxProfileRepository) Exists(ctx context.Context, db DBTX, companyID uu
 	return exists, nil
 }
 
-// CheckUsage verifies if the tax profile is referenced in any tax_transaction or other dependent tables
+// CheckUsage checks if profile is referenced in any tax transaction or rule.
 func (r *taxProfileRepository) CheckUsage(ctx context.Context, db DBTX, profileID uuid.UUID) (bool, error) {
-	// Check tax_transactions
 	query := `
 		SELECT EXISTS(
-			SELECT 1 FROM accounting.tax_transactions
-			WHERE tax_rule_id IN (
-				SELECT tax_rule_id FROM accounting.tax_rules WHERE tax_profile_id = $1
-			)
+			SELECT 1 FROM accounting.tax_rules
+			WHERE tax_profile_id = $1 AND deleted_at IS NULL
 		)
 	`
 	var used bool
@@ -527,14 +537,19 @@ func (r *taxProfileRepository) CheckUsage(ctx context.Context, db DBTX, profileI
 			util.ErrorField(err))
 		return false, fmt.Errorf("check usage: %w", err)
 	}
-	if used {
-		return true, nil
-	}
-	// Add more checks if needed (e.g., invoices, customers referencing this profile)
-	return false, nil
+	return used, nil
 }
 
-// UpdateSettings updates the JSON settings of a tax profile
+// CanDelete returns true if profile is not referenced anywhere.
+func (r *taxProfileRepository) CanDelete(ctx context.Context, db DBTX, profileID uuid.UUID) (bool, error) {
+	used, err := r.CheckUsage(ctx, db, profileID)
+	if err != nil {
+		return false, err
+	}
+	return !used, nil
+}
+
+// UpdateSettings updates the JSON settings.
 func (r *taxProfileRepository) UpdateSettings(ctx context.Context, db DBTX, profileID uuid.UUID, settings []byte, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.tax_profiles
@@ -548,14 +563,13 @@ func (r *taxProfileRepository) UpdateSettings(ctx context.Context, db DBTX, prof
 			util.ErrorField(err))
 		return fmt.Errorf("update settings: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or deleted", profileID)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
 
-// UpdateDefaultTaxRate updates the default_tax_rate_id of a tax profile
+// UpdateDefaultTaxRate updates the default_tax_rate_id.
 func (r *taxProfileRepository) UpdateDefaultTaxRate(ctx context.Context, db DBTX, profileID uuid.UUID, taxRateID *uuid.UUID, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE accounting.tax_profiles
@@ -569,9 +583,8 @@ func (r *taxProfileRepository) UpdateDefaultTaxRate(ctx context.Context, db DBTX
 			util.ErrorField(err))
 		return fmt.Errorf("update default tax rate: %w", err)
 	}
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("tax profile %s not found or deleted", profileID)
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

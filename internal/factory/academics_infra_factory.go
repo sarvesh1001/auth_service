@@ -273,17 +273,22 @@ func NewAcademicsInfraFactory(
 	// Outbox
 	if kafkaProducer != nil {
 		af.outboxRepo = outbox.NewPostgresRepository(postgresClient.DB)
+
 		af.academicsOutboxProcessor = outbox.NewProcessor(
-			af.outboxRepo, kafkaProducer, af.log, "academics-events",
+			af.outboxRepo,
+			kafkaProducer,
+			af.log,
 		)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		af.academicsOutboxCancel = cancel
+
 		go af.academicsOutboxProcessor.Start(ctx)
+
 		af.log.Info("Academics outbox processor started")
 	} else {
 		af.log.Warn("Kafka producer not available – outbox will be nil")
 	}
-
 	return af, nil
 }
 

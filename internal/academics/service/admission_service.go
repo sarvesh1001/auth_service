@@ -17,7 +17,6 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// AdmissionService defines business operations for admissions.
 type AdmissionService interface {
 	Create(ctx context.Context, req CreateAdmissionRequest) (*models.Admission, error)
 	BulkCreate(ctx context.Context, req []CreateAdmissionRequest) ([]*models.Admission, error)
@@ -32,21 +31,18 @@ type AdmissionService interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
-// CreateAdmissionRequest holds data for creating an admission.
 type CreateAdmissionRequest struct {
 	StudentID       uuid.UUID `json:"student_id"`
 	AcademicYearID  uuid.UUID `json:"academic_year_id"`
 	AdmissionDate   time.Time `json:"admission_date"`
 	ClassAppliedFor string    `json:"class_applied_for,omitempty"`
-	AdmissionStatus string    `json:"admission_status"` // pending, approved, rejected
+	AdmissionStatus string    `json:"admission_status"`
 	Remarks         string    `json:"remarks,omitempty"`
 	CreatedBy       *uuid.UUID
 	UpdatedBy       *uuid.UUID
-	// For idempotency – optional
-	IdempotencyKey string `json:"-"`
+	IdempotencyKey  string `json:"-"`
 }
 
-// UpdateAdmissionRequest holds data for updating an admission.
 type UpdateAdmissionRequest struct {
 	AdmissionID     uuid.UUID  `json:"admission_id"`
 	StudentID       uuid.UUID  `json:"student_id"`
@@ -68,7 +64,6 @@ type admissionService struct {
 	notificationSvc  NotificationService
 }
 
-// NewAdmissionService creates a new service instance.
 func NewAdmissionService(
 	repo repository.AdmissionRepository,
 	pgClient *client.PostgresClient,
@@ -89,10 +84,6 @@ func NewAdmissionService(
 	}
 }
 
-// ----------------------------------------------------------------------
-// Create
-// ----------------------------------------------------------------------
-
 func (s *admissionService) Create(ctx context.Context, req CreateAdmissionRequest) (*models.Admission, error) {
 	logger := s.logger.With(
 		zap.String("method", "Create"),
@@ -100,7 +91,6 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 		zap.String("academic_year_id", req.AcademicYearID.String()),
 	)
 
-	// Idempotency handling
 	if req.IdempotencyKey != "" {
 		var existing *models.Admission
 		if err := s.idempotencyStore.Get(ctx, nil, req.IdempotencyKey, &existing); err == nil && existing != nil {
@@ -109,7 +99,6 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 		}
 	}
 
-	// Validate input
 	if err := s.validateCreate(req); err != nil {
 		return nil, err
 	}
@@ -120,7 +109,6 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 	}
 	defer tx.Rollback()
 
-	// Check if admission already exists for this student & year
 	existing, _ := s.repo.GetByStudentAndYear(ctx, tx, req.StudentID, req.AcademicYearID)
 	if existing != nil {
 		return nil, fmt.Errorf("%w: admission already exists for student %s and year %s", ErrDuplicate, req.StudentID, req.AcademicYearID)
@@ -140,13 +128,13 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 		return nil, err
 	}
 
-	// Store outbox event
 	payload, _ := json.Marshal(admission)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "admission",
 		AggregateID:   admission.AdmissionID.String(),
 		EventType:     string(EventAdmissionCreated),
+		Topic:         TopicAdmission, // <-- NEW
 		Payload:       payload,
 		Headers:       map[string]string{},
 		Status:        "pending",
@@ -155,11 +143,9 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// Prepare data for notification (we need company ID)
 	var companyID uuid.UUID
 	if err := tx.QueryRowContext(ctx, "SELECT company_id FROM academics.students WHERE student_id = $1", admission.StudentID).Scan(&companyID); err != nil {
 		logger.Error("failed to fetch student company ID for notification", zap.Error(err))
-		// Non-fatal, continue
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -168,19 +154,16 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 
 	logger.Info("admission created", zap.String("id", admission.AdmissionID.String()))
 
-	// Audit after commit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, nil, "academics", "create", "admission",
 			&admission.AdmissionID, "user", req.CreatedBy, nil, nil,
 			map[string]interface{}{"student_id": admission.StudentID, "academic_year_id": admission.AcademicYearID})
 	}
 
-	// Store idempotency key response
 	if req.IdempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, nil, req.IdempotencyKey, admission)
 	}
 
-	// Send notification asynchronously (after commit to avoid nested tx)
 	if companyID != uuid.Nil {
 		go func() {
 			if err := s.sendAdmissionNotification(context.Background(), admission, companyID, "created"); err != nil {
@@ -192,10 +175,6 @@ func (s *admissionService) Create(ctx context.Context, req CreateAdmissionReques
 	return admission, nil
 }
 
-// ----------------------------------------------------------------------
-// BulkCreate
-// ----------------------------------------------------------------------
-
 func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissionRequest) ([]*models.Admission, error) {
 	if len(reqs) == 0 {
 		return nil, nil
@@ -203,7 +182,6 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 
 	logger := s.logger.With(zap.String("method", "BulkCreate"), zap.Int("batch_size", len(reqs)))
 
-	// Validate all before transaction
 	for i, req := range reqs {
 		if err := s.validateCreate(req); err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
@@ -216,8 +194,7 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 	}
 	defer tx.Rollback()
 
-	// Check for duplicates within batch and with existing DB records
-	existingMap := make(map[string]bool) // key = student_id:academic_year_id
+	existingMap := make(map[string]bool)
 	for i, req := range reqs {
 		key := fmt.Sprintf("%s:%s", req.StudentID.String(), req.AcademicYearID.String())
 		if existingMap[key] {
@@ -225,7 +202,6 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 		}
 		existingMap[key] = true
 
-		// Check DB
 		existing, _ := s.repo.GetByStudentAndYear(ctx, tx, req.StudentID, req.AcademicYearID)
 		if existing != nil {
 			return nil, fmt.Errorf("item %d: admission already exists for student %s and year %s", i, req.StudentID, req.AcademicYearID)
@@ -249,8 +225,7 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 		return nil, err
 	}
 
-	// Outbox events & collect company IDs for notifications
-	companyIDs := make(map[uuid.UUID]uuid.UUID) // admissionID -> companyID
+	companyIDs := make(map[uuid.UUID]uuid.UUID)
 	for _, admission := range admissions {
 		payload, _ := json.Marshal(admission)
 		outboxEvent := &outbox.Event{
@@ -258,6 +233,7 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 			AggregateType: "admission",
 			AggregateID:   admission.AdmissionID.String(),
 			EventType:     string(EventAdmissionCreated),
+			Topic:         TopicAdmission, // <-- NEW
 			Payload:       payload,
 			Status:        "pending",
 		}
@@ -280,7 +256,6 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 
 	logger.Info("bulk created admissions", zap.Int("count", len(admissions)))
 
-	// Audit each (optional)
 	if s.auditService != nil {
 		for _, a := range admissions {
 			_ = s.auditService.LogAction(ctx, nil, nil, "academics", "bulk_create", "admission",
@@ -288,7 +263,6 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 		}
 	}
 
-	// Send notifications asynchronously
 	for _, a := range admissions {
 		if cid, ok := companyIDs[a.AdmissionID]; ok {
 			go func(admission *models.Admission, companyID uuid.UUID) {
@@ -302,10 +276,6 @@ func (s *admissionService) BulkCreate(ctx context.Context, reqs []CreateAdmissio
 	return admissions, nil
 }
 
-// ----------------------------------------------------------------------
-// GetByID
-// ----------------------------------------------------------------------
-
 func (s *admissionService) GetByID(ctx context.Context, id uuid.UUID) (*models.Admission, error) {
 	admission, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
 	if err != nil {
@@ -318,19 +288,16 @@ func (s *admissionService) GetByID(ctx context.Context, id uuid.UUID) (*models.A
 	return admission, nil
 }
 
-// GetByStudentID retrieves all admissions for a student.
 func (s *admissionService) GetByStudentID(ctx context.Context, studentID uuid.UUID) ([]*models.Admission, error) {
 	s.logger.Debug("getting admissions by student", zap.String("student_id", studentID.String()))
 	return s.repo.GetByStudentID(ctx, s.pgClient.DB, studentID)
 }
 
-// GetByAcademicYearID retrieves all admissions for an academic year.
 func (s *admissionService) GetByAcademicYearID(ctx context.Context, academicYearID uuid.UUID) ([]*models.Admission, error) {
 	s.logger.Debug("getting admissions by academic year", zap.String("academic_year_id", academicYearID.String()))
 	return s.repo.GetByAcademicYearID(ctx, s.pgClient.DB, academicYearID)
 }
 
-// GetByStudentAndYear retrieves an admission for a specific student and academic year.
 func (s *admissionService) GetByStudentAndYear(ctx context.Context, studentID, academicYearID uuid.UUID) (*models.Admission, error) {
 	s.logger.Debug("getting admission by student and year",
 		zap.String("student_id", studentID.String()),
@@ -338,21 +305,15 @@ func (s *admissionService) GetByStudentAndYear(ctx context.Context, studentID, a
 	return s.repo.GetByStudentAndYear(ctx, s.pgClient.DB, studentID, academicYearID)
 }
 
-// List returns paginated admissions based on filter and sort.
 func (s *admissionService) List(ctx context.Context, filter repository.AdmissionFilter, p repository.Pagination, srt repository.Sort) ([]*models.Admission, error) {
 	s.logger.Debug("listing admissions")
 	return s.repo.List(ctx, s.pgClient.DB, filter, p, srt)
 }
 
-// Count returns total count of admissions matching filter.
 func (s *admissionService) Count(ctx context.Context, filter repository.AdmissionFilter) (int64, error) {
 	s.logger.Debug("counting admissions")
 	return s.repo.Count(ctx, s.pgClient.DB, filter)
 }
-
-// ----------------------------------------------------------------------
-// Update
-// ----------------------------------------------------------------------
 
 func (s *admissionService) Update(ctx context.Context, req UpdateAdmissionRequest) (*models.Admission, error) {
 	logger := s.logger.With(zap.String("method", "Update"), zap.String("id", req.AdmissionID.String()))
@@ -371,10 +332,8 @@ func (s *admissionService) Update(ctx context.Context, req UpdateAdmissionReques
 		return nil, fmt.Errorf("%w: admission %s", ErrNotFound, req.AdmissionID)
 	}
 
-	// Remember old status for notification
 	oldStatus := existing.AdmissionStatus
 
-	// Update fields
 	existing.StudentID = req.StudentID
 	existing.AcademicYearID = req.AcademicYearID
 	existing.AdmissionDate = req.AdmissionDate
@@ -386,13 +345,13 @@ func (s *admissionService) Update(ctx context.Context, req UpdateAdmissionReques
 		return nil, err
 	}
 
-	// Outbox event
 	payload, _ := json.Marshal(existing)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "admission",
 		AggregateID:   existing.AdmissionID.String(),
 		EventType:     string(EventAdmissionUpdated),
+		Topic:         TopicAdmission, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -400,7 +359,6 @@ func (s *admissionService) Update(ctx context.Context, req UpdateAdmissionReques
 		return nil, fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// Fetch company ID for notification if status changed
 	var companyID uuid.UUID
 	statusChanged := existing.AdmissionStatus != oldStatus
 	if statusChanged {
@@ -421,7 +379,6 @@ func (s *admissionService) Update(ctx context.Context, req UpdateAdmissionReques
 			map[string]interface{}{"status": existing.AdmissionStatus})
 	}
 
-	// Send notification after commit if status changed
 	if statusChanged && companyID != uuid.Nil {
 		go func() {
 			if err := s.sendAdmissionNotification(context.Background(), existing, companyID, "status_updated"); err != nil {
@@ -432,10 +389,6 @@ func (s *admissionService) Update(ctx context.Context, req UpdateAdmissionReques
 
 	return existing, nil
 }
-
-// ----------------------------------------------------------------------
-// UpdateStatus
-// ----------------------------------------------------------------------
 
 func (s *admissionService) UpdateStatus(ctx context.Context, id uuid.UUID, status string, updatedBy *uuid.UUID) error {
 	logger := s.logger.With(
@@ -460,14 +413,13 @@ func (s *admissionService) UpdateStatus(ctx context.Context, id uuid.UUID, statu
 
 	oldStatus := existing.AdmissionStatus
 	if string(oldStatus) == status {
-		return nil // no change
+		return nil
 	}
 
 	if err := s.repo.UpdateStatus(ctx, tx, id, status, updatedBy); err != nil {
 		return err
 	}
 
-	// Fetch updated admission for outbox event
 	updated, err := s.repo.GetByID(ctx, tx, id)
 	if err != nil {
 		return err
@@ -479,6 +431,7 @@ func (s *admissionService) UpdateStatus(ctx context.Context, id uuid.UUID, statu
 		AggregateType: "admission",
 		AggregateID:   updated.AdmissionID.String(),
 		EventType:     string(EventAdmissionStatusUpdated),
+		Topic:         TopicAdmission, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -486,7 +439,6 @@ func (s *admissionService) UpdateStatus(ctx context.Context, id uuid.UUID, statu
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// Fetch company ID for notification
 	var companyID uuid.UUID
 	if err := tx.QueryRowContext(ctx, "SELECT company_id FROM academics.students WHERE student_id = $1", updated.StudentID).Scan(&companyID); err != nil {
 		logger.Error("failed to fetch student company ID", zap.Error(err))
@@ -503,7 +455,6 @@ func (s *admissionService) UpdateStatus(ctx context.Context, id uuid.UUID, statu
 			&id, "user", updatedBy, nil, nil, map[string]interface{}{"new_status": status})
 	}
 
-	// Send notification after commit
 	if companyID != uuid.Nil {
 		go func() {
 			if err := s.sendAdmissionNotification(context.Background(), updated, companyID, "status_updated"); err != nil {
@@ -514,10 +465,6 @@ func (s *admissionService) UpdateStatus(ctx context.Context, id uuid.UUID, statu
 
 	return nil
 }
-
-// ----------------------------------------------------------------------
-// Delete
-// ----------------------------------------------------------------------
 
 func (s *admissionService) Delete(ctx context.Context, id uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("id", id.String()))
@@ -540,13 +487,13 @@ func (s *admissionService) Delete(ctx context.Context, id uuid.UUID) error {
 		return err
 	}
 
-	// Outbox event for deletion
 	payload, _ := json.Marshal(existing)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "admission",
 		AggregateID:   existing.AdmissionID.String(),
 		EventType:     string(EventAdmissionDeleted),
+		Topic:         TopicAdmission, // <-- NEW
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -568,10 +515,6 @@ func (s *admissionService) Delete(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// ----------------------------------------------------------------------
-// Private helpers
-// ----------------------------------------------------------------------
-
 func (s *admissionService) validateCreate(req CreateAdmissionRequest) error {
 	if req.StudentID == uuid.Nil {
 		return fmt.Errorf("%w: student_id is required", ErrInvalidInput)
@@ -591,11 +534,7 @@ func (s *admissionService) validateCreate(req CreateAdmissionRequest) error {
 	return nil
 }
 
-// sendAdmissionNotification creates a notification for the admission event.
-// This function is meant to be called after the main transaction has committed,
-// so it uses its own transaction.
 func (s *admissionService) sendAdmissionNotification(ctx context.Context, admission *models.Admission, companyID uuid.UUID, event string) error {
-	// Determine target – the student (and possibly guardians). For now, just student.
 	targets := []NotificationTargetInput{
 		{
 			TargetType:     models.TargetStudent,
@@ -625,8 +564,6 @@ func (s *admissionService) sendAdmissionNotification(ctx context.Context, admiss
 		CreatedBy: admission.CreatedBy,
 	}
 
-	// Note: notificationSvc.Create will start its own transaction.
-	// This is safe because this function is called after the main transaction committed.
 	_, err := s.notificationSvc.Create(ctx, notifReq, "")
 	return err
 }

@@ -12,3 +12,8 @@ var ValidAccountTypes = []string{
 	AccountTypeAsset, AccountTypeLiability, AccountTypeEquity,
 	AccountTypeRevenue, AccountTypeExpense,
 }
+
+const (
+	LedgerTypeNormal   = "normal"
+	LedgerTypeReversal = "reversal"
+)

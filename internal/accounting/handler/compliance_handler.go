@@ -1,4 +1,3 @@
-// FILE: ./internal/accounting/handler/compliance_handler.go
 package handler
 
 import (
@@ -8,11 +7,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
+	"auth-service/internal/accounting/models/enums"
 	"auth-service/internal/accounting/repository"
 	"auth-service/internal/accounting/service"
 )
@@ -29,7 +30,7 @@ func NewComplianceHandler(complianceService service.ComplianceService, logger *z
 	}
 }
 
-// ---------- Request DTOs ----------
+// ---------- Request DTOs (restored from original) ----------
 type createReturnRequest struct {
 	ReturnType  string    `json:"return_type"`
 	PeriodStart time.Time `json:"period_start"`
@@ -50,29 +51,27 @@ type fileReturnRequest struct {
 	Metadata            json.RawMessage  `json:"metadata,omitempty"`
 }
 
-type amendReturnRequest struct {
-	// empty body, only amended by taken from context
-}
-
 type updateFilingStatusRequest struct {
 	Status       string  `json:"status"`
 	ErrorMessage *string `json:"error_message,omitempty"`
 }
 
-type listReturnsQuery struct {
-	Status   string `json:"status"`
-	FromDate string `json:"from_date"`
-	ToDate   string `json:"to_date"`
-	Limit    int    `json:"limit"`
-	Offset   int    `json:"offset"`
+// ---------- Helper: idempotency key from header ----------
+func (h *ComplianceHandler) withIdempotencyKey(r *http.Request) context.Context {
+	ctx := r.Context()
+	key := r.Header.Get("Idempotency-Key")
+	if key != "" {
+		ctx = context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
 }
 
-// ---------- Helper ----------
-func (h *ComplianceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: implement actual permission check (e.g., via RBAC)
-	return true
+// ---------- Helper: timeout context ----------
+func (h *ComplianceHandler) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, 10*time.Second)
 }
 
+// ---------- Response helpers (unchanged) ----------
 func (h *ComplianceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -88,17 +87,17 @@ func (h *ComplianceHandler) respondWithError(w http.ResponseWriter, status int, 
 	})
 }
 
-// ---------- Handlers ----------
+// ---------- Stub permission (keep as is) ----------
+func (h *ComplianceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
+	return true
+}
 
-// CreateReturn godoc
-// @Summary Create a new compliance return
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param request body createReturnRequest true "Return details"
-// @Success 201 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns [post]
+// ---------- CREATE RETURN ----------
 func (h *ComplianceHandler) CreateReturn(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+	ctx = h.withIdempotencyKey(r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -123,6 +122,12 @@ func (h *ComplianceHandler) CreateReturn(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Validation
+	if req.ReturnType == "" {
+		h.respondWithError(w, http.StatusBadRequest, "return_type required")
+		return
+	}
+
 	serviceReq := service.CreateReturnRequest{
 		CompanyID:   companyID,
 		ReturnType:  req.ReturnType,
@@ -132,6 +137,11 @@ func (h *ComplianceHandler) CreateReturn(w http.ResponseWriter, r *http.Request)
 		CreatedBy:   &userID,
 		UpdatedBy:   &userID,
 	}
+
+	h.logger.Info("CreateReturn called",
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+	)
 
 	ret, err := h.complianceService.CreateReturn(ctx, serviceReq)
 	if err != nil {
@@ -147,16 +157,12 @@ func (h *ComplianceHandler) CreateReturn(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// UpdateReturn godoc
-// @Summary Update an existing compliance return (draft only)
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Return ID"
-// @Param request body updateReturnRequest true "Update fields"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns/{id} [put]
+// ---------- UPDATE RETURN ----------
 func (h *ComplianceHandler) UpdateReturn(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+	ctx = h.withIdempotencyKey(r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -200,8 +206,6 @@ func (h *ComplianceHandler) UpdateReturn(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	// optional: check that updated belongs to the company
 	if updated.CompanyID != companyID {
 		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
 		return
@@ -214,15 +218,12 @@ func (h *ComplianceHandler) UpdateReturn(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// SubmitReturn godoc
-// @Summary Submit a return (change status from draft to submitted)
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Return ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns/{id}/submit [post]
+// ---------- SUBMIT RETURN (with ownership check) ----------
 func (h *ComplianceHandler) SubmitReturn(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+	ctx = h.withIdempotencyKey(r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -248,6 +249,17 @@ func (h *ComplianceHandler) SubmitReturn(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Ownership check: fetch return first
+	ret, err := h.complianceService.GetReturnByID(ctx, returnID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ret.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
+		return
+	}
+
 	if err := h.complianceService.SubmitReturn(ctx, returnID, &userID); err != nil {
 		h.logger.Error("failed to submit return", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -260,16 +272,12 @@ func (h *ComplianceHandler) SubmitReturn(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// FileReturn godoc
-// @Summary File a submitted return with payment and acknowledgement
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Return ID"
-// @Param request body fileReturnRequest true "Filing details"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns/{id}/file [post]
+// ---------- FILE RETURN (with validation and ownership) ----------
 func (h *ComplianceHandler) FileReturn(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+	ctx = h.withIdempotencyKey(r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -301,6 +309,12 @@ func (h *ComplianceHandler) FileReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate payment amount sign
+	if req.PaymentAmount != nil && req.PaymentAmount.IsNegative() {
+		h.respondWithError(w, http.StatusBadRequest, "payment_amount cannot be negative")
+		return
+	}
+
 	taxPayableAccID, err := uuid.Parse(req.TaxPayableAccountID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid tax_payable_account_id")
@@ -309,6 +323,17 @@ func (h *ComplianceHandler) FileReturn(w http.ResponseWriter, r *http.Request) {
 	bankAccID, err := uuid.Parse(req.BankAccountID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid bank_account_id")
+		return
+	}
+
+	// Ownership check
+	ret, err := h.complianceService.GetReturnByID(ctx, returnID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ret.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
 		return
 	}
 
@@ -335,15 +360,12 @@ func (h *ComplianceHandler) FileReturn(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AmendReturn godoc
-// @Summary Amend an already filed return (creates new draft return)
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Original Return ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns/{id}/amend [post]
+// ---------- AMEND RETURN (with ownership check) ----------
 func (h *ComplianceHandler) AmendReturn(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+	ctx = h.withIdempotencyKey(r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -369,10 +391,18 @@ func (h *ComplianceHandler) AmendReturn(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	req := service.AmendReturnRequest{
-		AmendedBy: &userID,
+	// Ownership check
+	ret, err := h.complianceService.GetReturnByID(ctx, returnID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ret.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
+		return
 	}
 
+	req := service.AmendReturnRequest{AmendedBy: &userID}
 	amended, err := h.complianceService.AmendReturn(ctx, returnID, req)
 	if err != nil {
 		h.logger.Error("failed to amend return", zap.Error(err))
@@ -387,15 +417,12 @@ func (h *ComplianceHandler) AmendReturn(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// DeleteReturn godoc
-// @Summary Soft-delete a return (only if not filed)
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Return ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns/{id} [delete]
+// ---------- DELETE RETURN (with ownership check) ----------
 func (h *ComplianceHandler) DeleteReturn(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+	ctx = h.withIdempotencyKey(r)
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -421,6 +448,17 @@ func (h *ComplianceHandler) DeleteReturn(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Ownership check
+	ret, err := h.complianceService.GetReturnByID(ctx, returnID)
+	if err != nil {
+		h.respondWithError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if ret.CompanyID != companyID {
+		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
+		return
+	}
+
 	if err := h.complianceService.DeleteReturn(ctx, returnID, &userID); err != nil {
 		h.logger.Error("failed to delete return", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -433,15 +471,11 @@ func (h *ComplianceHandler) DeleteReturn(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// GetReturnByID godoc
-// @Summary Get a compliance return by ID
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param id path string true "Return ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns/{id} [get]
+// ---------- GET RETURN BY ID ----------
 func (h *ComplianceHandler) GetReturnByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -473,7 +507,6 @@ func (h *ComplianceHandler) GetReturnByID(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusNotFound, err.Error())
 		return
 	}
-
 	if ret.CompanyID != companyID {
 		h.respondWithError(w, http.StatusForbidden, "return does not belong to this company")
 		return
@@ -485,19 +518,11 @@ func (h *ComplianceHandler) GetReturnByID(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// ListReturns godoc
-// @Summary List compliance returns with filtering and pagination
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param status query string false "Filter by status"
-// @Param from_date query string false "Start date (YYYY-MM-DD)"
-// @Param to_date query string false "End date (YYYY-MM-DD)"
-// @Param limit query int false "Page size (default 50, max 1000)"
-// @Param offset query int false "Offset"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/returns [get]
+// ---------- LIST RETURNS ----------
 func (h *ComplianceHandler) ListReturns(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -521,20 +546,6 @@ func (h *ComplianceHandler) ListReturns(w http.ResponseWriter, r *http.Request) 
 		CompanyID: companyID,
 		Status:    query.Get("status"),
 	}
-	// Date filtering – adjust field names based on actual filter struct.
-	// If the filter uses PeriodStart/PeriodEnd, uncomment and modify accordingly:
-	/*
-		if from := query.Get("from_date"); from != "" {
-			if t, err := time.Parse("2006-01-02", from); err == nil {
-				filter.PeriodStart = &t
-			}
-		}
-		if to := query.Get("to_date"); to != "" {
-			if t, err := time.Parse("2006-01-02", to); err == nil {
-				filter.PeriodEnd = &t
-			}
-		}
-	*/
 
 	limit := 50
 	if l, err := strconv.Atoi(query.Get("limit")); err == nil && l > 0 {
@@ -567,15 +578,11 @@ func (h *ComplianceHandler) ListReturns(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// GetFilingByID godoc
-// @Summary Get a filing by ID
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param filingID path string true "Filing ID"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/filings/{filingID} [get]
+// ---------- GET FILING BY ID ----------
 func (h *ComplianceHandler) GetFilingByID(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -608,24 +615,17 @@ func (h *ComplianceHandler) GetFilingByID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// optional: verify that filing belongs to a return of the company
-	// we could fetch the return, but for brevity we trust the service
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    filing,
 	})
 }
 
-// UpdateFilingStatus godoc
-// @Summary Update filing status (e.g., accepted/rejected by tax authority)
-// @Tags compliance
-// @Param companyID path string true "Company ID"
-// @Param filingID path string true "Filing ID"
-// @Param request body updateFilingStatusRequest true "Status update"
-// @Success 200 {object} map[string]interface{}
-// @Router /companies/{companyID}/compliance/filings/{filingID}/status [patch]
+// ---------- UPDATE FILING STATUS (FIXED) ----------
 func (h *ComplianceHandler) UpdateFilingStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := h.withTimeout(r.Context())
+	defer cancel()
+
 	companyIDStr := chi.URLParam(r, "companyID")
 	companyID, err := uuid.Parse(companyIDStr)
 	if err != nil {
@@ -657,7 +657,16 @@ func (h *ComplianceHandler) UpdateFilingStatus(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := h.complianceService.UpdateFilingStatus(ctx, filingID, req.Status, req.ErrorMessage); err != nil {
+	// Convert string to enum and validate
+	status := enums.ComplianceFilingStatus(req.Status)
+	if status != enums.FilingStatusAccepted &&
+		status != enums.FilingStatusRejected &&
+		status != enums.FilingStatusPending {
+		h.respondWithError(w, http.StatusBadRequest, "invalid filing status")
+		return
+	}
+
+	if err := h.complianceService.UpdateFilingStatus(ctx, filingID, status, req.ErrorMessage); err != nil {
 		h.logger.Error("failed to update filing status", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return

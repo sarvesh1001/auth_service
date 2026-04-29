@@ -7,6 +7,7 @@ type Event struct {
 	AggregateType string
 	AggregateID   string
 	EventType     string
+	Topic         string // 🔥 NEW
 	Payload       []byte
 	Headers       map[string]string
 	Status        string

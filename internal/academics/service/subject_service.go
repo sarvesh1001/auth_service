@@ -110,6 +110,7 @@ func (s *subjectService) storeOutboxEvent(ctx context.Context, tx *sql.Tx, event
 		AggregateType: "subject",
 		AggregateID:   aggregateID.String(),
 		EventType:     string(eventType),
+		Topic:         TopicStudent,
 		Payload:       data,
 		Headers:       map[string]string{},
 		Status:        "pending",

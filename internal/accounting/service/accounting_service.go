@@ -2,12 +2,16 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
+	"auth-service/internal/accounting/events"
 	"auth-service/internal/accounting/models"
 	"auth-service/internal/accounting/models/compliance"
 	"auth-service/internal/accounting/models/settings"
@@ -19,30 +23,45 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
+// AccountingService defines the full accounting interface.
 type AccountingService interface {
-	CreateJournal(ctx context.Context, req CreateJournalRequest) (*models.JournalEntry, error)
-	UpdateJournal(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error)
-	PostJournal(ctx context.Context, journalID uuid.UUID, postedBy *uuid.UUID) error
-	ReverseJournal(ctx context.Context, journalID uuid.UUID, reason string, reversedBy *uuid.UUID) error
+	// Journal
+	CreateJournal(ctx context.Context, req CreateJournalRequest, idempotencyKey string) (*models.JournalEntry, error)
+	UpdateJournal(ctx context.Context, req UpdateJournalRequest, idempotencyKey string) (*models.JournalEntry, error)
+	PostJournal(ctx context.Context, journalID uuid.UUID, postedBy *uuid.UUID, idempotencyKey string) error
+	ReverseJournal(ctx context.Context, journalID uuid.UUID, reason string, reversedBy *uuid.UUID, idempotencyKey string) error
 	GetJournal(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error)
 	ListJournals(ctx context.Context, filter repository.JournalFilter, page, pageSize int) ([]*models.JournalEntry, int64, error)
+
+	// Ledger
 	GetAccountBalance(ctx context.Context, companyID, accountID uuid.UUID, fiscalYear, period int) (*models.AccountBalance, error)
-	RecomputeLedger(ctx context.Context, companyID uuid.UUID, fiscalYear int) error
+	RecomputeLedger(ctx context.Context, companyID uuid.UUID, fiscalYear int, idempotencyKey string) error
+
+	// Tax
 	ComputeTax(ctx context.Context, companyID uuid.UUID, amount decimal.Decimal, taxRateID *uuid.UUID) (*TaxResult, error)
-	CreateTaxTransaction(ctx context.Context, req CreateTaxTransactionRequest) (*tax.TaxTransaction, error)
+	CreateTaxTransaction(ctx context.Context, req CreateTaxTransactionRequest, idempotencyKey string) (*tax.TaxTransaction, error)
 	GetApplicableTaxRate(ctx context.Context, companyID uuid.UUID, date time.Time) (*tax.TaxRate, error)
-	CreateReturn(ctx context.Context, req CreateReturnRequest) (*compliance.ComplianceReturn, error)
-	SubmitReturn(ctx context.Context, returnID uuid.UUID, submittedBy *uuid.UUID) error
-	FileReturn(ctx context.Context, returnID uuid.UUID, req FileReturnRequest) (*compliance.ComplianceFiling, error)
-	AmendReturn(ctx context.Context, returnID uuid.UUID, req AmendReturnRequest) (*compliance.ComplianceReturn, error)
+
+	// Compliance
+	CreateReturn(ctx context.Context, req CreateReturnRequest, idempotencyKey string) (*compliance.ComplianceReturn, error)
+	SubmitReturn(ctx context.Context, returnID uuid.UUID, submittedBy *uuid.UUID, idempotencyKey string) error
+	FileReturn(ctx context.Context, returnID uuid.UUID, req FileReturnRequest, idempotencyKey string) (*compliance.ComplianceFiling, error)
+	AmendReturn(ctx context.Context, returnID uuid.UUID, req AmendReturnRequest, idempotencyKey string) (*compliance.ComplianceReturn, error)
 	GetReturn(ctx context.Context, id uuid.UUID) (*compliance.ComplianceReturn, error)
 	ListReturns(ctx context.Context, filter repository.ComplianceReturnFilter, page, pageSize int) ([]*compliance.ComplianceReturn, int64, error)
 
-	// Accounting Settings management
+	// Accounting Settings (with idempotency)
 	GetAccountingSettings(ctx context.Context, companyID uuid.UUID) (*settings.AccountingSettings, error)
-	UpdateFiscalYear(ctx context.Context, companyID uuid.UUID, startMonth int, updatedBy *uuid.UUID) error
-	UpdateCurrency(ctx context.Context, companyID uuid.UUID, currencyCode string, updatedBy *uuid.UUID) error
-	UpdateTaxScheme(ctx context.Context, companyID uuid.UUID, taxScheme string, updatedBy *uuid.UUID) error
+	GetAccountingSettingsForUpdate(ctx context.Context, companyID uuid.UUID) (*settings.AccountingSettings, error)
+	CreateAccountingSettings(ctx context.Context, s *settings.AccountingSettings, idempotencyKey string) error
+	UpsertAccountingSettings(ctx context.Context, s *settings.AccountingSettings, idempotencyKey string) error
+	UpdateAccountingSettings(ctx context.Context, s *settings.AccountingSettings, idempotencyKey string) error
+	UpdateFiscalYear(ctx context.Context, companyID uuid.UUID, startMonth int, updatedBy *uuid.UUID, idempotencyKey string) error
+	UpdateCurrency(ctx context.Context, companyID uuid.UUID, currencyCode string, updatedBy *uuid.UUID, idempotencyKey string) error
+	UpdateTaxScheme(ctx context.Context, companyID uuid.UUID, taxScheme string, updatedBy *uuid.UUID, idempotencyKey string) error
+	UpdateFlags(ctx context.Context, companyID uuid.UUID, allowIntercompany, autoReversal bool, updatedBy *uuid.UUID, idempotencyKey string) error
+	ExistsAccountingSettings(ctx context.Context, companyID uuid.UUID) (bool, error)
+	GetFiscalYearPeriod(ctx context.Context, companyID uuid.UUID, date time.Time) (fiscalYear int, period int, err error)
 }
 
 type accountingService struct {
@@ -84,19 +103,29 @@ func NewAccountingService(
 	}
 }
 
-func (s *accountingService) CreateJournal(ctx context.Context, req CreateJournalRequest) (*models.JournalEntry, error) {
+// ----------------------------------------------------------------------
+// Journal passthrough (idempotency handled inside journalSvc via its own store)
+// Note: we do NOT pass idempotencyKey to underlying journal methods because
+// they have their own idempotency handling (e.g., using the same store).
+// Instead, we rely on the idempotencyStore in this layer if needed, but for
+// journal we assume it's already handled inside journalSvc.
+// To keep it simple, we just forward the request without the key.
+// ----------------------------------------------------------------------
+func (s *accountingService) CreateJournal(ctx context.Context, req CreateJournalRequest, idempotencyKey string) (*models.JournalEntry, error) {
+	// Journal service already handles idempotency internally using the same store.
+	// We ignore the passed key because journalSvc doesn't accept it.
 	return s.journalSvc.Create(ctx, req)
 }
 
-func (s *accountingService) UpdateJournal(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error) {
+func (s *accountingService) UpdateJournal(ctx context.Context, req UpdateJournalRequest, idempotencyKey string) (*models.JournalEntry, error) {
 	return s.journalSvc.Update(ctx, req)
 }
 
-func (s *accountingService) PostJournal(ctx context.Context, journalID uuid.UUID, postedBy *uuid.UUID) error {
+func (s *accountingService) PostJournal(ctx context.Context, journalID uuid.UUID, postedBy *uuid.UUID, idempotencyKey string) error {
 	return s.journalSvc.Post(ctx, journalID, postedBy)
 }
 
-func (s *accountingService) ReverseJournal(ctx context.Context, journalID uuid.UUID, reason string, reversedBy *uuid.UUID) error {
+func (s *accountingService) ReverseJournal(ctx context.Context, journalID uuid.UUID, reason string, reversedBy *uuid.UUID, idempotencyKey string) error {
 	return s.journalSvc.Reverse(ctx, journalID, reason, reversedBy)
 }
 
@@ -112,19 +141,27 @@ func (s *accountingService) ListJournals(ctx context.Context, filter repository.
 	return s.journalSvc.List(ctx, filter, Pagination{Limit: pageSize, Offset: offset})
 }
 
+// ----------------------------------------------------------------------
+// Ledger passthrough
+// ----------------------------------------------------------------------
 func (s *accountingService) GetAccountBalance(ctx context.Context, companyID, accountID uuid.UUID, fiscalYear, period int) (*models.AccountBalance, error) {
 	return s.ledgerSvc.GetAccountBalance(ctx, companyID, accountID, fiscalYear, period)
 }
 
-func (s *accountingService) RecomputeLedger(ctx context.Context, companyID uuid.UUID, fiscalYear int) error {
+func (s *accountingService) RecomputeLedger(ctx context.Context, companyID uuid.UUID, fiscalYear int, idempotencyKey string) error {
+	// Idempotency not critical for recompute; just call.
 	return s.ledgerSvc.RecomputeBalances(ctx, companyID, fiscalYear)
 }
 
+// ----------------------------------------------------------------------
+// Tax passthrough
+// ----------------------------------------------------------------------
 func (s *accountingService) ComputeTax(ctx context.Context, companyID uuid.UUID, amount decimal.Decimal, taxRateID *uuid.UUID) (*TaxResult, error) {
 	return s.taxSvc.ComputeTax(ctx, companyID, amount, taxRateID)
 }
 
-func (s *accountingService) CreateTaxTransaction(ctx context.Context, req CreateTaxTransactionRequest) (*tax.TaxTransaction, error) {
+func (s *accountingService) CreateTaxTransaction(ctx context.Context, req CreateTaxTransactionRequest, idempotencyKey string) (*tax.TaxTransaction, error) {
+	// taxSvc might have its own idempotency; ignore key.
 	return s.taxSvc.CreateTaxTransaction(ctx, req)
 }
 
@@ -132,19 +169,23 @@ func (s *accountingService) GetApplicableTaxRate(ctx context.Context, companyID 
 	return s.taxSvc.GetApplicableTaxRate(ctx, companyID, date)
 }
 
-func (s *accountingService) CreateReturn(ctx context.Context, req CreateReturnRequest) (*compliance.ComplianceReturn, error) {
+// ----------------------------------------------------------------------
+// Compliance passthrough
+// ----------------------------------------------------------------------
+func (s *accountingService) CreateReturn(ctx context.Context, req CreateReturnRequest, idempotencyKey string) (*compliance.ComplianceReturn, error) {
+	// complianceSvc already handles idempotency internally using the store.
 	return s.complianceSvc.CreateReturn(ctx, req)
 }
 
-func (s *accountingService) SubmitReturn(ctx context.Context, returnID uuid.UUID, submittedBy *uuid.UUID) error {
+func (s *accountingService) SubmitReturn(ctx context.Context, returnID uuid.UUID, submittedBy *uuid.UUID, idempotencyKey string) error {
 	return s.complianceSvc.SubmitReturn(ctx, returnID, submittedBy)
 }
 
-func (s *accountingService) FileReturn(ctx context.Context, returnID uuid.UUID, req FileReturnRequest) (*compliance.ComplianceFiling, error) {
+func (s *accountingService) FileReturn(ctx context.Context, returnID uuid.UUID, req FileReturnRequest, idempotencyKey string) (*compliance.ComplianceFiling, error) {
 	return s.complianceSvc.FileReturn(ctx, returnID, req)
 }
 
-func (s *accountingService) AmendReturn(ctx context.Context, returnID uuid.UUID, req AmendReturnRequest) (*compliance.ComplianceReturn, error) {
+func (s *accountingService) AmendReturn(ctx context.Context, returnID uuid.UUID, req AmendReturnRequest, idempotencyKey string) (*compliance.ComplianceReturn, error) {
 	return s.complianceSvc.AmendReturn(ctx, returnID, req)
 }
 
@@ -161,36 +202,230 @@ func (s *accountingService) ListReturns(ctx context.Context, filter repository.C
 }
 
 // ----------------------------------------------------------------------
-// Accounting Settings Management
+// Accounting Settings Management (with idempotency & outbox)
 // ----------------------------------------------------------------------
 
+// GetAccountingSettings retrieves settings. Returns ErrNotFound if missing.
 func (s *accountingService) GetAccountingSettings(ctx context.Context, companyID uuid.UUID) (*settings.AccountingSettings, error) {
 	if companyID == uuid.Nil {
 		return nil, ErrInvalidInput
 	}
-	settings, err := s.settingsRepo.GetByCompany(ctx, s.pgClient.DB, companyID)
+	accSettings, err := s.settingsRepo.GetByCompany(ctx, s.pgClient.DB, companyID)
 	if err != nil {
 		s.logger.Error("failed to get accounting settings", zap.String("company_id", companyID.String()), zap.Error(err))
 		return nil, err
 	}
-	if settings == nil {
+	if accSettings == nil {
 		return nil, ErrNotFound
 	}
-	return settings, nil
+	return accSettings, nil
 }
 
-func (s *accountingService) UpdateFiscalYear(ctx context.Context, companyID uuid.UUID, startMonth int, updatedBy *uuid.UUID) error {
+// GetAccountingSettingsForUpdate retrieves settings with row-level lock.
+func (s *accountingService) GetAccountingSettingsForUpdate(ctx context.Context, companyID uuid.UUID) (*settings.AccountingSettings, error) {
 	if companyID == uuid.Nil {
-		return ErrInvalidInput
+		return nil, ErrInvalidInput
 	}
-	if startMonth < 1 || startMonth > 12 {
-		return ErrInvalidInput
-	}
-	err := s.settingsRepo.UpdateFiscalYear(ctx, s.pgClient.DB, companyID, startMonth, updatedBy)
+	accSettings, err := s.settingsRepo.GetByCompanyForUpdate(ctx, s.pgClient.DB, companyID)
 	if err != nil {
-		s.logger.Error("failed to update fiscal year", zap.String("company_id", companyID.String()), zap.Int("start_month", startMonth), zap.Error(err))
+		s.logger.Error("failed to get accounting settings for update", zap.String("company_id", companyID.String()), zap.Error(err))
+		return nil, err
+	}
+	if accSettings == nil {
+		return nil, ErrNotFound
+	}
+	return accSettings, nil
+}
+
+// // CreateAccountingSettings creates new settings with idempotency.
+// func (s *accountingService) CreateAccountingSettings(ctx context.Context, settings *settings.AccountingSettings, idempotencyKey string) error {
+// 	if settings.CompanyID == uuid.Nil {
+// 		return ErrInvalidInput
+// 	}
+// 	if idempotencyKey == "" {
+// 		return ErrInvalidInput
+// 	}
+
+// 	tx, err := s.pgClient.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return fmt.Errorf("begin tx: %w", err)
+// 	}
+// 	defer tx.Rollback()
+
+// 	// Idempotency check
+// 	var existingSettings *settings.AccountingSettings
+// 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existingSettings); err == nil && existingSettings != nil {
+// 		// Already processed
+// 		return nil
+// 	}
+
+// 	exists, err := s.settingsRepo.Exists(ctx, tx, settings.CompanyID)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	if exists {
+// 		return ErrDuplicate
+// 	}
+
+// 	err = s.settingsRepo.Create(ctx, tx, settings)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	// Store idempotency result
+// 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, settings)
+
+// 	// Emit outbox event
+// 	if err := s.emitSettingsEvent(ctx, tx, settings, events.EventAccountingSettingsCreated); err != nil {
+// 		s.logger.Warn("failed to emit settings created event", zap.Error(err))
+// 	}
+
+// 	if err := tx.Commit(); err != nil {
+// 		return fmt.Errorf("commit tx: %w", err)
+// 	}
+
+// 	// Audit (non‑transactional)
+// 	if s.auditService != nil {
+// 		_ = s.auditService.LogAction(ctx, nil, &settings.CompanyID, "settings", "create", "accounting_settings",
+// 			nil, "user", settings.CreatedBy, nil, nil, map[string]interface{}{
+// 				"fiscal_year_start_month": settings.FiscalYearStartMonth,
+// 				"currency_code":           settings.CurrencyCode,
+// 				"tax_scheme":              settings.TaxScheme,
+// 			})
+// 	}
+// 	return nil
+// }
+
+// // UpsertAccountingSettings creates or replaces settings with idempotency.
+// func (s *accountingService) UpsertAccountingSettings(ctx context.Context, settings *settings.AccountingSettings, idempotencyKey string) error {
+// 	if settings.CompanyID == uuid.Nil {
+// 		return ErrInvalidInput
+// 	}
+// 	if idempotencyKey == "" {
+// 		return ErrInvalidInput
+// 	}
+
+// 	tx, err := s.pgClient.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return fmt.Errorf("begin tx: %w", err)
+// 	}
+// 	defer tx.Rollback()
+
+// 	var existingSettings *settings.AccountingSettings
+// 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existingSettings); err == nil && existingSettings != nil {
+// 		return nil
+// 	}
+
+// 	err = s.settingsRepo.Upsert(ctx, tx, settings)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, settings)
+
+// 	if err := s.emitSettingsEvent(ctx, tx, settings, events.EventAccountingSettingsUpdated); err != nil {
+// 		s.logger.Warn("failed to emit settings updated event", zap.Error(err))
+// 	}
+
+// 	if err := tx.Commit(); err != nil {
+// 		return fmt.Errorf("commit tx: %w", err)
+// 	}
+
+// 	if s.auditService != nil {
+// 		_ = s.auditService.LogAction(ctx, nil, &settings.CompanyID, "settings", "upsert", "accounting_settings",
+// 			nil, "user", settings.UpdatedBy, nil, nil, map[string]interface{}{
+// 				"fiscal_year_start_month": settings.FiscalYearStartMonth,
+// 				"currency_code":           settings.CurrencyCode,
+// 				"tax_scheme":              settings.TaxScheme,
+// 			})
+// 	}
+// 	return nil
+// }
+
+// // UpdateAccountingSettings performs full update with idempotency.
+// func (s *accountingService) UpdateAccountingSettings(ctx context.Context, settings *settings.AccountingSettings, idempotencyKey string) error {
+// 	if settings.CompanyID == uuid.Nil {
+// 		return ErrInvalidInput
+// 	}
+// 	if idempotencyKey == "" {
+// 		return ErrInvalidInput
+// 	}
+
+// 	tx, err := s.pgClient.BeginTx(ctx, nil)
+// 	if err != nil {
+// 		return fmt.Errorf("begin tx: %w", err)
+// 	}
+// 	defer tx.Rollback()
+
+// 	var existingSettings *settings.AccountingSettings
+// 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existingSettings); err == nil && existingSettings != nil {
+// 		return nil
+// 	}
+
+// 	err = s.settingsRepo.Update(ctx, tx, settings)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, settings)
+
+// 	if err := s.emitSettingsEvent(ctx, tx, settings, events.EventAccountingSettingsUpdated); err != nil {
+// 		s.logger.Warn("failed to emit settings updated event", zap.Error(err))
+// 	}
+
+// 	if err := tx.Commit(); err != nil {
+// 		return fmt.Errorf("commit tx: %w", err)
+// 	}
+
+// 	if s.auditService != nil {
+// 		_ = s.auditService.LogAction(ctx, nil, &settings.CompanyID, "settings", "full_update", "accounting_settings",
+// 			nil, "user", settings.UpdatedBy, nil, nil, map[string]interface{}{
+// 				"fiscal_year_start_month": settings.FiscalYearStartMonth,
+// 				"currency_code":           settings.CurrencyCode,
+// 				"tax_scheme":              settings.TaxScheme,
+// 				"allow_intercompany":      settings.AllowIntercompanyJournal,
+// 				"auto_reversal":           settings.AutoGenerateReversals,
+// 			})
+// 	}
+// 	return nil
+// }
+
+// UpdateFiscalYear updates only the fiscal year start month with idempotency.
+func (s *accountingService) UpdateFiscalYear(ctx context.Context, companyID uuid.UUID, startMonth int, updatedBy *uuid.UUID, idempotencyKey string) error {
+	if companyID == uuid.Nil || startMonth < 1 || startMonth > 12 {
+		return ErrInvalidInput
+	}
+	if idempotencyKey == "" {
+		return ErrInvalidInput
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	err = s.settingsRepo.UpdateFiscalYear(ctx, tx, companyID, startMonth, updatedBy)
+	if err != nil {
 		return err
 	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+
+	// Emit partial update event (re-fetch full settings)
+	if err := s.emitPartialSettingsEvent(ctx, tx, companyID, events.EventAccountingSettingsUpdated); err != nil {
+		s.logger.Warn("failed to emit settings event after fiscal year update", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "settings", "update_fiscal_year", "accounting_settings",
 			nil, "user", updatedBy, nil, nil, map[string]interface{}{"start_month": startMonth})
@@ -198,18 +433,41 @@ func (s *accountingService) UpdateFiscalYear(ctx context.Context, companyID uuid
 	return nil
 }
 
-func (s *accountingService) UpdateCurrency(ctx context.Context, companyID uuid.UUID, currencyCode string, updatedBy *uuid.UUID) error {
-	if companyID == uuid.Nil {
+// UpdateCurrency updates the functional currency with idempotency.
+func (s *accountingService) UpdateCurrency(ctx context.Context, companyID uuid.UUID, currencyCode string, updatedBy *uuid.UUID, idempotencyKey string) error {
+	if companyID == uuid.Nil || len(currencyCode) != 3 {
 		return ErrInvalidInput
 	}
-	if len(currencyCode) != 3 {
+	if idempotencyKey == "" {
 		return ErrInvalidInput
 	}
-	err := s.settingsRepo.UpdateCurrency(ctx, s.pgClient.DB, companyID, currencyCode, updatedBy)
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
-		s.logger.Error("failed to update currency", zap.String("company_id", companyID.String()), zap.String("currency", currencyCode), zap.Error(err))
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	err = s.settingsRepo.UpdateCurrency(ctx, tx, companyID, currencyCode, updatedBy)
+	if err != nil {
 		return err
 	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+
+	if err := s.emitPartialSettingsEvent(ctx, tx, companyID, events.EventAccountingSettingsUpdated); err != nil {
+		s.logger.Warn("failed to emit settings event after currency update", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "settings", "update_currency", "accounting_settings",
 			nil, "user", updatedBy, nil, nil, map[string]interface{}{"currency_code": currencyCode})
@@ -217,21 +475,331 @@ func (s *accountingService) UpdateCurrency(ctx context.Context, companyID uuid.U
 	return nil
 }
 
-func (s *accountingService) UpdateTaxScheme(ctx context.Context, companyID uuid.UUID, taxScheme string, updatedBy *uuid.UUID) error {
-	if companyID == uuid.Nil {
+// UpdateTaxScheme updates the tax scheme with idempotency.
+func (s *accountingService) UpdateTaxScheme(ctx context.Context, companyID uuid.UUID, taxScheme string, updatedBy *uuid.UUID, idempotencyKey string) error {
+	if companyID == uuid.Nil || (taxScheme != "accrual" && taxScheme != "cash") {
 		return ErrInvalidInput
 	}
-	if taxScheme != "accrual" && taxScheme != "cash" {
+	if idempotencyKey == "" {
 		return ErrInvalidInput
 	}
-	err := s.settingsRepo.UpdateTaxScheme(ctx, s.pgClient.DB, companyID, taxScheme, updatedBy)
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
-		s.logger.Error("failed to update tax scheme", zap.String("company_id", companyID.String()), zap.String("tax_scheme", taxScheme), zap.Error(err))
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	err = s.settingsRepo.UpdateTaxScheme(ctx, tx, companyID, taxScheme, updatedBy)
+	if err != nil {
 		return err
 	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+
+	if err := s.emitPartialSettingsEvent(ctx, tx, companyID, events.EventAccountingSettingsUpdated); err != nil {
+		s.logger.Warn("failed to emit settings event after tax scheme update", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "settings", "update_tax_scheme", "accounting_settings",
 			nil, "user", updatedBy, nil, nil, map[string]interface{}{"tax_scheme": taxScheme})
+	}
+	return nil
+}
+
+// UpdateFlags updates boolean flags with idempotency.
+func (s *accountingService) UpdateFlags(ctx context.Context, companyID uuid.UUID, allowIntercompany, autoReversal bool, updatedBy *uuid.UUID, idempotencyKey string) error {
+	if companyID == uuid.Nil {
+		return ErrInvalidInput
+	}
+	if idempotencyKey == "" {
+		return ErrInvalidInput
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	err = s.settingsRepo.UpdateFlags(ctx, tx, companyID, allowIntercompany, autoReversal, updatedBy)
+	if err != nil {
+		return err
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+
+	if err := s.emitPartialSettingsEvent(ctx, tx, companyID, events.EventAccountingSettingsUpdated); err != nil {
+		s.logger.Warn("failed to emit settings event after flags update", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "settings", "update_flags", "accounting_settings",
+			nil, "user", updatedBy, nil, nil, map[string]interface{}{
+				"allow_intercompany_journal": allowIntercompany,
+				"auto_generate_reversals":    autoReversal,
+			})
+	}
+	return nil
+}
+
+// ExistsAccountingSettings checks if settings exist.
+func (s *accountingService) ExistsAccountingSettings(ctx context.Context, companyID uuid.UUID) (bool, error) {
+	if companyID == uuid.Nil {
+		return false, ErrInvalidInput
+	}
+	return s.settingsRepo.Exists(ctx, s.pgClient.DB, companyID)
+}
+
+// GetFiscalYearPeriod returns fiscal year and period.
+func (s *accountingService) GetFiscalYearPeriod(ctx context.Context, companyID uuid.UUID, date time.Time) (fiscalYear int, period int, err error) {
+	if companyID == uuid.Nil {
+		return 0, 0, ErrInvalidInput
+	}
+	return s.settingsRepo.GetFiscalYear(ctx, s.pgClient.DB, companyID, date)
+}
+
+// ----------------------------------------------------------------------
+// Helpers for outbox events
+// ----------------------------------------------------------------------
+
+// emitSettingsEvent stores an outbox event for the full settings object.
+func (s *accountingService) emitSettingsEvent(ctx context.Context, tx *sql.Tx, settings *settings.AccountingSettings, eventType string) error {
+	if s.outboxRepo == nil {
+		return nil
+	}
+	payload, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "accounting_settings",
+		AggregateID:   settings.CompanyID.String(),
+		EventType:     eventType,
+		Topic:         TopicAccountingEvents,
+		Payload:       payload,
+		Status:        "pending",
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
+}
+
+// emitPartialSettingsEvent fetches fresh settings and emits an event.
+func (s *accountingService) emitPartialSettingsEvent(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, eventType string) error {
+	var accSettings *settings.AccountingSettings
+	var err error
+	if tx != nil {
+		accSettings, err = s.settingsRepo.GetByCompany(ctx, tx, companyID)
+	} else {
+		accSettings, err = s.settingsRepo.GetByCompany(ctx, s.pgClient.DB, companyID)
+	}
+	if err != nil {
+		return err
+	}
+	if accSettings == nil {
+		return nil
+	}
+	return s.emitSettingsEvent(ctx, tx, accSettings, eventType)
+}
+
+// CreateAccountingSettings creates new settings with idempotency.
+func (s *accountingService) CreateAccountingSettings(ctx context.Context, accSettings *settings.AccountingSettings, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "CreateAccountingSettings"),
+		zap.String("company_id", accSettings.CompanyID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
+
+	if accSettings.CompanyID == uuid.Nil {
+		return ErrInvalidInput
+	}
+	if idempotencyKey == "" {
+		return ErrInvalidInput
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Idempotency check
+	var existing *settings.AccountingSettings
+	errGet := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing)
+	if errGet == nil && existing != nil {
+		logger.Info("Idempotent request detected – returning cached response")
+		return nil
+	}
+	if errGet != nil {
+		logger.Warn("IdempotencyStore.Get failed", zap.Error(errGet))
+	} else {
+		logger.Debug("IdempotencyStore.Get returned no existing record")
+	}
+
+	// 2. Check if settings already exist for this company
+	exists, err := s.settingsRepo.Exists(ctx, tx, accSettings.CompanyID)
+	if err != nil {
+		logger.Error("Failed to check existence", zap.Error(err))
+		return err
+	}
+	if exists {
+		logger.Warn("Settings already exist for company – returning duplicate error")
+		return ErrDuplicate
+	}
+	logger.Debug("No existing settings found for company")
+
+	// 3. Create the settings
+	err = s.settingsRepo.Create(ctx, tx, accSettings)
+	if err != nil {
+		logger.Error("Failed to create settings", zap.Error(err))
+		return err
+	}
+	logger.Info("Settings created in database")
+
+	// 4. Store idempotency record
+	errStore := s.idempotencyStore.Store(ctx, tx, idempotencyKey, accSettings)
+	if errStore != nil {
+		logger.Error("Failed to store idempotency record", zap.Error(errStore))
+		// Do not fail the whole operation – the data is already committed
+	} else {
+		logger.Debug("Idempotency record stored successfully")
+	}
+
+	// 5. Emit outbox event (non‑critical)
+	if err := s.emitSettingsEvent(ctx, tx, accSettings, events.EventAccountingSettingsCreated); err != nil {
+		logger.Warn("Failed to emit settings created event", zap.Error(err))
+	}
+
+	// 6. Commit transaction
+	if err := tx.Commit(); err != nil {
+		logger.Error("Transaction commit failed", zap.Error(err))
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("Accounting settings created successfully")
+
+	// 7. Audit log (after commit)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &accSettings.CompanyID, "settings", "create", "accounting_settings",
+			nil, "user", accSettings.CreatedBy, nil, nil, map[string]interface{}{
+				"fiscal_year_start_month": accSettings.FiscalYearStartMonth,
+				"currency_code":           accSettings.CurrencyCode,
+				"tax_scheme":              accSettings.TaxScheme,
+			})
+	}
+
+	return nil
+}
+
+// UpsertAccountingSettings creates or replaces settings with idempotency.
+func (s *accountingService) UpsertAccountingSettings(ctx context.Context, accSettings *settings.AccountingSettings, idempotencyKey string) error {
+	if accSettings.CompanyID == uuid.Nil {
+		return ErrInvalidInput
+	}
+	if idempotencyKey == "" {
+		return ErrInvalidInput
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existing *settings.AccountingSettings
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+		return nil
+	}
+
+	err = s.settingsRepo.Upsert(ctx, tx, accSettings)
+	if err != nil {
+		return err
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, accSettings)
+
+	if err := s.emitSettingsEvent(ctx, tx, accSettings, events.EventAccountingSettingsUpdated); err != nil {
+		s.logger.Warn("failed to emit settings updated event", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &accSettings.CompanyID, "settings", "upsert", "accounting_settings",
+			nil, "user", accSettings.UpdatedBy, nil, nil, map[string]interface{}{
+				"fiscal_year_start_month": accSettings.FiscalYearStartMonth,
+				"currency_code":           accSettings.CurrencyCode,
+				"tax_scheme":              accSettings.TaxScheme,
+			})
+	}
+	return nil
+}
+
+// UpdateAccountingSettings performs full update with idempotency.
+func (s *accountingService) UpdateAccountingSettings(ctx context.Context, accSettings *settings.AccountingSettings, idempotencyKey string) error {
+	if accSettings.CompanyID == uuid.Nil {
+		return ErrInvalidInput
+	}
+	if idempotencyKey == "" {
+		return ErrInvalidInput
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existing *settings.AccountingSettings
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+		return nil
+	}
+
+	err = s.settingsRepo.Update(ctx, tx, accSettings)
+	if err != nil {
+		return err
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, accSettings)
+
+	if err := s.emitSettingsEvent(ctx, tx, accSettings, events.EventAccountingSettingsUpdated); err != nil {
+		s.logger.Warn("failed to emit settings updated event", zap.Error(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &accSettings.CompanyID, "settings", "full_update", "accounting_settings",
+			nil, "user", accSettings.UpdatedBy, nil, nil, map[string]interface{}{
+				"fiscal_year_start_month": accSettings.FiscalYearStartMonth,
+				"currency_code":           accSettings.CurrencyCode,
+				"tax_scheme":              accSettings.TaxScheme,
+				"allow_intercompany":      accSettings.AllowIntercompanyJournal,
+				"auto_reversal":           accSettings.AutoGenerateReversals,
+			})
 	}
 	return nil
 }

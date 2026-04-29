@@ -1418,18 +1418,18 @@
     CREATE INDEX idx_students_name_trgm ON academics.students USING GIN (first_name gin_trgm_ops, last_name gin_trgm_ops);
 
     CREATE TABLE IF NOT EXISTS outbox.events (
-        event_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        aggregate_type VARCHAR(100) NOT NULL,
-        aggregate_id   UUID,
-        event_type     VARCHAR(100) NOT NULL,
-        payload        JSONB NOT NULL,
-        headers        JSONB,
-        status         VARCHAR(20) NOT NULL DEFAULT 'pending',
-        retry_count    INT NOT NULL DEFAULT 0,
-        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        processed_at   TIMESTAMPTZ
+    event_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type VARCHAR(100) NOT NULL,
+    aggregate_id   UUID,
+    event_type     VARCHAR(100) NOT NULL,
+    topic          VARCHAR(100) NOT NULL,        -- 🔥 NEW (CRITICAL)
+    payload        JSONB NOT NULL,
+    headers        JSONB,
+    status         VARCHAR(20) NOT NULL DEFAULT 'pending',
+    retry_count    INT NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at   TIMESTAMPTZ
     );
-
     CREATE INDEX idx_outbox_status ON outbox.events(status);
     CREATE INDEX idx_outbox_created ON outbox.events(created_at);
 
@@ -1885,3 +1885,7 @@ ADD COLUMN total_sessions_generated      INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN total_period_attendances      INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN total_biometric_attendances   INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN total_manual_period_attendances INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_outbox_pending 
+ON outbox.events(status, created_at);
+
+

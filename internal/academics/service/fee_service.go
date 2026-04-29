@@ -187,6 +187,7 @@ func (s *feeService) CreateFeeStructure(ctx context.Context, req CreateFeeStruct
 		AggregateType: "fee_structure",
 		AggregateID:   fs.FeeStructureID.String(),
 		EventType:     string(EventFeeStructureCreated),
+		Topic:         TopicStudent, // <-- ADD THIS
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -264,6 +265,7 @@ func (s *feeService) UpdateFeeStructure(ctx context.Context, req UpdateFeeStruct
 		AggregateType: "fee_structure",
 		AggregateID:   fs.FeeStructureID.String(),
 		EventType:     string(EventFeeStructureUpdated),
+		Topic:         TopicStudent, // <-- ADD THIS
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -312,6 +314,7 @@ func (s *feeService) DeleteFeeStructure(ctx context.Context, id uuid.UUID, delet
 		AggregateType: "fee_structure",
 		AggregateID:   id.String(),
 		EventType:     string(EventFeeStructureDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -523,6 +526,7 @@ func (s *feeService) CreateInvoice(ctx context.Context, req CreateInvoiceRequest
 		AggregateType: "fee_invoice",
 		AggregateID:   inv.InvoiceID.String(),
 		EventType:     string(EventFeeInvoiceCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -606,6 +610,7 @@ func (s *feeService) UpdateInvoiceStatus(ctx context.Context, id uuid.UUID, stat
 		AggregateType: "fee_invoice",
 		AggregateID:   id.String(),
 		EventType:     string(EventFeeInvoiceUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -671,6 +676,7 @@ func (s *feeService) CreatePayment(ctx context.Context, req CreatePaymentRequest
 		AggregateType: "fee_payment",
 		AggregateID:   payment.PaymentID.String(),
 		EventType:     string(EventFeePaymentCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -747,6 +753,7 @@ func (s *feeService) CreateDiscount(ctx context.Context, req CreateDiscountReque
 		AggregateType: "fee_discount",
 		AggregateID:   discount.DiscountID.String(),
 		EventType:     string(EventFeeDiscountCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -801,6 +808,7 @@ func (s *feeService) UpdateDiscount(ctx context.Context, req UpdateDiscountReque
 		AggregateType: "fee_discount",
 		AggregateID:   discount.DiscountID.String(),
 		EventType:     string(EventFeeDiscountUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -872,6 +880,7 @@ func (s *feeService) CreatePenalty(ctx context.Context, req CreatePenaltyRequest
 		AggregateType: "fee_penalty",
 		AggregateID:   penalty.PenaltyID.String(),
 		EventType:     string(EventFeePenaltyCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1108,6 +1117,7 @@ func (s *feeService) GenerateReceipt(ctx context.Context, paymentID uuid.UUID, r
 		AggregateType: "fee_receipt",
 		AggregateID:   receipt.ReceiptID.String(),
 		EventType:     string(EventFeeReceiptGenerated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}

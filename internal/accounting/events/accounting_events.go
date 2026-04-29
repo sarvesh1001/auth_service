@@ -4,11 +4,13 @@ import "time"
 
 // Accounting event types
 const (
-	EventJournalCreated  = "journal.created"
-	EventJournalUpdated  = "journal.updated"
-	EventJournalPosted   = "journal.posted"
-	EventJournalReversed = "journal.reversed"
-	EventJournalDeleted  = "journal.deleted"
+	EventJournalCreated            = "journal.created"
+	EventJournalUpdated            = "journal.updated"
+	EventJournalPosted             = "journal.posted"
+	EventJournalReversed           = "journal.reversed"
+	EventJournalDeleted            = "journal.deleted"
+	EventAccountingSettingsCreated = "accounting.settings.created"
+	EventAccountingSettingsUpdated = "accounting.settings.updated"
 )
 
 // JournalEventPayload carries the journal entry and its lines

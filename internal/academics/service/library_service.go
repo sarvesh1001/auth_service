@@ -255,6 +255,7 @@ func (s *libraryService) CreateCategory(ctx context.Context, req CreateCategoryR
 		AggregateType: "library_category",
 		AggregateID:   category.CategoryID.String(),
 		EventType:     string(EventLibraryCategoryCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -380,6 +381,7 @@ func (s *libraryService) UpdateCategory(ctx context.Context, req UpdateCategoryR
 		AggregateType: "library_category",
 		AggregateID:   category.CategoryID.String(),
 		EventType:     string(EventLibraryCategoryUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -455,6 +457,7 @@ func (s *libraryService) DeleteCategory(ctx context.Context, id uuid.UUID, delet
 		AggregateType: "library_category",
 		AggregateID:   id.String(),
 		EventType:     string(EventLibraryCategoryDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -562,6 +565,7 @@ func (s *libraryService) CreateBook(ctx context.Context, req CreateBookRequest) 
 		AggregateType: "library_book",
 		AggregateID:   book.BookID.String(),
 		EventType:     string(EventLibraryBookCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -704,6 +708,7 @@ func (s *libraryService) UpdateBook(ctx context.Context, req UpdateBookRequest) 
 		AggregateType: "library_book",
 		AggregateID:   book.BookID.String(),
 		EventType:     string(EventLibraryBookUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -778,6 +783,7 @@ func (s *libraryService) DeleteBook(ctx context.Context, id uuid.UUID, deletedBy
 		AggregateType: "library_book",
 		AggregateID:   id.String(),
 		EventType:     string(EventLibraryBookDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -878,6 +884,7 @@ func (s *libraryService) CreateCopy(ctx context.Context, req CreateCopyRequest) 
 		AggregateType: "library_copy",
 		AggregateID:   copy.CopyID.String(),
 		EventType:     string(EventLibraryCopyCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1019,6 +1026,7 @@ func (s *libraryService) UpdateCopy(ctx context.Context, req UpdateCopyRequest) 
 		AggregateType: "library_copy",
 		AggregateID:   copy.CopyID.String(),
 		EventType:     string(EventLibraryCopyUpdated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1101,6 +1109,7 @@ func (s *libraryService) DeleteCopy(ctx context.Context, id uuid.UUID) error {
 		AggregateType: "library_copy",
 		AggregateID:   id.String(),
 		EventType:     string(EventLibraryCopyDeleted),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1201,6 +1210,7 @@ func (s *libraryService) IssueBook(ctx context.Context, req IssueBookRequest) (*
 		AggregateType: "library_issue",
 		AggregateID:   issue.IssueID.String(),
 		EventType:     string(EventLibraryBookIssued),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1342,6 +1352,7 @@ func (s *libraryService) ReturnBook(ctx context.Context, req ReturnBookRequest) 
 		AggregateType: "library_return",
 		AggregateID:   returnRecord.ReturnID.String(),
 		EventType:     string(EventLibraryBookReturned),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1360,6 +1371,7 @@ func (s *libraryService) ReturnBook(ctx context.Context, req ReturnBookRequest) 
 			AggregateType: "library_fine",
 			AggregateID:   req.IssueID.String(),
 			EventType:     string(EventLibraryFinePaid),
+			Topic:         TopicStudent,
 			Payload:       finePayload,
 			Status:        "pending",
 		}
@@ -1481,6 +1493,7 @@ func (s *libraryService) CreateFine(ctx context.Context, req CreateFineRequest) 
 		AggregateType: "library_fine",
 		AggregateID:   fine.FineID.String(),
 		EventType:     string(EventLibraryFineCreated),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -1551,6 +1564,7 @@ func (s *libraryService) UpdateFinePayment(ctx context.Context, req UpdateFinePa
 		AggregateType: "library_fine",
 		AggregateID:   req.FineID.String(),
 		EventType:     string(EventLibraryFinePaid),
+		Topic:         TopicStudent,
 		Payload:       payload,
 		Status:        "pending",
 	}

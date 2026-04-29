@@ -18,7 +18,7 @@ type TaxTransaction struct {
 	TaxAmount          decimal.Decimal `db:"tax_amount" json:"tax_amount"`
 	Currency           string          `db:"currency" json:"currency"`
 	ExchangeRate       decimal.Decimal `db:"exchange_rate" json:"exchange_rate"`
-	BaseCurrencyAmount decimal.Decimal `db:"base_currency_amount" json:"base_currency_amount"` // generated column
+	BaseCurrencyAmount decimal.Decimal `db:"base_currency_amount" json:"base_currency_amount,omitempty"`
 	TransactionDate    time.Time       `db:"transaction_date" json:"transaction_date"`
 	CreatedAt          time.Time       `db:"created_at" json:"created_at"`
 }

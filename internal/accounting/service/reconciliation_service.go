@@ -21,33 +21,83 @@ import (
 	"auth-service/internal/infrastructure/outbox"
 )
 
-// ReconciliationService defines the interface for reconciliation operations
+type CreateReconciliationBatchRequest struct {
+	CompanyID          uuid.UUID  `json:"company_id"`
+	ReconciliationType string     `json:"reconciliation_type"`
+	Reference          *string    `json:"reference,omitempty"`
+	StartDate          *time.Time `json:"start_date,omitempty"`
+	EndDate            *time.Time `json:"end_date,omitempty"`
+	CreatedBy          *uuid.UUID `json:"created_by,omitempty"`
+}
+
+type ReconciliationFilter struct {
+	CompanyID          uuid.UUID  `json:"company_id"`
+	ReconciliationType string     `json:"reconciliation_type,omitempty"`
+	Status             string     `json:"status,omitempty"`
+	FromDate           *time.Time `json:"from_date,omitempty"`
+	ToDate             *time.Time `json:"to_date,omitempty"`
+}
+
+type ReconciliationItemInput struct {
+	SourceType      string           `json:"source_type"`
+	SourceID        *string          `json:"source_id,omitempty"`
+	Amount          decimal.Decimal  `json:"amount"`
+	Currency        string           `json:"currency"`
+	TransactionDate time.Time        `json:"transaction_date"`
+	Notes           *string          `json:"notes,omitempty"`
+	InitialStatus   *string          `json:"initial_status,omitempty"`
+	JournalEntryID  *uuid.UUID       `json:"journal_entry_id,omitempty"`
+	MatchScore      *decimal.Decimal `json:"match_score,omitempty"`
+}
+
+type AutoMatchResult struct {
+	TotalCandidates int     `json:"total_candidates"`
+	MatchedCount    int     `json:"matched_count"`
+	Errors          []error `json:"errors,omitempty"`
+}
+
+type CreateDifferenceRequest struct {
+	BatchID        uuid.UUID       `json:"batch_id"`
+	IssueType      string          `json:"issue_type"`
+	ExpectedAmount decimal.Decimal `json:"expected_amount"`
+	ActualAmount   decimal.Decimal `json:"actual_amount"`
+	SourceID       *string         `json:"source_id,omitempty"`
+	JournalEntryID *uuid.UUID      `json:"journal_entry_id,omitempty"`
+	Description    *string         `json:"description,omitempty"`
+}
+
+type ResolveDifferenceAdjustmentRequest struct {
+	CreateAdjustment bool      `json:"create_adjustment"`
+	DebitAccountID   uuid.UUID `json:"debit_account_id"`
+	CreditAccountID  uuid.UUID `json:"credit_account_id"`
+	Description      string    `json:"description"`
+}
+
+type CreateAdjustmentRequest struct {
+	BatchID          uuid.UUID       `json:"batch_id"`
+	JournalEntryID   uuid.UUID       `json:"journal_entry_id"`
+	Reason           *string         `json:"reason,omitempty"`
+	AdjustmentAmount decimal.Decimal `json:"adjustment_amount"`
+	CreatedBy        *uuid.UUID      `json:"created_by,omitempty"`
+}
+
 type ReconciliationService interface {
-	// Batch management
 	CreateBatch(ctx context.Context, req CreateReconciliationBatchRequest) (*models.ReconciliationBatch, error)
 	GetBatch(ctx context.Context, batchID uuid.UUID) (*models.ReconciliationBatch, error)
 	ListBatches(ctx context.Context, filter ReconciliationFilter, p Pagination) ([]*models.ReconciliationBatch, int64, error)
 	UpdateBatchStats(ctx context.Context, batchID uuid.UUID) error
 	CompleteBatch(ctx context.Context, batchID uuid.UUID) error
 	DeleteBatch(ctx context.Context, batchID uuid.UUID) error
-
-	// Item management
 	AddItems(ctx context.Context, batchID uuid.UUID, items []ReconciliationItemInput) ([]*models.ReconciliationItem, error)
-	GetItems(ctx context.Context, batchID uuid.UUID, status string) ([]*models.ReconciliationItem, error)
-	GetUnmatchedItems(ctx context.Context, batchID uuid.UUID) ([]*models.ReconciliationItem, error)
-
-	// Matching
+	GetItems(ctx context.Context, batchID uuid.UUID, status string, limit, offset int) ([]*models.ReconciliationItem, error)
+	GetUnmatchedItems(ctx context.Context, batchID uuid.UUID, limit, offset int) ([]*models.ReconciliationItem, error)
 	AutoMatch(ctx context.Context, batchID uuid.UUID, threshold decimal.Decimal) (*AutoMatchResult, error)
 	ManualMatch(ctx context.Context, itemID, journalEntryID uuid.UUID, score decimal.Decimal) error
 	SetItemMatchStatus(ctx context.Context, itemID uuid.UUID, status string, journalEntryID *uuid.UUID, score *decimal.Decimal) error
 	UnmatchItem(ctx context.Context, itemID uuid.UUID) error
-
-	// Differences
 	CreateDifference(ctx context.Context, req CreateDifferenceRequest) (*models.ReconciliationDifference, error)
 	ResolveDifference(ctx context.Context, diffID uuid.UUID, resolvedBy *uuid.UUID, adjustmentReq *ResolveDifferenceAdjustmentRequest) error
 	GetDifferences(ctx context.Context, batchID uuid.UUID, unresolvedOnly bool) ([]*models.ReconciliationDifference, error)
-
-	// Adjustments
 	CreateAdjustment(ctx context.Context, req CreateAdjustmentRequest) (*models.ReconciliationAdjustment, error)
 	DeleteAdjustment(ctx context.Context, adjID uuid.UUID) error
 	GetAdjustments(ctx context.Context, batchID uuid.UUID) ([]*models.ReconciliationAdjustment, error)
@@ -64,7 +114,6 @@ type reconciliationService struct {
 	auditService     *audit.AuditService
 }
 
-// NewReconciliationService creates a new reconciliation service instance
 func NewReconciliationService(
 	repo repository.ReconciliationRepository,
 	analyticsRepo repository.AnalyticsRepository,
@@ -87,74 +136,6 @@ func NewReconciliationService(
 	}
 }
 
-// CreateReconciliationBatchRequest defines input for creating a batch
-type CreateReconciliationBatchRequest struct {
-	CompanyID          uuid.UUID
-	ReconciliationType string
-	Reference          *string
-	StartDate          *time.Time
-	EndDate            *time.Time
-	CreatedBy          *uuid.UUID
-}
-
-// ReconciliationFilter defines filters for listing batches
-type ReconciliationFilter struct {
-	CompanyID          uuid.UUID
-	ReconciliationType string
-	Status             string
-	FromDate           *time.Time
-	ToDate             *time.Time
-}
-
-// ReconciliationItemInput defines input for adding items to a batch
-type ReconciliationItemInput struct {
-	SourceType      string
-	SourceID        *uuid.UUID
-	Amount          decimal.Decimal
-	Currency        string
-	TransactionDate time.Time
-	Notes           *string
-	InitialStatus   *string    // "matched", "unmatched", "partial", "ignored"
-	JournalEntryID  *uuid.UUID // if status is matched, optionally link to JE
-	MatchScore      *decimal.Decimal
-}
-
-// AutoMatchResult holds the result of an auto-match operation
-type AutoMatchResult struct {
-	TotalCandidates int
-	MatchedCount    int
-	Errors          []error
-}
-
-// CreateDifferenceRequest defines input for creating a difference
-type CreateDifferenceRequest struct {
-	BatchID        uuid.UUID
-	IssueType      string
-	ExpectedAmount decimal.Decimal
-	ActualAmount   decimal.Decimal
-	SourceID       *uuid.UUID
-	JournalEntryID *uuid.UUID
-	Description    *string
-}
-
-// CreateAdjustmentRequest defines input for creating an adjustment
-type CreateAdjustmentRequest struct {
-	BatchID          uuid.UUID
-	JournalEntryID   uuid.UUID
-	Reason           *string
-	AdjustmentAmount decimal.Decimal
-	CreatedBy        *uuid.UUID
-}
-
-// ResolveDifferenceAdjustmentRequest defines optional adjustment when resolving a difference
-type ResolveDifferenceAdjustmentRequest struct {
-	CreateAdjustment bool
-	DebitAccountID   uuid.UUID
-	CreditAccountID  uuid.UUID
-	Description      string
-}
-
-// Helper functions
 func validatePagination(p Pagination) (int, int) {
 	limit := p.Limit
 	if limit <= 0 {
@@ -177,9 +158,17 @@ func nullUUIDFromPtr(ptr *uuid.UUID) uuid.NullUUID {
 	return uuid.NullUUID{UUID: *ptr, Valid: true}
 }
 
-// CreateBatch creates a new reconciliation batch
+const (
+	defaultItemLimit  = 1000
+	defaultItemOffset = 0
+)
+
+// ----------------------------------------------
+// CreateBatch (already has idempotency)
+// ----------------------------------------------
 func (s *reconciliationService) CreateBatch(ctx context.Context, req CreateReconciliationBatchRequest) (*models.ReconciliationBatch, error) {
 	logger := s.logger.With(zap.String("method", "CreateBatch"), zap.String("company_id", req.CompanyID.String()))
+
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	if err := s.validateCreateBatchRequest(req); err != nil {
@@ -231,6 +220,7 @@ func (s *reconciliationService) CreateBatch(ctx context.Context, req CreateRecon
 		AggregateType: "reconciliation_batch",
 		AggregateID:   batch.BatchID.String(),
 		EventType:     events.EventReconciliationBatchCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
@@ -242,20 +232,22 @@ func (s *reconciliationService) CreateBatch(ctx context.Context, req CreateRecon
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, batch)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit tx: %w", err)
-	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, tx, &req.CompanyID, "reconciliation", "create", "reconciliation_batch",
 			&batch.BatchID, "user", req.CreatedBy, nil, nil, nil)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("reconciliation batch created", zap.String("batch_id", batch.BatchID.String()))
 	return batch, nil
 }
 
-// GetBatch returns a batch by ID
+// ----------------------------------------------
+// GetBatch (unchanged – read‑only)
+// ----------------------------------------------
 func (s *reconciliationService) GetBatch(ctx context.Context, batchID uuid.UUID) (*models.ReconciliationBatch, error) {
 	batch, err := s.repo.GetBatchByID(ctx, s.pgClient.DB, batchID)
 	if err != nil {
@@ -267,7 +259,9 @@ func (s *reconciliationService) GetBatch(ctx context.Context, batchID uuid.UUID)
 	return batch, nil
 }
 
-// ListBatches returns a paginated list of batches matching the filter
+// ----------------------------------------------
+// ListBatches (unchanged – read‑only)
+// ----------------------------------------------
 func (s *reconciliationService) ListBatches(ctx context.Context, filter ReconciliationFilter, p Pagination) ([]*models.ReconciliationBatch, int64, error) {
 	limit, offset := validatePagination(p)
 	sort := repository.Sort{Field: "created_at", Direction: "DESC"}
@@ -289,27 +283,61 @@ func (s *reconciliationService) ListBatches(ctx context.Context, filter Reconcil
 	return batches, total, nil
 }
 
-// UpdateBatchStats recalculates and updates statistics for a batch
+// ----------------------------------------------
+// UpdateBatchStats (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) UpdateBatchStats(ctx context.Context, batchID uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "UpdateBatchStats"), zap.String("batch_id", batchID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, skipping update")
+			return nil
+		}
+	}
+
 	if err := s.updateBatchStatsInternal(ctx, tx, batchID); err != nil {
 		return err
 	}
-	return tx.Commit()
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
-// CompleteBatch marks a batch as completed (only if no unmatched items)
+// ----------------------------------------------
+// CompleteBatch (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) CompleteBatch(ctx context.Context, batchID uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "CompleteBatch"), zap.String("batch_id", batchID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, batch already completed")
+			return nil
+		}
+	}
 
 	batch, err := s.repo.GetBatchByIDForUpdate(ctx, tx, batchID)
 	if err != nil {
@@ -347,11 +375,21 @@ func (s *reconciliationService) CompleteBatch(ctx context.Context, batchID uuid.
 		AggregateType: "reconciliation_batch",
 		AggregateID:   batchID.String(),
 		EventType:     events.EventReconciliationBatchCompleted,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return fmt.Errorf("store outbox event: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "complete", "reconciliation_batch",
+			&batchID, "system", nil, nil, nil, map[string]interface{}{"status": "completed"})
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -362,14 +400,26 @@ func (s *reconciliationService) CompleteBatch(ctx context.Context, batchID uuid.
 	return nil
 }
 
-// DeleteBatch deletes a batch and all its related data (only if not completed)
+// ----------------------------------------------
+// DeleteBatch (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) DeleteBatch(ctx context.Context, batchID uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteBatch"), zap.String("batch_id", batchID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, batch already deleted")
+			return nil
+		}
+	}
 
 	batch, err := s.repo.GetBatchByIDForUpdate(ctx, tx, batchID)
 	if err != nil {
@@ -386,6 +436,15 @@ func (s *reconciliationService) DeleteBatch(ctx context.Context, batchID uuid.UU
 		return fmt.Errorf("delete batch: %w", err)
 	}
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "delete", "reconciliation_batch",
+			&batchID, "system", nil, nil, nil, nil)
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -394,9 +453,14 @@ func (s *reconciliationService) DeleteBatch(ctx context.Context, batchID uuid.UU
 	return nil
 }
 
-// AddItems adds reconciliation items to a batch
+// ----------------------------------------------
+// AddItems (already has idempotency via handler? but we add explicit check)
+// Note: idempotency keys are usually per request – here we store the full result.
+// ----------------------------------------------
 func (s *reconciliationService) AddItems(ctx context.Context, batchID uuid.UUID, items []ReconciliationItemInput) ([]*models.ReconciliationItem, error) {
 	logger := s.logger.With(zap.String("method", "AddItems"), zap.String("batch_id", batchID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -406,6 +470,14 @@ func (s *reconciliationService) AddItems(ctx context.Context, batchID uuid.UUID,
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing []*models.ReconciliationItem
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached items")
+			return existing, nil
+		}
+	}
 
 	batch, err := s.repo.GetBatchByIDForUpdate(ctx, tx, batchID)
 	if err != nil {
@@ -417,7 +489,6 @@ func (s *reconciliationService) AddItems(ctx context.Context, batchID uuid.UUID,
 	if batch.Status == enums.ReconciliationStatusCompleted {
 		return nil, fmt.Errorf("%w: cannot add items to completed batch", ErrInvalidState)
 	}
-
 	if batch.Status == enums.ReconciliationStatusPending {
 		batch.Status = enums.ReconciliationStatusInProgress
 		if err := s.repo.UpdateBatch(ctx, tx, batch); err != nil {
@@ -427,9 +498,9 @@ func (s *reconciliationService) AddItems(ctx context.Context, batchID uuid.UUID,
 
 	modelItems := make([]*models.ReconciliationItem, len(items))
 	for i, inp := range items {
-		sourceID := uuid.NullUUID{}
+		var sourceID *string
 		if inp.SourceID != nil {
-			sourceID = uuid.NullUUID{UUID: *inp.SourceID, Valid: true}
+			sourceID = inp.SourceID
 		}
 		journalEntryID := uuid.NullUUID{}
 		if inp.JournalEntryID != nil {
@@ -457,9 +528,17 @@ func (s *reconciliationService) AddItems(ctx context.Context, batchID uuid.UUID,
 	if err := s.repo.BulkAddItems(ctx, tx, modelItems); err != nil {
 		return nil, fmt.Errorf("bulk add items: %w", err)
 	}
-
 	if err := s.updateBatchStatsInternal(ctx, tx, batchID); err != nil {
 		return nil, fmt.Errorf("update stats: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "add_items", "reconciliation_batch",
+			&batchID, "system", nil, nil, nil, map[string]interface{}{"items_added": len(modelItems)})
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, modelItems)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -470,27 +549,55 @@ func (s *reconciliationService) AddItems(ctx context.Context, batchID uuid.UUID,
 	return modelItems, nil
 }
 
-// GetItems returns all items of a batch, optionally filtered by status
-func (s *reconciliationService) GetItems(ctx context.Context, batchID uuid.UUID, status string) ([]*models.ReconciliationItem, error) {
-	if status != "" {
-		return s.repo.GetItemsByStatus(ctx, s.pgClient.DB, batchID, status)
+// ----------------------------------------------
+// GetItems (unchanged – read‑only)
+// ----------------------------------------------
+func (s *reconciliationService) GetItems(ctx context.Context, batchID uuid.UUID, status string, limit, offset int) ([]*models.ReconciliationItem, error) {
+	if limit <= 0 {
+		limit = defaultItemLimit
 	}
-	return s.repo.GetItemsByBatch(ctx, s.pgClient.DB, batchID)
+	if offset < 0 {
+		offset = defaultItemOffset
+	}
+	if status != "" {
+		return s.repo.GetItemsByStatus(ctx, s.pgClient.DB, batchID, status, limit, offset)
+	}
+	return s.repo.GetItemsByBatch(ctx, s.pgClient.DB, batchID, limit, offset)
 }
 
-// GetUnmatchedItems returns items with status 'unmatched' for a batch
-func (s *reconciliationService) GetUnmatchedItems(ctx context.Context, batchID uuid.UUID) ([]*models.ReconciliationItem, error) {
-	return s.repo.GetUnmatchedItems(ctx, s.pgClient.DB, batchID)
+// ----------------------------------------------
+// GetUnmatchedItems (unchanged – read‑only)
+// ----------------------------------------------
+func (s *reconciliationService) GetUnmatchedItems(ctx context.Context, batchID uuid.UUID, limit, offset int) ([]*models.ReconciliationItem, error) {
+	if limit <= 0 {
+		limit = defaultItemLimit
+	}
+	if offset < 0 {
+		offset = defaultItemOffset
+	}
+	return s.repo.GetUnmatchedItems(ctx, s.pgClient.DB, batchID, limit, offset)
 }
 
-// AutoMatch automatically matches items based on a threshold
+// ----------------------------------------------
+// AutoMatch (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) AutoMatch(ctx context.Context, batchID uuid.UUID, threshold decimal.Decimal) (*AutoMatchResult, error) {
 	logger := s.logger.With(zap.String("method", "AutoMatch"), zap.String("batch_id", batchID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing *AutoMatchResult
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached auto-match result")
+			return existing, nil
+		}
+	}
 
 	batch, err := s.repo.GetBatchByIDForUpdate(ctx, tx, batchID)
 	if err != nil {
@@ -503,7 +610,8 @@ func (s *reconciliationService) AutoMatch(ctx context.Context, batchID uuid.UUID
 		return nil, fmt.Errorf("%w: cannot auto-match completed batch", ErrInvalidState)
 	}
 
-	candidates, err := s.repo.FindPotentialMatches(ctx, tx, batchID, threshold)
+	const matchLimit = 1000
+	candidates, err := s.repo.FindPotentialMatches(ctx, tx, batchID, threshold, matchLimit)
 	if err != nil {
 		return nil, fmt.Errorf("find potential matches: %w", err)
 	}
@@ -522,7 +630,6 @@ func (s *reconciliationService) AutoMatch(ctx context.Context, batchID uuid.UUID
 	}
 	result.MatchedCount = matchedCount
 
-	// If any errors occurred, set batch status to 'failed'
 	if len(result.Errors) > 0 && batch.Status != enums.ReconciliationStatusCompleted {
 		batch.Status = enums.ReconciliationStatusFailed
 		if err := s.repo.UpdateBatch(ctx, tx, batch); err != nil {
@@ -545,11 +652,21 @@ func (s *reconciliationService) AutoMatch(ctx context.Context, batchID uuid.UUID
 		AggregateType: "reconciliation_batch",
 		AggregateID:   batchID.String(),
 		EventType:     events.EventReconciliationAutoMatched,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return nil, fmt.Errorf("store outbox event: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "auto_match", "reconciliation_batch",
+			&batchID, "system", nil, nil, nil, map[string]interface{}{"matched": matchedCount, "candidates": len(candidates)})
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, result)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -560,14 +677,26 @@ func (s *reconciliationService) AutoMatch(ctx context.Context, batchID uuid.UUID
 	return result, nil
 }
 
-// ManualMatch manually matches an item to a journal entry
+// ----------------------------------------------
+// ManualMatch (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) ManualMatch(ctx context.Context, itemID, journalEntryID uuid.UUID, score decimal.Decimal) error {
 	logger := s.logger.With(zap.String("method", "ManualMatch"), zap.String("item_id", itemID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, manual match already performed")
+			return nil
+		}
+	}
 
 	item, err := s.repo.GetItemByID(ctx, tx, itemID)
 	if err != nil {
@@ -576,7 +705,6 @@ func (s *reconciliationService) ManualMatch(ctx context.Context, itemID, journal
 	if item == nil {
 		return fmt.Errorf("%w: item %s", ErrNotFound, itemID)
 	}
-
 	if item.MatchStatus == enums.MatchStatusMatched {
 		return fmt.Errorf("%w: item already matched", ErrInvalidState)
 	}
@@ -597,27 +725,43 @@ func (s *reconciliationService) ManualMatch(ctx context.Context, itemID, journal
 		return fmt.Errorf("update batch stats: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "manual_match", "reconciliation_item",
 			&itemID, "system", nil, nil, nil, map[string]interface{}{"journal_entry_id": journalEntryID.String()})
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
 	}
 
 	logger.Info("manual match completed", zap.String("journal_entry_id", journalEntryID.String()))
 	return nil
 }
 
-// SetItemMatchStatus allows setting any match status (partial, ignored, matched) and optionally linking to a JE
+// ----------------------------------------------
+// SetItemMatchStatus (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) SetItemMatchStatus(ctx context.Context, itemID uuid.UUID, status string, journalEntryID *uuid.UUID, score *decimal.Decimal) error {
 	logger := s.logger.With(zap.String("method", "SetItemMatchStatus"), zap.String("item_id", itemID.String()), zap.String("status", status))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, status already set")
+			return nil
+		}
+	}
 
 	item, err := s.repo.GetItemByID(ctx, tx, itemID)
 	if err != nil {
@@ -637,20 +781,16 @@ func (s *reconciliationService) SetItemMatchStatus(ctx context.Context, itemID u
 		return fmt.Errorf("%w: invalid match status %s", ErrInvalidInput, status)
 	}
 
-	if status == enums.MatchStatusMatched && (journalEntryID == nil || *journalEntryID == uuid.Nil) {
-		return fmt.Errorf("%w: journal_entry_id required for matched status", ErrInvalidInput)
-	}
-
-	jeID := uuid.NullUUID{}
-	if journalEntryID != nil {
-		jeID = uuid.NullUUID{UUID: *journalEntryID, Valid: true}
-	}
-	if err := s.repo.UpdateItemMatch(ctx, tx, itemID, status, jeID, score); err != nil {
+	if err := s.repo.UpdateItemStatus(ctx, tx, itemID, status, journalEntryID, score); err != nil {
 		return fmt.Errorf("update match status: %w", err)
 	}
 
 	if err := s.updateBatchStatsInternal(ctx, tx, item.BatchID); err != nil {
 		return fmt.Errorf("update batch stats: %w", err)
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -661,14 +801,26 @@ func (s *reconciliationService) SetItemMatchStatus(ctx context.Context, itemID u
 	return nil
 }
 
-// UnmatchItem removes a match from an item, setting it back to unmatched
+// ----------------------------------------------
+// UnmatchItem (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) UnmatchItem(ctx context.Context, itemID uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "UnmatchItem"), zap.String("item_id", itemID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, item already unmatched")
+			return nil
+		}
+	}
 
 	item, err := s.repo.GetItemByID(ctx, tx, itemID)
 	if err != nil {
@@ -677,7 +829,6 @@ func (s *reconciliationService) UnmatchItem(ctx context.Context, itemID uuid.UUI
 	if item == nil {
 		return fmt.Errorf("%w: item %s", ErrNotFound, itemID)
 	}
-
 	if item.MatchStatus != enums.MatchStatusMatched {
 		return fmt.Errorf("%w: item is not matched", ErrInvalidState)
 	}
@@ -690,6 +841,10 @@ func (s *reconciliationService) UnmatchItem(ctx context.Context, itemID uuid.UUI
 		return fmt.Errorf("update batch stats: %w", err)
 	}
 
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -697,15 +852,29 @@ func (s *reconciliationService) UnmatchItem(ctx context.Context, itemID uuid.UUI
 	logger.Info("item unmatched")
 	return nil
 }
+
+// ----------------------------------------------
+// CreateDifference (already has idempotency)
+// ----------------------------------------------
 func (s *reconciliationService) CreateDifference(ctx context.Context, req CreateDifferenceRequest) (*models.ReconciliationDifference, error) {
 	logger := s.logger.With(zap.String("method", "CreateDifference"), zap.String("batch_id", req.BatchID.String()))
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Fetch batch to get companyID for trend
+	if idempotencyKey != "" {
+		var existing *models.ReconciliationDifference
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached difference")
+			return existing, nil
+		}
+	}
+
 	batch, err := s.repo.GetBatchByID(ctx, tx, req.BatchID)
 	if err != nil {
 		return nil, fmt.Errorf("get batch: %w", err)
@@ -720,7 +889,7 @@ func (s *reconciliationService) CreateDifference(ctx context.Context, req Create
 		IssueType:      req.IssueType,
 		ExpectedAmount: req.ExpectedAmount,
 		ActualAmount:   req.ActualAmount,
-		SourceID:       nullUUIDFromPtr(req.SourceID),
+		SourceID:       req.SourceID,
 		JournalEntryID: nullUUIDFromPtr(req.JournalEntryID),
 		Description:    req.Description,
 		Resolved:       false,
@@ -730,7 +899,6 @@ func (s *reconciliationService) CreateDifference(ctx context.Context, req Create
 		return nil, fmt.Errorf("add difference: %w", err)
 	}
 
-	// Convert decimal to float64 for trend
 	expectedFloat, _ := req.ExpectedAmount.Float64()
 	actualFloat, _ := req.ActualAmount.Float64()
 	trend := &analytics.ReconciliationDiffTrends{
@@ -760,11 +928,21 @@ func (s *reconciliationService) CreateDifference(ctx context.Context, req Create
 		AggregateType: "reconciliation_difference",
 		AggregateID:   diff.DifferenceID.String(),
 		EventType:     events.EventReconciliationDifferenceCreated,
+		Topic:         TopicAccountingEvents,
 		Payload:       payload,
 		Status:        "pending",
 	}
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return nil, fmt.Errorf("store outbox event: %w", err)
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, diff)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "create_difference", "reconciliation_difference",
+			&diff.DifferenceID, "system", nil, nil, nil, map[string]interface{}{"issue_type": diff.IssueType})
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -775,13 +953,26 @@ func (s *reconciliationService) CreateDifference(ctx context.Context, req Create
 	return diff, nil
 }
 
+// ----------------------------------------------
+// ResolveDifference (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uuid.UUID, resolvedBy *uuid.UUID, adjustmentReq *ResolveDifferenceAdjustmentRequest) error {
 	logger := s.logger.With(zap.String("method", "ResolveDifference"), zap.String("diff_id", diffID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, difference already resolved")
+			return nil
+		}
+	}
 
 	diff, err := s.repo.GetDifferenceByID(ctx, tx, diffID)
 	if err != nil {
@@ -794,7 +985,6 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		return fmt.Errorf("%w: difference already resolved", ErrInvalidState)
 	}
 
-	// Fetch batch to get company ID (for journal entry creation)
 	batch, err := s.repo.GetBatchByID(ctx, tx, diff.BatchID)
 	if err != nil {
 		return fmt.Errorf("get batch: %w", err)
@@ -805,7 +995,6 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 
 	var adjustmentID *uuid.UUID
 	if adjustmentReq != nil && adjustmentReq.CreateAdjustment {
-		// Calculate the absolute difference amount
 		amountDiff := diff.ExpectedAmount.Sub(diff.ActualAmount).Abs()
 		journalReq := CreateJournalRequest{
 			CompanyID:   batch.CompanyID,
@@ -832,7 +1021,6 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		if err != nil {
 			return fmt.Errorf("create adjustment journal entry: %w", err)
 		}
-		// Create adjustment record
 		adjReq := CreateAdjustmentRequest{
 			BatchID:          diff.BatchID,
 			JournalEntryID:   journalEntry.JournalEntryID,
@@ -851,7 +1039,6 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		return fmt.Errorf("resolve difference: %w", err)
 	}
 
-	// Convert decimal to float64 for resolution trend
 	expectedFloat, _ := diff.ExpectedAmount.Float64()
 	actualFloat, _ := diff.ActualAmount.Float64()
 	trend := &analytics.ReconciliationDiffTrends{
@@ -868,6 +1055,15 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 		logger.Error("failed to insert resolution trend", zap.Error(err))
 	}
 
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, tx, &batch.CompanyID, "reconciliation", "resolve_difference", "reconciliation_difference",
+			&diffID, "user", resolvedBy, nil, nil, map[string]interface{}{"adjustment_created": adjustmentID != nil})
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -876,19 +1072,33 @@ func (s *reconciliationService) ResolveDifference(ctx context.Context, diffID uu
 	return nil
 }
 
-// GetDifferences returns differences for a batch
+// ----------------------------------------------
+// GetDifferences (unchanged – read‑only)
+// ----------------------------------------------
 func (s *reconciliationService) GetDifferences(ctx context.Context, batchID uuid.UUID, unresolvedOnly bool) ([]*models.ReconciliationDifference, error) {
 	return s.repo.GetDifferencesByBatch(ctx, s.pgClient.DB, batchID, unresolvedOnly)
 }
 
-// CreateAdjustment creates a new adjustment record
+// ----------------------------------------------
+// CreateAdjustment (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) CreateAdjustment(ctx context.Context, req CreateAdjustmentRequest) (*models.ReconciliationAdjustment, error) {
 	logger := s.logger.With(zap.String("method", "CreateAdjustment"), zap.String("batch_id", req.BatchID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing *models.ReconciliationAdjustment
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			logger.Info("idempotent request, returning cached adjustment")
+			return existing, nil
+		}
+	}
 
 	adj := &models.ReconciliationAdjustment{
 		AdjustmentID:     uuid.New(),
@@ -903,6 +1113,10 @@ func (s *reconciliationService) CreateAdjustment(ctx context.Context, req Create
 		return nil, fmt.Errorf("add adjustment: %w", err)
 	}
 
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, adj)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
@@ -911,17 +1125,33 @@ func (s *reconciliationService) CreateAdjustment(ctx context.Context, req Create
 	return adj, nil
 }
 
-// DeleteAdjustment deletes an adjustment record
+// ----------------------------------------------
+// DeleteAdjustment (mutating) – with idempotency
+// ----------------------------------------------
 func (s *reconciliationService) DeleteAdjustment(ctx context.Context, adjID uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteAdjustment"), zap.String("adj_id", adjID.String()))
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	if idempotencyKey != "" {
+		var cached bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached {
+			logger.Info("idempotent request, adjustment already deleted")
+			return nil
+		}
+	}
+
 	if err := s.repo.DeleteAdjustment(ctx, tx, adjID); err != nil {
 		return fmt.Errorf("delete adjustment: %w", err)
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -932,12 +1162,16 @@ func (s *reconciliationService) DeleteAdjustment(ctx context.Context, adjID uuid
 	return nil
 }
 
-// GetAdjustments returns all adjustments for a batch
+// ----------------------------------------------
+// GetAdjustments (unchanged – read‑only)
+// ----------------------------------------------
 func (s *reconciliationService) GetAdjustments(ctx context.Context, batchID uuid.UUID) ([]*models.ReconciliationAdjustment, error) {
 	return s.repo.GetAdjustmentsByBatch(ctx, s.pgClient.DB, batchID)
 }
 
-// Internal helper to update batch statistics
+// ----------------------------------------------
+// Helper functions (unchanged)
+// ----------------------------------------------
 func (s *reconciliationService) updateBatchStatsInternal(ctx context.Context, tx repository.DBTX, batchID uuid.UUID) error {
 	total, matched, unmatched, err := s.repo.CountItemsByStatus(ctx, tx, batchID)
 	if err != nil {
@@ -946,7 +1180,6 @@ func (s *reconciliationService) updateBatchStatsInternal(ctx context.Context, tx
 	return s.repo.UpdateBatchStats(ctx, tx, batchID, total, matched, unmatched)
 }
 
-// validateCreateBatchRequest validates the request for creating a batch
 func (s *reconciliationService) validateCreateBatchRequest(req CreateReconciliationBatchRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", ErrInvalidInput)
