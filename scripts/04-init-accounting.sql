@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS accounting.journal_entries (
     )),
     reversal_of        UUID,
     source_type        VARCHAR(30),
-    source_id          UUID,
+    source_id          TEXT,                           -- ✅ changed from UUID to TEXT
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     posted_at          TIMESTAMPTZ,
     posted_by          UUID,
@@ -63,7 +63,6 @@ CREATE TABLE IF NOT EXISTS accounting.journal_entries (
     CONSTRAINT fk_journal_entries_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id),
     CONSTRAINT unique_source UNIQUE (company_id, source_type, source_id)
 );
-
 -- =====================================================
 -- 3. JOURNAL LINES (with immutability after posting)
 -- =====================================================
@@ -262,11 +261,13 @@ CREATE TABLE IF NOT EXISTS accounting.compliance_returns (
     updated_by         UUID,
     filed_by           UUID,
     filed_at           TIMESTAMPTZ,
+    amended_from       UUID,                                      -- now present
     deleted_at         TIMESTAMPTZ,
     CONSTRAINT fk_returns_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
     CONSTRAINT fk_returns_created_by FOREIGN KEY (created_by) REFERENCES users(user_id),
     CONSTRAINT fk_returns_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id),
-    CONSTRAINT fk_returns_filed_by FOREIGN KEY (filed_by) REFERENCES users(user_id)
+    CONSTRAINT fk_returns_filed_by FOREIGN KEY (filed_by) REFERENCES users(user_id),
+    CONSTRAINT fk_returns_amended_from FOREIGN KEY (amended_from) REFERENCES accounting.compliance_returns(return_id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS accounting.compliance_return_lines (
@@ -919,3 +920,11 @@ EXECUTE FUNCTION accounting.check_period_lock();
 
 ALTER TABLE accounting.reconciliation_batches
 ADD COLUMN failure_reason TEXT;
+
+
+
+
+
+
+ALTER TABLE accounting.journal_entries 
+ALTER COLUMN source_id TYPE TEXT;

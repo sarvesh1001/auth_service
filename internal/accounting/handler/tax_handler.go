@@ -585,12 +585,12 @@ func (h *TaxHandler) GetRuleBundle(w http.ResponseWriter, r *http.Request) {
 // ----------------------------------------------------------------------------
 
 type createTaxProfileRequest struct {
-	TaxRegime          string     `json:"tax_regime"`
-	Jurisdiction       string     `json:"jurisdiction"`
-	RegistrationNumber *string    `json:"registration_number,omitempty"`
-	DefaultTaxRateID   *uuid.UUID `json:"default_tax_rate_id,omitempty"`
-	Settings           []byte     `json:"settings,omitempty"`
-	IsActive           bool       `json:"is_active"`
+	TaxRegime          string          `json:"tax_regime"`
+	Jurisdiction       string          `json:"jurisdiction"`
+	RegistrationNumber *string         `json:"registration_number,omitempty"`
+	DefaultTaxRateID   *uuid.UUID      `json:"default_tax_rate_id,omitempty"`
+	Settings           json.RawMessage `json:"settings,omitempty"`
+	IsActive           bool            `json:"is_active"`
 }
 
 func (h *TaxHandler) CreateTaxProfile(w http.ResponseWriter, r *http.Request) {
@@ -647,12 +647,12 @@ func (h *TaxHandler) CreateTaxProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateTaxProfileRequest struct {
-	TaxRegime          *string    `json:"tax_regime,omitempty"`
-	Jurisdiction       *string    `json:"jurisdiction,omitempty"`
-	RegistrationNumber *string    `json:"registration_number,omitempty"`
-	DefaultTaxRateID   *uuid.UUID `json:"default_tax_rate_id,omitempty"`
-	Settings           []byte     `json:"settings,omitempty"`
-	IsActive           *bool      `json:"is_active,omitempty"`
+	TaxRegime          *string         `json:"tax_regime,omitempty"`
+	Jurisdiction       *string         `json:"jurisdiction,omitempty"`
+	RegistrationNumber *string         `json:"registration_number,omitempty"`
+	DefaultTaxRateID   *uuid.UUID      `json:"default_tax_rate_id,omitempty"`
+	Settings           json.RawMessage `json:"settings,omitempty"`
+	IsActive           *bool           `json:"is_active,omitempty"`
 }
 
 func (h *TaxHandler) UpdateTaxProfile(w http.ResponseWriter, r *http.Request) {
@@ -1025,6 +1025,7 @@ func (h *TaxHandler) VoidTaxTransaction(w http.ResponseWriter, r *http.Request) 
 
 type computeTaxRequest struct {
 	Amount          decimal.Decimal        `json:"amount"`
+	Discount        *discountRequest       `json:"discount,omitempty"` // 👈 new
 	Currency        string                 `json:"currency"`
 	TransactionType string                 `json:"transaction_type"`
 	ProductType     string                 `json:"product_type"`
@@ -1068,6 +1069,14 @@ func (h *TaxHandler) ComputeTax(w http.ResponseWriter, r *http.Request) {
 		Jurisdiction:    req.Jurisdiction,
 		Date:            req.Date,
 		Metadata:        req.Metadata,
+	}
+
+	// 👇 NEW: map discount if present
+	if req.Discount != nil {
+		input.Discount = &service.Discount{
+			Type:  req.Discount.Type,
+			Value: req.Discount.Value,
+		}
 	}
 
 	result, err := h.taxSvc.ComputeTaxBreakdown(ctx, companyID, input)
@@ -1298,4 +1307,9 @@ func (h *TaxHandler) respondWithError(w http.ResponseWriter, status int, message
 		"success": false,
 		"error":   message,
 	})
+}
+
+type discountRequest struct {
+	Type  string          `json:"type"`  // "percentage" or "fixed"
+	Value decimal.Decimal `json:"value"` // e.g., 5 for 5% or 500 for fixed amount
 }

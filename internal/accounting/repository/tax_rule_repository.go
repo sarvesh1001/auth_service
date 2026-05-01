@@ -384,25 +384,26 @@ func (r *taxRuleRepository) Delete(ctx context.Context, db DBTX, companyID, id u
 	return nil
 }
 
+// ================= FIXED CreateVersion =================
 func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.TaxRuleVersion) error {
 	tx, ok := db.(*sql.Tx)
 	if !ok {
 		return fmt.Errorf("CreateVersion requires a transaction")
 	}
 
-	// Lock the tax_rule row to prevent concurrent version creation
+	// Lock the parent tax_rule row – prevents concurrent version creation
 	var dummy int
 	err := tx.QueryRowContext(ctx, `SELECT 1 FROM accounting.tax_rules WHERE tax_rule_id = $1 FOR UPDATE`, v.TaxRuleID).Scan(&dummy)
 	if err != nil {
 		return fmt.Errorf("lock tax rule: %w", err)
 	}
 
+	// Get next version number – NO FOR UPDATE (the parent lock is enough)
 	var nextVersion int
 	err = tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(version), 0) + 1
 		FROM accounting.tax_rule_versions
 		WHERE tax_rule_id = $1
-		FOR UPDATE
 	`, v.TaxRuleID).Scan(&nextVersion)
 	if err != nil {
 		return fmt.Errorf("get next version: %w", err)
@@ -410,7 +411,7 @@ func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.T
 	v.Version = nextVersion
 	v.IsCurrent = true
 
-	// Unset current on previous version
+	// Mark previous versions as not current
 	_, err = tx.ExecContext(ctx, `
 		UPDATE accounting.tax_rule_versions
 		SET is_current = false
@@ -431,6 +432,8 @@ func (r *taxRuleRepository) CreateVersion(ctx context.Context, db DBTX, v *tax.T
 	}
 	return nil
 }
+
+// =====================================================
 
 func (r *taxRuleRepository) GetCurrentVersion(ctx context.Context, db DBTX, companyID, taxRuleID uuid.UUID) (*tax.TaxRuleVersion, error) {
 	query := `
@@ -517,7 +520,6 @@ func (r *taxRuleRepository) SetCurrentVersion(ctx context.Context, db DBTX, comp
 		return fmt.Errorf("set current version: %w", err)
 	}
 	if rows, _ := res.RowsAffected(); rows == 0 {
-		// ✅ FIX: return shared ErrNotFound instead of custom error string
 		return ErrNotFound
 	}
 	return nil
@@ -723,7 +725,7 @@ func (r *taxRuleRepository) ClearActions(ctx context.Context, db DBTX, companyID
 	return nil
 }
 
-// Applicable rules (with ANY array performance)
+// Applicable rules
 
 func (r *taxRuleRepository) GetApplicableRules(ctx context.Context, db DBTX, companyID uuid.UUID, appliesTo string) ([]*TaxRuleBundle, error) {
 	return r.GetApplicableRulesWithLimit(ctx, db, companyID, appliesTo, 0)

@@ -34,8 +34,9 @@ type CreateJournalRequest struct {
 	UpdatedBy   *uuid.UUID
 
 	// Source tracking fields – add these
-	SourceType *string    `json:"source_type,omitempty"`
-	SourceID   *uuid.UUID `json:"source_id,omitempty"`
+	SourceType  *string `json:"source_type,omitempty"`
+	SourceID    *string `json:"source_id,omitempty"` // ← changed from *uuid.UUID
+	ContextType string  // "normal" or "reconciliation"
 }
 
 // TotalDebit returns sum of debit amounts

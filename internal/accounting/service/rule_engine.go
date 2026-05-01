@@ -69,10 +69,19 @@ func (e *ruleEngine) getSQLTx(tx repository.DBTX) (*sql.Tx, error) {
 }
 
 // =============================================================================
-// 3. Core Validation Methods
+// 3. Core Validation Methods (Router + Context-Aware)
 // =============================================================================
 
+// ValidateJournal routes to normal or reconciliation validation based on ContextType.
 func (e *ruleEngine) ValidateJournal(ctx context.Context, tx repository.DBTX, req CreateJournalRequest) error {
+	if req.ContextType == "reconciliation" {
+		return e.validateReconciliationJournal(ctx, tx, req)
+	}
+	return e.validateNormalJournal(ctx, tx, req)
+}
+
+// validateNormalJournal contains the original strict accounting rules.
+func (e *ruleEngine) validateNormalJournal(ctx context.Context, tx repository.DBTX, req CreateJournalRequest) error {
 	// 1. Same account used multiple times? (allow contra: same account, different sides)
 	if err := e.checkSameAccountWithSide(req); err != nil {
 		e.auditRuleViolation(ctx, tx, req.CompanyID, "same_account_multiple_times", err.Error(), req)
@@ -115,6 +124,51 @@ func (e *ruleEngine) ValidateJournal(ctx context.Context, tx repository.DBTX, re
 	return nil
 }
 
+// validateReconciliationJournal applies relaxed rules for system-generated reconciliation adjustments.
+func (e *ruleEngine) validateReconciliationJournal(ctx context.Context, tx repository.DBTX, req CreateJournalRequest) error {
+	if err := e.checkSameAccountWithSide(req); err != nil {
+		e.auditRuleViolation(ctx, tx, req.CompanyID, "same_account_multiple_times", err.Error(), req)
+		return err
+	}
+	totalDebit, totalCredit := e.sumAmounts(req)
+	if !totalDebit.Equal(totalCredit) {
+		e.auditRuleViolation(ctx, tx, req.CompanyID, "debit_credit_mismatch",
+			fmt.Sprintf("debits=%s credits=%s", totalDebit, totalCredit), req)
+		return ErrDebitCreditMismatch
+	}
+	if len(req.Lines) == 0 {
+		err := fmt.Errorf("%w: at least one journal line is required", ErrInvalidInput)
+		e.auditRuleViolation(ctx, tx, req.CompanyID, "no_lines", err.Error(), req)
+		return err
+	}
+	accountIDs := e.extractAccountIDs(req)
+	accTypes, err := e.ledgerRepo.GetAccountTypesMap(ctx, tx, accountIDs)
+	if err != nil {
+		return fmt.Errorf("fetch account types: %w", err)
+	}
+	if len(accTypes) != len(accountIDs) {
+		err := errors.New("some accounts not found or inactive")
+		e.auditRuleViolation(ctx, tx, req.CompanyID, "account_not_found", err.Error(), req)
+		return err
+	}
+
+	// Optional: warn but don't fail on natural balance violations
+	if err := e.checkNaturalBalance(req, accTypes); err != nil {
+		ref := "(no reference)"
+		if req.Reference != nil {
+			ref = *req.Reference
+		}
+		e.logger.Warn("reconciliation journal violates natural balance",
+			zap.String("error", err.Error()),
+			zap.String("journal_ref", ref))
+		// Do NOT return error – allow the adjustment
+	}
+
+	_ = e.checkCombinationMatrix(req, accTypes)
+	return nil
+}
+
+// ValidateBeforePost is shared by both normal and reconciliation journals.
 func (e *ruleEngine) ValidateBeforePost(ctx context.Context, tx repository.DBTX, entry *models.JournalEntry, lines []*models.JournalLine) error {
 	// Period lock check
 	locked, err := e.IsPeriodLocked(ctx, tx, entry.CompanyID, entry.EntryDate)
@@ -335,6 +389,17 @@ func (e *ruleEngine) checkCombinationMatrix(req CreateJournalRequest, accTypes m
 	return nil
 }
 
+// sumAmounts returns total debit and total credit from the request lines.
+func (e *ruleEngine) sumAmounts(req CreateJournalRequest) (decimal.Decimal, decimal.Decimal) {
+	totalDebit := decimal.Zero
+	totalCredit := decimal.Zero
+	for _, line := range req.Lines {
+		totalDebit = totalDebit.Add(line.DebitAmount)
+		totalCredit = totalCredit.Add(line.CreditAmount)
+	}
+	return totalDebit, totalCredit
+}
+
 // =============================================================================
 // 5. Audit Helper
 // =============================================================================
@@ -395,4 +460,5 @@ var (
 	ErrInvalidExpenseJournal        = errors.New("expense journal must contain an Expense account and Cash/Liability")
 	ErrPeriodLocked                 = errors.New("accounting period is locked, cannot post")
 	ErrDuplicateTransaction         = errors.New("duplicate transaction detected")
+	ErrDebitCreditMismatch          = errors.New("total debits do not equal total credits") // added for reconciliation
 )

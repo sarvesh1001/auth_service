@@ -30,7 +30,6 @@ type JournalLine struct {
 FILE: ./models/reconciliation_item.go
 ================================================================================
 
-// FILE: ./models/reconciliation_item.go
 package models
 
 import (
@@ -43,14 +42,14 @@ import (
 type ReconciliationItem struct {
 	ItemID          uuid.UUID        `db:"item_id" json:"item_id"`
 	BatchID         uuid.UUID        `db:"batch_id" json:"batch_id"`
-	SourceType      string           `db:"source_type" json:"source_type"` // bank, payment_gateway, etc
-	SourceID        uuid.NullUUID    `db:"source_id" json:"source_id,omitempty"`
+	SourceType      string           `db:"source_type" json:"source_type"`
+	SourceID        *string          `db:"source_id" json:"source_id,omitempty"` // changed: *string
 	JournalEntryID  uuid.NullUUID    `db:"journal_entry_id" json:"journal_entry_id,omitempty"`
 	Amount          decimal.Decimal  `db:"amount" json:"amount"`
 	Currency        string           `db:"currency" json:"currency"`
 	TransactionDate time.Time        `db:"transaction_date" json:"transaction_date"`
-	MatchStatus     string           `db:"match_status" json:"match_status"`         // matched, unmatched, partial, ignored
-	MatchScore      *decimal.Decimal `db:"match_score" json:"match_score,omitempty"` // 0-100
+	MatchStatus     string           `db:"match_status" json:"match_status"`
+	MatchScore      *decimal.Decimal `db:"match_score" json:"match_score,omitempty"`
 	Notes           *string          `db:"notes" json:"notes,omitempty"`
 	CreatedAt       time.Time        `db:"created_at" json:"created_at"`
 	UpdatedAt       time.Time        `db:"updated_at" json:"updated_at"`
@@ -300,7 +299,7 @@ type ReconciliationDifference struct {
 	IssueType      string          `db:"issue_type" json:"issue_type"` // missing_entry, amount_mismatch, duplicate, timing_difference
 	ExpectedAmount decimal.Decimal `db:"expected_amount" json:"expected_amount"`
 	ActualAmount   decimal.Decimal `db:"actual_amount" json:"actual_amount"`
-	SourceID       uuid.NullUUID   `db:"source_id" json:"source_id,omitempty"`
+	SourceID       *string         `db:"source_id" json:"source_id,omitempty"` // changed: TEXT → *string
 	JournalEntryID uuid.NullUUID   `db:"journal_entry_id" json:"journal_entry_id,omitempty"`
 	Description    *string         `db:"description" json:"description,omitempty"`
 	Resolved       bool            `db:"resolved" json:"resolved"`
@@ -337,6 +336,33 @@ type Account struct {
 	CreatedBy       *uuid.UUID `db:"created_by" json:"created_by,omitempty"`
 	UpdatedBy       *uuid.UUID `db:"updated_by" json:"updated_by,omitempty"`
 	DeletedAt       *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/period_lock.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type PeriodLock struct {
+	LockID     uuid.UUID  `json:"lock_id"`
+	CompanyID  uuid.UUID  `json:"company_id"`
+	FiscalYear int        `json:"fiscal_year"`
+	Period     int        `json:"period"`
+	IsLocked   bool       `json:"is_locked"`
+	LockedAt   *time.Time `json:"locked_at,omitempty"`
+	LockedBy   *uuid.UUID `json:"locked_by,omitempty"`
+	Reason     string     `json:"reason"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 

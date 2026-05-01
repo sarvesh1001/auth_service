@@ -25,13 +25,19 @@ import (
 type RuleExecutionStrategy string
 
 const (
-	FirstMatch RuleExecutionStrategy = "first_match" // stop after first matched rule
-	AllMatch   RuleExecutionStrategy = "all_match"   // apply all matched rules
+	FirstMatch RuleExecutionStrategy = "first_match"
+	AllMatch   RuleExecutionStrategy = "all_match"
 )
+
+type Discount struct {
+	Type  string          `json:"type"`  // "percentage" or "fixed"
+	Value decimal.Decimal `json:"value"` // e.g., 5 for 5% or 500 for fixed amount
+}
 
 // TaxComputationInput is the context for tax calculation.
 type TaxComputationInput struct {
 	Amount          decimal.Decimal        `json:"amount"`
+	Discount        *Discount              `json:"discount,omitempty"` // 👈 new field
 	Currency        string                 `json:"currency"`
 	TransactionType string                 `json:"transaction_type"`
 	ProductType     string                 `json:"product_type"`
@@ -50,7 +56,7 @@ type TaxLineItem struct {
 	Description   *string         `json:"description,omitempty"`
 }
 
-// TaxResult is a simplified single‑rate result (kept for compatibility).
+// TaxResult is a simplified single‑rate result.
 type TaxResult struct {
 	TaxableAmount decimal.Decimal
 	TaxAmount     decimal.Decimal
@@ -111,7 +117,7 @@ type TaxEngineService interface {
 	ComputePeriodLiability(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (decimal.Decimal, []TaxLineItem, error)
 	ComputeBulkTax(ctx context.Context, companyID uuid.UUID, inputs []TaxComputationInput) ([]*TaxResult, error)
 
-	// Rule engine (time‑travel support)
+	// Rule engine
 	EvaluateRules(ctx context.Context, companyID uuid.UUID, appliesTo string, data map[string]interface{}) ([]*EvaluatedRule, error)
 	ApplyRules(ctx context.Context, input TaxComputationInput, rules []*EvaluatedRule) (*TaxResult, error)
 	GetApplicableRulesForTransaction(ctx context.Context, companyID uuid.UUID, appliesTo string) ([]*repository.TaxRuleBundle, error)
@@ -203,6 +209,9 @@ func NewTaxEngineService(
 }
 
 // ----------------------------------------------------------------------
+// Helper: idempotency not found check
+// ----------------------------------------------------------------------
+// ----------------------------------------------------------------------
 // Core Computation
 // ----------------------------------------------------------------------
 
@@ -253,6 +262,26 @@ func (s *taxEngineService) computeTaxWithInput(ctx context.Context, companyID uu
 }
 
 func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uuid.UUID, input TaxComputationInput) ([]TaxLineItem, error) {
+	// 👇 Apply discount to amount BEFORE any rule matching or profile fetching
+	netAmount := input.Amount
+	if input.Discount != nil {
+		switch input.Discount.Type {
+		case "percentage":
+			// e.g., Value = 5 means 5% off
+			percent := input.Discount.Value
+			netAmount = input.Amount.Mul(decimal.NewFromInt(100).Sub(percent)).Div(decimal.NewFromInt(100))
+		case "fixed":
+			netAmount = input.Amount.Sub(input.Discount.Value)
+			if netAmount.LessThan(decimal.Zero) {
+				netAmount = decimal.Zero
+			}
+		default:
+			s.logger.Warn("unknown discount type", zap.String("type", input.Discount.Type))
+		}
+		// Replace the original amount with the discounted amount
+		input.Amount = netAmount
+	}
+
 	profile, err := s.GetTaxProfileForTransaction(ctx, companyID, input.Metadata)
 	if err != nil || profile == nil {
 		return nil, fmt.Errorf("%w: no tax profile for company %s", ErrNotFound, companyID)
@@ -299,7 +328,6 @@ func (s *taxEngineService) ComputeTaxBreakdown(ctx context.Context, companyID uu
 	}
 	return mergeTaxLineItems(items), nil
 }
-
 func (s *taxEngineService) ComputePeriodLiability(ctx context.Context, companyID uuid.UUID, startDate, endDate time.Time) (decimal.Decimal, []TaxLineItem, error) {
 	transactions, err := s.taxTransactionRepo.GetForReturn(ctx, s.pgClient.DB, companyID, startDate, endDate)
 	if err != nil {
@@ -376,8 +404,9 @@ func (s *taxEngineService) applyActions(ctx context.Context, input TaxComputatio
 		}
 	}
 	for _, act := range actions {
+		// ✅ Fixed: handle both "apply_rate" and "apply_tax"
 		switch act.ActionType {
-		case "apply_rate":
+		case "apply_rate", "apply_tax":
 			rate, err := s.taxRateRepo.GetByID(ctx, s.pgClient.DB, act.TaxRateID)
 			if err != nil || rate == nil {
 				s.logger.Warn("rate not found for action", zap.String("rate_id", act.TaxRateID.String()))
@@ -405,6 +434,7 @@ func (s *taxEngineService) applyActions(ctx context.Context, input TaxComputatio
 				Description:   stringPtr("Tax exempt by rule"),
 			})
 		case "reduce_base":
+			// already handled earlier
 		case "override_amount":
 			s.logger.Warn("override_amount action not implemented")
 		}
@@ -563,6 +593,9 @@ func (s *taxEngineService) CreateTaxTransaction(ctx context.Context, req CreateT
 			logger.Info("idempotent request, returning cached response")
 			return existing, nil
 		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return nil, fmt.Errorf("idempotency check failed: %w", err)
+		}
 	}
 	taxTrans := &tax.TaxTransaction{
 		TaxTransactionID:   uuid.New(),
@@ -688,11 +721,22 @@ func (s *taxEngineService) BulkCreateTaxTransactions(ctx context.Context, reqs [
 }
 
 func (s *taxEngineService) VoidTaxTransaction(ctx context.Context, transactionType string, transactionID uuid.UUID, reason string) error {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			s.logger.Info("idempotent request, void already processed")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	if err := s.taxTransactionRepo.DeleteByTransaction(ctx, tx, transactionType, transactionID); err != nil {
 		return err
 	}
@@ -701,6 +745,9 @@ func (s *taxEngineService) VoidTaxTransaction(ctx context.Context, transactionTy
 		"transaction_id":   transactionID.String(),
 		"reason":           reason,
 	})
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
 	return tx.Commit()
 }
 
@@ -720,11 +767,22 @@ func (s *taxEngineService) CreateTaxProfile(ctx context.Context, p *tax.TaxProfi
 	if p.TaxProfileID == uuid.Nil {
 		p.TaxProfileID = uuid.New()
 	}
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var existing *tax.TaxProfile
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			s.logger.Info("idempotent request, returning cached profile")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	if err := s.taxProfileRepo.Create(ctx, tx, p); err != nil {
 		return err
 	}
@@ -745,6 +803,9 @@ func (s *taxEngineService) CreateTaxProfile(ctx context.Context, p *tax.TaxProfi
 		Status:        "pending",
 	}
 	_ = s.outboxRepo.Store(ctx, tx, outboxEvent)
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, p)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -753,11 +814,22 @@ func (s *taxEngineService) CreateTaxProfile(ctx context.Context, p *tax.TaxProfi
 }
 
 func (s *taxEngineService) UpdateTaxProfile(ctx context.Context, p *tax.TaxProfile) error {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var existing *tax.TaxProfile
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			s.logger.Info("idempotent request, returning cached profile")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	if err := s.taxProfileRepo.Update(ctx, tx, p); err != nil {
 		return err
 	}
@@ -778,6 +850,9 @@ func (s *taxEngineService) UpdateTaxProfile(ctx context.Context, p *tax.TaxProfi
 		Status:        "pending",
 	}
 	_ = s.outboxRepo.Store(ctx, tx, outboxEvent)
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, p)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -786,6 +861,21 @@ func (s *taxEngineService) UpdateTaxProfile(ctx context.Context, p *tax.TaxProfi
 }
 
 func (s *taxEngineService) SetDefaultTaxProfile(ctx context.Context, companyID uuid.UUID, profileID uuid.UUID) error {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	profile, err := s.taxProfileRepo.GetByID(ctx, s.pgClient.DB, profileID)
 	if err != nil || profile == nil {
 		return ErrNotFound
@@ -798,11 +888,40 @@ func (s *taxEngineService) SetDefaultTaxProfile(ctx context.Context, companyID u
 	}
 	settings["is_default"] = true
 	newSettings, _ := json.Marshal(settings)
-	return s.taxProfileRepo.UpdateSettings(ctx, s.pgClient.DB, profileID, newSettings, nil)
+	err = s.taxProfileRepo.UpdateSettings(ctx, tx, profileID, newSettings, nil)
+	if err != nil {
+		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+	return tx.Commit()
 }
 
 func (s *taxEngineService) SetTaxProfileActive(ctx context.Context, profileID uuid.UUID, isActive bool) error {
-	return s.taxProfileRepo.SetActive(ctx, s.pgClient.DB, profileID, isActive, nil)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+	err = s.taxProfileRepo.SetActive(ctx, tx, profileID, isActive, nil)
+	if err != nil {
+		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+	return tx.Commit()
 }
 
 func (s *taxEngineService) ListTaxProfiles(ctx context.Context, companyID uuid.UUID) ([]*tax.TaxProfile, error) {
@@ -810,7 +929,29 @@ func (s *taxEngineService) ListTaxProfiles(ctx context.Context, companyID uuid.U
 }
 
 func (s *taxEngineService) DeleteTaxProfile(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
-	return s.taxProfileRepo.Delete(ctx, s.pgClient.DB, id, deletedBy)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+	err = s.taxProfileRepo.Delete(ctx, tx, id, deletedBy)
+	if err != nil {
+		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+	return tx.Commit()
 }
 
 // ----------------------------------------------------------------------
@@ -821,11 +962,22 @@ func (s *taxEngineService) CreateTaxRate(ctx context.Context, r *tax.TaxRate) er
 	if r.TaxRateID == uuid.Nil {
 		r.TaxRateID = uuid.New()
 	}
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var existing *tax.TaxRate
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			s.logger.Info("idempotent request, returning cached rate")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	overlap, err := s.taxRateRepo.CheckOverlappingRates(ctx, tx, r.CompanyID, r.TaxName, r.EffectiveFrom, r.EffectiveTo, uuid.Nil)
 	if err != nil {
 		return err
@@ -855,6 +1007,9 @@ func (s *taxEngineService) CreateTaxRate(ctx context.Context, r *tax.TaxRate) er
 		Status:        "pending",
 	}
 	_ = s.outboxRepo.Store(ctx, tx, outboxEvent)
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, r)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -863,11 +1018,22 @@ func (s *taxEngineService) CreateTaxRate(ctx context.Context, r *tax.TaxRate) er
 }
 
 func (s *taxEngineService) UpdateTaxRate(ctx context.Context, r *tax.TaxRate) error {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var existing *tax.TaxRate
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			s.logger.Info("idempotent request, returning cached rate")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	if err := s.taxRateRepo.Update(ctx, tx, r); err != nil {
 		return err
 	}
@@ -890,6 +1056,9 @@ func (s *taxEngineService) UpdateTaxRate(ctx context.Context, r *tax.TaxRate) er
 		Status:        "pending",
 	}
 	_ = s.outboxRepo.Store(ctx, tx, outboxEvent)
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, r)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -898,7 +1067,29 @@ func (s *taxEngineService) UpdateTaxRate(ctx context.Context, r *tax.TaxRate) er
 }
 
 func (s *taxEngineService) CloseOpenRates(ctx context.Context, companyID uuid.UUID, taxName string, beforeDate time.Time, updatedBy *uuid.UUID) error {
-	return s.taxRateRepo.CloseOpenRates(ctx, s.pgClient.DB, companyID, taxName, beforeDate, updatedBy)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+	err = s.taxRateRepo.CloseOpenRates(ctx, tx, companyID, taxName, beforeDate, updatedBy)
+	if err != nil {
+		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+	return tx.Commit()
 }
 
 func (s *taxEngineService) ListTaxRates(ctx context.Context, filter repository.TaxRateFilter, pagination Pagination, sort Sort) ([]*tax.TaxRate, int64, error) {
@@ -914,7 +1105,29 @@ func (s *taxEngineService) ListTaxRates(ctx context.Context, filter repository.T
 }
 
 func (s *taxEngineService) DeleteTaxRate(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
-	return s.taxRateRepo.Delete(ctx, s.pgClient.DB, id, deletedBy)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+	err = s.taxRateRepo.Delete(ctx, tx, id, deletedBy)
+	if err != nil {
+		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+	return tx.Commit()
 }
 
 // ----------------------------------------------------------------------
@@ -925,11 +1138,22 @@ func (s *taxEngineService) CreateTaxRule(ctx context.Context, rule *tax.TaxRule,
 	if rule.TaxRuleID == uuid.Nil {
 		rule.TaxRuleID = uuid.New()
 	}
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var existing *tax.TaxRule
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			s.logger.Info("idempotent request, returning cached rule")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	if err := s.taxRuleRepo.Create(ctx, tx, rule); err != nil {
 		return err
 	}
@@ -974,6 +1198,9 @@ func (s *taxEngineService) CreateTaxRule(ctx context.Context, rule *tax.TaxRule,
 		Status:        "pending",
 	}
 	_ = s.outboxRepo.Store(ctx, tx, outboxEvent)
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, rule)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -981,31 +1208,54 @@ func (s *taxEngineService) CreateTaxRule(ctx context.Context, rule *tax.TaxRule,
 	return nil
 }
 
+// ✅ FIXED: UpdateTaxRule no longer clears conditions/actions unconditionally
 func (s *taxEngineService) UpdateTaxRule(ctx context.Context, rule *tax.TaxRule, conditions []*tax.TaxCondition, actions []*tax.TaxAction) error {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var existing *tax.TaxRule
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+			s.logger.Info("idempotent request, returning cached rule")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+
 	if err := s.taxRuleRepo.Update(ctx, tx, rule); err != nil {
 		return err
 	}
-	if err := s.taxRuleRepo.ClearConditions(ctx, tx, rule.CompanyID, rule.TaxRuleID); err != nil {
-		return err
-	}
-	if err := s.taxRuleRepo.ClearActions(ctx, tx, rule.CompanyID, rule.TaxRuleID); err != nil {
-		return err
-	}
-	if len(conditions) > 0 {
-		if err := s.taxRuleRepo.BulkAddConditions(ctx, tx, rule.CompanyID, conditions); err != nil {
+
+	// Only clear and re-add conditions if provided (non‑nil)
+	if conditions != nil {
+		if err := s.taxRuleRepo.ClearConditions(ctx, tx, rule.CompanyID, rule.TaxRuleID); err != nil {
 			return err
 		}
-	}
-	if len(actions) > 0 {
-		if err := s.taxRuleRepo.BulkAddActions(ctx, tx, rule.CompanyID, actions); err != nil {
-			return err
+		if len(conditions) > 0 {
+			if err := s.taxRuleRepo.BulkAddConditions(ctx, tx, rule.CompanyID, conditions); err != nil {
+				return err
+			}
 		}
 	}
+
+	// Only clear and re-add actions if provided (non‑nil)
+	if actions != nil {
+		if err := s.taxRuleRepo.ClearActions(ctx, tx, rule.CompanyID, rule.TaxRuleID); err != nil {
+			return err
+		}
+		if len(actions) > 0 {
+			if err := s.taxRuleRepo.BulkAddActions(ctx, tx, rule.CompanyID, actions); err != nil {
+				return err
+			}
+		}
+	}
+
 	ruleJSON, _ := json.Marshal(rule)
 	if err := s.CreateRuleVersion(ctx, tx, rule.TaxRuleID, ruleJSON); err != nil {
 		return err
@@ -1028,6 +1278,9 @@ func (s *taxEngineService) UpdateTaxRule(ctx context.Context, rule *tax.TaxRule,
 		Status:        "pending",
 	}
 	_ = s.outboxRepo.Store(ctx, tx, outboxEvent)
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, rule)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -1045,13 +1298,26 @@ func (s *taxEngineService) CreateRuleVersion(ctx context.Context, tx repository.
 }
 
 func (s *taxEngineService) SetRuleVersion(ctx context.Context, companyID, ruleID uuid.UUID, version int) error {
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 	if err := s.taxRuleRepo.SetCurrentVersion(ctx, tx, companyID, ruleID, version); err != nil {
 		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 	return tx.Commit()
 }
@@ -1082,11 +1348,33 @@ func (s *taxEngineService) GetRuleBundle(ctx context.Context, companyID, ruleID 
 }
 
 func (s *taxEngineService) DeleteTaxRule(ctx context.Context, companyID, id uuid.UUID, deletedBy *uuid.UUID) error {
-	return s.taxRuleRepo.Delete(ctx, s.pgClient.DB, companyID, id, deletedBy)
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if idempotencyKey != "" {
+		var processed bool
+		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+	err = s.taxRuleRepo.Delete(ctx, tx, companyID, id, deletedBy)
+	if err != nil {
+		return err
+	}
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+	return tx.Commit()
 }
 
 // ----------------------------------------------------------------------
-// Reporting & Compliance
+// Reporting & Compliance (read‑only)
 // ----------------------------------------------------------------------
 
 func (s *taxEngineService) GetTaxSummary(ctx context.Context, companyID uuid.UUID, from, to time.Time) (*TaxSummary, error) {

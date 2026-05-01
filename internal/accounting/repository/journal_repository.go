@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lib/pq" // for PostgreSQL error codes
+	"github.com/lib/pq"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
@@ -19,7 +19,7 @@ import (
 )
 
 // =============================================================================
-// Custom errors are now defined in errors.go (shared with service)
+// Custom errors (shared with service)
 // =============================================================================
 
 // JournalFilter defines filter criteria for listing journal entries
@@ -53,14 +53,14 @@ type JournalRepository interface {
 	// JOURNAL ENTRY (HEADER)
 	// =====================================================
 	Create(ctx context.Context, db DBTX, j *models.JournalEntry) error
-	CreateOrGetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID, builder func() *models.JournalEntry) (*models.JournalEntry, bool, error)
+	CreateOrGetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string, builder func() *models.JournalEntry) (*models.JournalEntry, bool, error)
 
 	Update(ctx context.Context, db DBTX, j *models.JournalEntry) error
 
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error)
-	GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error)
-	GetBySourceForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error)
+	GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string) (*models.JournalEntry, error)
+	GetBySourceForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string) (*models.JournalEntry, error)
 
 	List(ctx context.Context, db DBTX, filter JournalFilter, p Pagination, s Sort) ([]*models.JournalEntry, error)
 	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.JournalEntry, error)
@@ -68,7 +68,7 @@ type JournalRepository interface {
 	Count(ctx context.Context, db DBTX, filter JournalFilter) (int64, error)
 
 	Delete(ctx context.Context, db DBTX, id uuid.UUID, deletedBy *uuid.UUID) error
-	ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (bool, error)
+	ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string) (bool, error)
 
 	// =====================================================
 	// STATUS / LIFECYCLE
@@ -268,7 +268,7 @@ func (r *journalRepository) buildJournalFilter(filter JournalFilter) (string, []
 	return "WHERE " + strings.Join(conditions, " AND "), args
 }
 
-// scanJournalEntry unchanged
+// scanJournalEntry – updated to scan source_id as sql.NullString
 func (r *journalRepository) scanJournalEntry(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*models.JournalEntry, error) {
@@ -276,7 +276,7 @@ func (r *journalRepository) scanJournalEntry(scanner interface {
 	var reference, description sql.NullString
 	var reversalOf uuid.NullUUID
 	var sourceType sql.NullString
-	var sourceID uuid.NullUUID
+	var sourceID sql.NullString
 	var postedAt sql.NullTime
 	var postedBy, createdBy, updatedBy uuid.NullUUID
 	var deletedAt sql.NullTime
@@ -305,7 +305,7 @@ func (r *journalRepository) scanJournalEntry(scanner interface {
 		j.SourceType = &sourceType.String
 	}
 	if sourceID.Valid {
-		j.SourceID = &sourceID.UUID
+		j.SourceID = &sourceID.String
 	}
 	if postedAt.Valid {
 		j.PostedAt = &postedAt.Time
@@ -351,8 +351,8 @@ func (r *journalRepository) Create(ctx context.Context, db DBTX, j *models.Journ
 	return nil
 }
 
-// CreateOrGetBySource – idempotent creation
-func (r *journalRepository) CreateOrGetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID, builder func() *models.JournalEntry) (*models.JournalEntry, bool, error) {
+// CreateOrGetBySource – idempotent creation with string sourceID
+func (r *journalRepository) CreateOrGetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string, builder func() *models.JournalEntry) (*models.JournalEntry, bool, error) {
 	existing, err := r.GetBySourceForUpdate(ctx, db, companyID, sourceType, sourceID)
 	if err == nil {
 		return existing, false, nil
@@ -362,7 +362,9 @@ func (r *journalRepository) CreateOrGetBySource(ctx context.Context, db DBTX, co
 	}
 
 	newEntry := builder()
-	if newEntry.CompanyID != companyID || (newEntry.SourceType == nil || *newEntry.SourceType != sourceType) || (newEntry.SourceID == nil || *newEntry.SourceID != sourceID) {
+	if newEntry.CompanyID != companyID ||
+		(newEntry.SourceType == nil || *newEntry.SourceType != sourceType) ||
+		(newEntry.SourceID == nil || *newEntry.SourceID != sourceID) {
 		return nil, false, errors.New("builder must produce entry with matching company_id, source_type, source_id")
 	}
 	if err := r.Create(ctx, db, newEntry); err != nil {
@@ -417,7 +419,7 @@ func (r *journalRepository) Update(ctx context.Context, db DBTX, j *models.Journ
 	return nil
 }
 
-// GetByID, GetByIDForUpdate, GetBySource, GetBySourceForUpdate unchanged
+// GetByID, GetByIDForUpdate, GetBySource, GetBySourceForUpdate
 func (r *journalRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
@@ -463,7 +465,7 @@ func (r *journalRepository) GetByIDForUpdate(ctx context.Context, db DBTX, id uu
 	return j, nil
 }
 
-func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error) {
+func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
 		       reference, description, status, reversal_of,
@@ -480,14 +482,14 @@ func (r *journalRepository) GetBySource(ctx context.Context, db DBTX, companyID 
 		r.logger.Error("failed to get journal entry by source",
 			util.String("company_id", companyID.String()),
 			util.String("source_type", sourceType),
-			util.String("source_id", sourceID.String()),
+			util.String("source_id", sourceID),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get journal entry by source: %w", err)
 	}
 	return j, nil
 }
 
-func (r *journalRepository) GetBySourceForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (*models.JournalEntry, error) {
+func (r *journalRepository) GetBySourceForUpdate(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string) (*models.JournalEntry, error) {
 	query := `
 		SELECT journal_entry_id, company_id, journal_type, entry_date,
 		       reference, description, status, reversal_of,
@@ -505,7 +507,7 @@ func (r *journalRepository) GetBySourceForUpdate(ctx context.Context, db DBTX, c
 		r.logger.Error("failed to get journal entry by source with lock",
 			util.String("company_id", companyID.String()),
 			util.String("source_type", sourceType),
-			util.String("source_id", sourceID.String()),
+			util.String("source_id", sourceID),
 			util.ErrorField(err))
 		return nil, fmt.Errorf("get journal entry by source for update: %w", err)
 	}
@@ -645,7 +647,7 @@ func (r *journalRepository) Delete(ctx context.Context, db DBTX, id uuid.UUID, d
 	return nil
 }
 
-func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID uuid.UUID) (bool, error) {
+func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, companyID uuid.UUID, sourceType string, sourceID string) (bool, error) {
 	query := `
 		SELECT EXISTS (
 			SELECT 1
@@ -662,7 +664,7 @@ func (r *journalRepository) ExistsBySource(ctx context.Context, db DBTX, company
 		r.logger.Error("failed to check existence by source",
 			zap.String("company_id", companyID.String()),
 			zap.String("source_type", sourceType),
-			zap.String("source_id", sourceID.String()),
+			zap.String("source_id", sourceID),
 			zap.Error(err))
 		return false, fmt.Errorf("exists by source: %w", err)
 	}
@@ -728,7 +730,7 @@ func (r *journalRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.U
 	return nil
 }
 
-// Post (with IsBalanced error handling)
+// Post
 func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, postedBy *uuid.UUID) error {
 	if err := r.LockJournal(ctx, db, id); err != nil {
 		return err
@@ -769,7 +771,7 @@ func (r *journalRepository) Post(ctx context.Context, db DBTX, id uuid.UUID, pos
 	return nil
 }
 
-// Reverse (with HasReversal guard)
+// Reverse
 func (r *journalRepository) Reverse(ctx context.Context, db DBTX, originalID uuid.UUID, reversal *models.JournalEntry) error {
 	if err := r.LockJournal(ctx, db, originalID); err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,7 +31,7 @@ type JournalService interface {
 	CreateWithTx(ctx context.Context, tx *sql.Tx, req CreateJournalRequest) (*models.JournalEntry, error)
 	Update(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error)
 	Post(ctx context.Context, id uuid.UUID, postedBy *uuid.UUID) error
-	PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error // ✅ ADD THIS
+	PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error
 	Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error
 	GetByID(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error)
 	GetSummary(ctx context.Context, id uuid.UUID) (*repository.JournalSummary, error)
@@ -73,6 +74,11 @@ func NewJournalService(
 		idempotencyStore: idempotencyStore,
 		auditService:     auditService,
 	}
+}
+
+// Helper to check idempotency errors (works with any store)
+func isIdempotencyNotFound(err error) bool {
+	return errors.Is(err, idempotency.ErrKeyNotFound) || errors.Is(err, sql.ErrNoRows)
 }
 
 // =============================================================================
@@ -126,13 +132,17 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 		return nil, ErrDuplicateTransaction
 	}
 
-	// 4. Idempotency check
+	// 4. Idempotency check (fixed error handling)
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	if idempotencyKey != "" {
 		var existing models.JournalEntry
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing)
+		if err == nil {
 			logger.Info("idempotent request, returning cached response")
 			return &existing, nil
+		}
+		if !isIdempotencyNotFound(err) {
+			return nil, fmt.Errorf("idempotency check failed: %w", err)
 		}
 	}
 
@@ -142,7 +152,7 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 
 	if req.SourceType != nil && req.SourceID != nil {
 		journal, created, err = s.repo.CreateOrGetBySource(
-			ctx, tx, req.CompanyID, *req.SourceType, *req.SourceID,
+			ctx, tx, req.CompanyID, *req.SourceType, *req.SourceID, // SourceID is *string
 			func() *models.JournalEntry {
 				return &models.JournalEntry{
 					JournalEntryID: uuid.New(),
@@ -230,7 +240,7 @@ func (s *journalService) createWithTxInternal(ctx context.Context, tx *sql.Tx, r
 }
 
 // =============================================================================
-// UPDATE - FIXED with validation
+// UPDATE
 // =============================================================================
 
 func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (*models.JournalEntry, error) {
@@ -247,11 +257,16 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var existing *models.JournalEntry
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing); err == nil && existing != nil {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &existing)
+		if err == nil && existing != nil {
 			logger.Info("idempotent request, returning cached response")
 			return existing, nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return nil, fmt.Errorf("idempotency check failed: %w", err)
 		}
 	}
 
@@ -266,9 +281,8 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		return nil, fmt.Errorf("%w: cannot update journal entry in status %s", ErrInvalidState, existing.Status)
 	}
 
-	// ----- FIX START: Apply full validation if lines are being updated -----
+	// Apply full validation if lines are being updated
 	if req.Lines != nil {
-		// Build a CreateJournalRequest from the existing journal data + new lines
 		validationReq := CreateJournalRequest{
 			CompanyID:   existing.CompanyID,
 			JournalType: existing.JournalType,
@@ -277,16 +291,13 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 			Description: existing.Description,
 			Lines:       req.Lines,
 		}
-		// 1. Basic double‑entry validation
 		if err := s.validateJournal(validationReq); err != nil {
 			return nil, err
 		}
-		// 2. Advanced business rule validation (account types, period locks, etc.)
 		if err := s.ruleEngine.ValidateJournal(ctx, tx, validationReq); err != nil {
 			return nil, err
 		}
 	}
-	// ----- FIX END -----
 
 	// Apply updates
 	if req.EntryDate != nil {
@@ -331,7 +342,7 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 		}
 	}
 
-	// Outbox event for update
+	// Outbox event
 	payload := s.buildJournalEventPayload(existing, lines)
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
@@ -364,7 +375,7 @@ func (s *journalService) Update(ctx context.Context, req UpdateJournalRequest) (
 }
 
 // =============================================================================
-// Other methods (Post, Reverse, Delete, GetByID, etc.) remain unchanged
+// POST
 // =============================================================================
 
 func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.UUID) error {
@@ -377,15 +388,19 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var processed bool
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
+		if err == nil && processed {
 			logger.Info("idempotent request, already posted")
 			return nil
 		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
 	}
 
-	// Use the internal method to do the actual work
 	if err := s.postWithTxInternal(ctx, tx, id, postedBy); err != nil {
 		return err
 	}
@@ -405,12 +420,13 @@ func (s *journalService) Post(ctx context.Context, id uuid.UUID, postedBy *uuid.
 	logger.Info("journal entry posted")
 	return nil
 }
-func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error {
-	logger := s.logger.With(
-		zap.String("method", "Reverse"),
-		zap.String("journal_id", id.String()),
-	)
 
+// =============================================================================
+// REVERSE
+// =============================================================================
+
+func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason string, reversedBy *uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "Reverse"), zap.String("journal_id", id.String()))
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -419,20 +435,20 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 	}
 	defer tx.Rollback()
 
-	// -------------------------------
-	// Idempotency check
-	// -------------------------------
+	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var processed bool
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
+		if err == nil && processed {
 			logger.Info("idempotent request, already reversed")
 			return nil
 		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
 	}
 
-	// -------------------------------
 	// Check existing reversal
-	// -------------------------------
 	hasRev, err := s.repo.HasReversal(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("check reversal existence: %w", err)
@@ -441,9 +457,7 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return repository.ErrReversalAlreadyExists
 	}
 
-	// -------------------------------
 	// Lock & fetch original
-	// -------------------------------
 	original, err := s.repo.GetByIDForUpdate(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get original entry: %w", err)
@@ -455,9 +469,7 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return fmt.Errorf("only posted entries can be reversed, status: %s", original.Status)
 	}
 
-	// -------------------------------
 	// Fetch original lines
-	// -------------------------------
 	originalLines, err := s.repo.GetLines(ctx, tx, id)
 	if err != nil {
 		return fmt.Errorf("get original lines: %w", err)
@@ -466,9 +478,7 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		return fmt.Errorf("original journal has no lines")
 	}
 
-	// -------------------------------
 	// Create reversal entry (DRAFT)
-	// -------------------------------
 	reversal := &models.JournalEntry{
 		JournalEntryID: uuid.New(),
 		CompanyID:      original.CompanyID,
@@ -482,59 +492,44 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		UpdatedBy:      reversedBy,
 	}
 
-	// Create reversal entry
 	if err := s.repo.Reverse(ctx, tx, id, reversal); err != nil {
 		return fmt.Errorf("reverse journal: %w", err)
 	}
 
-	// -------------------------------
 	// Create reversed lines (swap debit/credit)
-	// -------------------------------
 	reversalLines := make([]*models.JournalLine, len(originalLines))
-
 	for i, l := range originalLines {
 		reversalLines[i] = &models.JournalLine{
 			JournalLineID:  uuid.New(),
 			JournalEntryID: reversal.JournalEntryID,
 			AccountID:      l.AccountID,
 			LineNumber:     i + 1,
-			DebitAmount:    l.CreditAmount, // 🔁 swap
-			CreditAmount:   l.DebitAmount,  // 🔁 swap
+			DebitAmount:    l.CreditAmount,
+			CreditAmount:   l.DebitAmount,
 			Description:    l.Description,
 		}
 	}
-
-	// Insert reversed lines
 	if err := s.repo.BulkAddLines(ctx, tx, reversalLines); err != nil {
 		return fmt.Errorf("create reversal lines: %w", err)
 	}
 
-	// -------------------------------
 	// Rule validation before post
-	// -------------------------------
 	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, reversal, reversalLines); err != nil {
 		return err
 	}
 
-	// -------------------------------
-	// Post to ledger FIRST
-	// -------------------------------
+	// Post to ledger
 	if err := s.ledgerService.PostJournalToLedger(ctx, tx, reversal, reversalLines); err != nil {
 		return fmt.Errorf("post reversal to ledger: %w", err)
 	}
 
-	// -------------------------------
-	// Then mark as POSTED
-	// -------------------------------
+	// Mark as POSTED
 	if err := s.repo.Post(ctx, tx, reversal.JournalEntryID, reversedBy); err != nil {
 		return fmt.Errorf("post reversal entry: %w", err)
 	}
 
-	// -------------------------------
 	// Outbox event
-	// -------------------------------
 	payload := s.buildJournalEventPayload(reversal, reversalLines)
-
 	outboxEvent := &outbox.Event{
 		EventID:       uuid.New().String(),
 		AggregateType: "journal_entry",
@@ -544,53 +539,34 @@ func (s *journalService) Reverse(ctx context.Context, id uuid.UUID, reason strin
 		Payload:       payload,
 		Status:        "pending",
 	}
-
 	if err := s.outboxRepo.Store(ctx, tx, outboxEvent); err != nil {
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// -------------------------------
-	// Idempotency store
-	// -------------------------------
 	if idempotencyKey != "" {
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	}
 
-	// -------------------------------
-	// Commit
-	// -------------------------------
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// -------------------------------
-	// Audit log
-	// -------------------------------
 	if s.auditService != nil {
-		_ = s.auditService.LogAction(
-			ctx,
-			nil,
-			&original.CompanyID,
-			"accounting",
-			"reverse",
-			"journal_entry",
-			&id,
-			"user",
-			reversedBy,
-			nil,
-			nil,
-			map[string]interface{}{
+		_ = s.auditService.LogAction(ctx, nil, &original.CompanyID, "accounting", "reverse", "journal_entry",
+			&id, "user", reversedBy, nil, nil, map[string]interface{}{
 				"reason":      reason,
 				"reversal_id": reversal.JournalEntryID.String(),
-			},
-		)
+			})
 	}
 
 	logger.Info("journal entry reversed successfully",
 		zap.String("reversal_id", reversal.JournalEntryID.String()))
-
 	return nil
 }
+
+// =============================================================================
+// DELETE
+// =============================================================================
 
 func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "Delete"), zap.String("journal_id", id.String()))
@@ -602,11 +578,16 @@ func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	}
 	defer tx.Rollback()
 
+	// Idempotency check (fixed)
 	if idempotencyKey != "" {
 		var processed bool
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
+		if err == nil && processed {
 			logger.Info("idempotent request, already deleted")
 			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
 		}
 	}
 
@@ -660,6 +641,10 @@ func (s *journalService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uu
 	logger.Info("journal entry soft-deleted")
 	return nil
 }
+
+// =============================================================================
+// GETTERS & LIST
+// =============================================================================
 
 func (s *journalService) GetByID(ctx context.Context, id uuid.UUID) (*models.JournalEntry, error) {
 	entry, err := s.repo.GetByID(ctx, s.pgClient.DB, id)
@@ -794,7 +779,6 @@ func stringPtr(s string) *string {
 }
 
 // postWithTxInternal performs the actual posting logic using an existing transaction.
-// It does NOT commit or rollback – the caller is responsible for the transaction.
 func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "postWithTxInternal"), zap.String("journal_id", id.String()))
 
@@ -813,7 +797,7 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 		return fmt.Errorf("cannot post journal with status %s", entry.Status)
 	}
 
-	// 2. Validate before post (e.g., lines exist, balanced)
+	// 2. Validate before post
 	if err := s.repo.ValidateBeforePost(ctx, tx, id); err != nil {
 		return err
 	}
@@ -824,12 +808,12 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 		return fmt.Errorf("get lines: %w", err)
 	}
 
-	// 4. Run rule engine validations
+	// 4. Rule engine validation
 	if err := s.ruleEngine.ValidateBeforePost(ctx, tx, entry, lines); err != nil {
 		return err
 	}
 
-	// 5. Post to ledger (this uses the same transaction)
+	// 5. Post to ledger
 	logger.Info("calling PostJournalToLedger")
 	if err := s.ledgerService.PostJournalToLedger(ctx, tx, entry, lines); err != nil {
 		logger.Error("PostJournalToLedger failed", zap.Error(err))
@@ -837,7 +821,7 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 	}
 	logger.Info("PostJournalToLedger completed successfully")
 
-	// 6. Verify ledger entries were created (optional but safe)
+	// 6. Verify ledger entries
 	var ledgerCount int
 	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounting.ledger_entries WHERE journal_entry_id = $1`, id).Scan(&ledgerCount)
 	if err != nil {
@@ -845,14 +829,13 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 	} else {
 		logger.Info("ledger entries count after PostJournalToLedger", zap.Int("count", ledgerCount))
 	}
-
 	if err := s.repo.ValidateLedgerExists(ctx, tx, id); err != nil {
 		logger.Error("ValidateLedgerExists failed", zap.Error(err))
 		return fmt.Errorf("ledger validation failed: %w", err)
 	}
 	logger.Info("ValidateLedgerExists passed")
 
-	// 7. Update journal status to 'posted'
+	// 7. Update journal status
 	if err := s.repo.Post(ctx, tx, id, postedBy); err != nil {
 		return fmt.Errorf("post journal entry: %w", err)
 	}
@@ -873,23 +856,26 @@ func (s *journalService) postWithTxInternal(ctx context.Context, tx *sql.Tx, id 
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	// 9. Audit log (note: we pass nil for the request field because we don't have one)
+	// 9. Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &entry.CompanyID, "accounting", "post", "journal_entry",
 			&id, "user", postedBy, nil, nil, nil)
 	}
-
 	return nil
-} // PostWithTx posts a journal entry using an existing transaction.
-// The caller must commit or rollback the transaction.
+}
+
+// PostWithTx posts a journal entry using an existing transaction.
 func (s *journalService) PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error {
-	// Idempotency check (optional – if you want idempotency inside the caller's transaction)
 	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
 	if idempotencyKey != "" {
 		var processed bool
-		if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed)
+		if err == nil && processed {
 			s.logger.Info("idempotent request, already posted (PostWithTx)", zap.String("journal_id", id.String()))
 			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
 		}
 	}
 
@@ -904,6 +890,5 @@ func (s *journalService) PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUI
 		}
 		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, postResult{JournalID: id, Status: "posted"})
 	}
-
 	return nil
 }

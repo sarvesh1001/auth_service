@@ -127,6 +127,7 @@ func NewAccountingInfraFactory(
 		af.postgresClient, // 👈 ADD THIS
 		af.auditService,
 		af.log,
+		af.idempotencyStore, // 👈 ADD THIS
 	)
 	af.periodLockHandler = handler.NewPeriodLockHandler(af.periodLockService, af.log)
 	af.reconciliationRepo = repository.NewReconciliationRepository(af.log)

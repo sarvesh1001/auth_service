@@ -75,7 +75,7 @@ type AmendReturnRequest struct {
 
 type TransactionalJournalService interface {
 	CreateWithTx(ctx context.Context, tx *sql.Tx, req CreateJournalRequest) (*models.JournalEntry, error)
-	// Other journal methods can be added if needed
+	PostWithTx(ctx context.Context, tx *sql.Tx, id uuid.UUID, postedBy *uuid.UUID) error // add this line
 }
 
 // CreateJournalRequest and JournalLineRequest must be defined elsewhere
@@ -476,8 +476,13 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 			CreatedBy: req.FiledBy,
 			UpdatedBy: req.FiledBy,
 		}
-		if _, err := s.journalService.CreateWithTx(ctx, tx, journalReq); err != nil {
+		journalEntry, err := s.journalService.CreateWithTx(ctx, tx, journalReq)
+		if err != nil {
 			return nil, fmt.Errorf("create payment journal: %w", err)
+		}
+		// 🔥 CRITICAL FIX: Post the journal immediately so ledger entries are created
+		if err := s.journalService.PostWithTx(ctx, tx, journalEntry.JournalEntryID, req.FiledBy); err != nil {
+			return nil, fmt.Errorf("post payment journal: %w", err)
 		}
 		ret.TotalPaid = newTotalPaid
 		if err := s.repo.UpdateReturn(ctx, tx, ret); err != nil {
@@ -498,6 +503,12 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 	if err := s.repo.CreateFiling(ctx, tx, filing); err != nil {
 		return nil, fmt.Errorf("create filing: %w", err)
 	}
+
+	// 🔥 Mark return as filed right away (synchronous)
+	if err := s.repo.UpdateReturnStatus(ctx, tx, ret.ReturnID, enums.ReturnStatusFiled, req.FiledBy); err != nil {
+		return nil, fmt.Errorf("update return status to filed: %w", err)
+	}
+	ret.Status = string(enums.ReturnStatusFiled)
 
 	// Outbox events
 	returnPayload, _ := json.Marshal(events.ComplianceReturnPayload{
@@ -542,7 +553,7 @@ func (s *complianceService) FileReturn(ctx context.Context, id uuid.UUID, req Fi
 			&id, "user", req.FiledBy, oldStateJSON, newStateJSON, map[string]interface{}{"acknowledgement_no": req.AcknowledgementNo})
 	}
 
-	logger.Info("compliance return filing initiated", zap.String("filing_id", filing.FilingID.String()))
+	logger.Info("compliance return filing completed", zap.String("filing_id", filing.FilingID.String()))
 	return filing, nil
 }
 

@@ -73,7 +73,7 @@ func NewLedgerService(
 }
 
 // --------------------------------------------------------------------------
-// PostJournalToLedger – with period lock final guard and running balance update
+// PostJournalToLedger – with idempotency + type assertion for *sql.Tx
 // --------------------------------------------------------------------------
 func (s *ledgerService) PostJournalToLedger(
 	ctx context.Context,
@@ -85,6 +85,27 @@ func (s *ledgerService) PostJournalToLedger(
 		zap.String("method", "PostJournalToLedger"),
 		zap.String("journal_id", entry.JournalEntryID.String()),
 	)
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
+	// Assert the concrete *sql.Tx (idempotency store requires it)
+	sqlTx, ok := tx.(*sql.Tx)
+	if !ok {
+		return fmt.Errorf("expected *sql.Tx for idempotency, got %T", tx)
+	}
+
+	// Idempotency check
+	if idempotencyKey != "" {
+		var done bool
+		err := s.idempotencyStore.Get(ctx, sqlTx, idempotencyKey, &done)
+		if err == nil && done {
+			logger.Info("idempotent request, ledger already posted")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
 
 	fiscalYear, period, err := s.getFiscalPeriod(ctx, entry.CompanyID, entry.EntryDate)
 	if err != nil {
@@ -186,10 +207,7 @@ func (s *ledgerService) PostJournalToLedger(
 		}
 	}
 
-	sqlTx, ok := tx.(*sql.Tx)
-	if !ok {
-		return fmt.Errorf("expected *sql.Tx for outbox, got %T", tx)
-	}
+	// outbox also needs *sql.Tx – reuse sqlTx
 	payloadBytes, err := json.Marshal(eventPayload)
 	if err != nil {
 		return fmt.Errorf("marshal ledger event payload: %w", err)
@@ -207,7 +225,12 @@ func (s *ledgerService) PostJournalToLedger(
 		return fmt.Errorf("store outbox event: %w", err)
 	}
 
-	logger.Info("posted journal to ledger (inserted entries, updated balances, running balances)",
+	// Store idempotency result
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, sqlTx, idempotencyKey, true)
+	}
+
+	logger.Info("posted journal to ledger",
 		zap.Int("line_count", len(lines)),
 		zap.Int("fiscal_year", fiscalYear),
 		zap.Int("period", period))
@@ -215,7 +238,7 @@ func (s *ledgerService) PostJournalToLedger(
 }
 
 // --------------------------------------------------------------------------
-// ReverseLedgerEntries – reuses PostJournalToLedger
+// ReverseLedgerEntries – idempotency handled by PostJournalToLedger
 // --------------------------------------------------------------------------
 func (s *ledgerService) ReverseLedgerEntries(
 	ctx context.Context,
@@ -238,7 +261,7 @@ func (s *ledgerService) ReverseLedgerEntries(
 }
 
 // --------------------------------------------------------------------------
-// GetAccountBalance – direct repository call
+// GetAccountBalance – read-only
 // --------------------------------------------------------------------------
 func (s *ledgerService) GetAccountBalance(
 	ctx context.Context,
@@ -249,17 +272,53 @@ func (s *ledgerService) GetAccountBalance(
 }
 
 // --------------------------------------------------------------------------
-// RecomputeBalances – full fiscal year recompute
+// RecomputeBalances – uses its own *sql.Tx (no DBTX assertion needed)
 // --------------------------------------------------------------------------
 func (s *ledgerService) RecomputeBalances(ctx context.Context, companyID uuid.UUID, fiscalYear int) error {
-	s.logger.Info("recomputing balances for company",
+	logger := s.logger.With(
+		zap.String("method", "RecomputeBalances"),
 		zap.String("company_id", companyID.String()),
-		zap.Int("fiscal_year", fiscalYear))
-	return s.ledgerRepo.RecomputeCompany(ctx, s.pgClient.DB, companyID, fiscalYear)
+		zap.Int("fiscal_year", fiscalYear),
+	)
+
+	idempotencyKey, _ := ctx.Value("idempotency_key").(string)
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if idempotencyKey != "" {
+		var done bool
+		err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &done)
+		if err == nil && done {
+			logger.Info("idempotent request, recompute already done")
+			return nil
+		}
+		if err != nil && !isIdempotencyNotFound(err) {
+			return fmt.Errorf("idempotency check failed: %w", err)
+		}
+	}
+
+	if err := s.ledgerRepo.RecomputeCompany(ctx, tx, companyID, fiscalYear); err != nil {
+		return fmt.Errorf("recompute balances: %w", err)
+	}
+
+	if idempotencyKey != "" {
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	logger.Info("recomputed balances")
+	return nil
 }
 
 // --------------------------------------------------------------------------
-// Reporting methods
+// Reporting (read-only, no idempotency)
 // --------------------------------------------------------------------------
 func (s *ledgerService) ComputeTrialBalance(ctx context.Context, companyID uuid.UUID, from, to time.Time) ([]*repository.TrialBalanceRow, error) {
 	return s.ledgerRepo.ComputeTrialBalance(ctx, s.pgClient.DB, companyID, from, to)
@@ -269,52 +328,41 @@ func (s *ledgerService) ComputePAndL(ctx context.Context, companyID uuid.UUID, f
 	return s.ledgerRepo.ComputePAndL(ctx, s.pgClient.DB, companyID, from, to)
 }
 
-// ComputeBalanceSheet returns assets, liabilities, equity and appends current year earnings (YTD net profit)
 func (s *ledgerService) ComputeBalanceSheet(ctx context.Context, companyID uuid.UUID, asOf time.Time) ([]*repository.BalanceSheetRow, error) {
-	// 1. Get the base balance sheet (real accounts)
 	rows, err := s.ledgerRepo.ComputeBalanceSheet(ctx, s.pgClient.DB, companyID, asOf)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Fetch fiscal year start month
 	startMonth, err := s.ledgerRepo.GetFiscalYearStartMonth(ctx, s.pgClient.DB, companyID)
 	if err != nil {
-		s.logger.Warn("failed to get fiscal year start month, skipping current year earnings", zap.Error(err))
-		return rows, nil // fallback: return without synthetic row
+		s.logger.Warn("failed to get fiscal year start month", zap.Error(err))
+		return rows, nil
 	}
 
-	// 3. Determine fiscal year start date based on asOf
 	fiscalYear := asOf.Year()
 	fiscalStart := time.Date(fiscalYear, time.Month(startMonth), 1, 0, 0, 0, 0, time.UTC)
 	if asOf.Before(fiscalStart) {
 		fiscalYear--
 		fiscalStart = time.Date(fiscalYear, time.Month(startMonth), 1, 0, 0, 0, 0, time.UTC)
 	}
-
-	// 4. Compute YTD net profit (inclusive of asOf date)
-	// Because ComputePAndL uses "entry_date < $3", we pass asOf+1 day to include asOf.
 	asOfInclusive := asOf.AddDate(0, 0, 1)
 	netProfit, err := s.computeNetProfitFromFiscalStart(ctx, companyID, fiscalStart, asOfInclusive)
 	if err != nil {
-		s.logger.Warn("failed to compute net profit for balance sheet", zap.Error(err))
+		s.logger.Warn("failed to compute net profit", zap.Error(err))
 		return rows, nil
 	}
-
-	// 5. Append synthetic equity row if non-zero
 	if !netProfit.IsZero() {
 		rows = append(rows, &repository.BalanceSheetRow{
-			AccountID:   uuid.Nil, // sentinel
+			AccountID:   uuid.Nil,
 			AccountName: "Current Year Earnings",
 			AccountType: "equity",
 			Amount:      netProfit,
 		})
 	}
-
 	return rows, nil
 }
 
-// computeNetProfitFromFiscalStart returns YTD net profit (revenue - expense) for interval [fiscalStart, toExclusive)
 func (s *ledgerService) computeNetProfitFromFiscalStart(ctx context.Context, companyID uuid.UUID, fiscalStart, toExclusive time.Time) (decimal.Decimal, error) {
 	pnlRows, err := s.ledgerRepo.ComputePAndL(ctx, s.pgClient.DB, companyID, fiscalStart, toExclusive)
 	if err != nil {
@@ -341,7 +389,7 @@ func (s *ledgerService) CheckImbalance(ctx context.Context, companyID uuid.UUID,
 		return err
 	}
 	if imbalance {
-		return fmt.Errorf("ledger imbalance detected: total debit=%s, total credit=%s", debit, credit)
+		return fmt.Errorf("ledger imbalance: debit=%s, credit=%s", debit, credit)
 	}
 	return nil
 }
@@ -351,7 +399,7 @@ func (s *ledgerService) UpdateRunningBalances(ctx context.Context, companyID, ac
 }
 
 // --------------------------------------------------------------------------
-// Helper: get fiscal year/period from company settings
+// Helper
 // --------------------------------------------------------------------------
 func (s *ledgerService) getFiscalPeriod(ctx context.Context, companyID uuid.UUID, date time.Time) (int, int, error) {
 	return s.settingsRepo.GetFiscalYear(ctx, s.pgClient.DB, companyID, date)

@@ -39,7 +39,7 @@ type createJournalRequest struct {
 	Description *string              `json:"description,omitempty"`
 	Lines       []journalLineRequest `json:"lines"`
 	SourceType  *string              `json:"source_type,omitempty"`
-	SourceID    *uuid.UUID           `json:"source_id,omitempty"`
+	SourceID    *string              `json:"source_id,omitempty"` // ✅ new
 }
 
 type journalLineRequest struct {

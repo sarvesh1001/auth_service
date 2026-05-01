@@ -187,17 +187,18 @@ func (r *taxTransactionRepository) scanTaxTransaction(scanner interface {
 // Create inserts a single tax transaction.
 func (r *taxTransactionRepository) Create(ctx context.Context, db DBTX, t *tax.TaxTransaction) error {
 	query := `
-		INSERT INTO accounting.tax_transactions (
-			tax_transaction_id, company_id, transaction_type, transaction_id,
-			tax_rule_id, tax_rate_id, taxable_amount, tax_amount,
-			currency, exchange_rate, transaction_date, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-	`
-	_, err := db.ExecContext(ctx, query,
+        INSERT INTO accounting.tax_transactions (
+            tax_transaction_id, company_id, transaction_type, transaction_id,
+            tax_rule_id, tax_rate_id, taxable_amount, tax_amount,
+            currency, exchange_rate, transaction_date, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+        RETURNING base_currency_amount
+    `
+	err := db.QueryRowContext(ctx, query,
 		t.TaxTransactionID, t.CompanyID, t.TransactionType, t.TransactionID,
 		t.TaxRuleID, t.TaxRateID, t.TaxableAmount, t.TaxAmount,
 		t.Currency, t.ExchangeRate, t.TransactionDate,
-	)
+	).Scan(&t.BaseCurrencyAmount)
 	if err != nil {
 		r.logger.Error("failed to create tax transaction",
 			util.String("company_id", t.CompanyID.String()),
