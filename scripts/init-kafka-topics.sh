@@ -3,7 +3,7 @@
 # File: scripts/init-kafka-topics.sh
 # Purpose: Create only the Kafka topics actually used
 #          after consolidating all academic events
-#          into "academics-events".
+#          into "academics-events" and adding inventory.
 # ===============================================
 
 set -e
@@ -105,6 +105,9 @@ declare -A TOPIC_CONFIGS=(
     # Accounting module (separate, not part of academics)
     ["accounting-events"]="3 1 2592000000 gzip"
 
+    # Inventory module (new)
+    ["inventory-events"]="3 1 2592000000 gzip"
+
     # Time‑series / analytics events (consumed by ClickHouse)
     ["device-events"]="3 1 2592000000 gzip"
     ["mpin-events"]="3 1 2592000000 gzip"
@@ -116,9 +119,10 @@ declare -A TOPIC_CONFIGS=(
     # Audit logs (optional, can be removed if not used)
     ["audit-logs"]="3 1 2592000000 gzip"
 
-    # Dead Letter Queue for the unified academic topic
+    # Dead Letter Queues
     ["academics-events.dlq"]="3 1 604800000 gzip"
     ["accounting-events.dlq"]="3 1 604800000 gzip"
+    ["inventory-events.dlq"]="3 1 604800000 gzip"
 )
 
 FAILED_TOPICS=()
@@ -167,6 +171,10 @@ echo "📊 Accounting:"
 check_topic "accounting-events"
 
 echo ""
+echo "📦 Inventory:"
+check_topic "inventory-events"
+
+echo ""
 echo "📈 Time‑Series / Analytics:"
 for t in "device-events" "mpin-events" "otp-events" "security-events" "audit-logs"; do check_topic $t; done
 
@@ -174,6 +182,7 @@ echo ""
 echo "⚠️ DLQ Topics:"
 check_topic "academics-events.dlq"
 check_topic "accounting-events.dlq"
+check_topic "inventory-events.dlq"
 
 echo ""
 

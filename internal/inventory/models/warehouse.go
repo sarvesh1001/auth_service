@@ -17,4 +17,12 @@ type Warehouse struct {
 	UpdatedAt   time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy   *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+
+	// New fields (already present)
+	LocationID         *uuid.UUID `gorm:"type:uuid" json:"locationId,omitempty"`
+	WarehouseType      *string    `gorm:"type:varchar(50)" json:"warehouseType,omitempty"`
+	AllowNegativeStock bool       `gorm:"not null;default:false" json:"allowNegativeStock"`
+
+	// Missing field – now added
+	IsDefault bool `gorm:"not null;default:false" json:"isDefault"`
 }

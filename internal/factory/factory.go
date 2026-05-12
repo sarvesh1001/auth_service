@@ -27,6 +27,7 @@ import (
 	hrpostgres "auth-service/internal/hr/repository"
 	hrservice "auth-service/internal/hr/service"
 	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/inventory"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
@@ -235,6 +236,7 @@ type Factory struct {
 	accountingInfra                   *AccountingInfraFactory // <-- ADD THIS
 	analyticsConsumer                 *consumer.AnalyticsConsumer
 	analyticsConsumerCancel           context.CancelFunc
+	inventoryInfra                    *InventoryInfraFactory // new field
 	studentConsumer                   *consumer.StudentConsumer
 	studentConsumerCancel             context.CancelFunc
 	accountingConsumer                *consumer.AccountingConsumer
@@ -370,6 +372,22 @@ func NewFactory() (*Factory, error) {
 	}
 	f.accountingInfra = accountingInfra
 
+	// ============================================================
+	// NEW: Initialize Inventory Infrastructure Factory
+	// ============================================================
+	inventoryInfra, err := NewInventoryInfraFactory(
+		f.PostgresClient(),
+		f.RedisClient(),
+		f.KafkaProducer(),
+		&kafkaEventPublisher{producer: f.KafkaProducer()},
+		f.GetAuditService(),
+		f.logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize inventory infra factory: %w", err)
+	}
+	f.inventoryInfra = inventoryInfra
+
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
 		logger.Error("failed to initialize Kafka logging", zap.Error(err))
@@ -495,8 +513,8 @@ func NewFactory() (*Factory, error) {
 				f.accountingInfra.AccountingAnalyticsService(),
 				f.accountingInfra.ComplianceAnalyticsService(),
 				f.accountingInfra.TaxAnalyticsService(),
-				f.accountingInfra.AnalyticsRepo(), // ✅ repository for idempotency
-				f.postgresClient.DB,               // ✅ *sql.DB for transactions
+				f.accountingInfra.AnalyticsRepo(), // repository for idempotency
+				f.postgresClient.DB,               // *sql.DB for transactions
 				f.logger,
 				accountingKafkaConsumer,
 				accountingTopic,
@@ -929,6 +947,9 @@ func (f *Factory) PayrollLockService() payrollsvc.PayrollLockService {
 		)
 	}
 	return f.payrollLockSvc
+}
+func (f *Factory) GetInventoryHandlers() *inventory.InventoryHandlers {
+	return f.inventoryInfra.InventoryHandlers()
 }
 
 func (f *Factory) StatutoryProfileService() payrollsvc.StatutoryProfileService {
@@ -2842,7 +2863,7 @@ func (f *Factory) InitializeHandlers() error {
 
 	// Build accounting handlers struct
 	accountingHandlers := &accounting.AccountingHandlers{
-		AccountHandler:            f.accountingInfra.AccountHandler(), // ✅ ADD THIS
+		AccountHandler:            f.accountingInfra.AccountHandler(),
 		LedgerHandler:             f.accountingInfra.LedgerHandler(),
 		ReconciliationHandler:     f.accountingInfra.ReconciliationHandler(),
 		ReportHandler:             f.accountingInfra.ReportHandler(),
@@ -2850,9 +2871,13 @@ func (f *Factory) InitializeHandlers() error {
 		JournalHandler:            f.accountingInfra.JournalHandler(),
 		TaxHandler:                f.accountingInfra.TaxHandler(),
 		AccountingSettingsHandler: f.accountingInfra.AccountingSettingsHandler(),
-		AnalyticsHandler:          f.accountingInfra.AnalyticsHandler(),  // ✅ ADD THIS LINE
-		PeriodLockHandler:         f.accountingInfra.PeriodLockHandler(), // 👈 NEW
+		AnalyticsHandler:          f.accountingInfra.AnalyticsHandler(),
+		PeriodLockHandler:         f.accountingInfra.PeriodLockHandler(),
 	}
+
+	// Retrieve inventory handlers from the inventory infrastructure factory
+	inventoryHandlers := f.GetInventoryHandlers() // <-- NEW
+
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
@@ -2906,10 +2931,11 @@ func (f *Factory) InitializeHandlers() error {
 		reportingHandler,
 		taxDeclarationHandler,
 		academicHandlers,
-		accountingHandlers, // <-- NEW: accounting handlers as last argument
+		accountingHandlers,
+		inventoryHandlers, // <-- NEW (last argument)
 	)
 
-	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, and accounting systems")
+	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, and inventory systems")
 	return nil
 }
 
@@ -3045,6 +3071,11 @@ func (f *Factory) Close() error {
 		// Close accounting infra (outbox processor)
 		if f.accountingInfra != nil {
 			f.accountingInfra.Close()
+		}
+
+		// Close inventory infra (outbox processor)
+		if f.inventoryInfra != nil {
+			f.inventoryInfra.Close()
 		}
 
 		if f.postgresClient != nil {

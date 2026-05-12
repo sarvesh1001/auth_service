@@ -16,6 +16,7 @@ import (
 	middle "auth-service/internal/hr/middleware"
 	payrollhandler "auth-service/internal/hr/payroll/handler"
 	a "auth-service/internal/infrastructure/audit"
+	"auth-service/internal/inventory"
 	authMiddleware "auth-service/internal/middleware"
 	"auth-service/internal/service"
 
@@ -111,6 +112,7 @@ func NewRouter(
 	// ACADEMIC HANDLERS (grouped)
 	academicHandlers *AcademicHandlers,
 	accountingHandlers *accounting.AccountingHandlers, // <-- NEW
+	inventoryHandlers *inventory.InventoryHandlers,
 ) chi.Router {
 	router := chi.NewRouter()
 
@@ -1373,6 +1375,7 @@ func NewRouter(
 					academicHandlers.StudentBiometricSyncHandler,
 				)
 				accounting.RegisterAccountingRoutes(r, accountingHandlers, logger, jwtService)
+				inventory.RegisterInventoryRoutes(r, inventoryHandlers, logger, jwtService)
 
 				// NOTE: The student biometric sync routes have been moved OUTSIDE the JWT group,
 				// to the public device-authenticated section (above the student login route).

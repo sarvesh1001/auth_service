@@ -9,27 +9,28 @@ import (
 	"go.uber.org/zap"
 )
 
+// Processor publishes outbox events to Kafka using topic from DB.
 type Processor struct {
 	repo      Repository
 	producer  *client.KafkaProducer
 	logger    *zap.Logger
 	batchSize int
-	topic     string // single topic for all events
 }
 
-// NewProcessor creates a new outbox processor.
-// topic: the Kafka topic to publish all events to (e.g., "academics-events").
-func NewProcessor(repo Repository, producer *client.KafkaProducer, logger *zap.Logger, topic string) *Processor {
+func NewProcessor(
+	repo Repository,
+	producer *client.KafkaProducer,
+	logger *zap.Logger,
+) *Processor {
 	return &Processor{
 		repo:      repo,
 		producer:  producer,
 		logger:    logger,
 		batchSize: 50,
-		topic:     topic,
 	}
 }
 
-// Start begins polling the outbox table and publishing events.
+// Start polling loop
 func (p *Processor) Start(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -52,16 +53,21 @@ func (p *Processor) processBatch(ctx context.Context) {
 	}
 
 	for _, e := range events {
-		// Prepare headers: include event type, aggregate type, etc.
+
+		// 🔥 USE topic from DB (NO routing logic)
+		topic := e.Topic
+
+		// Prepare headers
 		headers := make(map[string]string)
 		if e.Headers != nil {
-			// Copy existing headers if any
 			for k, v := range e.Headers {
 				headers[k] = v
 			}
 		}
-		// Add event type header (required by consumer)
+
+		headers["event_id"] = e.EventID
 		headers["event_type"] = e.EventType
+
 		if e.AggregateType != "" {
 			headers["aggregate_type"] = e.AggregateType
 		}
@@ -71,8 +77,8 @@ func (p *Processor) processBatch(ctx context.Context) {
 
 		err := p.producer.ProduceMessage(
 			ctx,
-			p.topic,               // single topic
-			[]byte(e.AggregateID), // message key (optional)
+			topic,
+			[]byte(e.AggregateID), // partition key
 			e.Payload,
 			headers,
 		)
@@ -80,15 +86,15 @@ func (p *Processor) processBatch(ctx context.Context) {
 		if err != nil {
 			p.logger.Error("failed to publish event",
 				zap.String("event_id", e.EventID),
+				zap.String("topic", topic),
 				zap.String("event_type", e.EventType),
 				zap.Error(err),
 			)
-			// Increment retry count
+
 			_ = p.repo.MarkFailed(ctx, e.EventID, e.RetryCount+1)
 			continue
 		}
 
-		// Mark as processed
 		_ = p.repo.MarkProcessed(ctx, e.EventID)
 	}
 }
@@ -110,7 +116,9 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 	return &PostgresRepository{db: db}
 }
 
+// ============================================================
 // Store inside TX
+// ============================================================
 func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event) error {
 	// Validate required fields
 	if event.EventID == "" {
@@ -119,17 +127,17 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 	if event.AggregateType == "" {
 		return errors.New("aggregate_type cannot be empty")
 	}
-	if event.AggregateID == "" {
-		return errors.New("aggregate_id cannot be empty")
-	}
 	if event.EventType == "" {
 		return errors.New("event_type cannot be empty")
+	}
+	if event.Topic == "" {
+		return errors.New("topic cannot be empty") // 🔥 NEW
 	}
 	if len(event.Payload) == 0 {
 		return errors.New("payload cannot be empty")
 	}
 
-	// Marshal headers (nil becomes JSON null)
+	// Marshal headers
 	var headers []byte
 	var err error
 	if event.Headers == nil {
@@ -143,14 +151,24 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO outbox.events (
-			event_id, aggregate_type, aggregate_id,
-			event_type, payload, headers
-		) VALUES ($1,$2,$3,$4,$5,$6)
+			event_id,
+			aggregate_type,
+			aggregate_id,
+			event_type,
+			topic,              -- 🔥 NEW
+			payload,
+			headers,
+			status,
+			retry_count,
+			created_at
+		)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,NOW())
 	`,
 		event.EventID,
 		event.AggregateType,
 		event.AggregateID,
 		event.EventType,
+		event.Topic, // 🔥 NEW
 		event.Payload,
 		headers,
 	)
@@ -158,11 +176,21 @@ func (r *PostgresRepository) Store(ctx context.Context, tx *sql.Tx, event *Event
 	return err
 }
 
+// ============================================================
 // Fetch pending events
+// ============================================================
 func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Event, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT event_id, aggregate_type, aggregate_id,
-		       event_type, payload, headers, retry_count
+		SELECT 
+			event_id,
+			aggregate_type,
+			aggregate_id,
+			event_type,
+			topic,              -- 🔥 NEW
+			payload,
+			headers,
+			retry_count,
+			created_at
 		FROM outbox.events
 		WHERE status = 'pending'
 		ORDER BY created_at
@@ -184,17 +212,18 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 			&e.AggregateType,
 			&e.AggregateID,
 			&e.EventType,
+			&e.Topic, // 🔥 NEW
 			&e.Payload,
 			&headers,
 			&e.RetryCount,
+			&e.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 
-		// Unmarshal headers (if present)
+		// Unmarshal headers
 		if len(headers) > 0 && string(headers) != "null" {
 			if err := json.Unmarshal(headers, &e.Headers); err != nil {
-				// Log but continue with empty headers
 				e.Headers = make(map[string]string)
 			}
 		} else {
@@ -207,30 +236,45 @@ func (r *PostgresRepository) FetchPending(ctx context.Context, limit int) ([]*Ev
 	return events, nil
 }
 
+// ============================================================
 // Mark processed
+// ============================================================
 func (r *PostgresRepository) MarkProcessed(ctx context.Context, eventID string) error {
 	if eventID == "" {
 		return errors.New("event_id cannot be empty")
 	}
+
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE outbox.events
-		SET status = 'processed', processed_at = NOW()
+		SET status = 'processed',
+		    processed_at = NOW()
 		WHERE event_id = $1
 	`, eventID)
 
 	return err
 }
 
-// Mark failed
+// ============================================================
+// Mark failed (with retry)
+// ============================================================
 func (r *PostgresRepository) MarkFailed(ctx context.Context, eventID string, retryCount int) error {
 	if eventID == "" {
 		return errors.New("event_id cannot be empty")
 	}
+
+	status := "pending"
+
+	// optional: move to failed after max retries
+	if retryCount >= 5 {
+		status = "failed"
+	}
+
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE outbox.events
-		SET retry_count = $2
+		SET retry_count = $2,
+		    status = $3
 		WHERE event_id = $1
-	`, eventID, retryCount)
+	`, eventID, retryCount, status)
 
 	return err
 }
@@ -244,6 +288,7 @@ type Event struct {
 	AggregateType string
 	AggregateID   string
 	EventType     string
+	Topic         string // 🔥 NEW
 	Payload       []byte
 	Headers       map[string]string
 	Status        string
@@ -441,6 +486,12 @@ func (r *RedisCache) Set(ctx context.Context, key string, value interface{}) err
 
 	return r.client.Set(ctx, key, data, r.ttl)
 }
+
+package idempotency
+
+import "errors"
+
+var ErrKeyNotFound = errors.New("idempotency key not found")
 
 package audit
 

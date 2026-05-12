@@ -1,0 +1,213 @@
+🔥 CONSTRUCTOR INDEX (FOR FACTORY)
+================================================================================
+
+📦 Constructor: NewStockHandler
+📁 File: ./handler/stock_handler.go
+🔧 Params: (stockService service.StockService, queryService service.InventoryQueryService, movementService service.MovementService, logger *zap.Logger,)
+🎯 Returns: *StockHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewValuationHandler
+📁 File: ./handler/valuation_handler.go
+🔧 Params: (valuationService service.ValuationService, logger *zap.Logger)
+🎯 Returns: *ValuationHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewItemHandler
+📁 File: ./handler/item_handler.go
+🔧 Params: (itemService ItemApplicationService, logger *zap.Logger)
+🎯 Returns: *ItemHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewBOMHandler
+📁 File: ./handler/bom_handler.go
+🔧 Params: (bomService BOMService, logger *zap.Logger)
+🎯 Returns: *BOMHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewProductionHandler
+📁 File: ./handler/production_handler.go
+🔧 Params: (prodService service.ProductionService, logger *zap.Logger)
+🎯 Returns: *ProductionHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewWarehouseHandler
+📁 File: ./handler/warehouse_handler.go
+🔧 Params: (warehouseService service.WarehouseService, logger *zap.Logger)
+🎯 Returns: *WarehouseHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewMovementHandler
+📁 File: ./handler/movement_handler.go
+🔧 Params: (movementService service.MovementService, logger *zap.Logger)
+🎯 Returns: *MovementHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReportHandler
+📁 File: ./handler/report_handler.go
+🔧 Params: (querySvc service.InventoryQueryService, valuationSvc service.ValuationService, analyticsSvc service.InventoryAnalyticsService, logger *zap.Logger,)
+🎯 Returns: *ReportHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReorderHandler
+📁 File: ./handler/reorder_handler.go
+🔧 Params: (reorderService service.ReorderService, repo repository.ReorderOrderRepository, db *sql.DB, logger *zap.Logger,)
+🎯 Returns: *ReorderHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewBatchHandler
+📁 File: ./handler/batch_handler.go
+🔧 Params: (inventorySvc service.InventoryService, batchRepo repository.BatchRepository, pgClient *client.PostgresClient, logger *zap.Logger,)
+🎯 Returns: *BatchHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewInventoryQueryHandler
+📁 File: ./handler/inventory_query_handler.go
+🔧 Params: (querySvc service.InventoryQueryService, logger *zap.Logger)
+🎯 Returns: *InventoryQueryHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewAdjustmentHandler
+📁 File: ./handler/adjustment_handler.go
+🔧 Params: (stockService service.StockService, movementService service.MovementService, logger *zap.Logger,)
+🎯 Returns: *AdjustmentHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReservationHandler
+📁 File: ./handler/reservation_handler.go
+🔧 Params: (reservationSvc service.ReservationService, reservationRepo repository.ReservationRepository, pgClient *client.PostgresClient, logger *zap.Logger,)
+🎯 Returns: *ReservationHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewAnalyticsHandler
+📁 File: ./handler/analytics_handler.go
+🔧 Params: (analyticsService AnalyticsQueryService, logger *zap.Logger)
+🎯 Returns: *AnalyticsHandler
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewItemRepository
+📁 File: ./repository/item_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: ItemRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewStockLedgerRepository
+📁 File: ./repository/stock_ledger_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: StockLedgerRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewProductionOrderRepository
+📁 File: ./repository/production_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: ProductionOrderRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewStockBalanceRepository
+📁 File: ./repository/stock_balance_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: StockBalanceRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewBatchRepository
+📁 File: ./repository/batch_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: BatchRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewBOMRepository
+📁 File: ./repository/bom_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: BOMRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewMovementRepository
+📁 File: ./repository/movement_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: MovementRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewInventoryAnalysisRepository
+📁 File: ./repository/analysis_repo.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: InventoryAnalysisRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReorderOrderRepository
+📁 File: ./repository/reorder_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: ReorderOrderRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewWarehouseRepository
+📁 File: ./repository/warehouse_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: WarehouseRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReservationRepository
+📁 File: ./repository/reservation_repository.go
+🔧 Params: (logger *zap.Logger)
+🎯 Returns: ReservationRepository
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewInventoryService
+📁 File: ./service/inventory_service.go
+🔧 Params: (itemRepo repository.ItemRepository, movementRepo repository.MovementRepository, balanceRepo repository.StockBalanceRepository, ledgerRepo repository.StockLedgerRepository, batchRepo repository.BatchRepository, pgClient *client.PostgresClient, outboxRepo outbox.Repository, idempotencyStore idempotency.Store, auditService *audit.AuditService, logger *zap.Logger,)
+🎯 Returns: InventoryService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewValuationService
+📁 File: ./service/valuation_service.go
+🔧 Params: (itemRepo repository.ItemRepository, balanceRepo repository.StockBalanceRepository, ledgerRepo repository.StockLedgerRepository, movementRepo repository.MovementRepository, batchRepo repository.BatchRepository, pgClient *client.PostgresClient, logger *zap.Logger,)
+🎯 Returns: ValuationService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewStockService
+📁 File: ./service/stock_service.go
+🔧 Params: (balanceRepo repository.StockBalanceRepository, ledgerRepo repository.StockLedgerRepository, batchRepo repository.BatchRepository, movementRepo repository.MovementRepository, itemRepo repository.ItemRepository, warehouseRepo repository.WarehouseRepository, pgClient *client.PostgresClient, outboxRepo outbox.Repository, idempotencyStore idempotency.Store, auditService *audit.AuditService, logger *zap.Logger,)
+🎯 Returns: StockService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewMovementService
+📁 File: ./service/movement_service.go
+🔧 Params: (movementRepo repository.MovementRepository, balanceRepo repository.StockBalanceRepository, ledgerRepo repository.StockLedgerRepository, reservationRepo repository.ReservationRepository, // new reservationSvc ReservationService, // new pgClient *client.PostgresClient, outboxRepo outbox.Repository, idempotency idempotency.Store, audit *audit.AuditService, logger *zap.Logger,)
+🎯 Returns: MovementService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewWarehouseService
+📁 File: ./service/warehouse_service.go
+🔧 Params: (warehouseRepo repository.WarehouseRepository, pgClient *client.PostgresClient, outboxRepo outbox.Repository, idempotencyStore idempotency.Store, auditService *audit.AuditService, logger *zap.Logger,)
+🎯 Returns: WarehouseService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewProductionService
+📁 File: ./service/production_service.go
+🔧 Params: (prodRepo repository.ProductionOrderRepository, movementRepo repository.MovementRepository, balanceRepo repository.StockBalanceRepository, ledgerRepo repository.StockLedgerRepository, bomRepo repository.BOMRepository, itemRepo repository.ItemRepository, outboxRepo outbox.Repository, idempotency idempotency.Store, audit *audit.AuditService, pgClient *client.PostgresClient, logger *zap.Logger,)
+🎯 Returns: ProductionService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewInventoryQueryService
+📁 File: ./service/inventory_query_service.go
+🔧 Params: (db repository.DBTX, balanceRepo repository.StockBalanceRepository, movementRepo repository.MovementRepository, itemRepo repository.ItemRepository, batchRepo repository.BatchRepository, warehouseRepo repository.WarehouseRepository, reservationRepo repository.ReservationRepository, logger *zap.Logger,)
+🎯 Returns: InventoryQueryService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReorderService
+📁 File: ./service/reorder_service.go
+🔧 Params: (itemRepo repository.ItemRepository, reorderRepo repository.ReorderOrderRepository, balanceRepo repository.StockBalanceRepository, pgClient *client.PostgresClient, outboxRepo outbox.Repository, idempotencyStore idempotency.Store, auditService *audit.AuditService, logger *zap.Logger,)
+🎯 Returns: ReorderService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewReservationService
+📁 File: ./service/reservation_service.go
+🔧 Params: (reservationRepo repository.ReservationRepository, balanceRepo repository.StockBalanceRepository, pgClient *client.PostgresClient, outboxRepo outbox.Repository, idempotencyStore idempotency.Store, auditService *audit.AuditService, logger *zap.Logger,)
+🎯 Returns: ReservationService
+--------------------------------------------------------------------------------
+
+📦 Constructor: NewInventoryAnalyticsService
+📁 File: ./service/analysis_service.go
+🔧 Params: (snapshotRepo repository.InventoryAnalysisRepository, movementRepo repository.MovementRepository, balanceRepo repository.StockBalanceRepository, ledgerRepo repository.StockLedgerRepository, reorderSvc ReorderService, // new parameter pgClient *client.PostgresClient, logger *zap.Logger,)
+🎯 Returns: InventoryAnalyticsService
+--------------------------------------------------------------------------------
+

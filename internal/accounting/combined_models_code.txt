@@ -83,8 +83,8 @@ type JournalEntry struct {
 
 	ReversalOf *uuid.UUID `db:"reversal_of" json:"reversal_of,omitempty"`
 
-	SourceType *string    `db:"source_type" json:"source_type,omitempty"`
-	SourceID   *uuid.UUID `db:"source_id" json:"source_id,omitempty"`
+	SourceType *string `db:"source_type" json:"source_type,omitempty"`
+	SourceID   *string `db:"source_id" json:"source_id,omitempty"`
 
 	CreatedAt time.Time  `db:"created_at" json:"created_at"`
 	PostedAt  *time.Time `db:"posted_at" json:"posted_at,omitempty"`

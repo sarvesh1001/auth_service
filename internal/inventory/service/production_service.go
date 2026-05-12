@@ -1,0 +1,618 @@
+package service
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
+	"auth-service/internal/inventory/events"
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/inventory/models/enums"
+	"auth-service/internal/inventory/repository"
+)
+
+var allowedTransitions = map[string][]string{
+	"draft":     {"released", "cancelled"},
+	"released":  {"started", "cancelled"},
+	"started":   {"completed", "cancelled"},
+	"completed": {},
+	"cancelled": {},
+}
+
+func isValidStatusTransition(current, next string) bool {
+	allowed, ok := allowedTransitions[current]
+	if !ok {
+		return false
+	}
+	for _, s := range allowed {
+		if s == next {
+			return true
+		}
+	}
+	return false
+}
+
+type ProductionService interface {
+	CreateProductionOrder(ctx context.Context, req CreateProductionOrderRequest, idempotencyKey string) (*models.ProductionOrder, error)
+	ReleaseProductionOrder(ctx context.Context, orderID, companyID uuid.UUID, releasedBy *uuid.UUID, idempotencyKey string) error
+	StartProduction(ctx context.Context, orderID, companyID uuid.UUID, startedBy *uuid.UUID, idempotencyKey string) error
+	CompleteProduction(ctx context.Context, req CompleteProductionRequest, idempotencyKey string) error
+	CancelProductionOrder(ctx context.Context, req CancelProductionOrderRequest, idempotencyKey string) error
+	GetProductionOrder(ctx context.Context, orderID, companyID uuid.UUID) (*models.ProductionOrder, error)
+	ListProductionOrders(ctx context.Context, filter repository.ProductionOrderFilter, page, pageSize int) ([]*models.ProductionOrder, int64, error)
+}
+
+type CreateMovementRequest struct {
+	CompanyID       uuid.UUID
+	MovementType    enums.MovementType
+	MovementDate    time.Time
+	WarehouseID     uuid.UUID
+	FromWarehouseID *uuid.UUID
+	ItemID          uuid.UUID
+	BatchID         *uuid.UUID
+	QuantityIn      decimal.Decimal
+	QuantityOut     decimal.Decimal
+	UnitCost        decimal.Decimal
+	Reason          *string
+	ReferenceType   *string
+	ReferenceID     *uuid.UUID
+	CreatedBy       *uuid.UUID
+	Status          string
+	ReservationID   *uuid.UUID
+	ShipmentID      *uuid.UUID
+	TransferOrderID *uuid.UUID
+}
+
+func stringPtr(s string) *string {
+	return &s
+}
+
+type productionService struct {
+	prodRepo     repository.ProductionOrderRepository
+	bomRepo      repository.BOMRepository
+	itemRepo     repository.ItemRepository
+	batchRepo    repository.BatchRepository // added for batch picking
+	stockService StockService               // added for batch picking
+	inventorySvc InventoryService
+	outboxRepo   outbox.Repository
+	idempotency  idempotency.Store
+	audit        *audit.AuditService
+	pgClient     *client.PostgresClient
+	logger       *zap.Logger
+}
+
+func NewProductionService(
+	prodRepo repository.ProductionOrderRepository,
+	bomRepo repository.BOMRepository,
+	itemRepo repository.ItemRepository,
+	batchRepo repository.BatchRepository, // new param
+	stockService StockService, // new param
+	inventorySvc InventoryService,
+	outboxRepo outbox.Repository,
+	idempotency idempotency.Store,
+	audit *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+) ProductionService {
+	return &productionService{
+		prodRepo:     prodRepo,
+		bomRepo:      bomRepo,
+		itemRepo:     itemRepo,
+		batchRepo:    batchRepo,
+		stockService: stockService,
+		inventorySvc: inventorySvc,
+		outboxRepo:   outboxRepo,
+		idempotency:  idempotency,
+		audit:        audit,
+		pgClient:     pgClient,
+		logger:       logger.Named("production_service"),
+	}
+}
+
+type CreateProductionOrderRequest struct {
+	CompanyID           uuid.UUID
+	OrderNumber         string
+	ProductItemID       uuid.UUID
+	BOMID               uuid.UUID
+	PlannedQuantity     decimal.Decimal
+	PlannedStartDate    *time.Time
+	PlannedEndDate      *time.Time
+	WarehouseID         uuid.UUID
+	CreatedBy           *uuid.UUID
+	SourceReferenceType *string
+	SourceReferenceID   *uuid.UUID
+}
+
+type CompleteProductionRequest struct {
+	ProductionOrderID   uuid.UUID
+	CompanyID           uuid.UUID
+	ProducedQuantity    decimal.Decimal
+	CompletedBy         *uuid.UUID
+	ComponentQuantities map[uuid.UUID]decimal.Decimal
+}
+
+type CancelProductionOrderRequest struct {
+	ProductionOrderID uuid.UUID
+	CompanyID         uuid.UUID
+	Reason            string
+	CancelledBy       *uuid.UUID
+}
+
+func (s *productionService) CreateProductionOrder(ctx context.Context, req CreateProductionOrderRequest, idempotencyKey string) (*models.ProductionOrder, error) {
+	logger := s.logger.With(zap.String("method", "CreateProductionOrder"), zap.String("key", idempotencyKey))
+
+	if err := s.validateCreateOrder(req); err != nil {
+		return nil, err
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var cached *models.ProductionOrder
+	if err := s.idempotency.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent request – returning cached order")
+		return cached, nil
+	}
+
+	existing, _ := s.prodRepo.GetByOrderNumber(ctx, tx, req.CompanyID, req.OrderNumber)
+	if existing != nil {
+		return nil, fmt.Errorf("%w: order number %s already exists", inventory_errors.ErrDuplicate, req.OrderNumber)
+	}
+
+	bom, err := s.bomRepo.GetBOMByIDAndCompany(ctx, tx, req.BOMID, req.CompanyID)
+	if err != nil {
+		if errors.Is(err, inventory_errors.ErrNotFound) {
+			return nil, fmt.Errorf("%w: BOM not found", inventory_errors.ErrInvalidInput)
+		}
+		return nil, fmt.Errorf("get BOM: %w", err)
+	}
+	if !bom.IsActive {
+		return nil, fmt.Errorf("%w: BOM %s is inactive", inventory_errors.ErrInactiveBOM, bom.BOMID)
+	}
+
+	order := &models.ProductionOrder{
+		ProductionOrderID:   uuid.New(),
+		CompanyID:           req.CompanyID,
+		OrderNumber:         req.OrderNumber,
+		ProductItemID:       req.ProductItemID,
+		BOMID:               req.BOMID,
+		PlannedQuantity:     req.PlannedQuantity,
+		ProducedQuantity:    decimal.Zero,
+		Status:              "draft",
+		PlannedStartDate:    req.PlannedStartDate,
+		PlannedEndDate:      req.PlannedEndDate,
+		WarehouseID:         req.WarehouseID,
+		CreatedBy:           req.CreatedBy,
+		SourceReferenceType: req.SourceReferenceType,
+		SourceReferenceID:   req.SourceReferenceID,
+	}
+	if err := s.prodRepo.Create(ctx, tx, order); err != nil {
+		return nil, fmt.Errorf("create order: %w", err)
+	}
+	if err := s.createPlannedComponents(ctx, tx, order); err != nil {
+		logger.Warn("failed to store planned components", zap.Error(err))
+	}
+	if err := s.emitProductionEvent(ctx, tx, order, events.EventProductionOrderCreated); err != nil {
+		logger.Warn("failed to emit creation event", zap.Error(err))
+	}
+	_ = s.idempotency.Store(ctx, tx, idempotencyKey, order)
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	if s.audit != nil {
+		_ = s.audit.LogAction(ctx, nil, &req.CompanyID, "inventory", "create_production_order", "production_order",
+			&order.ProductionOrderID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"order_number": order.OrderNumber,
+				"planned_qty":  order.PlannedQuantity,
+			})
+	}
+	return order, nil
+}
+
+func (s *productionService) ReleaseProductionOrder(ctx context.Context, orderID, companyID uuid.UUID, releasedBy *uuid.UUID, idempotencyKey string) error {
+	return s.updateOrderStatus(ctx, orderID, companyID, "released", releasedBy, idempotencyKey, events.EventProductionOrderReleased)
+}
+
+func (s *productionService) StartProduction(ctx context.Context, orderID, companyID uuid.UUID, startedBy *uuid.UUID, idempotencyKey string) error {
+	s.logger.Info("StartProduction called", zap.String("order_id", orderID.String()))
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotency.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		s.logger.Info("Idempotent start request, skipping")
+		return nil
+	}
+
+	order, err := s.prodRepo.GetByID(ctx, tx, orderID, companyID)
+	if err != nil {
+		return err
+	}
+	if !isValidStatusTransition(order.Status, "started") {
+		return fmt.Errorf("%w: cannot transition from %s to started", inventory_errors.ErrInvalidTransition, order.Status)
+	}
+
+	bomItems, err := s.bomRepo.GetBOMItems(ctx, tx, order.BOMID)
+	if err != nil {
+		return fmt.Errorf("get BOM items: %w", err)
+	}
+
+	for _, bomItem := range bomItems {
+		requiredQty := bomItem.Quantity.Mul(order.PlannedQuantity)
+		if bomItem.ScrapPercentage != nil && !bomItem.ScrapPercentage.IsZero() {
+			multiplier := decimal.NewFromInt(1).Add(bomItem.ScrapPercentage.Div(decimal.NewFromInt(100)))
+			requiredQty = requiredQty.Mul(multiplier)
+		}
+		var availableQty decimal.Decimal
+		query := `SELECT COALESCE(SUM(quantity_on_hand), 0) FROM stock_balances
+                  WHERE company_id = $1 AND warehouse_id = $2 AND item_id = $3`
+		err := tx.QueryRowContext(ctx, query, companyID, order.WarehouseID, bomItem.ComponentItemID).Scan(&availableQty)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("get stock for component %s: %w", bomItem.ComponentItemID, err)
+		}
+		if availableQty.LessThan(requiredQty) {
+			return fmt.Errorf("%w: component %s requires %s, but only %s available",
+				inventory_errors.ErrInsufficientStock, bomItem.ComponentItemID, requiredQty.String(), availableQty.String())
+		}
+	}
+
+	order.Status = "started"
+	now := time.Now()
+	order.ActualStartTime = &now
+	if err := s.prodRepo.Update(ctx, tx, order); err != nil {
+		return err
+	}
+	if err := s.emitProductionEvent(ctx, tx, order, events.EventProductionOrderStarted); err != nil {
+		s.logger.Warn("failed to emit started event", zap.Error(err))
+	}
+	_ = s.idempotency.Store(ctx, tx, idempotencyKey, true)
+	return tx.Commit()
+}
+
+// CompleteProduction consumes components (with batch picking for batch-tracked items)
+// and creates the finished good movement.
+func (s *productionService) CompleteProduction(ctx context.Context, req CompleteProductionRequest, idempotencyKey string) error {
+	logger := s.logger.With(zap.String("method", "CompleteProduction"), zap.String("order_id", req.ProductionOrderID.String()))
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotency.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – completion already processed")
+		return nil
+	}
+
+	order, err := s.prodRepo.GetByID(ctx, tx, req.ProductionOrderID, req.CompanyID)
+	if err != nil {
+		return err
+	}
+	if !isValidStatusTransition(order.Status, "completed") {
+		return fmt.Errorf("%w: cannot transition from %s to completed", inventory_errors.ErrInvalidTransition, order.Status)
+	}
+	if req.ProducedQuantity.GreaterThan(order.PlannedQuantity) {
+		return fmt.Errorf("%w: produced quantity %s exceeds planned quantity %s",
+			inventory_errors.ErrInvalidProductionCompletion, req.ProducedQuantity.String(), order.PlannedQuantity.String())
+	}
+	if req.ProducedQuantity.IsZero() {
+		return fmt.Errorf("produced quantity cannot be zero")
+	}
+
+	bomComponents, err := s.bomRepo.GetBOMItems(ctx, tx, order.BOMID)
+	if err != nil {
+		return fmt.Errorf("get BOM items: %w", err)
+	}
+
+	// Prefetch item details to know which components are batch‑tracked
+	itemMap := make(map[uuid.UUID]*models.Item)
+	for _, comp := range bomComponents {
+		if _, ok := itemMap[comp.ComponentItemID]; ok {
+			continue
+		}
+		// FIX: removed the extra companyID argument
+		item, err := s.itemRepo.GetByID(ctx, tx, comp.ComponentItemID)
+		if err != nil {
+			return fmt.Errorf("get item %s: %w", comp.ComponentItemID, err)
+		}
+		itemMap[comp.ComponentItemID] = item
+	}
+
+	// Process each component
+	for _, comp := range bomComponents {
+		// Calculate required quantity based on produced quantity and scrap
+		requiredQty := comp.Quantity.Mul(req.ProducedQuantity)
+		if comp.ScrapPercentage != nil && !comp.ScrapPercentage.IsZero() {
+			multiplier := decimal.NewFromInt(1).Add(comp.ScrapPercentage.Div(decimal.NewFromInt(100)))
+			requiredQty = requiredQty.Mul(multiplier)
+		}
+		// Override with explicit quantity if provided in request
+		if actual, ok := req.ComponentQuantities[comp.ComponentItemID]; ok {
+			if !actual.Equal(requiredQty) {
+				return fmt.Errorf("%w: component %s requires %s, but %s provided",
+					inventory_errors.ErrInvalidProductionCompletion, comp.ComponentItemID, requiredQty.String(), actual.String())
+			}
+			requiredQty = actual
+		}
+		if requiredQty.IsZero() {
+			continue
+		}
+
+		item := itemMap[comp.ComponentItemID]
+		if item.IsBatchTracked {
+			// Batch‑tracked component: allocate from batches (FIFO)
+			allocations, err := s.stockService.GetBatchPicking(ctx, req.CompanyID, comp.ComponentItemID, order.WarehouseID, requiredQty, PickingStrategyFIFO)
+			if err != nil {
+				return fmt.Errorf("allocate batches for component %s: %w", comp.ComponentItemID, err)
+			}
+			for _, alloc := range allocations {
+				reason := fmt.Sprintf("Production consumption for %s (batch %s)", order.OrderNumber, alloc.BatchNumber)
+				movementReq := CreateMovementRequest{
+					CompanyID:     req.CompanyID,
+					MovementType:  enums.MovementTypeAdjustmentOut,
+					MovementDate:  time.Now(),
+					WarehouseID:   order.WarehouseID,
+					ItemID:        comp.ComponentItemID,
+					BatchID:       &alloc.BatchID,
+					QuantityOut:   alloc.AllocatedQty,
+					UnitCost:      alloc.UnitCost,
+					Reason:        &reason,
+					ReferenceType: stringPtr("production"),
+					ReferenceID:   &order.ProductionOrderID,
+					CreatedBy:     req.CompletedBy,
+					Status:        "posted",
+				}
+				movement, err := s.inventorySvc.CreateMovement(ctx, movementReq, idempotencyKey+":comp:"+comp.ComponentItemID.String()+":"+alloc.BatchID.String())
+				if err != nil {
+					return fmt.Errorf("consume component %s batch %s: %w", comp.ComponentItemID, alloc.BatchID, err)
+				}
+				componentRecord := &models.ProductionOrderComponent{
+					ComponentID:       uuid.New(),
+					ProductionOrderID: order.ProductionOrderID,
+					ItemID:            comp.ComponentItemID,
+					PlannedQuantity:   comp.Quantity.Mul(order.PlannedQuantity),
+					ActualQuantity:    alloc.AllocatedQty,
+					MovementID:        &movement.MovementID,
+				}
+				if err := s.prodRepo.AddComponent(ctx, tx, componentRecord); err != nil {
+					logger.Warn("failed to record component consumption", zap.Error(err), zap.String("batch", alloc.BatchID.String()))
+				}
+			}
+		} else {
+			// Non‑batch‑tracked component: single movement
+			reason := fmt.Sprintf("Production consumption for %s", order.OrderNumber)
+			movementReq := CreateMovementRequest{
+				CompanyID:     req.CompanyID,
+				MovementType:  enums.MovementTypeAdjustmentOut,
+				MovementDate:  time.Now(),
+				WarehouseID:   order.WarehouseID,
+				ItemID:        comp.ComponentItemID,
+				QuantityOut:   requiredQty,
+				UnitCost:      decimal.NewFromInt(1), // fallback; can be improved with actual cost
+				Reason:        &reason,
+				ReferenceType: stringPtr("production"),
+				ReferenceID:   &order.ProductionOrderID,
+				CreatedBy:     req.CompletedBy,
+				Status:        "posted",
+			}
+			movement, err := s.inventorySvc.CreateMovement(ctx, movementReq, idempotencyKey+":comp:"+comp.ComponentItemID.String())
+			if err != nil {
+				return fmt.Errorf("consume component %s: %w", comp.ComponentItemID, err)
+			}
+			componentRecord := &models.ProductionOrderComponent{
+				ComponentID:       uuid.New(),
+				ProductionOrderID: order.ProductionOrderID,
+				ItemID:            comp.ComponentItemID,
+				PlannedQuantity:   comp.Quantity.Mul(order.PlannedQuantity),
+				ActualQuantity:    requiredQty,
+				MovementID:        &movement.MovementID,
+			}
+			if err := s.prodRepo.AddComponent(ctx, tx, componentRecord); err != nil {
+				logger.Warn("failed to record component consumption", zap.Error(err))
+			}
+		}
+	}
+
+	// Create finished good inbound movement
+	inboundMovementReq := CreateMovementRequest{
+		CompanyID:     req.CompanyID,
+		MovementType:  enums.MovementTypeProductionIn,
+		MovementDate:  time.Now(),
+		WarehouseID:   order.WarehouseID,
+		ItemID:        order.ProductItemID,
+		QuantityIn:    req.ProducedQuantity,
+		UnitCost:      decimal.Zero,
+		Reason:        stringPtr(fmt.Sprintf("Production of %s", order.OrderNumber)),
+		ReferenceType: stringPtr("production"),
+		ReferenceID:   &order.ProductionOrderID,
+		CreatedBy:     req.CompletedBy,
+		Status:        "posted",
+	}
+	if _, err := s.inventorySvc.CreateMovement(ctx, inboundMovementReq, idempotencyKey+":fg"); err != nil {
+		return fmt.Errorf("create finished good movement: %w", err)
+	}
+
+	order.ProducedQuantity = req.ProducedQuantity
+	order.Status = "completed"
+	now := time.Now()
+	order.ActualEndTime = &now
+	if err := s.prodRepo.Update(ctx, tx, order); err != nil {
+		return err
+	}
+	if err := s.emitProductionEvent(ctx, tx, order, events.EventProductionOrderCompleted); err != nil {
+		logger.Warn("failed to emit completion event", zap.Error(err))
+	}
+	_ = s.idempotency.Store(ctx, tx, idempotencyKey, true)
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.audit != nil {
+		_ = s.audit.LogAction(ctx, nil, &req.CompanyID, "inventory", "complete_production", "production_order",
+			&order.ProductionOrderID, "user", req.CompletedBy, nil, nil, map[string]interface{}{
+				"produced_qty": req.ProducedQuantity,
+			})
+	}
+	return nil
+}
+
+func (s *productionService) CancelProductionOrder(ctx context.Context, req CancelProductionOrderRequest, idempotencyKey string) error {
+	logger := s.logger.With(zap.String("method", "CancelProductionOrder"), zap.String("order_id", req.ProductionOrderID.String()))
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotency.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		return nil
+	}
+	order, err := s.prodRepo.GetByID(ctx, tx, req.ProductionOrderID, req.CompanyID)
+	if err != nil {
+		return err
+	}
+	if !isValidStatusTransition(order.Status, "cancelled") {
+		return fmt.Errorf("%w: cannot transition from %s to cancelled", inventory_errors.ErrInvalidTransition, order.Status)
+	}
+	order.Status = "cancelled"
+	if err := s.prodRepo.Update(ctx, tx, order); err != nil {
+		return err
+	}
+	if err := s.emitProductionEvent(ctx, tx, order, events.EventProductionOrderCancelled); err != nil {
+		logger.Warn("failed to emit cancellation event", zap.Error(err))
+	}
+	_ = s.idempotency.Store(ctx, tx, idempotencyKey, true)
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if s.audit != nil {
+		_ = s.audit.LogAction(ctx, nil, &req.CompanyID, "inventory", "cancel_production", "production_order",
+			&req.ProductionOrderID, "user", req.CancelledBy, nil, nil, map[string]interface{}{
+				"reason": req.Reason,
+			})
+	}
+	return nil
+}
+
+func (s *productionService) GetProductionOrder(ctx context.Context, orderID, companyID uuid.UUID) (*models.ProductionOrder, error) {
+	return s.prodRepo.GetByID(ctx, s.pgClient.DB, orderID, companyID)
+}
+
+func (s *productionService) ListProductionOrders(ctx context.Context, filter repository.ProductionOrderFilter, page, pageSize int) ([]*models.ProductionOrder, int64, error) {
+	p := repository.Pagination{Limit: pageSize, Offset: (page - 1) * pageSize}
+	items, err := s.prodRepo.List(ctx, s.pgClient.DB, filter, p, repository.Sort{Field: "created_at", Direction: "DESC"})
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.prodRepo.Count(ctx, s.pgClient.DB, filter)
+	return items, total, err
+}
+
+func (s *productionService) validateCreateOrder(req CreateProductionOrderRequest) error {
+	if req.CompanyID == uuid.Nil || req.ProductItemID == uuid.Nil || req.BOMID == uuid.Nil || req.WarehouseID == uuid.Nil {
+		return fmt.Errorf("%w: missing required fields", inventory_errors.ErrInvalidInput)
+	}
+	if req.OrderNumber == "" {
+		return fmt.Errorf("%w: order_number required", inventory_errors.ErrInvalidInput)
+	}
+	if req.PlannedQuantity.LessThanOrEqual(decimal.Zero) {
+		return fmt.Errorf("%w: planned_quantity must be positive", inventory_errors.ErrInvalidInput)
+	}
+	return nil
+}
+
+func (s *productionService) createPlannedComponents(ctx context.Context, tx *sql.Tx, order *models.ProductionOrder) error {
+	bomItems, err := s.bomRepo.GetBOMItems(ctx, tx, order.BOMID)
+	if err != nil {
+		return err
+	}
+	for _, bi := range bomItems {
+		plannedQty := bi.Quantity.Mul(order.PlannedQuantity)
+		comp := &models.ProductionOrderComponent{
+			ComponentID:       uuid.New(),
+			ProductionOrderID: order.ProductionOrderID,
+			ItemID:            bi.ComponentItemID,
+			PlannedQuantity:   plannedQty,
+			ActualQuantity:    decimal.Zero,
+		}
+		if err := s.prodRepo.AddComponent(ctx, tx, comp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *productionService) updateOrderStatus(ctx context.Context, orderID, companyID uuid.UUID, newStatus string, actor *uuid.UUID, idempotencyKey, eventType string) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var processed bool
+	if err := s.idempotency.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		return nil
+	}
+	order, err := s.prodRepo.GetByID(ctx, tx, orderID, companyID)
+	if err != nil {
+		return err
+	}
+	if !isValidStatusTransition(order.Status, newStatus) {
+		return fmt.Errorf("%w: cannot transition from %s to %s", inventory_errors.ErrInvalidTransition, order.Status, newStatus)
+	}
+	order.Status = newStatus
+	if err := s.prodRepo.Update(ctx, tx, order); err != nil {
+		return err
+	}
+	if err := s.emitProductionEvent(ctx, tx, order, eventType); err != nil {
+		s.logger.Warn("failed to emit status event", zap.Error(err))
+	}
+	_ = s.idempotency.Store(ctx, tx, idempotencyKey, true)
+	return tx.Commit()
+}
+
+func (s *productionService) emitProductionEvent(ctx context.Context, tx *sql.Tx, order *models.ProductionOrder, eventType string) error {
+	payload := events.ProductionOrderPayload{
+		ProductionOrderID: order.ProductionOrderID.String(),
+		CompanyID:         order.CompanyID.String(),
+		OrderNumber:       order.OrderNumber,
+		ProductItemID:     order.ProductItemID.String(),
+		BOMID:             order.BOMID.String(),
+		PlannedQuantity:   toFloat64(order.PlannedQuantity),
+		ProducedQuantity:  toFloat64(order.ProducedQuantity),
+		Status:            order.Status,
+		WarehouseID:       order.WarehouseID.String(),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "production_order",
+		AggregateID:   order.ProductionOrderID.String(),
+		EventType:     eventType,
+		Topic:         events.TopicInventoryEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
+}

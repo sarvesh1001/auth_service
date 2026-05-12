@@ -10,7 +10,7 @@ import (
 type StockLedger struct {
 	LedgerID        uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"ledgerId"`
 	CompanyID       uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
-	WarehouseID     *uuid.UUID      `gorm:"type:uuid" json:"warehouseId,omitempty"` // NEW
+	WarehouseID     *uuid.UUID      `gorm:"type:uuid" json:"warehouseId,omitempty"`
 	ItemID          uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
 	BatchID         *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
 	MovementID      uuid.UUID       `gorm:"type:uuid;not null" json:"movementId"`
@@ -20,4 +20,7 @@ type StockLedger struct {
 	UnitCost        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitCost"`
 	RunningBalance  decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"runningBalance"`
 	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+
+	// New field for FIFO performance
+	RemainingQuantity *decimal.Decimal `gorm:"type:numeric(14,4)" json:"remainingQuantity,omitempty"`
 }

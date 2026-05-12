@@ -21,9 +21,20 @@ type Item struct {
 	SellingPrice    *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"sellingPrice,omitempty"`
 	ReorderLevel    *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"reorderLevel,omitempty"`
 	ReorderQuantity *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"reorderQuantity,omitempty"`
+	LastReorderedAt *time.Time            `gorm:"type:timestamptz" json:"lastReorderedAt,omitempty"`
 	IsActive        bool                  `gorm:"not null;default:true" json:"isActive"`
 	CreatedAt       time.Time             `gorm:"not null;default:now()" json:"createdAt"`
 	UpdatedAt       time.Time             `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID            `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy       *uuid.UUID            `gorm:"type:uuid" json:"updatedBy,omitempty"`
+
+	// New behavior flags
+	TrackInventory     bool                    `gorm:"not null;default:true" json:"trackInventory"`
+	AllowNegativeStock bool                    `gorm:"not null;default:false" json:"allowNegativeStock"`
+	IsSellable         bool                    `gorm:"not null;default:true" json:"isSellable"`
+	IsPurchasable      bool                    `gorm:"not null;default:true" json:"isPurchasable"`
+	RequiresShipping   bool                    `gorm:"not null;default:true" json:"requiresShipping"`
+	IsBatchTracked     bool                    `gorm:"not null;default:false" json:"isBatchTracked"`
+	IsSerialTracked    bool                    `gorm:"not null;default:false" json:"isSerialTracked"`
+	FulfillmentPolicy  enums.FulfillmentPolicy `gorm:"type:fulfillment_policy;not null;default:'inventory_required'" json:"fulfillmentPolicy"`
 }

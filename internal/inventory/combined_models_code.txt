@@ -19,9 +19,17 @@ type Warehouse struct {
 	Location    *string    `gorm:"type:text" json:"location,omitempty"`
 	IsActive    bool       `gorm:"not null;default:true" json:"isActive"`
 	CreatedAt   time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt   time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt   time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy   *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+
+	// New fields (already present)
+	LocationID         *uuid.UUID `gorm:"type:uuid" json:"locationId,omitempty"`
+	WarehouseType      *string    `gorm:"type:varchar(50)" json:"warehouseType,omitempty"`
+	AllowNegativeStock bool       `gorm:"not null;default:false" json:"allowNegativeStock"`
+
+	// Missing field – now added
+	IsDefault bool `gorm:"not null;default:false" json:"isDefault"`
 }
 
 
@@ -36,24 +44,55 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Reservation struct {
-	ReservationID   uuid.UUID  `db:"reservation_id" json:"reservation_id" gorm:"primaryKey"`
-	CompanyID       uuid.UUID  `db:"company_id" json:"company_id"`
-	ReservationType string     `db:"reservation_type" json:"reservation_type"`
-	ReferenceID     uuid.UUID  `db:"reference_id" json:"reference_id"`
-	WarehouseID     uuid.UUID  `db:"warehouse_id" json:"warehouse_id"`
-	ItemID          uuid.UUID  `db:"item_id" json:"item_id"`
-	BatchID         *uuid.UUID `db:"batch_id" json:"batch_id"`
-	Quantity        float64    `db:"quantity" json:"quantity"`
-	Status          string     `db:"status" json:"status"` // active, fulfilled, cancelled
-	CreatedAt       time.Time  `db:"created_at" json:"created_at"`
-	ExpiresAt       *time.Time `db:"expires_at" json:"expires_at"`
-	CreatedBy       *uuid.UUID `db:"created_by" json:"created_by"`
-	FulfilledAt     *time.Time `db:"fulfilled_at" json:"fulfilled_at"`
-	CancelledAt     *time.Time `db:"cancelled_at" json:"cancelled_at"`
+	ReservationID   uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"reservationId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	ReservationType string          `gorm:"type:varchar(50);not null" json:"reservationType"`
+	ReferenceID     uuid.UUID       `gorm:"type:uuid;not null" json:"referenceId"`
+	WarehouseID     uuid.UUID       `gorm:"type:uuid;not null" json:"warehouseId"`
+	ItemID          uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	BatchID         *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
+	Quantity        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	// Removed check constraint from tag – handled by DB
+	Status      string     `gorm:"type:varchar(20);not null;default:'active'" json:"status"`
+	CreatedAt   time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	ExpiresAt   *time.Time `gorm:"type:timestamptz" json:"expiresAt,omitempty"`
+	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	FulfilledAt *time.Time `gorm:"type:timestamptz" json:"fulfilledAt,omitempty"`
+	CancelledAt *time.Time `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+
+	// New field
+	FulfilledQuantity decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"fulfilledQuantity"`
 }
+
+
+
+================================================================================
+FILE: ./models/fulfillment_order.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type FulfillmentOrder struct {
+	FulfillmentOrderID uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"fulfillmentOrderId"`
+	CompanyID          uuid.UUID `gorm:"type:uuid;not null" json:"companyId"`
+	ReferenceType      string    `gorm:"type:varchar(50);not null" json:"referenceType"`
+	ReferenceID        uuid.UUID `gorm:"type:uuid;not null" json:"referenceId"`
+	WarehouseID        uuid.UUID `gorm:"type:uuid;not null" json:"warehouseId"`
+	Status             string    `gorm:"type:varchar(20);not null;default:'pending'" json:"status"`
+	CreatedAt          time.Time `gorm:"default:now()" json:"createdAt"`
+}
+
+func (FulfillmentOrder) TableName() string { return "fulfillment_orders" }
 
 
 
@@ -68,6 +107,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type StockMovement struct {
@@ -81,14 +121,44 @@ type StockMovement struct {
 	FromWarehouseID *uuid.UUID         `gorm:"type:uuid" json:"fromWarehouseId,omitempty"`
 	ItemID          uuid.UUID          `gorm:"type:uuid;not null" json:"itemId"`
 	BatchID         *uuid.UUID         `gorm:"type:uuid" json:"batchId,omitempty"`
-	QuantityIn      float64            `gorm:"type:numeric(14,4);not null;default:0" json:"quantityIn"`
-	QuantityOut     float64            `gorm:"type:numeric(14,4);not null;default:0" json:"quantityOut"`
-	UnitCost        float64            `gorm:"type:numeric(14,4);not null" json:"unitCost"`
-	TotalCost       float64            `gorm:"->;-:migration" json:"totalCost"` // generated
+	QuantityIn      decimal.Decimal    `gorm:"type:numeric(14,4);not null;default:0" json:"quantityIn"`
+	QuantityOut     decimal.Decimal    `gorm:"type:numeric(14,4);not null;default:0" json:"quantityOut"`
+	UnitCost        decimal.Decimal    `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalCost       decimal.Decimal    `gorm:"->" json:"totalCost"`
 	Reason          *string            `gorm:"type:text" json:"reason,omitempty"`
 	CreatedAt       time.Time          `gorm:"not null;default:now()" json:"createdAt"`
 	CreatedBy       *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
+
+	// New operational fields
+	Status          string     `gorm:"type:varchar(20);not null;default:'posted'" json:"status"`
+	ReservationID   *uuid.UUID `gorm:"type:uuid" json:"reservationId,omitempty"`
+	ShipmentID      *uuid.UUID `gorm:"type:uuid" json:"shipmentId,omitempty"`
+	TransferOrderID *uuid.UUID `gorm:"type:uuid" json:"transferOrderId,omitempty"`
 }
+
+
+
+================================================================================
+FILE: ./models/fulfillment_order_item.go
+================================================================================
+
+package models
+
+import (
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type FulfillmentOrderItem struct {
+	FulfillmentItemID  uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"fulfillmentItemId"`
+	FulfillmentOrderID uuid.UUID       `gorm:"type:uuid;not null" json:"fulfillmentOrderId"`
+	ItemID             uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	OrderedQty         decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"orderedQty"`
+	FulfilledQty       decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"fulfilledQty"`
+	BackorderedQty     decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"backorderedQty"`
+}
+
+func (FulfillmentOrderItem) TableName() string { return "fulfillment_order_items" }
 
 
 
@@ -96,23 +166,45 @@ type StockMovement struct {
 FILE: ./models/bom_item.go
 ================================================================================
 
-// models/bom_item.go
 package models
 
 import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type BOMItem struct {
-	BOMItemID       uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"bomItemId"`
-	BOMID           uuid.UUID `gorm:"type:uuid;not null" json:"bomId"`
-	ComponentItemID uuid.UUID `gorm:"type:uuid;not null" json:"componentItemId"`
-	Quantity        float64   `gorm:"type:numeric(14,4);not null" json:"quantity"`
-	ScrapPercentage *float64  `gorm:"type:numeric(5,2);default:0" json:"scrapPercentage,omitempty"`
-	CreatedAt       time.Time `gorm:"not null;default:now()" json:"createdAt"`
+	BOMItemID       uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"bomItemId"`
+	BOMID           uuid.UUID        `gorm:"type:uuid;not null" json:"bomId"`
+	ComponentItemID uuid.UUID        `gorm:"type:uuid;not null" json:"componentItemId"`
+	Quantity        decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	ScrapPercentage *decimal.Decimal `gorm:"type:numeric(5,2);default:0" json:"scrapPercentage,omitempty"`
+	CreatedAt       time.Time        `gorm:"not null;default:now()" json:"createdAt"`
 }
+
+
+
+================================================================================
+FILE: ./models/stock_transfer_item.go
+================================================================================
+
+package models
+
+import (
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type StockTransferItem struct {
+	TransferItemID  uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"transferItemId"`
+	TransferOrderID uuid.UUID       `gorm:"type:uuid;not null" json:"transferOrderId"`
+	ItemID          uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	Quantity        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+}
+
+func (StockTransferItem) TableName() string { return "stock_transfer_items" }
 
 
 
@@ -126,25 +218,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Batch struct {
-	BatchID          uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"batchId"`
-	CompanyID        uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
-	ItemID           uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
-	BatchNumber      string     `gorm:"type:varchar(100);not null" json:"batchNumber"`
-	SupplierBatch    *string    `gorm:"type:varchar(100)" json:"supplierBatch,omitempty"`
-	ManufacturedDate *time.Time `gorm:"type:date" json:"manufacturedDate,omitempty"`
-	ExpiryDate       *time.Time `gorm:"type:date" json:"expiryDate,omitempty"`
-	ReceivedDate     *time.Time `gorm:"type:date" json:"receivedDate,omitempty"`
-	Quantity         float64    `gorm:"type:numeric(14,4);not null" json:"quantity"`
-	RemainingQty     float64    `gorm:"type:numeric(14,4);not null" json:"remainingQty"`
-	CostPerUnit      float64    `gorm:"type:numeric(14,4);not null" json:"costPerUnit"`
-	IsActive         bool       `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt        time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
-	CreatedBy        *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy        *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	BatchID          uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"batchId"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	ItemID           uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	BatchNumber      string          `gorm:"type:varchar(100);not null" json:"batchNumber"`
+	SupplierBatch    *string         `gorm:"type:varchar(100)" json:"supplierBatch,omitempty"`
+	ManufacturedDate *time.Time      `gorm:"type:date" json:"manufacturedDate,omitempty"`
+	ExpiryDate       *time.Time      `gorm:"type:date" json:"expiryDate,omitempty"`
+	ReceivedDate     *time.Time      `gorm:"type:date" json:"receivedDate,omitempty"`
+	Quantity         decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	RemainingQty     decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"remainingQty"`
+	CostPerUnit      decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"costPerUnit"`
+	IsActive         bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt        time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt        time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy        *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy        *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -159,20 +252,25 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type StockLedger struct {
-	LedgerID        uuid.UUID  `db:"ledger_id" json:"ledger_id" gorm:"primaryKey"`
-	CompanyID       uuid.UUID  `db:"company_id" json:"company_id"`
-	ItemID          uuid.UUID  `db:"item_id" json:"item_id"`
-	BatchID         *uuid.UUID `db:"batch_id" json:"batch_id"`
-	MovementID      uuid.UUID  `db:"movement_id" json:"movement_id"`
-	TransactionDate time.Time  `db:"transaction_date" json:"transaction_date"`
-	QuantityIn      float64    `db:"quantity_in" json:"quantity_in"`
-	QuantityOut     float64    `db:"quantity_out" json:"quantity_out"`
-	UnitCost        float64    `db:"unit_cost" json:"unit_cost"`
-	RunningBalance  float64    `db:"running_balance" json:"running_balance"`
-	CreatedAt       time.Time  `db:"created_at" json:"created_at"`
+	LedgerID        uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"ledgerId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	WarehouseID     *uuid.UUID      `gorm:"type:uuid" json:"warehouseId,omitempty"`
+	ItemID          uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	BatchID         *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
+	MovementID      uuid.UUID       `gorm:"type:uuid;not null" json:"movementId"`
+	TransactionDate time.Time       `gorm:"type:date;not null" json:"transactionDate"`
+	QuantityIn      decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"quantityIn"`
+	QuantityOut     decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"quantityOut"`
+	UnitCost        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	RunningBalance  decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"runningBalance"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+
+	// New field for FIFO performance
+	RemainingQuantity *decimal.Decimal `gorm:"type:numeric(14,4)" json:"remainingQuantity,omitempty"`
 }
 
 
@@ -187,25 +285,25 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type StockAllocation struct {
-	AllocationID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"allocationId"`
-	CompanyID      uuid.UUID `gorm:"type:uuid;not null" json:"companyId"`
-	MovementID     uuid.UUID `gorm:"type:uuid;not null" json:"movementId"`
-	SourceLedgerID uuid.UUID `gorm:"type:uuid;not null" json:"sourceLedgerId"`
-	Quantity       float64   `gorm:"type:numeric(14,4);not null" json:"quantity"`
-	UnitCost       float64   `gorm:"type:numeric(14,4);not null" json:"unitCost"`
-	CreatedAt      time.Time `gorm:"not null;default:now()" json:"createdAt"`
+	AllocationID   uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"allocationId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	MovementID     uuid.UUID       `gorm:"type:uuid;not null" json:"movementId"`
+	SourceLedgerID uuid.UUID       `gorm:"type:uuid;not null" json:"sourceLedgerId"`
+	Quantity       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitCost       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 
 
 ================================================================================
-FILE: ./models/bom.go
+FILE: ./models/stock_transfer_order.go
 ================================================================================
 
-// models/bom.go
 package models
 
 import (
@@ -214,19 +312,110 @@ import (
 	"github.com/google/uuid"
 )
 
+type StockTransferOrder struct {
+	TransferOrderID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"transferOrderId"`
+	CompanyID       uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	TransferNumber  string     `gorm:"type:varchar(100);not null" json:"transferNumber"`
+	FromWarehouseID uuid.UUID  `gorm:"type:uuid;not null" json:"fromWarehouseId"`
+	ToWarehouseID   uuid.UUID  `gorm:"type:uuid;not null" json:"toWarehouseId"`
+	Status          string     `gorm:"type:varchar(20);not null;default:'draft'" json:"status"`
+	DispatchedAt    *time.Time `gorm:"type:timestamptz" json:"dispatchedAt,omitempty"`
+	ReceivedAt      *time.Time `gorm:"type:timestamptz" json:"receivedAt,omitempty"`
+	CreatedAt       time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+func (StockTransferOrder) TableName() string { return "stock_transfer_orders" }
+
+
+
+================================================================================
+FILE: ./models/reorder.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ReorderOrder struct {
+	ReorderOrderID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"reorderOrderId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	ItemID         uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	WarehouseID    uuid.UUID       `gorm:"type:uuid;not null" json:"warehouseId"`
+	RequestedQty   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"requestedQty"`
+	Status         string          `gorm:"type:varchar(20);not null;default:'pending'" json:"status"`
+	Source         string          `gorm:"type:varchar(20);not null;default:'auto'" json:"source"`
+	ReferenceType  *string         `gorm:"type:varchar(50)" json:"referenceType,omitempty"`
+	ReferenceID    *uuid.UUID      `gorm:"type:uuid" json:"referenceId,omitempty"`
+	GeneratedAt    time.Time       `gorm:"not null;default:now()" json:"generatedAt"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy      *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+}
+
+func (ReorderOrder) TableName() string {
+	return "reorder_orders"
+}
+
+
+
+================================================================================
+FILE: ./models/serial_number.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type SerialNumber struct {
+	SerialID     uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"serialId"`
+	CompanyID    uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	ItemID       uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
+	SerialNumber string     `gorm:"type:varchar(255);not null" json:"serialNumber"`
+	WarehouseID  *uuid.UUID `gorm:"type:uuid" json:"warehouseId,omitempty"`
+	BatchID      *uuid.UUID `gorm:"type:uuid" json:"batchId,omitempty"`
+	Status       *string    `gorm:"type:varchar(20)" json:"status,omitempty"`
+	CreatedAt    time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+func (SerialNumber) TableName() string { return "serial_numbers" }
+
+
+
+================================================================================
+FILE: ./models/bom.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
 type BOM struct {
-	BOMID         uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"bomId"`
-	CompanyID     uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
-	ProductItemID uuid.UUID  `gorm:"type:uuid;not null" json:"productItemId"`
-	BOMCode       string     `gorm:"type:varchar(100);not null" json:"bomCode"`
-	Name          string     `gorm:"type:varchar(255);not null" json:"name"`
-	Version       int        `gorm:"not null;default:1" json:"version"`
-	Quantity      float64    `gorm:"type:numeric(14,4);not null;default:1" json:"quantity"`
-	IsActive      bool       `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt     time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
-	CreatedBy     *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy     *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	BOMID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"bomId"`
+	CompanyID     uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	ProductItemID uuid.UUID       `gorm:"type:uuid;not null" json:"productItemId"`
+	BOMCode       string          `gorm:"type:varchar(100);not null" json:"bomCode"`
+	Name          string          `gorm:"type:varchar(255);not null" json:"name"`
+	Version       int             `gorm:"not null;default:1" json:"version"`
+	Quantity      decimal.Decimal `gorm:"type:numeric(14,4);not null;default:1" json:"quantity"`
+	IsActive      bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt     time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy     *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy     *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -242,6 +431,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type InventoryValuation struct {
@@ -250,12 +440,69 @@ type InventoryValuation struct {
 	ValuationDate   time.Time             `gorm:"type:date;not null" json:"valuationDate"`
 	ItemID          uuid.UUID             `gorm:"type:uuid;not null" json:"itemId"`
 	WarehouseID     *uuid.UUID            `gorm:"type:uuid" json:"warehouseId,omitempty"`
-	Quantity        float64               `gorm:"type:numeric(14,4);not null" json:"quantity"`
-	UnitCost        float64               `gorm:"type:numeric(14,4);not null" json:"unitCost"`
-	TotalValue      float64               `gorm:"->;-:migration" json:"totalValue"` // generated
+	Quantity        decimal.Decimal       `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitCost        decimal.Decimal       `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalValue      decimal.Decimal       `gorm:"->" json:"totalValue"` // generated column
 	ValuationMethod enums.ValuationMethod `gorm:"type:valuation_method;not null" json:"valuationMethod"`
 	CreatedAt       time.Time             `gorm:"not null;default:now()" json:"createdAt"`
 }
+
+
+
+================================================================================
+FILE: ./models/inventory_location.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type InventoryLocation struct {
+	LocationID       uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"locationId"`
+	CompanyID        uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	Code             string     `gorm:"type:varchar(50);not null" json:"code"`
+	Name             string     `gorm:"type:varchar(255);not null" json:"name"`
+	LocationType     *string    `gorm:"type:varchar(50)" json:"locationType,omitempty"`
+	ParentLocationID *uuid.UUID `gorm:"type:uuid" json:"parentLocationId,omitempty"`
+	IsActive         bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+func (InventoryLocation) TableName() string {
+	return "inventory_locations"
+}
+
+
+
+================================================================================
+FILE: ./models/shipment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Shipment struct {
+	ShipmentID         uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"shipmentId"`
+	CompanyID          uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	FulfillmentOrderID uuid.UUID  `gorm:"type:uuid;not null" json:"fulfillmentOrderId"`
+	WarehouseID        uuid.UUID  `gorm:"type:uuid;not null" json:"warehouseId"`
+	ShipmentNumber     string     `gorm:"type:varchar(100);not null" json:"shipmentNumber"`
+	ShipmentStatus     string     `gorm:"type:varchar(20);not null;default:'draft'" json:"shipmentStatus"`
+	ShippedAt          *time.Time `gorm:"type:timestamptz" json:"shippedAt,omitempty"`
+	DeliveredAt        *time.Time `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
+	CreatedAt          time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+func (Shipment) TableName() string { return "shipments" }
 
 
 
@@ -269,20 +516,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type StockBalance struct {
-	StockBalanceID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"stockBalanceId"`
-	CompanyID      uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
-	WarehouseID    uuid.UUID  `gorm:"type:uuid;not null" json:"warehouseId"`
-	ItemID         uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
-	BatchID        *uuid.UUID `gorm:"type:uuid" json:"batchId,omitempty"`
-	QuantityOnHand float64    `gorm:"type:numeric(14,4);not null;default:0" json:"quantityOnHand"`
-	ReservedQty    float64    `gorm:"type:numeric(14,4);not null;default:0" json:"reservedQty"`
-	AvailableQty   float64    `gorm:"->;-:migration" json:"availableQty"` // generated column, read-only
-	LastMovementAt *time.Time `gorm:"type:timestamptz" json:"lastMovementAt,omitempty"`
-	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt      time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	StockBalanceID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"stockBalanceId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	WarehouseID    uuid.UUID       `gorm:"type:uuid;not null" json:"warehouseId"`
+	ItemID         uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	BatchID        *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
+	QuantityOnHand decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"quantityOnHand"`
+	ReservedQty    decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"reservedQty"`
+	AvailableQty   decimal.Decimal `gorm:"->" json:"availableQty"` // read‑only generated column
+	LastMovementAt *time.Time      `gorm:"type:timestamptz" json:"lastMovementAt,omitempty"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
 }
 
 
@@ -298,27 +546,231 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Item struct {
 	ItemID          uuid.UUID             `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"itemId"`
-	CompanyID       uuid.UUID             `gorm:"type:uuid;not null" json:"companyId"`
-	SKU             string                `gorm:"type:varchar(100);not null" json:"sku"`
+	CompanyID       uuid.UUID             `gorm:"type:uuid;not null;uniqueIndex:idx_company_sku" json:"companyId"`
+	SKU             string                `gorm:"type:varchar(100);not null;uniqueIndex:idx_company_sku" json:"sku"`
 	Name            string                `gorm:"type:varchar(255);not null" json:"name"`
 	Description     *string               `gorm:"type:text" json:"description,omitempty"`
 	ItemType        enums.ItemType        `gorm:"type:item_type;not null" json:"itemType"`
 	UnitOfMeasure   string                `gorm:"type:varchar(20);not null" json:"unitOfMeasure"`
 	ValuationMethod enums.ValuationMethod `gorm:"type:valuation_method;not null;default:'weighted_average'" json:"valuationMethod"`
-	StandardCost    *float64              `gorm:"type:numeric(14,4);default:0" json:"standardCost,omitempty"`
-	SellingPrice    *float64              `gorm:"type:numeric(14,4);default:0" json:"sellingPrice,omitempty"`
-	ReorderLevel    *float64              `gorm:"type:numeric(14,4);default:0" json:"reorderLevel,omitempty"`
-	ReorderQuantity *float64              `gorm:"type:numeric(14,4);default:0" json:"reorderQuantity,omitempty"`
+	StandardCost    *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"standardCost,omitempty"`
+	SellingPrice    *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"sellingPrice,omitempty"`
+	ReorderLevel    *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"reorderLevel,omitempty"`
+	ReorderQuantity *decimal.Decimal      `gorm:"type:numeric(14,4);default:0" json:"reorderQuantity,omitempty"`
+	LastReorderedAt *time.Time            `gorm:"type:timestamptz" json:"lastReorderedAt,omitempty"`
 	IsActive        bool                  `gorm:"not null;default:true" json:"isActive"`
 	CreatedAt       time.Time             `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt       time.Time             `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt       time.Time             `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID            `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy       *uuid.UUID            `gorm:"type:uuid" json:"updatedBy,omitempty"`
+
+	// New behavior flags
+	TrackInventory     bool                    `gorm:"not null;default:true" json:"trackInventory"`
+	AllowNegativeStock bool                    `gorm:"not null;default:false" json:"allowNegativeStock"`
+	IsSellable         bool                    `gorm:"not null;default:true" json:"isSellable"`
+	IsPurchasable      bool                    `gorm:"not null;default:true" json:"isPurchasable"`
+	RequiresShipping   bool                    `gorm:"not null;default:true" json:"requiresShipping"`
+	IsBatchTracked     bool                    `gorm:"not null;default:false" json:"isBatchTracked"`
+	IsSerialTracked    bool                    `gorm:"not null;default:false" json:"isSerialTracked"`
+	FulfillmentPolicy  enums.FulfillmentPolicy `gorm:"type:fulfillment_policy;not null;default:'inventory_required'" json:"fulfillmentPolicy"`
 }
+
+
+
+================================================================================
+FILE: ./models/production.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// ProductionOrder represents a manufacturing order to produce a finished good.
+type ProductionOrder struct {
+	ProductionOrderID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"productionOrderId"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	OrderNumber       string          `gorm:"type:varchar(100);not null" json:"orderNumber"`
+	ProductItemID     uuid.UUID       `gorm:"type:uuid;not null" json:"productItemId"`
+	BOMID             uuid.UUID       `gorm:"type:uuid;not null" json:"bomId"`
+	PlannedQuantity   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"plannedQuantity"`
+	ProducedQuantity  decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"producedQuantity"`
+	Status            string          `gorm:"type:varchar(20);not null;default:'draft'" json:"status"`
+	PlannedStartDate  *time.Time      `gorm:"type:date" json:"plannedStartDate,omitempty"`
+	PlannedEndDate    *time.Time      `gorm:"type:date" json:"plannedEndDate,omitempty"`
+	ActualStartTime   *time.Time      `gorm:"type:timestamptz" json:"actualStartTime,omitempty"`
+	ActualEndTime     *time.Time      `gorm:"type:timestamptz" json:"actualEndTime,omitempty"`
+	WarehouseID       uuid.UUID       `gorm:"type:uuid;not null" json:"warehouseId"`
+	CreatedBy         *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	CreatedAt         time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt         time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+
+	// New fields for make-to-order linking
+	SourceReferenceType *string    `gorm:"type:varchar(50)" json:"sourceReferenceType,omitempty"`
+	SourceReferenceID   *uuid.UUID `gorm:"type:uuid" json:"sourceReferenceId,omitempty"`
+}
+
+func (ProductionOrder) TableName() string {
+	return "production_orders"
+}
+
+// ProductionOrderComponent records actual raw material consumption for a production order.
+type ProductionOrderComponent struct {
+	ComponentID       uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"componentId"`
+	ProductionOrderID uuid.UUID       `gorm:"type:uuid;not null" json:"productionOrderId"`
+	ItemID            uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	BatchID           *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
+	PlannedQuantity   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"plannedQuantity"`
+	ActualQuantity    decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"actualQuantity"`
+	MovementID        *uuid.UUID      `gorm:"type:uuid" json:"movementId,omitempty"`
+	CreatedAt         time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+func (ProductionOrderComponent) TableName() string {
+	return "production_order_components"
+}
+
+// ProductionMetric stores daily KPIs for production analytics.
+type ProductionMetric struct {
+	MetricID            uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"metricId"`
+	CompanyID           uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_unique_prod_metric,priority:1" json:"companyId"`
+	Date                time.Time        `gorm:"type:date;not null;uniqueIndex:idx_unique_prod_metric,priority:2" json:"date"`
+	ProductItemID       uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_unique_prod_metric,priority:3" json:"productItemId"`
+	TotalProducedQty    decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"totalProducedQty"`
+	TotalConsumedRawQty decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"totalConsumedRawQty"`
+	Efficiency          *decimal.Decimal `gorm:"type:numeric(5,2)" json:"efficiency,omitempty"`
+	CreatedAt           time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt           time.Time        `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (ProductionMetric) TableName() string {
+	return "production_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/analytics.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// DailyInventorySnapshot – already correct
+type DailyInventorySnapshot struct {
+	SnapshotID     uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"snapshotId"`
+	CompanyID      uuid.UUID        `gorm:"type:uuid;not null;index:idx_snapshot_date_company,priority:2;index:idx_snapshot_company" json:"companyId"`
+	SnapshotDate   time.Time        `gorm:"type:date;not null;index:idx_snapshot_date_company,priority:1;index:idx_snapshot_item_date,priority:2" json:"snapshotDate"`
+	WarehouseID    *uuid.UUID       `gorm:"type:uuid;index:idx_snapshot_warehouse" json:"warehouseId,omitempty"`
+	ItemID         uuid.UUID        `gorm:"type:uuid;not null;index:idx_snapshot_item_date,priority:1" json:"itemId"`
+	BatchID        *uuid.UUID       `gorm:"type:uuid" json:"batchId,omitempty"`
+	QuantityOnHand decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"quantityOnHand"`
+	ReservedQty    decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"reservedQty"`
+	AvailableQty   decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"availableQty"`
+	UnitCost       decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalValue     decimal.Decimal  `gorm:"->;type:numeric(14,4);generated:always" json:"totalValue"`
+	DaysOfStock    *decimal.Decimal `gorm:"type:numeric(10,2)" json:"daysOfStock,omitempty"`
+	CreatedAt      time.Time        `gorm:"default:now()" json:"createdAt"`
+}
+
+func (DailyInventorySnapshot) TableName() string { return "daily_inventory_snapshot" }
+
+// InventoryAging – corrected
+type InventoryAging struct {
+	AgingID      uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"agingId"`
+	CompanyID    uuid.UUID       `gorm:"type:uuid;not null;index:idx_aging_snapshot,priority:2" json:"companyId"`
+	SnapshotDate time.Time       `gorm:"type:date;not null;index:idx_aging_snapshot,priority:1;index:idx_aging_bucket,priority:2" json:"snapshotDate"`
+	WarehouseID  uuid.UUID       `gorm:"type:uuid;not null;index" json:"warehouseId"`
+	ItemID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"itemId"`
+	BatchID      uuid.UUID       `gorm:"type:uuid;not null;index" json:"batchId"`
+	DaysInStock  int             `gorm:"not null" json:"daysInStock"`
+	AgingBucket  string          `gorm:"type:varchar(20);not null;index:idx_aging_bucket,priority:1" json:"agingBucket"`
+	Quantity     decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitCost     decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalValue   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"totalValue"`
+	CreatedAt    time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (InventoryAging) TableName() string { return "inventory_aging" }
+
+// InventoryTurnoverMetrics – corrected
+type InventoryTurnoverMetrics struct {
+	TurnoverID         uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"turnoverId"`
+	CompanyID          uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_unique_turnover,priority:1;index:idx_turnover_month,priority:2" json:"companyId"`
+	YearMonth          time.Time        `gorm:"type:date;not null;uniqueIndex:idx_unique_turnover,priority:2;index:idx_turnover_month,priority:1" json:"yearMonth"`
+	WarehouseID        *uuid.UUID       `gorm:"type:uuid;uniqueIndex:idx_unique_turnover,priority:3" json:"warehouseId,omitempty"`
+	ItemID             uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_unique_turnover,priority:4" json:"itemId"`
+	TotalConsumedQty   decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"totalConsumedQty"`
+	TotalConsumedValue decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"totalConsumedValue"`
+	AvgInventoryQty    decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"avgInventoryQty"`
+	TurnoverRatio      decimal.Decimal  `gorm:"->;type:numeric(10,2);generated:always" json:"turnoverRatio"`
+	DaysInventory      *decimal.Decimal `gorm:"type:numeric(10,2)" json:"daysInventory,omitempty"`
+	CreatedAt          time.Time        `gorm:"default:now()" json:"createdAt"`
+}
+
+func (InventoryTurnoverMetrics) TableName() string { return "inventory_turnover_metrics" }
+
+// ABCClassification – corrected
+type ABCClassification struct {
+	ClassificationID       uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"classificationId"`
+	CompanyID              uuid.UUID       `gorm:"type:uuid;not null;index:idx_abc_date_class,priority:2;index:idx_abc_item,priority:2" json:"companyId"`
+	ClassificationDate     time.Time       `gorm:"type:date;not null;index:idx_abc_date_class,priority:1;index:idx_abc_item,priority:1" json:"classificationDate"`
+	ItemID                 uuid.UUID       `gorm:"type:uuid;not null;index:idx_abc_item,priority:1" json:"itemId"`
+	WarehouseID            *uuid.UUID      `gorm:"type:uuid" json:"warehouseId,omitempty"`
+	AnnualConsumptionValue decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"annualConsumptionValue"`
+	CumulativePercent      decimal.Decimal `gorm:"type:numeric(5,2);not null" json:"cumulativePercent"`
+	ABCClass               string          `gorm:"type:char(1);not null;check:abc_class IN ('A','B','C');index:idx_abc_date_class,priority:3" json:"abcClass"`
+	CreatedAt              time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (ABCClassification) TableName() string { return "abc_classification" }
+
+// DemandHistory – corrected
+type DemandHistory struct {
+	DemandID         uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"demandId"`
+	CompanyID        uuid.UUID        `gorm:"type:uuid;not null;index:idx_demand_item_date,priority:2;index:idx_demand_warehouse,priority:2" json:"companyId"`
+	DemandDate       time.Time        `gorm:"type:date;not null;index:idx_demand_item_date,priority:1" json:"demandDate"`
+	ItemID           uuid.UUID        `gorm:"type:uuid;not null;index:idx_demand_item_date,priority:1" json:"itemId"`
+	WarehouseID      *uuid.UUID       `gorm:"type:uuid;index:idx_demand_warehouse,priority:1" json:"warehouseId,omitempty"`
+	QuantityDemanded decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"quantityDemanded"`
+	QuantityShipped  *decimal.Decimal `gorm:"type:numeric(14,4)" json:"quantityShipped,omitempty"`
+	BackorderQty     decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"backorderQty"`
+	CreatedAt        time.Time        `gorm:"default:now()" json:"createdAt"`
+}
+
+func (DemandHistory) TableName() string { return "demand_history" }
+
+// MovementDailySummary – corrected
+type MovementDailySummary struct {
+	SummaryID        uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"summaryId"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_unique_movement_summary,priority:1;index:idx_movement_analytics,priority:1" json:"companyId"`
+	Date             time.Time       `gorm:"type:date;not null;uniqueIndex:idx_unique_movement_summary,priority:2;index:idx_movement_analytics,priority:2" json:"date"`
+	WarehouseID      *uuid.UUID      `gorm:"type:uuid" json:"warehouseId,omitempty"`
+	ItemID           uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_unique_movement_summary,priority:4" json:"itemId"`
+	MovementType     string          `gorm:"type:varchar(50);not null;uniqueIndex:idx_unique_movement_summary,priority:5" json:"movementType"`
+	TotalQuantityIn  decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalQuantityIn"`
+	TotalQuantityOut decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalQuantityOut"`
+	TransactionCount int             `gorm:"not null;default:0" json:"transactionCount"`
+	CreatedAt        time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt        time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (MovementDailySummary) TableName() string { return "movement_daily_summary" }
 
 
 
@@ -470,6 +922,43 @@ func (v ValuationMethod) IsValid() bool {
 
 func (v ValuationMethod) String() string {
 	return string(v)
+}
+
+
+
+================================================================================
+FILE: ./models/enums/fulfillment_policy.go
+================================================================================
+
+package enums
+
+type FulfillmentPolicy string
+
+const (
+	FulfillmentInventoryRequired FulfillmentPolicy = "inventory_required"
+	FulfillmentAllowBackorder    FulfillmentPolicy = "allow_backorder"
+	FulfillmentMadeToOrder       FulfillmentPolicy = "made_to_order"
+	FulfillmentDropship          FulfillmentPolicy = "dropship"
+	FulfillmentServiceOnly       FulfillmentPolicy = "service_only"
+)
+
+func ValidFulfillmentPolicies() []FulfillmentPolicy {
+	return []FulfillmentPolicy{
+		FulfillmentInventoryRequired,
+		FulfillmentAllowBackorder,
+		FulfillmentMadeToOrder,
+		FulfillmentDropship,
+		FulfillmentServiceOnly,
+	}
+}
+
+func (f FulfillmentPolicy) IsValid() bool {
+	switch f {
+	case FulfillmentInventoryRequired, FulfillmentAllowBackorder,
+		FulfillmentMadeToOrder, FulfillmentDropship, FulfillmentServiceOnly:
+		return true
+	}
+	return false
 }
 
 

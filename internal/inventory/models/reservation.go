@@ -16,10 +16,14 @@ type Reservation struct {
 	ItemID          uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
 	BatchID         *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
 	Quantity        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
-	Status          string          `gorm:"type:varchar(20);not null;default:'active';check:status IN ('active','fulfilled','cancelled')" json:"status"`
-	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
-	ExpiresAt       *time.Time      `gorm:"type:timestamptz" json:"expiresAt,omitempty"`
-	CreatedBy       *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
-	FulfilledAt     *time.Time      `gorm:"type:timestamptz" json:"fulfilledAt,omitempty"`
-	CancelledAt     *time.Time      `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+	// Removed check constraint from tag – handled by DB
+	Status      string     `gorm:"type:varchar(20);not null;default:'active'" json:"status"`
+	CreatedAt   time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	ExpiresAt   *time.Time `gorm:"type:timestamptz" json:"expiresAt,omitempty"`
+	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	FulfilledAt *time.Time `gorm:"type:timestamptz" json:"fulfilledAt,omitempty"`
+	CancelledAt *time.Time `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+
+	// New field
+	FulfilledQuantity decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"fulfilledQuantity"`
 }
