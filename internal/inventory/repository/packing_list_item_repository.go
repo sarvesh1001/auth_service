@@ -20,7 +20,8 @@ type PackingListItemRepository interface {
 	BulkCreate(ctx context.Context, db DBTX, items []*models.PackingListItem) error
 	GetByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) ([]*models.PackingListItem, error)
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingListItem, error)
-	UpdatePackedQty(ctx context.Context, db DBTX, id uuid.UUID, packedQty decimal.Decimal) error
+	// AddPackedQty increments the packed quantity by the given delta.
+	AddPackedQty(ctx context.Context, db DBTX, id uuid.UUID, delta decimal.Decimal) error
 	DeleteByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) error
 }
 
@@ -125,15 +126,16 @@ func (r *packingListItemRepository) GetByID(ctx context.Context, db DBTX, id uui
 	return r.scanPackingListItem(row)
 }
 
-func (r *packingListItemRepository) UpdatePackedQty(ctx context.Context, db DBTX, id uuid.UUID, packedQty decimal.Decimal) error {
+// AddPackedQty increments the packed quantity by the given delta.
+func (r *packingListItemRepository) AddPackedQty(ctx context.Context, db DBTX, id uuid.UUID, delta decimal.Decimal) error {
 	query := `
 		UPDATE packing_list_items
-		SET packed_qty = $2
+		SET packed_qty = packed_qty + $2
 		WHERE packing_item_id = $1
 	`
-	res, err := db.ExecContext(ctx, query, id, packedQty)
+	res, err := db.ExecContext(ctx, query, id, delta)
 	if err != nil {
-		return fmt.Errorf("update packed qty: %w", err)
+		return fmt.Errorf("add packed qty: %w", err)
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {

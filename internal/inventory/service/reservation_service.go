@@ -33,6 +33,7 @@ type ReservationService interface {
 
 	// FulfillReservation fulfills the entire reservation.
 	FulfillReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, idempotencyKey string) error
+	GetActiveReservationsByReference(ctx context.Context, db repository.DBTX, companyID uuid.UUID, reservationType string, referenceID, itemID uuid.UUID) ([]*models.Reservation, error)
 
 	CancelReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, idempotencyKey string) error
 	ExpireReservations(ctx context.Context, db repository.DBTX, companyID uuid.UUID) (int64, error)
@@ -166,6 +167,7 @@ func (s *reservationService) GetActiveReservationByReference(ctx context.Context
 }
 
 // PartialFulfillReservation fulfills a portion of an active reservation.
+// PartialFulfillReservation fulfills a portion of an active reservation.
 func (s *reservationService) PartialFulfillReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, quantityFulfilled decimal.Decimal, idempotencyKey string) error {
 	logger := s.logger.With(
 		zap.String("method", "PartialFulfillReservation"),
@@ -203,6 +205,12 @@ func (s *reservationService) PartialFulfillReservation(ctx context.Context, db r
 	if quantityFulfilled.GreaterThan(remaining) {
 		return fmt.Errorf("%w: cannot fulfill more than remaining quantity (remaining %s, requested %s)",
 			inventory_errors.ErrInvalidInput, remaining.String(), quantityFulfilled.String())
+	}
+
+	// --- NEW: Release the fulfilled quantity from the reserved stock ---
+	qtyFloat, _ := quantityFulfilled.Float64()
+	if err := s.balanceRepo.ReleaseReservation(ctx, db, res.CompanyID, res.WarehouseID, res.ItemID, res.BatchID, qtyFloat); err != nil {
+		return fmt.Errorf("release reserved stock: %w", err)
 	}
 
 	// Update the reservation's fulfilled quantity and status
@@ -403,4 +411,17 @@ func (s *reservationService) emitReservationEvent(ctx context.Context, tx *sql.T
 		Payload:       data,
 	}
 	return s.outboxRepo.Store(ctx, tx, event)
+}
+func (s *reservationService) GetActiveReservationsByReference(ctx context.Context, db repository.DBTX, companyID uuid.UUID, reservationType string, referenceID, itemID uuid.UUID) ([]*models.Reservation, error) {
+	reservations, err := s.reservationRepo.GetByReference(ctx, db, reservationType, referenceID)
+	if err != nil {
+		return nil, err
+	}
+	var active []*models.Reservation
+	for _, res := range reservations {
+		if res.CompanyID == companyID && res.ItemID == itemID && (res.Status == "active" || res.Status == "partially_fulfilled") {
+			active = append(active, res)
+		}
+	}
+	return active, nil
 }

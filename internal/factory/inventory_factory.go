@@ -253,22 +253,29 @@ func NewInventoryInfraFactory(
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
-	// UPDATED: FulfillmentService now includes ShipmentItemService
 	infra.fulfillmentSvc = service.NewFulfillmentService(
-		infra.fulfillmentRepo, infra.shipmentRepo, infra.reservationSvc,
-		infra.inventorySvc, infra.productionSvc,
-		infra.itemRepo, infra.warehouseRepo, infra.stockBalanceRepo,
-		infra.postgresClient, infra.outboxRepo, infra.idempotencyStore,
-		infra.auditService, infra.log,
+		infra.fulfillmentRepo,
+		infra.shipmentRepo,
+		infra.reservationSvc,
+		infra.inventorySvc,
+		infra.productionSvc,
+		infra.stockSvc, // <-- added
+		infra.itemRepo,
+		infra.warehouseRepo,
+		infra.stockBalanceRepo,
+		infra.postgresClient,
+		infra.outboxRepo,
+		infra.idempotencyStore,
+		infra.auditService,
+		infra.log,
 	)
-
 	infra.shipmentSvc = service.NewShipmentService(
 		infra.shipmentRepo, infra.postgresClient, infra.outboxRepo,
 		infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
 	infra.transferOrderSvc = service.NewTransferOrderService(
-		infra.transferRepo, infra.itemRepo, infra.warehouseRepo,
+		infra.transferRepo, infra.itemRepo, infra.warehouseRepo, infra.stockBalanceRepo,
 		infra.inventorySvc, infra.stockLedgerRepo, infra.postgresClient,
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
 	)
@@ -343,7 +350,7 @@ func NewInventoryInfraFactory(
 	)
 	infra.analyticsHandler = handler.NewAnalyticsHandler(infra.analyticsQuerySvc, infra.log)
 	infra.locationHandler = handler.NewInventoryLocationHandler(infra.locationSvc, infra.log)
-	infra.fulfillmentHandler = handler.NewFulfillmentOrderHandler(infra.fulfillmentSvc, infra.log)
+	infra.fulfillmentHandler = handler.NewFulfillmentOrderHandler(infra.fulfillmentSvc, infra.warehouseRepo, infra.log)
 	infra.shipmentHandler = handler.NewShipmentHandler(infra.shipmentSvc, infra.fulfillmentSvc, infra.log)
 	infra.transferOrderHandler = handler.NewTransferOrderHandler(infra.transferOrderSvc, infra.log)
 	infra.serialNumberHandler = handler.NewSerialNumberHandler(infra.serialNumberSvc, infra.log)
@@ -387,6 +394,7 @@ func (i *InventoryInfraFactory) InventoryHandlers() *inventory.InventoryHandlers
 		// NEW handlers
 		ShipmentItemHandler:            i.shipmentItemHandler,
 		SerialNumberTransactionHandler: i.serialNumberTransactionHandler,
+		PickingHandler:                 i.pickingHandler, // ✅ ADD THIS
 		PackingHandler:                 i.packingHandler,
 	}
 }

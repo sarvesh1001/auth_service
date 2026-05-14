@@ -278,28 +278,35 @@ func (s *packingService) PackItem(ctx context.Context, req PackItemRequest, idem
 		return err
 	}
 
-	// Validate packed quantity does not exceed shipment item quantity
-	if req.PackedQty.GreaterThan(shipmentItem.QuantityShipped) {
-		return fmt.Errorf("%w: packed quantity %s exceeds shipment quantity %s",
-			inventory_errors.ErrInvalidInput, req.PackedQty.String(), shipmentItem.QuantityShipped.String())
+	// Calculate new total packed quantity (incremental)
+	newTotal := packingItem.PackedQty.Add(req.PackedQty)
+	if newTotal.GreaterThan(shipmentItem.QuantityShipped) {
+		return fmt.Errorf("%w: packed quantity would exceed shipment quantity %s (current %s + %s)",
+			inventory_errors.ErrInvalidInput, shipmentItem.QuantityShipped.String(),
+			packingItem.PackedQty.String(), req.PackedQty.String())
 	}
 
-	// Update packed quantity
-	if err := s.packingListItemRepo.UpdatePackedQty(ctx, tx, req.PackingItemID, req.PackedQty); err != nil {
-		return fmt.Errorf("update packed qty: %w", err)
+	// Increment packed quantity using the delta
+	if err := s.packingListItemRepo.AddPackedQty(ctx, tx, req.PackingItemID, req.PackedQty); err != nil {
+		return fmt.Errorf("add packed qty: %w", err)
 	}
 
-	// Mark packing list as 'packed' if all items are fully packed
+	// After update, check if all items in the packing list are now fully packed
 	allPacked, err := s.isFullyPacked(ctx, tx, packingList.PackingListID)
 	if err != nil {
-		logger.Warn("failed to check if fully packed", zap.Error(err))
-	} else if allPacked && packingList.Status == "created" {
-		if err := s.packingListRepo.UpdateStatus(ctx, tx, packingList.PackingListID, "packed", timePtr(time.Now()), nil); err != nil {
-			logger.Warn("failed to update packing list status to packed", zap.Error(err))
-		} else {
-			packingList.Status = "packed"
-			packingList.PackedAt = timePtr(time.Now())
-			_ = s.emitPackingEvent(ctx, tx, packingList, events.EventPackingListPacked)
+		return fmt.Errorf("check if fully packed: %w", err)
+	}
+	if allPacked && packingList.Status == "created" {
+		packedAt := time.Now()
+		if err := s.packingListRepo.UpdateStatusToPacked(ctx, tx, packingList.PackingListID, req.PackedBy, packedAt); err != nil {
+			return fmt.Errorf("failed to update packing list status to packed: %w", err)
+		}
+		// Update local object for event emission
+		packingList.Status = "packed"
+		packingList.PackedAt = &packedAt
+		packingList.PackedBy = req.PackedBy
+		if err := s.emitPackingEvent(ctx, tx, packingList, events.EventPackingListPacked); err != nil {
+			logger.Warn("failed to emit packing list packed event", zap.Error(err))
 		}
 	}
 
@@ -312,14 +319,17 @@ func (s *packingService) PackItem(ctx context.Context, req PackItemRequest, idem
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "inventory", "pack_item", "packing_list_item",
 			&req.PackingItemID, "user", req.PackedBy, nil, nil, map[string]interface{}{
-				"packed_qty": req.PackedQty,
+				"packed_qty_added": req.PackedQty.String(),
+				"new_total":        newTotal.String(),
 			})
 	}
 
-	logger.Info("packing item updated", zap.String("packing_item_id", req.PackingItemID.String()))
+	logger.Info("packing item updated",
+		zap.String("packing_item_id", req.PackingItemID.String()),
+		zap.String("added_qty", req.PackedQty.String()),
+		zap.String("new_total", newTotal.String()))
 	return nil
 }
-
 func (s *packingService) validatePackItem(req PackItemRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", inventory_errors.ErrInvalidInput)
@@ -382,13 +392,20 @@ func (s *packingService) BulkPackItems(ctx context.Context, req BulkPackItemsReq
 			return err
 		}
 
-		if item.PackedQty.GreaterThan(shipmentItem.QuantityShipped) {
-			return fmt.Errorf("%w: packed quantity %s exceeds shipment quantity %s for item %s",
-				inventory_errors.ErrInvalidInput, item.PackedQty.String(), shipmentItem.QuantityShipped.String(), packingItem.PackingItemID)
+		// Calculate new total packed quantity (incremental)
+		newTotal := packingItem.PackedQty.Add(item.PackedQty)
+		if newTotal.GreaterThan(shipmentItem.QuantityShipped) {
+			return fmt.Errorf("%w: packed quantity would exceed shipment quantity %s for item %s (current %s + %s)",
+				inventory_errors.ErrInvalidInput,
+				shipmentItem.QuantityShipped.String(),
+				packingItem.PackingItemID.String(),
+				packingItem.PackedQty.String(),
+				item.PackedQty.String())
 		}
 
-		if err := s.packingListItemRepo.UpdatePackedQty(ctx, tx, item.PackingItemID, item.PackedQty); err != nil {
-			return fmt.Errorf("update packed qty: %w", err)
+		// Increment packed quantity using AddPackedQty (delta)
+		if err := s.packingListItemRepo.AddPackedQty(ctx, tx, item.PackingItemID, item.PackedQty); err != nil {
+			return fmt.Errorf("add packed qty: %w", err)
 		}
 
 		affectedListIDs[packingList.PackingListID] = true
@@ -398,21 +415,23 @@ func (s *packingService) BulkPackItems(ctx context.Context, req BulkPackItemsReq
 	for listID := range affectedListIDs {
 		allPacked, err := s.isFullyPacked(ctx, tx, listID)
 		if err != nil {
-			logger.Warn("failed to check if fully packed", zap.String("list_id", listID.String()), zap.Error(err))
-			continue
+			return fmt.Errorf("check if fully packed for list %s: %w", listID, err)
 		}
 		if allPacked {
 			list, err := s.packingListRepo.GetByID(ctx, tx, listID)
 			if err != nil {
-				continue
+				return fmt.Errorf("get packing list %s: %w", listID, err)
 			}
 			if list.Status == "created" {
-				if err := s.packingListRepo.UpdateStatus(ctx, tx, listID, "packed", timePtr(time.Now()), nil); err != nil {
-					logger.Warn("failed to update packing list status", zap.Error(err))
-				} else {
-					list.Status = "packed"
-					list.PackedAt = timePtr(time.Now())
-					_ = s.emitPackingEvent(ctx, tx, list, events.EventPackingListPacked)
+				packedAt := time.Now()
+				if err := s.packingListRepo.UpdateStatusToPacked(ctx, tx, listID, req.PackedBy, packedAt); err != nil {
+					return fmt.Errorf("failed to update packing list %s status to packed: %w", listID, err)
+				}
+				list.Status = "packed"
+				list.PackedAt = &packedAt
+				list.PackedBy = req.PackedBy
+				if err := s.emitPackingEvent(ctx, tx, list, events.EventPackingListPacked); err != nil {
+					logger.Warn("failed to emit packing list packed event", zap.String("list_id", listID.String()), zap.Error(err))
 				}
 			}
 		}

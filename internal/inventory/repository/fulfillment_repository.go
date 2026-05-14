@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
@@ -229,6 +230,9 @@ func (r *fulfillmentRepository) scanOrderItem(s scanner) (*models.FulfillmentOrd
 	return &item, nil
 }
 
+// AddOrderItems inserts multiple fulfillment order items.
+// If a foreign key violation occurs (e.g., item_id does not exist),
+// it returns inventory_errors.ErrNotFound with a clear message.
 func (r *fulfillmentRepository) AddOrderItems(ctx context.Context, db DBTX, items []*models.FulfillmentOrderItem) error {
 	if len(items) == 0 {
 		return nil
@@ -244,6 +248,12 @@ func (r *fulfillmentRepository) AddOrderItems(ctx context.Context, db DBTX, item
 			it.OrderedQty, it.FulfilledQty, it.BackorderedQty,
 		)
 		if err != nil {
+			// Detect foreign key violation (item not found)
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23503" {
+				if strings.Contains(pqErr.Message, "fk_fulfillment_item_item") {
+					return fmt.Errorf("%w: item %s does not exist", inventory_errors.ErrNotFound, it.ItemID)
+				}
+			}
 			return fmt.Errorf("add fulfillment order item: %w", err)
 		}
 	}

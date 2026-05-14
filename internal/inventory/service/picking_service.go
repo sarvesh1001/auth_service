@@ -266,6 +266,7 @@ func (s *pickingService) PickItem(ctx context.Context, pickingItemID uuid.UUID, 
 		return err
 	}
 
+	// Check if all items are now fully picked
 	allItems, err := s.pickingListItemRepo.GetByPickingList(ctx, tx, list.PickingListID)
 	if err != nil {
 		return err
@@ -279,9 +280,13 @@ func (s *pickingService) PickItem(ctx context.Context, pickingItemID uuid.UUID, 
 	}
 	if allPicked {
 		now := time.Now()
+		// Update status to "picked" – this must succeed
 		if err := s.pickingListRepo.UpdateStatus(ctx, tx, list.PickingListID, "picked", &now, nil); err != nil {
-			logger.Warn("failed to update picking list status to picked", zap.Error(err))
+			// Log and return error so transaction rolls back
+			logger.Error("failed to update picking list status to picked", zap.Error(err))
+			return fmt.Errorf("update picking list status: %w", err)
 		}
+		logger.Info("picking list marked as picked", zap.String("picking_list_id", list.PickingListID.String()))
 	}
 
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
@@ -298,7 +303,6 @@ func (s *pickingService) PickItem(ctx context.Context, pickingItemID uuid.UUID, 
 	logger.Info("item picked", zap.String("picking_item_id", pickingItemID.String()), zap.String("picked_qty", pickedQty.String()))
 	return nil
 }
-
 func (s *pickingService) CompletePicking(ctx context.Context, pickingListID uuid.UUID, companyID uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "CompletePicking"), zap.String("idempotency_key", idempotencyKey))
 

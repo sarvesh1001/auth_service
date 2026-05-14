@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"go.uber.org/zap"
-
 	"auth-service/internal/inventory/inventory_errors"
 	"auth-service/internal/inventory/models"
 	"auth-service/internal/util"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 type PackingListRepository interface {
@@ -23,6 +23,7 @@ type PackingListRepository interface {
 	CompletePacking(ctx context.Context, db DBTX, id uuid.UUID, completedAt time.Time) error // <-- NEW
 	VerifyPacking(ctx context.Context, db DBTX, id uuid.UUID, verifiedBy *uuid.UUID, verifiedAt time.Time) error
 	List(ctx context.Context, db DBTX, filter PackingListFilter, p Pagination, s Sort) ([]*models.PackingList, int64, error)
+	UpdateStatusToPacked(ctx context.Context, tx *sql.Tx, packingListID uuid.UUID, packedBy *uuid.UUID, packedAt time.Time) error
 }
 
 type PackingListFilter struct {
@@ -295,4 +296,18 @@ func (r *packingListRepository) List(ctx context.Context, db DBTX, filter Packin
 		result = append(result, pl)
 	}
 	return result, total, rows.Err()
+}
+
+// UpdateStatusToPacked updates the packing list status to 'packed', sets packed_at and packed_by.
+func (r *packingListRepository) UpdateStatusToPacked(ctx context.Context, tx *sql.Tx, packingListID uuid.UUID, packedBy *uuid.UUID, packedAt time.Time) error {
+	query := `
+        UPDATE packing_lists
+        SET status = 'packed', packed_at = $1, packed_by = $2
+        WHERE packing_list_id = $3
+    `
+	_, err := tx.ExecContext(ctx, query, packedAt, packedBy, packingListID)
+	if err != nil {
+		return fmt.Errorf("update packing list to packed: %w", err)
+	}
+	return nil
 }

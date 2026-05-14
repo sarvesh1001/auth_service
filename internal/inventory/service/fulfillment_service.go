@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -58,6 +59,7 @@ type fulfillmentService struct {
 	reservationSvc   ReservationService
 	inventorySvc     InventoryService
 	productionSvc    ProductionService
+	stockSvc         StockService // ADDED: for batch picking
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
 	balanceRepo      repository.StockBalanceRepository
@@ -68,12 +70,14 @@ type fulfillmentService struct {
 	logger           *zap.Logger
 }
 
+// NewFulfillmentService creates a new fulfillment service.
 func NewFulfillmentService(
 	fulfillmentRepo repository.FulfillmentRepository,
 	shipmentRepo repository.ShipmentRepository,
 	reservationSvc ReservationService,
 	inventorySvc InventoryService,
 	productionSvc ProductionService,
+	stockSvc StockService, // ADDED parameter
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
 	balanceRepo repository.StockBalanceRepository,
@@ -89,6 +93,7 @@ func NewFulfillmentService(
 		reservationSvc:   reservationSvc,
 		inventorySvc:     inventorySvc,
 		productionSvc:    productionSvc,
+		stockSvc:         stockSvc, // ADDED
 		itemRepo:         itemRepo,
 		warehouseRepo:    warehouseRepo,
 		balanceRepo:      balanceRepo,
@@ -112,6 +117,15 @@ func (s *fulfillmentService) getAvailableStock(ctx context.Context, tx *sql.Tx, 
 	return balance.AvailableQty, nil
 }
 
+// allowed reference types for fulfillment orders
+var allowedRefTypes = map[string]bool{
+	"sales_order":    true,
+	"fulfillment":    true,
+	"purchase_order": true,
+	"transfer":       true,
+	"adjustment":     true,
+}
+
 func (s *fulfillmentService) CreateFulfillmentOrder(ctx context.Context, req CreateFulfillmentOrderRequest, idempotencyKey string) (*models.FulfillmentOrder, error) {
 	logger := s.logger.With(zap.String("method", "CreateFulfillmentOrder"), zap.String("idempotency_key", idempotencyKey))
 
@@ -125,10 +139,20 @@ func (s *fulfillmentService) CreateFulfillmentOrder(ctx context.Context, req Cre
 	}
 	defer tx.Rollback()
 
+	// Idempotency check
 	var cached *models.FulfillmentOrder
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached fulfillment order")
 		return cached, nil
+	}
+
+	// Validate warehouse exists
+	exists, err := s.warehouseRepo.Exists(ctx, tx, req.CompanyID, req.WarehouseID)
+	if err != nil {
+		return nil, fmt.Errorf("check warehouse existence: %w", err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("%w: warehouse %s not found", inventory_errors.ErrNotFound, req.WarehouseID)
 	}
 
 	order := &models.FulfillmentOrder{
@@ -177,6 +201,15 @@ func (s *fulfillmentService) AddFulfillmentItems(ctx context.Context, fulfillmen
 		return fmt.Errorf("%w: at least one item required", inventory_errors.ErrInvalidInput)
 	}
 
+	// Check for duplicate item IDs in the request
+	seen := make(map[uuid.UUID]bool)
+	for _, it := range items {
+		if seen[it.ItemID] {
+			return fmt.Errorf("%w: duplicate item_id %s in request", inventory_errors.ErrInvalidInput, it.ItemID)
+		}
+		seen[it.ItemID] = true
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -194,10 +227,19 @@ func (s *fulfillmentService) AddFulfillmentItems(ctx context.Context, fulfillmen
 		return err
 	}
 
+	// Pre-check all items exist
 	modelItems := make([]*models.FulfillmentOrderItem, 0, len(items))
 	for _, it := range items {
 		if it.OrderedQty.LessThanOrEqual(decimal.Zero) {
 			return fmt.Errorf("%w: ordered_qty must be positive for item %s", inventory_errors.ErrInvalidInput, it.ItemID)
+		}
+		// Verify item exists
+		_, err := s.itemRepo.GetByID(ctx, tx, it.ItemID)
+		if err != nil {
+			if err == inventory_errors.ErrNotFound {
+				return fmt.Errorf("%w: item %s not found", inventory_errors.ErrNotFound, it.ItemID)
+			}
+			return fmt.Errorf("get item %s: %w", it.ItemID, err)
 		}
 		modelItems = append(modelItems, &models.FulfillmentOrderItem{
 			FulfillmentItemID:  uuid.New(),
@@ -313,22 +355,132 @@ func (s *fulfillmentService) ProcessFulfillmentOrder(ctx context.Context, fulfil
 	return nil
 }
 
-func (s *fulfillmentService) handleInventoryRequired(ctx context.Context, tx *sql.Tx, order *models.FulfillmentOrder, item *models.FulfillmentOrderItem, remaining decimal.Decimal, idempotencyKey string) error {
-	expiresAt := time.Now().Add(48 * time.Hour)
-	reservationReq := CreateReservationRequest{
-		CompanyID:       order.CompanyID,
-		ReservationType: "fulfillment",
-		ReferenceID:     order.FulfillmentOrderID,
-		WarehouseID:     order.WarehouseID,
-		ItemID:          item.ItemID,
-		BatchID:         nil,
-		Quantity:        remaining,
-		ExpiresAt:       &expiresAt,
-		CreatedBy:       nil,
+// ----------------------------------------------------------------------------------
+// NEW: helper to map item valuation method to batch picking strategy
+func pickingStrategyFromItem(item *models.Item) PickingStrategy {
+	// Default to FIFO
+	if item.ValuationMethod == "weighted_average" {
+		// Weighted average often uses FIFO as well, but could also use FEFO for expiry.
+		// For expiry‑sensitive items, you may want to configure is_fefo flag.
+		return PickingStrategyFIFO
 	}
-	_, err := s.reservationSvc.CreateReservation(ctx, tx, reservationReq, idempotencyKey+":invreq:"+item.ItemID.String())
-	return err
+	// FIFO and LIFO both use FIFO picking (oldest batch first)
+	return PickingStrategyFIFO
 }
+
+// handleInventoryRequired creates reservations for inventory‑required items.
+// For batch‑tracked items, it calls batch picking and creates one reservation per batch.
+func (s *fulfillmentService) handleInventoryRequired(ctx context.Context, tx *sql.Tx, order *models.FulfillmentOrder, item *models.FulfillmentOrderItem, remaining decimal.Decimal, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "handleInventoryRequired"),
+		zap.String("fulfillment_order_id", order.FulfillmentOrderID.String()),
+		zap.String("item_id", item.ItemID.String()),
+		zap.String("remaining", remaining.String()),
+	)
+
+	itm, err := s.itemRepo.GetByID(ctx, tx, item.ItemID)
+	if err != nil {
+		logger.Error("failed to fetch item", zap.Error(err))
+		return fmt.Errorf("get item for batch check: %w", err)
+	}
+
+	logger.Info("item details",
+		zap.Bool("is_batch_tracked", itm.IsBatchTracked),
+		zap.String("valuation_method", string(itm.ValuationMethod)),
+	)
+
+	// If item is not batch‑tracked, create a single reservation (existing behaviour)
+	if !itm.IsBatchTracked {
+		logger.Info("item not batch‑tracked, creating single reservation")
+		expiresAt := time.Now().Add(48 * time.Hour)
+		reservationReq := CreateReservationRequest{
+			CompanyID:       order.CompanyID,
+			ReservationType: "fulfillment",
+			ReferenceID:     order.FulfillmentOrderID,
+			WarehouseID:     order.WarehouseID,
+			ItemID:          item.ItemID,
+			BatchID:         nil,
+			Quantity:        remaining,
+			ExpiresAt:       &expiresAt,
+			CreatedBy:       nil,
+		}
+		_, err := s.reservationSvc.CreateReservation(ctx, tx, reservationReq, idempotencyKey+":invreq:"+item.ItemID.String())
+		if err != nil {
+			logger.Error("failed to create single reservation", zap.Error(err))
+		}
+		return err
+	}
+
+	// ---- Batch‑tracked item: get batch allocations using FIFO / FEFO ----
+	logger.Info("item is batch‑tracked, calling batch picking")
+
+	strategy := pickingStrategyFromItem(itm)
+	logger.Info("batch picking strategy", zap.String("strategy", string(strategy)))
+
+	allocations, err := s.stockSvc.GetBatchPicking(
+		ctx,
+		order.CompanyID,
+		item.ItemID,
+		order.WarehouseID,
+		remaining,
+		strategy,
+	)
+	if err != nil {
+		if errors.Is(err, inventory_errors.ErrInsufficientStock) {
+			logger.Error("insufficient stock for batch picking", zap.Error(err))
+			return fmt.Errorf("%w: %s", inventory_errors.ErrInsufficientStock, err.Error())
+		}
+		logger.Error("batch picking failed", zap.Error(err))
+		return fmt.Errorf("batch picking failed: %w", err)
+	}
+
+	if len(allocations) == 0 {
+		logger.Warn("batch picking returned zero allocations – no stock available?")
+		return fmt.Errorf("%w: no batches available to allocate", inventory_errors.ErrInsufficientStock)
+	}
+
+	logger.Info("batch allocations received", zap.Int("num_allocations", len(allocations)))
+	for i, alloc := range allocations {
+		logger.Info(fmt.Sprintf("allocation %d", i),
+			zap.String("batch_id", alloc.BatchID.String()),
+			zap.String("quantity", alloc.AllocatedQty.String()),
+		)
+	}
+
+	// Create one reservation per batch allocation
+	expiresAt := time.Now().Add(48 * time.Hour)
+	for idx, alloc := range allocations {
+		reservationReq := CreateReservationRequest{
+			CompanyID:       order.CompanyID,
+			ReservationType: "fulfillment",
+			ReferenceID:     order.FulfillmentOrderID,
+			WarehouseID:     order.WarehouseID,
+			ItemID:          item.ItemID,
+			BatchID:         &alloc.BatchID,
+			Quantity:        alloc.AllocatedQty,
+			ExpiresAt:       &expiresAt,
+			CreatedBy:       nil,
+		}
+		itemKey := fmt.Sprintf("%s:batch:%s", idempotencyKey, alloc.BatchID.String())
+		if _, err := s.reservationSvc.CreateReservation(ctx, tx, reservationReq, itemKey); err != nil {
+			logger.Error("failed to create batch reservation",
+				zap.Int("allocation_index", idx),
+				zap.String("batch_id", alloc.BatchID.String()),
+				zap.Error(err),
+			)
+			return fmt.Errorf("create batch reservation for %s: %w", alloc.BatchID, err)
+		}
+		logger.Info("batch reservation created",
+			zap.Int("allocation_index", idx),
+			zap.String("batch_id", alloc.BatchID.String()),
+		)
+	}
+
+	logger.Info("all batch reservations created successfully")
+	return nil
+}
+
+// ----------------------------------------------------------------------------------
 
 func (s *fulfillmentService) handleAllowBackorder(ctx context.Context, tx *sql.Tx, order *models.FulfillmentOrder, item *models.FulfillmentOrderItem, remaining decimal.Decimal, idempotencyKey string) error {
 	available, err := s.getAvailableStock(ctx, tx, order.CompanyID, order.WarehouseID, item.ItemID, nil)
@@ -372,6 +524,10 @@ func (s *fulfillmentService) handleMadeToOrder(ctx context.Context, tx *sql.Tx, 
 	bomID, err := s.getActiveBOMForProduct(ctx, tx, order.CompanyID, item.ItemID)
 	if err != nil {
 		return fmt.Errorf("get active BOM for product %s: %w", item.ItemID, err)
+	}
+	// If no active BOM, consider returning an error (cannot fulfill)
+	if bomID == uuid.Nil {
+		return fmt.Errorf("%w: no active BOM for product %s", inventory_errors.ErrInvalidInput, item.ItemID)
 	}
 
 	prodOrderReq := CreateProductionOrderRequest{
@@ -512,6 +668,7 @@ func (s *fulfillmentService) AllocateStockToFulfillment(ctx context.Context, ful
 	logger.Info("stock allocated for fulfillment", zap.String("order_id", fulfillmentOrderID.String()))
 	return nil
 }
+
 func (s *fulfillmentService) CreateShipment(ctx context.Context, req CreateShipmentRequest, idempotencyKey string) (*models.Shipment, error) {
 	logger := s.logger.With(zap.String("method", "CreateShipment"), zap.String("idempotency_key", idempotencyKey))
 
@@ -632,7 +789,7 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			continue
 		}
 
-		// If item does not require shipping (e.g., digital goods, services), just mark as fulfilled
+		// Items that don't require shipping or don't track inventory are handled directly
 		if !itm.RequiresShipping {
 			newFulfilled := item.FulfilledQty.Add(remainingToShip)
 			if err := s.fulfillmentRepo.UpdateFulfilledQty(ctx, tx, item.FulfillmentItemID, newFulfilled, item.BackorderedQty); err != nil {
@@ -640,8 +797,6 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			}
 			continue
 		}
-
-		// If item does not track inventory, mark as fulfilled (already handled in process, but double‑check)
 		if !itm.TrackInventory {
 			newFulfilled := item.FulfilledQty.Add(remainingToShip)
 			if err := s.fulfillmentRepo.UpdateFulfilledQty(ctx, tx, item.FulfillmentItemID, newFulfilled, item.BackorderedQty); err != nil {
@@ -650,14 +805,16 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			continue
 		}
 
-		reservation, err := s.reservationSvc.GetActiveReservationByReference(
+		// --- NEW: fetch all active reservations for this fulfillment order and item ---
+		reservations, err := s.reservationSvc.GetActiveReservationsByReference(
 			ctx, tx, order.CompanyID, "fulfillment", order.FulfillmentOrderID, item.ItemID,
 		)
 		if err != nil && err != inventory_errors.ErrNotFound {
-			return fmt.Errorf("get active reservation for item %s: %w", item.ItemID, err)
+			return fmt.Errorf("get active reservations for item %s: %w", item.ItemID, err)
 		}
-		if err == inventory_errors.ErrNotFound {
-			// No reservation – check available stock directly
+
+		if len(reservations) == 0 {
+			// No reservations – fallback to direct stock check (for non‑batch items or errors)
 			available, err := s.getAvailableStock(ctx, tx, order.CompanyID, shipment.WarehouseID, item.ItemID, nil)
 			if err != nil {
 				return fmt.Errorf("check available stock for item %s: %w", item.ItemID, err)
@@ -665,47 +822,94 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			if available.LessThan(remainingToShip) {
 				return fmt.Errorf("%w: insufficient stock for item %s (available %s, need %s)", inventory_errors.ErrInsufficientStock, item.ItemID, available.String(), remainingToShip.String())
 			}
-			reservation = nil // no reservation to link
-		}
-
-		unitCost := decimal.Zero
-		if itm.StandardCost != nil {
-			unitCost = *itm.StandardCost
-		}
-
-		movementReq := CreateMovementRequest{
-			CompanyID:     order.CompanyID,
-			MovementType:  enums.MovementTypeSalesOut,
-			MovementDate:  time.Now(),
-			WarehouseID:   shipment.WarehouseID,
-			ItemID:        item.ItemID,
-			QuantityOut:   remainingToShip,
-			UnitCost:      unitCost,
-			Reason:        stringPtr(fmt.Sprintf("Shipment %s", shipment.ShipmentNumber)),
-			ReferenceType: stringPtr("shipment"),
-			ReferenceID:   &shipment.ShipmentID,
-			CreatedBy:     nil,
-		}
-		if reservation != nil {
-			movementReq.ReservationID = &reservation.ReservationID
-		}
-		_, err = s.inventorySvc.CreateMovement(ctx, movementReq, idempotencyKey+":movement:"+item.ItemID.String())
-		if err != nil {
-			return fmt.Errorf("create movement for item %s: %w", item.ItemID, err)
-		}
-
-		if reservation != nil {
-			if err := s.reservationSvc.PartialFulfillReservation(ctx, tx, reservation.ReservationID, order.CompanyID, remainingToShip, idempotencyKey+":partial:"+reservation.ReservationID.String()); err != nil {
-				return fmt.Errorf("partial fulfill reservation for item %s: %w", item.ItemID, err)
+			// Create a single movement without reservation
+			unitCost := decimal.Zero
+			if itm.StandardCost != nil {
+				unitCost = *itm.StandardCost
 			}
+			movementReq := CreateMovementRequest{
+				CompanyID:     order.CompanyID,
+				MovementType:  enums.MovementTypeSalesOut,
+				MovementDate:  time.Now(),
+				WarehouseID:   shipment.WarehouseID,
+				ItemID:        item.ItemID,
+				QuantityOut:   remainingToShip,
+				UnitCost:      unitCost,
+				Reason:        stringPtr(fmt.Sprintf("Shipment %s", shipment.ShipmentNumber)),
+				ReferenceType: stringPtr("shipment"),
+				ReferenceID:   &shipment.ShipmentID,
+				CreatedBy:     nil,
+			}
+			_, err = s.inventorySvc.CreateMovement(ctx, movementReq, idempotencyKey+":movement:"+item.ItemID.String())
+			if err != nil {
+				return fmt.Errorf("create movement for item %s: %w", item.ItemID, err)
+			}
+			// No reservation to update
+		} else {
+			// Process each active reservation (one per batch)
+			shippedFromReservations := decimal.Zero
+			for _, res := range reservations {
+				// How much to ship from this reservation
+				shipQty := res.Quantity.Sub(res.FulfilledQuantity)
+				if shipQty.LessThanOrEqual(decimal.Zero) {
+					continue
+				}
+				if shipQty.GreaterThan(remainingToShip) {
+					shipQty = remainingToShip
+				}
+				if shipQty.LessThanOrEqual(decimal.Zero) {
+					break
+				}
+
+				unitCost := decimal.Zero
+				if itm.StandardCost != nil {
+					unitCost = *itm.StandardCost
+				}
+				movementReq := CreateMovementRequest{
+					CompanyID:     order.CompanyID,
+					MovementType:  enums.MovementTypeSalesOut,
+					MovementDate:  time.Now(),
+					WarehouseID:   shipment.WarehouseID,
+					ItemID:        item.ItemID,
+					BatchID:       res.BatchID, // Critical: set the batch ID
+					QuantityOut:   shipQty,
+					UnitCost:      unitCost,
+					Reason:        stringPtr(fmt.Sprintf("Shipment %s", shipment.ShipmentNumber)),
+					ReferenceType: stringPtr("shipment"),
+					ReferenceID:   &shipment.ShipmentID,
+					CreatedBy:     nil,
+					ReservationID: &res.ReservationID,
+				}
+				key := fmt.Sprintf("%s:movement:%s:%s", idempotencyKey, item.ItemID.String(), res.BatchID.String())
+				if _, err := s.inventorySvc.CreateMovement(ctx, movementReq, key); err != nil {
+					return fmt.Errorf("create movement for batch %s: %w", res.BatchID.String(), err)
+				}
+
+				// Partially fulfill the reservation (full shipped amount)
+				if err := s.reservationSvc.PartialFulfillReservation(ctx, tx, res.ReservationID, order.CompanyID, shipQty, idempotencyKey+":partial:"+res.ReservationID.String()); err != nil {
+					return fmt.Errorf("fulfill reservation %s: %w", res.ReservationID.String(), err)
+				}
+
+				shippedFromReservations = shippedFromReservations.Add(shipQty)
+				remainingToShip = remainingToShip.Sub(shipQty)
+				if remainingToShip.LessThanOrEqual(decimal.Zero) {
+					break
+				}
+			}
+			if remainingToShip.GreaterThan(decimal.Zero) {
+				return fmt.Errorf("%w: could not allocate all quantity from reservations (remaining %s)", inventory_errors.ErrInsufficientStock, remainingToShip.String())
+			}
+			// The fulfillment item's fulfilled quantity will be updated after the loop (outside the reservation block)
 		}
 
+		// Update fulfilled quantity on the fulfillment order item
 		newFulfilled := item.FulfilledQty.Add(remainingToShip)
 		if err := s.fulfillmentRepo.UpdateFulfilledQty(ctx, tx, item.FulfillmentItemID, newFulfilled, item.BackorderedQty); err != nil {
 			logger.Warn("failed to update fulfilled_qty", zap.Error(err))
 		}
 	}
 
+	// Mark shipment as shipped
 	now := time.Now()
 	if err := s.shipmentRepo.UpdateStatus(ctx, tx, shipmentID, "shipped", &now, nil); err != nil {
 		return fmt.Errorf("update shipment status to shipped: %w", err)
@@ -713,9 +917,11 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 	shipment.ShipmentStatus = "shipped"
 	shipment.ShippedAt = &now
 
+	// If all items are fulfilled, update fulfillment order status
 	allFulfilled := true
-	for _, item := range items {
-		if item.FulfilledQty.LessThan(item.OrderedQty) {
+	itemsAfter, _ := s.fulfillmentRepo.GetOrderItems(ctx, tx, order.FulfillmentOrderID)
+	for _, it := range itemsAfter {
+		if it.FulfilledQty.LessThan(it.OrderedQty) {
 			allFulfilled = false
 			break
 		}
@@ -744,7 +950,6 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 	logger.Info("shipment shipped", zap.String("shipment_id", shipmentID.String()))
 	return nil
 }
-
 func (s *fulfillmentService) Deliver(ctx context.Context, shipmentID uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "Deliver"), zap.String("idempotency_key", idempotencyKey))
 
@@ -804,12 +1009,16 @@ func (s *fulfillmentService) validateCreateFulfillmentOrder(req CreateFulfillmen
 	if req.ReferenceType == "" {
 		return fmt.Errorf("%w: reference_type required", inventory_errors.ErrInvalidInput)
 	}
+	// Validate allowed reference types
+	if !allowedRefTypes[req.ReferenceType] {
+		return fmt.Errorf("%w: invalid reference_type '%s'", inventory_errors.ErrInvalidInput, req.ReferenceType)
+	}
 	if req.ReferenceID == uuid.Nil {
 		return fmt.Errorf("%w: reference_id required", inventory_errors.ErrInvalidInput)
 	}
-	if req.WarehouseID == uuid.Nil {
-		return fmt.Errorf("%w: warehouse_id required", inventory_errors.ErrInvalidInput)
-	}
+	// if req.WarehouseID == uuid.Nil {
+	// 	return fmt.Errorf("%w: warehouse_id required", inventory_errors.ErrInvalidInput)
+	// }
 	return nil
 }
 

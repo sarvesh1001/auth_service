@@ -29,6 +29,7 @@ type InventoryService interface {
 	CreateItem(ctx context.Context, req CreateItemRequest, idempotencyKey string) (*models.Item, error)
 	UpdateItem(ctx context.Context, req UpdateItemRequest, idempotencyKey string) (*models.Item, error)
 	DeleteItem(ctx context.Context, companyID, itemID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	CreateMovementWithTx(ctx context.Context, tx *sql.Tx, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
 
 	// Stock movement (core transactional)
 	CreateMovement(ctx context.Context, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
@@ -1050,4 +1051,97 @@ func (s *inventoryService) emitStockChangeEvent(ctx context.Context, tx *sql.Tx,
 func toFloat64(d decimal.Decimal) float64 {
 	f, _ := d.Float64()
 	return f
+}
+
+// CreateMovementWithTx performs the movement within the given transaction.
+func (s *inventoryService) CreateMovementWithTx(ctx context.Context, tx *sql.Tx, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error) {
+	logger := s.logger.With(zap.String("method", "CreateMovementWithTx"), zap.String("idempotency_key", idempotencyKey))
+	if err := s.validateMovement(req); err != nil {
+		return nil, err
+	}
+
+	// Idempotency check inside the provided tx
+	var cached *models.StockMovement
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached movement")
+		return cached, nil
+	}
+
+	item, err := s.itemRepo.GetByID(ctx, tx, req.ItemID)
+	if err != nil {
+		return nil, fmt.Errorf("get item: %w", err)
+	}
+	if item.CompanyID != req.CompanyID {
+		return nil, inventory_errors.ErrPermissionDenied
+	}
+
+	if req.MovementType == enums.MovementTypePurchaseIn && !item.IsPurchasable {
+		return nil, fmt.Errorf("%w: item %s is not purchasable", inventory_errors.ErrInvalidInput, item.SKU)
+	}
+	if req.MovementType == enums.MovementTypeSalesOut && !item.IsSellable {
+		return nil, fmt.Errorf("%w: item %s is not sellable", inventory_errors.ErrInvalidInput, item.SKU)
+	}
+
+	movement := &models.StockMovement{
+		MovementID:      uuid.New(),
+		CompanyID:       req.CompanyID,
+		MovementType:    req.MovementType,
+		MovementDate:    req.MovementDate,
+		WarehouseID:     req.WarehouseID,
+		FromWarehouseID: req.FromWarehouseID,
+		ItemID:          req.ItemID,
+		BatchID:         req.BatchID,
+		QuantityIn:      req.QuantityIn,
+		QuantityOut:     req.QuantityOut,
+		UnitCost:        req.UnitCost,
+		Reason:          req.Reason,
+		ReferenceType:   req.ReferenceType,
+		ReferenceID:     req.ReferenceID,
+		CreatedBy:       req.CreatedBy,
+		Status:          req.Status,
+		ReservationID:   req.ReservationID,
+		ShipmentID:      req.ShipmentID,
+		TransferOrderID: req.TransferOrderID,
+	}
+	if movement.Status == "" {
+		movement.Status = "posted"
+	}
+
+	if err := s.movementRepo.CreateMovement(ctx, tx, movement); err != nil {
+		return nil, fmt.Errorf("create movement record: %w", err)
+	}
+
+	var oldAvailable, newAvailable float64
+
+	if !item.TrackInventory {
+		logger.Debug("item does not track inventory; skipping stock/ledger updates")
+		if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
+			logger.Warn("failed to emit movement event", zap.Error(err))
+		}
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
+		// Do NOT commit – caller will
+		return movement, nil
+	}
+
+	if req.QuantityIn.GreaterThan(decimal.Zero) {
+		oldAvailable, newAvailable, err = s.processInbound(ctx, tx, movement)
+	} else {
+		oldAvailable, newAvailable, err = s.processOutboundWithAllocation(ctx, tx, movement)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
+		logger.Warn("failed to emit movement event", zap.Error(err))
+	}
+	if err := s.emitStockChangeEvent(ctx, tx, movement, oldAvailable, newAvailable); err != nil {
+		logger.Warn("failed to emit stock change event", zap.Error(err))
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
+
+	// Audit is postponed to the caller (or can be called here, but it's fine)
+	logger.Info("movement created within tx", zap.String("movement_id", movement.MovementID.String()))
+	return movement, nil
 }

@@ -341,6 +341,9 @@ func RegisterInventoryRoutes(
 		// -------------------------------
 		// 16. Shipments
 		// -------------------------------
+		// -------------------------------
+		// 16. Shipments
+		// -------------------------------
 		r.Route("/shipments", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.out", logger)).
 				Post("/", handlers.ShipmentHandler.CreateShipment)
@@ -352,8 +355,15 @@ func RegisterInventoryRoutes(
 				Get("/{id}", handlers.ShipmentHandler.GetShipment)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.view", logger)).
 				Get("/", handlers.ShipmentHandler.ListShipments)
-		})
 
+			// ========== NEW: Shipment Items under shipment ==========
+			r.Route("/{shipmentID}/items", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.out", logger)).
+					Post("/", handlers.ShipmentItemHandler.CreateShipmentItems)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.view", logger)).
+					Get("/", handlers.ShipmentItemHandler.GetShipmentItems)
+			})
+		})
 		// -------------------------------
 		// 17. Transfer Orders
 		// -------------------------------
@@ -471,6 +481,7 @@ func RegisterInventoryRoutes(
 		})
 
 		// ========== NEW: Packing Lists ==========
+		// ========== NEW: Packing Lists ==========
 		r.Route("/packing", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 				Post("/lists", handlers.PackingHandler.GeneratePackingList)
@@ -478,10 +489,15 @@ func RegisterInventoryRoutes(
 				Post("/lists/{listID}/verify", handlers.PackingHandler.VerifyPacking)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 				Post("/lists/{listID}/complete", handlers.PackingHandler.CompletePacking)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
-				Post("/items", handlers.PackingHandler.PackItem) // single item
-			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
-				Post("/items/bulk", handlers.PackingHandler.BulkPackItems) // bulk pack
+
+			// Item operations now under the specific list
+			r.Route("/lists/{listID}/items", func(r chi.Router) {
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
+					Post("/", handlers.PackingHandler.PackItem) // single item
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
+					Post("/bulk", handlers.PackingHandler.BulkPackItems) // bulk pack
+			})
+
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.view", logger)).
 				Get("/lists/{listID}", handlers.PackingHandler.GetPackingList)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.view", logger)).

@@ -14,19 +14,35 @@ import (
 
 	"auth-service/internal/inventory/inventory_errors"
 	"auth-service/internal/inventory/models"
+	"auth-service/internal/inventory/repository"
 	"auth-service/internal/inventory/service"
 )
+
+// allowedReferenceTypes defines valid values for reference_type field.
+var allowedReferenceTypes = map[string]bool{
+	"sales_order":    true,
+	"fulfillment":    true,
+	"purchase_order": true,
+	"transfer":       true,
+	"adjustment":     true,
+}
 
 // FulfillmentOrderHandler handles API endpoints for fulfillment orders and shipments.
 type FulfillmentOrderHandler struct {
 	fulfillmentSvc service.FulfillmentService
+	warehouseRepo  repository.WarehouseRepository
 	logger         *zap.Logger
 }
 
-// NewFulfillmentOrderHandler creates a new handler instance.
-func NewFulfillmentOrderHandler(fulfillmentSvc service.FulfillmentService, logger *zap.Logger) *FulfillmentOrderHandler {
+// NewFulfillmentOrderHandler creates a new handler instance with required dependencies.
+func NewFulfillmentOrderHandler(
+	fulfillmentSvc service.FulfillmentService,
+	warehouseRepo repository.WarehouseRepository,
+	logger *zap.Logger,
+) *FulfillmentOrderHandler {
 	return &FulfillmentOrderHandler{
 		fulfillmentSvc: fulfillmentSvc,
+		warehouseRepo:  warehouseRepo,
 		logger:         logger.Named("fulfillment_order_handler"),
 	}
 }
@@ -71,6 +87,7 @@ type fulfillmentOrderItemResponse struct {
 // ---------- Handlers ----------
 
 // CreateFulfillmentOrder handles POST /companies/{companyID}/fulfillment-orders
+// CreateFulfillmentOrder handles POST /companies/{companyID}/fulfillment-orders
 func (h *FulfillmentOrderHandler) CreateFulfillmentOrder(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -107,6 +124,11 @@ func (h *FulfillmentOrderHandler) CreateFulfillmentOrder(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusBadRequest, "reference_type is required")
 		return
 	}
+	// Validate reference_type against allowed values
+	if !allowedReferenceTypes[req.ReferenceType] {
+		h.respondWithError(w, http.StatusBadRequest, "invalid reference_type")
+		return
+	}
 	referenceID, err := uuid.Parse(req.ReferenceID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid reference_id")
@@ -117,6 +139,8 @@ func (h *FulfillmentOrderHandler) CreateFulfillmentOrder(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
 		return
 	}
+
+	// REMOVED the problematic warehouse existence check – service will handle it.
 
 	svcReq := service.CreateFulfillmentOrderRequest{
 		CompanyID:     companyID,
@@ -184,8 +208,17 @@ func (h *FulfillmentOrderHandler) AddFulfillmentItems(w http.ResponseWriter, r *
 		return
 	}
 
+	// Detect duplicate item_id in the same request
+	seen := make(map[string]bool)
 	items := make([]service.FulfillmentOrderItemRequest, 0, len(req.Items))
+
 	for _, it := range req.Items {
+		if seen[it.ItemID] {
+			h.respondWithError(w, http.StatusBadRequest, "duplicate item_id in request: "+it.ItemID)
+			return
+		}
+		seen[it.ItemID] = true
+
 		itemID, err := uuid.Parse(it.ItemID)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid item_id: "+it.ItemID)
@@ -383,7 +416,6 @@ func (h *FulfillmentOrderHandler) GetFulfillmentOrderItems(w http.ResponseWriter
 		return
 	}
 
-	// Optional: pagination (not implemented in service currently, but can be added)
 	items, err := h.fulfillmentSvc.GetFulfillmentOrderItems(ctx, fulfillmentOrderID)
 	if err != nil {
 		h.logger.Error("failed to get fulfillment order items", zap.Error(err))
@@ -478,18 +510,13 @@ func (h *FulfillmentOrderHandler) respondWithInventoryError(w http.ResponseWrite
 	case errors.Is(err, inventory_errors.ErrInvalidTransition):
 		h.respondWithError(w, http.StatusConflict, err.Error())
 	default:
+		// Check for foreign key violation (item not found)
+		var pqErr interface{ Code() string }
+		if errors.As(err, &pqErr) && pqErr.Code() == "23503" {
+			h.respondWithError(w, http.StatusNotFound, "referenced record not found (item or warehouse)")
+			return
+		}
 		h.logger.Error("unexpected error", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "internal server error")
 	}
 }
-
-// ---------- Optional: Shipment sub-resource (if you prefer to keep shipments separate) ----------
-// You can also add handlers for creating shipments directly on the fulfillment order,
-// but the FulfillmentService already has CreateShipment, Ship, Deliver methods.
-// To expose them as endpoints:
-//
-// POST /companies/{companyID}/fulfillment-orders/{fulfillmentOrderID}/shipments
-// POST /shipments/{shipmentID}/ship
-// POST /shipments/{shipmentID}/deliver
-//
-// Those would be placed in a separate ShipmentHandler or combined here.

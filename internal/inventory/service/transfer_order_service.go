@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -53,8 +54,9 @@ type transferOrderService struct {
 	transferRepo     repository.TransferOrderRepository
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
-	inventorySvc     InventoryService                 // Core inventory engine
-	ledgerRepo       repository.StockLedgerRepository // Only for FIFO cost calculation
+	balanceRepo      repository.StockBalanceRepository // Added for stock availability check
+	inventorySvc     InventoryService
+	ledgerRepo       repository.StockLedgerRepository
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -67,6 +69,7 @@ func NewTransferOrderService(
 	transferRepo repository.TransferOrderRepository,
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
+	balanceRepo repository.StockBalanceRepository, // Added parameter
 	inventorySvc InventoryService,
 	ledgerRepo repository.StockLedgerRepository,
 	pgClient *client.PostgresClient,
@@ -79,6 +82,7 @@ func NewTransferOrderService(
 		transferRepo:     transferRepo,
 		itemRepo:         itemRepo,
 		warehouseRepo:    warehouseRepo,
+		balanceRepo:      balanceRepo,
 		inventorySvc:     inventorySvc,
 		ledgerRepo:       ledgerRepo,
 		pgClient:         pgClient,
@@ -198,6 +202,7 @@ func (s *transferOrderService) CreateTransferOrder(ctx context.Context, req Crea
 }
 
 // DispatchTransferOrder marks a transfer order as dispatched and creates outbound stock movements.
+// It now checks stock availability and respects negative stock rules.
 func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transferOrderID, companyID uuid.UUID, dispatchedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "DispatchTransferOrder"), zap.String("transfer_order_id", transferOrderID.String()))
 
@@ -229,11 +234,48 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 		return fmt.Errorf("get transfer items: %w", err)
 	}
 
-	// For each item, create an outbound movement using InventoryService
+	// Get source warehouse for negative stock flag
+	sourceWarehouse, err := s.warehouseRepo.GetByID(ctx, tx, companyID, order.FromWarehouseID)
+	if err != nil {
+		return fmt.Errorf("get source warehouse: %w", err)
+	}
+
+	// Pre‑validate all items before creating any movement
 	for _, it := range items {
-		// Calculate the actual FIFO cost for this item at source warehouse (optional, InventoryService will use its own logic)
-		// We'll let InventoryService compute the cost, but we need to know it for the inbound movement later.
-		// So we first create the outbound movement, retrieve its unit cost, then use the same cost for inbound.
+		// Fetch item with company context
+		item, err := s.itemRepo.GetByID(ctx, tx, it.ItemID) // Assumes GetByID returns item with company_id
+		if err != nil {
+			return fmt.Errorf("get item %s: %w", it.ItemID, err)
+		}
+		if item.CompanyID != companyID {
+			return inventory_errors.ErrPermissionDenied
+		}
+
+		// Get current stock balance with FOR UPDATE (batch = nil, as transfers are not batch‑tracked)
+		balance, err := s.balanceRepo.GetForUpdate(ctx, tx, companyID, order.FromWarehouseID, it.ItemID, nil)
+		if err != nil {
+			if errors.Is(err, inventory_errors.ErrNotFound) {
+				// No stock record means quantity_on_hand = 0, reserved = 0
+				balance = &models.StockBalance{
+					QuantityOnHand: decimal.Zero,
+					ReservedQty:    decimal.Zero,
+				}
+			} else {
+				return fmt.Errorf("get stock balance for item %s: %w", it.ItemID, err)
+			}
+		}
+		availableQty := balance.QuantityOnHand.Sub(balance.ReservedQty)
+		requiredQty := it.Quantity
+
+		// Negative stock allowed only if BOTH item and warehouse allow it
+		if requiredQty.GreaterThan(availableQty) && !(item.AllowNegativeStock && sourceWarehouse.AllowNegativeStock) {
+			return fmt.Errorf("%w: insufficient stock for item %s: required %s, available %s",
+				inventory_errors.ErrInsufficientStock, it.ItemID, requiredQty.String(), availableQty.String())
+		}
+	}
+
+	// All stock checks passed – create outbound movements
+	for _, it := range items {
 		outMovementReq := CreateMovementRequest{
 			CompanyID:       companyID,
 			MovementType:    enums.MovementTypeTransfer,
@@ -242,13 +284,13 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 			FromWarehouseID: &order.FromWarehouseID,
 			ItemID:          it.ItemID,
 			QuantityOut:     it.Quantity,
-			UnitCost:        decimal.Zero, // Let InventoryService compute real cost
+			UnitCost:        decimal.Zero,
 			Reason:          stringPtr(fmt.Sprintf("Transfer to %s", order.ToWarehouseID.String())),
 			ReferenceType:   stringPtr("transfer"),
 			ReferenceID:     &transferOrderID,
 			CreatedBy:       dispatchedBy,
 			Status:          "posted",
-			TransferOrderID: &transferOrderID, // Link to transfer order
+			TransferOrderID: &transferOrderID,
 		}
 
 		outMovement, err := s.inventorySvc.CreateMovement(ctx, outMovementReq, idempotencyKey+":out:"+it.ItemID.String())
@@ -256,21 +298,9 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 			return fmt.Errorf("create outbound movement for item %s: %w", it.ItemID, err)
 		}
 
-		// Store the cost for inbound movement
-		unitCost := outMovement.UnitCost
-		if unitCost.IsZero() {
-			// Fallback to latest cost if for some reason zero (should not happen)
-			logger.Warn("outbound movement has zero unit cost, falling back to latest cost", zap.String("item_id", it.ItemID.String()))
+		if outMovement.UnitCost.IsZero() {
+			logger.Warn("outbound movement has zero unit cost", zap.String("item_id", it.ItemID.String()))
 		}
-
-		// We'll need the cost for inbound receipt later; we can store it in a temporary map or refetch from out movement record.
-		// Since we are still in the same transaction, we can simply remember the cost per item.
-		// We'll store it in a map to use during receive.
-		// But the receive method will run in a separate transaction, so we need to persist this cost somewhere.
-		// Option: Store it in the transfer order item (but that table has no cost column). Alternatively, the inbound movement
-		// can look up the outbound movement's cost via the transfer_order_id and item_id. We'll do that in ReceiveTransferOrder.
-		// For now, just ensure the outbound movement is created.
-		_ = unitCost // will be used later via query
 	}
 
 	// Update transfer order status to dispatched
@@ -330,9 +360,8 @@ func (s *transferOrderService) ReceiveTransferOrder(ctx context.Context, transfe
 		return fmt.Errorf("get transfer items: %w", err)
 	}
 
-	// For each item, look up the unit cost from the outbound movement (same transfer_order_id)
+	// For each item, look up the unit cost from the outbound movement
 	for _, it := range items {
-		// Find the outbound movement for this item and transfer order
 		outMovement, err := s.findOutboundMovement(ctx, tx, companyID, transferOrderID, it.ItemID)
 		if err != nil {
 			return fmt.Errorf("find outbound movement for item %s: %w", it.ItemID, err)
@@ -340,7 +369,6 @@ func (s *transferOrderService) ReceiveTransferOrder(ctx context.Context, transfe
 		unitCost := outMovement.UnitCost
 		if unitCost.IsZero() {
 			logger.Warn("outbound movement has zero unit cost, using latest cost as fallback", zap.String("item_id", it.ItemID.String()))
-			// fallback: get latest cost at source warehouse (or zero)
 		}
 
 		inMovementReq := CreateMovementRequest{
@@ -421,7 +449,7 @@ func (s *transferOrderService) CancelTransferOrder(ctx context.Context, transfer
 		return nil
 	}
 
-	// If already dispatched, we need to reverse the outbound movements (create inbound movements back to source)
+	// If already dispatched, reverse the outbound movements
 	if order.Status == "dispatched" {
 		items, err := s.transferRepo.GetItems(ctx, tx, transferOrderID)
 		if err != nil {
@@ -545,7 +573,6 @@ func (s *transferOrderService) validateCreateRequest(req CreateTransferOrderRequ
 }
 
 // findOutboundMovement retrieves the outbound movement for a given transfer order and item.
-// It uses the movement_repository to query by transfer_order_id and item_id, looking for quantity_out > 0.
 func (s *transferOrderService) findOutboundMovement(ctx context.Context, tx *sql.Tx, companyID, transferOrderID, itemID uuid.UUID) (*models.StockMovement, error) {
 	query := `
 		SELECT movement_id, company_id, movement_type, reference_type, reference_id,
@@ -629,14 +656,6 @@ func (s *transferOrderService) emitTransferOrderEvent(ctx context.Context, tx *s
 		Payload:       data,
 	}
 	return s.outboxRepo.Store(ctx, tx, event)
-}
-
-// helper to convert *string to sql string
-func nullStringPtr(s *string) *string {
-	if s == nil {
-		return nil
-	}
-	return s
 }
 
 // nullStringFromNullString converts sql.NullString to *string.
