@@ -1,3 +1,4 @@
+// package service – transfer_order_service.go
 package service
 
 import (
@@ -54,7 +55,7 @@ type transferOrderService struct {
 	transferRepo     repository.TransferOrderRepository
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
-	balanceRepo      repository.StockBalanceRepository // Added for stock availability check
+	balanceRepo      repository.StockBalanceRepository
 	inventorySvc     InventoryService
 	ledgerRepo       repository.StockLedgerRepository
 	pgClient         *client.PostgresClient
@@ -69,7 +70,7 @@ func NewTransferOrderService(
 	transferRepo repository.TransferOrderRepository,
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
-	balanceRepo repository.StockBalanceRepository, // Added parameter
+	balanceRepo repository.StockBalanceRepository,
 	inventorySvc InventoryService,
 	ledgerRepo repository.StockLedgerRepository,
 	pgClient *client.PostgresClient,
@@ -242,8 +243,7 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 
 	// Pre‑validate all items before creating any movement
 	for _, it := range items {
-		// Fetch item with company context
-		item, err := s.itemRepo.GetByID(ctx, tx, it.ItemID) // Assumes GetByID returns item with company_id
+		item, err := s.itemRepo.GetByID(ctx, tx, it.ItemID)
 		if err != nil {
 			return fmt.Errorf("get item %s: %w", it.ItemID, err)
 		}
@@ -251,11 +251,10 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 			return inventory_errors.ErrPermissionDenied
 		}
 
-		// Get current stock balance with FOR UPDATE (batch = nil, as transfers are not batch‑tracked)
+		// Get current stock balance with FOR UPDATE
 		balance, err := s.balanceRepo.GetForUpdate(ctx, tx, companyID, order.FromWarehouseID, it.ItemID, nil)
 		if err != nil {
 			if errors.Is(err, inventory_errors.ErrNotFound) {
-				// No stock record means quantity_on_hand = 0, reserved = 0
 				balance = &models.StockBalance{
 					QuantityOnHand: decimal.Zero,
 					ReservedQty:    decimal.Zero,
@@ -267,14 +266,13 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 		availableQty := balance.QuantityOnHand.Sub(balance.ReservedQty)
 		requiredQty := it.Quantity
 
-		// Negative stock allowed only if BOTH item and warehouse allow it
 		if requiredQty.GreaterThan(availableQty) && !(item.AllowNegativeStock && sourceWarehouse.AllowNegativeStock) {
 			return fmt.Errorf("%w: insufficient stock for item %s: required %s, available %s",
 				inventory_errors.ErrInsufficientStock, it.ItemID, requiredQty.String(), availableQty.String())
 		}
 	}
 
-	// All stock checks passed – create outbound movements
+	// All stock checks passed – create outbound movements using the SAME transaction
 	for _, it := range items {
 		outMovementReq := CreateMovementRequest{
 			CompanyID:       companyID,
@@ -293,7 +291,7 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 			TransferOrderID: &transferOrderID,
 		}
 
-		outMovement, err := s.inventorySvc.CreateMovement(ctx, outMovementReq, idempotencyKey+":out:"+it.ItemID.String())
+		outMovement, err := s.inventorySvc.CreateMovementWithTx(ctx, tx, outMovementReq, idempotencyKey+":out:"+it.ItemID.String())
 		if err != nil {
 			return fmt.Errorf("create outbound movement for item %s: %w", it.ItemID, err)
 		}
@@ -388,7 +386,7 @@ func (s *transferOrderService) ReceiveTransferOrder(ctx context.Context, transfe
 			TransferOrderID: &transferOrderID,
 		}
 
-		_, err = s.inventorySvc.CreateMovement(ctx, inMovementReq, idempotencyKey+":in:"+it.ItemID.String())
+		_, err = s.inventorySvc.CreateMovementWithTx(ctx, tx, inMovementReq, idempotencyKey+":in:"+it.ItemID.String())
 		if err != nil {
 			return fmt.Errorf("create inbound movement for item %s: %w", it.ItemID, err)
 		}
@@ -476,7 +474,7 @@ func (s *transferOrderService) CancelTransferOrder(ctx context.Context, transfer
 				Status:          "posted",
 				TransferOrderID: &transferOrderID,
 			}
-			_, err = s.inventorySvc.CreateMovement(ctx, reverseReq, idempotencyKey+":rev:"+it.ItemID.String())
+			_, err = s.inventorySvc.CreateMovementWithTx(ctx, tx, reverseReq, idempotencyKey+":rev:"+it.ItemID.String())
 			if err != nil {
 				return fmt.Errorf("create reversal movement for item %s: %w", it.ItemID, err)
 			}

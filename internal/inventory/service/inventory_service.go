@@ -457,107 +457,22 @@ func (s *inventoryService) DeleteItem(ctx context.Context, companyID, itemID uui
 // ----------------------------------------------------------------------
 
 func (s *inventoryService) CreateMovement(ctx context.Context, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error) {
-	logger := s.logger.With(zap.String("method", "CreateMovement"), zap.String("idempotency_key", idempotencyKey))
-	if err := s.validateMovement(req); err != nil {
-		return nil, err
-	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	var cached *models.StockMovement
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
-		logger.Info("idempotent – returning cached movement")
-		return cached, nil
-	}
-
-	item, err := s.itemRepo.GetByID(ctx, tx, req.ItemID)
-	if err != nil {
-		return nil, fmt.Errorf("get item: %w", err)
-	}
-	if item.CompanyID != req.CompanyID {
-		return nil, inventory_errors.ErrPermissionDenied
-	}
-
-	if req.MovementType == enums.MovementTypePurchaseIn && !item.IsPurchasable {
-		return nil, fmt.Errorf("%w: item %s is not purchasable", inventory_errors.ErrInvalidInput, item.SKU)
-	}
-	if req.MovementType == enums.MovementTypeSalesOut && !item.IsSellable {
-		return nil, fmt.Errorf("%w: item %s is not sellable", inventory_errors.ErrInvalidInput, item.SKU)
-	}
-
-	movement := &models.StockMovement{
-		MovementID:      uuid.New(),
-		CompanyID:       req.CompanyID,
-		MovementType:    req.MovementType,
-		MovementDate:    req.MovementDate,
-		WarehouseID:     req.WarehouseID,
-		FromWarehouseID: req.FromWarehouseID,
-		ItemID:          req.ItemID,
-		BatchID:         req.BatchID,
-		QuantityIn:      req.QuantityIn,
-		QuantityOut:     req.QuantityOut,
-		UnitCost:        req.UnitCost,
-		Reason:          req.Reason,
-		ReferenceType:   req.ReferenceType,
-		ReferenceID:     req.ReferenceID,
-		CreatedBy:       req.CreatedBy,
-		Status:          req.Status,
-		ReservationID:   req.ReservationID,
-		ShipmentID:      req.ShipmentID,
-		TransferOrderID: req.TransferOrderID,
-	}
-	if movement.Status == "" {
-		movement.Status = "posted"
-	}
-
-	// Always create the movement record first (for both tracked and non-tracked items)
-	if err := s.movementRepo.CreateMovement(ctx, tx, movement); err != nil {
-		return nil, fmt.Errorf("create movement record: %w", err)
-	}
-
-	var oldAvailable float64
-	var newAvailable float64
-
-	if !item.TrackInventory {
-		logger.Debug("item does not track inventory; skipping stock/ledger updates", zap.String("item_id", item.ItemID.String()))
-		if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
-			logger.Warn("failed to emit movement event", zap.Error(err))
-		}
-		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
-		if err := tx.Commit(); err != nil {
-			return nil, fmt.Errorf("commit tx: %w", err)
-		}
-		logger.Info("non‑inventory movement created", zap.String("movement_id", movement.MovementID.String()))
-		return movement, nil
-	}
-
-	// For inventory‑tracked items, process stock changes *after* movement is created
-	if req.QuantityIn.GreaterThan(decimal.Zero) {
-		oldAvailable, newAvailable, err = s.processInbound(ctx, tx, movement)
-	} else {
-		oldAvailable, newAvailable, err = s.processOutboundWithAllocation(ctx, tx, movement)
-	}
+	movement, err := s.CreateMovementWithTx(ctx, tx, req, idempotencyKey)
 	if err != nil {
 		return nil, err
 	}
 
-	// Emit events after successful stock updates
-	if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
-		logger.Warn("failed to emit movement event", zap.Error(err))
-	}
-	if err := s.emitStockChangeEvent(ctx, tx, movement, oldAvailable, newAvailable); err != nil {
-		logger.Warn("failed to emit stock change event", zap.Error(err))
-	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
+	// Audit after successful commit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "inventory", "create_movement", "stock_movement",
 			&movement.MovementID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -568,10 +483,8 @@ func (s *inventoryService) CreateMovement(ctx context.Context, req CreateMovemen
 			})
 	}
 
-	logger.Info("movement created", zap.String("movement_id", movement.MovementID.String()))
 	return movement, nil
 }
-
 func (s *inventoryService) validateMovement(req CreateMovementRequest) error {
 	if req.CompanyID == uuid.Nil || req.ItemID == uuid.Nil || req.WarehouseID == uuid.Nil {
 		return fmt.Errorf("%w: company_id, item_id, warehouse_id required", inventory_errors.ErrInvalidInput)

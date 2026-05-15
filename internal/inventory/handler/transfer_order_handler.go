@@ -282,6 +282,8 @@ func (h *TransferOrderHandler) DispatchTransferOrder(w http.ResponseWriter, r *h
 			h.respondWithError(w, http.StatusConflict, err.Error())
 		case errors.Is(err, inventory_errors.ErrPermissionDenied):
 			h.respondWithError(w, http.StatusForbidden, err.Error())
+		case errors.Is(err, inventory_errors.ErrInsufficientStock):
+			h.respondWithError(w, http.StatusConflict, err.Error())
 		default:
 			h.respondWithError(w, http.StatusInternalServerError, "failed to dispatch transfer order")
 		}
