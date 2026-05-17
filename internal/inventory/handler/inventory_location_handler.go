@@ -36,6 +36,7 @@ func NewInventoryLocationHandler(locationService service.InventoryLocationServic
 type createLocationRequest struct {
 	Code             string  `json:"code"`
 	Name             string  `json:"name"`
+	WarehouseID      string  `json:"warehouse_id"` // required
 	LocationType     *string `json:"location_type,omitempty"`
 	ParentLocationID *string `json:"parent_location_id,omitempty"`
 }
@@ -43,19 +44,16 @@ type createLocationRequest struct {
 type updateLocationRequest struct {
 	Code             *string `json:"code,omitempty"`
 	Name             *string `json:"name,omitempty"`
+	WarehouseID      *string `json:"warehouse_id,omitempty"` // optional
 	LocationType     *string `json:"location_type,omitempty"`
 	ParentLocationID *string `json:"parent_location_id,omitempty"`
 	IsActive         *bool   `json:"is_active,omitempty"`
 }
 
-type assignWarehouseRequest struct {
-	WarehouseID string `json:"warehouse_id"`
-	LocationID  string `json:"location_id"`
-}
-
 type locationResponse struct {
 	LocationID       string    `json:"locationId"`
 	CompanyID        string    `json:"companyId"`
+	WarehouseID      string    `json:"warehouseId"`
 	Code             string    `json:"code"`
 	Name             string    `json:"name"`
 	LocationType     *string   `json:"locationType,omitempty"`
@@ -67,6 +65,7 @@ type locationResponse struct {
 type locationNodeResponse struct {
 	LocationID       string                  `json:"locationId"`
 	CompanyID        string                  `json:"companyId"`
+	WarehouseID      string                  `json:"warehouseId"`
 	Code             string                  `json:"code"`
 	Name             string                  `json:"name"`
 	LocationType     *string                 `json:"locationType,omitempty"`
@@ -100,17 +99,6 @@ func (h *InventoryLocationHandler) parseLocationID(r *http.Request) (uuid.UUID, 
 	return uuid.Parse(idStr)
 }
 
-func (h *InventoryLocationHandler) parseWarehouseID(r *http.Request) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, "warehouseId")
-	if idStr == "" {
-		idStr = chi.URLParam(r, "warehouseID")
-	}
-	if idStr == "" {
-		return uuid.Nil, errors.New("warehouse ID is required")
-	}
-	return uuid.Parse(idStr)
-}
-
 func (h *InventoryLocationHandler) uuidPtrFromStringPtr(s *string) *uuid.UUID {
 	if s == nil || *s == "" {
 		return nil
@@ -125,6 +113,7 @@ func (h *InventoryLocationHandler) toLocationResponse(loc *models.InventoryLocat
 	resp := locationResponse{
 		LocationID:   loc.LocationID.String(),
 		CompanyID:    loc.CompanyID.String(),
+		WarehouseID:  loc.WarehouseID.String(),
 		Code:         loc.Code,
 		Name:         loc.Name,
 		LocationType: loc.LocationType,
@@ -142,6 +131,7 @@ func (h *InventoryLocationHandler) toLocationNodeResponse(node *service.Location
 	resp := &locationNodeResponse{
 		LocationID:   node.LocationID.String(),
 		CompanyID:    node.CompanyID.String(),
+		WarehouseID:  node.WarehouseID.String(),
 		Code:         node.Code,
 		Name:         node.Name,
 		LocationType: node.LocationType,
@@ -208,11 +198,21 @@ func (h *InventoryLocationHandler) CreateLocation(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+	if req.WarehouseID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "warehouse_id is required")
+		return
+	}
+	warehouseID, err := uuid.Parse(req.WarehouseID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
+		return
+	}
 
 	parentID := h.uuidPtrFromStringPtr(req.ParentLocationID)
 
 	serviceReq := service.CreateLocationRequest{
 		CompanyID:        companyID,
+		WarehouseID:      warehouseID,
 		Code:             req.Code,
 		Name:             req.Name,
 		LocationType:     req.LocationType,
@@ -231,6 +231,8 @@ func (h *InventoryLocationHandler) CreateLocation(w http.ResponseWriter, r *http
 			status = http.StatusConflict
 		case errors.Is(err, inventory_errors.ErrPermissionDenied):
 			status = http.StatusForbidden
+		case errors.Is(err, inventory_errors.ErrParentWarehouseMismatch):
+			status = http.StatusBadRequest
 		}
 		h.respondWithError(w, status, err.Error())
 		return
@@ -291,6 +293,14 @@ func (h *InventoryLocationHandler) UpdateLocation(w http.ResponseWriter, r *http
 		IsActive:         req.IsActive,
 		UpdatedBy:        &userID,
 	}
+	if req.WarehouseID != nil {
+		whID, err := uuid.Parse(*req.WarehouseID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
+			return
+		}
+		serviceReq.WarehouseID = &whID
+	}
 
 	location, err := h.locationService.UpdateLocation(ctx, serviceReq, idempotencyKey)
 	if err != nil {
@@ -305,6 +315,8 @@ func (h *InventoryLocationHandler) UpdateLocation(w http.ResponseWriter, r *http
 			status = http.StatusConflict
 		case errors.Is(err, inventory_errors.ErrPermissionDenied):
 			status = http.StatusForbidden
+		case errors.Is(err, inventory_errors.ErrParentWarehouseMismatch):
+			status = http.StatusBadRequest
 		}
 		h.respondWithError(w, status, err.Error())
 		return
@@ -415,12 +427,24 @@ func (h *InventoryLocationHandler) GetLocation(w http.ResponseWriter, r *http.Re
 }
 
 // ListLocations handles GET /companies/{companyID}/locations
-// Query params: active_only (bool), parent_id (optional)
+// Query params: warehouse_id (required), active_only (bool), parent_id (optional)
 func (h *InventoryLocationHandler) ListLocations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := h.parseCompanyID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// warehouse_id is required
+	warehouseIDStr := r.URL.Query().Get("warehouse_id")
+	if warehouseIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "warehouse_id query parameter is required")
+		return
+	}
+	warehouseID, err := uuid.Parse(warehouseIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
 		return
 	}
 
@@ -440,7 +464,17 @@ func (h *InventoryLocationHandler) ListLocations(w http.ResponseWriter, r *http.
 		activeOnly, _ = strconv.ParseBool(activeOnlyStr)
 	}
 
-	locations, err := h.locationService.ListLocations(ctx, companyID, activeOnly)
+	var parentID *uuid.UUID
+	if parentIDStr := r.URL.Query().Get("parent_id"); parentIDStr != "" {
+		parsed, err := uuid.Parse(parentIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid parent_id")
+			return
+		}
+		parentID = &parsed
+	}
+
+	locations, err := h.locationService.ListLocations(ctx, companyID, warehouseID, parentID, activeOnly)
 	if err != nil {
 		h.logger.Error("failed to list locations", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve locations")
@@ -459,11 +493,23 @@ func (h *InventoryLocationHandler) ListLocations(w http.ResponseWriter, r *http.
 }
 
 // GetLocationTree handles GET /companies/{companyID}/locations/tree
+// Query param: warehouse_id (required)
 func (h *InventoryLocationHandler) GetLocationTree(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := h.parseCompanyID(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	warehouseIDStr := r.URL.Query().Get("warehouse_id")
+	if warehouseIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "warehouse_id query parameter is required")
+		return
+	}
+	warehouseID, err := uuid.Parse(warehouseIDStr)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
 		return
 	}
 
@@ -478,7 +524,7 @@ func (h *InventoryLocationHandler) GetLocationTree(w http.ResponseWriter, r *htt
 		return
 	}
 
-	tree, err := h.locationService.GetLocationTree(ctx, companyID)
+	tree, err := h.locationService.GetLocationTree(ctx, companyID, warehouseID)
 	if err != nil {
 		h.logger.Error("failed to get location tree", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve location tree")
@@ -496,80 +542,7 @@ func (h *InventoryLocationHandler) GetLocationTree(w http.ResponseWriter, r *htt
 	})
 }
 
-// AssignWarehouseToLocation handles POST /companies/{companyID}/warehouses/{warehouseId}/location
-func (h *InventoryLocationHandler) AssignWarehouseToLocation(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	companyID, err := h.parseCompanyID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	warehouseID, err := h.parseWarehouseID(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	userID, err := getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "warehouse:update") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := r.Header.Get("Idempotency-Key")
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	var req assignWarehouseRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	locationID, err := uuid.Parse(req.LocationID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid location_id")
-		return
-	}
-
-	serviceReq := service.AssignWarehouseRequest{
-		CompanyID:   companyID,
-		WarehouseID: warehouseID,
-		LocationID:  locationID,
-		UpdatedBy:   &userID,
-	}
-
-	err = h.locationService.AssignWarehouseToLocation(ctx, serviceReq, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to assign warehouse to location", zap.Error(err))
-		status := http.StatusInternalServerError
-		switch {
-		case errors.Is(err, inventory_errors.ErrNotFound):
-			status = http.StatusNotFound
-		case errors.Is(err, inventory_errors.ErrInvalidInput):
-			status = http.StatusBadRequest
-		case errors.Is(err, inventory_errors.ErrPermissionDenied):
-			status = http.StatusForbidden
-		}
-		h.respondWithError(w, status, err.Error())
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Warehouse assigned to location successfully",
-	})
-}
-
-// ---------- Response helpers (same as other handlers) ----------
+// ---------- Response helpers ----------
 func (h *InventoryLocationHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

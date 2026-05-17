@@ -381,6 +381,7 @@ func NewFactory() (*Factory, error) {
 		f.KafkaProducer(),
 		&kafkaEventPublisher{producer: f.KafkaProducer()},
 		f.GetAuditService(),
+		f.EncryptionManager(), // new argument
 		f.logger,
 	)
 	if err != nil {

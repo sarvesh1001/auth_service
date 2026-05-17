@@ -17,12 +17,12 @@ import (
 type InventoryLocationRepository interface {
 	Create(ctx context.Context, db DBTX, loc *models.InventoryLocation) error
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.InventoryLocation, error)
-	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.InventoryLocation, error)
+	GetByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string) (*models.InventoryLocation, error)
 	Update(ctx context.Context, db DBTX, loc *models.InventoryLocation) error
 	SoftDelete(ctx context.Context, db DBTX, id uuid.UUID) error
-	List(ctx context.Context, db DBTX, companyID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
-	GetTree(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.InventoryLocation, error) // full hierarchy
-	ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error)
+	List(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
+	GetTree(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) ([]*models.InventoryLocation, error)
+	ExistsByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error)
 }
 
 type inventoryLocationRepository struct {
@@ -43,6 +43,7 @@ func (r *inventoryLocationRepository) scanLocation(s scanner) (*models.Inventory
 	err := s.Scan(
 		&loc.LocationID,
 		&loc.CompanyID,
+		&loc.WarehouseID,
 		&loc.Code,
 		&loc.Name,
 		&locationType,
@@ -69,12 +70,12 @@ func (r *inventoryLocationRepository) scanLocation(s scanner) (*models.Inventory
 func (r *inventoryLocationRepository) Create(ctx context.Context, db DBTX, loc *models.InventoryLocation) error {
 	query := `
 		INSERT INTO inventory_locations (
-			location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+			location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
-		loc.LocationID, loc.CompanyID, loc.Code, loc.Name,
+		loc.LocationID, loc.CompanyID, loc.WarehouseID, loc.Code, loc.Name,
 		loc.LocationType, loc.ParentLocationID, loc.IsActive,
 	).Scan(&loc.CreatedAt)
 	if err != nil {
@@ -86,7 +87,7 @@ func (r *inventoryLocationRepository) Create(ctx context.Context, db DBTX, loc *
 
 func (r *inventoryLocationRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.InventoryLocation, error) {
 	query := `
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
 		WHERE location_id = $1
 	`
@@ -94,24 +95,24 @@ func (r *inventoryLocationRepository) GetByID(ctx context.Context, db DBTX, id u
 	return r.scanLocation(row)
 }
 
-func (r *inventoryLocationRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.InventoryLocation, error) {
+func (r *inventoryLocationRepository) GetByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string) (*models.InventoryLocation, error) {
 	query := `
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
-		WHERE company_id = $1 AND code = $2
+		WHERE company_id = $1 AND warehouse_id = $2 AND code = $3
 	`
-	row := db.QueryRowContext(ctx, query, companyID, code)
+	row := db.QueryRowContext(ctx, query, companyID, warehouseID, code)
 	return r.scanLocation(row)
 }
 
 func (r *inventoryLocationRepository) Update(ctx context.Context, db DBTX, loc *models.InventoryLocation) error {
 	query := `
 		UPDATE inventory_locations
-		SET code = $2, name = $3, location_type = $4, parent_location_id = $5, is_active = $6
+		SET warehouse_id = $2, code = $3, name = $4, location_type = $5, parent_location_id = $6, is_active = $7
 		WHERE location_id = $1
 	`
 	res, err := db.ExecContext(ctx, query,
-		loc.LocationID, loc.Code, loc.Name, loc.LocationType, loc.ParentLocationID, loc.IsActive)
+		loc.LocationID, loc.WarehouseID, loc.Code, loc.Name, loc.LocationType, loc.ParentLocationID, loc.IsActive)
 	if err != nil {
 		return fmt.Errorf("update location: %w", err)
 	}
@@ -135,10 +136,10 @@ func (r *inventoryLocationRepository) SoftDelete(ctx context.Context, db DBTX, i
 	return nil
 }
 
-func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, companyID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error) {
-	conds := []string{"company_id = $1"}
-	args := []interface{}{companyID}
-	idx := 2
+func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error) {
+	conds := []string{"company_id = $1", "warehouse_id = $2"}
+	args := []interface{}{companyID, warehouseID}
+	idx := 3
 
 	if parentID != nil {
 		conds = append(conds, fmt.Sprintf("parent_location_id = $%d", idx))
@@ -150,7 +151,7 @@ func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, company
 	}
 
 	query := fmt.Sprintf(`
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
 		WHERE %s
 		ORDER BY code
@@ -173,15 +174,15 @@ func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, company
 	return result, rows.Err()
 }
 
-// GetTree returns all locations for a company with parent-child relationships (no specific ordering; client can build tree).
-func (r *inventoryLocationRepository) GetTree(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.InventoryLocation, error) {
+// GetTree returns all locations for a company+warehouse, ordered by parent nulls first.
+func (r *inventoryLocationRepository) GetTree(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) ([]*models.InventoryLocation, error) {
 	query := `
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
-		WHERE company_id = $1
+		WHERE company_id = $1 AND warehouse_id = $2
 		ORDER BY parent_location_id NULLS FIRST, code
 	`
-	rows, err := db.QueryContext(ctx, query, companyID)
+	rows, err := db.QueryContext(ctx, query, companyID, warehouseID)
 	if err != nil {
 		return nil, fmt.Errorf("get location tree: %w", err)
 	}
@@ -198,11 +199,11 @@ func (r *inventoryLocationRepository) GetTree(ctx context.Context, db DBTX, comp
 	return result, rows.Err()
 }
 
-func (r *inventoryLocationRepository) ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM inventory_locations WHERE company_id = $1 AND code = $2`
-	args := []interface{}{companyID, code}
+func (r *inventoryLocationRepository) ExistsByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM inventory_locations WHERE company_id = $1 AND warehouse_id = $2 AND code = $3`
+	args := []interface{}{companyID, warehouseID, code}
 	if excludeID != nil {
-		query += ` AND location_id != $3`
+		query += ` AND location_id != $4`
 		args = append(args, *excludeID)
 	}
 	query += `)`

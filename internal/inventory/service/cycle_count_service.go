@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -102,6 +103,9 @@ func (s *cycleCountService) validateCreate(req CreateCycleCountRequest) error {
 	if req.CountType != "full" && req.CountType != "random" && req.CountType != "abc" {
 		return fmt.Errorf("%w: count_type must be 'full', 'random', or 'abc'", inventory_errors.ErrInvalidInput)
 	}
+	if req.ExpectedQuantity.LessThan(decimal.Zero) {
+		return fmt.Errorf("%w: expected_quantity cannot be negative", inventory_errors.ErrInvalidInput)
+	}
 	if req.ItemID != nil {
 		item, err := s.itemRepo.GetByID(context.Background(), s.pgClient.DB, *req.ItemID)
 		if err != nil {
@@ -139,6 +143,15 @@ func (s *cycleCountService) CreateCycleCount(ctx context.Context, req CreateCycl
 		return cached, nil
 	}
 
+	// Check for duplicate (same company, warehouse, item, scheduled date)
+	existing, err := s.cycleCountRepo.GetByUnique(ctx, tx, req.CompanyID, req.WarehouseID, req.ItemID, req.ScheduledDate)
+	if err != nil && !errors.Is(err, inventory_errors.ErrNotFound) {
+		return nil, fmt.Errorf("duplicate check: %w", err)
+	}
+	if existing != nil {
+		return nil, fmt.Errorf("%w: cycle count already exists for this warehouse, item, and scheduled date", inventory_errors.ErrDuplicate)
+	}
+
 	expectedQty := req.ExpectedQuantity
 	if expectedQty.IsZero() && req.ItemID != nil {
 		balance, err := s.balanceRepo.GetTotalOnHand(ctx, tx, req.CompanyID, *req.ItemID, &req.WarehouseID)
@@ -164,7 +177,6 @@ func (s *cycleCountService) CreateCycleCount(ctx context.Context, req CreateCycl
 	}
 	// Note: InventoryCycleCount model currently lacks CreatedBy field.
 	// If you need to store the creator, add `CreatedBy *uuid.UUID` to the model and database table.
-	// For now, we skip setting it.
 
 	if err := s.cycleCountRepo.Create(ctx, tx, cycleCount); err != nil {
 		return nil, fmt.Errorf("create cycle count: %w", err)
@@ -398,6 +410,11 @@ func (s *cycleCountService) ListCycleCounts(ctx context.Context, filter reposito
 		Offset: (page - 1) * pageSize,
 	}
 	sort := repository.Sort{Field: "scheduled_date", Direction: "DESC"}
+
+	// Ensure filter has WarehouseID, otherwise the repo's ListByWarehouse will fail.
+	if filter.WarehouseID == nil {
+		return nil, 0, fmt.Errorf("%w: warehouse_id is required for listing", inventory_errors.ErrInvalidInput)
+	}
 	return s.cycleCountRepo.ListByWarehouse(ctx, s.pgClient.DB, filter.CompanyID, *filter.WarehouseID, filter, pagination, sort)
 }
 

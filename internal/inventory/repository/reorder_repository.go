@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -21,8 +22,13 @@ type ReorderOrderRepository interface {
 	UpdateReference(ctx context.Context, db DBTX, id uuid.UUID, refType string, refID uuid.UUID) error
 	ListPending(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ReorderOrder, error)
 	ExistsPendingForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error)
+
+	// UpdateOrderWithReference updates status, reference_type, reference_id for a reorder order.
+	UpdateOrderWithReference(ctx context.Context, db DBTX, order *models.ReorderOrder) error
+
 	// ExistsOpenForItem checks for existing reorder with status IN ('pending', 'approved')
 	ExistsOpenForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error)
+	ListByFilters(ctx context.Context, db DBTX, filters ReorderFilters) ([]*models.ReorderOrder, int, error)
 }
 
 type reorderOrderRepository struct {
@@ -97,31 +103,15 @@ func (r *reorderOrderRepository) UpdateReference(ctx context.Context, db DBTX, i
 }
 
 func (r *reorderOrderRepository) ListPending(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ReorderOrder, error) {
-	query := `
-		SELECT reorder_order_id, company_id, item_id, warehouse_id, requested_qty,
-		       status, source, reference_type, reference_id, generated_at,
-		       created_at, updated_at, created_by
-		FROM reorder_orders
-		WHERE company_id = $1 AND status = 'pending'
-		ORDER BY generated_at ASC
-	`
-	rows, err := db.QueryContext(ctx, query, companyID)
-	if err != nil {
-		return nil, fmt.Errorf("list pending: %w", err)
+	filters := ReorderFilters{
+		CompanyID: companyID,
+		Status:    "pending",
+		Page:      1,
+		PageSize:  1000, // large enough to get all
 	}
-	defer rows.Close()
-
-	var result []*models.ReorderOrder
-	for rows.Next() {
-		o, err := r.scanOrder(rows)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, o)
-	}
-	return result, rows.Err()
+	orders, _, err := r.ListByFilters(ctx, db, filters)
+	return orders, err
 }
-
 func (r *reorderOrderRepository) ExistsPendingForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error) {
 	query := `
 		SELECT EXISTS (
@@ -184,4 +174,112 @@ func (r *reorderOrderRepository) scanOrder(row scanner) (*models.ReorderOrder, e
 		o.CreatedBy = &createdBy.UUID
 	}
 	return &o, nil
+}
+
+type ReorderFilters struct {
+	CompanyID   uuid.UUID
+	Status      string    // empty means all statuses
+	ItemID      uuid.UUID // zero means no filter
+	WarehouseID uuid.UUID // zero means no filter
+	Page        int
+	PageSize    int
+}
+
+// ListByFilters returns reorder orders matching the filters, with pagination.
+// It returns the list of orders and the total count (without pagination) for pagination metadata.
+
+// ListByFilters implementation
+func (r *reorderOrderRepository) ListByFilters(ctx context.Context, db DBTX, filters ReorderFilters) ([]*models.ReorderOrder, int, error) {
+	// Build WHERE clause
+	conditions := []string{"company_id = $1"}
+	args := []interface{}{filters.CompanyID}
+	idx := 2
+
+	if filters.Status != "" {
+		conditions = append(conditions, fmt.Sprintf("status = $%d", idx))
+		args = append(args, filters.Status)
+		idx++
+	}
+	if filters.ItemID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("item_id = $%d", idx))
+		args = append(args, filters.ItemID)
+		idx++
+	}
+	if filters.WarehouseID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("warehouse_id = $%d", idx))
+		args = append(args, filters.WarehouseID)
+		idx++
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	// Count total
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM reorder_orders WHERE %s", whereClause)
+	var total int
+	err := db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count reorder orders: %w", err)
+	}
+	if total == 0 {
+		return []*models.ReorderOrder{}, 0, nil
+	}
+
+	// Pagination
+	limit := filters.PageSize
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (filters.Page - 1) * limit
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := fmt.Sprintf(`
+        SELECT reorder_order_id, company_id, item_id, warehouse_id, requested_qty,
+               status, source, reference_type, reference_id, generated_at,
+               created_at, updated_at, created_by
+        FROM reorder_orders
+        WHERE %s
+        ORDER BY generated_at DESC
+        LIMIT $%d OFFSET $%d
+    `, whereClause, idx, idx+1)
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query reorder orders: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []*models.ReorderOrder
+	for rows.Next() {
+		o, err := r.scanOrder(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		orders = append(orders, o)
+	}
+	return orders, total, rows.Err()
+}
+
+// UpdateOrderWithReference implementation
+func (r *reorderOrderRepository) UpdateOrderWithReference(ctx context.Context, db DBTX, order *models.ReorderOrder) error {
+	query := `
+        UPDATE reorder_orders
+        SET status = $2, reference_type = $3, reference_id = $4, updated_at = NOW()
+        WHERE reorder_order_id = $1
+    `
+	_, err := db.ExecContext(ctx, query,
+		order.ReorderOrderID,
+		order.Status,
+		order.ReferenceType,
+		order.ReferenceID,
+	)
+	if err != nil {
+		return fmt.Errorf("update order with reference: %w", err)
+	}
+	return nil
 }

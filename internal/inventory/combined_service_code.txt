@@ -34,6 +34,7 @@ type InventoryService interface {
 	CreateItem(ctx context.Context, req CreateItemRequest, idempotencyKey string) (*models.Item, error)
 	UpdateItem(ctx context.Context, req UpdateItemRequest, idempotencyKey string) (*models.Item, error)
 	DeleteItem(ctx context.Context, companyID, itemID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	CreateMovementWithTx(ctx context.Context, tx *sql.Tx, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
 
 	// Stock movement (core transactional)
 	CreateMovement(ctx context.Context, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
@@ -461,107 +462,22 @@ func (s *inventoryService) DeleteItem(ctx context.Context, companyID, itemID uui
 // ----------------------------------------------------------------------
 
 func (s *inventoryService) CreateMovement(ctx context.Context, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error) {
-	logger := s.logger.With(zap.String("method", "CreateMovement"), zap.String("idempotency_key", idempotencyKey))
-	if err := s.validateMovement(req); err != nil {
-		return nil, err
-	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	var cached *models.StockMovement
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
-		logger.Info("idempotent – returning cached movement")
-		return cached, nil
-	}
-
-	item, err := s.itemRepo.GetByID(ctx, tx, req.ItemID)
-	if err != nil {
-		return nil, fmt.Errorf("get item: %w", err)
-	}
-	if item.CompanyID != req.CompanyID {
-		return nil, inventory_errors.ErrPermissionDenied
-	}
-
-	if req.MovementType == enums.MovementTypePurchaseIn && !item.IsPurchasable {
-		return nil, fmt.Errorf("%w: item %s is not purchasable", inventory_errors.ErrInvalidInput, item.SKU)
-	}
-	if req.MovementType == enums.MovementTypeSalesOut && !item.IsSellable {
-		return nil, fmt.Errorf("%w: item %s is not sellable", inventory_errors.ErrInvalidInput, item.SKU)
-	}
-
-	movement := &models.StockMovement{
-		MovementID:      uuid.New(),
-		CompanyID:       req.CompanyID,
-		MovementType:    req.MovementType,
-		MovementDate:    req.MovementDate,
-		WarehouseID:     req.WarehouseID,
-		FromWarehouseID: req.FromWarehouseID,
-		ItemID:          req.ItemID,
-		BatchID:         req.BatchID,
-		QuantityIn:      req.QuantityIn,
-		QuantityOut:     req.QuantityOut,
-		UnitCost:        req.UnitCost,
-		Reason:          req.Reason,
-		ReferenceType:   req.ReferenceType,
-		ReferenceID:     req.ReferenceID,
-		CreatedBy:       req.CreatedBy,
-		Status:          req.Status,
-		ReservationID:   req.ReservationID,
-		ShipmentID:      req.ShipmentID,
-		TransferOrderID: req.TransferOrderID,
-	}
-	if movement.Status == "" {
-		movement.Status = "posted"
-	}
-
-	// Always create the movement record first (for both tracked and non-tracked items)
-	if err := s.movementRepo.CreateMovement(ctx, tx, movement); err != nil {
-		return nil, fmt.Errorf("create movement record: %w", err)
-	}
-
-	var oldAvailable float64
-	var newAvailable float64
-
-	if !item.TrackInventory {
-		logger.Debug("item does not track inventory; skipping stock/ledger updates", zap.String("item_id", item.ItemID.String()))
-		if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
-			logger.Warn("failed to emit movement event", zap.Error(err))
-		}
-		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
-		if err := tx.Commit(); err != nil {
-			return nil, fmt.Errorf("commit tx: %w", err)
-		}
-		logger.Info("non‑inventory movement created", zap.String("movement_id", movement.MovementID.String()))
-		return movement, nil
-	}
-
-	// For inventory‑tracked items, process stock changes *after* movement is created
-	if req.QuantityIn.GreaterThan(decimal.Zero) {
-		oldAvailable, newAvailable, err = s.processInbound(ctx, tx, movement)
-	} else {
-		oldAvailable, newAvailable, err = s.processOutboundWithAllocation(ctx, tx, movement)
-	}
+	movement, err := s.CreateMovementWithTx(ctx, tx, req, idempotencyKey)
 	if err != nil {
 		return nil, err
 	}
 
-	// Emit events after successful stock updates
-	if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
-		logger.Warn("failed to emit movement event", zap.Error(err))
-	}
-	if err := s.emitStockChangeEvent(ctx, tx, movement, oldAvailable, newAvailable); err != nil {
-		logger.Warn("failed to emit stock change event", zap.Error(err))
-	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
+	// Audit after successful commit
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "inventory", "create_movement", "stock_movement",
 			&movement.MovementID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -572,10 +488,8 @@ func (s *inventoryService) CreateMovement(ctx context.Context, req CreateMovemen
 			})
 	}
 
-	logger.Info("movement created", zap.String("movement_id", movement.MovementID.String()))
 	return movement, nil
 }
-
 func (s *inventoryService) validateMovement(req CreateMovementRequest) error {
 	if req.CompanyID == uuid.Nil || req.ItemID == uuid.Nil || req.WarehouseID == uuid.Nil {
 		return fmt.Errorf("%w: company_id, item_id, warehouse_id required", inventory_errors.ErrInvalidInput)
@@ -1057,6 +971,99 @@ func toFloat64(d decimal.Decimal) float64 {
 	return f
 }
 
+// CreateMovementWithTx performs the movement within the given transaction.
+func (s *inventoryService) CreateMovementWithTx(ctx context.Context, tx *sql.Tx, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error) {
+	logger := s.logger.With(zap.String("method", "CreateMovementWithTx"), zap.String("idempotency_key", idempotencyKey))
+	if err := s.validateMovement(req); err != nil {
+		return nil, err
+	}
+
+	// Idempotency check inside the provided tx
+	var cached *models.StockMovement
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached movement")
+		return cached, nil
+	}
+
+	item, err := s.itemRepo.GetByID(ctx, tx, req.ItemID)
+	if err != nil {
+		return nil, fmt.Errorf("get item: %w", err)
+	}
+	if item.CompanyID != req.CompanyID {
+		return nil, inventory_errors.ErrPermissionDenied
+	}
+
+	if req.MovementType == enums.MovementTypePurchaseIn && !item.IsPurchasable {
+		return nil, fmt.Errorf("%w: item %s is not purchasable", inventory_errors.ErrInvalidInput, item.SKU)
+	}
+	if req.MovementType == enums.MovementTypeSalesOut && !item.IsSellable {
+		return nil, fmt.Errorf("%w: item %s is not sellable", inventory_errors.ErrInvalidInput, item.SKU)
+	}
+
+	movement := &models.StockMovement{
+		MovementID:      uuid.New(),
+		CompanyID:       req.CompanyID,
+		MovementType:    req.MovementType,
+		MovementDate:    req.MovementDate,
+		WarehouseID:     req.WarehouseID,
+		FromWarehouseID: req.FromWarehouseID,
+		ItemID:          req.ItemID,
+		BatchID:         req.BatchID,
+		QuantityIn:      req.QuantityIn,
+		QuantityOut:     req.QuantityOut,
+		UnitCost:        req.UnitCost,
+		Reason:          req.Reason,
+		ReferenceType:   req.ReferenceType,
+		ReferenceID:     req.ReferenceID,
+		CreatedBy:       req.CreatedBy,
+		Status:          req.Status,
+		ReservationID:   req.ReservationID,
+		ShipmentID:      req.ShipmentID,
+		TransferOrderID: req.TransferOrderID,
+	}
+	if movement.Status == "" {
+		movement.Status = "posted"
+	}
+
+	if err := s.movementRepo.CreateMovement(ctx, tx, movement); err != nil {
+		return nil, fmt.Errorf("create movement record: %w", err)
+	}
+
+	var oldAvailable, newAvailable float64
+
+	if !item.TrackInventory {
+		logger.Debug("item does not track inventory; skipping stock/ledger updates")
+		if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
+			logger.Warn("failed to emit movement event", zap.Error(err))
+		}
+		_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
+		// Do NOT commit – caller will
+		return movement, nil
+	}
+
+	if req.QuantityIn.GreaterThan(decimal.Zero) {
+		oldAvailable, newAvailable, err = s.processInbound(ctx, tx, movement)
+	} else {
+		oldAvailable, newAvailable, err = s.processOutboundWithAllocation(ctx, tx, movement)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.emitMovementEvent(ctx, tx, movement, events.EventMovementCreated); err != nil {
+		logger.Warn("failed to emit movement event", zap.Error(err))
+	}
+	if err := s.emitStockChangeEvent(ctx, tx, movement, oldAvailable, newAvailable); err != nil {
+		logger.Warn("failed to emit stock change event", zap.Error(err))
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, movement)
+
+	// Audit is postponed to the caller (or can be called here, but it's fine)
+	logger.Info("movement created within tx", zap.String("movement_id", movement.MovementID.String()))
+	return movement, nil
+}
+
 
 
 ================================================================================
@@ -1331,6 +1338,7 @@ func (s *pickingService) PickItem(ctx context.Context, pickingItemID uuid.UUID, 
 		return err
 	}
 
+	// Check if all items are now fully picked
 	allItems, err := s.pickingListItemRepo.GetByPickingList(ctx, tx, list.PickingListID)
 	if err != nil {
 		return err
@@ -1344,9 +1352,13 @@ func (s *pickingService) PickItem(ctx context.Context, pickingItemID uuid.UUID, 
 	}
 	if allPicked {
 		now := time.Now()
+		// Update status to "picked" – this must succeed
 		if err := s.pickingListRepo.UpdateStatus(ctx, tx, list.PickingListID, "picked", &now, nil); err != nil {
-			logger.Warn("failed to update picking list status to picked", zap.Error(err))
+			// Log and return error so transaction rolls back
+			logger.Error("failed to update picking list status to picked", zap.Error(err))
+			return fmt.Errorf("update picking list status: %w", err)
 		}
+		logger.Info("picking list marked as picked", zap.String("picking_list_id", list.PickingListID.String()))
 	}
 
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
@@ -1363,7 +1375,6 @@ func (s *pickingService) PickItem(ctx context.Context, pickingItemID uuid.UUID, 
 	logger.Info("item picked", zap.String("picking_item_id", pickingItemID.String()), zap.String("picked_qty", pickedQty.String()))
 	return nil
 }
-
 func (s *pickingService) CompletePicking(ctx context.Context, pickingListID uuid.UUID, companyID uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "CompletePicking"), zap.String("idempotency_key", idempotencyKey))
 
@@ -2523,28 +2534,35 @@ func (s *packingService) PackItem(ctx context.Context, req PackItemRequest, idem
 		return err
 	}
 
-	// Validate packed quantity does not exceed shipment item quantity
-	if req.PackedQty.GreaterThan(shipmentItem.QuantityShipped) {
-		return fmt.Errorf("%w: packed quantity %s exceeds shipment quantity %s",
-			inventory_errors.ErrInvalidInput, req.PackedQty.String(), shipmentItem.QuantityShipped.String())
+	// Calculate new total packed quantity (incremental)
+	newTotal := packingItem.PackedQty.Add(req.PackedQty)
+	if newTotal.GreaterThan(shipmentItem.QuantityShipped) {
+		return fmt.Errorf("%w: packed quantity would exceed shipment quantity %s (current %s + %s)",
+			inventory_errors.ErrInvalidInput, shipmentItem.QuantityShipped.String(),
+			packingItem.PackedQty.String(), req.PackedQty.String())
 	}
 
-	// Update packed quantity
-	if err := s.packingListItemRepo.UpdatePackedQty(ctx, tx, req.PackingItemID, req.PackedQty); err != nil {
-		return fmt.Errorf("update packed qty: %w", err)
+	// Increment packed quantity using the delta
+	if err := s.packingListItemRepo.AddPackedQty(ctx, tx, req.PackingItemID, req.PackedQty); err != nil {
+		return fmt.Errorf("add packed qty: %w", err)
 	}
 
-	// Mark packing list as 'packed' if all items are fully packed
+	// After update, check if all items in the packing list are now fully packed
 	allPacked, err := s.isFullyPacked(ctx, tx, packingList.PackingListID)
 	if err != nil {
-		logger.Warn("failed to check if fully packed", zap.Error(err))
-	} else if allPacked && packingList.Status == "created" {
-		if err := s.packingListRepo.UpdateStatus(ctx, tx, packingList.PackingListID, "packed", timePtr(time.Now()), nil); err != nil {
-			logger.Warn("failed to update packing list status to packed", zap.Error(err))
-		} else {
-			packingList.Status = "packed"
-			packingList.PackedAt = timePtr(time.Now())
-			_ = s.emitPackingEvent(ctx, tx, packingList, events.EventPackingListPacked)
+		return fmt.Errorf("check if fully packed: %w", err)
+	}
+	if allPacked && packingList.Status == "created" {
+		packedAt := time.Now()
+		if err := s.packingListRepo.UpdateStatusToPacked(ctx, tx, packingList.PackingListID, req.PackedBy, packedAt); err != nil {
+			return fmt.Errorf("failed to update packing list status to packed: %w", err)
+		}
+		// Update local object for event emission
+		packingList.Status = "packed"
+		packingList.PackedAt = &packedAt
+		packingList.PackedBy = req.PackedBy
+		if err := s.emitPackingEvent(ctx, tx, packingList, events.EventPackingListPacked); err != nil {
+			logger.Warn("failed to emit packing list packed event", zap.Error(err))
 		}
 	}
 
@@ -2557,14 +2575,17 @@ func (s *packingService) PackItem(ctx context.Context, req PackItemRequest, idem
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "inventory", "pack_item", "packing_list_item",
 			&req.PackingItemID, "user", req.PackedBy, nil, nil, map[string]interface{}{
-				"packed_qty": req.PackedQty,
+				"packed_qty_added": req.PackedQty.String(),
+				"new_total":        newTotal.String(),
 			})
 	}
 
-	logger.Info("packing item updated", zap.String("packing_item_id", req.PackingItemID.String()))
+	logger.Info("packing item updated",
+		zap.String("packing_item_id", req.PackingItemID.String()),
+		zap.String("added_qty", req.PackedQty.String()),
+		zap.String("new_total", newTotal.String()))
 	return nil
 }
-
 func (s *packingService) validatePackItem(req PackItemRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", inventory_errors.ErrInvalidInput)
@@ -2627,13 +2648,20 @@ func (s *packingService) BulkPackItems(ctx context.Context, req BulkPackItemsReq
 			return err
 		}
 
-		if item.PackedQty.GreaterThan(shipmentItem.QuantityShipped) {
-			return fmt.Errorf("%w: packed quantity %s exceeds shipment quantity %s for item %s",
-				inventory_errors.ErrInvalidInput, item.PackedQty.String(), shipmentItem.QuantityShipped.String(), packingItem.PackingItemID)
+		// Calculate new total packed quantity (incremental)
+		newTotal := packingItem.PackedQty.Add(item.PackedQty)
+		if newTotal.GreaterThan(shipmentItem.QuantityShipped) {
+			return fmt.Errorf("%w: packed quantity would exceed shipment quantity %s for item %s (current %s + %s)",
+				inventory_errors.ErrInvalidInput,
+				shipmentItem.QuantityShipped.String(),
+				packingItem.PackingItemID.String(),
+				packingItem.PackedQty.String(),
+				item.PackedQty.String())
 		}
 
-		if err := s.packingListItemRepo.UpdatePackedQty(ctx, tx, item.PackingItemID, item.PackedQty); err != nil {
-			return fmt.Errorf("update packed qty: %w", err)
+		// Increment packed quantity using AddPackedQty (delta)
+		if err := s.packingListItemRepo.AddPackedQty(ctx, tx, item.PackingItemID, item.PackedQty); err != nil {
+			return fmt.Errorf("add packed qty: %w", err)
 		}
 
 		affectedListIDs[packingList.PackingListID] = true
@@ -2643,21 +2671,23 @@ func (s *packingService) BulkPackItems(ctx context.Context, req BulkPackItemsReq
 	for listID := range affectedListIDs {
 		allPacked, err := s.isFullyPacked(ctx, tx, listID)
 		if err != nil {
-			logger.Warn("failed to check if fully packed", zap.String("list_id", listID.String()), zap.Error(err))
-			continue
+			return fmt.Errorf("check if fully packed for list %s: %w", listID, err)
 		}
 		if allPacked {
 			list, err := s.packingListRepo.GetByID(ctx, tx, listID)
 			if err != nil {
-				continue
+				return fmt.Errorf("get packing list %s: %w", listID, err)
 			}
 			if list.Status == "created" {
-				if err := s.packingListRepo.UpdateStatus(ctx, tx, listID, "packed", timePtr(time.Now()), nil); err != nil {
-					logger.Warn("failed to update packing list status", zap.Error(err))
-				} else {
-					list.Status = "packed"
-					list.PackedAt = timePtr(time.Now())
-					_ = s.emitPackingEvent(ctx, tx, list, events.EventPackingListPacked)
+				packedAt := time.Now()
+				if err := s.packingListRepo.UpdateStatusToPacked(ctx, tx, listID, req.PackedBy, packedAt); err != nil {
+					return fmt.Errorf("failed to update packing list %s status to packed: %w", listID, err)
+				}
+				list.Status = "packed"
+				list.PackedAt = &packedAt
+				list.PackedBy = req.PackedBy
+				if err := s.emitPackingEvent(ctx, tx, list, events.EventPackingListPacked); err != nil {
+					logger.Warn("failed to emit packing list packed event", zap.String("list_id", listID.String()), zap.Error(err))
 				}
 			}
 		}
@@ -2909,6 +2939,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -2925,20 +2956,28 @@ import (
 	"auth-service/internal/inventory/repository"
 )
 
+// Allowed location types
+var allowedLocationTypes = map[string]bool{
+	"region": true,
+	"zone":   true,
+	"aisle":  true,
+	"bin":    true,
+}
+
 // InventoryLocationService manages warehouse location hierarchy.
 type InventoryLocationService interface {
 	CreateLocation(ctx context.Context, req CreateLocationRequest, idempotencyKey string) (*models.InventoryLocation, error)
 	UpdateLocation(ctx context.Context, req UpdateLocationRequest, idempotencyKey string) (*models.InventoryLocation, error)
 	DeleteLocation(ctx context.Context, companyID, locationID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
-	GetLocationTree(ctx context.Context, companyID uuid.UUID) ([]*LocationNode, error)
+	GetLocationTree(ctx context.Context, companyID, warehouseID uuid.UUID) ([]*LocationNode, error)
 	GetLocationByID(ctx context.Context, companyID, locationID uuid.UUID) (*models.InventoryLocation, error)
-	ListLocations(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
-	AssignWarehouseToLocation(ctx context.Context, req AssignWarehouseRequest, idempotencyKey string) error
+	ListLocations(ctx context.Context, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
 }
 
 // CreateLocationRequest defines input for creating a location.
 type CreateLocationRequest struct {
 	CompanyID        uuid.UUID
+	WarehouseID      uuid.UUID
 	Code             string
 	Name             string
 	LocationType     *string
@@ -2950,20 +2989,13 @@ type CreateLocationRequest struct {
 type UpdateLocationRequest struct {
 	LocationID       uuid.UUID
 	CompanyID        uuid.UUID
+	WarehouseID      *uuid.UUID
 	Code             *string
 	Name             *string
 	LocationType     *string
-	ParentLocationID *uuid.UUID // nil means no change; empty uuid means set to NULL
+	ParentLocationID *uuid.UUID // nil = no change; empty uuid = set to NULL
 	IsActive         *bool
 	UpdatedBy        *uuid.UUID
-}
-
-// AssignWarehouseRequest assigns a warehouse to a location.
-type AssignWarehouseRequest struct {
-	CompanyID   uuid.UUID
-	WarehouseID uuid.UUID
-	LocationID  uuid.UUID
-	UpdatedBy   *uuid.UUID
 }
 
 // LocationNode represents a location with its children for tree view.
@@ -3003,6 +3035,43 @@ func NewInventoryLocationService(
 	}
 }
 
+// ----------------------------------------------------------------------
+// Validation helpers
+// ----------------------------------------------------------------------
+
+func validateLocationType(locationType *string) error {
+	if locationType == nil {
+		return nil // optional field
+	}
+	if !allowedLocationTypes[*locationType] {
+		return fmt.Errorf("%w: location_type must be one of: region, zone, aisle, bin", inventory_errors.ErrInvalidInput)
+	}
+	return nil
+}
+
+func validateCreateLocation(req CreateLocationRequest) error {
+	if req.CompanyID == uuid.Nil {
+		return fmt.Errorf("%w: company_id required", inventory_errors.ErrInvalidInput)
+	}
+	if req.WarehouseID == uuid.Nil {
+		return fmt.Errorf("%w: warehouse_id required", inventory_errors.ErrInvalidInput)
+	}
+	if req.Code == "" {
+		return fmt.Errorf("%w: code required", inventory_errors.ErrInvalidInput)
+	}
+	if req.Name == "" {
+		return fmt.Errorf("%w: name required", inventory_errors.ErrInvalidInput)
+	}
+	if err := validateLocationType(req.LocationType); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// CreateLocation
+// ----------------------------------------------------------------------
+
 // CreateLocation creates a new inventory location.
 func (s *inventoryLocationService) CreateLocation(ctx context.Context, req CreateLocationRequest, idempotencyKey string) (*models.InventoryLocation, error) {
 	logger := s.logger.With(zap.String("method", "CreateLocation"), zap.String("idempotency_key", idempotencyKey))
@@ -3024,29 +3093,36 @@ func (s *inventoryLocationService) CreateLocation(ctx context.Context, req Creat
 		return cached, nil
 	}
 
-	// Check code uniqueness
-	exists, err := s.locationRepo.ExistsByCode(ctx, tx, req.CompanyID, req.Code, nil)
+	// Validate warehouse exists and belongs to company
+	_, err = s.warehouseRepo.GetByID(ctx, tx, req.CompanyID, req.WarehouseID)
+	if err != nil {
+		return nil, fmt.Errorf("warehouse validation failed: %w", err)
+	}
+
+	// Check code uniqueness per company + warehouse
+	exists, err := s.locationRepo.ExistsByCode(ctx, tx, req.CompanyID, req.WarehouseID, req.Code, nil)
 	if err != nil {
 		return nil, fmt.Errorf("check code exists: %w", err)
 	}
 	if exists {
-		return nil, fmt.Errorf("%w: location code %s already exists", inventory_errors.ErrDuplicate, req.Code)
+		return nil, fmt.Errorf("%w: location code %s already exists in this warehouse", inventory_errors.ErrDuplicate, req.Code)
 	}
 
-	// Validate parent exists if provided
+	// Validate parent location belongs to the same warehouse
 	if req.ParentLocationID != nil {
 		parent, err := s.locationRepo.GetByID(ctx, tx, *req.ParentLocationID)
 		if err != nil {
 			return nil, fmt.Errorf("parent location not found: %w", err)
 		}
-		if parent.CompanyID != req.CompanyID {
-			return nil, inventory_errors.ErrPermissionDenied
+		if parent.CompanyID != req.CompanyID || parent.WarehouseID != req.WarehouseID {
+			return nil, inventory_errors.ErrParentWarehouseMismatch
 		}
 	}
 
 	location := &models.InventoryLocation{
 		LocationID:       uuid.New(),
 		CompanyID:        req.CompanyID,
+		WarehouseID:      req.WarehouseID,
 		Code:             req.Code,
 		Name:             req.Name,
 		LocationType:     req.LocationType,
@@ -3084,6 +3160,10 @@ func (s *inventoryLocationService) CreateLocation(ctx context.Context, req Creat
 	return location, nil
 }
 
+// ----------------------------------------------------------------------
+// UpdateLocation
+// ----------------------------------------------------------------------
+
 // UpdateLocation updates an existing inventory location.
 func (s *inventoryLocationService) UpdateLocation(ctx context.Context, req UpdateLocationRequest, idempotencyKey string) (*models.InventoryLocation, error) {
 	logger := s.logger.With(zap.String("method", "UpdateLocation"), zap.String("idempotency_key", idempotencyKey))
@@ -3112,14 +3192,50 @@ func (s *inventoryLocationService) UpdateLocation(ctx context.Context, req Updat
 		return nil, inventory_errors.ErrPermissionDenied
 	}
 
+	// Validate location_type if provided
+	if req.LocationType != nil {
+		if err := validateLocationType(req.LocationType); err != nil {
+			return nil, err
+		}
+	}
+
+	// 1. Prevent setting parent to itself
+	if req.ParentLocationID != nil && *req.ParentLocationID == req.LocationID {
+		return nil, fmt.Errorf("%w: cannot set parent to itself", inventory_errors.ErrInvalidInput)
+	}
+
+	// 2. Prevent creating a circular reference (location cannot become ancestor of itself)
+	if req.ParentLocationID != nil && *req.ParentLocationID != uuid.Nil {
+		isDescendant, err := s.isDescendant(ctx, tx, *req.ParentLocationID, req.LocationID)
+		if err != nil {
+			return nil, fmt.Errorf("circular reference check failed: %w", err)
+		}
+		if isDescendant {
+			return nil, fmt.Errorf("%w: setting parent would create a circular reference", inventory_errors.ErrInvalidInput)
+		}
+	}
+
+	// If warehouse is being changed, validate new warehouse exists and belongs to company
+	if req.WarehouseID != nil && *req.WarehouseID != location.WarehouseID {
+		_, err := s.warehouseRepo.GetByID(ctx, tx, req.CompanyID, *req.WarehouseID)
+		if err != nil {
+			return nil, fmt.Errorf("new warehouse validation failed: %w", err)
+		}
+		location.WarehouseID = *req.WarehouseID
+	}
+
 	// Check code uniqueness if code is being changed
 	if req.Code != nil && *req.Code != location.Code {
-		exists, err := s.locationRepo.ExistsByCode(ctx, tx, req.CompanyID, *req.Code, &req.LocationID)
+		whID := location.WarehouseID
+		if req.WarehouseID != nil {
+			whID = *req.WarehouseID
+		}
+		exists, err := s.locationRepo.ExistsByCode(ctx, tx, req.CompanyID, whID, *req.Code, &req.LocationID)
 		if err != nil {
 			return nil, fmt.Errorf("check code exists: %w", err)
 		}
 		if exists {
-			return nil, fmt.Errorf("%w: location code %s already exists", inventory_errors.ErrDuplicate, *req.Code)
+			return nil, fmt.Errorf("%w: location code %s already exists in target warehouse", inventory_errors.ErrDuplicate, *req.Code)
 		}
 		location.Code = *req.Code
 	}
@@ -3130,18 +3246,18 @@ func (s *inventoryLocationService) UpdateLocation(ctx context.Context, req Updat
 	if req.LocationType != nil {
 		location.LocationType = req.LocationType
 	}
-	// Handle parent update (nil means no change, but we need to differentiate between "no change" and "set to NULL")
+	// Handle parent update
 	if req.ParentLocationID != nil {
 		if *req.ParentLocationID == uuid.Nil {
 			location.ParentLocationID = nil
 		} else {
-			// Validate parent exists and belongs to same company
+			// Validate parent exists and belongs to same company+warehouse
 			parent, err := s.locationRepo.GetByID(ctx, tx, *req.ParentLocationID)
 			if err != nil {
 				return nil, fmt.Errorf("parent location not found: %w", err)
 			}
-			if parent.CompanyID != req.CompanyID {
-				return nil, inventory_errors.ErrPermissionDenied
+			if parent.CompanyID != req.CompanyID || parent.WarehouseID != location.WarehouseID {
+				return nil, inventory_errors.ErrParentWarehouseMismatch
 			}
 			location.ParentLocationID = req.ParentLocationID
 		}
@@ -3172,7 +3288,36 @@ func (s *inventoryLocationService) UpdateLocation(ctx context.Context, req Updat
 	return location, nil
 }
 
+// isDescendant checks whether candidate is a descendant of ancestor.
+func (s *inventoryLocationService) isDescendant(ctx context.Context, tx *sql.Tx, candidate, ancestor uuid.UUID) (bool, error) {
+	if candidate == ancestor {
+		return true, nil
+	}
+	currentID := candidate
+	for {
+		loc, err := s.locationRepo.GetByID(ctx, tx, currentID)
+		if err != nil {
+			if errors.Is(err, inventory_errors.ErrNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if loc.ParentLocationID == nil {
+			return false, nil
+		}
+		if *loc.ParentLocationID == ancestor {
+			return true, nil
+		}
+		currentID = *loc.ParentLocationID
+	}
+}
+
+// ----------------------------------------------------------------------
+// DeleteLocation
+// ----------------------------------------------------------------------
+
 // DeleteLocation soft-deletes a location (sets is_active = false).
+// If the location is already inactive, returns ErrNotFound.
 func (s *inventoryLocationService) DeleteLocation(ctx context.Context, companyID, locationID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "DeleteLocation"), zap.String("idempotency_key", idempotencyKey))
 
@@ -3199,6 +3344,10 @@ func (s *inventoryLocationService) DeleteLocation(ctx context.Context, companyID
 	if location.CompanyID != companyID {
 		return inventory_errors.ErrPermissionDenied
 	}
+	// If already inactive, treat as not found
+	if !location.IsActive {
+		return inventory_errors.ErrNotFound
+	}
 
 	if err := s.locationRepo.SoftDelete(ctx, tx, locationID); err != nil {
 		return fmt.Errorf("soft delete location: %w", err)
@@ -3222,14 +3371,17 @@ func (s *inventoryLocationService) DeleteLocation(ctx context.Context, companyID
 	return nil
 }
 
-// GetLocationTree returns the hierarchical tree of locations for a company.
-func (s *inventoryLocationService) GetLocationTree(ctx context.Context, companyID uuid.UUID) ([]*LocationNode, error) {
-	locations, err := s.locationRepo.GetTree(ctx, s.pgClient.DB, companyID)
+// ----------------------------------------------------------------------
+// GetLocationTree, GetLocationByID, ListLocations
+// ----------------------------------------------------------------------
+
+// GetLocationTree returns the hierarchical tree of locations for a company+warehouse.
+func (s *inventoryLocationService) GetLocationTree(ctx context.Context, companyID, warehouseID uuid.UUID) ([]*LocationNode, error) {
+	locations, err := s.locationRepo.GetTree(ctx, s.pgClient.DB, companyID, warehouseID)
 	if err != nil {
 		return nil, fmt.Errorf("get location tree: %w", err)
 	}
 
-	// Build map of locationID -> node
 	nodeMap := make(map[uuid.UUID]*LocationNode)
 	for _, loc := range locations {
 		nodeMap[loc.LocationID] = &LocationNode{
@@ -3246,7 +3398,6 @@ func (s *inventoryLocationService) GetLocationTree(ctx context.Context, companyI
 			if parent, ok := nodeMap[*node.ParentLocationID]; ok {
 				parent.Children = append(parent.Children, node)
 			} else {
-				// Parent not found in same company – treat as root
 				roots = append(roots, node)
 			}
 		}
@@ -3255,6 +3406,7 @@ func (s *inventoryLocationService) GetLocationTree(ctx context.Context, companyI
 }
 
 // GetLocationByID retrieves a single location by ID (with company check).
+// Inactive locations are still returned (with isActive false).
 func (s *inventoryLocationService) GetLocationByID(ctx context.Context, companyID, locationID uuid.UUID) (*models.InventoryLocation, error) {
 	loc, err := s.locationRepo.GetByID(ctx, s.pgClient.DB, locationID)
 	if err != nil {
@@ -3266,102 +3418,25 @@ func (s *inventoryLocationService) GetLocationByID(ctx context.Context, companyI
 	return loc, nil
 }
 
-// ListLocations lists all locations for a company, optionally only active ones.
-func (s *inventoryLocationService) ListLocations(ctx context.Context, companyID uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error) {
-	var parentID *uuid.UUID = nil
-	locations, err := s.locationRepo.List(ctx, s.pgClient.DB, companyID, parentID, activeOnly)
+// ListLocations lists all locations for a company and warehouse, optionally only active ones and filtering by parent.
+func (s *inventoryLocationService) ListLocations(ctx context.Context, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error) {
+	locations, err := s.locationRepo.List(ctx, s.pgClient.DB, companyID, warehouseID, parentID, activeOnly)
 	if err != nil {
 		return nil, fmt.Errorf("list locations: %w", err)
 	}
 	return locations, nil
 }
 
-// AssignWarehouseToLocation updates the location_id of a warehouse.
-func (s *inventoryLocationService) AssignWarehouseToLocation(ctx context.Context, req AssignWarehouseRequest, idempotencyKey string) error {
-	logger := s.logger.With(zap.String("method", "AssignWarehouseToLocation"), zap.String("idempotency_key", idempotencyKey))
-
-	if req.CompanyID == uuid.Nil || req.WarehouseID == uuid.Nil || req.LocationID == uuid.Nil {
-		return inventory_errors.ErrInvalidInput
-	}
-
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
-		logger.Info("idempotent – already assigned")
-		return nil
-	}
-
-	// Verify warehouse exists and belongs to company
-	warehouse, err := s.warehouseRepo.GetByID(ctx, tx, req.CompanyID, req.WarehouseID)
-	if err != nil {
-		return err
-	}
-	// Verify location exists and belongs to company
-	location, err := s.locationRepo.GetByID(ctx, tx, req.LocationID)
-	if err != nil {
-		return err
-	}
-	if location.CompanyID != req.CompanyID {
-		return inventory_errors.ErrPermissionDenied
-	}
-
-	// Update warehouse
-	warehouse.LocationID = &req.LocationID
-	warehouse.UpdatedBy = req.UpdatedBy
-	if err := s.warehouseRepo.Update(ctx, tx, warehouse); err != nil {
-		return fmt.Errorf("update warehouse location: %w", err)
-	}
-
-	// Emit event (optional – could be a warehouse updated event)
-	// We'll reuse warehouse updated event or create a new one. For simplicity, emit warehouse updated.
-	// But we need a warehouse service to emit events? We'll emit directly here.
-	if err := s.emitWarehouseLocationEvent(ctx, tx, warehouse); err != nil {
-		logger.Warn("failed to emit warehouse location change event", zap.Error(err))
-	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-
-	if s.auditService != nil {
-		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "inventory", "assign_warehouse_to_location", "warehouse",
-			&req.WarehouseID, "user", req.UpdatedBy, nil, nil, map[string]interface{}{
-				"location_id": req.LocationID.String(),
-			})
-	}
-
-	return nil
-}
-
 // ----------------------------------------------------------------------
-// Helper functions
+// Event emission
 // ----------------------------------------------------------------------
-
-func validateCreateLocation(req CreateLocationRequest) error {
-	if req.CompanyID == uuid.Nil {
-		return fmt.Errorf("%w: company_id required", inventory_errors.ErrInvalidInput)
-	}
-	if req.Code == "" {
-		return fmt.Errorf("%w: code required", inventory_errors.ErrInvalidInput)
-	}
-	if req.Name == "" {
-		return fmt.Errorf("%w: name required", inventory_errors.ErrInvalidInput)
-	}
-	return nil
-}
 
 // emitLocationEvent publishes location-related outbox events.
 func (s *inventoryLocationService) emitLocationEvent(ctx context.Context, tx *sql.Tx, loc *models.InventoryLocation, eventType string) error {
 	payload := map[string]interface{}{
 		"location_id":   loc.LocationID.String(),
 		"company_id":    loc.CompanyID.String(),
+		"warehouse_id":  loc.WarehouseID.String(),
 		"code":          loc.Code,
 		"name":          loc.Name,
 		"location_type": loc.LocationType,
@@ -3380,34 +3455,6 @@ func (s *inventoryLocationService) emitLocationEvent(ctx context.Context, tx *sq
 		AggregateType: "inventory_location",
 		AggregateID:   loc.LocationID.String(),
 		EventType:     eventType,
-		Topic:         events.TopicInventoryEvents,
-		Payload:       data,
-	}
-	return s.outboxRepo.Store(ctx, tx, event)
-}
-
-// emitWarehouseLocationEvent emits a warehouse updated event when location is assigned.
-func (s *inventoryLocationService) emitWarehouseLocationEvent(ctx context.Context, tx *sql.Tx, warehouse *models.Warehouse) error {
-	payload := map[string]interface{}{
-		"warehouse_id":   warehouse.WarehouseID.String(),
-		"company_id":     warehouse.CompanyID.String(),
-		"code":           warehouse.Code,
-		"name":           warehouse.Name,
-		"location_id":    nil,
-		"warehouse_type": warehouse.WarehouseType,
-	}
-	if warehouse.LocationID != nil {
-		payload["location_id"] = warehouse.LocationID.String()
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	event := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "warehouse",
-		AggregateID:   warehouse.WarehouseID.String(),
-		EventType:     events.EventWarehouseUpdated,
 		Topic:         events.TopicInventoryEvents,
 		Payload:       data,
 	}
@@ -3726,7 +3773,7 @@ type serialNumberService struct {
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
 	batchRepo        repository.BatchRepository
-	txnSvc           SerialNumberTransactionService // NEW: transaction logging
+	txnSvc           SerialNumberTransactionService
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -3734,12 +3781,43 @@ type serialNumberService struct {
 	logger           *zap.Logger
 }
 
+// serialAllowedStatuses defines all valid serial number statuses.
+var serialAllowedStatuses = map[string]bool{
+	"available": true,
+	"sold":      true,
+	"reserved":  true,
+	"returned":  true,
+	"damaged":   true,
+}
+
+// serialAllowedTransitions defines which status transitions are permitted.
+var serialAllowedTransitions = map[string]map[string]bool{
+	"available": {
+		"sold":     true,
+		"reserved": true,
+		"damaged":  true,
+	},
+	"sold": {
+		"returned": true,
+	},
+	"reserved": {
+		"available": true,
+		"sold":      true,
+	},
+	"returned": {
+		"available": true,
+	},
+	"damaged": {
+		"available": true,
+	},
+}
+
 func NewSerialNumberService(
 	serialRepo repository.SerialRepository,
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
 	batchRepo repository.BatchRepository,
-	txnSvc SerialNumberTransactionService, // NEW parameter
+	txnSvc SerialNumberTransactionService,
 	pgClient *client.PostgresClient,
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
@@ -3804,6 +3882,9 @@ func (s *serialNumberService) RegisterSerialNumbers(ctx context.Context, req Reg
 	status := "available"
 	if req.Status != nil {
 		status = *req.Status
+		if !serialAllowedStatuses[status] {
+			return nil, fmt.Errorf("%w: invalid status %s", inventory_errors.ErrInvalidInput, status)
+		}
 	}
 
 	createdSerials := make([]*models.SerialNumber, 0, len(req.SerialNumbers))
@@ -3827,7 +3908,6 @@ func (s *serialNumberService) RegisterSerialNumbers(ctx context.Context, req Reg
 			return nil, fmt.Errorf("create serial %s: %w", sn, err)
 		}
 
-		// Log "created" transaction
 		if err := s.txnSvc.LogCustom(ctx, tx, LogCustomRequest{
 			CompanyID:       req.CompanyID,
 			SerialID:        serial.SerialID,
@@ -3894,7 +3974,6 @@ func (s *serialNumberService) AssignSerialToWarehouse(ctx context.Context, seria
 		return fmt.Errorf("assign to warehouse: %w", err)
 	}
 
-	// Log assignment transaction
 	if err := s.txnSvc.LogAssignment(ctx, tx, LogAssignmentRequest{
 		CompanyID:     companyID,
 		SerialID:      serialID,
@@ -3957,7 +4036,6 @@ func (s *serialNumberService) AssignSerialToBatch(ctx context.Context, serialID,
 		return fmt.Errorf("assign to batch: %w", err)
 	}
 
-	// Log assignment transaction
 	if err := s.txnSvc.LogAssignment(ctx, tx, LogAssignmentRequest{
 		CompanyID:     companyID,
 		SerialID:      serialID,
@@ -3988,8 +4066,12 @@ func (s *serialNumberService) AssignSerialToBatch(ctx context.Context, serialID,
 
 func (s *serialNumberService) UpdateSerialStatus(ctx context.Context, serialID uuid.UUID, companyID uuid.UUID, status string, updatedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "UpdateSerialStatus"), zap.String("idempotency_key", idempotencyKey))
+
 	if status == "" {
 		return fmt.Errorf("%w: status cannot be empty", inventory_errors.ErrInvalidInput)
+	}
+	if !serialAllowedStatuses[status] {
+		return fmt.Errorf("%w: invalid status '%s'", inventory_errors.ErrInvalidInput, status)
 	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -4013,11 +4095,22 @@ func (s *serialNumberService) UpdateSerialStatus(ctx context.Context, serialID u
 	}
 
 	oldStatus := serial.Status
+
+	// Validate status transition
+	if oldStatus != nil {
+		allowed, ok := serialAllowedTransitions[*oldStatus]
+		if !ok {
+			return fmt.Errorf("%w: unknown old status %s", inventory_errors.ErrInvalidInput, *oldStatus)
+		}
+		if !allowed[status] {
+			return fmt.Errorf("%w: cannot transition from %s to %s", inventory_errors.ErrInvalidInput, *oldStatus, status)
+		}
+	}
+
 	if err := s.serialRepo.UpdateStatus(ctx, tx, serialID, status); err != nil {
 		return fmt.Errorf("update status: %w", err)
 	}
 
-	// Log status change transaction
 	if err := s.txnSvc.LogStatusChange(ctx, tx, LogStatusChangeRequest{
 		CompanyID:  companyID,
 		SerialID:   serialID,
@@ -4038,6 +4131,7 @@ func (s *serialNumberService) UpdateSerialStatus(ctx context.Context, serialID u
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "inventory", "update_serial_status", "serial_number",
 			&serialID, "user", updatedBy, nil, nil, map[string]interface{}{
+				"old_status": oldStatus,
 				"new_status": status,
 			})
 	}
@@ -4840,6 +4934,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -4893,6 +4988,7 @@ type fulfillmentService struct {
 	reservationSvc   ReservationService
 	inventorySvc     InventoryService
 	productionSvc    ProductionService
+	stockSvc         StockService // ADDED: for batch picking
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
 	balanceRepo      repository.StockBalanceRepository
@@ -4903,12 +4999,14 @@ type fulfillmentService struct {
 	logger           *zap.Logger
 }
 
+// NewFulfillmentService creates a new fulfillment service.
 func NewFulfillmentService(
 	fulfillmentRepo repository.FulfillmentRepository,
 	shipmentRepo repository.ShipmentRepository,
 	reservationSvc ReservationService,
 	inventorySvc InventoryService,
 	productionSvc ProductionService,
+	stockSvc StockService, // ADDED parameter
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
 	balanceRepo repository.StockBalanceRepository,
@@ -4924,6 +5022,7 @@ func NewFulfillmentService(
 		reservationSvc:   reservationSvc,
 		inventorySvc:     inventorySvc,
 		productionSvc:    productionSvc,
+		stockSvc:         stockSvc, // ADDED
 		itemRepo:         itemRepo,
 		warehouseRepo:    warehouseRepo,
 		balanceRepo:      balanceRepo,
@@ -5185,22 +5284,132 @@ func (s *fulfillmentService) ProcessFulfillmentOrder(ctx context.Context, fulfil
 	return nil
 }
 
-func (s *fulfillmentService) handleInventoryRequired(ctx context.Context, tx *sql.Tx, order *models.FulfillmentOrder, item *models.FulfillmentOrderItem, remaining decimal.Decimal, idempotencyKey string) error {
-	expiresAt := time.Now().Add(48 * time.Hour)
-	reservationReq := CreateReservationRequest{
-		CompanyID:       order.CompanyID,
-		ReservationType: "fulfillment",
-		ReferenceID:     order.FulfillmentOrderID,
-		WarehouseID:     order.WarehouseID,
-		ItemID:          item.ItemID,
-		BatchID:         nil,
-		Quantity:        remaining,
-		ExpiresAt:       &expiresAt,
-		CreatedBy:       nil,
+// ----------------------------------------------------------------------------------
+// NEW: helper to map item valuation method to batch picking strategy
+func pickingStrategyFromItem(item *models.Item) PickingStrategy {
+	// Default to FIFO
+	if item.ValuationMethod == "weighted_average" {
+		// Weighted average often uses FIFO as well, but could also use FEFO for expiry.
+		// For expiry‑sensitive items, you may want to configure is_fefo flag.
+		return PickingStrategyFIFO
 	}
-	_, err := s.reservationSvc.CreateReservation(ctx, tx, reservationReq, idempotencyKey+":invreq:"+item.ItemID.String())
-	return err
+	// FIFO and LIFO both use FIFO picking (oldest batch first)
+	return PickingStrategyFIFO
 }
+
+// handleInventoryRequired creates reservations for inventory‑required items.
+// For batch‑tracked items, it calls batch picking and creates one reservation per batch.
+func (s *fulfillmentService) handleInventoryRequired(ctx context.Context, tx *sql.Tx, order *models.FulfillmentOrder, item *models.FulfillmentOrderItem, remaining decimal.Decimal, idempotencyKey string) error {
+	logger := s.logger.With(
+		zap.String("method", "handleInventoryRequired"),
+		zap.String("fulfillment_order_id", order.FulfillmentOrderID.String()),
+		zap.String("item_id", item.ItemID.String()),
+		zap.String("remaining", remaining.String()),
+	)
+
+	itm, err := s.itemRepo.GetByID(ctx, tx, item.ItemID)
+	if err != nil {
+		logger.Error("failed to fetch item", zap.Error(err))
+		return fmt.Errorf("get item for batch check: %w", err)
+	}
+
+	logger.Info("item details",
+		zap.Bool("is_batch_tracked", itm.IsBatchTracked),
+		zap.String("valuation_method", string(itm.ValuationMethod)),
+	)
+
+	// If item is not batch‑tracked, create a single reservation (existing behaviour)
+	if !itm.IsBatchTracked {
+		logger.Info("item not batch‑tracked, creating single reservation")
+		expiresAt := time.Now().Add(48 * time.Hour)
+		reservationReq := CreateReservationRequest{
+			CompanyID:       order.CompanyID,
+			ReservationType: "fulfillment",
+			ReferenceID:     order.FulfillmentOrderID,
+			WarehouseID:     order.WarehouseID,
+			ItemID:          item.ItemID,
+			BatchID:         nil,
+			Quantity:        remaining,
+			ExpiresAt:       &expiresAt,
+			CreatedBy:       nil,
+		}
+		_, err := s.reservationSvc.CreateReservation(ctx, tx, reservationReq, idempotencyKey+":invreq:"+item.ItemID.String())
+		if err != nil {
+			logger.Error("failed to create single reservation", zap.Error(err))
+		}
+		return err
+	}
+
+	// ---- Batch‑tracked item: get batch allocations using FIFO / FEFO ----
+	logger.Info("item is batch‑tracked, calling batch picking")
+
+	strategy := pickingStrategyFromItem(itm)
+	logger.Info("batch picking strategy", zap.String("strategy", string(strategy)))
+
+	allocations, err := s.stockSvc.GetBatchPicking(
+		ctx,
+		order.CompanyID,
+		item.ItemID,
+		order.WarehouseID,
+		remaining,
+		strategy,
+	)
+	if err != nil {
+		if errors.Is(err, inventory_errors.ErrInsufficientStock) {
+			logger.Error("insufficient stock for batch picking", zap.Error(err))
+			return fmt.Errorf("%w: %s", inventory_errors.ErrInsufficientStock, err.Error())
+		}
+		logger.Error("batch picking failed", zap.Error(err))
+		return fmt.Errorf("batch picking failed: %w", err)
+	}
+
+	if len(allocations) == 0 {
+		logger.Warn("batch picking returned zero allocations – no stock available?")
+		return fmt.Errorf("%w: no batches available to allocate", inventory_errors.ErrInsufficientStock)
+	}
+
+	logger.Info("batch allocations received", zap.Int("num_allocations", len(allocations)))
+	for i, alloc := range allocations {
+		logger.Info(fmt.Sprintf("allocation %d", i),
+			zap.String("batch_id", alloc.BatchID.String()),
+			zap.String("quantity", alloc.AllocatedQty.String()),
+		)
+	}
+
+	// Create one reservation per batch allocation
+	expiresAt := time.Now().Add(48 * time.Hour)
+	for idx, alloc := range allocations {
+		reservationReq := CreateReservationRequest{
+			CompanyID:       order.CompanyID,
+			ReservationType: "fulfillment",
+			ReferenceID:     order.FulfillmentOrderID,
+			WarehouseID:     order.WarehouseID,
+			ItemID:          item.ItemID,
+			BatchID:         &alloc.BatchID,
+			Quantity:        alloc.AllocatedQty,
+			ExpiresAt:       &expiresAt,
+			CreatedBy:       nil,
+		}
+		itemKey := fmt.Sprintf("%s:batch:%s", idempotencyKey, alloc.BatchID.String())
+		if _, err := s.reservationSvc.CreateReservation(ctx, tx, reservationReq, itemKey); err != nil {
+			logger.Error("failed to create batch reservation",
+				zap.Int("allocation_index", idx),
+				zap.String("batch_id", alloc.BatchID.String()),
+				zap.Error(err),
+			)
+			return fmt.Errorf("create batch reservation for %s: %w", alloc.BatchID, err)
+		}
+		logger.Info("batch reservation created",
+			zap.Int("allocation_index", idx),
+			zap.String("batch_id", alloc.BatchID.String()),
+		)
+	}
+
+	logger.Info("all batch reservations created successfully")
+	return nil
+}
+
+// ----------------------------------------------------------------------------------
 
 func (s *fulfillmentService) handleAllowBackorder(ctx context.Context, tx *sql.Tx, order *models.FulfillmentOrder, item *models.FulfillmentOrderItem, remaining decimal.Decimal, idempotencyKey string) error {
 	available, err := s.getAvailableStock(ctx, tx, order.CompanyID, order.WarehouseID, item.ItemID, nil)
@@ -5509,7 +5718,7 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			continue
 		}
 
-		// If item does not require shipping (e.g., digital goods, services), just mark as fulfilled
+		// Items that don't require shipping or don't track inventory are handled directly
 		if !itm.RequiresShipping {
 			newFulfilled := item.FulfilledQty.Add(remainingToShip)
 			if err := s.fulfillmentRepo.UpdateFulfilledQty(ctx, tx, item.FulfillmentItemID, newFulfilled, item.BackorderedQty); err != nil {
@@ -5517,8 +5726,6 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			}
 			continue
 		}
-
-		// If item does not track inventory, mark as fulfilled (already handled in process, but double‑check)
 		if !itm.TrackInventory {
 			newFulfilled := item.FulfilledQty.Add(remainingToShip)
 			if err := s.fulfillmentRepo.UpdateFulfilledQty(ctx, tx, item.FulfillmentItemID, newFulfilled, item.BackorderedQty); err != nil {
@@ -5527,14 +5734,16 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			continue
 		}
 
-		reservation, err := s.reservationSvc.GetActiveReservationByReference(
+		// --- NEW: fetch all active reservations for this fulfillment order and item ---
+		reservations, err := s.reservationSvc.GetActiveReservationsByReference(
 			ctx, tx, order.CompanyID, "fulfillment", order.FulfillmentOrderID, item.ItemID,
 		)
 		if err != nil && err != inventory_errors.ErrNotFound {
-			return fmt.Errorf("get active reservation for item %s: %w", item.ItemID, err)
+			return fmt.Errorf("get active reservations for item %s: %w", item.ItemID, err)
 		}
-		if err == inventory_errors.ErrNotFound {
-			// No reservation – check available stock directly
+
+		if len(reservations) == 0 {
+			// No reservations – fallback to direct stock check (for non‑batch items or errors)
 			available, err := s.getAvailableStock(ctx, tx, order.CompanyID, shipment.WarehouseID, item.ItemID, nil)
 			if err != nil {
 				return fmt.Errorf("check available stock for item %s: %w", item.ItemID, err)
@@ -5542,47 +5751,94 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 			if available.LessThan(remainingToShip) {
 				return fmt.Errorf("%w: insufficient stock for item %s (available %s, need %s)", inventory_errors.ErrInsufficientStock, item.ItemID, available.String(), remainingToShip.String())
 			}
-			reservation = nil // no reservation to link
-		}
-
-		unitCost := decimal.Zero
-		if itm.StandardCost != nil {
-			unitCost = *itm.StandardCost
-		}
-
-		movementReq := CreateMovementRequest{
-			CompanyID:     order.CompanyID,
-			MovementType:  enums.MovementTypeSalesOut,
-			MovementDate:  time.Now(),
-			WarehouseID:   shipment.WarehouseID,
-			ItemID:        item.ItemID,
-			QuantityOut:   remainingToShip,
-			UnitCost:      unitCost,
-			Reason:        stringPtr(fmt.Sprintf("Shipment %s", shipment.ShipmentNumber)),
-			ReferenceType: stringPtr("shipment"),
-			ReferenceID:   &shipment.ShipmentID,
-			CreatedBy:     nil,
-		}
-		if reservation != nil {
-			movementReq.ReservationID = &reservation.ReservationID
-		}
-		_, err = s.inventorySvc.CreateMovement(ctx, movementReq, idempotencyKey+":movement:"+item.ItemID.String())
-		if err != nil {
-			return fmt.Errorf("create movement for item %s: %w", item.ItemID, err)
-		}
-
-		if reservation != nil {
-			if err := s.reservationSvc.PartialFulfillReservation(ctx, tx, reservation.ReservationID, order.CompanyID, remainingToShip, idempotencyKey+":partial:"+reservation.ReservationID.String()); err != nil {
-				return fmt.Errorf("partial fulfill reservation for item %s: %w", item.ItemID, err)
+			// Create a single movement without reservation
+			unitCost := decimal.Zero
+			if itm.StandardCost != nil {
+				unitCost = *itm.StandardCost
 			}
+			movementReq := CreateMovementRequest{
+				CompanyID:     order.CompanyID,
+				MovementType:  enums.MovementTypeSalesOut,
+				MovementDate:  time.Now(),
+				WarehouseID:   shipment.WarehouseID,
+				ItemID:        item.ItemID,
+				QuantityOut:   remainingToShip,
+				UnitCost:      unitCost,
+				Reason:        stringPtr(fmt.Sprintf("Shipment %s", shipment.ShipmentNumber)),
+				ReferenceType: stringPtr("shipment"),
+				ReferenceID:   &shipment.ShipmentID,
+				CreatedBy:     nil,
+			}
+			_, err = s.inventorySvc.CreateMovement(ctx, movementReq, idempotencyKey+":movement:"+item.ItemID.String())
+			if err != nil {
+				return fmt.Errorf("create movement for item %s: %w", item.ItemID, err)
+			}
+			// No reservation to update
+		} else {
+			// Process each active reservation (one per batch)
+			shippedFromReservations := decimal.Zero
+			for _, res := range reservations {
+				// How much to ship from this reservation
+				shipQty := res.Quantity.Sub(res.FulfilledQuantity)
+				if shipQty.LessThanOrEqual(decimal.Zero) {
+					continue
+				}
+				if shipQty.GreaterThan(remainingToShip) {
+					shipQty = remainingToShip
+				}
+				if shipQty.LessThanOrEqual(decimal.Zero) {
+					break
+				}
+
+				unitCost := decimal.Zero
+				if itm.StandardCost != nil {
+					unitCost = *itm.StandardCost
+				}
+				movementReq := CreateMovementRequest{
+					CompanyID:     order.CompanyID,
+					MovementType:  enums.MovementTypeSalesOut,
+					MovementDate:  time.Now(),
+					WarehouseID:   shipment.WarehouseID,
+					ItemID:        item.ItemID,
+					BatchID:       res.BatchID, // Critical: set the batch ID
+					QuantityOut:   shipQty,
+					UnitCost:      unitCost,
+					Reason:        stringPtr(fmt.Sprintf("Shipment %s", shipment.ShipmentNumber)),
+					ReferenceType: stringPtr("shipment"),
+					ReferenceID:   &shipment.ShipmentID,
+					CreatedBy:     nil,
+					ReservationID: &res.ReservationID,
+				}
+				key := fmt.Sprintf("%s:movement:%s:%s", idempotencyKey, item.ItemID.String(), res.BatchID.String())
+				if _, err := s.inventorySvc.CreateMovement(ctx, movementReq, key); err != nil {
+					return fmt.Errorf("create movement for batch %s: %w", res.BatchID.String(), err)
+				}
+
+				// Partially fulfill the reservation (full shipped amount)
+				if err := s.reservationSvc.PartialFulfillReservation(ctx, tx, res.ReservationID, order.CompanyID, shipQty, idempotencyKey+":partial:"+res.ReservationID.String()); err != nil {
+					return fmt.Errorf("fulfill reservation %s: %w", res.ReservationID.String(), err)
+				}
+
+				shippedFromReservations = shippedFromReservations.Add(shipQty)
+				remainingToShip = remainingToShip.Sub(shipQty)
+				if remainingToShip.LessThanOrEqual(decimal.Zero) {
+					break
+				}
+			}
+			if remainingToShip.GreaterThan(decimal.Zero) {
+				return fmt.Errorf("%w: could not allocate all quantity from reservations (remaining %s)", inventory_errors.ErrInsufficientStock, remainingToShip.String())
+			}
+			// The fulfillment item's fulfilled quantity will be updated after the loop (outside the reservation block)
 		}
 
+		// Update fulfilled quantity on the fulfillment order item
 		newFulfilled := item.FulfilledQty.Add(remainingToShip)
 		if err := s.fulfillmentRepo.UpdateFulfilledQty(ctx, tx, item.FulfillmentItemID, newFulfilled, item.BackorderedQty); err != nil {
 			logger.Warn("failed to update fulfilled_qty", zap.Error(err))
 		}
 	}
 
+	// Mark shipment as shipped
 	now := time.Now()
 	if err := s.shipmentRepo.UpdateStatus(ctx, tx, shipmentID, "shipped", &now, nil); err != nil {
 		return fmt.Errorf("update shipment status to shipped: %w", err)
@@ -5590,9 +5846,11 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 	shipment.ShipmentStatus = "shipped"
 	shipment.ShippedAt = &now
 
+	// If all items are fulfilled, update fulfillment order status
 	allFulfilled := true
-	for _, item := range items {
-		if item.FulfilledQty.LessThan(item.OrderedQty) {
+	itemsAfter, _ := s.fulfillmentRepo.GetOrderItems(ctx, tx, order.FulfillmentOrderID)
+	for _, it := range itemsAfter {
+		if it.FulfilledQty.LessThan(it.OrderedQty) {
 			allFulfilled = false
 			break
 		}
@@ -5621,7 +5879,6 @@ func (s *fulfillmentService) Ship(ctx context.Context, shipmentID uuid.UUID, ide
 	logger.Info("shipment shipped", zap.String("shipment_id", shipmentID.String()))
 	return nil
 }
-
 func (s *fulfillmentService) Deliver(ctx context.Context, shipmentID uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "Deliver"), zap.String("idempotency_key", idempotencyKey))
 
@@ -8892,6 +9149,7 @@ type reorderService struct {
 	warehouseRepo    repository.WarehouseRepository
 	reorderRepo      repository.ReorderOrderRepository
 	balanceRepo      repository.StockBalanceRepository
+	poService        PurchaseOrderService // new
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -8904,6 +9162,7 @@ func NewReorderService(
 	warehouseRepo repository.WarehouseRepository,
 	reorderRepo repository.ReorderOrderRepository,
 	balanceRepo repository.StockBalanceRepository,
+	poService PurchaseOrderService, // new parameter
 	pgClient *client.PostgresClient,
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
@@ -8915,6 +9174,7 @@ func NewReorderService(
 		warehouseRepo:    warehouseRepo,
 		reorderRepo:      reorderRepo,
 		balanceRepo:      balanceRepo,
+		poService:        poService,
 		pgClient:         pgClient,
 		outboxRepo:       outboxRepo,
 		idempotencyStore: idempotencyStore,
@@ -8961,7 +9221,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 	// 3. Check reorder configuration
 	if item.ReorderLevel == nil || item.ReorderQuantity == nil {
 		logger.Debug("no reorder configuration, skipping")
-		return nil // no error, no order, but not a skip reason? return nil means success with no order
+		return nil // no error, no order
 	}
 	reorderLevel := *item.ReorderLevel
 	reorderQty := *item.ReorderQuantity
@@ -8969,7 +9229,6 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 	// 4. Get actual available stock from DB
 	availableQty, err := s.balanceRepo.GetByWarehouseAndItem(ctx, s.pgClient.DB, companyID, warehouseID, itemID)
 	if err != nil {
-		// If no stock balance record, treat as zero
 		if errors.Is(err, inventory_errors.ErrNotFound) {
 			availableQty = decimal.Zero
 		} else {
@@ -8995,7 +9254,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 		return inventory_errors.ErrOpenReorderExists
 	}
 
-	// 7. Idempotency (optional, keep)
+	// 7. Idempotency
 	idempotencyKey := fmt.Sprintf("reorder:%s:%s:%s:%d",
 		companyID.String(), itemID.String(), warehouseID.String(), time.Now().Unix()/3600)
 
@@ -9029,9 +9288,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 		return fmt.Errorf("create reorder order: %w", err)
 	}
 
-	// 9. No cooldown – do NOT update item.LastReorderedAt
-
-	// 10. Emit event
+	// 9. Emit event
 	if err := s.emitReorderEvent(ctx, tx, reorderOrder); err != nil {
 		logger.Warn("failed to emit reorder event", zap.Error(err))
 	}
@@ -9042,7 +9299,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// 11. Audit log
+	// 10. Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(
 			ctx, nil, &companyID, "inventory", "create_reorder", "reorder_order",
@@ -9103,16 +9360,41 @@ func (s *reorderService) UpdateOrderStatus(ctx context.Context, orderID uuid.UUI
 	return s.reorderRepo.UpdateStatus(ctx, s.pgClient.DB, orderID, newStatus)
 }
 
+// ProcessPendingOrders processes all pending reorder orders by creating a purchase order for each.
+// Returns the number of successfully processed orders.
 func (s *reorderService) ProcessPendingOrders(ctx context.Context, companyID uuid.UUID) (int, error) {
 	orders, err := s.reorderRepo.ListPending(ctx, s.pgClient.DB, companyID)
 	if err != nil {
 		return 0, fmt.Errorf("list pending: %w", err)
 	}
+	processed := 0
 	for _, order := range orders {
-		// Here you would implement actual processing, e.g., create purchase order
 		s.logger.Info("processing pending order", zap.String("order_id", order.ReorderOrderID.String()))
+
+		// Create idempotency key for PO creation
+		poIdempotencyKey := fmt.Sprintf("reorder:process:%s", order.ReorderOrderID.String())
+
+		// Call PurchaseOrderService to create a purchase order from this reorder
+		po, created, err := s.poService.CreatePurchaseOrderFromReorder(ctx, order, poIdempotencyKey)
+		if err != nil {
+			s.logger.Error("failed to create purchase order from reorder",
+				zap.String("reorder_id", order.ReorderOrderID.String()),
+				zap.Error(err))
+			// Do not mark as processed; leave it pending for retry
+			continue
+		}
+		if created {
+			processed++
+			s.logger.Info("purchase order created",
+				zap.String("po_id", po.PurchaseOrderID.String()),
+				zap.String("reorder_id", order.ReorderOrderID.String()))
+		} else {
+			// Idempotent – already processed, but we still count it for reporting
+			processed++
+			s.logger.Info("reorder already processed (idempotent)", zap.String("reorder_id", order.ReorderOrderID.String()))
+		}
 	}
-	return len(orders), nil
+	return processed, nil
 }
 
 func (s *reorderService) emitReorderEvent(ctx context.Context, tx *sql.Tx, order *models.ReorderOrder) error {
@@ -9135,6 +9417,789 @@ func (s *reorderService) emitReorderEvent(ctx context.Context, tx *sql.Tx, order
 		AggregateType: "reorder_order",
 		AggregateID:   order.ReorderOrderID.String(),
 		EventType:     events.EventReorderCreated,
+		Topic:         events.TopicInventoryEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
+}
+
+
+
+================================================================================
+FILE: ./service/purchase_order_service.go
+================================================================================
+
+package service
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/client"
+	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
+	"auth-service/internal/inventory/events"
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/inventory/repository"
+)
+
+// PurchaseOrderService defines all purchase order related operations
+type PurchaseOrderService interface {
+	// Reorder integration
+	CreatePurchaseOrderFromReorder(ctx context.Context, reorder *models.ReorderOrder, idempotencyKey string) (*models.PurchaseOrder, bool, error)
+
+	// Receiving
+	ReceivePurchaseOrder(ctx context.Context, req ReceivePurchaseOrderRequest, idempotencyKey string) (*models.PurchaseOrderReceipt, error)
+
+	// Vendor CRUD
+	CreateVendor(ctx context.Context, req CreateVendorRequest, idempotencyKey string) (*models.Vendor, error)
+	GetVendor(ctx context.Context, vendorID uuid.UUID) (*models.Vendor, error)
+	ListVendors(ctx context.Context, filter repository.VendorFilter, page, pageSize int) ([]*models.Vendor, int64, error)
+	UpdateVendor(ctx context.Context, vendor *models.Vendor, idempotencyKey string) error
+	DeleteVendor(ctx context.Context, vendorID uuid.UUID, idempotencyKey string) error
+
+	// Purchase Order CRUD
+	CreatePurchaseOrder(ctx context.Context, req CreatePurchaseOrderRequest, idempotencyKey string) (*models.PurchaseOrder, error)
+	GetPurchaseOrder(ctx context.Context, poID uuid.UUID) (*models.PurchaseOrder, error)
+	ListPurchaseOrders(ctx context.Context, filter repository.PurchaseOrderFilter, page, pageSize int) ([]*models.PurchaseOrder, int64, error)
+	UpdatePurchaseOrderStatus(ctx context.Context, poID uuid.UUID, newStatus string, idempotencyKey string) error
+	AddPurchaseOrderItems(ctx context.Context, poID uuid.UUID, items []PurchaseOrderItemInput, idempotencyKey string) error
+	GetPurchaseOrderItems(ctx context.Context, poID uuid.UUID) ([]*models.PurchaseOrderItem, error)
+}
+
+// ---------- Request/Response DTOs ----------
+
+type CreateVendorRequest struct {
+	CompanyID       uuid.UUID
+	VendorCode      string
+	VendorName      string
+	VendorType      *string
+	ContactPerson   string
+	Phone           string
+	Email           string
+	Address         string
+	BankAccountNo   string
+	BankRoutingCode string
+	BankName        string
+	IsActive        bool
+	CreatedBy       *uuid.UUID
+}
+
+type CreatePurchaseOrderRequest struct {
+	CompanyID            uuid.UUID
+	PONumber             string
+	VendorID             uuid.UUID
+	OrderDate            time.Time
+	ExpectedDeliveryDate *time.Time
+	Items                []PurchaseOrderItemInput
+	Notes                *string
+	CreatedBy            *uuid.UUID
+}
+
+type PurchaseOrderItemInput struct {
+	ItemID          uuid.UUID
+	QuantityOrdered decimal.Decimal
+	UnitCost        decimal.Decimal
+}
+
+type ReceivePurchaseOrderRequest struct {
+	CompanyID       uuid.UUID
+	PurchaseOrderID uuid.UUID
+	ReceiptDate     time.Time
+	Items           []ReceivePurchaseOrderItemInput
+	WarehouseID     uuid.UUID
+	CreatedBy       *uuid.UUID
+}
+
+type ReceivePurchaseOrderItemInput struct {
+	POItemID         uuid.UUID
+	QuantityReceived decimal.Decimal
+	UnitCost         decimal.Decimal
+}
+
+// ---------- Service Implementation ----------
+
+type purchaseOrderService struct {
+	repo             repository.VendorPurchaseRepository
+	stockService     StockService
+	pgClient         *client.PostgresClient
+	outboxRepo       outbox.Repository
+	idempotencyStore idempotency.Store
+	auditService     *audit.AuditService
+	logger           *zap.Logger
+}
+
+func NewPurchaseOrderService(
+	repo repository.VendorPurchaseRepository,
+	stockService StockService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+) PurchaseOrderService {
+	return &purchaseOrderService{
+		repo:             repo,
+		stockService:     stockService,
+		pgClient:         pgClient,
+		outboxRepo:       outboxRepo,
+		idempotencyStore: idempotencyStore,
+		auditService:     auditService,
+		logger:           logger.Named("purchase_order_service"),
+	}
+}
+
+// ---------- Reorder Integration ----------
+
+func (s *purchaseOrderService) CreatePurchaseOrderFromReorder(
+	ctx context.Context,
+	reorder *models.ReorderOrder,
+	idempotencyKey string,
+) (*models.PurchaseOrder, bool, error) {
+	logger := s.logger.With(
+		zap.String("reorder_id", reorder.ReorderOrderID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Idempotency: store PO ID as string
+	var cachedPOIDStr string
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cachedPOIDStr); err == nil && cachedPOIDStr != "" {
+		poID, err := uuid.Parse(cachedPOIDStr)
+		if err == nil {
+			po, err := s.repo.GetPurchaseOrderByID(ctx, tx, poID)
+			if err != nil {
+				return nil, false, err
+			}
+			logger.Info("idempotent – returning existing purchase order")
+			return po, false, nil
+		}
+	}
+
+	// Get the default vendor for the item
+	itemVendor, err := s.repo.GetDefaultItemVendor(ctx, tx, reorder.ItemID)
+	if err != nil {
+		return nil, false, fmt.Errorf("get default vendor: %w", err)
+	}
+	if itemVendor == nil {
+		return nil, false, fmt.Errorf("%w: no default vendor for item %s", inventory_errors.ErrInvalidInput, reorder.ItemID)
+	}
+
+	// Generate PO number
+	poNumber, err := s.generatePONumber(ctx, tx, reorder.CompanyID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	po := &models.PurchaseOrder{
+		PurchaseOrderID: uuid.New(),
+		CompanyID:       reorder.CompanyID,
+		PONumber:        poNumber,
+		VendorID:        itemVendor.VendorID,
+		OrderDate:       time.Now(),
+		Status:          "submitted",
+		Currency:        "USD",
+		CreatedBy:       nil, // system
+		UpdatedBy:       nil,
+	}
+	if err := s.repo.CreatePurchaseOrder(ctx, tx, po); err != nil {
+		return nil, false, fmt.Errorf("create purchase order: %w", err)
+	}
+
+	// Create purchase order item
+	poItem := &models.PurchaseOrderItem{
+		POItemID:        uuid.New(),
+		PurchaseOrderID: po.PurchaseOrderID,
+		ItemID:          reorder.ItemID,
+		QuantityOrdered: reorder.RequestedQty,
+		UnitCost:        itemVendor.UnitCost,
+	}
+	if err := s.repo.AddPurchaseOrderItem(ctx, tx, poItem); err != nil {
+		return nil, false, fmt.Errorf("add purchase order item: %w", err)
+	}
+
+	// Update reorder order status and reference
+	reorder.Status = "approved"
+	refType := "purchase_order"
+	reorder.ReferenceType = &refType
+	reorder.ReferenceID = &po.PurchaseOrderID
+
+	if err := s.updateReorderOrderWithReference(ctx, tx, reorder); err != nil {
+		return nil, false, fmt.Errorf("update reorder order: %w", err)
+	}
+
+	// Emit event
+	if err := s.emitPurchaseOrderCreatedEvent(ctx, tx, po, reorder); err != nil {
+		logger.Warn("failed to emit event", zap.Error(err))
+	}
+
+	// Store idempotency result (PO ID as string)
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, po.PurchaseOrderID.String())
+
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("commit tx: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &reorder.CompanyID, "purchasing", "create_purchase_order", "purchase_order",
+			&po.PurchaseOrderID, "system", nil, nil, nil,
+			map[string]interface{}{
+				"reorder_id":    reorder.ReorderOrderID.String(),
+				"po_number":     po.PONumber,
+				"vendor_id":     po.VendorID.String(),
+				"requested_qty": reorder.RequestedQty.String(),
+			})
+	}
+
+	logger.Info("purchase order created from reorder", zap.String("po_id", po.PurchaseOrderID.String()))
+	return po, true, nil
+}
+
+// Temporary helper – should be moved to ReorderOrderRepository
+func (s *purchaseOrderService) updateReorderOrderWithReference(ctx context.Context, tx *sql.Tx, reorder *models.ReorderOrder) error {
+	query := `
+		UPDATE reorder_orders
+		SET status = $2, reference_type = $3, reference_id = $4, updated_at = NOW()
+		WHERE reorder_order_id = $1
+	`
+	_, err := tx.ExecContext(ctx, query,
+		reorder.ReorderOrderID,
+		reorder.Status,
+		reorder.ReferenceType,
+		reorder.ReferenceID,
+	)
+	return err
+}
+
+func (s *purchaseOrderService) generatePONumber(ctx context.Context, tx *sql.Tx, companyID uuid.UUID) (string, error) {
+	// Example: PO-20260516-ABC123 (date + first 6 chars of company ID)
+	dateStr := time.Now().Format("20060102")
+	shortID := companyID.String()[:6]
+	base := fmt.Sprintf("PO-%s-%s", dateStr, shortID)
+
+	var count int
+	query := `SELECT COUNT(*) FROM purchase_orders WHERE po_number LIKE $1`
+	err := tx.QueryRowContext(ctx, query, base+"%").Scan(&count)
+	if err != nil {
+		return "", err
+	}
+	if count == 0 {
+		return base, nil
+	}
+	return fmt.Sprintf("%s-%d", base, count+1), nil
+}
+
+// ---------- Receiving Purchase Order ----------
+
+func (s *purchaseOrderService) ReceivePurchaseOrder(
+	ctx context.Context,
+	req ReceivePurchaseOrderRequest,
+	idempotencyKey string,
+) (*models.PurchaseOrderReceipt, error) {
+	logger := s.logger.With(
+		zap.String("po_id", req.PurchaseOrderID.String()),
+		zap.String("idempotency_key", idempotencyKey),
+	)
+
+	if req.CompanyID == uuid.Nil {
+		return nil, fmt.Errorf("%w: company_id required", inventory_errors.ErrInvalidInput)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var cachedReceiptIDStr string
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cachedReceiptIDStr); err == nil && cachedReceiptIDStr != "" {
+		receiptID, err := uuid.Parse(cachedReceiptIDStr)
+		if err == nil {
+			receipt, err := s.repo.GetPurchaseOrderReceiptByID(ctx, tx, receiptID)
+			if err != nil {
+				return nil, err
+			}
+			logger.Info("idempotent – returning existing receipt")
+			return receipt, nil
+		}
+	}
+
+	var firstReceipt *models.PurchaseOrderReceipt
+	for _, it := range req.Items {
+		poItem, err := s.repo.GetPurchaseOrderItemByID(ctx, tx, it.POItemID)
+		if err != nil {
+			return nil, err
+		}
+
+		// --- FIX 1: Prevent over‑receipt ---
+		remaining := poItem.QuantityOrdered.Sub(poItem.QuantityReceived)
+		if it.QuantityReceived.GreaterThan(remaining) {
+			return nil, fmt.Errorf("%w: received quantity %.2f exceeds remaining quantity %.2f for item %s",
+				inventory_errors.ErrInvalidInput,
+				toFloat64(it.QuantityReceived),
+				toFloat64(remaining),
+				poItem.POItemID)
+		}
+
+		// Create stock adjustment (positive delta = increase stock)
+		adjustReq := AdjustStockRequest{
+			CompanyID:      req.CompanyID,
+			WarehouseID:    req.WarehouseID,
+			ItemID:         poItem.ItemID,
+			BatchID:        nil,
+			Delta:          it.QuantityReceived,
+			Reason:         fmt.Sprintf("Purchase order receipt: %s", req.PurchaseOrderID.String()),
+			AdjustmentDate: req.ReceiptDate,
+			CreatedBy:      req.CreatedBy,
+		}
+		movement, err := s.stockService.AdjustStock(ctx, adjustReq, idempotencyKey+":stock:"+it.POItemID.String())
+		if err != nil {
+			return nil, fmt.Errorf("stock adjustment failed: %w", err)
+		}
+
+		// Update PO item received quantity
+		if err := s.repo.UpdatePurchaseOrderItemReceivedQty(ctx, tx, it.POItemID, it.QuantityReceived); err != nil {
+			return nil, err
+		}
+
+		// Create receipt record
+		receipt := &models.PurchaseOrderReceipt{
+			ReceiptID:        uuid.New(),
+			PurchaseOrderID:  req.PurchaseOrderID,
+			POItemID:         it.POItemID,
+			ReceiptDate:      req.ReceiptDate,
+			QuantityReceived: it.QuantityReceived,
+			UnitCost:         it.UnitCost,
+			WarehouseID:      req.WarehouseID,
+			MovementID:       &movement.MovementID,
+			CreatedBy:        req.CreatedBy,
+		}
+		if err := s.repo.CreatePurchaseOrderReceipt(ctx, tx, receipt); err != nil {
+			return nil, err
+		}
+		if firstReceipt == nil {
+			firstReceipt = receipt
+		}
+	}
+
+	// Update PO status (check if all items fully received – simplified)
+	// For production, you should check if sum(received) >= sum(ordered)
+	if err := s.repo.UpdatePurchaseOrderStatus(ctx, tx, req.PurchaseOrderID, "received"); err != nil {
+		return nil, err
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, firstReceipt.ReceiptID.String())
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return firstReceipt, nil
+}
+
+// ---------- Vendor CRUD ----------
+
+func (s *purchaseOrderService) CreateVendor(ctx context.Context, req CreateVendorRequest, idempotencyKey string) (*models.Vendor, error) {
+	// Validate required fields
+	if req.VendorCode == "" {
+		return nil, fmt.Errorf("%w: vendorCode is required", inventory_errors.ErrInvalidInput)
+	}
+	if req.VendorName == "" {
+		return nil, fmt.Errorf("%w: vendorName is required", inventory_errors.ErrInvalidInput)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var cachedVendorIDStr string
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cachedVendorIDStr); err == nil && cachedVendorIDStr != "" {
+		vendorID, err := uuid.Parse(cachedVendorIDStr)
+		if err == nil {
+			return s.repo.GetVendorByID(ctx, tx, vendorID)
+		}
+	}
+
+	exists, err := s.repo.ExistsVendorByCode(ctx, tx, req.CompanyID, req.VendorCode)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, fmt.Errorf("%w: vendor code %s already exists", inventory_errors.ErrDuplicate, req.VendorCode)
+	}
+
+	vendor := &models.Vendor{
+		VendorID:        uuid.New(),
+		CompanyID:       req.CompanyID,
+		VendorCode:      req.VendorCode,
+		VendorName:      req.VendorName,
+		VendorType:      req.VendorType,
+		ContactPerson:   req.ContactPerson,
+		Phone:           req.Phone,
+		Email:           req.Email,
+		Address:         req.Address,
+		BankAccountNo:   req.BankAccountNo,
+		BankRoutingCode: req.BankRoutingCode,
+		BankName:        req.BankName,
+		IsActive:        req.IsActive,
+		CreatedBy:       req.CreatedBy,
+		UpdatedBy:       req.CreatedBy,
+	}
+	if err := s.repo.CreateVendor(ctx, tx, vendor); err != nil {
+		return nil, err
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, vendor.VendorID.String())
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return vendor, nil
+}
+
+func (s *purchaseOrderService) GetVendor(ctx context.Context, vendorID uuid.UUID) (*models.Vendor, error) {
+	return s.repo.GetVendorByID(ctx, s.pgClient.DB, vendorID)
+}
+
+func (s *purchaseOrderService) ListVendors(ctx context.Context, filter repository.VendorFilter, page, pageSize int) ([]*models.Vendor, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	pagination := repository.Pagination{Limit: pageSize, Offset: (page - 1) * pageSize}
+	sort := repository.Sort{Field: "vendor_code", Direction: "ASC"}
+
+	vendors, err := s.repo.ListVendors(ctx, s.pgClient.DB, filter, pagination, sort)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.repo.CountVendors(ctx, s.pgClient.DB, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return vendors, total, nil
+}
+
+func (s *purchaseOrderService) UpdateVendor(ctx context.Context, vendor *models.Vendor, idempotencyKey string) error {
+	return s.repo.UpdateVendor(ctx, s.pgClient.DB, vendor)
+}
+
+func (s *purchaseOrderService) DeleteVendor(ctx context.Context, vendorID uuid.UUID, idempotencyKey string) error {
+	return s.repo.DeleteVendor(ctx, s.pgClient.DB, vendorID)
+}
+
+// ---------- Purchase Order CRUD ----------
+
+func (s *purchaseOrderService) CreatePurchaseOrder(ctx context.Context, req CreatePurchaseOrderRequest, idempotencyKey string) (*models.PurchaseOrder, error) {
+	// --- 1. Basic validations ---
+	if req.PONumber == "" {
+		return nil, fmt.Errorf("%w: poNumber is required", inventory_errors.ErrInvalidInput)
+	}
+	if req.VendorID == uuid.Nil {
+		return nil, fmt.Errorf("%w: vendorId is required", inventory_errors.ErrInvalidInput)
+	}
+	if req.OrderDate.IsZero() {
+		return nil, fmt.Errorf("%w: orderDate is required", inventory_errors.ErrInvalidInput)
+	}
+	if len(req.Items) == 0 {
+		return nil, fmt.Errorf("%w: at least one item is required", inventory_errors.ErrInvalidInput)
+	}
+	for i, it := range req.Items {
+		if it.ItemID == uuid.Nil {
+			return nil, fmt.Errorf("%w: itemId is required in item %d", inventory_errors.ErrInvalidInput, i)
+		}
+		if it.QuantityOrdered.LessThanOrEqual(decimal.Zero) {
+			return nil, fmt.Errorf("%w: quantityOrdered must be > 0 in item %d", inventory_errors.ErrInvalidInput, i)
+		}
+		if it.UnitCost.LessThanOrEqual(decimal.Zero) {
+			return nil, fmt.Errorf("%w: unitCost must be > 0 in item %d", inventory_errors.ErrInvalidInput, i)
+		}
+	}
+
+	// --- 2. Verify vendor exists ---
+	vendor, err := s.repo.GetVendorByID(ctx, s.pgClient.DB, req.VendorID)
+	if err != nil {
+		if errors.Is(err, inventory_errors.ErrNotFound) {
+			return nil, fmt.Errorf("%w: vendor %s not found", inventory_errors.ErrNotFound, req.VendorID)
+		}
+		return nil, fmt.Errorf("get vendor: %w", err)
+	}
+	if vendor.CompanyID != req.CompanyID {
+		return nil, fmt.Errorf("%w: vendor does not belong to this company", inventory_errors.ErrPermissionDenied)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// --- 3. Idempotency check ---
+	var cachedPOIDStr string
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cachedPOIDStr); err == nil && cachedPOIDStr != "" {
+		poID, err := uuid.Parse(cachedPOIDStr)
+		if err == nil {
+			po, err := s.repo.GetPurchaseOrderByID(ctx, tx, poID)
+			if err != nil {
+				return nil, err
+			}
+			return po, nil
+		}
+	}
+
+	// --- 4. Duplicate PO number ---
+	exists, err := s.repo.ExistsPurchaseOrderNumber(ctx, tx, req.CompanyID, req.PONumber)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, fmt.Errorf("%w: PO number %s already exists", inventory_errors.ErrDuplicate, req.PONumber)
+	}
+
+	// --- 5. Create PO header ---
+	po := &models.PurchaseOrder{
+		PurchaseOrderID:      uuid.New(),
+		CompanyID:            req.CompanyID,
+		PONumber:             req.PONumber,
+		VendorID:             req.VendorID,
+		OrderDate:            req.OrderDate,
+		ExpectedDeliveryDate: req.ExpectedDeliveryDate,
+		Status:               "draft",
+		Currency:             "USD",
+		Notes:                req.Notes,
+		CreatedBy:            req.CreatedBy,
+		UpdatedBy:            req.CreatedBy,
+	}
+	if err := s.repo.CreatePurchaseOrder(ctx, tx, po); err != nil {
+		return nil, err
+	}
+
+	// --- 6. Create PO items (check duplicate items in same request) ---
+	seenItems := make(map[uuid.UUID]bool)
+	for _, it := range req.Items {
+		if seenItems[it.ItemID] {
+			return nil, fmt.Errorf("%w: duplicate item %s in request", inventory_errors.ErrInvalidInput, it.ItemID)
+		}
+		seenItems[it.ItemID] = true
+
+		poItem := &models.PurchaseOrderItem{
+			POItemID:        uuid.New(),
+			PurchaseOrderID: po.PurchaseOrderID,
+			ItemID:          it.ItemID,
+			QuantityOrdered: it.QuantityOrdered,
+			UnitCost:        it.UnitCost,
+		}
+		if err := s.repo.AddPurchaseOrderItem(ctx, tx, poItem); err != nil {
+			if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+				return nil, fmt.Errorf("%w: item %s already exists in this purchase order", inventory_errors.ErrDuplicate, it.ItemID)
+			}
+			return nil, err
+		}
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, po.PurchaseOrderID.String())
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return po, nil
+}
+
+func (s *purchaseOrderService) GetPurchaseOrder(ctx context.Context, poID uuid.UUID) (*models.PurchaseOrder, error) {
+	return s.repo.GetPurchaseOrderByID(ctx, s.pgClient.DB, poID)
+}
+
+func (s *purchaseOrderService) ListPurchaseOrders(ctx context.Context, filter repository.PurchaseOrderFilter, page, pageSize int) ([]*models.PurchaseOrder, int64, error) {
+	// Validate status filter if provided
+	if filter.Status != "" {
+		allowed := map[string]bool{
+			"draft": true, "submitted": true, "approved": true,
+			"ordered": true, "partially_received": true, "received": true, "cancelled": true,
+		}
+		if !allowed[filter.Status] {
+			return nil, 0, fmt.Errorf("%w: invalid status %s", inventory_errors.ErrInvalidStatus, filter.Status)
+		}
+	}
+
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	pagination := repository.Pagination{Limit: pageSize, Offset: (page - 1) * pageSize}
+	sort := repository.Sort{Field: "order_date", Direction: "DESC"}
+
+	pos, err := s.repo.ListPurchaseOrders(ctx, s.pgClient.DB, filter, pagination, sort)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.repo.CountPurchaseOrders(ctx, s.pgClient.DB, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	return pos, total, nil
+}
+
+// UpdatePurchaseOrderStatus updates the status of a purchase order with transition validation.
+func (s *purchaseOrderService) UpdatePurchaseOrderStatus(ctx context.Context, poID uuid.UUID, newStatus string, idempotencyKey string) error {
+	// Validate status value
+	allowedStatuses := map[string]bool{
+		"draft": true, "submitted": true, "approved": true,
+		"ordered": true, "partially_received": true, "received": true, "cancelled": true,
+	}
+	if !allowedStatuses[newStatus] {
+		return fmt.Errorf("%w: invalid status %s", inventory_errors.ErrInvalidStatus, newStatus)
+	}
+
+	// Get current purchase order
+	po, err := s.repo.GetPurchaseOrderByID(ctx, s.pgClient.DB, poID)
+	if err != nil {
+		return err
+	}
+
+	// Define allowed transitions
+	validTransitions := map[string][]string{
+		"draft":              {"submitted", "cancelled"},
+		"submitted":          {"approved", "cancelled"},
+		"approved":           {"ordered", "cancelled"},
+		"ordered":            {"partially_received", "received", "cancelled"},
+		"partially_received": {"ordered", "received", "cancelled"},
+		"received":           {},
+		"cancelled":          {},
+	}
+
+	allowedNext, ok := validTransitions[po.Status]
+	if !ok {
+		return fmt.Errorf("%w: unknown current status %s", inventory_errors.ErrInvalidTransition, po.Status)
+	}
+	transitionAllowed := false
+	for _, next := range allowedNext {
+		if next == newStatus {
+			transitionAllowed = true
+			break
+		}
+	}
+	if !transitionAllowed {
+		return fmt.Errorf("%w: cannot transition from %s to %s", inventory_errors.ErrInvalidTransition, po.Status, newStatus)
+	}
+
+	// Update status
+	return s.repo.UpdatePurchaseOrderStatus(ctx, s.pgClient.DB, poID, newStatus)
+}
+
+func (s *purchaseOrderService) AddPurchaseOrderItems(ctx context.Context, poID uuid.UUID, items []PurchaseOrderItemInput, idempotencyKey string) error {
+	// --- 1. Validate items ---
+	if len(items) == 0 {
+		return fmt.Errorf("%w: at least one item required", inventory_errors.ErrInvalidInput)
+	}
+	for i, it := range items {
+		if it.ItemID == uuid.Nil {
+			return fmt.Errorf("%w: itemId required in item %d", inventory_errors.ErrInvalidInput, i)
+		}
+		if it.QuantityOrdered.LessThanOrEqual(decimal.Zero) {
+			return fmt.Errorf("%w: quantityOrdered must be > 0 in item %d", inventory_errors.ErrInvalidInput, i)
+		}
+		if it.UnitCost.LessThanOrEqual(decimal.Zero) {
+			return fmt.Errorf("%w: unitCost must be > 0 in item %d", inventory_errors.ErrInvalidInput, i)
+		}
+	}
+	// Check duplicates within request
+	seen := make(map[uuid.UUID]bool)
+	for _, it := range items {
+		if seen[it.ItemID] {
+			return fmt.Errorf("%w: duplicate item %s in request", inventory_errors.ErrInvalidInput, it.ItemID)
+		}
+		seen[it.ItemID] = true
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// --- 2. Check if items already exist in PO ---
+	existing, err := s.repo.GetPurchaseOrderItems(ctx, tx, poID)
+	if err != nil {
+		return err
+	}
+	existingMap := make(map[uuid.UUID]bool)
+	for _, e := range existing {
+		existingMap[e.ItemID] = true
+	}
+	for _, it := range items {
+		if existingMap[it.ItemID] {
+			return fmt.Errorf("%w: item %s already exists in this purchase order", inventory_errors.ErrDuplicate, it.ItemID)
+		}
+	}
+
+	// --- 3. Insert new items ---
+	for _, it := range items {
+		poItem := &models.PurchaseOrderItem{
+			POItemID:        uuid.New(),
+			PurchaseOrderID: poID,
+			ItemID:          it.ItemID,
+			QuantityOrdered: it.QuantityOrdered,
+			UnitCost:        it.UnitCost,
+		}
+		if err := s.repo.AddPurchaseOrderItem(ctx, tx, poItem); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *purchaseOrderService) GetPurchaseOrderItems(ctx context.Context, poID uuid.UUID) ([]*models.PurchaseOrderItem, error) {
+	return s.repo.GetPurchaseOrderItems(ctx, s.pgClient.DB, poID)
+}
+
+// ---------- Event Emission ----------
+
+func (s *purchaseOrderService) emitPurchaseOrderCreatedEvent(ctx context.Context, tx *sql.Tx, po *models.PurchaseOrder, reorder *models.ReorderOrder) error {
+	payload := map[string]interface{}{
+		"purchase_order_id": po.PurchaseOrderID.String(),
+		"po_number":         po.PONumber,
+		"vendor_id":         po.VendorID.String(),
+		"order_date":        po.OrderDate,
+		"status":            po.Status,
+		"reorder_order_id":  reorder.ReorderOrderID.String(),
+		"total_amount":      po.TotalAmount.String(),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "purchase_order",
+		AggregateID:   po.PurchaseOrderID.String(),
+		EventType:     "purchasing.purchase_order.created",
 		Topic:         events.TopicInventoryEvents,
 		Payload:       data,
 	}
@@ -9182,6 +10247,7 @@ type ReservationService interface {
 
 	// FulfillReservation fulfills the entire reservation.
 	FulfillReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, idempotencyKey string) error
+	GetActiveReservationsByReference(ctx context.Context, db repository.DBTX, companyID uuid.UUID, reservationType string, referenceID, itemID uuid.UUID) ([]*models.Reservation, error)
 
 	CancelReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, idempotencyKey string) error
 	ExpireReservations(ctx context.Context, db repository.DBTX, companyID uuid.UUID) (int64, error)
@@ -9315,6 +10381,7 @@ func (s *reservationService) GetActiveReservationByReference(ctx context.Context
 }
 
 // PartialFulfillReservation fulfills a portion of an active reservation.
+// PartialFulfillReservation fulfills a portion of an active reservation.
 func (s *reservationService) PartialFulfillReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, quantityFulfilled decimal.Decimal, idempotencyKey string) error {
 	logger := s.logger.With(
 		zap.String("method", "PartialFulfillReservation"),
@@ -9352,6 +10419,12 @@ func (s *reservationService) PartialFulfillReservation(ctx context.Context, db r
 	if quantityFulfilled.GreaterThan(remaining) {
 		return fmt.Errorf("%w: cannot fulfill more than remaining quantity (remaining %s, requested %s)",
 			inventory_errors.ErrInvalidInput, remaining.String(), quantityFulfilled.String())
+	}
+
+	// --- NEW: Release the fulfilled quantity from the reserved stock ---
+	qtyFloat, _ := quantityFulfilled.Float64()
+	if err := s.balanceRepo.ReleaseReservation(ctx, db, res.CompanyID, res.WarehouseID, res.ItemID, res.BatchID, qtyFloat); err != nil {
+		return fmt.Errorf("release reserved stock: %w", err)
 	}
 
 	// Update the reservation's fulfilled quantity and status
@@ -9552,6 +10625,19 @@ func (s *reservationService) emitReservationEvent(ctx context.Context, tx *sql.T
 		Payload:       data,
 	}
 	return s.outboxRepo.Store(ctx, tx, event)
+}
+func (s *reservationService) GetActiveReservationsByReference(ctx context.Context, db repository.DBTX, companyID uuid.UUID, reservationType string, referenceID, itemID uuid.UUID) ([]*models.Reservation, error) {
+	reservations, err := s.reservationRepo.GetByReference(ctx, db, reservationType, referenceID)
+	if err != nil {
+		return nil, err
+	}
+	var active []*models.Reservation
+	for _, res := range reservations {
+		if res.CompanyID == companyID && res.ItemID == itemID && (res.Status == "active" || res.Status == "partially_fulfilled") {
+			active = append(active, res)
+		}
+	}
+	return active, nil
 }
 
 
@@ -9850,6 +10936,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9948,6 +11035,9 @@ func (s *cycleCountService) validateCreate(req CreateCycleCountRequest) error {
 	if req.CountType != "full" && req.CountType != "random" && req.CountType != "abc" {
 		return fmt.Errorf("%w: count_type must be 'full', 'random', or 'abc'", inventory_errors.ErrInvalidInput)
 	}
+	if req.ExpectedQuantity.LessThan(decimal.Zero) {
+		return fmt.Errorf("%w: expected_quantity cannot be negative", inventory_errors.ErrInvalidInput)
+	}
 	if req.ItemID != nil {
 		item, err := s.itemRepo.GetByID(context.Background(), s.pgClient.DB, *req.ItemID)
 		if err != nil {
@@ -9985,6 +11075,15 @@ func (s *cycleCountService) CreateCycleCount(ctx context.Context, req CreateCycl
 		return cached, nil
 	}
 
+	// Check for duplicate (same company, warehouse, item, scheduled date)
+	existing, err := s.cycleCountRepo.GetByUnique(ctx, tx, req.CompanyID, req.WarehouseID, req.ItemID, req.ScheduledDate)
+	if err != nil && !errors.Is(err, inventory_errors.ErrNotFound) {
+		return nil, fmt.Errorf("duplicate check: %w", err)
+	}
+	if existing != nil {
+		return nil, fmt.Errorf("%w: cycle count already exists for this warehouse, item, and scheduled date", inventory_errors.ErrDuplicate)
+	}
+
 	expectedQty := req.ExpectedQuantity
 	if expectedQty.IsZero() && req.ItemID != nil {
 		balance, err := s.balanceRepo.GetTotalOnHand(ctx, tx, req.CompanyID, *req.ItemID, &req.WarehouseID)
@@ -10010,7 +11109,6 @@ func (s *cycleCountService) CreateCycleCount(ctx context.Context, req CreateCycl
 	}
 	// Note: InventoryCycleCount model currently lacks CreatedBy field.
 	// If you need to store the creator, add `CreatedBy *uuid.UUID` to the model and database table.
-	// For now, we skip setting it.
 
 	if err := s.cycleCountRepo.Create(ctx, tx, cycleCount); err != nil {
 		return nil, fmt.Errorf("create cycle count: %w", err)
@@ -10244,6 +11342,11 @@ func (s *cycleCountService) ListCycleCounts(ctx context.Context, filter reposito
 		Offset: (page - 1) * pageSize,
 	}
 	sort := repository.Sort{Field: "scheduled_date", Direction: "DESC"}
+
+	// Ensure filter has WarehouseID, otherwise the repo's ListByWarehouse will fail.
+	if filter.WarehouseID == nil {
+		return nil, 0, fmt.Errorf("%w: warehouse_id is required for listing", inventory_errors.ErrInvalidInput)
+	}
 	return s.cycleCountRepo.ListByWarehouse(ctx, s.pgClient.DB, filter.CompanyID, *filter.WarehouseID, filter, pagination, sort)
 }
 
@@ -10306,12 +11409,14 @@ func (s *cycleCountService) emitCycleCountAdjustmentEvent(ctx context.Context, t
 FILE: ./service/transfer_order_service.go
 ================================================================================
 
+// package service – transfer_order_service.go
 package service
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10361,8 +11466,9 @@ type transferOrderService struct {
 	transferRepo     repository.TransferOrderRepository
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
-	inventorySvc     InventoryService                 // Core inventory engine
-	ledgerRepo       repository.StockLedgerRepository // Only for FIFO cost calculation
+	balanceRepo      repository.StockBalanceRepository
+	inventorySvc     InventoryService
+	ledgerRepo       repository.StockLedgerRepository
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -10375,6 +11481,7 @@ func NewTransferOrderService(
 	transferRepo repository.TransferOrderRepository,
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
+	balanceRepo repository.StockBalanceRepository,
 	inventorySvc InventoryService,
 	ledgerRepo repository.StockLedgerRepository,
 	pgClient *client.PostgresClient,
@@ -10387,6 +11494,7 @@ func NewTransferOrderService(
 		transferRepo:     transferRepo,
 		itemRepo:         itemRepo,
 		warehouseRepo:    warehouseRepo,
+		balanceRepo:      balanceRepo,
 		inventorySvc:     inventorySvc,
 		ledgerRepo:       ledgerRepo,
 		pgClient:         pgClient,
@@ -10506,6 +11614,7 @@ func (s *transferOrderService) CreateTransferOrder(ctx context.Context, req Crea
 }
 
 // DispatchTransferOrder marks a transfer order as dispatched and creates outbound stock movements.
+// It now checks stock availability and respects negative stock rules.
 func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transferOrderID, companyID uuid.UUID, dispatchedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "DispatchTransferOrder"), zap.String("transfer_order_id", transferOrderID.String()))
 
@@ -10537,11 +11646,45 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 		return fmt.Errorf("get transfer items: %w", err)
 	}
 
-	// For each item, create an outbound movement using InventoryService
+	// Get source warehouse for negative stock flag
+	sourceWarehouse, err := s.warehouseRepo.GetByID(ctx, tx, companyID, order.FromWarehouseID)
+	if err != nil {
+		return fmt.Errorf("get source warehouse: %w", err)
+	}
+
+	// Pre‑validate all items before creating any movement
 	for _, it := range items {
-		// Calculate the actual FIFO cost for this item at source warehouse (optional, InventoryService will use its own logic)
-		// We'll let InventoryService compute the cost, but we need to know it for the inbound movement later.
-		// So we first create the outbound movement, retrieve its unit cost, then use the same cost for inbound.
+		item, err := s.itemRepo.GetByID(ctx, tx, it.ItemID)
+		if err != nil {
+			return fmt.Errorf("get item %s: %w", it.ItemID, err)
+		}
+		if item.CompanyID != companyID {
+			return inventory_errors.ErrPermissionDenied
+		}
+
+		// Get current stock balance with FOR UPDATE
+		balance, err := s.balanceRepo.GetForUpdate(ctx, tx, companyID, order.FromWarehouseID, it.ItemID, nil)
+		if err != nil {
+			if errors.Is(err, inventory_errors.ErrNotFound) {
+				balance = &models.StockBalance{
+					QuantityOnHand: decimal.Zero,
+					ReservedQty:    decimal.Zero,
+				}
+			} else {
+				return fmt.Errorf("get stock balance for item %s: %w", it.ItemID, err)
+			}
+		}
+		availableQty := balance.QuantityOnHand.Sub(balance.ReservedQty)
+		requiredQty := it.Quantity
+
+		if requiredQty.GreaterThan(availableQty) && !(item.AllowNegativeStock && sourceWarehouse.AllowNegativeStock) {
+			return fmt.Errorf("%w: insufficient stock for item %s: required %s, available %s",
+				inventory_errors.ErrInsufficientStock, it.ItemID, requiredQty.String(), availableQty.String())
+		}
+	}
+
+	// All stock checks passed – create outbound movements using the SAME transaction
+	for _, it := range items {
 		outMovementReq := CreateMovementRequest{
 			CompanyID:       companyID,
 			MovementType:    enums.MovementTypeTransfer,
@@ -10550,35 +11693,23 @@ func (s *transferOrderService) DispatchTransferOrder(ctx context.Context, transf
 			FromWarehouseID: &order.FromWarehouseID,
 			ItemID:          it.ItemID,
 			QuantityOut:     it.Quantity,
-			UnitCost:        decimal.Zero, // Let InventoryService compute real cost
+			UnitCost:        decimal.Zero,
 			Reason:          stringPtr(fmt.Sprintf("Transfer to %s", order.ToWarehouseID.String())),
 			ReferenceType:   stringPtr("transfer"),
 			ReferenceID:     &transferOrderID,
 			CreatedBy:       dispatchedBy,
 			Status:          "posted",
-			TransferOrderID: &transferOrderID, // Link to transfer order
+			TransferOrderID: &transferOrderID,
 		}
 
-		outMovement, err := s.inventorySvc.CreateMovement(ctx, outMovementReq, idempotencyKey+":out:"+it.ItemID.String())
+		outMovement, err := s.inventorySvc.CreateMovementWithTx(ctx, tx, outMovementReq, idempotencyKey+":out:"+it.ItemID.String())
 		if err != nil {
 			return fmt.Errorf("create outbound movement for item %s: %w", it.ItemID, err)
 		}
 
-		// Store the cost for inbound movement
-		unitCost := outMovement.UnitCost
-		if unitCost.IsZero() {
-			// Fallback to latest cost if for some reason zero (should not happen)
-			logger.Warn("outbound movement has zero unit cost, falling back to latest cost", zap.String("item_id", it.ItemID.String()))
+		if outMovement.UnitCost.IsZero() {
+			logger.Warn("outbound movement has zero unit cost", zap.String("item_id", it.ItemID.String()))
 		}
-
-		// We'll need the cost for inbound receipt later; we can store it in a temporary map or refetch from out movement record.
-		// Since we are still in the same transaction, we can simply remember the cost per item.
-		// We'll store it in a map to use during receive.
-		// But the receive method will run in a separate transaction, so we need to persist this cost somewhere.
-		// Option: Store it in the transfer order item (but that table has no cost column). Alternatively, the inbound movement
-		// can look up the outbound movement's cost via the transfer_order_id and item_id. We'll do that in ReceiveTransferOrder.
-		// For now, just ensure the outbound movement is created.
-		_ = unitCost // will be used later via query
 	}
 
 	// Update transfer order status to dispatched
@@ -10638,9 +11769,8 @@ func (s *transferOrderService) ReceiveTransferOrder(ctx context.Context, transfe
 		return fmt.Errorf("get transfer items: %w", err)
 	}
 
-	// For each item, look up the unit cost from the outbound movement (same transfer_order_id)
+	// For each item, look up the unit cost from the outbound movement
 	for _, it := range items {
-		// Find the outbound movement for this item and transfer order
 		outMovement, err := s.findOutboundMovement(ctx, tx, companyID, transferOrderID, it.ItemID)
 		if err != nil {
 			return fmt.Errorf("find outbound movement for item %s: %w", it.ItemID, err)
@@ -10648,7 +11778,6 @@ func (s *transferOrderService) ReceiveTransferOrder(ctx context.Context, transfe
 		unitCost := outMovement.UnitCost
 		if unitCost.IsZero() {
 			logger.Warn("outbound movement has zero unit cost, using latest cost as fallback", zap.String("item_id", it.ItemID.String()))
-			// fallback: get latest cost at source warehouse (or zero)
 		}
 
 		inMovementReq := CreateMovementRequest{
@@ -10668,7 +11797,7 @@ func (s *transferOrderService) ReceiveTransferOrder(ctx context.Context, transfe
 			TransferOrderID: &transferOrderID,
 		}
 
-		_, err = s.inventorySvc.CreateMovement(ctx, inMovementReq, idempotencyKey+":in:"+it.ItemID.String())
+		_, err = s.inventorySvc.CreateMovementWithTx(ctx, tx, inMovementReq, idempotencyKey+":in:"+it.ItemID.String())
 		if err != nil {
 			return fmt.Errorf("create inbound movement for item %s: %w", it.ItemID, err)
 		}
@@ -10729,7 +11858,7 @@ func (s *transferOrderService) CancelTransferOrder(ctx context.Context, transfer
 		return nil
 	}
 
-	// If already dispatched, we need to reverse the outbound movements (create inbound movements back to source)
+	// If already dispatched, reverse the outbound movements
 	if order.Status == "dispatched" {
 		items, err := s.transferRepo.GetItems(ctx, tx, transferOrderID)
 		if err != nil {
@@ -10756,7 +11885,7 @@ func (s *transferOrderService) CancelTransferOrder(ctx context.Context, transfer
 				Status:          "posted",
 				TransferOrderID: &transferOrderID,
 			}
-			_, err = s.inventorySvc.CreateMovement(ctx, reverseReq, idempotencyKey+":rev:"+it.ItemID.String())
+			_, err = s.inventorySvc.CreateMovementWithTx(ctx, tx, reverseReq, idempotencyKey+":rev:"+it.ItemID.String())
 			if err != nil {
 				return fmt.Errorf("create reversal movement for item %s: %w", it.ItemID, err)
 			}
@@ -10853,7 +11982,6 @@ func (s *transferOrderService) validateCreateRequest(req CreateTransferOrderRequ
 }
 
 // findOutboundMovement retrieves the outbound movement for a given transfer order and item.
-// It uses the movement_repository to query by transfer_order_id and item_id, looking for quantity_out > 0.
 func (s *transferOrderService) findOutboundMovement(ctx context.Context, tx *sql.Tx, companyID, transferOrderID, itemID uuid.UUID) (*models.StockMovement, error) {
 	query := `
 		SELECT movement_id, company_id, movement_type, reference_type, reference_id,
@@ -10937,14 +12065,6 @@ func (s *transferOrderService) emitTransferOrderEvent(ctx context.Context, tx *s
 		Payload:       data,
 	}
 	return s.outboxRepo.Store(ctx, tx, event)
-}
-
-// helper to convert *string to sql string
-func nullStringPtr(s *string) *string {
-	if s == nil {
-		return nil
-	}
-	return s
 }
 
 // nullStringFromNullString converts sql.NullString to *string.

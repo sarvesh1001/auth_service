@@ -14,7 +14,6 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/inventory/inventory_errors"
-	"auth-service/internal/inventory/models"
 	"auth-service/internal/inventory/repository"
 	"auth-service/internal/inventory/service"
 )
@@ -176,6 +175,19 @@ func (h *ReorderHandler) ListReorderOrders(w http.ResponseWriter, r *http.Reques
 	itemIDStr := query.Get("itemId")
 	warehouseIDStr := query.Get("warehouseId")
 
+	// Validate status if provided
+	allowedStatuses := map[string]bool{
+		"pending":   true,
+		"approved":  true,
+		"ordered":   true,
+		"received":  true,
+		"cancelled": true,
+	}
+	if status != "" && !allowedStatuses[status] {
+		h.respondWithError(w, http.StatusBadRequest, "invalid status value")
+		return
+	}
+
 	page, _ := strconv.Atoi(query.Get("page"))
 	if page < 1 {
 		page = 1
@@ -188,49 +200,56 @@ func (h *ReorderHandler) ListReorderOrders(w http.ResponseWriter, r *http.Reques
 		pageSize = 100
 	}
 
-	orders, err := h.repo.ListPending(ctx, h.db, companyID)
+	// Parse optional UUIDs
+	var itemID uuid.UUID
+	if itemIDStr != "" {
+		parsed, err := uuid.Parse(itemIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid itemId")
+			return
+		}
+		itemID = parsed
+	}
+	var warehouseID uuid.UUID
+	if warehouseIDStr != "" {
+		parsed, err := uuid.Parse(warehouseIDStr)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid warehouseId")
+			return
+		}
+		warehouseID = parsed
+	}
+
+	filters := repository.ReorderFilters{
+		CompanyID:   companyID,
+		Status:      status,
+		ItemID:      itemID,
+		WarehouseID: warehouseID,
+		Page:        page,
+		PageSize:    pageSize,
+	}
+
+	orders, total, err := h.repo.ListByFilters(ctx, h.db, filters)
 	if err != nil {
 		h.logger.Error("failed to list reorder orders", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve reorder orders")
 		return
 	}
 
-	filtered := make([]*models.ReorderOrder, 0, len(orders))
-	for _, o := range orders {
-		if status != "" && o.Status != status {
-			continue
-		}
-		if itemIDStr != "" {
-			if id, err := uuid.Parse(itemIDStr); err == nil && o.ItemID != id {
-				continue
-			}
-		}
-		if warehouseIDStr != "" {
-			if id, err := uuid.Parse(warehouseIDStr); err == nil && o.WarehouseID != id {
-				continue
-			}
-		}
-		filtered = append(filtered, o)
+	// Calculate total pages (optional but helpful)
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages < 1 {
+		totalPages = 1
 	}
-
-	total := len(filtered)
-	start := (page - 1) * pageSize
-	if start > total {
-		start = total
-	}
-	end := start + pageSize
-	if end > total {
-		end = total
-	}
-	paged := filtered[start:end]
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data": map[string]interface{}{
-			"items":    paged,
-			"total":    total,
-			"page":     page,
-			"pageSize": pageSize,
+			"items":      orders,
+			"total":      total,
+			"page":       page,
+			"pageSize":   pageSize,
+			"totalPages": totalPages,
 		},
 	})
 }

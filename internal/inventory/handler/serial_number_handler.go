@@ -65,6 +65,15 @@ type serialNumberResponse struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
+// Allowed statuses for filtering and validation
+var allowedSerialStatuses = map[string]bool{
+	"available": true,
+	"sold":      true,
+	"reserved":  true,
+	"returned":  true,
+	"damaged":   true,
+}
+
 // ---------- Helper: convert model to response ----------
 func toSerialNumberResponse(s *models.SerialNumber) serialNumberResponse {
 	resp := serialNumberResponse{
@@ -155,6 +164,14 @@ func (h *SerialNumberHandler) RegisterSerialNumbers(w http.ResponseWriter, r *ht
 		batchUUID = &parsed
 	}
 
+	// Validate status if provided
+	if req.Status != nil && *req.Status != "" {
+		if !allowedSerialStatuses[*req.Status] {
+			h.respondWithError(w, http.StatusBadRequest, "invalid status")
+			return
+		}
+	}
+
 	svcReq := service.RegisterSerialNumbersRequest{
 		CompanyID:     companyID,
 		ItemID:        itemUUID,
@@ -191,7 +208,7 @@ func (h *SerialNumberHandler) RegisterSerialNumbers(w http.ResponseWriter, r *ht
 	})
 }
 
-// AssignToWarehouse handles PATCH /serials/{id}/warehouse
+// AssignToWarehouse handles POST /serials/{id}/assign-warehouse
 func (h *SerialNumberHandler) AssignToWarehouse(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := h.parseCompanyID(r)
@@ -256,7 +273,7 @@ func (h *SerialNumberHandler) AssignToWarehouse(w http.ResponseWriter, r *http.R
 	})
 }
 
-// AssignToBatch handles PATCH /serials/{id}/batch
+// AssignToBatch handles POST /serials/{id}/assign-batch
 func (h *SerialNumberHandler) AssignToBatch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := h.parseCompanyID(r)
@@ -363,6 +380,11 @@ func (h *SerialNumberHandler) UpdateStatus(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "status is required")
 		return
 	}
+	// Validate status
+	if !allowedSerialStatuses[req.Status] {
+		h.respondWithError(w, http.StatusBadRequest, "invalid status")
+		return
+	}
 
 	if err := h.serialSvc.UpdateSerialStatus(ctx, serialID, companyID, req.Status, &userID, idempotencyKey); err != nil {
 		h.logger.Error("failed to update serial status", zap.Error(err))
@@ -371,6 +393,8 @@ func (h *SerialNumberHandler) UpdateStatus(w http.ResponseWriter, r *http.Reques
 			h.respondWithError(w, http.StatusNotFound, err.Error())
 		case errors.Is(err, inventory_errors.ErrPermissionDenied):
 			h.respondWithError(w, http.StatusForbidden, err.Error())
+		case errors.Is(err, inventory_errors.ErrInvalidInput):
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
 		default:
 			h.respondWithError(w, http.StatusInternalServerError, "failed to update status")
 		}
@@ -492,9 +516,19 @@ func (h *SerialNumberHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter := h.parseSerialFilter(r, companyID)
+	query := r.URL.Query()
 
+	// Validate status filter
+	if status := query.Get("status"); status != "" {
+		if !allowedSerialStatuses[status] {
+			h.respondWithError(w, http.StatusBadRequest, "invalid status value")
+			return
+		}
+	}
+
+	filter := h.parseSerialFilter(r, companyID)
 	page, pageSize := h.parsePagination(r)
+
 	serials, total, err := h.serialSvc.ListSerials(ctx, filter, page, pageSize)
 	if err != nil {
 		h.logger.Error("failed to list serials", zap.Error(err))
@@ -556,7 +590,7 @@ func (h *SerialNumberHandler) parseSerialFilter(r *http.Request, companyID uuid.
 			filter.BatchID = &id
 		}
 	}
-	if status := query.Get("status"); status != "" {
+	if status := query.Get("status"); status != "" && allowedSerialStatuses[status] {
 		filter.Status = &status
 	}
 	if search := query.Get("search"); search != "" {

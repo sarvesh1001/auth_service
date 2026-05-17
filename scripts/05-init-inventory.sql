@@ -743,3 +743,180 @@ CREATE INDEX IF NOT EXISTS idx_picking_lists_fulfillment ON picking_lists(fulfil
 CREATE INDEX IF NOT EXISTS idx_picking_lists_status ON picking_lists(status);
 CREATE INDEX IF NOT EXISTS idx_packing_lists_shipment ON packing_lists(shipment_id);
 CREATE INDEX IF NOT EXISTS idx_packing_lists_status ON packing_lists(status);
+
+
+-- Add warehouse_id column (required, with foreign key)
+ALTER TABLE inventory_locations 
+ADD COLUMN warehouse_id UUID NOT NULL,
+ADD CONSTRAINT fk_inv_location_warehouse 
+    FOREIGN KEY (warehouse_id) REFERENCES warehouses(warehouse_id) ON DELETE RESTRICT;
+
+-- Drop the old warehouse‑location assignment table if it exists
+DROP TABLE IF EXISTS warehouse_locations;
+
+-- Unique constraint: code must be unique per company + warehouse
+ALTER TABLE inventory_locations 
+DROP CONSTRAINT inventory_locations_company_id_code_key,
+ADD CONSTRAINT unique_location_code_per_warehouse 
+    UNIQUE (company_id, code, warehouse_id);
+
+
+
+
+
+
+-- =====================================================
+-- VENDORS & PURCHASE ORDERS (for reorder integration)
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS vendors (
+    vendor_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id         UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+
+    -- Business identifiers (not encrypted – searchable)
+    vendor_code        VARCHAR(50) NOT NULL,
+    vendor_name        VARCHAR(255) NOT NULL,
+    vendor_type        VARCHAR(50),   -- e.g., 'raw_material', 'service', 'logistics'
+
+    -- Encrypted contact fields (pattern: field, field_dek, field_key_id)
+    contact_person     TEXT,
+    contact_person_dek TEXT,
+    contact_person_key_id TEXT,
+
+    phone              TEXT,
+    phone_dek          TEXT,
+    phone_key_id       TEXT,
+
+    email              TEXT,
+    email_dek          TEXT,
+    email_key_id       TEXT,
+
+    address            TEXT,
+    address_dek        TEXT,
+    address_key_id     TEXT,
+
+    -- Bank details (generic, no country‑specific assumptions)
+    bank_account_no    TEXT,
+    bank_account_no_dek TEXT,
+    bank_account_no_key_id TEXT,
+
+    bank_routing_code  TEXT,                -- BIC/SWIFT or local routing number
+    bank_routing_code_dek TEXT,
+    bank_routing_code_key_id TEXT,
+
+    bank_name          TEXT,
+    bank_name_dek      TEXT,
+    bank_name_key_id   TEXT,
+
+    -- Operational
+    is_active          BOOLEAN NOT NULL DEFAULT true,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by         UUID REFERENCES users(user_id),
+    updated_by         UUID REFERENCES users(user_id),
+    deleted_at         TIMESTAMPTZ,
+
+    UNIQUE (company_id, vendor_code)
+);
+
+CREATE INDEX idx_vendors_company_code ON vendors(company_id, vendor_code) WHERE deleted_at IS NULL;
+CREATE INDEX idx_vendors_name ON vendors(vendor_name) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS vendor_tax_identifiers (
+    tax_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    vendor_id          UUID NOT NULL REFERENCES vendors(vendor_id) ON DELETE CASCADE,
+    tax_type           VARCHAR(50) NOT NULL,   -- 'GST', 'VAT', 'PAN', 'EIN', 'NIF', etc.
+    tax_number         TEXT,
+    tax_number_dek     TEXT,
+    tax_number_key_id  TEXT,
+    is_primary         BOOLEAN NOT NULL DEFAULT false,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by         UUID REFERENCES users(user_id),
+    UNIQUE(vendor_id, tax_type)
+);
+
+CREATE INDEX idx_vendor_tax_vendor ON vendor_tax_identifiers(vendor_id);
+
+
+CREATE TABLE IF NOT EXISTS purchase_orders (
+    purchase_order_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id          UUID NOT NULL REFERENCES companies(company_id) ON DELETE CASCADE,
+    po_number           VARCHAR(100) NOT NULL,
+    vendor_id           UUID NOT NULL REFERENCES vendors(vendor_id),
+    order_date          DATE NOT NULL,
+    expected_delivery_date DATE,
+    status              VARCHAR(20) NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft','submitted','approved','ordered','partially_received','received','cancelled')),
+    total_amount        NUMERIC(14,4),
+    currency            VARCHAR(3) DEFAULT 'USD',
+    notes               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          UUID REFERENCES users(user_id),
+    updated_by          UUID REFERENCES users(user_id),
+    UNIQUE(company_id, po_number)
+);
+
+CREATE INDEX idx_purchase_orders_company ON purchase_orders(company_id);
+CREATE INDEX idx_purchase_orders_vendor ON purchase_orders(vendor_id);
+CREATE INDEX idx_purchase_orders_status ON purchase_orders(status);
+CREATE INDEX idx_purchase_orders_date ON purchase_orders(order_date);
+
+
+
+CREATE TABLE IF NOT EXISTS purchase_order_items (
+    po_item_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    purchase_order_id   UUID NOT NULL REFERENCES purchase_orders(purchase_order_id) ON DELETE CASCADE,
+    item_id             UUID NOT NULL REFERENCES items(item_id),
+    quantity_ordered    NUMERIC(14,4) NOT NULL,
+    quantity_received   NUMERIC(14,4) NOT NULL DEFAULT 0,
+    unit_cost           NUMERIC(14,4) NOT NULL,
+    total_line          NUMERIC(14,4) GENERATED ALWAYS AS (quantity_ordered * unit_cost) STORED,
+    received_date       DATE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(purchase_order_id, item_id)
+);
+
+CREATE INDEX idx_po_items_order ON purchase_order_items(purchase_order_id);
+CREATE INDEX idx_po_items_item ON purchase_order_items(item_id);
+
+
+CREATE TABLE IF NOT EXISTS purchase_order_receipts (
+    receipt_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    purchase_order_id   UUID NOT NULL REFERENCES purchase_orders(purchase_order_id) ON DELETE CASCADE,
+    po_item_id          UUID NOT NULL REFERENCES purchase_order_items(po_item_id) ON DELETE CASCADE,
+    receipt_date        DATE NOT NULL,
+    quantity_received   NUMERIC(14,4) NOT NULL,
+    unit_cost           NUMERIC(14,4) NOT NULL,          -- could include freight/insurance share
+    warehouse_id        UUID NOT NULL REFERENCES warehouses(warehouse_id),
+    batch_id            UUID REFERENCES batches(batch_id), -- if batch‑tracked
+    movement_id         UUID REFERENCES stock_movements(movement_id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          UUID REFERENCES users(user_id)
+);
+
+CREATE INDEX idx_po_receipts_order ON purchase_order_receipts(purchase_order_id);
+CREATE INDEX idx_po_receipts_item ON purchase_order_receipts(po_item_id);
+
+CREATE TABLE item_vendors (
+    item_id    UUID NOT NULL REFERENCES items(item_id),
+    vendor_id  UUID NOT NULL REFERENCES vendors(vendor_id),
+    is_default BOOLEAN NOT NULL DEFAULT false,
+    lead_time  INT,   -- days
+    unit_cost  NUMERIC(14,4),
+    PRIMARY KEY (item_id, vendor_id)
+);
+
+ALTER TABLE purchase_orders
+ADD COLUMN deleted_at TIMESTAMPTZ;
+
+-- Drop the existing unique constraint
+ALTER TABLE purchase_orders DROP CONSTRAINT purchase_orders_company_id_po_number_key;
+
+-- Create a partial unique index that ignores soft‑deleted rows
+CREATE UNIQUE INDEX idx_purchase_orders_unique_active
+ON purchase_orders (company_id, po_number)
+WHERE deleted_at IS NULL;
+

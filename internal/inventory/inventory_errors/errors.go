@@ -18,8 +18,10 @@ var (
 	ErrOpenReorderExists           = errors.New("open reorder order already exists")
 	ErrInactiveBOM                 = errors.New("BOM is inactive")
 	ErrInvalidProductionCompletion = errors.New("invalid production completion data")
-	EventDropshipRequired          = "inventory.dropship.required"
-	EventFulfillmentBackorder      = "inventory.fulfillment.backorder"
+	ErrParentWarehouseMismatch     = errors.New("parent location must belong to the same warehouse") // NEW
+
+	EventDropshipRequired     = "inventory.dropship.required"
+	EventFulfillmentBackorder = "inventory.fulfillment.backorder"
 )
 
 func IsNotFound(err error) bool {
@@ -76,4 +78,9 @@ func IsOpenReorderExists(err error) bool {
 
 func IsInactiveBOM(err error) bool {
 	return errors.Is(err, ErrInactiveBOM)
+}
+
+// Optional helper for parent warehouse mismatch
+func IsParentWarehouseMismatch(err error) bool {
+	return errors.Is(err, ErrParentWarehouseMismatch)
 }

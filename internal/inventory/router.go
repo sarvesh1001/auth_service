@@ -31,12 +31,13 @@ type InventoryHandlers struct {
 	SerialNumberHandler   *handler.SerialNumberHandler
 	LocationHandler       *handler.InventoryLocationHandler
 
-	// NEW handlers
+	// New handlers
 	ShipmentItemHandler            *handler.ShipmentItemHandler
 	SerialNumberTransactionHandler *handler.SerialNumberTransactionHandler
 	CycleCountHandler              *handler.CycleCountHandler
 	PackingHandler                 *handler.PackingHandler
 	PickingHandler                 *handler.PickingHandler
+	PurchaseOrderHandler           *handler.PurchaseOrderHandler // <-- NEW: vendors & purchase orders
 }
 
 // RegisterInventoryRoutes mounts all inventory routes under /api/v1/companies/{companyID}/inventory.
@@ -341,9 +342,6 @@ func RegisterInventoryRoutes(
 		// -------------------------------
 		// 16. Shipments
 		// -------------------------------
-		// -------------------------------
-		// 16. Shipments
-		// -------------------------------
 		r.Route("/shipments", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.out", logger)).
 				Post("/", handlers.ShipmentHandler.CreateShipment)
@@ -356,7 +354,7 @@ func RegisterInventoryRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.view", logger)).
 				Get("/", handlers.ShipmentHandler.ListShipments)
 
-			// ========== NEW: Shipment Items under shipment ==========
+			// Shipment Items under shipment
 			r.Route("/{shipmentID}/items", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.out", logger)).
 					Post("/", handlers.ShipmentItemHandler.CreateShipmentItems)
@@ -364,6 +362,7 @@ func RegisterInventoryRoutes(
 					Get("/", handlers.ShipmentItemHandler.GetShipmentItems)
 			})
 		})
+
 		// -------------------------------
 		// 17. Transfer Orders
 		// -------------------------------
@@ -402,29 +401,44 @@ func RegisterInventoryRoutes(
 				Get("/by-number", handlers.SerialNumberHandler.GetByNumber)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.batch.view", logger)).
 				Get("/", handlers.SerialNumberHandler.List)
+
+			// Transaction history for a specific serial number
+			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.batch.view", logger)).
+				Get("/{serialID}/transactions", handlers.SerialNumberTransactionHandler.GetTransactionHistory)
 		})
 
 		// -------------------------------
 		// 19. Inventory Locations (hierarchical)
 		// -------------------------------
 		r.Route("/locations", func(r chi.Router) {
+			// Create location (requires warehouse_id in body)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.create", logger)).
 				Post("/", handlers.LocationHandler.CreateLocation)
+
+			// Update location (can change warehouse, name, etc.)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.update", logger)).
 				Put("/{locationId}", handlers.LocationHandler.UpdateLocation)
+
+			// Soft delete location
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.delete", logger)).
 				Delete("/{locationId}", handlers.LocationHandler.DeleteLocation)
+
+			// Get single location by ID
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.view", logger)).
 				Get("/{locationId}", handlers.LocationHandler.GetLocation)
+
+			// List locations for a specific warehouse (requires ?warehouse_id=...)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.view", logger)).
 				Get("/", handlers.LocationHandler.ListLocations)
+
+			// Get hierarchical tree for a specific warehouse (requires ?warehouse_id=...)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.view", logger)).
 				Get("/tree", handlers.LocationHandler.GetLocationTree)
-			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.warehouse.update", logger)).
-				Post("/warehouses/{warehouseId}/assign", handlers.LocationHandler.AssignWarehouseToLocation)
 		})
 
-		// ========== NEW: Shipment Items ==========
+		// -------------------------------
+		// Shipment Items (standalone)
+		// -------------------------------
 		r.Route("/shipment-items", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.out", logger)).
 				Post("/", handlers.ShipmentItemHandler.CreateShipmentItems)
@@ -440,15 +454,19 @@ func RegisterInventoryRoutes(
 				Get("/", handlers.ShipmentItemHandler.ListShipmentItems)
 		})
 
-		// ========== NEW: Serial Number Transactions ==========
+		// -------------------------------
+		// Serial Number Transactions (global)
+		// -------------------------------
 		r.Route("/serial-transactions", func(r chi.Router) {
-			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.batch.view", logger)).
-				Get("/serials/{serialID}", handlers.SerialNumberTransactionHandler.GetTransactionHistory)
+			// This endpoint already exists in /serials/{serialID}/transactions,
+			// but we keep for global listing
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.batch.view", logger)).
 				Get("/", handlers.SerialNumberTransactionHandler.ListTransactions)
 		})
 
-		// ========== NEW: Cycle Counts ==========
+		// -------------------------------
+		// Cycle Counts
+		// -------------------------------
 		r.Route("/cycle-counts", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 				Post("/", handlers.CycleCountHandler.CreateCycleCount)
@@ -464,7 +482,9 @@ func RegisterInventoryRoutes(
 				Get("/", handlers.CycleCountHandler.ListCycleCounts)
 		})
 
-		// ========== NEW: Picking Lists ==========
+		// -------------------------------
+		// Picking Lists
+		// -------------------------------
 		r.Route("/picking", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 				Post("/lists", handlers.PickingHandler.GeneratePickingList)
@@ -480,8 +500,9 @@ func RegisterInventoryRoutes(
 				Get("/lists", handlers.PickingHandler.ListPickingLists)
 		})
 
-		// ========== NEW: Packing Lists ==========
-		// ========== NEW: Packing Lists ==========
+		// -------------------------------
+		// Packing Lists
+		// -------------------------------
 		r.Route("/packing", func(r chi.Router) {
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 				Post("/lists", handlers.PackingHandler.GeneratePackingList)
@@ -490,7 +511,7 @@ func RegisterInventoryRoutes(
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 				Post("/lists/{listID}/complete", handlers.PackingHandler.CompletePacking)
 
-			// Item operations now under the specific list
+			// Item operations under the specific list
 			r.Route("/lists/{listID}/items", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
 					Post("/", handlers.PackingHandler.PackItem) // single item
@@ -504,6 +525,63 @@ func RegisterInventoryRoutes(
 				Get("/lists", handlers.PackingHandler.ListPackingLists)
 			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.view", logger)).
 				Get("/lists/{listID}/items", handlers.PackingHandler.GetPackingListItems)
+		})
+
+		// -------------------------------
+		// 20. Vendors & Purchase Orders (NEW)
+		// -------------------------------
+		// Vendors CRUD
+		r.Route("/vendors", func(r chi.Router) {
+			// Create vendor (requires inventory.item.create permission – reuses existing)
+			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.create", logger)).
+				Post("/", handlers.PurchaseOrderHandler.CreateVendor)
+			// List vendors (inventory.item.view)
+			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.view", logger)).
+				Get("/", handlers.PurchaseOrderHandler.ListVendors)
+			r.Route("/{vendorId}", func(r chi.Router) {
+				// Get vendor by ID (view)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.view", logger)).
+					Get("/", handlers.PurchaseOrderHandler.GetVendor)
+				// Update vendor (item.update)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.update", logger)).
+					Put("/", handlers.PurchaseOrderHandler.UpdateVendor)
+				// Delete vendor (item.delete)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.delete", logger)).
+					Delete("/", handlers.PurchaseOrderHandler.DeleteVendor)
+			})
+		})
+
+		// Purchase Orders CRUD + Items + Receiving
+		r.Route("/purchase-orders", func(r chi.Router) {
+			// Create purchase order (requires inventory.item.create)
+			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.create", logger)).
+				Post("/", handlers.PurchaseOrderHandler.CreatePurchaseOrder)
+			// List purchase orders (view)
+			r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.view", logger)).
+				Get("/", handlers.PurchaseOrderHandler.ListPurchaseOrders)
+
+			r.Route("/{purchaseOrderId}", func(r chi.Router) {
+				// Get PO (view)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.view", logger)).
+					Get("/", handlers.PurchaseOrderHandler.GetPurchaseOrder)
+				// Update status (update)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.update", logger)).
+					Put("/status", handlers.PurchaseOrderHandler.UpdatePurchaseOrderStatus)
+
+				// Items under PO
+				r.Route("/items", func(r chi.Router) {
+					// Add items to PO (update)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.update", logger)).
+						Post("/", handlers.PurchaseOrderHandler.AddPurchaseOrderItems)
+					// List items (view)
+					r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.item.view", logger)).
+						Get("/", handlers.PurchaseOrderHandler.GetPurchaseOrderItems)
+				})
+
+				// Receiving endpoint (stock adjust permission – because it creates stock movements)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("inventory.stock.adjust", logger)).
+					Post("/receive", handlers.PurchaseOrderHandler.ReceivePurchaseOrder)
+			})
 		})
 	})
 }

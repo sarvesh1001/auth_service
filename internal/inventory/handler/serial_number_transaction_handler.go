@@ -101,7 +101,7 @@ func toSerialNumberTransactionResponse(t *models.SerialNumberTransaction) serial
 }
 
 // GetTransactionHistory returns paginated transaction history for a specific serial number.
-// GET /api/v1/companies/{companyID}/inventory/serials/{serialID}/transactions
+// GET /api/v1/companies/{companyID}/inventory/serials/{id}/transactions
 func (h *SerialNumberTransactionHandler) GetTransactionHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -111,7 +111,8 @@ func (h *SerialNumberTransactionHandler) GetTransactionHistory(w http.ResponseWr
 		return
 	}
 
-	serialID, err := parseSerialID(r)
+	// The URL param is "id" to match the test route (GET /serials/{id}/transactions)
+	serialID, err := parseSerialIDFromParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -177,8 +178,24 @@ func (h *SerialNumberTransactionHandler) ListTransactions(w http.ResponseWriter,
 		return
 	}
 
+	// Validate transaction_type if provided
+	query := r.URL.Query()
+	if txnType := query.Get("transaction_type"); txnType != "" {
+		if !isValidTransactionType(txnType) {
+			h.respondWithError(w, http.StatusBadRequest, "invalid transaction_type")
+			return
+		}
+	}
+
 	filter := h.parseTransactionFilter(r, companyID)
-	page, pageSize := parsePageAndSize(r) // renamed to avoid conflict
+
+	// Validate from_date <= to_date
+	if filter.FromDate != nil && filter.ToDate != nil && filter.FromDate.After(*filter.ToDate) {
+		h.respondWithError(w, http.StatusBadRequest, "from_date must be before or equal to to_date")
+		return
+	}
+
+	page, pageSize := parsePageAndSize(r)
 
 	txns, total, err := h.txnSvc.ListTransactions(ctx, h.db, filter, page, pageSize)
 	if err != nil {
@@ -204,6 +221,18 @@ func (h *SerialNumberTransactionHandler) ListTransactions(w http.ResponseWriter,
 	})
 }
 
+// isValidTransactionType checks if the transaction type is allowed.
+func isValidTransactionType(txnType string) bool {
+	allowed := map[string]bool{
+		"created":       true,
+		"assigned":      true,
+		"status_change": true,
+		"sold":          true,
+		"transferred":   true,
+	}
+	return allowed[txnType]
+}
+
 // parseTransactionFilter builds the repository filter from query parameters.
 func (h *SerialNumberTransactionHandler) parseTransactionFilter(r *http.Request, companyID uuid.UUID) repository.SerialNumberTransactionFilter {
 	query := r.URL.Query()
@@ -221,7 +250,7 @@ func (h *SerialNumberTransactionHandler) parseTransactionFilter(r *http.Request,
 			filter.MovementID = &id
 		}
 	}
-	if txnType := query.Get("transaction_type"); txnType != "" {
+	if txnType := query.Get("transaction_type"); txnType != "" && isValidTransactionType(txnType) {
 		filter.TransactionType = &txnType
 	}
 	if fromDateStr := query.Get("from_date"); fromDateStr != "" {
@@ -246,8 +275,9 @@ func parseCompanyID(r *http.Request) (uuid.UUID, error) {
 	return uuid.Parse(idStr)
 }
 
-func parseSerialID(r *http.Request) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, "serialID")
+// parseSerialIDFromParam reads the serial ID from a named URL parameter.
+func parseSerialIDFromParam(r *http.Request, paramName string) (uuid.UUID, error) {
+	idStr := chi.URLParam(r, paramName)
 	if idStr == "" {
 		return uuid.Nil, errors.New("serial ID is required")
 	}

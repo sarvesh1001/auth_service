@@ -45,7 +45,7 @@ type serialNumberService struct {
 	itemRepo         repository.ItemRepository
 	warehouseRepo    repository.WarehouseRepository
 	batchRepo        repository.BatchRepository
-	txnSvc           SerialNumberTransactionService // NEW: transaction logging
+	txnSvc           SerialNumberTransactionService
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -53,12 +53,43 @@ type serialNumberService struct {
 	logger           *zap.Logger
 }
 
+// serialAllowedStatuses defines all valid serial number statuses.
+var serialAllowedStatuses = map[string]bool{
+	"available": true,
+	"sold":      true,
+	"reserved":  true,
+	"returned":  true,
+	"damaged":   true,
+}
+
+// serialAllowedTransitions defines which status transitions are permitted.
+var serialAllowedTransitions = map[string]map[string]bool{
+	"available": {
+		"sold":     true,
+		"reserved": true,
+		"damaged":  true,
+	},
+	"sold": {
+		"returned": true,
+	},
+	"reserved": {
+		"available": true,
+		"sold":      true,
+	},
+	"returned": {
+		"available": true,
+	},
+	"damaged": {
+		"available": true,
+	},
+}
+
 func NewSerialNumberService(
 	serialRepo repository.SerialRepository,
 	itemRepo repository.ItemRepository,
 	warehouseRepo repository.WarehouseRepository,
 	batchRepo repository.BatchRepository,
-	txnSvc SerialNumberTransactionService, // NEW parameter
+	txnSvc SerialNumberTransactionService,
 	pgClient *client.PostgresClient,
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
@@ -123,6 +154,9 @@ func (s *serialNumberService) RegisterSerialNumbers(ctx context.Context, req Reg
 	status := "available"
 	if req.Status != nil {
 		status = *req.Status
+		if !serialAllowedStatuses[status] {
+			return nil, fmt.Errorf("%w: invalid status %s", inventory_errors.ErrInvalidInput, status)
+		}
 	}
 
 	createdSerials := make([]*models.SerialNumber, 0, len(req.SerialNumbers))
@@ -146,7 +180,6 @@ func (s *serialNumberService) RegisterSerialNumbers(ctx context.Context, req Reg
 			return nil, fmt.Errorf("create serial %s: %w", sn, err)
 		}
 
-		// Log "created" transaction
 		if err := s.txnSvc.LogCustom(ctx, tx, LogCustomRequest{
 			CompanyID:       req.CompanyID,
 			SerialID:        serial.SerialID,
@@ -213,7 +246,6 @@ func (s *serialNumberService) AssignSerialToWarehouse(ctx context.Context, seria
 		return fmt.Errorf("assign to warehouse: %w", err)
 	}
 
-	// Log assignment transaction
 	if err := s.txnSvc.LogAssignment(ctx, tx, LogAssignmentRequest{
 		CompanyID:     companyID,
 		SerialID:      serialID,
@@ -276,7 +308,6 @@ func (s *serialNumberService) AssignSerialToBatch(ctx context.Context, serialID,
 		return fmt.Errorf("assign to batch: %w", err)
 	}
 
-	// Log assignment transaction
 	if err := s.txnSvc.LogAssignment(ctx, tx, LogAssignmentRequest{
 		CompanyID:     companyID,
 		SerialID:      serialID,
@@ -307,8 +338,12 @@ func (s *serialNumberService) AssignSerialToBatch(ctx context.Context, serialID,
 
 func (s *serialNumberService) UpdateSerialStatus(ctx context.Context, serialID uuid.UUID, companyID uuid.UUID, status string, updatedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "UpdateSerialStatus"), zap.String("idempotency_key", idempotencyKey))
+
 	if status == "" {
 		return fmt.Errorf("%w: status cannot be empty", inventory_errors.ErrInvalidInput)
+	}
+	if !serialAllowedStatuses[status] {
+		return fmt.Errorf("%w: invalid status '%s'", inventory_errors.ErrInvalidInput, status)
 	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -332,11 +367,22 @@ func (s *serialNumberService) UpdateSerialStatus(ctx context.Context, serialID u
 	}
 
 	oldStatus := serial.Status
+
+	// Validate status transition
+	if oldStatus != nil {
+		allowed, ok := serialAllowedTransitions[*oldStatus]
+		if !ok {
+			return fmt.Errorf("%w: unknown old status %s", inventory_errors.ErrInvalidInput, *oldStatus)
+		}
+		if !allowed[status] {
+			return fmt.Errorf("%w: cannot transition from %s to %s", inventory_errors.ErrInvalidInput, *oldStatus, status)
+		}
+	}
+
 	if err := s.serialRepo.UpdateStatus(ctx, tx, serialID, status); err != nil {
 		return fmt.Errorf("update status: %w", err)
 	}
 
-	// Log status change transaction
 	if err := s.txnSvc.LogStatusChange(ctx, tx, LogStatusChangeRequest{
 		CompanyID:  companyID,
 		SerialID:   serialID,
@@ -357,6 +403,7 @@ func (s *serialNumberService) UpdateSerialStatus(ctx context.Context, serialID u
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "inventory", "update_serial_status", "serial_number",
 			&serialID, "user", updatedBy, nil, nil, map[string]interface{}{
+				"old_status": oldStatus,
 				"new_status": status,
 			})
 	}

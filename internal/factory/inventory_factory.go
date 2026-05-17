@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"auth-service/internal/client"
+	"auth-service/internal/encryption"
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
 	"auth-service/internal/infrastructure/outbox"
@@ -53,6 +54,9 @@ type InventoryInfraFactory struct {
 	packingListRepo     repository.PackingListRepository
 	packingListItemRepo repository.PackingListItemRepository
 
+	// NEW: Vendor & Purchase Order repository
+	vendorPurchaseRepo repository.VendorPurchaseRepository
+
 	// Services
 	inventorySvc       service.InventoryService
 	valuationSvc       service.ValuationService
@@ -74,6 +78,9 @@ type InventoryInfraFactory struct {
 	cycleCountSvc      service.CycleCountService
 	pickingSvc         service.PickingService
 	packingSvc         service.PackingService
+
+	// NEW: Purchase Order service
+	purchaseOrderService service.PurchaseOrderService
 
 	// App services
 	itemAppSvc        service.ItemApplicationService
@@ -107,14 +114,19 @@ type InventoryInfraFactory struct {
 	cycleCountHandler              *handler.CycleCountHandler
 	pickingHandler                 *handler.PickingHandler
 	packingHandler                 *handler.PackingHandler
+
+	// NEW: Purchase Order handler
+	purchaseOrderHandler *handler.PurchaseOrderHandler
 }
 
+// NewInventoryInfraFactory now receives encryptionManager for vendor/purchase repo.
 func NewInventoryInfraFactory(
 	postgresClient *client.PostgresClient,
 	redisClient *client.RedisClient,
 	kafkaProducer *client.KafkaProducer,
 	eventPublisher EventPublisher,
 	auditService *audit.AuditService,
+	encryptionManager *encryption.EncryptionManager, // new parameter
 	logger *zap.Logger,
 ) (*InventoryInfraFactory, error) {
 	infra := &InventoryInfraFactory{
@@ -167,6 +179,9 @@ func NewInventoryInfraFactory(
 	infra.packingListRepo = repository.NewPackingListRepository(infra.log)
 	infra.packingListItemRepo = repository.NewPackingListItemRepository(infra.log)
 
+	// NEW: Vendor & Purchase Order repository (needs encryption manager)
+	infra.vendorPurchaseRepo = repository.NewVendorPurchaseRepository(infra.log, encryptionManager)
+
 	// ========== Core Services ==========
 	infra.inventorySvc = service.NewInventoryService(
 		infra.itemRepo, infra.movementRepo, infra.stockBalanceRepo,
@@ -209,8 +224,8 @@ func NewInventoryInfraFactory(
 		infra.prodOrderRepo,
 		infra.bomRepo,
 		infra.itemRepo,
-		infra.batchRepo, // ✅ new
-		infra.stockSvc,  // ✅ new
+		infra.batchRepo,
+		infra.stockSvc,
 		infra.inventorySvc,
 		infra.outboxRepo,
 		infra.idempotencyStore,
@@ -224,9 +239,23 @@ func NewInventoryInfraFactory(
 		infra.log,
 	)
 
+	// NEW: PurchaseOrderService – depends on stockSvc
+	infra.purchaseOrderService = service.NewPurchaseOrderService(
+		infra.vendorPurchaseRepo,
+		infra.stockSvc,
+		infra.postgresClient,
+		infra.outboxRepo,
+		infra.idempotencyStore,
+		infra.auditService,
+		infra.log,
+	)
+
+	// UPDATED: ReorderService now receives purchaseOrderService
 	infra.reorderSvc = service.NewReorderService(
 		infra.itemRepo, infra.warehouseRepo, infra.reorderRepo,
-		infra.stockBalanceRepo, infra.postgresClient,
+		infra.stockBalanceRepo,
+		infra.purchaseOrderService, // NEW dependency
+		infra.postgresClient,
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
@@ -240,14 +269,12 @@ func NewInventoryInfraFactory(
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
-	// NEW: ShipmentItemService
 	infra.shipmentItemSvc = service.NewShipmentItemService(
 		infra.shipmentItemRepo, infra.fulfillmentRepo, infra.shipmentRepo,
 		infra.itemRepo, infra.postgresClient, infra.outboxRepo,
 		infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
-	// NEW: SerialNumberTransactionService
 	infra.serialNumberTxnSvc = service.NewSerialNumberTransactionService(
 		infra.serialNumberTxnRepo, infra.serialRepo, infra.postgresClient,
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
@@ -259,7 +286,7 @@ func NewInventoryInfraFactory(
 		infra.reservationSvc,
 		infra.inventorySvc,
 		infra.productionSvc,
-		infra.stockSvc, // <-- added
+		infra.stockSvc,
 		infra.itemRepo,
 		infra.warehouseRepo,
 		infra.stockBalanceRepo,
@@ -280,29 +307,25 @@ func NewInventoryInfraFactory(
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
-	// UPDATED: SerialNumberService now includes SerialNumberTransactionService
 	infra.serialNumberSvc = service.NewSerialNumberService(
 		infra.serialRepo, infra.itemRepo, infra.warehouseRepo, infra.batchRepo,
-		infra.serialNumberTxnSvc, // new dependency
+		infra.serialNumberTxnSvc,
 		infra.postgresClient, infra.outboxRepo, infra.idempotencyStore,
 		infra.auditService, infra.log,
 	)
 
-	// NEW: CycleCountService
 	infra.cycleCountSvc = service.NewCycleCountService(
 		infra.cycleCountRepo, infra.stockSvc, infra.itemRepo,
 		infra.warehouseRepo, infra.stockBalanceRepo, infra.postgresClient,
 		infra.outboxRepo, infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
-	// NEW: PickingService
 	infra.pickingSvc = service.NewPickingService(
 		infra.pickingListRepo, infra.pickingListItemRepo, infra.fulfillmentRepo,
 		infra.warehouseRepo, infra.postgresClient, infra.outboxRepo,
 		infra.idempotencyStore, infra.auditService, infra.log,
 	)
 
-	// NEW: PackingService
 	infra.packingSvc = service.NewPackingService(
 		infra.packingListRepo, infra.packingListItemRepo, infra.shipmentItemRepo,
 		infra.shipmentRepo, infra.warehouseRepo, infra.postgresClient,
@@ -364,6 +387,9 @@ func NewInventoryInfraFactory(
 	infra.pickingHandler = handler.NewPickingHandler(infra.pickingSvc, infra.log)
 	infra.packingHandler = handler.NewPackingHandler(infra.packingSvc, infra.log)
 
+	// NEW: Purchase Order Handler
+	infra.purchaseOrderHandler = handler.NewPurchaseOrderHandler(infra.purchaseOrderService, infra.log)
+
 	return infra, nil
 }
 
@@ -394,8 +420,12 @@ func (i *InventoryInfraFactory) InventoryHandlers() *inventory.InventoryHandlers
 		// NEW handlers
 		ShipmentItemHandler:            i.shipmentItemHandler,
 		SerialNumberTransactionHandler: i.serialNumberTransactionHandler,
-		PickingHandler:                 i.pickingHandler, // ✅ ADD THIS
+		CycleCountHandler:              i.cycleCountHandler,
+		PickingHandler:                 i.pickingHandler,
 		PackingHandler:                 i.packingHandler,
+
+		// NEW: Purchase Order Handler
+		PurchaseOrderHandler: i.purchaseOrderHandler,
 	}
 }
 

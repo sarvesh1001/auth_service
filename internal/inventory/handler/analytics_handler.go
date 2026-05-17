@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"auth-service/internal/inventory/models"
 	"auth-service/internal/inventory/repository"
 	"auth-service/internal/inventory/service"
 )
@@ -30,7 +31,10 @@ func NewAnalyticsHandler(analyticsService service.AnalyticsQueryService, logger 
 	}
 }
 
-// GetDailySnapshots GET /api/v1/companies/{companyId}/analytics/snapshots
+// ----------------------------------------------------------------------
+// Public handlers
+// ----------------------------------------------------------------------
+
 func (h *AnalyticsHandler) GetDailySnapshots(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -46,6 +50,18 @@ func (h *AnalyticsHandler) GetDailySnapshots(w http.ResponseWriter, r *http.Requ
 
 	filter, err := parseSnapshotFilter(r.URL.Query(), companyID)
 	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ---- VALIDATION ----
+	// warehouse_id is required
+	if filter.WarehouseID == nil || *filter.WarehouseID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "warehouse_id is required")
+		return
+	}
+	// from_date must be <= to_date
+	if err := validateDateOrder(filter.DateFrom, filter.DateTo, "from_date", "to_date"); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -72,7 +88,6 @@ func (h *AnalyticsHandler) GetDailySnapshots(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// GetTurnoverMetrics GET /api/v1/companies/{companyId}/analytics/turnover
 func (h *AnalyticsHandler) GetTurnoverMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -88,6 +103,13 @@ func (h *AnalyticsHandler) GetTurnoverMetrics(w http.ResponseWriter, r *http.Req
 
 	filter, err := parseTurnoverFilter(r.URL.Query(), companyID)
 	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ---- VALIDATION ----
+	// from_month must be <= to_month
+	if err := validateDateOrder(filter.YearMonthFrom, filter.YearMonthTo, "from_month", "to_month"); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -114,7 +136,6 @@ func (h *AnalyticsHandler) GetTurnoverMetrics(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// GetABCClassifications GET /api/v1/companies/{companyId}/analytics/abc
 func (h *AnalyticsHandler) GetABCClassifications(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -130,6 +151,18 @@ func (h *AnalyticsHandler) GetABCClassifications(w http.ResponseWriter, r *http.
 
 	filter, err := parseABCFilter(r.URL.Query(), companyID)
 	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ---- VALIDATION ----
+	// classification_date is required
+	if filter.Date == nil {
+		h.respondWithError(w, http.StatusBadRequest, "classification_date is required")
+		return
+	}
+	// abc_class must be A, B, or C (if provided)
+	if err := validateABCClass(filter.Class); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -156,7 +189,6 @@ func (h *AnalyticsHandler) GetABCClassifications(w http.ResponseWriter, r *http.
 	})
 }
 
-// GetInventoryAging GET /api/v1/companies/{companyId}/analytics/aging
 func (h *AnalyticsHandler) GetInventoryAging(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -172,6 +204,23 @@ func (h *AnalyticsHandler) GetInventoryAging(w http.ResponseWriter, r *http.Requ
 
 	filter, err := parseAgingFilter(r.URL.Query(), companyID)
 	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ---- VALIDATION ----
+	// snapshot_date is required
+	if filter.SnapshotDate == nil {
+		h.respondWithError(w, http.StatusBadRequest, "snapshot_date is required")
+		return
+	}
+	// warehouse_id is required
+	if filter.WarehouseID == nil || *filter.WarehouseID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "warehouse_id is required")
+		return
+	}
+	// aging_bucket must be one of the allowed values (if provided)
+	if err := validateAgingBucket(filter.AgingBucket); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -198,7 +247,6 @@ func (h *AnalyticsHandler) GetInventoryAging(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// GetDemandHistory GET /api/v1/companies/{companyId}/analytics/demand
 func (h *AnalyticsHandler) GetDemandHistory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -214,6 +262,20 @@ func (h *AnalyticsHandler) GetDemandHistory(w http.ResponseWriter, r *http.Reque
 
 	filter, err := parseDemandFilter(r.URL.Query(), companyID)
 	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// ---- VALIDATION ----
+	// At least one of item_id or warehouse_id is required
+	hasItemID := filter.ItemID != nil && *filter.ItemID != uuid.Nil
+	hasWarehouseID := filter.WarehouseID != nil && *filter.WarehouseID != uuid.Nil
+	if !hasItemID && !hasWarehouseID {
+		h.respondWithError(w, http.StatusBadRequest, "either item_id or warehouse_id is required")
+		return
+	}
+	// from_date must be <= to_date
+	if err := validateDateOrder(filter.DateFrom, filter.DateTo, "from_date", "to_date"); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -240,7 +302,6 @@ func (h *AnalyticsHandler) GetDemandHistory(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// GetMovementDailySummary GET /api/v1/companies/{companyId}/analytics/movement-summary
 func (h *AnalyticsHandler) GetMovementDailySummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := parseCompanyIDFromRequest(r)
@@ -260,20 +321,39 @@ func (h *AnalyticsHandler) GetMovementDailySummary(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// ---- VALIDATION ----
+	// from_date <= to_date
+	if fromDate.After(toDate) {
+		h.respondWithError(w, http.StatusBadRequest, "from_date must be before or equal to to_date")
+		return
+	}
+	// At least one of warehouse_id or item_id is required
+	hasWarehouseID := warehouseID != nil && *warehouseID != uuid.Nil
+	hasItemID := itemID != nil && *itemID != uuid.Nil
+	if !hasWarehouseID && !hasItemID {
+		h.respondWithError(w, http.StatusBadRequest, "either warehouse_id or item_id is required")
+		return
+	}
+
 	summaries, err := h.analyticsService.GetMovementSummary(ctx, companyID, fromDate, toDate, warehouseID, itemID)
 	if err != nil {
 		h.logger.Error("failed to get movement summary", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve movement summaries")
 		return
 	}
-
+	// Ensure we return an empty slice, not nil, for consistency
+	if summaries == nil {
+		summaries = []*models.MovementDailySummary{}
+	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    summaries,
 	})
 }
 
-// ---------- Helper functions ----------
+// ----------------------------------------------------------------------
+// Helper functions for parsing and validation
+// ----------------------------------------------------------------------
 
 func parseCompanyIDFromRequest(r *http.Request) (uuid.UUID, error) {
 	companyIDStr := chi.URLParam(r, "companyID")
@@ -287,9 +367,56 @@ func parseCompanyIDFromRequest(r *http.Request) (uuid.UUID, error) {
 }
 
 func (h *AnalyticsHandler) checkPermission(ctx context.Context, companyID uuid.UUID, permission string) error {
-	// Stub: implement real permission check using your auth system.
+	// Stub: replace with real permission check
 	return nil
 }
+
+// ----- Validation helpers -----
+
+func validateDateOrder(from, to interface{}, fromName, toName string) error {
+	// Check for time.Time values
+	switch vFrom := from.(type) {
+	case *time.Time:
+		if vFrom == nil {
+			return nil
+		}
+		if vTo, ok := to.(*time.Time); ok && vTo != nil {
+			if vFrom.After(*vTo) {
+				return fmt.Errorf("%s must be before or equal to %s", fromName, toName)
+			}
+		}
+	case time.Time:
+		if vTo, ok := to.(time.Time); ok {
+			if vFrom.After(vTo) {
+				return fmt.Errorf("%s must be before or equal to %s", fromName, toName)
+			}
+		}
+	}
+	return nil
+}
+
+func validateABCClass(class string) error {
+	if class == "" {
+		return nil
+	}
+	if class != "A" && class != "B" && class != "C" {
+		return fmt.Errorf("invalid abc_class: must be A, B, or C")
+	}
+	return nil
+}
+
+func validateAgingBucket(bucket string) error {
+	if bucket == "" {
+		return nil
+	}
+	allowed := map[string]bool{"0-30": true, "31-60": true, "61-90": true, "90+": true}
+	if !allowed[bucket] {
+		return fmt.Errorf("invalid aging_bucket: must be one of 0-30, 31-60, 61-90, 90+")
+	}
+	return nil
+}
+
+// ----- Filter parsers (unchanged except minor fixes) -----
 
 func parseSnapshotFilter(query map[string][]string, companyID uuid.UUID) (repository.SnapshotFilter, error) {
 	filter := repository.SnapshotFilter{CompanyID: companyID}
@@ -472,6 +599,8 @@ func parseMovementSummaryParams(query map[string][]string) (from, to time.Time, 
 	return from, to, warehouseID, itemID, nil
 }
 
+// ----- Pagination/sort helpers (unchanged) -----
+
 func parsePaginationAndSort(query map[string][]string, defaultSortField, defaultSortOrder string) (repository.Pagination, repository.Sort) {
 	limit := 20
 	if limitStr := getQueryParam(query, "limit"); limitStr != "" {
@@ -505,6 +634,8 @@ func getQueryParam(query map[string][]string, key string) string {
 	}
 	return ""
 }
+
+// ----- Response helpers -----
 
 func (h *AnalyticsHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

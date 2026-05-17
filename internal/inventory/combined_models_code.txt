@@ -1,5 +1,38 @@
 
 ================================================================================
+FILE: ./models/serial_number_transaction.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type SerialNumberTransaction struct {
+	TransactionID   uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"transactionId"`
+	SerialID        uuid.UUID  `gorm:"type:uuid;not null" json:"serialId"`
+	CompanyID       uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	MovementID      *uuid.UUID `gorm:"type:uuid" json:"movementId,omitempty"`
+	FromWarehouseID *uuid.UUID `gorm:"type:uuid" json:"fromWarehouseId,omitempty"`
+	ToWarehouseID   *uuid.UUID `gorm:"type:uuid" json:"toWarehouseId,omitempty"`
+	FromBatchID     *uuid.UUID `gorm:"type:uuid" json:"fromBatchId,omitempty"`
+	ToBatchID       *uuid.UUID `gorm:"type:uuid" json:"toBatchId,omitempty"`
+	OldStatus       *string    `gorm:"type:varchar(20)" json:"oldStatus,omitempty"`
+	NewStatus       *string    `gorm:"type:varchar(20)" json:"newStatus,omitempty"`
+	TransactionType string     `gorm:"type:varchar(50);not null" json:"transactionType"`
+	TransactionDate time.Time  `gorm:"not null;default:now()" json:"transactionDate"`
+	CreatedBy       *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	Notes           *string    `gorm:"type:text" json:"notes,omitempty"`
+}
+
+func (SerialNumberTransaction) TableName() string { return "serial_number_transactions" }
+
+
+
+================================================================================
 FILE: ./models/warehouse.go
 ================================================================================
 
@@ -139,6 +172,31 @@ type StockMovement struct {
 
 
 ================================================================================
+FILE: ./models/packing_list_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PackingListItem struct {
+	PackingItemID  uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"packingItemId"`
+	PackingListID  uuid.UUID       `gorm:"type:uuid;not null" json:"packingListId"`
+	ShipmentItemID uuid.UUID       `gorm:"type:uuid;not null" json:"shipmentItemId"`
+	PackedQty      decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"packedQty"`
+	CreatedAt      time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (PackingListItem) TableName() string { return "packing_list_items" }
+
+
+
+================================================================================
 FILE: ./models/fulfillment_order_item.go
 ================================================================================
 
@@ -159,6 +217,31 @@ type FulfillmentOrderItem struct {
 }
 
 func (FulfillmentOrderItem) TableName() string { return "fulfillment_order_items" }
+
+
+
+================================================================================
+FILE: ./models/shipment_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ShipmentItem struct {
+	ShipmentItemID    uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"shipmentItemId"`
+	ShipmentID        uuid.UUID       `gorm:"type:uuid;not null" json:"shipmentId"`
+	FulfillmentItemID uuid.UUID       `gorm:"type:uuid;not null" json:"fulfillmentItemId"`
+	QuantityShipped   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantityShipped"`
+	CreatedAt         time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (ShipmentItem) TableName() string { return "shipment_items" }
 
 
 
@@ -239,6 +322,34 @@ type Batch struct {
 	CreatedBy        *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy        *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
+
+
+
+================================================================================
+FILE: ./models/picking_list.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type PickingList struct {
+	PickingListID      uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"pickingListId"`
+	CompanyID          uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	FulfillmentOrderID uuid.UUID  `gorm:"type:uuid;not null" json:"fulfillmentOrderId"`
+	WarehouseID        uuid.UUID  `gorm:"type:uuid;not null" json:"warehouseId"`
+	Status             string     `gorm:"type:varchar(20);not null;default:'created'" json:"status"`
+	AssignedTo         *uuid.UUID `gorm:"type:uuid" json:"assignedTo,omitempty"`
+	CreatedAt          time.Time  `gorm:"default:now()" json:"createdAt"`
+	PickedAt           *time.Time `gorm:"type:timestamptz" json:"pickedAt,omitempty"`
+	CompletedAt        *time.Time `gorm:"type:timestamptz" json:"completedAt,omitempty"`
+}
+
+func (PickingList) TableName() string { return "picking_lists" }
 
 
 
@@ -387,6 +498,68 @@ type SerialNumber struct {
 }
 
 func (SerialNumber) TableName() string { return "serial_numbers" }
+
+
+
+================================================================================
+FILE: ./models/picking_list_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PickingListItem struct {
+	PickingItemID     uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"pickingItemId"`
+	PickingListID     uuid.UUID       `gorm:"type:uuid;not null" json:"pickingListId"`
+	FulfillmentItemID uuid.UUID       `gorm:"type:uuid;not null" json:"fulfillmentItemId"`
+	OrderedQty        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"orderedQty"`
+	PickedQty         decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"pickedQty"`
+	CreatedAt         time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (PickingListItem) TableName() string { return "picking_list_items" }
+
+
+
+================================================================================
+FILE: ./models/inventory_cycle_count.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type InventoryCycleCount struct {
+	CycleCountID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"cycleCountId"`
+	CompanyID            uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	WarehouseID          uuid.UUID       `gorm:"type:uuid;not null" json:"warehouseId"`
+	ItemID               *uuid.UUID      `gorm:"type:uuid" json:"itemId,omitempty"`
+	LocationID           *uuid.UUID      `gorm:"type:uuid" json:"locationId,omitempty"`
+	CountType            string          `gorm:"type:varchar(20);not null" json:"countType"`
+	Status               string          `gorm:"type:varchar(20);not null;default:'planned'" json:"status"`
+	ScheduledDate        *time.Time      `gorm:"type:date" json:"scheduledDate,omitempty"`
+	CountedBy            *uuid.UUID      `gorm:"type:uuid" json:"countedBy,omitempty"`
+	CountedAt            *time.Time      `gorm:"type:timestamptz" json:"countedAt,omitempty"`
+	ExpectedQuantity     decimal.Decimal `gorm:"type:numeric(14,4)" json:"expectedQuantity"`
+	ActualQuantity       decimal.Decimal `gorm:"type:numeric(14,4)" json:"actualQuantity"`
+	Variance             decimal.Decimal `gorm:"->" json:"variance"`
+	AdjustmentMovementID *uuid.UUID      `gorm:"type:uuid" json:"adjustmentMovementId,omitempty"`
+	CreatedAt            time.Time       `gorm:"default:now()" json:"createdAt"`
+	UpdatedAt            time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (InventoryCycleCount) TableName() string { return "inventory_cycle_counts" }
 
 
 
@@ -655,6 +828,35 @@ type ProductionMetric struct {
 func (ProductionMetric) TableName() string {
 	return "production_metrics"
 }
+
+
+
+================================================================================
+FILE: ./models/packing_list.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type PackingList struct {
+	PackingListID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"packingListId"`
+	CompanyID     uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	ShipmentID    uuid.UUID  `gorm:"type:uuid;not null" json:"shipmentId"`
+	Status        string     `gorm:"type:varchar(20);not null;default:'created'" json:"status"`
+	PackedBy      *uuid.UUID `gorm:"type:uuid" json:"packedBy,omitempty"`
+	CreatedAt     time.Time  `gorm:"default:now()" json:"createdAt"`
+	PackedAt      *time.Time `gorm:"type:timestamptz" json:"packedAt,omitempty"`
+	VerifiedAt    *time.Time `gorm:"type:timestamptz" json:"verifiedAt,omitempty"`
+	CompletedAt   *time.Time `gorm:"type:timestamptz" json:"completedAt,omitempty"` // <-- ADD
+
+}
+
+func (PackingList) TableName() string { return "packing_lists" }
 
 
 
@@ -940,6 +1142,9 @@ const (
 	FulfillmentMadeToOrder       FulfillmentPolicy = "made_to_order"
 	FulfillmentDropship          FulfillmentPolicy = "dropship"
 	FulfillmentServiceOnly       FulfillmentPolicy = "service_only"
+	FulfillmentDigitalDelivery   FulfillmentPolicy = "digital_delivery" // NEW
+	FulfillmentExternalVendor    FulfillmentPolicy = "external_vendor"  // NEW
+
 )
 
 func ValidFulfillmentPolicies() []FulfillmentPolicy {
@@ -949,13 +1154,16 @@ func ValidFulfillmentPolicies() []FulfillmentPolicy {
 		FulfillmentMadeToOrder,
 		FulfillmentDropship,
 		FulfillmentServiceOnly,
+		FulfillmentDigitalDelivery, // added
+		FulfillmentExternalVendor,  // added
 	}
 }
 
 func (f FulfillmentPolicy) IsValid() bool {
 	switch f {
 	case FulfillmentInventoryRequired, FulfillmentAllowBackorder,
-		FulfillmentMadeToOrder, FulfillmentDropship, FulfillmentServiceOnly:
+		FulfillmentMadeToOrder, FulfillmentDropship, FulfillmentServiceOnly,
+		FulfillmentDigitalDelivery, FulfillmentExternalVendor: // added
 		return true
 	}
 	return false

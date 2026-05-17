@@ -20,6 +20,7 @@ import (
 type InventoryCycleCountRepository interface {
 	Create(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error
 	GetByID(ctx context.Context, db DBTX, cycleCountID uuid.UUID) (*models.InventoryCycleCount, error)
+	GetByUnique(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, itemID *uuid.UUID, scheduledDate *time.Time) (*models.InventoryCycleCount, error) // new method
 	UpdateStatus(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, status string, updatedAt time.Time) error
 	CompleteCount(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, countedBy uuid.UUID, actualQuantity decimal.Decimal, adjustmentMovementID *uuid.UUID) error
 	ListByWarehouse(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, filter CycleCountFilter, p Pagination, s Sort) ([]*models.InventoryCycleCount, int64, error)
@@ -188,7 +189,8 @@ func (r *inventoryCycleCountRepository) scanCycleCount(s scanner) (*models.Inven
 	return &cc, nil
 }
 
-// Create inserts a new cycle count record.
+// Create inserts a new cycle count record. Returns inventory_errors.ErrDuplicate if a record already exists
+// for the same company, warehouse, item, and scheduled date.
 func (r *inventoryCycleCountRepository) Create(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error {
 	query := `
 		INSERT INTO inventory_cycle_counts (
@@ -216,6 +218,10 @@ func (r *inventoryCycleCountRepository) Create(ctx context.Context, tx DBTX, cou
 	).Scan(&count.CreatedAt, &count.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create cycle count", util.ErrorField(err))
+		// Detect unique constraint violation (duplicate company/warehouse/item/date)
+		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+			return inventory_errors.ErrDuplicate
+		}
 		return fmt.Errorf("create cycle count: %w", err)
 	}
 	return nil
@@ -232,6 +238,21 @@ func (r *inventoryCycleCountRepository) GetByID(ctx context.Context, db DBTX, cy
 		WHERE cycle_count_id = $1
 	`
 	row := db.QueryRowContext(ctx, query, cycleCountID)
+	return r.scanCycleCount(row)
+}
+
+// GetByUnique retrieves a cycle count by its natural key: company_id, warehouse_id, item_id, scheduled_date.
+// Returns inventory_errors.ErrNotFound if not found.
+func (r *inventoryCycleCountRepository) GetByUnique(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, itemID *uuid.UUID, scheduledDate *time.Time) (*models.InventoryCycleCount, error) {
+	query := `
+		SELECT cycle_count_id, company_id, warehouse_id, item_id, location_id,
+		       count_type, status, scheduled_date, counted_by, counted_at,
+		       expected_quantity, actual_quantity, variance, adjustment_movement_id,
+		       created_at, updated_at
+		FROM inventory_cycle_counts
+		WHERE company_id = $1 AND warehouse_id = $2 AND item_id = $3 AND scheduled_date = $4
+	`
+	row := db.QueryRowContext(ctx, query, companyID, warehouseID, nullUUIDParam(itemID), scheduledDate)
 	return r.scanCycleCount(row)
 }
 

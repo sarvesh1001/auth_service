@@ -33,6 +33,7 @@ type reorderService struct {
 	warehouseRepo    repository.WarehouseRepository
 	reorderRepo      repository.ReorderOrderRepository
 	balanceRepo      repository.StockBalanceRepository
+	poService        PurchaseOrderService // new
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -45,6 +46,7 @@ func NewReorderService(
 	warehouseRepo repository.WarehouseRepository,
 	reorderRepo repository.ReorderOrderRepository,
 	balanceRepo repository.StockBalanceRepository,
+	poService PurchaseOrderService, // new parameter
 	pgClient *client.PostgresClient,
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
@@ -56,6 +58,7 @@ func NewReorderService(
 		warehouseRepo:    warehouseRepo,
 		reorderRepo:      reorderRepo,
 		balanceRepo:      balanceRepo,
+		poService:        poService,
 		pgClient:         pgClient,
 		outboxRepo:       outboxRepo,
 		idempotencyStore: idempotencyStore,
@@ -102,7 +105,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 	// 3. Check reorder configuration
 	if item.ReorderLevel == nil || item.ReorderQuantity == nil {
 		logger.Debug("no reorder configuration, skipping")
-		return nil // no error, no order, but not a skip reason? return nil means success with no order
+		return nil // no error, no order
 	}
 	reorderLevel := *item.ReorderLevel
 	reorderQty := *item.ReorderQuantity
@@ -110,7 +113,6 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 	// 4. Get actual available stock from DB
 	availableQty, err := s.balanceRepo.GetByWarehouseAndItem(ctx, s.pgClient.DB, companyID, warehouseID, itemID)
 	if err != nil {
-		// If no stock balance record, treat as zero
 		if errors.Is(err, inventory_errors.ErrNotFound) {
 			availableQty = decimal.Zero
 		} else {
@@ -136,7 +138,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 		return inventory_errors.ErrOpenReorderExists
 	}
 
-	// 7. Idempotency (optional, keep)
+	// 7. Idempotency
 	idempotencyKey := fmt.Sprintf("reorder:%s:%s:%s:%d",
 		companyID.String(), itemID.String(), warehouseID.String(), time.Now().Unix()/3600)
 
@@ -170,9 +172,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 		return fmt.Errorf("create reorder order: %w", err)
 	}
 
-	// 9. No cooldown – do NOT update item.LastReorderedAt
-
-	// 10. Emit event
+	// 9. Emit event
 	if err := s.emitReorderEvent(ctx, tx, reorderOrder); err != nil {
 		logger.Warn("failed to emit reorder event", zap.Error(err))
 	}
@@ -183,7 +183,7 @@ func (s *reorderService) CheckAndCreateReorderOrders(
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// 11. Audit log
+	// 10. Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(
 			ctx, nil, &companyID, "inventory", "create_reorder", "reorder_order",
@@ -244,16 +244,41 @@ func (s *reorderService) UpdateOrderStatus(ctx context.Context, orderID uuid.UUI
 	return s.reorderRepo.UpdateStatus(ctx, s.pgClient.DB, orderID, newStatus)
 }
 
+// ProcessPendingOrders processes all pending reorder orders by creating a purchase order for each.
+// Returns the number of successfully processed orders.
 func (s *reorderService) ProcessPendingOrders(ctx context.Context, companyID uuid.UUID) (int, error) {
 	orders, err := s.reorderRepo.ListPending(ctx, s.pgClient.DB, companyID)
 	if err != nil {
 		return 0, fmt.Errorf("list pending: %w", err)
 	}
+	processed := 0
 	for _, order := range orders {
-		// Here you would implement actual processing, e.g., create purchase order
 		s.logger.Info("processing pending order", zap.String("order_id", order.ReorderOrderID.String()))
+
+		// Create idempotency key for PO creation
+		poIdempotencyKey := fmt.Sprintf("reorder:process:%s", order.ReorderOrderID.String())
+
+		// Call PurchaseOrderService to create a purchase order from this reorder
+		po, created, err := s.poService.CreatePurchaseOrderFromReorder(ctx, order, poIdempotencyKey)
+		if err != nil {
+			s.logger.Error("failed to create purchase order from reorder",
+				zap.String("reorder_id", order.ReorderOrderID.String()),
+				zap.Error(err))
+			// Do not mark as processed; leave it pending for retry
+			continue
+		}
+		if created {
+			processed++
+			s.logger.Info("purchase order created",
+				zap.String("po_id", po.PurchaseOrderID.String()),
+				zap.String("reorder_id", order.ReorderOrderID.String()))
+		} else {
+			// Idempotent – already processed, but we still count it for reporting
+			processed++
+			s.logger.Info("reorder already processed (idempotent)", zap.String("reorder_id", order.ReorderOrderID.String()))
+		}
 	}
-	return len(orders), nil
+	return processed, nil
 }
 
 func (s *reorderService) emitReorderEvent(ctx context.Context, tx *sql.Tx, order *models.ReorderOrder) error {
