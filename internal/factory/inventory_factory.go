@@ -429,6 +429,11 @@ func (i *InventoryInfraFactory) InventoryHandlers() *inventory.InventoryHandlers
 	}
 }
 
+// InventoryAnalyticsService returns the analytics service for event consumption.
+func (i *InventoryInfraFactory) InventoryAnalyticsService() service.InventoryAnalyticsService {
+	return i.analyticsSvc
+}
+
 // Close shuts down background processes.
 func (i *InventoryInfraFactory) Close() {
 	if i.outboxCancel != nil {

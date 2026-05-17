@@ -232,15 +232,18 @@ type Factory struct {
 	payslipHandler                    *payrollhandler.PayslipHandler
 	reportingHandler                  *payrollhandler.ReportingHandler
 	taxDeclarationHandler             *payrollhandler.TaxDeclarationHandler
-	academicsInfra                    *AcademicsInfraFactory  // <-- new
-	accountingInfra                   *AccountingInfraFactory // <-- ADD THIS
+	academicsInfra                    *AcademicsInfraFactory
+	accountingInfra                   *AccountingInfraFactory
 	analyticsConsumer                 *consumer.AnalyticsConsumer
 	analyticsConsumerCancel           context.CancelFunc
-	inventoryInfra                    *InventoryInfraFactory // new field
+	inventoryInfra                    *InventoryInfraFactory
 	studentConsumer                   *consumer.StudentConsumer
 	studentConsumerCancel             context.CancelFunc
 	accountingConsumer                *consumer.AccountingConsumer
 	accountingConsumerCancel          context.CancelFunc
+	// NEW: inventory consumer
+	inventoryConsumer       *consumer.InventoryConsumer
+	inventoryConsumerCancel context.CancelFunc
 
 	// Email sender for notifications
 	emailSender email.Sender
@@ -381,7 +384,7 @@ func NewFactory() (*Factory, error) {
 		f.KafkaProducer(),
 		&kafkaEventPublisher{producer: f.KafkaProducer()},
 		f.GetAuditService(),
-		f.EncryptionManager(), // new argument
+		f.EncryptionManager(),
 		f.logger,
 	)
 	if err != nil {
@@ -433,7 +436,7 @@ func NewFactory() (*Factory, error) {
 	f.initializePayrollWorker()
 
 	// ============================================================
-	// Initialize analytics, student, and accounting consumers
+	// Initialize analytics, student, accounting, and inventory consumers
 	// ============================================================
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
 		// Analytics consumer – listens to academics-events topic
@@ -497,9 +500,7 @@ func NewFactory() (*Factory, error) {
 			f.logger.Warn("No Kafka consumers created for student consumer – disabled")
 		}
 
-		// ============================================================
-		// NEW: Accounting consumer – listens to accounting-events topic
-		// ============================================================
+		// Accounting consumer – listens to accounting-events topic
 		accountingTopic := "accounting-events"
 		accountingKafkaConsumer, err := client.NewKafkaConsumer(
 			f.config,
@@ -514,8 +515,8 @@ func NewFactory() (*Factory, error) {
 				f.accountingInfra.AccountingAnalyticsService(),
 				f.accountingInfra.ComplianceAnalyticsService(),
 				f.accountingInfra.TaxAnalyticsService(),
-				f.accountingInfra.AnalyticsRepo(), // repository for idempotency
-				f.postgresClient.DB,               // *sql.DB for transactions
+				f.accountingInfra.AnalyticsRepo(),
+				f.postgresClient.DB,
 				f.logger,
 				accountingKafkaConsumer,
 				accountingTopic,
@@ -529,12 +530,177 @@ func NewFactory() (*Factory, error) {
 			}()
 			f.logger.Info("Accounting consumer started", zap.String("topic", accountingTopic))
 		}
+
+		// Inventory consumer – listens to inventory-events topic
+		inventoryTopic := "inventory-events"
+		inventoryKafkaConsumer, err := client.NewKafkaConsumer(
+			f.config,
+			inventoryTopic,
+			"inventory-consumer-group",
+			f.logger,
+		)
+		if err != nil {
+			f.logger.Error("Failed to create inventory Kafka consumer", zap.Error(err))
+		} else {
+			inventoryAnalyticsSvc := f.inventoryInfra.InventoryAnalyticsService()
+			if inventoryAnalyticsSvc == nil {
+				f.logger.Error("InventoryAnalyticsService not available, cannot start inventory consumer")
+			} else {
+				f.inventoryConsumer = consumer.NewInventoryConsumer(
+					inventoryAnalyticsSvc,
+					f.logger,
+					inventoryKafkaConsumer,
+					inventoryTopic,
+					f.config.Kafka.Brokers,
+				)
+				ctx, cancel := context.WithCancel(context.Background())
+				f.inventoryConsumerCancel = cancel
+				go func() {
+					f.inventoryConsumer.Start(ctx)
+					f.logger.Info("Inventory consumer stopped")
+				}()
+				f.logger.Info("Inventory consumer started", zap.String("topic", inventoryTopic))
+			}
+		}
 	} else {
-		f.logger.Warn("Kafka not available – analytics, student, and accounting consumers disabled")
+		f.logger.Warn("Kafka not available – analytics, student, accounting, and inventory consumers disabled")
 	}
 
 	return f, nil
 }
+
+// ... (all other methods unchanged: PayrollJobRepository, ComponentRepository, etc.) ...
+
+func (f *Factory) Close() error {
+	f.closeOnce.Do(func() {
+		close(f.closed)
+
+		if f.kafkaLoggingMgr != nil {
+			if f.kafkaLoggingMgr.cancelCtx != nil {
+				f.kafkaLoggingMgr.cancelCtx()
+			}
+			f.kafkaLoggingMgr.wg.Wait()
+			if f.kafkaLoggingMgr.producer != nil {
+				if err := f.kafkaLoggingMgr.producer.Close(); err != nil {
+					f.logger.Error("Failed to close Kafka producer", zap.Error(err))
+				}
+			}
+		}
+
+		if f.kafkaProducer != nil {
+			if err := f.kafkaProducer.Close(); err != nil {
+				f.logger.Error("Failed to close Kafka producer", zap.Error(err))
+			} else {
+				f.logger.Info("Kafka producer closed successfully")
+			}
+		}
+
+		if f.attendanceOutboxCancel != nil {
+			f.logger.Info("Stopping attendance outbox service...")
+			f.attendanceOutboxCancel()
+		}
+		if f.attendanceResolutionCancel != nil {
+			f.logger.Info("Stopping attendance resolution consumer...")
+			f.attendanceResolutionCancel()
+		}
+		if f.auditOutboxCancel != nil {
+			f.logger.Info("Stopping audit outbox service...")
+			f.auditOutboxCancel()
+		}
+		if f.payrollWorkerCancel != nil {
+			f.logger.Info("Stopping payroll worker...")
+			f.payrollWorkerCancel()
+		}
+		if f.attendanceBatchOutboxCancel != nil {
+			f.logger.Info("Stopping attendance batch outbox processor...")
+			f.attendanceBatchOutboxCancel()
+		}
+
+		// Shutdown analytics and student consumers
+		if f.analyticsConsumerCancel != nil {
+			f.logger.Info("Stopping analytics consumer...")
+			f.analyticsConsumerCancel()
+		}
+		if f.studentConsumerCancel != nil {
+			f.logger.Info("Stopping student consumer...")
+			f.studentConsumerCancel()
+		}
+		if f.analyticsConsumer != nil {
+			if err := f.analyticsConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close analytics consumer", zap.Error(err))
+			}
+		}
+		if f.studentConsumer != nil {
+			if err := f.studentConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close student consumer", zap.Error(err))
+			}
+		}
+
+		// Shutdown accounting consumer
+		if f.accountingConsumerCancel != nil {
+			f.logger.Info("Stopping accounting consumer...")
+			f.accountingConsumerCancel()
+		}
+		if f.accountingConsumer != nil {
+			if err := f.accountingConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close accounting consumer", zap.Error(err))
+			}
+		}
+
+		// NEW: Shutdown inventory consumer
+		if f.inventoryConsumerCancel != nil {
+			f.logger.Info("Stopping inventory consumer...")
+			f.inventoryConsumerCancel()
+		}
+		if f.inventoryConsumer != nil {
+			if err := f.inventoryConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close inventory consumer", zap.Error(err))
+			}
+		}
+
+		// Close accounting infra (outbox processor)
+		if f.accountingInfra != nil {
+			f.accountingInfra.Close()
+		}
+
+		// Close inventory infra (outbox processor)
+		if f.inventoryInfra != nil {
+			f.inventoryInfra.Close()
+		}
+
+		if f.postgresClient != nil {
+			f.postgresClient.Close()
+		}
+		if f.clickhouseClient != nil {
+			f.clickhouseClient.Close()
+		}
+		if f.esClient != nil {
+			f.esClient.Close()
+		}
+		if f.serviceFactory != nil {
+			f.serviceFactory.Cleanup()
+		}
+		if f.scyllaClient != nil {
+			f.scyllaClient.Close()
+		}
+		if f.redisClient != nil {
+			f.redisClient.Close()
+		}
+		if f.encryptionManager != nil {
+			f.encryptionManager.ClearCache()
+		}
+		if f.wsService != nil {
+			if closer, ok := interface{}(f.wsService).(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+		}
+	})
+
+	return nil
+}
+
+// ... (remaining getters and methods unchanged, included below for completeness) ...
+
 func (f *Factory) PayrollJobRepository() payrollrepo.PayrollJobRepository {
 	if f.payrollJobRepo == nil {
 		f.payrollJobRepo = payrollrepo.NewPayrollJobRepository(
@@ -670,7 +836,7 @@ func (f *Factory) PayslipService() payrollsvc.PayslipService {
 	if f.payslipSvc == nil {
 		f.payslipSvc = payrollsvc.NewPayslipService(
 			f.PayslipRepository(),
-			f.emailSender, // <-- added email sender
+			f.emailSender,
 			f.logger,
 		)
 	}
@@ -2877,7 +3043,7 @@ func (f *Factory) InitializeHandlers() error {
 	}
 
 	// Retrieve inventory handlers from the inventory infrastructure factory
-	inventoryHandlers := f.GetInventoryHandlers() // <-- NEW
+	inventoryHandlers := f.GetInventoryHandlers()
 
 	f.router = handler.NewRouter(
 		otpHandler,
@@ -2933,7 +3099,7 @@ func (f *Factory) InitializeHandlers() error {
 		taxDeclarationHandler,
 		academicHandlers,
 		accountingHandlers,
-		inventoryHandlers, // <-- NEW (last argument)
+		inventoryHandlers,
 	)
 
 	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, and inventory systems")
@@ -2993,122 +3159,6 @@ func (f *Factory) HealthCheck(ctx context.Context) map[string]error {
 	return errs
 }
 
-func (f *Factory) Close() error {
-	f.closeOnce.Do(func() {
-		close(f.closed)
-
-		if f.kafkaLoggingMgr != nil {
-			if f.kafkaLoggingMgr.cancelCtx != nil {
-				f.kafkaLoggingMgr.cancelCtx()
-			}
-			f.kafkaLoggingMgr.wg.Wait()
-			if f.kafkaLoggingMgr.producer != nil {
-				if err := f.kafkaLoggingMgr.producer.Close(); err != nil {
-					f.logger.Error("Failed to close Kafka producer", zap.Error(err))
-				}
-			}
-		}
-
-		if f.kafkaProducer != nil {
-			if err := f.kafkaProducer.Close(); err != nil {
-				f.logger.Error("Failed to close Kafka producer", zap.Error(err))
-			} else {
-				f.logger.Info("Kafka producer closed successfully")
-			}
-		}
-
-		if f.attendanceOutboxCancel != nil {
-			f.logger.Info("Stopping attendance outbox service...")
-			f.attendanceOutboxCancel()
-		}
-		if f.attendanceResolutionCancel != nil {
-			f.logger.Info("Stopping attendance resolution consumer...")
-			f.attendanceResolutionCancel()
-		}
-		if f.auditOutboxCancel != nil {
-			f.logger.Info("Stopping audit outbox service...")
-			f.auditOutboxCancel()
-		}
-		if f.payrollWorkerCancel != nil {
-			f.logger.Info("Stopping payroll worker...")
-			f.payrollWorkerCancel()
-		}
-		if f.attendanceBatchOutboxCancel != nil {
-			f.logger.Info("Stopping attendance batch outbox processor...")
-			f.attendanceBatchOutboxCancel()
-		}
-
-		// Shutdown analytics and student consumers
-		if f.analyticsConsumerCancel != nil {
-			f.logger.Info("Stopping analytics consumer...")
-			f.analyticsConsumerCancel()
-		}
-		if f.studentConsumerCancel != nil {
-			f.logger.Info("Stopping student consumer...")
-			f.studentConsumerCancel()
-		}
-		if f.analyticsConsumer != nil {
-			if err := f.analyticsConsumer.Close(); err != nil {
-				f.logger.Error("Failed to close analytics consumer", zap.Error(err))
-			}
-		}
-		if f.studentConsumer != nil {
-			if err := f.studentConsumer.Close(); err != nil {
-				f.logger.Error("Failed to close student consumer", zap.Error(err))
-			}
-		}
-
-		// Shutdown accounting consumer
-		if f.accountingConsumerCancel != nil {
-			f.logger.Info("Stopping accounting consumer...")
-			f.accountingConsumerCancel()
-		}
-		if f.accountingConsumer != nil {
-			if err := f.accountingConsumer.Close(); err != nil {
-				f.logger.Error("Failed to close accounting consumer", zap.Error(err))
-			}
-		}
-
-		// Close accounting infra (outbox processor)
-		if f.accountingInfra != nil {
-			f.accountingInfra.Close()
-		}
-
-		// Close inventory infra (outbox processor)
-		if f.inventoryInfra != nil {
-			f.inventoryInfra.Close()
-		}
-
-		if f.postgresClient != nil {
-			f.postgresClient.Close()
-		}
-		if f.clickhouseClient != nil {
-			f.clickhouseClient.Close()
-		}
-		if f.esClient != nil {
-			f.esClient.Close()
-		}
-		if f.serviceFactory != nil {
-			f.serviceFactory.Cleanup()
-		}
-		if f.scyllaClient != nil {
-			f.scyllaClient.Close()
-		}
-		if f.redisClient != nil {
-			f.redisClient.Close()
-		}
-		if f.encryptionManager != nil {
-			f.encryptionManager.ClearCache()
-		}
-		if f.wsService != nil {
-			if closer, ok := interface{}(f.wsService).(interface{ Close() error }); ok {
-				_ = closer.Close()
-			}
-		}
-	})
-
-	return nil
-}
 func (f *Factory) Config() *config.Config                           { return f.config }
 func (f *Factory) TLSManager() *tls.TLSManager                      { return f.tlsManager }
 func (f *Factory) ScyllaClient() *scylla.ScyllaClient               { return f.scyllaClient }
