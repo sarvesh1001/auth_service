@@ -9,11 +9,11 @@ import (
 
 type Return struct {
 	ReturnID     uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnId"`
-	CompanyID    uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
-	OrderID      uuid.UUID       `gorm:"type:uuid;not null" json:"orderId"`
+	CompanyID    uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	OrderID      uuid.UUID       `gorm:"type:uuid;not null;index" json:"orderId"`
 	InvoiceID    *uuid.UUID      `gorm:"type:uuid" json:"invoiceId,omitempty"`
-	CreditNoteID *uuid.UUID      `gorm:"type:uuid" json:"creditNoteId,omitempty"`
-	ReturnNumber string          `gorm:"type:varchar(50);not null;uniqueIndex:idx_return_number" json:"returnNumber"`
+	CreditNoteID *uuid.UUID      `gorm:"column:credit_note_id;type:uuid" json:"creditNoteId,omitempty"` // explicit column name
+	ReturnNumber string          `gorm:"type:varchar(50);not null;uniqueIndex" json:"returnNumber"`
 	ReturnDate   time.Time       `gorm:"type:date;not null" json:"returnDate"`
 	Reason       *string         `gorm:"type:text" json:"reason,omitempty"`
 	Status       string          `gorm:"type:varchar(20);not null;default:'pending';check:status IN ('pending','approved','completed','rejected')" json:"status"`

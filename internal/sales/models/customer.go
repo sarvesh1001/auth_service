@@ -5,28 +5,39 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
-	"gorm.io/datatypes" // recommended for JSONB
 )
 
 type Customer struct {
-	CustomerID      uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"customerId"`
-	CompanyID       uuid.UUID        `gorm:"type:uuid;not null" json:"companyId"`
-	CustomerCode    string           `gorm:"type:varchar(50);not null;uniqueIndex:idx_customer_code" json:"customerCode"`
-	Name            string           `gorm:"type:varchar(255);not null" json:"name"`
-	Email           *string          `gorm:"type:varchar(255)" json:"email,omitempty"`
-	Phone           *string          `gorm:"type:varchar(50)" json:"phone,omitempty"`
-	TaxID           *string          `gorm:"type:varchar(100)" json:"taxId,omitempty"`
-	BillingAddress  datatypes.JSON   `gorm:"type:jsonb" json:"billingAddress,omitempty"`
-	ShippingAddress datatypes.JSON   `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
-	CreditLimit     *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
-	IsActive        bool             `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt       time.Time        `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt       time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy       *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy       *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
-}
+	CustomerID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"customerId"`
+	CompanyID    uuid.UUID `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerCode string    `gorm:"type:varchar(50);not null;uniqueIndex" json:"customerCode"`
+	Name         string    `gorm:"type:varchar(255);not null" json:"name"`
 
-// If you prefer to keep your own JSONB type, define it once in a shared package.
-// Here we use datatypes.JSON from GORM.
-// JSONB is a helper type for PostgreSQL jsonb; you can use datatypes.JSON from gorm.io/datatypes
-type JSONB map[string]interface{}
+	// Encrypted fields – store ciphertext + metadata
+	EmailEncrypted *string `gorm:"column:email;type:text" json:"-"`
+	EmailDEK       *string `gorm:"column:email_dek;type:text" json:"-"`
+	EmailKeyID     *string `gorm:"column:email_key_id;type:text" json:"-"`
+
+	PhoneEncrypted *string `gorm:"column:phone;type:text" json:"-"`
+	PhoneDEK       *string `gorm:"column:phone_dek;type:text" json:"-"`
+	PhoneKeyID     *string `gorm:"column:phone_key_id;type:text" json:"-"`
+
+	TaxIDEncrypted *string `gorm:"column:tax_id;type:text" json:"-"`
+	TaxIDDEK       *string `gorm:"column:tax_id_dek;type:text" json:"-"`
+	TaxIDKeyID     *string `gorm:"column:tax_id_key_id;type:text" json:"-"`
+
+	BillingAddressEncrypted *string `gorm:"column:billing_address;type:text" json:"-"`
+	BillingAddressDEK       *string `gorm:"column:billing_address_dek;type:text" json:"-"`
+	BillingAddressKeyID     *string `gorm:"column:billing_address_key_id;type:text" json:"-"`
+
+	ShippingAddressEncrypted *string `gorm:"column:shipping_address;type:text" json:"-"`
+	ShippingAddressDEK       *string `gorm:"column:shipping_address_dek;type:text" json:"-"`
+	ShippingAddressKeyID     *string `gorm:"column:shipping_address_key_id;type:text" json:"-"`
+
+	CreditLimit *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
+	IsActive    bool             `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt   time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt   time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy   *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy   *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}

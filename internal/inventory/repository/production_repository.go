@@ -37,17 +37,31 @@ type ProductionOrderRepository interface {
 	Count(ctx context.Context, db DBTX, filter ProductionOrderFilter) (int64, error)
 	AddComponent(ctx context.Context, db DBTX, comp *models.ProductionOrderComponent) error
 	GetComponents(ctx context.Context, db DBTX, orderID uuid.UUID) ([]*models.ProductionOrderComponent, error)
-	UpdateComponentActualQuantity(ctx context.Context, db DBTX, componentID uuid.UUID, actualQty decimal.Decimal, movementID *uuid.UUID) error
+	GetComponentByID(ctx context.Context, db DBTX, componentID uuid.UUID) (*models.ProductionOrderComponent, error)
 	DeleteComponents(ctx context.Context, db DBTX, orderID uuid.UUID) error
+
+	// New methods using consumption & scrap tables
+	GetTotalConsumedQty(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error)
+	GetTotalScrappedQty(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error)
+	GetRemainingToConsume(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error)
+	CanCompleteOrder(ctx context.Context, db DBTX, orderID uuid.UUID) (bool, error)
 }
 
 type productionOrderRepository struct {
-	logger *zap.Logger
+	logger          *zap.Logger
+	consumptionRepo ProductionOrderConsumptionRepository
+	scrapRepo       ProductionOrderScrapRepository
 }
 
-func NewProductionOrderRepository(logger *zap.Logger) ProductionOrderRepository {
+func NewProductionOrderRepository(
+	logger *zap.Logger,
+	consumptionRepo ProductionOrderConsumptionRepository,
+	scrapRepo ProductionOrderScrapRepository,
+) ProductionOrderRepository {
 	return &productionOrderRepository{
-		logger: logger.Named("production_order_repo"),
+		logger:          logger.Named("production_order_repo"),
+		consumptionRepo: consumptionRepo,
+		scrapRepo:       scrapRepo,
 	}
 }
 
@@ -186,16 +200,15 @@ func (r *productionOrderRepository) scanOrder(sc scanner) (*models.ProductionOrd
 
 func (r *productionOrderRepository) scanComponent(sc scanner) (*models.ProductionOrderComponent, error) {
 	var comp models.ProductionOrderComponent
-	var batchID, movementID uuid.NullUUID
+	var batchID uuid.NullUUID
 
+	// Removed actual_quantity from scan
 	err := sc.Scan(
 		&comp.ComponentID,
 		&comp.ProductionOrderID,
 		&comp.ItemID,
 		&batchID,
 		&comp.PlannedQuantity,
-		&comp.ActualQuantity,
-		&movementID,
 		&comp.CreatedAt,
 	)
 	if err != nil {
@@ -207,9 +220,6 @@ func (r *productionOrderRepository) scanComponent(sc scanner) (*models.Productio
 
 	if batchID.Valid {
 		comp.BatchID = &batchID.UUID
-	}
-	if movementID.Valid {
-		comp.MovementID = &movementID.UUID
 	}
 	return &comp, nil
 }
@@ -374,16 +384,17 @@ func (r *productionOrderRepository) Count(ctx context.Context, db DBTX, filter P
 }
 
 func (r *productionOrderRepository) AddComponent(ctx context.Context, db DBTX, comp *models.ProductionOrderComponent) error {
+	// Removed actual_quantity from INSERT
 	query := `
 		INSERT INTO production_order_components (
 			component_id, production_order_id, item_id, batch_id,
-			planned_quantity, actual_quantity, movement_id, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+			planned_quantity, created_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
 		comp.ComponentID, comp.ProductionOrderID, comp.ItemID, comp.BatchID,
-		comp.PlannedQuantity, comp.ActualQuantity, comp.MovementID,
+		comp.PlannedQuantity,
 	).Scan(&comp.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("add component: %w", err)
@@ -392,9 +403,10 @@ func (r *productionOrderRepository) AddComponent(ctx context.Context, db DBTX, c
 }
 
 func (r *productionOrderRepository) GetComponents(ctx context.Context, db DBTX, orderID uuid.UUID) ([]*models.ProductionOrderComponent, error) {
+	// Removed actual_quantity from SELECT
 	query := `
 		SELECT component_id, production_order_id, item_id, batch_id,
-		       planned_quantity, actual_quantity, movement_id, created_at
+		       planned_quantity, created_at
 		FROM production_order_components
 		WHERE production_order_id = $1
 		ORDER BY created_at
@@ -416,17 +428,16 @@ func (r *productionOrderRepository) GetComponents(ctx context.Context, db DBTX, 
 	return components, rows.Err()
 }
 
-func (r *productionOrderRepository) UpdateComponentActualQuantity(ctx context.Context, db DBTX, componentID uuid.UUID, actualQty decimal.Decimal, movementID *uuid.UUID) error {
+func (r *productionOrderRepository) GetComponentByID(ctx context.Context, db DBTX, componentID uuid.UUID) (*models.ProductionOrderComponent, error) {
+	// Removed actual_quantity from SELECT
 	query := `
-		UPDATE production_order_components
-		SET actual_quantity = $2, movement_id = $3
+		SELECT component_id, production_order_id, item_id, batch_id,
+		       planned_quantity, created_at
+		FROM production_order_components
 		WHERE component_id = $1
 	`
-	_, err := db.ExecContext(ctx, query, componentID, actualQty, movementID)
-	if err != nil {
-		return fmt.Errorf("update component actual quantity: %w", err)
-	}
-	return nil
+	row := db.QueryRowContext(ctx, query, componentID)
+	return r.scanComponent(row)
 }
 
 func (r *productionOrderRepository) DeleteComponents(ctx context.Context, db DBTX, orderID uuid.UUID) error {
@@ -435,4 +446,78 @@ func (r *productionOrderRepository) DeleteComponents(ctx context.Context, db DBT
 		return fmt.Errorf("delete components: %w", err)
 	}
 	return nil
+}
+
+// ---- Helper to get companyID from a component ----
+func (r *productionOrderRepository) getCompanyIDByComponentID(ctx context.Context, db DBTX, componentID uuid.UUID) (uuid.UUID, error) {
+	var companyID uuid.UUID
+	query := `
+		SELECT po.company_id
+		FROM production_order_components poc
+		JOIN production_orders po ON poc.production_order_id = po.production_order_id
+		WHERE poc.component_id = $1
+	`
+	err := db.QueryRowContext(ctx, query, componentID).Scan(&companyID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return uuid.Nil, inventory_errors.ErrNotFound
+		}
+		return uuid.Nil, fmt.Errorf("get companyID by component: %w", err)
+	}
+	return companyID, nil
+}
+
+// ---- New methods using consumption & scrap tables ----
+
+func (r *productionOrderRepository) GetTotalConsumedQty(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error) {
+	companyID, err := r.getCompanyIDByComponentID(ctx, db, componentID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return r.consumptionRepo.GetTotalConsumedByComponent(ctx, db, companyID, componentID)
+}
+
+func (r *productionOrderRepository) GetTotalScrappedQty(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error) {
+	companyID, err := r.getCompanyIDByComponentID(ctx, db, componentID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	return r.scrapRepo.GetTotalScrappedByComponent(ctx, db, companyID, componentID)
+}
+
+func (r *productionOrderRepository) GetRemainingToConsume(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error) {
+	comp, err := r.GetComponentByID(ctx, db, componentID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	consumed, err := r.GetTotalConsumedQty(ctx, db, componentID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	scrapped, err := r.GetTotalScrappedQty(ctx, db, componentID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	remaining := comp.PlannedQuantity.Sub(consumed).Sub(scrapped)
+	if remaining.LessThan(decimal.Zero) {
+		remaining = decimal.Zero
+	}
+	return remaining, nil
+}
+
+func (r *productionOrderRepository) CanCompleteOrder(ctx context.Context, db DBTX, orderID uuid.UUID) (bool, error) {
+	components, err := r.GetComponents(ctx, db, orderID)
+	if err != nil {
+		return false, err
+	}
+	for _, comp := range components {
+		remaining, err := r.GetRemainingToConsume(ctx, db, comp.ComponentID)
+		if err != nil {
+			return false, err
+		}
+		if remaining.GreaterThan(decimal.Zero) {
+			return false, nil
+		}
+	}
+	return true, nil
 }

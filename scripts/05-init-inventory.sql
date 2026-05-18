@@ -9,7 +9,7 @@ EXCEPTION WHEN duplicate_object THEN null;
 END $$;
 
 DO $$ BEGIN
-    CREATE TYPE movement_type AS ENUM ('purchase_in', 'sales_out', 'production_in', 'return_in', 'return_out', 'adjustment_in', 'adjustment_out','production_out', 'transfer');
+    CREATE TYPE movement_type AS ENUM ('purchase_in', 'sales_out', 'production_in', 'return_in', 'return_out', 'adjustment_in', 'adjustment_out','production_out', 'transfer' , 'production_scrap');
 EXCEPTION WHEN duplicate_object THEN null;
 END $$;
 
@@ -920,3 +920,90 @@ CREATE UNIQUE INDEX idx_purchase_orders_unique_active
 ON purchase_orders (company_id, po_number)
 WHERE deleted_at IS NULL;
 
+
+
+
+-- =====================================================================
+-- PRODUCTION ORDER COMPONENT CONSUMPTIONS (with company_id)
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS production_order_component_consumptions (
+    consumption_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id          UUID NOT NULL,                         -- multi‑tenant
+    component_id        UUID NOT NULL,
+    production_order_id UUID NOT NULL,
+    item_id             UUID NOT NULL,
+    batch_id            UUID,
+    quantity_consumed   NUMERIC(14,4) NOT NULL CHECK (quantity_consumed > 0),
+    movement_id         UUID NOT NULL UNIQUE,
+    consumed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          UUID,
+    notes               TEXT,
+
+    CONSTRAINT fk_consumption_company 
+        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_consumption_component 
+        FOREIGN KEY (component_id) REFERENCES production_order_components(component_id) ON DELETE CASCADE,
+    CONSTRAINT fk_consumption_order 
+        FOREIGN KEY (production_order_id) REFERENCES production_orders(production_order_id) ON DELETE CASCADE,
+    CONSTRAINT fk_consumption_item 
+        FOREIGN KEY (item_id) REFERENCES items(item_id),
+    CONSTRAINT fk_consumption_batch 
+        FOREIGN KEY (batch_id) REFERENCES batches(batch_id),
+    CONSTRAINT fk_consumption_movement 
+        FOREIGN KEY (movement_id) REFERENCES stock_movements(movement_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_consumption_created_by 
+        FOREIGN KEY (created_by) REFERENCES users(user_id)
+);
+
+CREATE INDEX idx_consumption_company ON production_order_component_consumptions(company_id);
+CREATE INDEX idx_consumption_component ON production_order_component_consumptions(component_id);
+CREATE INDEX idx_consumption_order ON production_order_component_consumptions(production_order_id);
+CREATE INDEX idx_consumption_movement ON production_order_component_consumptions(movement_id);
+
+-- =====================================================================
+-- PRODUCTION ORDER SCRAP (with company_id)
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS production_order_scrap (
+    scrap_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id          UUID NOT NULL,
+    production_order_id UUID NOT NULL,
+    component_id        UUID,
+    item_id             UUID NOT NULL,
+    batch_id            UUID,
+    scrap_quantity      NUMERIC(14,4) NOT NULL CHECK (scrap_quantity > 0),
+    movement_id         UUID NOT NULL UNIQUE,
+    reason              TEXT,
+    recorded_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          UUID,
+
+    CONSTRAINT fk_scrap_company 
+        FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_scrap_order 
+        FOREIGN KEY (production_order_id) REFERENCES production_orders(production_order_id) ON DELETE CASCADE,
+    CONSTRAINT fk_scrap_component 
+        FOREIGN KEY (component_id) REFERENCES production_order_components(component_id) ON DELETE SET NULL,
+    CONSTRAINT fk_scrap_item 
+        FOREIGN KEY (item_id) REFERENCES items(item_id),
+    CONSTRAINT fk_scrap_batch 
+        FOREIGN KEY (batch_id) REFERENCES batches(batch_id),
+    CONSTRAINT fk_scrap_movement 
+        FOREIGN KEY (movement_id) REFERENCES stock_movements(movement_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_scrap_created_by 
+        FOREIGN KEY (created_by) REFERENCES users(user_id)
+);
+
+CREATE INDEX idx_scrap_company ON production_order_scrap(company_id);
+CREATE INDEX idx_scrap_order ON production_order_scrap(production_order_id);
+CREATE INDEX idx_scrap_movement ON production_order_scrap(movement_id);
+
+-- Add the new movement type (if not already present)
+ALTER TYPE movement_type ADD VALUE IF NOT EXISTS 'production_scrap';
+
+ALTER TABLE production_order_components DROP COLUMN IF EXISTS actual_quantity;
+ALTER TABLE production_order_components DROP CONSTRAINT IF EXISTS fk_prod_comp_movement;
+ALTER TABLE production_order_components DROP COLUMN IF EXISTS movement_id;
+-- Remove redundant columns from production_order_components
+ALTER TABLE production_order_components 
+    DROP COLUMN IF EXISTS actual_quantity,
+    DROP CONSTRAINT IF EXISTS fk_prod_comp_movement,
+    DROP COLUMN IF EXISTS movement_id;

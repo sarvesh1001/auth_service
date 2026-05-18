@@ -10,8 +10,8 @@ import (
 
 type Payment struct {
 	PaymentID       uuid.UUID           `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"paymentId"`
-	CompanyID       uuid.UUID           `gorm:"type:uuid;not null" json:"companyId"`
-	PaymentNumber   string              `gorm:"type:varchar(50);not null;uniqueIndex:idx_payment_number" json:"paymentNumber"`
+	CompanyID       uuid.UUID           `gorm:"type:uuid;not null;index" json:"companyId"`
+	PaymentNumber   string              `gorm:"type:varchar(50);not null;uniqueIndex" json:"paymentNumber"`
 	ExternalRef     *string             `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
 	PaymentDate     time.Time           `gorm:"type:date;not null" json:"paymentDate"`
 	Amount          decimal.Decimal     `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
@@ -22,7 +22,7 @@ type Payment struct {
 	GatewayResponse JSONB               `gorm:"type:jsonb" json:"gatewayResponse,omitempty"`
 	FailureReason   *string             `gorm:"type:text" json:"failureReason,omitempty"`
 	CompletedAt     *time.Time          `gorm:"type:timestamptz" json:"completedAt,omitempty"`
-	RefundedAmount  *decimal.Decimal    `gorm:"type:numeric(14,4);default:0" json:"refundedAmount,omitempty"`
+	RefundedAmount  decimal.Decimal     `gorm:"type:numeric(14,4);default:0" json:"refundedAmount"` // NOT a pointer
 	CreatedAt       time.Time           `gorm:"not null;default:now()" json:"createdAt"`
 	UpdatedAt       time.Time           `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`

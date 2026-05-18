@@ -1,5 +1,143 @@
 
 ================================================================================
+FILE: ./models/production_order_component_consumption.go
+================================================================================
+
+// models/production_order_component_consumption.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// ProductionOrderComponentConsumption records each partial consumption of a component
+// for a production order (e.g., issue 60 units out of 100 planned).
+type ProductionOrderComponentConsumption struct {
+	ConsumptionID     uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null"`
+	ComponentID       uuid.UUID       `gorm:"type:uuid;not null"`
+	ProductionOrderID uuid.UUID       `gorm:"type:uuid;not null"`
+	ItemID            uuid.UUID       `gorm:"type:uuid;not null"`
+	BatchID           *uuid.UUID      `gorm:"type:uuid"`
+	QuantityConsumed  decimal.Decimal `gorm:"type:numeric(14,4);not null"`
+	MovementID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex"`
+	ConsumedAt        time.Time       `gorm:"not null;default:now()"`
+	CreatedBy         *uuid.UUID      `gorm:"type:uuid"`
+	Notes             *string         `gorm:"type:text"`
+}
+
+func (ProductionOrderComponentConsumption) TableName() string {
+	return "production_order_component_consumptions"
+}
+
+
+
+================================================================================
+FILE: ./models/purchase_order_receipt.go
+================================================================================
+
+// models/purchase_order_receipt.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PurchaseOrderReceipt struct {
+	ReceiptID        uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"receiptId"`
+	PurchaseOrderID  uuid.UUID       `gorm:"type:uuid;not null" json:"purchaseOrderId"`
+	POItemID         uuid.UUID       `gorm:"type:uuid;not null" json:"poItemId"`
+	ReceiptDate      time.Time       `gorm:"type:date;not null" json:"receiptDate"`
+	QuantityReceived decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantityReceived"`
+	UnitCost         decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	WarehouseID      uuid.UUID       `gorm:"type:uuid;not null" json:"warehouseId"`
+	BatchID          *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
+	MovementID       *uuid.UUID      `gorm:"type:uuid" json:"movementId,omitempty"`
+	CreatedAt        time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	CreatedBy        *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+}
+
+func (PurchaseOrderReceipt) TableName() string { return "purchase_order_receipts" }
+
+
+
+================================================================================
+FILE: ./models/vendor.go
+================================================================================
+
+// models/vendor.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Vendor struct {
+	VendorID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"vendorId"`
+	CompanyID  uuid.UUID `gorm:"type:uuid;not null" json:"companyId"`
+	VendorCode string    `gorm:"type:varchar(50);not null" json:"vendorCode"`
+	VendorName string    `gorm:"type:varchar(255);not null" json:"vendorName"`
+	VendorType *string   `gorm:"type:varchar(50)" json:"vendorType,omitempty"`
+
+	// Encrypted fields (plaintext will be stored in these variables for app use)
+	ContactPerson   string `json:"contactPerson,omitempty"`
+	Phone           string `json:"phone,omitempty"`
+	Email           string `json:"email,omitempty"`
+	Address         string `json:"address,omitempty"`
+	BankAccountNo   string `json:"bankAccountNo,omitempty"`
+	BankRoutingCode string `json:"bankRoutingCode,omitempty"`
+	BankName        string `json:"bankName,omitempty"`
+
+	// Database encrypted columns (for GORM or manual mapping)
+	ContactPersonEnc   string `gorm:"column:contact_person"`
+	ContactPersonDEK   string `gorm:"column:contact_person_dek"`
+	ContactPersonKeyID string `gorm:"column:contact_person_key_id"`
+
+	PhoneEnc   string `gorm:"column:phone"`
+	PhoneDEK   string `gorm:"column:phone_dek"`
+	PhoneKeyID string `gorm:"column:phone_key_id"`
+
+	EmailEnc   string `gorm:"column:email"`
+	EmailDEK   string `gorm:"column:email_dek"`
+	EmailKeyID string `gorm:"column:email_key_id"`
+
+	AddressEnc   string `gorm:"column:address"`
+	AddressDEK   string `gorm:"column:address_dek"`
+	AddressKeyID string `gorm:"column:address_key_id"`
+
+	BankAccountEnc   string `gorm:"column:bank_account_no"`
+	BankAccountDEK   string `gorm:"column:bank_account_no_dek"`
+	BankAccountKeyID string `gorm:"column:bank_account_no_key_id"`
+
+	BankRoutingEnc   string `gorm:"column:bank_routing_code"`
+	BankRoutingDEK   string `gorm:"column:bank_routing_code_dek"`
+	BankRoutingKeyID string `gorm:"column:bank_routing_code_key_id"`
+
+	BankNameEnc   string `gorm:"column:bank_name"`
+	BankNameDEK   string `gorm:"column:bank_name_dek"`
+	BankNameKeyID string `gorm:"column:bank_name_key_id"`
+
+	IsActive  bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	DeletedAt *time.Time `gorm:"type:timestamptz" json:"deletedAt,omitempty"`
+}
+
+func (Vendor) TableName() string { return "vendors" }
+
+
+
+================================================================================
 FILE: ./models/serial_number_transaction.go
 ================================================================================
 
@@ -168,6 +306,41 @@ type StockMovement struct {
 	ShipmentID      *uuid.UUID `gorm:"type:uuid" json:"shipmentId,omitempty"`
 	TransferOrderID *uuid.UUID `gorm:"type:uuid" json:"transferOrderId,omitempty"`
 }
+
+
+
+================================================================================
+FILE: ./models/purchase_order.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PurchaseOrder struct {
+	PurchaseOrderID      uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"purchaseOrderId"`
+	CompanyID            uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	PONumber             string          `gorm:"type:varchar(100);not null" json:"poNumber"`
+	VendorID             uuid.UUID       `gorm:"type:uuid;not null" json:"vendorId"`
+	OrderDate            time.Time       `gorm:"type:date;not null" json:"orderDate"`
+	ExpectedDeliveryDate *time.Time      `gorm:"type:date" json:"expectedDeliveryDate,omitempty"`
+	Status               string          `gorm:"type:varchar(20);not null;default:'draft'" json:"status"`
+	TotalAmount          decimal.Decimal `gorm:"type:numeric(14,4)" json:"totalAmount"`
+	Currency             string          `gorm:"type:varchar(3);default:'USD'" json:"currency"`
+	Notes                *string         `gorm:"type:text" json:"notes,omitempty"`
+	CreatedAt            time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt            time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy            *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy            *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	DeletedAt            *time.Time      `gorm:"type:timestamptz" json:"deletedAt,omitempty"`
+}
+
+func (PurchaseOrder) TableName() string { return "purchase_orders" }
 
 
 
@@ -350,6 +523,37 @@ type PickingList struct {
 }
 
 func (PickingList) TableName() string { return "picking_lists" }
+
+
+
+================================================================================
+FILE: ./models/vendor_tax_identifier.go
+================================================================================
+
+// models/vendor_tax_identifier.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type VendorTaxIdentifier struct {
+	TaxID     uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"taxId"`
+	VendorID  uuid.UUID `gorm:"type:uuid;not null" json:"vendorId"`
+	TaxType   string    `gorm:"type:varchar(50);not null" json:"taxType"`
+	TaxNumber string    `json:"taxNumber"` // plaintext
+	// Encrypted columns
+	TaxNumberEnc   string     `gorm:"column:tax_number"`
+	TaxNumberDEK   string     `gorm:"column:tax_number_dek"`
+	TaxNumberKeyID string     `gorm:"column:tax_number_key_id"`
+	IsPrimary      bool       `gorm:"not null;default:false" json:"isPrimary"`
+	CreatedAt      time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	CreatedBy      *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+}
+
+func (VendorTaxIdentifier) TableName() string { return "vendor_tax_identifiers" }
 
 
 
@@ -623,6 +827,43 @@ type InventoryValuation struct {
 
 
 ================================================================================
+FILE: ./models/production_order_scrap.go
+================================================================================
+
+// models/production_order_scrap.go
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// ProductionOrderScrap records scrapped material (component or finished good)
+// during production.
+// ProductionOrderScrap
+type ProductionOrderScrap struct {
+	ScrapID           uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null"`
+	ProductionOrderID uuid.UUID       `gorm:"type:uuid;not null"`
+	ComponentID       *uuid.UUID      `gorm:"type:uuid"`
+	ItemID            uuid.UUID       `gorm:"type:uuid;not null"`
+	BatchID           *uuid.UUID      `gorm:"type:uuid"`
+	ScrapQuantity     decimal.Decimal `gorm:"type:numeric(14,4);not null"`
+	MovementID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex"`
+	Reason            *string         `gorm:"type:text"`
+	RecordedAt        time.Time       `gorm:"not null;default:now()"`
+	CreatedBy         *uuid.UUID      `gorm:"type:uuid"`
+}
+
+func (ProductionOrderScrap) TableName() string {
+	return "production_order_scrap"
+}
+
+
+
+================================================================================
 FILE: ./models/inventory_location.go
 ================================================================================
 
@@ -637,6 +878,7 @@ import (
 type InventoryLocation struct {
 	LocationID       uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"locationId"`
 	CompanyID        uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	WarehouseID      uuid.UUID  `gorm:"type:uuid;not null" json:"warehouseId"` // NEW
 	Code             string     `gorm:"type:varchar(50);not null" json:"code"`
 	Name             string     `gorm:"type:varchar(255);not null" json:"name"`
 	LocationType     *string    `gorm:"type:varchar(50)" json:"locationType,omitempty"`
@@ -645,9 +887,7 @@ type InventoryLocation struct {
 	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
 }
 
-func (InventoryLocation) TableName() string {
-	return "inventory_locations"
-}
+func (InventoryLocation) TableName() string { return "inventory_locations" }
 
 
 
@@ -676,6 +916,36 @@ type Shipment struct {
 }
 
 func (Shipment) TableName() string { return "shipments" }
+
+
+
+================================================================================
+FILE: ./models/purchase_order_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PurchaseOrderItem struct {
+	POItemID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"poItemId"`
+	PurchaseOrderID  uuid.UUID       `gorm:"type:uuid;not null" json:"purchaseOrderId"`
+	ItemID           uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
+	QuantityOrdered  decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantityOrdered"`
+	QuantityReceived decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"quantityReceived"`
+	UnitCost         decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitCost"`
+	TotalLine        decimal.Decimal `gorm:"->" json:"totalLine"` // generated
+	ReceivedDate     *time.Time      `gorm:"type:date" json:"receivedDate,omitempty"`
+	CreatedAt        time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt        time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+}
+
+func (PurchaseOrderItem) TableName() string { return "purchase_order_items" }
 
 
 
@@ -804,8 +1074,8 @@ type ProductionOrderComponent struct {
 	BatchID           *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
 	PlannedQuantity   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"plannedQuantity"`
 	ActualQuantity    decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"actualQuantity"`
-	MovementID        *uuid.UUID      `gorm:"type:uuid" json:"movementId,omitempty"`
-	CreatedAt         time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	// MovementID removed – consumptions tracked via separate table
+	CreatedAt time.Time `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 func (ProductionOrderComponent) TableName() string {
@@ -857,6 +1127,29 @@ type PackingList struct {
 }
 
 func (PackingList) TableName() string { return "packing_lists" }
+
+
+
+================================================================================
+FILE: ./models/item_vendor.go
+================================================================================
+
+package models
+
+import (
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type ItemVendor struct {
+	ItemID    uuid.UUID       `gorm:"type:uuid;primaryKey" json:"itemId"`
+	VendorID  uuid.UUID       `gorm:"type:uuid;primaryKey" json:"vendorId"`
+	IsDefault bool            `gorm:"not null;default:false" json:"isDefault"`
+	LeadTime  *int            `gorm:"type:int" json:"leadTime,omitempty"`
+	UnitCost  decimal.Decimal `gorm:"type:numeric(14,4)" json:"unitCost,omitempty"`
+}
+
+func (ItemVendor) TableName() string { return "item_vendors" }
 
 
 
@@ -980,19 +1273,23 @@ func (MovementDailySummary) TableName() string { return "movement_daily_summary"
 FILE: ./models/enums/movement_type.go
 ================================================================================
 
+// models/enums/movement_type.go
+
 package enums
 
 type MovementType string
 
 const (
-	MovementTypePurchaseIn    MovementType = "purchase_in"
-	MovementTypeSalesOut      MovementType = "sales_out"
-	MovementTypeProductionIn  MovementType = "production_in"
-	MovementTypeReturnIn      MovementType = "return_in"
-	MovementTypeReturnOut     MovementType = "return_out"
-	MovementTypeAdjustmentIn  MovementType = "adjustment_in"
-	MovementTypeAdjustmentOut MovementType = "adjustment_out"
-	MovementTypeTransfer      MovementType = "transfer"
+	MovementTypePurchaseIn      MovementType = "purchase_in"
+	MovementTypeSalesOut        MovementType = "sales_out"
+	MovementTypeProductionIn    MovementType = "production_in"
+	MovementTypeReturnIn        MovementType = "return_in"
+	MovementTypeReturnOut       MovementType = "return_out"
+	MovementTypeAdjustmentIn    MovementType = "adjustment_in"
+	MovementTypeAdjustmentOut   MovementType = "adjustment_out"
+	MovementTypeTransfer        MovementType = "transfer"
+	MovementTypeProductionOut   MovementType = "production_out"   // existing (if defined)
+	MovementTypeProductionScrap MovementType = "production_scrap" // NEW
 )
 
 // ValidMovementTypes returns all valid movement types.
@@ -1006,6 +1303,8 @@ func ValidMovementTypes() []MovementType {
 		MovementTypeAdjustmentIn,
 		MovementTypeAdjustmentOut,
 		MovementTypeTransfer,
+		MovementTypeProductionOut,
+		MovementTypeProductionScrap, // added
 	}
 }
 
@@ -1014,7 +1313,8 @@ func (m MovementType) IsValid() bool {
 	switch m {
 	case MovementTypePurchaseIn, MovementTypeSalesOut, MovementTypeProductionIn,
 		MovementTypeReturnIn, MovementTypeReturnOut, MovementTypeAdjustmentIn,
-		MovementTypeAdjustmentOut, MovementTypeTransfer:
+		MovementTypeAdjustmentOut, MovementTypeTransfer, MovementTypeProductionOut,
+		MovementTypeProductionScrap:
 		return true
 	}
 	return false
@@ -1033,7 +1333,8 @@ func (m MovementType) IsInbound() bool {
 // IsOutbound returns true if the movement decreases stock.
 func (m MovementType) IsOutbound() bool {
 	switch m {
-	case MovementTypeSalesOut, MovementTypeReturnOut, MovementTypeAdjustmentOut, MovementTypeTransfer:
+	case MovementTypeSalesOut, MovementTypeReturnOut, MovementTypeAdjustmentOut,
+		MovementTypeTransfer, MovementTypeProductionOut, MovementTypeProductionScrap:
 		return true
 	default:
 		return false

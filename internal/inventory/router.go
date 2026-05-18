@@ -146,6 +146,13 @@ func RegisterInventoryRoutes(
 					Post("/release", handlers.ProductionHandler.Release)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("production.order.start", logger)).
 					Post("/start", handlers.ProductionHandler.Start)
+
+				// NEW: partial consumption and scrap recording
+				r.With(authMiddleware.BitmaskPermissionMiddleware("production.order.update", logger)).
+					Post("/consume", handlers.ProductionHandler.ConsumeComponent)
+				r.With(authMiddleware.BitmaskPermissionMiddleware("production.order.update", logger)).
+					Post("/scrap", handlers.ProductionHandler.RecordScrap)
+
 				r.With(authMiddleware.BitmaskPermissionMiddleware("production.order.finish", logger)).
 					Post("/complete", handlers.ProductionHandler.Complete)
 				r.With(authMiddleware.BitmaskPermissionMiddleware("production.order.cancel", logger)).

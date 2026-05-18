@@ -35,16 +35,14 @@ func (ProductionOrder) TableName() string {
 	return "production_orders"
 }
 
-// ProductionOrderComponent records actual raw material consumption for a production order.
 type ProductionOrderComponent struct {
 	ComponentID       uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"componentId"`
 	ProductionOrderID uuid.UUID       `gorm:"type:uuid;not null" json:"productionOrderId"`
 	ItemID            uuid.UUID       `gorm:"type:uuid;not null" json:"itemId"`
 	BatchID           *uuid.UUID      `gorm:"type:uuid" json:"batchId,omitempty"`
 	PlannedQuantity   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"plannedQuantity"`
-	ActualQuantity    decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"actualQuantity"`
-	MovementID        *uuid.UUID      `gorm:"type:uuid" json:"movementId,omitempty"`
-	CreatedAt         time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	// ActualQuantity removed – actual consumption is tracked in production_order_component_consumptions table
+	CreatedAt time.Time `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 func (ProductionOrderComponent) TableName() string {

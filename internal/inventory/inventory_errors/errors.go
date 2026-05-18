@@ -18,11 +18,18 @@ var (
 	ErrOpenReorderExists           = errors.New("open reorder order already exists")
 	ErrInactiveBOM                 = errors.New("BOM is inactive")
 	ErrInvalidProductionCompletion = errors.New("invalid production completion data")
-	ErrParentWarehouseMismatch     = errors.New("parent location must belong to the same warehouse") // NEW
+	ErrParentWarehouseMismatch     = errors.New("parent location must belong to the same warehouse")
+	ErrInvalidQuantity             = errors.New("invalid quantity")             // NEW
+	ErrProductionOrderNotStarted   = errors.New("production order not started") // NEW (optional)
+	ErrComponentNotFound           = errors.New("component not found")          // NEW
+	ErrBatchNotFound               = errors.New("batch not found")              // NEW
 
+	// Event constants (not errors)
 	EventDropshipRequired     = "inventory.dropship.required"
 	EventFulfillmentBackorder = "inventory.fulfillment.backorder"
 )
+
+// --- Helper functions ---
 
 func IsNotFound(err error) bool {
 	return errors.Is(err, ErrNotFound)
@@ -80,7 +87,22 @@ func IsInactiveBOM(err error) bool {
 	return errors.Is(err, ErrInactiveBOM)
 }
 
-// Optional helper for parent warehouse mismatch
 func IsParentWarehouseMismatch(err error) bool {
 	return errors.Is(err, ErrParentWarehouseMismatch)
+}
+
+func IsInvalidQuantity(err error) bool {
+	return errors.Is(err, ErrInvalidQuantity)
+}
+
+func IsProductionOrderNotStarted(err error) bool {
+	return errors.Is(err, ErrProductionOrderNotStarted)
+}
+
+func IsComponentNotFound(err error) bool {
+	return errors.Is(err, ErrComponentNotFound)
+}
+
+func IsBatchNotFound(err error) bool {
+	return errors.Is(err, ErrBatchNotFound)
 }

@@ -1,5 +1,164 @@
 
 ================================================================================
+FILE: ./repository/packing_list_item_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+type PackingListItemRepository interface {
+	Create(ctx context.Context, db DBTX, item *models.PackingListItem) error
+	BulkCreate(ctx context.Context, db DBTX, items []*models.PackingListItem) error
+	GetByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) ([]*models.PackingListItem, error)
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingListItem, error)
+	// AddPackedQty increments the packed quantity by the given delta.
+	AddPackedQty(ctx context.Context, db DBTX, id uuid.UUID, delta decimal.Decimal) error
+	DeleteByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) error
+}
+
+type packingListItemRepository struct {
+	logger *zap.Logger
+}
+
+func NewPackingListItemRepository(logger *zap.Logger) PackingListItemRepository {
+	return &packingListItemRepository{
+		logger: logger.Named("packing_list_item_repo"),
+	}
+}
+
+func (r *packingListItemRepository) scanPackingListItem(s scanner) (*models.PackingListItem, error) {
+	var item models.PackingListItem
+	var createdAt time.Time
+
+	err := s.Scan(
+		&item.PackingItemID,
+		&item.PackingListID,
+		&item.ShipmentItemID,
+		&item.PackedQty,
+		&createdAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan packing list item: %w", err)
+	}
+	item.CreatedAt = createdAt
+	return &item, nil
+}
+
+func (r *packingListItemRepository) Create(ctx context.Context, db DBTX, item *models.PackingListItem) error {
+	query := `
+		INSERT INTO packing_list_items (
+			packing_item_id, packing_list_id, shipment_item_id, packed_qty, created_at
+		) VALUES ($1, $2, $3, $4, NOW())
+	`
+	_, err := db.ExecContext(ctx, query,
+		item.PackingItemID, item.PackingListID, item.ShipmentItemID, item.PackedQty,
+	)
+	if err != nil {
+		r.logger.Error("failed to create packing list item", util.ErrorField(err))
+		return fmt.Errorf("create packing list item: %w", err)
+	}
+	return nil
+}
+
+func (r *packingListItemRepository) BulkCreate(ctx context.Context, db DBTX, items []*models.PackingListItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	query := `
+		INSERT INTO packing_list_items (
+			packing_item_id, packing_list_id, shipment_item_id, packed_qty, created_at
+		) VALUES ($1, $2, $3, $4, NOW())
+	`
+	for _, it := range items {
+		_, err := db.ExecContext(ctx, query,
+			it.PackingItemID, it.PackingListID, it.ShipmentItemID, it.PackedQty,
+		)
+		if err != nil {
+			return fmt.Errorf("bulk create packing list item: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *packingListItemRepository) GetByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) ([]*models.PackingListItem, error) {
+	query := `
+		SELECT packing_item_id, packing_list_id, shipment_item_id, packed_qty, created_at
+		FROM packing_list_items
+		WHERE packing_list_id = $1
+		ORDER BY created_at
+	`
+	rows, err := db.QueryContext(ctx, query, packingListID)
+	if err != nil {
+		return nil, fmt.Errorf("get by packing list: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PackingListItem
+	for rows.Next() {
+		it, err := r.scanPackingListItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, it)
+	}
+	return result, rows.Err()
+}
+
+func (r *packingListItemRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingListItem, error) {
+	query := `
+		SELECT packing_item_id, packing_list_id, shipment_item_id, packed_qty, created_at
+		FROM packing_list_items
+		WHERE packing_item_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, id)
+	return r.scanPackingListItem(row)
+}
+
+// AddPackedQty increments the packed quantity by the given delta.
+func (r *packingListItemRepository) AddPackedQty(ctx context.Context, db DBTX, id uuid.UUID, delta decimal.Decimal) error {
+	query := `
+		UPDATE packing_list_items
+		SET packed_qty = packed_qty + $2
+		WHERE packing_item_id = $1
+	`
+	res, err := db.ExecContext(ctx, query, id, delta)
+	if err != nil {
+		return fmt.Errorf("add packed qty: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: packing list item %s", inventory_errors.ErrNotFound, id)
+	}
+	return nil
+}
+
+func (r *packingListItemRepository) DeleteByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM packing_list_items WHERE packing_list_id = $1`, packingListID)
+	if err != nil {
+		return fmt.Errorf("delete by packing list: %w", err)
+	}
+	return nil
+}
+
+
+================================================================================
 FILE: ./repository/item_repository.go
 ================================================================================
 
@@ -9,6 +168,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,6 +181,9 @@ import (
 	"auth-service/internal/inventory/models/enums"
 	"auth-service/internal/util"
 )
+
+// ErrInvalidSortField indicates that the provided sort field is not allowed.
+var ErrInvalidSortField = errors.New("invalid sort field")
 
 // ItemFilter for listing/filtering items
 type ItemFilter struct {
@@ -50,6 +213,7 @@ type ItemRepository interface {
 	GetBySKU(ctx context.Context, db DBTX, companyID uuid.UUID, sku string) (*models.Item, error)
 	Update(ctx context.Context, db DBTX, item *models.Item) error
 	Delete(ctx context.Context, db DBTX, itemID uuid.UUID) error // soft delete
+	ExistsBySKUExcludingID(ctx context.Context, db DBTX, companyID uuid.UUID, sku string, excludeID uuid.UUID) (bool, error)
 
 	// Listing & filtering
 	List(ctx context.Context, db DBTX, filter ItemFilter, p Pagination, s Sort) ([]*models.Item, error)
@@ -84,10 +248,11 @@ func NewItemRepository(logger *zap.Logger) ItemRepository {
 // ---------- helpers ----------
 func (r *itemRepository) validateSort(s Sort, allowed map[string]bool) (string, error) {
 	if s.Field == "" {
-		return "", fmt.Errorf("sort field required")
+		// Empty field is acceptable, use default
+		return "", nil
 	}
 	if !allowed[s.Field] {
-		return "", fmt.Errorf("invalid sort field: %s", s.Field)
+		return "", fmt.Errorf("%w: %s", ErrInvalidSortField, s.Field)
 	}
 	dir := strings.ToUpper(s.Direction)
 	if dir != "ASC" && dir != "DESC" {
@@ -335,11 +500,17 @@ func (r *itemRepository) List(ctx context.Context, db DBTX, filter ItemFilter, p
 		"item_type":  true,
 		"created_at": true,
 		"updated_at": true,
+		"item_id":    true, // 🔧 Add this line
 	}
 	orderBy, err := r.validateSort(s, allowedSort)
 	if err != nil {
-		orderBy = "ORDER BY name ASC"
+		// Return the error (including ErrInvalidSortField) to the caller
+		return nil, err
 	}
+	if orderBy == "" {
+		orderBy = "ORDER BY name ASC" // default sort when field is empty
+	}
+
 	limit, offset := r.validatePagination(p)
 
 	query := fmt.Sprintf(`
@@ -581,6 +752,439 @@ func (r *itemRepository) GetAllActiveItems(ctx context.Context, db DBTX, company
 		IsActive:  &active,
 	}
 	return r.List(ctx, db, filter, Pagination{Limit: 100000}, Sort{Field: "item_id", Direction: "ASC"})
+}
+func (r *itemRepository) ExistsBySKUExcludingID(ctx context.Context, db DBTX, companyID uuid.UUID, sku string, excludeID uuid.UUID) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM items WHERE company_id = $1 AND sku = $2 AND item_id != $3)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, sku, excludeID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check SKU existence excluding ID: %w", err)
+	}
+	return exists, nil
+}
+
+
+
+================================================================================
+FILE: ./repository/inventory_cycle_count_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+// InventoryCycleCountRepository defines operations for cycle counts.
+type InventoryCycleCountRepository interface {
+	Create(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error
+	GetByID(ctx context.Context, db DBTX, cycleCountID uuid.UUID) (*models.InventoryCycleCount, error)
+	GetByUnique(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, itemID *uuid.UUID, scheduledDate *time.Time) (*models.InventoryCycleCount, error) // new method
+	UpdateStatus(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, status string, updatedAt time.Time) error
+	CompleteCount(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, countedBy uuid.UUID, actualQuantity decimal.Decimal, adjustmentMovementID *uuid.UUID) error
+	ListByWarehouse(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, filter CycleCountFilter, p Pagination, s Sort) ([]*models.InventoryCycleCount, int64, error)
+	Update(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error // optional, for full update
+	Delete(ctx context.Context, tx DBTX, cycleCountID uuid.UUID) error
+}
+
+// CycleCountFilter for listing.
+type CycleCountFilter struct {
+	CompanyID   uuid.UUID
+	WarehouseID *uuid.UUID
+	ItemID      *uuid.UUID
+	LocationID  *uuid.UUID
+	CountType   *string
+	Status      *string
+	DateFrom    *time.Time
+	DateTo      *time.Time
+}
+
+type inventoryCycleCountRepository struct {
+	logger *zap.Logger
+}
+
+func NewInventoryCycleCountRepository(logger *zap.Logger) InventoryCycleCountRepository {
+	return &inventoryCycleCountRepository{
+		logger: logger.Named("inventory_cycle_count_repo"),
+	}
+}
+
+func (r *inventoryCycleCountRepository) validateSort(s Sort, allowed map[string]bool) (string, error) {
+	if s.Field == "" {
+		return "", fmt.Errorf("sort field required")
+	}
+	if !allowed[s.Field] {
+		return "", fmt.Errorf("invalid sort field: %s", s.Field)
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "ASC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", s.Field, dir), nil
+}
+
+func (r *inventoryCycleCountRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+func (r *inventoryCycleCountRepository) buildCycleCountFilter(filter CycleCountFilter) (string, []interface{}) {
+	var conds []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conds = append(conds, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.WarehouseID != nil {
+		conds = append(conds, fmt.Sprintf("warehouse_id = $%d", idx))
+		args = append(args, *filter.WarehouseID)
+		idx++
+	}
+	if filter.ItemID != nil {
+		conds = append(conds, fmt.Sprintf("item_id = $%d", idx))
+		args = append(args, *filter.ItemID)
+		idx++
+	}
+	if filter.LocationID != nil {
+		conds = append(conds, fmt.Sprintf("location_id = $%d", idx))
+		args = append(args, *filter.LocationID)
+		idx++
+	}
+	if filter.CountType != nil && *filter.CountType != "" {
+		conds = append(conds, fmt.Sprintf("count_type = $%d", idx))
+		args = append(args, *filter.CountType)
+		idx++
+	}
+	if filter.Status != nil && *filter.Status != "" {
+		conds = append(conds, fmt.Sprintf("status = $%d", idx))
+		args = append(args, *filter.Status)
+		idx++
+	}
+	if filter.DateFrom != nil {
+		conds = append(conds, fmt.Sprintf("scheduled_date >= $%d", idx))
+		args = append(args, *filter.DateFrom)
+		idx++
+	}
+	if filter.DateTo != nil {
+		conds = append(conds, fmt.Sprintf("scheduled_date <= $%d", idx))
+		args = append(args, *filter.DateTo)
+		idx++
+	}
+
+	if len(conds) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conds, " AND "), args
+}
+
+func (r *inventoryCycleCountRepository) scanCycleCount(s scanner) (*models.InventoryCycleCount, error) {
+	var cc models.InventoryCycleCount
+	var itemID, locationID, countedBy, adjustmentMovementID uuid.NullUUID
+	var scheduledDate, countedAt sql.NullTime
+	var expectedQuantity, actualQuantity sql.NullFloat64
+
+	err := s.Scan(
+		&cc.CycleCountID,
+		&cc.CompanyID,
+		&cc.WarehouseID,
+		&itemID,
+		&locationID,
+		&cc.CountType,
+		&cc.Status,
+		&scheduledDate,
+		&countedBy,
+		&countedAt,
+		&expectedQuantity,
+		&actualQuantity,
+		&cc.Variance,
+		&adjustmentMovementID,
+		&cc.CreatedAt,
+		&cc.UpdatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan cycle count: %w", err)
+	}
+
+	if itemID.Valid {
+		cc.ItemID = &itemID.UUID
+	}
+	if locationID.Valid {
+		cc.LocationID = &locationID.UUID
+	}
+	if scheduledDate.Valid {
+		cc.ScheduledDate = &scheduledDate.Time
+	}
+	if countedBy.Valid {
+		cc.CountedBy = &countedBy.UUID
+	}
+	if countedAt.Valid {
+		cc.CountedAt = &countedAt.Time
+	}
+	if expectedQuantity.Valid {
+		cc.ExpectedQuantity = decimal.NewFromFloat(expectedQuantity.Float64)
+	}
+	if actualQuantity.Valid {
+		cc.ActualQuantity = decimal.NewFromFloat(actualQuantity.Float64)
+	}
+	if adjustmentMovementID.Valid {
+		cc.AdjustmentMovementID = &adjustmentMovementID.UUID
+	}
+	return &cc, nil
+}
+
+// Create inserts a new cycle count record. Returns inventory_errors.ErrDuplicate if a record already exists
+// for the same company, warehouse, item, and scheduled date.
+func (r *inventoryCycleCountRepository) Create(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error {
+	query := `
+		INSERT INTO inventory_cycle_counts (
+			cycle_count_id, company_id, warehouse_id, item_id, location_id,
+			count_type, status, scheduled_date, counted_by, counted_at,
+			expected_quantity, actual_quantity, adjustment_movement_id,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+		RETURNING created_at, updated_at
+	`
+	err := tx.QueryRowContext(ctx, query,
+		count.CycleCountID,
+		count.CompanyID,
+		count.WarehouseID,
+		nullUUIDParam(count.ItemID),
+		nullUUIDParam(count.LocationID),
+		count.CountType,
+		count.Status,
+		count.ScheduledDate,
+		nullUUIDParam(count.CountedBy),
+		count.CountedAt,
+		count.ExpectedQuantity,
+		count.ActualQuantity,
+		nullUUIDParam(count.AdjustmentMovementID),
+	).Scan(&count.CreatedAt, &count.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create cycle count", util.ErrorField(err))
+		// Detect unique constraint violation (duplicate company/warehouse/item/date)
+		if strings.Contains(err.Error(), "duplicate key value violates unique constraint") {
+			return inventory_errors.ErrDuplicate
+		}
+		return fmt.Errorf("create cycle count: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves a cycle count by its ID.
+func (r *inventoryCycleCountRepository) GetByID(ctx context.Context, db DBTX, cycleCountID uuid.UUID) (*models.InventoryCycleCount, error) {
+	query := `
+		SELECT cycle_count_id, company_id, warehouse_id, item_id, location_id,
+		       count_type, status, scheduled_date, counted_by, counted_at,
+		       expected_quantity, actual_quantity, variance, adjustment_movement_id,
+		       created_at, updated_at
+		FROM inventory_cycle_counts
+		WHERE cycle_count_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, cycleCountID)
+	return r.scanCycleCount(row)
+}
+
+// GetByUnique retrieves a cycle count by its natural key: company_id, warehouse_id, item_id, scheduled_date.
+// Returns inventory_errors.ErrNotFound if not found.
+func (r *inventoryCycleCountRepository) GetByUnique(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, itemID *uuid.UUID, scheduledDate *time.Time) (*models.InventoryCycleCount, error) {
+	query := `
+		SELECT cycle_count_id, company_id, warehouse_id, item_id, location_id,
+		       count_type, status, scheduled_date, counted_by, counted_at,
+		       expected_quantity, actual_quantity, variance, adjustment_movement_id,
+		       created_at, updated_at
+		FROM inventory_cycle_counts
+		WHERE company_id = $1 AND warehouse_id = $2 AND item_id = $3 AND scheduled_date = $4
+	`
+	row := db.QueryRowContext(ctx, query, companyID, warehouseID, nullUUIDParam(itemID), scheduledDate)
+	return r.scanCycleCount(row)
+}
+
+// UpdateStatus updates only the status of a cycle count.
+func (r *inventoryCycleCountRepository) UpdateStatus(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, status string, updatedAt time.Time) error {
+	query := `
+		UPDATE inventory_cycle_counts
+		SET status = $2, updated_at = $3
+		WHERE cycle_count_id = $1
+	`
+	result, err := tx.ExecContext(ctx, query, cycleCountID, status, updatedAt)
+	if err != nil {
+		return fmt.Errorf("update cycle count status: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: cycle count %s", inventory_errors.ErrNotFound, cycleCountID)
+	}
+	return nil
+}
+
+// CompleteCount marks a cycle count as completed, records counted_by, counted_at, actual_quantity, and optional adjustment movement.
+func (r *inventoryCycleCountRepository) CompleteCount(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, countedBy uuid.UUID, actualQuantity decimal.Decimal, adjustmentMovementID *uuid.UUID) error {
+	query := `
+		UPDATE inventory_cycle_counts
+		SET status = 'completed',
+		    counted_by = $2,
+		    counted_at = NOW(),
+		    actual_quantity = $3,
+		    adjustment_movement_id = $4,
+		    updated_at = NOW()
+		WHERE cycle_count_id = $1
+		RETURNING updated_at
+	`
+	var updatedAt time.Time
+	err := tx.QueryRowContext(ctx, query, cycleCountID, countedBy, actualQuantity, nullUUIDParam(adjustmentMovementID)).Scan(&updatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: cycle count %s", inventory_errors.ErrNotFound, cycleCountID)
+		}
+		return fmt.Errorf("complete cycle count: %w", err)
+	}
+	return nil
+}
+
+// ListByWarehouse returns cycle counts for a specific warehouse with filtering and pagination.
+func (r *inventoryCycleCountRepository) ListByWarehouse(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, filter CycleCountFilter, p Pagination, s Sort) ([]*models.InventoryCycleCount, int64, error) {
+	// Ensure the filter uses the provided company and warehouse
+	filter.CompanyID = companyID
+	filter.WarehouseID = &warehouseID
+
+	where, args := r.buildCycleCountFilter(filter)
+
+	allowedSort := map[string]bool{
+		"scheduled_date": true,
+		"created_at":     true,
+		"status":         true,
+		"count_type":     true,
+	}
+	orderBy, err := r.validateSort(s, allowedSort)
+	if err != nil {
+		orderBy = "ORDER BY scheduled_date DESC, created_at DESC"
+	}
+
+	limit, offset := r.validatePagination(p)
+
+	// Count total
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM inventory_cycle_counts %s", where)
+	var total int64
+	err = db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count cycle counts: %w", err)
+	}
+	if total == 0 {
+		return []*models.InventoryCycleCount{}, 0, nil
+	}
+
+	// Main query
+	query := fmt.Sprintf(`
+		SELECT cycle_count_id, company_id, warehouse_id, item_id, location_id,
+		       count_type, status, scheduled_date, counted_by, counted_at,
+		       expected_quantity, actual_quantity, variance, adjustment_movement_id,
+		       created_at, updated_at
+		FROM inventory_cycle_counts
+		%s
+		%s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list cycle counts: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.InventoryCycleCount
+	for rows.Next() {
+		cc, err := r.scanCycleCount(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		result = append(result, cc)
+	}
+	return result, total, rows.Err()
+}
+
+// Update updates the entire cycle count record (optional, for full updates).
+func (r *inventoryCycleCountRepository) Update(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error {
+	query := `
+		UPDATE inventory_cycle_counts
+		SET warehouse_id = $2,
+		    item_id = $3,
+		    location_id = $4,
+		    count_type = $5,
+		    status = $6,
+		    scheduled_date = $7,
+		    counted_by = $8,
+		    counted_at = $9,
+		    expected_quantity = $10,
+		    actual_quantity = $11,
+		    adjustment_movement_id = $12,
+		    updated_at = NOW()
+		WHERE cycle_count_id = $1
+		RETURNING updated_at
+	`
+	err := tx.QueryRowContext(ctx, query,
+		count.CycleCountID,
+		count.WarehouseID,
+		nullUUIDParam(count.ItemID),
+		nullUUIDParam(count.LocationID),
+		count.CountType,
+		count.Status,
+		count.ScheduledDate,
+		nullUUIDParam(count.CountedBy),
+		count.CountedAt,
+		count.ExpectedQuantity,
+		count.ActualQuantity,
+		nullUUIDParam(count.AdjustmentMovementID),
+	).Scan(&count.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("%w: cycle count %s", inventory_errors.ErrNotFound, count.CycleCountID)
+		}
+		return fmt.Errorf("update cycle count: %w", err)
+	}
+	return nil
+}
+
+// Delete permanently removes a cycle count (soft delete not required – use status = 'cancelled').
+func (r *inventoryCycleCountRepository) Delete(ctx context.Context, tx DBTX, cycleCountID uuid.UUID) error {
+	query := `DELETE FROM inventory_cycle_counts WHERE cycle_count_id = $1`
+	result, err := tx.ExecContext(ctx, query, cycleCountID)
+	if err != nil {
+		return fmt.Errorf("delete cycle count: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: cycle count %s", inventory_errors.ErrNotFound, cycleCountID)
+	}
+	return nil
 }
 
 
@@ -1415,6 +2019,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
@@ -1637,6 +2242,9 @@ func (r *fulfillmentRepository) scanOrderItem(s scanner) (*models.FulfillmentOrd
 	return &item, nil
 }
 
+// AddOrderItems inserts multiple fulfillment order items.
+// If a foreign key violation occurs (e.g., item_id does not exist),
+// it returns inventory_errors.ErrNotFound with a clear message.
 func (r *fulfillmentRepository) AddOrderItems(ctx context.Context, db DBTX, items []*models.FulfillmentOrderItem) error {
 	if len(items) == 0 {
 		return nil
@@ -1652,6 +2260,12 @@ func (r *fulfillmentRepository) AddOrderItems(ctx context.Context, db DBTX, item
 			it.OrderedQty, it.FulfilledQty, it.BackorderedQty,
 		)
 		if err != nil {
+			// Detect foreign key violation (item not found)
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23503" {
+				if strings.Contains(pqErr.Message, "fk_fulfillment_item_item") {
+					return fmt.Errorf("%w: item %s does not exist", inventory_errors.ErrNotFound, it.ItemID)
+				}
+			}
 			return fmt.Errorf("add fulfillment order item: %w", err)
 		}
 	}
@@ -2471,6 +3085,1541 @@ func (r *serialRepository) List(ctx context.Context, db DBTX, filter SerialFilte
 
 
 ================================================================================
+FILE: ./repository/picking_list_item_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+type PickingListItemRepository interface {
+	Create(ctx context.Context, tx DBTX, item *models.PickingListItem) error
+	BulkCreate(ctx context.Context, tx DBTX, items []*models.PickingListItem) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PickingListItem, error)
+	GetByPickingList(ctx context.Context, db DBTX, pickingListID uuid.UUID) ([]*models.PickingListItem, error)
+	UpdatePickedQty(ctx context.Context, tx DBTX, pickingItemID uuid.UUID, pickedQty decimal.Decimal) error
+	Update(ctx context.Context, tx DBTX, item *models.PickingListItem) error
+	DeleteByPickingList(ctx context.Context, tx DBTX, pickingListID uuid.UUID) error
+	ListByFulfillmentItem(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID) ([]*models.PickingListItem, error)
+}
+
+type pickingListItemRepository struct {
+	logger *zap.Logger
+}
+
+func NewPickingListItemRepository(logger *zap.Logger) PickingListItemRepository {
+	return &pickingListItemRepository{
+		logger: logger.Named("picking_list_item_repo"),
+	}
+}
+
+func (r *pickingListItemRepository) scanItem(sc scanner) (*models.PickingListItem, error) {
+	var item models.PickingListItem
+	err := sc.Scan(
+		&item.PickingItemID,
+		&item.PickingListID,
+		&item.FulfillmentItemID,
+		&item.OrderedQty,
+		&item.PickedQty,
+		&item.CreatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan picking list item: %w", err)
+	}
+	return &item, nil
+}
+
+func (r *pickingListItemRepository) Create(ctx context.Context, tx DBTX, item *models.PickingListItem) error {
+	query := `
+		INSERT INTO picking_list_items (
+			picking_item_id, picking_list_id, fulfillment_item_id,
+			ordered_qty, picked_qty, created_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())
+		RETURNING created_at
+	`
+	err := tx.QueryRowContext(ctx, query,
+		item.PickingItemID, item.PickingListID, item.FulfillmentItemID,
+		item.OrderedQty, item.PickedQty,
+	).Scan(&item.CreatedAt)
+	if err != nil {
+		r.logger.Error("failed to create picking list item", util.ErrorField(err))
+		return fmt.Errorf("create picking list item: %w", err)
+	}
+	return nil
+}
+
+func (r *pickingListItemRepository) BulkCreate(ctx context.Context, tx DBTX, items []*models.PickingListItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	query := `
+		INSERT INTO picking_list_items (
+			picking_item_id, picking_list_id, fulfillment_item_id,
+			ordered_qty, picked_qty, created_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())
+	`
+	for _, it := range items {
+		_, err := tx.ExecContext(ctx, query,
+			it.PickingItemID, it.PickingListID, it.FulfillmentItemID,
+			it.OrderedQty, it.PickedQty,
+		)
+		if err != nil {
+			return fmt.Errorf("bulk create picking list item: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *pickingListItemRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PickingListItem, error) {
+	query := `
+		SELECT picking_item_id, picking_list_id, fulfillment_item_id,
+		       ordered_qty, picked_qty, created_at
+		FROM picking_list_items WHERE picking_item_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, id)
+	return r.scanItem(row)
+}
+
+func (r *pickingListItemRepository) GetByPickingList(ctx context.Context, db DBTX, pickingListID uuid.UUID) ([]*models.PickingListItem, error) {
+	query := `
+		SELECT picking_item_id, picking_list_id, fulfillment_item_id,
+		       ordered_qty, picked_qty, created_at
+		FROM picking_list_items WHERE picking_list_id = $1
+		ORDER BY created_at
+	`
+	rows, err := db.QueryContext(ctx, query, pickingListID)
+	if err != nil {
+		return nil, fmt.Errorf("get by picking list: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PickingListItem
+	for rows.Next() {
+		item, err := r.scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (r *pickingListItemRepository) UpdatePickedQty(ctx context.Context, tx DBTX, pickingItemID uuid.UUID, pickedQty decimal.Decimal) error {
+	query := `
+		UPDATE picking_list_items
+		SET picked_qty = $2
+		WHERE picking_item_id = $1
+	`
+	result, err := tx.ExecContext(ctx, query, pickingItemID, pickedQty)
+	if err != nil {
+		return fmt.Errorf("update picked quantity: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: picking item %s", inventory_errors.ErrNotFound, pickingItemID)
+	}
+	return nil
+}
+
+func (r *pickingListItemRepository) Update(ctx context.Context, tx DBTX, item *models.PickingListItem) error {
+	query := `
+		UPDATE picking_list_items
+		SET ordered_qty = $2, picked_qty = $3
+		WHERE picking_item_id = $1
+	`
+	_, err := tx.ExecContext(ctx, query, item.PickingItemID, item.OrderedQty, item.PickedQty)
+	if err != nil {
+		return fmt.Errorf("update picking list item: %w", err)
+	}
+	return nil
+}
+
+func (r *pickingListItemRepository) DeleteByPickingList(ctx context.Context, tx DBTX, pickingListID uuid.UUID) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM picking_list_items WHERE picking_list_id = $1`, pickingListID)
+	if err != nil {
+		return fmt.Errorf("delete by picking list: %w", err)
+	}
+	return nil
+}
+
+func (r *pickingListItemRepository) ListByFulfillmentItem(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID) ([]*models.PickingListItem, error) {
+	query := `
+		SELECT picking_item_id, picking_list_id, fulfillment_item_id,
+		       ordered_qty, picked_qty, created_at
+		FROM picking_list_items WHERE fulfillment_item_id = $1
+	`
+	rows, err := db.QueryContext(ctx, query, fulfillmentItemID)
+	if err != nil {
+		return nil, fmt.Errorf("list by fulfillment item: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PickingListItem
+	for rows.Next() {
+		item, err := r.scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+
+
+================================================================================
+FILE: ./repository/vendor_purchase_repo.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/encryption"
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+// VendorPurchaseRepository defines all operations for vendors, purchase orders, and related entities.
+type VendorPurchaseRepository interface {
+	// Vendors
+	CreateVendor(ctx context.Context, db DBTX, v *models.Vendor) error
+	GetVendorByID(ctx context.Context, db DBTX, vendorID uuid.UUID) (*models.Vendor, error)
+	GetVendorByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Vendor, error)
+	ListVendors(ctx context.Context, db DBTX, filter VendorFilter, p Pagination, s Sort) ([]*models.Vendor, error)
+	UpdateVendor(ctx context.Context, db DBTX, v *models.Vendor) error
+	DeleteVendor(ctx context.Context, db DBTX, vendorID uuid.UUID) error
+	ExistsVendorByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error)
+
+	// Vendor Tax Identifiers
+	AddVendorTaxIdentifier(ctx context.Context, db DBTX, tax *models.VendorTaxIdentifier) error
+	GetVendorTaxIdentifiers(ctx context.Context, db DBTX, vendorID uuid.UUID) ([]*models.VendorTaxIdentifier, error)
+	GetVendorTaxIdentifierByID(ctx context.Context, db DBTX, taxID uuid.UUID) (*models.VendorTaxIdentifier, error)
+	UpdateVendorTaxIdentifier(ctx context.Context, db DBTX, tax *models.VendorTaxIdentifier) error
+	DeleteVendorTaxIdentifier(ctx context.Context, db DBTX, taxID uuid.UUID) error
+	GetPrimaryTaxIdentifier(ctx context.Context, db DBTX, vendorID uuid.UUID) (*models.VendorTaxIdentifier, error)
+	CountVendors(ctx context.Context, db DBTX, filter VendorFilter) (int64, error)
+	CountPurchaseOrders(ctx context.Context, db DBTX, filter PurchaseOrderFilter) (int64, error)
+
+	// Purchase Orders (soft-delete enabled)
+	CreatePurchaseOrder(ctx context.Context, db DBTX, po *models.PurchaseOrder) error
+	GetPurchaseOrderByID(ctx context.Context, db DBTX, poID uuid.UUID) (*models.PurchaseOrder, error)
+	GetPurchaseOrderByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, poNumber string) (*models.PurchaseOrder, error)
+	ListPurchaseOrders(ctx context.Context, db DBTX, filter PurchaseOrderFilter, p Pagination, s Sort) ([]*models.PurchaseOrder, error)
+	UpdatePurchaseOrder(ctx context.Context, db DBTX, po *models.PurchaseOrder) error
+	UpdatePurchaseOrderStatus(ctx context.Context, db DBTX, poID uuid.UUID, status string) error
+	DeletePurchaseOrder(ctx context.Context, db DBTX, poID uuid.UUID) error // soft delete
+	ExistsPurchaseOrderNumber(ctx context.Context, db DBTX, companyID uuid.UUID, poNumber string) (bool, error)
+
+	// Purchase Order Items
+	AddPurchaseOrderItem(ctx context.Context, db DBTX, item *models.PurchaseOrderItem) error
+	AddPurchaseOrderItems(ctx context.Context, db DBTX, items []*models.PurchaseOrderItem) error
+	GetPurchaseOrderItems(ctx context.Context, db DBTX, poID uuid.UUID) ([]*models.PurchaseOrderItem, error)
+	GetPurchaseOrderItemByID(ctx context.Context, db DBTX, poItemID uuid.UUID) (*models.PurchaseOrderItem, error)
+	UpdatePurchaseOrderItem(ctx context.Context, db DBTX, item *models.PurchaseOrderItem) error
+	UpdatePurchaseOrderItemReceivedQty(ctx context.Context, db DBTX, poItemID uuid.UUID, receivedQty decimal.Decimal) error
+	DeletePurchaseOrderItem(ctx context.Context, db DBTX, poItemID uuid.UUID) error
+
+	// Purchase Order Receipts
+	CreatePurchaseOrderReceipt(ctx context.Context, db DBTX, receipt *models.PurchaseOrderReceipt) error
+	GetPurchaseOrderReceipts(ctx context.Context, db DBTX, poID uuid.UUID) ([]*models.PurchaseOrderReceipt, error)
+	GetPurchaseOrderReceiptByID(ctx context.Context, db DBTX, receiptID uuid.UUID) (*models.PurchaseOrderReceipt, error)
+	DeletePurchaseOrderReceipt(ctx context.Context, db DBTX, receiptID uuid.UUID) error
+
+	// Item Vendors
+	AddItemVendor(ctx context.Context, db DBTX, iv *models.ItemVendor) error
+	GetItemVendors(ctx context.Context, db DBTX, itemID uuid.UUID) ([]*models.ItemVendor, error)
+	GetDefaultItemVendor(ctx context.Context, db DBTX, itemID uuid.UUID) (*models.ItemVendor, error)
+	UpdateItemVendor(ctx context.Context, db DBTX, iv *models.ItemVendor) error
+	DeleteItemVendor(ctx context.Context, db DBTX, itemID, vendorID uuid.UUID) error
+	GetVendorsForItem(ctx context.Context, db DBTX, itemID uuid.UUID) ([]*models.Vendor, error)
+
+	// Helper to ensure only one default vendor per item
+	EnsureSingleDefaultVendor(ctx context.Context, db DBTX, itemID uuid.UUID, keepVendorID uuid.UUID) error
+}
+
+type vendorPurchaseRepository struct {
+	logger     *zap.Logger
+	encryption *encryption.EncryptionManager
+}
+
+func NewVendorPurchaseRepository(logger *zap.Logger, encryptionManager *encryption.EncryptionManager) VendorPurchaseRepository {
+	return &vendorPurchaseRepository{
+		logger:     logger.Named("vendor_purchase_repo"),
+		encryption: encryptionManager,
+	}
+}
+
+// ---------- Filter Structs ----------
+
+type VendorFilter struct {
+	CompanyID  uuid.UUID
+	VendorCode string
+	VendorName string
+	VendorType string
+	IsActive   *bool
+	Search     string
+}
+
+type PurchaseOrderFilter struct {
+	CompanyID      uuid.UUID
+	VendorID       *uuid.UUID
+	Status         string
+	FromOrderDate  *time.Time
+	ToOrderDate    *time.Time
+	ExpectedBefore *time.Time
+	ExpectedAfter  *time.Time
+}
+
+// ---------- Encryption Helpers ----------
+
+func (r *vendorPurchaseRepository) encryptField(ctx context.Context, plaintext, purpose string) (*encryption.EncryptedData, error) {
+	if plaintext == "" {
+		return &encryption.EncryptedData{
+			EncryptedValue: "",
+			EncryptedDEK:   "",
+			KeyID:          "",
+		}, nil
+	}
+	return r.encryption.EncryptField(ctx, plaintext, purpose)
+}
+
+func (r *vendorPurchaseRepository) decryptField(ctx context.Context, encValue, encDEK, keyID string) (string, error) {
+	if encValue == "" || encDEK == "" || keyID == "" {
+		return "", nil
+	}
+	return r.encryption.DecryptField(ctx, &encryption.EncryptedData{
+		EncryptedValue: encValue,
+		EncryptedDEK:   encDEK,
+		KeyID:          keyID,
+	})
+}
+
+// ---------- Vendors ----------
+
+func (r *vendorPurchaseRepository) CreateVendor(ctx context.Context, db DBTX, v *models.Vendor) error {
+	encContactPerson, err := r.encryptField(ctx, v.ContactPerson, "vendor_contact_person")
+	if err != nil {
+		return err
+	}
+	encPhone, err := r.encryptField(ctx, v.Phone, "vendor_phone")
+	if err != nil {
+		return err
+	}
+	encEmail, err := r.encryptField(ctx, v.Email, "vendor_email")
+	if err != nil {
+		return err
+	}
+	encAddress, err := r.encryptField(ctx, v.Address, "vendor_address")
+	if err != nil {
+		return err
+	}
+	encBankAccount, err := r.encryptField(ctx, v.BankAccountNo, "vendor_bank_account")
+	if err != nil {
+		return err
+	}
+	encRoutingCode, err := r.encryptField(ctx, v.BankRoutingCode, "vendor_routing_code")
+	if err != nil {
+		return err
+	}
+	encBankName, err := r.encryptField(ctx, v.BankName, "vendor_bank_name")
+	if err != nil {
+		return err
+	}
+
+	query := `
+		INSERT INTO vendors (
+			vendor_id, company_id, vendor_code, vendor_name, vendor_type,
+			contact_person, contact_person_dek, contact_person_key_id,
+			phone, phone_dek, phone_key_id,
+			email, email_dek, email_key_id,
+			address, address_dek, address_key_id,
+			bank_account_no, bank_account_no_dek, bank_account_no_key_id,
+			bank_routing_code, bank_routing_code_dek, bank_routing_code_key_id,
+			bank_name, bank_name_dek, bank_name_key_id,
+			is_active, created_at, updated_at, created_by, updated_by
+		) VALUES ($1, $2, $3, $4, $5,
+			$6, $7, $8,
+			$9, $10, $11,
+			$12, $13, $14,
+			$15, $16, $17,
+			$18, $19, $20,
+			$21, $22, $23,
+			$24, $25, $26,
+			$27, NOW(), NOW(), $28, $29)
+		RETURNING created_at, updated_at
+	`
+	err = db.QueryRowContext(ctx, query,
+		v.VendorID, v.CompanyID, v.VendorCode, v.VendorName, v.VendorType,
+		encContactPerson.EncryptedValue, encContactPerson.EncryptedDEK, encContactPerson.KeyID,
+		encPhone.EncryptedValue, encPhone.EncryptedDEK, encPhone.KeyID,
+		encEmail.EncryptedValue, encEmail.EncryptedDEK, encEmail.KeyID,
+		encAddress.EncryptedValue, encAddress.EncryptedDEK, encAddress.KeyID,
+		encBankAccount.EncryptedValue, encBankAccount.EncryptedDEK, encBankAccount.KeyID,
+		encRoutingCode.EncryptedValue, encRoutingCode.EncryptedDEK, encRoutingCode.KeyID,
+		encBankName.EncryptedValue, encBankName.EncryptedDEK, encBankName.KeyID,
+		v.IsActive, v.CreatedBy, v.UpdatedBy,
+	).Scan(&v.CreatedAt, &v.UpdatedAt)
+	if err != nil {
+		r.logger.Error("failed to create vendor", util.ErrorField(err))
+		return fmt.Errorf("create vendor: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetVendorByID(ctx context.Context, db DBTX, vendorID uuid.UUID) (*models.Vendor, error) {
+	query := `
+		SELECT vendor_id, company_id, vendor_code, vendor_name, vendor_type,
+			contact_person, contact_person_dek, contact_person_key_id,
+			phone, phone_dek, phone_key_id,
+			email, email_dek, email_key_id,
+			address, address_dek, address_key_id,
+			bank_account_no, bank_account_no_dek, bank_account_no_key_id,
+			bank_routing_code, bank_routing_code_dek, bank_routing_code_key_id,
+			bank_name, bank_name_dek, bank_name_key_id,
+			is_active, created_at, updated_at, created_by, updated_by, deleted_at
+		FROM vendors
+		WHERE vendor_id = $1 AND deleted_at IS NULL
+	`
+	row := db.QueryRowContext(ctx, query, vendorID)
+	return r.scanVendor(ctx, row)
+}
+
+func (r *vendorPurchaseRepository) GetVendorByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Vendor, error) {
+	query := `
+		SELECT vendor_id, company_id, vendor_code, vendor_name, vendor_type,
+			contact_person, contact_person_dek, contact_person_key_id,
+			phone, phone_dek, phone_key_id,
+			email, email_dek, email_key_id,
+			address, address_dek, address_key_id,
+			bank_account_no, bank_account_no_dek, bank_account_no_key_id,
+			bank_routing_code, bank_routing_code_dek, bank_routing_code_key_id,
+			bank_name, bank_name_dek, bank_name_key_id,
+			is_active, created_at, updated_at, created_by, updated_by, deleted_at
+		FROM vendors
+		WHERE company_id = $1 AND vendor_code = $2 AND deleted_at IS NULL
+	`
+	row := db.QueryRowContext(ctx, query, companyID, code)
+	return r.scanVendor(ctx, row)
+}
+
+func (r *vendorPurchaseRepository) ListVendors(ctx context.Context, db DBTX, filter VendorFilter, p Pagination, s Sort) ([]*models.Vendor, error) {
+	where, args := r.buildVendorFilter(filter)
+	orderBy := r.validateVendorSort(s)
+	limit, offset := r.validatePagination(p)
+
+	query := fmt.Sprintf(`
+		SELECT vendor_id, company_id, vendor_code, vendor_name, vendor_type,
+			contact_person, contact_person_dek, contact_person_key_id,
+			phone, phone_dek, phone_key_id,
+			email, email_dek, email_key_id,
+			address, address_dek, address_key_id,
+			bank_account_no, bank_account_no_dek, bank_account_no_key_id,
+			bank_routing_code, bank_routing_code_dek, bank_routing_code_key_id,
+			bank_name, bank_name_dek, bank_name_key_id,
+			is_active, created_at, updated_at, created_by, updated_by, deleted_at
+		FROM vendors
+		%s
+		%s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list vendors: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Vendor
+	for rows.Next() {
+		v, err := r.scanVendor(ctx, rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, v)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) UpdateVendor(ctx context.Context, db DBTX, v *models.Vendor) error {
+	encContactPerson, _ := r.encryptField(ctx, v.ContactPerson, "vendor_contact_person")
+	encPhone, _ := r.encryptField(ctx, v.Phone, "vendor_phone")
+	encEmail, _ := r.encryptField(ctx, v.Email, "vendor_email")
+	encAddress, _ := r.encryptField(ctx, v.Address, "vendor_address")
+	encBankAccount, _ := r.encryptField(ctx, v.BankAccountNo, "vendor_bank_account")
+	encRoutingCode, _ := r.encryptField(ctx, v.BankRoutingCode, "vendor_routing_code")
+	encBankName, _ := r.encryptField(ctx, v.BankName, "vendor_bank_name")
+
+	query := `
+		UPDATE vendors SET
+			vendor_code = $2,
+			vendor_name = $3,
+			vendor_type = $4,
+			contact_person = $5, contact_person_dek = $6, contact_person_key_id = $7,
+			phone = $8, phone_dek = $9, phone_key_id = $10,
+			email = $11, email_dek = $12, email_key_id = $13,
+			address = $14, address_dek = $15, address_key_id = $16,
+			bank_account_no = $17, bank_account_no_dek = $18, bank_account_no_key_id = $19,
+			bank_routing_code = $20, bank_routing_code_dek = $21, bank_routing_code_key_id = $22,
+			bank_name = $23, bank_name_dek = $24, bank_name_key_id = $25,
+			is_active = $26,
+			updated_by = $27,
+			updated_at = NOW()
+		WHERE vendor_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		v.VendorID,
+		v.VendorCode, v.VendorName, v.VendorType,
+		encContactPerson.EncryptedValue, encContactPerson.EncryptedDEK, encContactPerson.KeyID,
+		encPhone.EncryptedValue, encPhone.EncryptedDEK, encPhone.KeyID,
+		encEmail.EncryptedValue, encEmail.EncryptedDEK, encEmail.KeyID,
+		encAddress.EncryptedValue, encAddress.EncryptedDEK, encAddress.KeyID,
+		encBankAccount.EncryptedValue, encBankAccount.EncryptedDEK, encBankAccount.KeyID,
+		encRoutingCode.EncryptedValue, encRoutingCode.EncryptedDEK, encRoutingCode.KeyID,
+		encBankName.EncryptedValue, encBankName.EncryptedDEK, encBankName.KeyID,
+		v.IsActive, v.UpdatedBy,
+	).Scan(&v.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return inventory_errors.ErrNotFound
+		}
+		return fmt.Errorf("update vendor: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) DeleteVendor(ctx context.Context, db DBTX, vendorID uuid.UUID) error {
+	query := `UPDATE vendors SET deleted_at = NOW() WHERE vendor_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, vendorID)
+	if err != nil {
+		return fmt.Errorf("delete vendor: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return inventory_errors.ErrNotFound
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) ExistsVendorByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM vendors WHERE company_id = $1 AND vendor_code = $2 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, code).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists vendor by code: %w", err)
+	}
+	return exists, nil
+}
+
+// ---------- Vendor Tax Identifiers ----------
+
+func (r *vendorPurchaseRepository) AddVendorTaxIdentifier(ctx context.Context, db DBTX, tax *models.VendorTaxIdentifier) error {
+	encTaxNumber, err := r.encryptField(ctx, tax.TaxNumber, "tax_number")
+	if err != nil {
+		return err
+	}
+	query := `
+		INSERT INTO vendor_tax_identifiers (
+			tax_id, vendor_id, tax_type, tax_number, tax_number_dek, tax_number_key_id,
+			is_primary, created_at, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8)
+		RETURNING created_at
+	`
+	err = db.QueryRowContext(ctx, query,
+		tax.TaxID, tax.VendorID, tax.TaxType,
+		encTaxNumber.EncryptedValue, encTaxNumber.EncryptedDEK, encTaxNumber.KeyID,
+		tax.IsPrimary, tax.CreatedBy,
+	).Scan(&tax.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("add vendor tax identifier: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetVendorTaxIdentifiers(ctx context.Context, db DBTX, vendorID uuid.UUID) ([]*models.VendorTaxIdentifier, error) {
+	query := `
+		SELECT tax_id, vendor_id, tax_type, tax_number, tax_number_dek, tax_number_key_id,
+			is_primary, created_at, created_by
+		FROM vendor_tax_identifiers
+		WHERE vendor_id = $1
+	`
+	rows, err := db.QueryContext(ctx, query, vendorID)
+	if err != nil {
+		return nil, fmt.Errorf("get vendor tax identifiers: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.VendorTaxIdentifier
+	for rows.Next() {
+		tax := &models.VendorTaxIdentifier{}
+		var encNumber, encDEK, keyID sql.NullString
+		var createdBy uuid.NullUUID
+		err := rows.Scan(&tax.TaxID, &tax.VendorID, &tax.TaxType, &encNumber, &encDEK, &keyID,
+			&tax.IsPrimary, &tax.CreatedAt, &createdBy)
+		if err != nil {
+			return nil, fmt.Errorf("scan tax identifier: %w", err)
+		}
+		if encNumber.Valid && encDEK.Valid && keyID.Valid {
+			tax.TaxNumber, _ = r.decryptField(ctx, encNumber.String, encDEK.String, keyID.String)
+		}
+		if createdBy.Valid {
+			tax.CreatedBy = &createdBy.UUID
+		}
+		result = append(result, tax)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) GetVendorTaxIdentifierByID(ctx context.Context, db DBTX, taxID uuid.UUID) (*models.VendorTaxIdentifier, error) {
+	query := `
+		SELECT tax_id, vendor_id, tax_type, tax_number, tax_number_dek, tax_number_key_id,
+			is_primary, created_at, created_by
+		FROM vendor_tax_identifiers
+		WHERE tax_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, taxID)
+	tax := &models.VendorTaxIdentifier{}
+	var encNumber, encDEK, keyID sql.NullString
+	var createdBy uuid.NullUUID
+	err := row.Scan(&tax.TaxID, &tax.VendorID, &tax.TaxType, &encNumber, &encDEK, &keyID,
+		&tax.IsPrimary, &tax.CreatedAt, &createdBy)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("get tax identifier by ID: %w", err)
+	}
+	if encNumber.Valid && encDEK.Valid && keyID.Valid {
+		tax.TaxNumber, _ = r.decryptField(ctx, encNumber.String, encDEK.String, keyID.String)
+	}
+	if createdBy.Valid {
+		tax.CreatedBy = &createdBy.UUID
+	}
+	return tax, nil
+}
+
+func (r *vendorPurchaseRepository) UpdateVendorTaxIdentifier(ctx context.Context, db DBTX, tax *models.VendorTaxIdentifier) error {
+	encTaxNumber, err := r.encryptField(ctx, tax.TaxNumber, "tax_number")
+	if err != nil {
+		return err
+	}
+	query := `
+		UPDATE vendor_tax_identifiers
+		SET tax_type = $2, tax_number = $3, tax_number_dek = $4, tax_number_key_id = $5,
+			is_primary = $6
+		WHERE tax_id = $1
+	`
+	_, err = db.ExecContext(ctx, query,
+		tax.TaxID, tax.TaxType,
+		encTaxNumber.EncryptedValue, encTaxNumber.EncryptedDEK, encTaxNumber.KeyID,
+		tax.IsPrimary)
+	if err != nil {
+		return fmt.Errorf("update vendor tax identifier: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) DeleteVendorTaxIdentifier(ctx context.Context, db DBTX, taxID uuid.UUID) error {
+	query := `DELETE FROM vendor_tax_identifiers WHERE tax_id = $1`
+	_, err := db.ExecContext(ctx, query, taxID)
+	if err != nil {
+		return fmt.Errorf("delete vendor tax identifier: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetPrimaryTaxIdentifier(ctx context.Context, db DBTX, vendorID uuid.UUID) (*models.VendorTaxIdentifier, error) {
+	query := `
+		SELECT tax_id, vendor_id, tax_type, tax_number, tax_number_dek, tax_number_key_id,
+			is_primary, created_at, created_by
+		FROM vendor_tax_identifiers
+		WHERE vendor_id = $1 AND is_primary = true
+	`
+	row := db.QueryRowContext(ctx, query, vendorID)
+	tax := &models.VendorTaxIdentifier{}
+	var encNumber, encDEK, keyID sql.NullString
+	var createdBy uuid.NullUUID
+	err := row.Scan(&tax.TaxID, &tax.VendorID, &tax.TaxType, &encNumber, &encDEK, &keyID,
+		&tax.IsPrimary, &tax.CreatedAt, &createdBy)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get primary tax identifier: %w", err)
+	}
+	if encNumber.Valid && encDEK.Valid && keyID.Valid {
+		tax.TaxNumber, _ = r.decryptField(ctx, encNumber.String, encDEK.String, keyID.String)
+	}
+	if createdBy.Valid {
+		tax.CreatedBy = &createdBy.UUID
+	}
+	return tax, nil
+}
+
+// ---------- Purchase Orders (soft delete) ----------
+
+func (r *vendorPurchaseRepository) CreatePurchaseOrder(ctx context.Context, db DBTX, po *models.PurchaseOrder) error {
+	query := `
+		INSERT INTO purchase_orders (
+			purchase_order_id, company_id, po_number, vendor_id, order_date,
+			expected_delivery_date, status, total_amount, currency, notes,
+			created_at, updated_at, created_by, updated_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW(), $11, $12)
+		RETURNING created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		po.PurchaseOrderID, po.CompanyID, po.PONumber, po.VendorID, po.OrderDate,
+		po.ExpectedDeliveryDate, po.Status, po.TotalAmount, po.Currency, po.Notes,
+		po.CreatedBy, po.UpdatedBy,
+	).Scan(&po.CreatedAt, &po.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("create purchase order: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetPurchaseOrderByID(ctx context.Context, db DBTX, poID uuid.UUID) (*models.PurchaseOrder, error) {
+	query := `
+		SELECT purchase_order_id, company_id, po_number, vendor_id, order_date,
+			expected_delivery_date, status, total_amount, currency, notes,
+			created_at, updated_at, created_by, updated_by, deleted_at
+		FROM purchase_orders
+		WHERE purchase_order_id = $1 AND deleted_at IS NULL
+	`
+	row := db.QueryRowContext(ctx, query, poID)
+	return r.scanPurchaseOrder(row)
+}
+
+func (r *vendorPurchaseRepository) GetPurchaseOrderByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, poNumber string) (*models.PurchaseOrder, error) {
+	query := `
+		SELECT purchase_order_id, company_id, po_number, vendor_id, order_date,
+			expected_delivery_date, status, total_amount, currency, notes,
+			created_at, updated_at, created_by, updated_by, deleted_at
+		FROM purchase_orders
+		WHERE company_id = $1 AND po_number = $2 AND deleted_at IS NULL
+	`
+	row := db.QueryRowContext(ctx, query, companyID, poNumber)
+	return r.scanPurchaseOrder(row)
+}
+
+func (r *vendorPurchaseRepository) ListPurchaseOrders(ctx context.Context, db DBTX, filter PurchaseOrderFilter, p Pagination, s Sort) ([]*models.PurchaseOrder, error) {
+	where, args := r.buildPurchaseOrderFilter(filter)
+	// Ensure we exclude soft-deleted rows
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+	orderBy := r.validatePurchaseOrderSort(s)
+	limit, offset := r.validatePagination(p)
+
+	query := fmt.Sprintf(`
+		SELECT purchase_order_id, company_id, po_number, vendor_id, order_date,
+			expected_delivery_date, status, total_amount, currency, notes,
+			created_at, updated_at, created_by, updated_by, deleted_at
+		FROM purchase_orders
+		%s
+		%s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list purchase orders: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PurchaseOrder
+	for rows.Next() {
+		po, err := r.scanPurchaseOrder(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, po)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) UpdatePurchaseOrder(ctx context.Context, db DBTX, po *models.PurchaseOrder) error {
+	query := `
+		UPDATE purchase_orders SET
+			po_number = $2,
+			vendor_id = $3,
+			order_date = $4,
+			expected_delivery_date = $5,
+			status = $6,
+			total_amount = $7,
+			currency = $8,
+			notes = $9,
+			updated_by = $10,
+			updated_at = NOW()
+		WHERE purchase_order_id = $1 AND deleted_at IS NULL
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		po.PurchaseOrderID, po.PONumber, po.VendorID, po.OrderDate,
+		po.ExpectedDeliveryDate, po.Status, po.TotalAmount, po.Currency, po.Notes,
+		po.UpdatedBy,
+	).Scan(&po.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return inventory_errors.ErrNotFound
+		}
+		return fmt.Errorf("update purchase order: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) UpdatePurchaseOrderStatus(ctx context.Context, db DBTX, poID uuid.UUID, status string) error {
+	query := `UPDATE purchase_orders SET status = $2, updated_at = NOW() WHERE purchase_order_id = $1 AND deleted_at IS NULL`
+	_, err := db.ExecContext(ctx, query, poID, status)
+	if err != nil {
+		return fmt.Errorf("update purchase order status: %w", err)
+	}
+	return nil
+}
+
+// DeletePurchaseOrder soft-deletes a purchase order by setting deleted_at.
+func (r *vendorPurchaseRepository) DeletePurchaseOrder(ctx context.Context, db DBTX, poID uuid.UUID) error {
+	query := `UPDATE purchase_orders SET deleted_at = NOW() WHERE purchase_order_id = $1 AND deleted_at IS NULL`
+	result, err := db.ExecContext(ctx, query, poID)
+	if err != nil {
+		return fmt.Errorf("delete purchase order: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return inventory_errors.ErrNotFound
+	}
+	return nil
+}
+
+// ExistsPurchaseOrderNumber checks for active (non-deleted) PO number.
+func (r *vendorPurchaseRepository) ExistsPurchaseOrderNumber(ctx context.Context, db DBTX, companyID uuid.UUID, poNumber string) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM purchase_orders WHERE company_id = $1 AND po_number = $2 AND deleted_at IS NULL)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, companyID, poNumber).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists purchase order number: %w", err)
+	}
+	return exists, nil
+}
+
+// ---------- Purchase Order Items ----------
+
+func (r *vendorPurchaseRepository) AddPurchaseOrderItem(ctx context.Context, db DBTX, item *models.PurchaseOrderItem) error {
+	query := `
+		INSERT INTO purchase_order_items (
+			po_item_id, purchase_order_id, item_id, quantity_ordered, quantity_received,
+			unit_cost, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, 0, $5, NOW(), NOW())
+		RETURNING created_at, updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		item.POItemID, item.PurchaseOrderID, item.ItemID,
+		item.QuantityOrdered, item.UnitCost,
+	).Scan(&item.CreatedAt, &item.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("add purchase order item: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) AddPurchaseOrderItems(ctx context.Context, db DBTX, items []*models.PurchaseOrderItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	query := `
+		INSERT INTO purchase_order_items (
+			po_item_id, purchase_order_id, item_id, quantity_ordered, quantity_received,
+			unit_cost, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, 0, $5, NOW(), NOW())
+	`
+	for _, item := range items {
+		err := db.QueryRowContext(ctx, query,
+			item.POItemID, item.PurchaseOrderID, item.ItemID,
+			item.QuantityOrdered, item.UnitCost,
+		).Scan(&item.CreatedAt, &item.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("bulk add purchase order item: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetPurchaseOrderItems(ctx context.Context, db DBTX, poID uuid.UUID) ([]*models.PurchaseOrderItem, error) {
+	query := `
+		SELECT po_item_id, purchase_order_id, item_id, quantity_ordered, quantity_received,
+			unit_cost, total_line, received_date, created_at, updated_at
+		FROM purchase_order_items
+		WHERE purchase_order_id = $1
+	`
+	rows, err := db.QueryContext(ctx, query, poID)
+	if err != nil {
+		return nil, fmt.Errorf("get purchase order items: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PurchaseOrderItem
+	for rows.Next() {
+		item := &models.PurchaseOrderItem{}
+		var totalLine sql.NullFloat64
+		var receivedDate sql.NullTime
+		err := rows.Scan(
+			&item.POItemID, &item.PurchaseOrderID, &item.ItemID,
+			&item.QuantityOrdered, &item.QuantityReceived,
+			&item.UnitCost, &totalLine, &receivedDate,
+			&item.CreatedAt, &item.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan purchase order item: %w", err)
+		}
+		if receivedDate.Valid {
+			item.ReceivedDate = &receivedDate.Time
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) GetPurchaseOrderItemByID(ctx context.Context, db DBTX, poItemID uuid.UUID) (*models.PurchaseOrderItem, error) {
+	query := `
+		SELECT po_item_id, purchase_order_id, item_id, quantity_ordered, quantity_received,
+			unit_cost, total_line, received_date, created_at, updated_at
+		FROM purchase_order_items
+		WHERE po_item_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, poItemID)
+	item := &models.PurchaseOrderItem{}
+	var totalLine sql.NullFloat64
+	var receivedDate sql.NullTime
+	err := row.Scan(
+		&item.POItemID, &item.PurchaseOrderID, &item.ItemID,
+		&item.QuantityOrdered, &item.QuantityReceived,
+		&item.UnitCost, &totalLine, &receivedDate,
+		&item.CreatedAt, &item.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("get purchase order item by ID: %w", err)
+	}
+	if receivedDate.Valid {
+		item.ReceivedDate = &receivedDate.Time
+	}
+	return item, nil
+}
+
+func (r *vendorPurchaseRepository) UpdatePurchaseOrderItem(ctx context.Context, db DBTX, item *models.PurchaseOrderItem) error {
+	query := `
+		UPDATE purchase_order_items SET
+			quantity_ordered = $2,
+			unit_cost = $3,
+			updated_at = NOW()
+		WHERE po_item_id = $1
+		RETURNING updated_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		item.POItemID, item.QuantityOrdered, item.UnitCost,
+	).Scan(&item.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return inventory_errors.ErrNotFound
+		}
+		return fmt.Errorf("update purchase order item: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) UpdatePurchaseOrderItemReceivedQty(ctx context.Context, db DBTX, poItemID uuid.UUID, receivedQty decimal.Decimal) error {
+	query := `
+		UPDATE purchase_order_items
+		SET quantity_received = quantity_received + $2,
+			received_date = CASE WHEN quantity_received + $2 >= quantity_ordered THEN NOW() ELSE received_date END,
+			updated_at = NOW()
+		WHERE po_item_id = $1
+	`
+	_, err := db.ExecContext(ctx, query, poItemID, receivedQty)
+	if err != nil {
+		return fmt.Errorf("update received quantity: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) DeletePurchaseOrderItem(ctx context.Context, db DBTX, poItemID uuid.UUID) error {
+	query := `DELETE FROM purchase_order_items WHERE po_item_id = $1`
+	_, err := db.ExecContext(ctx, query, poItemID)
+	if err != nil {
+		return fmt.Errorf("delete purchase order item: %w", err)
+	}
+	return nil
+}
+
+// ---------- Purchase Order Receipts ----------
+
+func (r *vendorPurchaseRepository) CreatePurchaseOrderReceipt(ctx context.Context, db DBTX, receipt *models.PurchaseOrderReceipt) error {
+	query := `
+		INSERT INTO purchase_order_receipts (
+			receipt_id, purchase_order_id, po_item_id, receipt_date, quantity_received,
+			unit_cost, warehouse_id, batch_id, movement_id, created_at, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10)
+		RETURNING created_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		receipt.ReceiptID, receipt.PurchaseOrderID, receipt.POItemID, receipt.ReceiptDate,
+		receipt.QuantityReceived, receipt.UnitCost, receipt.WarehouseID,
+		receipt.BatchID, receipt.MovementID, receipt.CreatedBy,
+	).Scan(&receipt.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("create purchase order receipt: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetPurchaseOrderReceipts(ctx context.Context, db DBTX, poID uuid.UUID) ([]*models.PurchaseOrderReceipt, error) {
+	query := `
+		SELECT receipt_id, purchase_order_id, po_item_id, receipt_date, quantity_received,
+			unit_cost, warehouse_id, batch_id, movement_id, created_at, created_by
+		FROM purchase_order_receipts
+		WHERE purchase_order_id = $1
+	`
+	rows, err := db.QueryContext(ctx, query, poID)
+	if err != nil {
+		return nil, fmt.Errorf("get purchase order receipts: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PurchaseOrderReceipt
+	for rows.Next() {
+		rct := &models.PurchaseOrderReceipt{}
+		var batchID, movementID, createdBy uuid.NullUUID
+		err := rows.Scan(
+			&rct.ReceiptID, &rct.PurchaseOrderID, &rct.POItemID, &rct.ReceiptDate,
+			&rct.QuantityReceived, &rct.UnitCost, &rct.WarehouseID,
+			&batchID, &movementID, &rct.CreatedAt, &createdBy,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan receipt: %w", err)
+		}
+		if batchID.Valid {
+			rct.BatchID = &batchID.UUID
+		}
+		if movementID.Valid {
+			rct.MovementID = &movementID.UUID
+		}
+		if createdBy.Valid {
+			rct.CreatedBy = &createdBy.UUID
+		}
+		result = append(result, rct)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) GetPurchaseOrderReceiptByID(ctx context.Context, db DBTX, receiptID uuid.UUID) (*models.PurchaseOrderReceipt, error) {
+	query := `
+		SELECT receipt_id, purchase_order_id, po_item_id, receipt_date, quantity_received,
+			unit_cost, warehouse_id, batch_id, movement_id, created_at, created_by
+		FROM purchase_order_receipts
+		WHERE receipt_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, receiptID)
+	rct := &models.PurchaseOrderReceipt{}
+	var batchID, movementID, createdBy uuid.NullUUID
+	err := row.Scan(
+		&rct.ReceiptID, &rct.PurchaseOrderID, &rct.POItemID, &rct.ReceiptDate,
+		&rct.QuantityReceived, &rct.UnitCost, &rct.WarehouseID,
+		&batchID, &movementID, &rct.CreatedAt, &createdBy,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("get receipt by ID: %w", err)
+	}
+	if batchID.Valid {
+		rct.BatchID = &batchID.UUID
+	}
+	if movementID.Valid {
+		rct.MovementID = &movementID.UUID
+	}
+	if createdBy.Valid {
+		rct.CreatedBy = &createdBy.UUID
+	}
+	return rct, nil
+}
+
+func (r *vendorPurchaseRepository) DeletePurchaseOrderReceipt(ctx context.Context, db DBTX, receiptID uuid.UUID) error {
+	query := `DELETE FROM purchase_order_receipts WHERE receipt_id = $1`
+	_, err := db.ExecContext(ctx, query, receiptID)
+	if err != nil {
+		return fmt.Errorf("delete receipt: %w", err)
+	}
+	return nil
+}
+
+// ---------- Item Vendors ----------
+
+func (r *vendorPurchaseRepository) AddItemVendor(ctx context.Context, db DBTX, iv *models.ItemVendor) error {
+	query := `
+		INSERT INTO item_vendors (item_id, vendor_id, is_default, lead_time, unit_cost)
+		VALUES ($1, $2, $3, $4, $5)
+	`
+	_, err := db.ExecContext(ctx, query, iv.ItemID, iv.VendorID, iv.IsDefault, iv.LeadTime, iv.UnitCost)
+	if err != nil {
+		return fmt.Errorf("add item vendor: %w", err)
+	}
+	if iv.IsDefault {
+		_ = r.EnsureSingleDefaultVendor(ctx, db, iv.ItemID, iv.VendorID)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetItemVendors(ctx context.Context, db DBTX, itemID uuid.UUID) ([]*models.ItemVendor, error) {
+	query := `
+		SELECT item_id, vendor_id, is_default, lead_time, unit_cost
+		FROM item_vendors
+		WHERE item_id = $1
+	`
+	rows, err := db.QueryContext(ctx, query, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("get item vendors: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.ItemVendor
+	for rows.Next() {
+		iv := &models.ItemVendor{}
+		err := rows.Scan(&iv.ItemID, &iv.VendorID, &iv.IsDefault, &iv.LeadTime, &iv.UnitCost)
+		if err != nil {
+			return nil, fmt.Errorf("scan item vendor: %w", err)
+		}
+		result = append(result, iv)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) GetDefaultItemVendor(ctx context.Context, db DBTX, itemID uuid.UUID) (*models.ItemVendor, error) {
+	query := `
+		SELECT item_id, vendor_id, is_default, lead_time, unit_cost
+		FROM item_vendors
+		WHERE item_id = $1 AND is_default = true
+	`
+	row := db.QueryRowContext(ctx, query, itemID)
+	iv := &models.ItemVendor{}
+	err := row.Scan(&iv.ItemID, &iv.VendorID, &iv.IsDefault, &iv.LeadTime, &iv.UnitCost)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get default item vendor: %w", err)
+	}
+	return iv, nil
+}
+
+func (r *vendorPurchaseRepository) UpdateItemVendor(ctx context.Context, db DBTX, iv *models.ItemVendor) error {
+	query := `
+		UPDATE item_vendors
+		SET is_default = $3, lead_time = $4, unit_cost = $5
+		WHERE item_id = $1 AND vendor_id = $2
+	`
+	_, err := db.ExecContext(ctx, query, iv.ItemID, iv.VendorID, iv.IsDefault, iv.LeadTime, iv.UnitCost)
+	if err != nil {
+		return fmt.Errorf("update item vendor: %w", err)
+	}
+	if iv.IsDefault {
+		_ = r.EnsureSingleDefaultVendor(ctx, db, iv.ItemID, iv.VendorID)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) DeleteItemVendor(ctx context.Context, db DBTX, itemID, vendorID uuid.UUID) error {
+	query := `DELETE FROM item_vendors WHERE item_id = $1 AND vendor_id = $2`
+	_, err := db.ExecContext(ctx, query, itemID, vendorID)
+	if err != nil {
+		return fmt.Errorf("delete item vendor: %w", err)
+	}
+	return nil
+}
+
+func (r *vendorPurchaseRepository) GetVendorsForItem(ctx context.Context, db DBTX, itemID uuid.UUID) ([]*models.Vendor, error) {
+	query := `
+		SELECT v.vendor_id, v.company_id, v.vendor_code, v.vendor_name, v.vendor_type,
+			v.contact_person, v.contact_person_dek, v.contact_person_key_id,
+			v.phone, v.phone_dek, v.phone_key_id,
+			v.email, v.email_dek, v.email_key_id,
+			v.address, v.address_dek, v.address_key_id,
+			v.bank_account_no, v.bank_account_no_dek, v.bank_account_no_key_id,
+			v.bank_routing_code, v.bank_routing_code_dek, v.bank_routing_code_key_id,
+			v.bank_name, v.bank_name_dek, v.bank_name_key_id,
+			v.is_active, v.created_at, v.updated_at, v.created_by, v.updated_by, v.deleted_at
+		FROM vendors v
+		JOIN item_vendors iv ON v.vendor_id = iv.vendor_id
+		WHERE iv.item_id = $1 AND v.deleted_at IS NULL
+	`
+	rows, err := db.QueryContext(ctx, query, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("get vendors for item: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.Vendor
+	for rows.Next() {
+		v, err := r.scanVendor(ctx, rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, v)
+	}
+	return result, rows.Err()
+}
+
+func (r *vendorPurchaseRepository) EnsureSingleDefaultVendor(ctx context.Context, db DBTX, itemID uuid.UUID, keepVendorID uuid.UUID) error {
+	query := `UPDATE item_vendors SET is_default = false WHERE item_id = $1 AND vendor_id != $2 AND is_default = true`
+	_, err := db.ExecContext(ctx, query, itemID, keepVendorID)
+	if err != nil {
+		r.logger.Error("failed to ensure single default vendor", zap.Error(err))
+		return fmt.Errorf("ensure single default vendor: %w", err)
+	}
+	return nil
+}
+
+// ---------- Scanner helpers ----------
+
+func (r *vendorPurchaseRepository) scanVendor(ctx context.Context, row scanner) (*models.Vendor, error) {
+	var v models.Vendor
+	var (
+		contactPerson, contactPersonDEK, contactPersonKeyID sql.NullString
+		phone, phoneDEK, phoneKeyID                         sql.NullString
+		email, emailDEK, emailKeyID                         sql.NullString
+		address, addressDEK, addressKeyID                   sql.NullString
+		bankAccount, bankAccountDEK, bankAccountKeyID       sql.NullString
+		routingCode, routingCodeDEK, routingCodeKeyID       sql.NullString
+		bankName, bankNameDEK, bankNameKeyID                sql.NullString
+		createdBy, updatedBy                                uuid.NullUUID
+		deletedAt                                           sql.NullTime
+	)
+
+	err := row.Scan(
+		&v.VendorID, &v.CompanyID, &v.VendorCode, &v.VendorName, &v.VendorType,
+		&contactPerson, &contactPersonDEK, &contactPersonKeyID,
+		&phone, &phoneDEK, &phoneKeyID,
+		&email, &emailDEK, &emailKeyID,
+		&address, &addressDEK, &addressKeyID,
+		&bankAccount, &bankAccountDEK, &bankAccountKeyID,
+		&routingCode, &routingCodeDEK, &routingCodeKeyID,
+		&bankName, &bankNameDEK, &bankNameKeyID,
+		&v.IsActive, &v.CreatedAt, &v.UpdatedAt, &createdBy, &updatedBy, &deletedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan vendor: %w", err)
+	}
+
+	if contactPerson.Valid {
+		dec, err := r.decryptField(ctx, contactPerson.String, contactPersonDEK.String, contactPersonKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt contact_person", zap.Error(err))
+		} else {
+			v.ContactPerson = dec
+		}
+	}
+	if phone.Valid {
+		dec, err := r.decryptField(ctx, phone.String, phoneDEK.String, phoneKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt phone", zap.Error(err))
+		} else {
+			v.Phone = dec
+		}
+	}
+	if email.Valid {
+		dec, err := r.decryptField(ctx, email.String, emailDEK.String, emailKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt email", zap.Error(err))
+		} else {
+			v.Email = dec
+		}
+	}
+	if address.Valid {
+		dec, err := r.decryptField(ctx, address.String, addressDEK.String, addressKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt address", zap.Error(err))
+		} else {
+			v.Address = dec
+		}
+	}
+	if bankAccount.Valid {
+		dec, err := r.decryptField(ctx, bankAccount.String, bankAccountDEK.String, bankAccountKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt bank_account_no", zap.Error(err))
+		} else {
+			v.BankAccountNo = dec
+		}
+	}
+	if routingCode.Valid {
+		dec, err := r.decryptField(ctx, routingCode.String, routingCodeDEK.String, routingCodeKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt bank_routing_code", zap.Error(err))
+		} else {
+			v.BankRoutingCode = dec
+		}
+	}
+	if bankName.Valid {
+		dec, err := r.decryptField(ctx, bankName.String, bankNameDEK.String, bankNameKeyID.String)
+		if err != nil {
+			r.logger.Warn("failed to decrypt bank_name", zap.Error(err))
+		} else {
+			v.BankName = dec
+		}
+	}
+	if createdBy.Valid {
+		v.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		v.UpdatedBy = &updatedBy.UUID
+	}
+	if deletedAt.Valid {
+		v.DeletedAt = &deletedAt.Time
+	}
+	return &v, nil
+}
+
+func (r *vendorPurchaseRepository) scanPurchaseOrder(row scanner) (*models.PurchaseOrder, error) {
+	var po models.PurchaseOrder
+	var expectedDeliveryDate sql.NullTime
+	var notes sql.NullString
+	var createdBy, updatedBy uuid.NullUUID
+	var deletedAt sql.NullTime
+
+	err := row.Scan(
+		&po.PurchaseOrderID, &po.CompanyID, &po.PONumber, &po.VendorID, &po.OrderDate,
+		&expectedDeliveryDate, &po.Status, &po.TotalAmount, &po.Currency, &notes,
+		&po.CreatedAt, &po.UpdatedAt, &createdBy, &updatedBy, &deletedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan purchase order: %w", err)
+	}
+	if expectedDeliveryDate.Valid {
+		po.ExpectedDeliveryDate = &expectedDeliveryDate.Time
+	}
+	if notes.Valid {
+		po.Notes = &notes.String
+	}
+	if createdBy.Valid {
+		po.CreatedBy = &createdBy.UUID
+	}
+	if updatedBy.Valid {
+		po.UpdatedBy = &updatedBy.UUID
+	}
+	if deletedAt.Valid {
+		po.DeletedAt = &deletedAt.Time
+	}
+	return &po, nil
+}
+
+// ---------- Helper functions (pagination, sorting, filters) ----------
+
+func (r *vendorPurchaseRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+func (r *vendorPurchaseRepository) validateVendorSort(s Sort) string {
+	field := s.Field
+	if field == "" {
+		field = "vendor_code"
+	}
+	allowed := map[string]bool{"vendor_code": true, "vendor_name": true, "created_at": true, "updated_at": true}
+	if !allowed[field] {
+		field = "vendor_code"
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "ASC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", field, dir)
+}
+
+func (r *vendorPurchaseRepository) validatePurchaseOrderSort(s Sort) string {
+	field := s.Field
+	if field == "" {
+		field = "order_date"
+	}
+	allowed := map[string]bool{"order_date": true, "po_number": true, "status": true, "created_at": true}
+	if !allowed[field] {
+		field = "order_date"
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "DESC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", field, dir)
+}
+
+func (r *vendorPurchaseRepository) buildVendorFilter(filter VendorFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.VendorCode != "" {
+		conditions = append(conditions, fmt.Sprintf("vendor_code = $%d", idx))
+		args = append(args, filter.VendorCode)
+		idx++
+	}
+	if filter.VendorName != "" {
+		conditions = append(conditions, fmt.Sprintf("vendor_name ILIKE $%d", idx))
+		args = append(args, "%"+filter.VendorName+"%")
+		idx++
+	}
+	if filter.VendorType != "" {
+		conditions = append(conditions, fmt.Sprintf("vendor_type = $%d", idx))
+		args = append(args, filter.VendorType)
+		idx++
+	}
+	if filter.IsActive != nil {
+		conditions = append(conditions, fmt.Sprintf("is_active = $%d", idx))
+		args = append(args, *filter.IsActive)
+		idx++
+	}
+	if filter.Search != "" {
+		conditions = append(conditions, fmt.Sprintf("(vendor_code ILIKE $%d OR vendor_name ILIKE $%d)", idx, idx+1))
+		args = append(args, "%"+filter.Search+"%", "%"+filter.Search+"%")
+		idx += 2
+	}
+	conditions = append(conditions, "deleted_at IS NULL")
+
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func (r *vendorPurchaseRepository) buildPurchaseOrderFilter(filter PurchaseOrderFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.VendorID != nil {
+		conditions = append(conditions, fmt.Sprintf("vendor_id = $%d", idx))
+		args = append(args, *filter.VendorID)
+		idx++
+	}
+	if filter.Status != "" {
+		conditions = append(conditions, fmt.Sprintf("status = $%d", idx))
+		args = append(args, filter.Status)
+		idx++
+	}
+	if filter.FromOrderDate != nil {
+		conditions = append(conditions, fmt.Sprintf("order_date >= $%d", idx))
+		args = append(args, *filter.FromOrderDate)
+		idx++
+	}
+	if filter.ToOrderDate != nil {
+		conditions = append(conditions, fmt.Sprintf("order_date <= $%d", idx))
+		args = append(args, *filter.ToOrderDate)
+		idx++
+	}
+	if filter.ExpectedAfter != nil {
+		conditions = append(conditions, fmt.Sprintf("expected_delivery_date >= $%d", idx))
+		args = append(args, *filter.ExpectedAfter)
+		idx++
+	}
+	if filter.ExpectedBefore != nil {
+		conditions = append(conditions, fmt.Sprintf("expected_delivery_date <= $%d", idx))
+		args = append(args, *filter.ExpectedBefore)
+		idx++
+	}
+
+	if len(conditions) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func (r *vendorPurchaseRepository) CountVendors(ctx context.Context, db DBTX, filter VendorFilter) (int64, error) {
+	where, args := r.buildVendorFilter(filter)
+	query := fmt.Sprintf("SELECT COUNT(*) FROM vendors %s", where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count vendors: %w", err)
+	}
+	return count, nil
+}
+
+func (r *vendorPurchaseRepository) CountPurchaseOrders(ctx context.Context, db DBTX, filter PurchaseOrderFilter) (int64, error) {
+	where, args := r.buildPurchaseOrderFilter(filter)
+	// Ensure we exclude soft-deleted rows
+	if where == "" {
+		where = "WHERE deleted_at IS NULL"
+	} else {
+		where += " AND deleted_at IS NULL"
+	}
+	query := fmt.Sprintf("SELECT COUNT(*) FROM purchase_orders %s", where)
+	var count int64
+	err := db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count purchase orders: %w", err)
+	}
+	return count, nil
+}
+
+
+
+================================================================================
 FILE: ./repository/stock_balance_repository.go
 ================================================================================
 
@@ -2755,29 +4904,59 @@ func (r *stockBalanceRepository) GetByWarehouses(ctx context.Context, db DBTX, c
 	return results, rows.Err()
 }
 
+// UpsertStock uses partial unique indexes to handle NULL and non‑NULL batch_id
 func (r *stockBalanceRepository) UpsertStock(ctx context.Context, db DBTX, balance *models.StockBalance) error {
-	query := `
-		INSERT INTO stock_balances (
-			stock_balance_id, company_id, warehouse_id, item_id, batch_id,
-			quantity_on_hand, reserved_qty, last_movement_at, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-		ON CONFLICT (company_id, warehouse_id, item_id, batch_id)
-		DO UPDATE SET
-			quantity_on_hand = EXCLUDED.quantity_on_hand,
-			reserved_qty = EXCLUDED.reserved_qty,
-			last_movement_at = EXCLUDED.last_movement_at,
-			updated_at = NOW()
-	`
-	_, err := db.ExecContext(ctx, query,
-		balance.StockBalanceID,
-		balance.CompanyID,
-		balance.WarehouseID,
-		balance.ItemID,
-		nullUUIDParam(balance.BatchID),
-		balance.QuantityOnHand,
-		balance.ReservedQty,
-		balance.LastMovementAt,
-	)
+	var query string
+	var args []interface{}
+
+	if balance.BatchID == nil {
+		query = `
+			INSERT INTO stock_balances (
+				stock_balance_id, company_id, warehouse_id, item_id, batch_id,
+				quantity_on_hand, reserved_qty, last_movement_at, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, NOW(), NOW())
+			ON CONFLICT (company_id, warehouse_id, item_id) WHERE batch_id IS NULL
+			DO UPDATE SET
+				quantity_on_hand = EXCLUDED.quantity_on_hand,
+				reserved_qty = EXCLUDED.reserved_qty,
+				last_movement_at = EXCLUDED.last_movement_at,
+				updated_at = NOW()
+		`
+		args = []interface{}{
+			balance.StockBalanceID,
+			balance.CompanyID,
+			balance.WarehouseID,
+			balance.ItemID,
+			balance.QuantityOnHand,
+			balance.ReservedQty,
+			balance.LastMovementAt,
+		}
+	} else {
+		query = `
+			INSERT INTO stock_balances (
+				stock_balance_id, company_id, warehouse_id, item_id, batch_id,
+				quantity_on_hand, reserved_qty, last_movement_at, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+			ON CONFLICT (company_id, warehouse_id, item_id, batch_id) WHERE batch_id IS NOT NULL
+			DO UPDATE SET
+				quantity_on_hand = EXCLUDED.quantity_on_hand,
+				reserved_qty = EXCLUDED.reserved_qty,
+				last_movement_at = EXCLUDED.last_movement_at,
+				updated_at = NOW()
+		`
+		args = []interface{}{
+			balance.StockBalanceID,
+			balance.CompanyID,
+			balance.WarehouseID,
+			balance.ItemID,
+			*balance.BatchID,
+			balance.QuantityOnHand,
+			balance.ReservedQty,
+			balance.LastMovementAt,
+		}
+	}
+
+	_, err := db.ExecContext(ctx, query, args...)
 	if err != nil {
 		r.logger.Error("upsert stock failed", util.ErrorField(err))
 		return fmt.Errorf("upsert stock: %w", err)
@@ -2785,16 +4964,35 @@ func (r *stockBalanceRepository) UpsertStock(ctx context.Context, db DBTX, balan
 	return nil
 }
 
+// IncreaseStock uses partial unique indexes for conflict detection
 func (r *stockBalanceRepository) IncreaseStock(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error {
 	qtyDec := toDecimal(quantity)
+
+	if batchID == nil || *batchID == uuid.Nil {
+		// Non-batch stock: conflict on (company_id, warehouse_id, item_id) WHERE batch_id IS NULL
+		query := `
+			INSERT INTO stock_balances (stock_balance_id, company_id, warehouse_id, item_id, batch_id, quantity_on_hand, reserved_qty)
+			VALUES (gen_random_uuid(), $1, $2, $3, NULL, $4, 0)
+			ON CONFLICT (company_id, warehouse_id, item_id) WHERE batch_id IS NULL
+			DO UPDATE SET quantity_on_hand = stock_balances.quantity_on_hand + EXCLUDED.quantity_on_hand,
+			              updated_at = NOW()
+		`
+		_, err := db.ExecContext(ctx, query, companyID, warehouseID, itemID, qtyDec)
+		if err != nil {
+			return fmt.Errorf("increase stock: %w", err)
+		}
+		return nil
+	}
+
+	// Batch-tracked stock: conflict on (company_id, warehouse_id, item_id, batch_id) WHERE batch_id IS NOT NULL
 	query := `
 		INSERT INTO stock_balances (stock_balance_id, company_id, warehouse_id, item_id, batch_id, quantity_on_hand, reserved_qty)
 		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 0)
-		ON CONFLICT (company_id, warehouse_id, item_id, batch_id)
+		ON CONFLICT (company_id, warehouse_id, item_id, batch_id) WHERE batch_id IS NOT NULL
 		DO UPDATE SET quantity_on_hand = stock_balances.quantity_on_hand + EXCLUDED.quantity_on_hand,
 		              updated_at = NOW()
 	`
-	_, err := db.ExecContext(ctx, query, companyID, warehouseID, itemID, nullUUIDParam(batchID), qtyDec)
+	_, err := db.ExecContext(ctx, query, companyID, warehouseID, itemID, *batchID, qtyDec)
 	if err != nil {
 		return fmt.Errorf("increase stock: %w", err)
 	}
@@ -2829,11 +5027,11 @@ func (r *stockBalanceRepository) DecreaseStock(ctx context.Context, db DBTX, com
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		// Record does not exist – treat as insufficient stock for practical purposes
 		return fmt.Errorf("%w: stock record not found for item", inventory_errors.ErrNotFound)
 	}
 	return nil
 }
+
 func (r *stockBalanceRepository) ReserveStock(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error {
 	qtyDec := toDecimal(quantity)
 	var res sql.Result
@@ -2865,11 +5063,11 @@ func (r *stockBalanceRepository) ReserveStock(ctx context.Context, db DBTX, comp
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		// No rows updated => insufficient available stock
 		return inventory_errors.ErrInsufficientStock
 	}
 	return nil
 }
+
 func (r *stockBalanceRepository) ReleaseReservation(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error {
 	qtyDec := toDecimal(quantity)
 	var res sql.Result
@@ -3062,7 +5260,6 @@ func (r *stockBalanceRepository) GetTotalOnHand(ctx context.Context, db DBTX, co
 	return decimal.NewFromFloat(total), nil
 }
 
-// StockBalanceFilter defines all possible filters
 type StockBalanceFilter struct {
 	CompanyID   uuid.UUID
 	WarehouseID *uuid.UUID
@@ -3072,8 +5269,6 @@ type StockBalanceFilter struct {
 	MinAvail    *decimal.Decimal
 }
 
-// GetByFilters returns stock balances matching the given filters.
-// GetByFilters returns stock balances matching the given filters.
 func (r *stockBalanceRepository) GetByFilters(ctx context.Context, db DBTX, filter StockBalanceFilter) ([]*models.StockBalance, error) {
 	conditions := []string{"company_id = $1"}
 	args := []interface{}{filter.CompanyID}
@@ -3091,7 +5286,6 @@ func (r *stockBalanceRepository) GetByFilters(ctx context.Context, db DBTX, filt
 	}
 	if filter.BatchID != nil {
 		conditions = append(conditions, fmt.Sprintf("batch_id = $%d", argIdx))
-		// Use nullUUIDParam to handle nil -> SQL NULL or actual UUID
 		args = append(args, nullUUIDParam(filter.BatchID))
 		argIdx++
 	}
@@ -3146,6 +5340,326 @@ func (r *stockBalanceRepository) GetByWarehouseAndItem(ctx context.Context, db D
 		return decimal.Zero, fmt.Errorf("get by warehouse and item: %w", err)
 	}
 	return total, nil
+}
+
+
+
+================================================================================
+FILE: ./repository/packing_list_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+type PackingListRepository interface {
+	Create(ctx context.Context, db DBTX, list *models.PackingList) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingList, error)
+	GetByShipment(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.PackingList, error)
+	UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, packedAt, verifiedAt *time.Time) error
+	CompletePacking(ctx context.Context, db DBTX, id uuid.UUID, completedAt time.Time) error // <-- NEW
+	VerifyPacking(ctx context.Context, db DBTX, id uuid.UUID, verifiedBy *uuid.UUID, verifiedAt time.Time) error
+	List(ctx context.Context, db DBTX, filter PackingListFilter, p Pagination, s Sort) ([]*models.PackingList, int64, error)
+	UpdateStatusToPacked(ctx context.Context, tx *sql.Tx, packingListID uuid.UUID, packedBy *uuid.UUID, packedAt time.Time) error
+}
+
+type PackingListFilter struct {
+	CompanyID  uuid.UUID
+	ShipmentID *uuid.UUID
+	Status     *string
+	PackedBy   *uuid.UUID
+	DateFrom   *time.Time
+	DateTo     *time.Time
+}
+
+type packingListRepository struct {
+	logger *zap.Logger
+}
+
+func NewPackingListRepository(logger *zap.Logger) PackingListRepository {
+	return &packingListRepository{
+		logger: logger.Named("packing_list_repo"),
+	}
+}
+
+func (r *packingListRepository) validateSort(s Sort, allowed map[string]bool) (string, error) {
+	if s.Field == "" {
+		return "", fmt.Errorf("sort field required")
+	}
+	if !allowed[s.Field] {
+		return "", fmt.Errorf("invalid sort field: %s", s.Field)
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "ASC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", s.Field, dir), nil
+}
+
+func (r *packingListRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+func (r *packingListRepository) buildFilter(filter PackingListFilter) (string, []interface{}) {
+	var conds []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conds = append(conds, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.ShipmentID != nil {
+		conds = append(conds, fmt.Sprintf("shipment_id = $%d", idx))
+		args = append(args, *filter.ShipmentID)
+		idx++
+	}
+	if filter.Status != nil {
+		conds = append(conds, fmt.Sprintf("status = $%d", idx))
+		args = append(args, *filter.Status)
+		idx++
+	}
+	if filter.PackedBy != nil {
+		conds = append(conds, fmt.Sprintf("packed_by = $%d", idx))
+		args = append(args, *filter.PackedBy)
+		idx++
+	}
+	if filter.DateFrom != nil {
+		conds = append(conds, fmt.Sprintf("created_at >= $%d", idx))
+		args = append(args, *filter.DateFrom)
+		idx++
+	}
+	if filter.DateTo != nil {
+		conds = append(conds, fmt.Sprintf("created_at <= $%d", idx))
+		args = append(args, *filter.DateTo)
+		idx++
+	}
+
+	if len(conds) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conds, " AND "), args
+}
+
+func (r *packingListRepository) scanPackingList(s scanner) (*models.PackingList, error) {
+	var pl models.PackingList
+	var packedBy uuid.NullUUID
+	var packedAt, verifiedAt, completedAt sql.NullTime
+	var createdAt time.Time
+
+	err := s.Scan(
+		&pl.PackingListID,
+		&pl.CompanyID,
+		&pl.ShipmentID,
+		&pl.Status,
+		&packedBy,
+		&createdAt,
+		&packedAt,
+		&verifiedAt,
+		&completedAt, // <-- NEW
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan packing list: %w", err)
+	}
+	pl.CreatedAt = createdAt
+	if packedBy.Valid {
+		pl.PackedBy = &packedBy.UUID
+	}
+	if packedAt.Valid {
+		pl.PackedAt = &packedAt.Time
+	}
+	if verifiedAt.Valid {
+		pl.VerifiedAt = &verifiedAt.Time
+	}
+	if completedAt.Valid {
+		pl.CompletedAt = &completedAt.Time
+	}
+	return &pl, nil
+}
+
+func (r *packingListRepository) Create(ctx context.Context, db DBTX, list *models.PackingList) error {
+	query := `
+		INSERT INTO packing_lists (
+			packing_list_id, company_id, shipment_id, status, packed_by,
+			created_at, packed_at, verified_at, completed_at
+		) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8)
+		RETURNING created_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		list.PackingListID, list.CompanyID, list.ShipmentID,
+		list.Status, list.PackedBy, list.PackedAt, list.VerifiedAt, list.CompletedAt,
+	).Scan(&list.CreatedAt)
+	if err != nil {
+		r.logger.Error("failed to create packing list", util.ErrorField(err))
+		return fmt.Errorf("create packing list: %w", err)
+	}
+	return nil
+}
+
+func (r *packingListRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingList, error) {
+	query := `
+		SELECT packing_list_id, company_id, shipment_id, status, packed_by,
+		       created_at, packed_at, verified_at, completed_at
+		FROM packing_lists
+		WHERE packing_list_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, id)
+	return r.scanPackingList(row)
+}
+
+func (r *packingListRepository) GetByShipment(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.PackingList, error) {
+	filter := PackingListFilter{
+		ShipmentID: &shipmentID,
+	}
+	lists, _, err := r.List(ctx, db, filter, Pagination{Limit: 100}, Sort{Field: "created_at", Direction: "DESC"})
+	return lists, err
+}
+
+func (r *packingListRepository) UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, packedAt, verifiedAt *time.Time) error {
+	query := `
+		UPDATE packing_lists
+		SET status = $2, packed_at = $3, verified_at = $4
+		WHERE packing_list_id = $1
+	`
+	res, err := db.ExecContext(ctx, query, id, status, packedAt, verifiedAt)
+	if err != nil {
+		return fmt.Errorf("update status: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: packing list %s", inventory_errors.ErrNotFound, id)
+	}
+	return nil
+}
+
+// CompletePacking marks packing list as completed and sets completed_at.
+func (r *packingListRepository) CompletePacking(ctx context.Context, db DBTX, id uuid.UUID, completedAt time.Time) error {
+	query := `
+		UPDATE packing_lists
+		SET status = 'completed', completed_at = $2
+		WHERE packing_list_id = $1 AND status = 'verified'
+	`
+	res, err := db.ExecContext(ctx, query, id, completedAt)
+	if err != nil {
+		return fmt.Errorf("complete packing: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: packing list %s not in 'verified' state", inventory_errors.ErrNotFound, id)
+	}
+	return nil
+}
+
+func (r *packingListRepository) VerifyPacking(ctx context.Context, db DBTX, id uuid.UUID, verifiedBy *uuid.UUID, verifiedAt time.Time) error {
+	query := `
+		UPDATE packing_lists
+		SET status = 'verified', verified_at = $2, packed_by = $3
+		WHERE packing_list_id = $1 AND status = 'packed'
+	`
+	res, err := db.ExecContext(ctx, query, id, verifiedAt, verifiedBy)
+	if err != nil {
+		return fmt.Errorf("verify packing: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: packing list %s not in 'packed' state", inventory_errors.ErrNotFound, id)
+	}
+	return nil
+}
+
+func (r *packingListRepository) List(ctx context.Context, db DBTX, filter PackingListFilter, p Pagination, s Sort) ([]*models.PackingList, int64, error) {
+	where, args := r.buildFilter(filter)
+	allowedSort := map[string]bool{
+		"created_at":   true,
+		"status":       true,
+		"packed_at":    true,
+		"verified_at":  true,
+		"completed_at": true,
+	}
+	orderBy, err := r.validateSort(s, allowedSort)
+	if err != nil {
+		orderBy = "ORDER BY created_at DESC"
+	}
+	limit, offset := r.validatePagination(p)
+
+	// Count
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM packing_lists %s", where)
+	var total int64
+	err = db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count packing lists: %w", err)
+	}
+	if total == 0 {
+		return []*models.PackingList{}, 0, nil
+	}
+
+	query := fmt.Sprintf(`
+		SELECT packing_list_id, company_id, shipment_id, status, packed_by,
+		       created_at, packed_at, verified_at, completed_at
+		FROM packing_lists
+		%s
+		%s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list packing lists: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PackingList
+	for rows.Next() {
+		pl, err := r.scanPackingList(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		result = append(result, pl)
+	}
+	return result, total, rows.Err()
+}
+
+// UpdateStatusToPacked updates the packing list status to 'packed', sets packed_at and packed_by.
+func (r *packingListRepository) UpdateStatusToPacked(ctx context.Context, tx *sql.Tx, packingListID uuid.UUID, packedBy *uuid.UUID, packedAt time.Time) error {
+	query := `
+        UPDATE packing_lists
+        SET status = 'packed', packed_at = $1, packed_by = $2
+        WHERE packing_list_id = $3
+    `
+	_, err := tx.ExecContext(ctx, query, packedAt, packedBy, packingListID)
+	if err != nil {
+		return fmt.Errorf("update packing list to packed: %w", err)
+	}
+	return nil
 }
 
 
@@ -3776,7 +6290,6 @@ func boolPtr(b bool) *bool {
 FILE: ./repository/bom_repository.go
 ================================================================================
 
-// repository/bom_repository.go
 package repository
 
 import (
@@ -4023,23 +6536,49 @@ func (r *bomRepository) GetBOMVersions(ctx context.Context, db DBTX, companyID u
 	return result, rows.Err()
 }
 
+// UpdateBOM - dynamically builds SET clause including version
 func (r *bomRepository) UpdateBOM(ctx context.Context, db DBTX, bom *models.BOM) error {
-	query := `
-		UPDATE boms SET
-			bom_code = $2,
-			name = $3,
-			quantity = $4,
-			updated_at = NOW(),
-			updated_by = $5
-		WHERE bom_id = $1 AND is_active = true
-		RETURNING updated_at
-	`
-	err := db.QueryRowContext(ctx, query,
-		bom.BOMID, bom.BOMCode, bom.Name, bom.Quantity, bom.UpdatedBy,
-	).Scan(&bom.UpdatedAt)
+	query := `UPDATE boms SET updated_at = NOW()`
+	args := []interface{}{bom.BOMID}
+	argIdx := 2
+
+	if bom.BOMCode != "" {
+		query += fmt.Sprintf(", bom_code = $%d", argIdx)
+		args = append(args, bom.BOMCode)
+		argIdx++
+	}
+	if bom.Name != "" {
+		query += fmt.Sprintf(", name = $%d", argIdx)
+		args = append(args, bom.Name)
+		argIdx++
+	}
+	if bom.Quantity != decimal.Zero {
+		query += fmt.Sprintf(", quantity = $%d", argIdx)
+		args = append(args, bom.Quantity)
+		argIdx++
+	}
+	if bom.Version != 0 {
+		query += fmt.Sprintf(", version = $%d", argIdx)
+		args = append(args, bom.Version)
+		argIdx++
+	}
+	if bom.IsActive {
+		query += fmt.Sprintf(", is_active = $%d", argIdx)
+		args = append(args, bom.IsActive)
+		argIdx++
+	}
+	if bom.UpdatedBy != nil {
+		query += fmt.Sprintf(", updated_by = $%d", argIdx)
+		args = append(args, bom.UpdatedBy)
+		argIdx++
+	}
+
+	query += fmt.Sprintf(" WHERE bom_id = $1 RETURNING updated_at")
+
+	err := db.QueryRowContext(ctx, query, args...).Scan(&bom.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return fmt.Errorf("%w: BOM %s (maybe inactive)", inventory_errors.ErrNotFound, bom.BOMID)
+			return fmt.Errorf("%w: BOM %s", inventory_errors.ErrNotFound, bom.BOMID)
 		}
 		return fmt.Errorf("update BOM: %w", err)
 	}
@@ -4922,12 +7461,12 @@ import (
 type InventoryLocationRepository interface {
 	Create(ctx context.Context, db DBTX, loc *models.InventoryLocation) error
 	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.InventoryLocation, error)
-	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.InventoryLocation, error)
+	GetByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string) (*models.InventoryLocation, error)
 	Update(ctx context.Context, db DBTX, loc *models.InventoryLocation) error
 	SoftDelete(ctx context.Context, db DBTX, id uuid.UUID) error
-	List(ctx context.Context, db DBTX, companyID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
-	GetTree(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.InventoryLocation, error) // full hierarchy
-	ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error)
+	List(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
+	GetTree(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) ([]*models.InventoryLocation, error)
+	ExistsByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error)
 }
 
 type inventoryLocationRepository struct {
@@ -4948,6 +7487,7 @@ func (r *inventoryLocationRepository) scanLocation(s scanner) (*models.Inventory
 	err := s.Scan(
 		&loc.LocationID,
 		&loc.CompanyID,
+		&loc.WarehouseID,
 		&loc.Code,
 		&loc.Name,
 		&locationType,
@@ -4974,12 +7514,12 @@ func (r *inventoryLocationRepository) scanLocation(s scanner) (*models.Inventory
 func (r *inventoryLocationRepository) Create(ctx context.Context, db DBTX, loc *models.InventoryLocation) error {
 	query := `
 		INSERT INTO inventory_locations (
-			location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+			location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
 		RETURNING created_at
 	`
 	err := db.QueryRowContext(ctx, query,
-		loc.LocationID, loc.CompanyID, loc.Code, loc.Name,
+		loc.LocationID, loc.CompanyID, loc.WarehouseID, loc.Code, loc.Name,
 		loc.LocationType, loc.ParentLocationID, loc.IsActive,
 	).Scan(&loc.CreatedAt)
 	if err != nil {
@@ -4991,7 +7531,7 @@ func (r *inventoryLocationRepository) Create(ctx context.Context, db DBTX, loc *
 
 func (r *inventoryLocationRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.InventoryLocation, error) {
 	query := `
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
 		WHERE location_id = $1
 	`
@@ -4999,24 +7539,24 @@ func (r *inventoryLocationRepository) GetByID(ctx context.Context, db DBTX, id u
 	return r.scanLocation(row)
 }
 
-func (r *inventoryLocationRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.InventoryLocation, error) {
+func (r *inventoryLocationRepository) GetByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string) (*models.InventoryLocation, error) {
 	query := `
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
-		WHERE company_id = $1 AND code = $2
+		WHERE company_id = $1 AND warehouse_id = $2 AND code = $3
 	`
-	row := db.QueryRowContext(ctx, query, companyID, code)
+	row := db.QueryRowContext(ctx, query, companyID, warehouseID, code)
 	return r.scanLocation(row)
 }
 
 func (r *inventoryLocationRepository) Update(ctx context.Context, db DBTX, loc *models.InventoryLocation) error {
 	query := `
 		UPDATE inventory_locations
-		SET code = $2, name = $3, location_type = $4, parent_location_id = $5, is_active = $6
+		SET warehouse_id = $2, code = $3, name = $4, location_type = $5, parent_location_id = $6, is_active = $7
 		WHERE location_id = $1
 	`
 	res, err := db.ExecContext(ctx, query,
-		loc.LocationID, loc.Code, loc.Name, loc.LocationType, loc.ParentLocationID, loc.IsActive)
+		loc.LocationID, loc.WarehouseID, loc.Code, loc.Name, loc.LocationType, loc.ParentLocationID, loc.IsActive)
 	if err != nil {
 		return fmt.Errorf("update location: %w", err)
 	}
@@ -5040,10 +7580,10 @@ func (r *inventoryLocationRepository) SoftDelete(ctx context.Context, db DBTX, i
 	return nil
 }
 
-func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, companyID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error) {
-	conds := []string{"company_id = $1"}
-	args := []interface{}{companyID}
-	idx := 2
+func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error) {
+	conds := []string{"company_id = $1", "warehouse_id = $2"}
+	args := []interface{}{companyID, warehouseID}
+	idx := 3
 
 	if parentID != nil {
 		conds = append(conds, fmt.Sprintf("parent_location_id = $%d", idx))
@@ -5055,7 +7595,7 @@ func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, company
 	}
 
 	query := fmt.Sprintf(`
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
 		WHERE %s
 		ORDER BY code
@@ -5078,15 +7618,15 @@ func (r *inventoryLocationRepository) List(ctx context.Context, db DBTX, company
 	return result, rows.Err()
 }
 
-// GetTree returns all locations for a company with parent-child relationships (no specific ordering; client can build tree).
-func (r *inventoryLocationRepository) GetTree(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.InventoryLocation, error) {
+// GetTree returns all locations for a company+warehouse, ordered by parent nulls first.
+func (r *inventoryLocationRepository) GetTree(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) ([]*models.InventoryLocation, error) {
 	query := `
-		SELECT location_id, company_id, code, name, location_type, parent_location_id, is_active, created_at
+		SELECT location_id, company_id, warehouse_id, code, name, location_type, parent_location_id, is_active, created_at
 		FROM inventory_locations
-		WHERE company_id = $1
+		WHERE company_id = $1 AND warehouse_id = $2
 		ORDER BY parent_location_id NULLS FIRST, code
 	`
-	rows, err := db.QueryContext(ctx, query, companyID)
+	rows, err := db.QueryContext(ctx, query, companyID, warehouseID)
 	if err != nil {
 		return nil, fmt.Errorf("get location tree: %w", err)
 	}
@@ -5103,11 +7643,11 @@ func (r *inventoryLocationRepository) GetTree(ctx context.Context, db DBTX, comp
 	return result, rows.Err()
 }
 
-func (r *inventoryLocationRepository) ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error) {
-	query := `SELECT EXISTS(SELECT 1 FROM inventory_locations WHERE company_id = $1 AND code = $2`
-	args := []interface{}{companyID, code}
+func (r *inventoryLocationRepository) ExistsByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM inventory_locations WHERE company_id = $1 AND warehouse_id = $2 AND code = $3`
+	args := []interface{}{companyID, warehouseID, code}
 	if excludeID != nil {
-		query += ` AND location_id != $3`
+		query += ` AND location_id != $4`
 		args = append(args, *excludeID)
 	}
 	query += `)`
@@ -6788,6 +9328,252 @@ func (r *inventoryAnalysisRepository) UpsertProductionMetric(ctx context.Context
 
 
 ================================================================================
+FILE: ./repository/picking_list_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+type PickingListRepository interface {
+	Create(ctx context.Context, db DBTX, pickingList *models.PickingList) error
+	GetByID(ctx context.Context, db DBTX, pickingListID uuid.UUID) (*models.PickingList, error)
+	GetByFulfillmentOrder(ctx context.Context, db DBTX, fulfillmentOrderID uuid.UUID) ([]*models.PickingList, error)
+	UpdateStatus(ctx context.Context, db DBTX, pickingListID uuid.UUID, status string, pickedAt, completedAt *time.Time) error
+	AssignPicker(ctx context.Context, db DBTX, pickingListID, assignedTo uuid.UUID) error
+	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID, status *string, limit, offset int) ([]*models.PickingList, int64, error)
+	Delete(ctx context.Context, db DBTX, pickingListID uuid.UUID) error
+}
+
+type pickingListRepository struct {
+	logger *zap.Logger
+}
+
+func NewPickingListRepository(logger *zap.Logger) PickingListRepository {
+	return &pickingListRepository{
+		logger: logger.Named("picking_list_repo"),
+	}
+}
+
+func (r *pickingListRepository) scanPickingList(s scanner) (*models.PickingList, error) {
+	var pl models.PickingList
+	var assignedToUUID uuid.NullUUID
+	var pickedAt, completedAt sql.NullTime
+
+	err := s.Scan(
+		&pl.PickingListID,
+		&pl.CompanyID,
+		&pl.FulfillmentOrderID,
+		&pl.WarehouseID,
+		&pl.Status,
+		&assignedToUUID,
+		&pl.CreatedAt,
+		&pickedAt,
+		&completedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan picking list: %w", err)
+	}
+
+	if assignedToUUID.Valid {
+		pl.AssignedTo = &assignedToUUID.UUID
+	}
+	if pickedAt.Valid {
+		pl.PickedAt = &pickedAt.Time
+	}
+	if completedAt.Valid {
+		pl.CompletedAt = &completedAt.Time
+	}
+
+	return &pl, nil
+}
+
+func (r *pickingListRepository) Create(ctx context.Context, db DBTX, pickingList *models.PickingList) error {
+	query := `
+		INSERT INTO picking_lists (
+			picking_list_id, company_id, fulfillment_order_id, warehouse_id,
+			status, assigned_to, created_at, picked_at, completed_at
+		) VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8)
+		RETURNING created_at
+	`
+	err := db.QueryRowContext(ctx, query,
+		pickingList.PickingListID,
+		pickingList.CompanyID,
+		pickingList.FulfillmentOrderID,
+		pickingList.WarehouseID,
+		pickingList.Status,
+		pickingList.AssignedTo,
+		pickingList.PickedAt,
+		pickingList.CompletedAt,
+	).Scan(&pickingList.CreatedAt)
+	if err != nil {
+		r.logger.Error("failed to create picking list", util.ErrorField(err))
+		return fmt.Errorf("create picking list: %w", err)
+	}
+	return nil
+}
+
+func (r *pickingListRepository) GetByID(ctx context.Context, db DBTX, pickingListID uuid.UUID) (*models.PickingList, error) {
+	query := `
+		SELECT picking_list_id, company_id, fulfillment_order_id, warehouse_id,
+		       status, assigned_to, created_at, picked_at, completed_at
+		FROM picking_lists
+		WHERE picking_list_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, pickingListID)
+	return r.scanPickingList(row)
+}
+
+func (r *pickingListRepository) GetByFulfillmentOrder(ctx context.Context, db DBTX, fulfillmentOrderID uuid.UUID) ([]*models.PickingList, error) {
+	query := `
+		SELECT picking_list_id, company_id, fulfillment_order_id, warehouse_id,
+		       status, assigned_to, created_at, picked_at, completed_at
+		FROM picking_lists
+		WHERE fulfillment_order_id = $1
+		ORDER BY created_at ASC
+	`
+	rows, err := db.QueryContext(ctx, query, fulfillmentOrderID)
+	if err != nil {
+		return nil, fmt.Errorf("get by fulfillment order: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PickingList
+	for rows.Next() {
+		pl, err := r.scanPickingList(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, pl)
+	}
+	return result, rows.Err()
+}
+
+func (r *pickingListRepository) UpdateStatus(ctx context.Context, db DBTX, pickingListID uuid.UUID, status string, pickedAt, completedAt *time.Time) error {
+	query := `
+		UPDATE picking_lists
+		SET status = $2, picked_at = $3, completed_at = $4
+		WHERE picking_list_id = $1
+	`
+	res, err := db.ExecContext(ctx, query, pickingListID, status, pickedAt, completedAt)
+	if err != nil {
+		return fmt.Errorf("update picking list status: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: picking list %s", inventory_errors.ErrNotFound, pickingListID)
+	}
+	return nil
+}
+
+func (r *pickingListRepository) AssignPicker(ctx context.Context, db DBTX, pickingListID, assignedTo uuid.UUID) error {
+	query := `
+		UPDATE picking_lists
+		SET assigned_to = $2
+		WHERE picking_list_id = $1
+	`
+	res, err := db.ExecContext(ctx, query, pickingListID, assignedTo)
+	if err != nil {
+		return fmt.Errorf("assign picker: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: picking list %s", inventory_errors.ErrNotFound, pickingListID)
+	}
+	return nil
+}
+
+func (r *pickingListRepository) ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID, status *string, limit, offset int) ([]*models.PickingList, int64, error) {
+	conds := []string{"company_id = $1"}
+	args := []interface{}{companyID}
+	idx := 2
+
+	if status != nil && *status != "" {
+		conds = append(conds, fmt.Sprintf("status = $%d", idx))
+		args = append(args, *status)
+		idx++
+	}
+
+	where := "WHERE " + strings.Join(conds, " AND ")
+
+	// Count total
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM picking_lists %s", where)
+	var total int64
+	err := db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count picking lists: %w", err)
+	}
+
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := fmt.Sprintf(`
+		SELECT picking_list_id, company_id, fulfillment_order_id, warehouse_id,
+		       status, assigned_to, created_at, picked_at, completed_at
+		FROM picking_lists
+		%s
+		ORDER BY created_at DESC
+		LIMIT $%d OFFSET $%d
+	`, where, idx, idx+1)
+
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list picking lists: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.PickingList
+	for rows.Next() {
+		pl, err := r.scanPickingList(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		result = append(result, pl)
+	}
+	return result, total, rows.Err()
+}
+
+func (r *pickingListRepository) Delete(ctx context.Context, db DBTX, pickingListID uuid.UUID) error {
+	query := `DELETE FROM picking_lists WHERE picking_list_id = $1`
+	res, err := db.ExecContext(ctx, query, pickingListID)
+	if err != nil {
+		return fmt.Errorf("delete picking list: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("%w: picking list %s", inventory_errors.ErrNotFound, pickingListID)
+	}
+	return nil
+}
+
+
+
+================================================================================
 FILE: ./repository/reorder_repository.go
 ================================================================================
 
@@ -6797,6 +9583,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -6814,8 +9601,13 @@ type ReorderOrderRepository interface {
 	UpdateReference(ctx context.Context, db DBTX, id uuid.UUID, refType string, refID uuid.UUID) error
 	ListPending(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ReorderOrder, error)
 	ExistsPendingForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error)
+
+	// UpdateOrderWithReference updates status, reference_type, reference_id for a reorder order.
+	UpdateOrderWithReference(ctx context.Context, db DBTX, order *models.ReorderOrder) error
+
 	// ExistsOpenForItem checks for existing reorder with status IN ('pending', 'approved')
 	ExistsOpenForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error)
+	ListByFilters(ctx context.Context, db DBTX, filters ReorderFilters) ([]*models.ReorderOrder, int, error)
 }
 
 type reorderOrderRepository struct {
@@ -6890,31 +9682,15 @@ func (r *reorderOrderRepository) UpdateReference(ctx context.Context, db DBTX, i
 }
 
 func (r *reorderOrderRepository) ListPending(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ReorderOrder, error) {
-	query := `
-		SELECT reorder_order_id, company_id, item_id, warehouse_id, requested_qty,
-		       status, source, reference_type, reference_id, generated_at,
-		       created_at, updated_at, created_by
-		FROM reorder_orders
-		WHERE company_id = $1 AND status = 'pending'
-		ORDER BY generated_at ASC
-	`
-	rows, err := db.QueryContext(ctx, query, companyID)
-	if err != nil {
-		return nil, fmt.Errorf("list pending: %w", err)
+	filters := ReorderFilters{
+		CompanyID: companyID,
+		Status:    "pending",
+		Page:      1,
+		PageSize:  1000, // large enough to get all
 	}
-	defer rows.Close()
-
-	var result []*models.ReorderOrder
-	for rows.Next() {
-		o, err := r.scanOrder(rows)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, o)
-	}
-	return result, rows.Err()
+	orders, _, err := r.ListByFilters(ctx, db, filters)
+	return orders, err
 }
-
 func (r *reorderOrderRepository) ExistsPendingForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error) {
 	query := `
 		SELECT EXISTS (
@@ -6977,6 +9753,733 @@ func (r *reorderOrderRepository) scanOrder(row scanner) (*models.ReorderOrder, e
 		o.CreatedBy = &createdBy.UUID
 	}
 	return &o, nil
+}
+
+type ReorderFilters struct {
+	CompanyID   uuid.UUID
+	Status      string    // empty means all statuses
+	ItemID      uuid.UUID // zero means no filter
+	WarehouseID uuid.UUID // zero means no filter
+	Page        int
+	PageSize    int
+}
+
+// ListByFilters returns reorder orders matching the filters, with pagination.
+// It returns the list of orders and the total count (without pagination) for pagination metadata.
+
+// ListByFilters implementation
+func (r *reorderOrderRepository) ListByFilters(ctx context.Context, db DBTX, filters ReorderFilters) ([]*models.ReorderOrder, int, error) {
+	// Build WHERE clause
+	conditions := []string{"company_id = $1"}
+	args := []interface{}{filters.CompanyID}
+	idx := 2
+
+	if filters.Status != "" {
+		conditions = append(conditions, fmt.Sprintf("status = $%d", idx))
+		args = append(args, filters.Status)
+		idx++
+	}
+	if filters.ItemID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("item_id = $%d", idx))
+		args = append(args, filters.ItemID)
+		idx++
+	}
+	if filters.WarehouseID != uuid.Nil {
+		conditions = append(conditions, fmt.Sprintf("warehouse_id = $%d", idx))
+		args = append(args, filters.WarehouseID)
+		idx++
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	// Count total
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM reorder_orders WHERE %s", whereClause)
+	var total int
+	err := db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count reorder orders: %w", err)
+	}
+	if total == 0 {
+		return []*models.ReorderOrder{}, 0, nil
+	}
+
+	// Pagination
+	limit := filters.PageSize
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (filters.Page - 1) * limit
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := fmt.Sprintf(`
+        SELECT reorder_order_id, company_id, item_id, warehouse_id, requested_qty,
+               status, source, reference_type, reference_id, generated_at,
+               created_at, updated_at, created_by
+        FROM reorder_orders
+        WHERE %s
+        ORDER BY generated_at DESC
+        LIMIT $%d OFFSET $%d
+    `, whereClause, idx, idx+1)
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query reorder orders: %w", err)
+	}
+	defer rows.Close()
+
+	var orders []*models.ReorderOrder
+	for rows.Next() {
+		o, err := r.scanOrder(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		orders = append(orders, o)
+	}
+	return orders, total, rows.Err()
+}
+
+// UpdateOrderWithReference implementation
+func (r *reorderOrderRepository) UpdateOrderWithReference(ctx context.Context, db DBTX, order *models.ReorderOrder) error {
+	query := `
+        UPDATE reorder_orders
+        SET status = $2, reference_type = $3, reference_id = $4, updated_at = NOW()
+        WHERE reorder_order_id = $1
+    `
+	_, err := db.ExecContext(ctx, query,
+		order.ReorderOrderID,
+		order.Status,
+		order.ReferenceType,
+		order.ReferenceID,
+	)
+	if err != nil {
+		return fmt.Errorf("update order with reference: %w", err)
+	}
+	return nil
+}
+
+
+
+================================================================================
+FILE: ./repository/serial_number_transaction_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+// SerialNumberTransactionFilter defines filters for listing transactions.
+type SerialNumberTransactionFilter struct {
+	CompanyID       uuid.UUID
+	SerialID        *uuid.UUID
+	MovementID      *uuid.UUID
+	TransactionType *string
+	FromDate        *time.Time
+	ToDate          *time.Time
+}
+
+// SerialNumberTransactionRepository defines operations for serial number audit trail.
+type SerialNumberTransactionRepository interface {
+	Create(ctx context.Context, db DBTX, tx *models.SerialNumberTransaction) error
+	GetByID(ctx context.Context, db DBTX, transactionID uuid.UUID) (*models.SerialNumberTransaction, error)
+	GetBySerialID(ctx context.Context, db DBTX, serialID uuid.UUID, limit, offset int) ([]*models.SerialNumberTransaction, error)
+	GetByMovementID(ctx context.Context, db DBTX, movementID uuid.UUID) ([]*models.SerialNumberTransaction, error)
+	ListByCompany(ctx context.Context, db DBTX, filter SerialNumberTransactionFilter, p Pagination, s Sort) ([]*models.SerialNumberTransaction, int64, error)
+}
+
+type serialNumberTransactionRepository struct {
+	logger *zap.Logger
+}
+
+// NewSerialNumberTransactionRepository creates a new repository instance.
+func NewSerialNumberTransactionRepository(logger *zap.Logger) SerialNumberTransactionRepository {
+	return &serialNumberTransactionRepository{
+		logger: logger.Named("serial_number_txn_repo"),
+	}
+}
+
+// validateSort validates sort field and direction.
+func (r *serialNumberTransactionRepository) validateSort(s Sort, allowed map[string]bool) (string, error) {
+	if s.Field == "" {
+		return "", fmt.Errorf("sort field required")
+	}
+	if !allowed[s.Field] {
+		return "", fmt.Errorf("invalid sort field: %s", s.Field)
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "ASC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", s.Field, dir), nil
+}
+
+// validatePagination returns limit and offset with defaults.
+func (r *serialNumberTransactionRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// buildFilter builds WHERE clause and args for ListByCompany.
+func (r *serialNumberTransactionRepository) buildFilter(filter SerialNumberTransactionFilter) (string, []interface{}) {
+	var conds []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != uuid.Nil {
+		conds = append(conds, fmt.Sprintf("company_id = $%d", idx))
+		args = append(args, filter.CompanyID)
+		idx++
+	}
+	if filter.SerialID != nil {
+		conds = append(conds, fmt.Sprintf("serial_id = $%d", idx))
+		args = append(args, *filter.SerialID)
+		idx++
+	}
+	if filter.MovementID != nil {
+		conds = append(conds, fmt.Sprintf("movement_id = $%d", idx))
+		args = append(args, *filter.MovementID)
+		idx++
+	}
+	if filter.TransactionType != nil && *filter.TransactionType != "" {
+		conds = append(conds, fmt.Sprintf("transaction_type = $%d", idx))
+		args = append(args, *filter.TransactionType)
+		idx++
+	}
+	if filter.FromDate != nil {
+		conds = append(conds, fmt.Sprintf("transaction_date >= $%d", idx))
+		args = append(args, *filter.FromDate)
+		idx++
+	}
+	if filter.ToDate != nil {
+		conds = append(conds, fmt.Sprintf("transaction_date <= $%d", idx))
+		args = append(args, *filter.ToDate)
+		idx++
+	}
+
+	if len(conds) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conds, " AND "), args
+}
+
+// scanTransaction scans a row into a SerialNumberTransaction model.
+func (r *serialNumberTransactionRepository) scanTransaction(s scanner) (*models.SerialNumberTransaction, error) {
+	var txn models.SerialNumberTransaction
+	var movementID, fromWarehouseID, toWarehouseID, fromBatchID, toBatchID, createdBy uuid.NullUUID
+	var oldStatus, newStatus, notes sql.NullString
+
+	err := s.Scan(
+		&txn.TransactionID,
+		&txn.SerialID,
+		&txn.CompanyID,
+		&movementID,
+		&fromWarehouseID,
+		&toWarehouseID,
+		&fromBatchID,
+		&toBatchID,
+		&oldStatus,
+		&newStatus,
+		&txn.TransactionType,
+		&txn.TransactionDate,
+		&createdBy,
+		&notes,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan serial number transaction: %w", err)
+	}
+
+	if movementID.Valid {
+		txn.MovementID = &movementID.UUID
+	}
+	if fromWarehouseID.Valid {
+		txn.FromWarehouseID = &fromWarehouseID.UUID
+	}
+	if toWarehouseID.Valid {
+		txn.ToWarehouseID = &toWarehouseID.UUID
+	}
+	if fromBatchID.Valid {
+		txn.FromBatchID = &fromBatchID.UUID
+	}
+	if toBatchID.Valid {
+		txn.ToBatchID = &toBatchID.UUID
+	}
+	if oldStatus.Valid {
+		txn.OldStatus = &oldStatus.String
+	}
+	if newStatus.Valid {
+		txn.NewStatus = &newStatus.String
+	}
+	if createdBy.Valid {
+		txn.CreatedBy = &createdBy.UUID
+	}
+	if notes.Valid {
+		txn.Notes = &notes.String
+	}
+	return &txn, nil
+}
+
+// Create inserts a new serial number transaction.
+func (r *serialNumberTransactionRepository) Create(ctx context.Context, db DBTX, txn *models.SerialNumberTransaction) error {
+	query := `
+		INSERT INTO serial_number_transactions (
+			transaction_id, serial_id, company_id, movement_id,
+			from_warehouse_id, to_warehouse_id, from_batch_id, to_batch_id,
+			old_status, new_status, transaction_type, transaction_date, created_by, notes
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	`
+	_, err := db.ExecContext(ctx, query,
+		txn.TransactionID,
+		txn.SerialID,
+		txn.CompanyID,
+		txn.MovementID,
+		txn.FromWarehouseID,
+		txn.ToWarehouseID,
+		txn.FromBatchID,
+		txn.ToBatchID,
+		txn.OldStatus,
+		txn.NewStatus,
+		txn.TransactionType,
+		txn.TransactionDate,
+		txn.CreatedBy,
+		txn.Notes,
+	)
+	if err != nil {
+		r.logger.Error("failed to create serial number transaction", util.ErrorField(err))
+		return fmt.Errorf("create serial number transaction: %w", err)
+	}
+	return nil
+}
+
+// GetByID retrieves a transaction by its ID.
+func (r *serialNumberTransactionRepository) GetByID(ctx context.Context, db DBTX, transactionID uuid.UUID) (*models.SerialNumberTransaction, error) {
+	query := `
+		SELECT transaction_id, serial_id, company_id, movement_id,
+		       from_warehouse_id, to_warehouse_id, from_batch_id, to_batch_id,
+		       old_status, new_status, transaction_type, transaction_date, created_by, notes
+		FROM serial_number_transactions
+		WHERE transaction_id = $1
+	`
+	row := db.QueryRowContext(ctx, query, transactionID)
+	return r.scanTransaction(row)
+}
+
+// GetBySerialID retrieves all transactions for a given serial number, ordered by date descending.
+func (r *serialNumberTransactionRepository) GetBySerialID(ctx context.Context, db DBTX, serialID uuid.UUID, limit, offset int) ([]*models.SerialNumberTransaction, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	query := `
+		SELECT transaction_id, serial_id, company_id, movement_id,
+		       from_warehouse_id, to_warehouse_id, from_batch_id, to_batch_id,
+		       old_status, new_status, transaction_type, transaction_date, created_by, notes
+		FROM serial_number_transactions
+		WHERE serial_id = $1
+		ORDER BY transaction_date DESC
+		LIMIT $2 OFFSET $3
+	`
+	rows, err := db.QueryContext(ctx, query, serialID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("get by serial id: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.SerialNumberTransaction
+	for rows.Next() {
+		txn, err := r.scanTransaction(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, txn)
+	}
+	return result, rows.Err()
+}
+
+// GetByMovementID retrieves all transactions linked to a stock movement.
+func (r *serialNumberTransactionRepository) GetByMovementID(ctx context.Context, db DBTX, movementID uuid.UUID) ([]*models.SerialNumberTransaction, error) {
+	query := `
+		SELECT transaction_id, serial_id, company_id, movement_id,
+		       from_warehouse_id, to_warehouse_id, from_batch_id, to_batch_id,
+		       old_status, new_status, transaction_type, transaction_date, created_by, notes
+		FROM serial_number_transactions
+		WHERE movement_id = $1
+		ORDER BY transaction_date ASC
+	`
+	rows, err := db.QueryContext(ctx, query, movementID)
+	if err != nil {
+		return nil, fmt.Errorf("get by movement id: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.SerialNumberTransaction
+	for rows.Next() {
+		txn, err := r.scanTransaction(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, txn)
+	}
+	return result, rows.Err()
+}
+
+// ListByCompany lists transactions for a company with filters, pagination, and sorting.
+func (r *serialNumberTransactionRepository) ListByCompany(ctx context.Context, db DBTX, filter SerialNumberTransactionFilter, p Pagination, s Sort) ([]*models.SerialNumberTransaction, int64, error) {
+	where, args := r.buildFilter(filter)
+
+	allowedSort := map[string]bool{
+		"transaction_date": true,
+		"transaction_type": true,
+		"created_at":       true,
+	}
+	orderBy, err := r.validateSort(s, allowedSort)
+	if err != nil {
+		orderBy = "ORDER BY transaction_date DESC"
+	}
+
+	limit, offset := r.validatePagination(p)
+
+	// Count query
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM serial_number_transactions %s", where)
+	var total int64
+	err = db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count serial number transactions: %w", err)
+	}
+	if total == 0 {
+		return []*models.SerialNumberTransaction{}, 0, nil
+	}
+
+	// Data query
+	query := fmt.Sprintf(`
+		SELECT transaction_id, serial_id, company_id, movement_id,
+		       from_warehouse_id, to_warehouse_id, from_batch_id, to_batch_id,
+		       old_status, new_status, transaction_type, transaction_date, created_by, notes
+		FROM serial_number_transactions
+		%s
+		%s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list serial number transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*models.SerialNumberTransaction
+	for rows.Next() {
+		txn, err := r.scanTransaction(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		result = append(result, txn)
+	}
+	return result, total, rows.Err()
+}
+
+
+
+================================================================================
+FILE: ./repository/shipment_item_repository.go
+================================================================================
+
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
+
+	"auth-service/internal/inventory/inventory_errors"
+	"auth-service/internal/inventory/models"
+	"auth-service/internal/util"
+)
+
+// ShipmentItemRepository defines operations for shipment items.
+type ShipmentItemRepository interface {
+	Create(ctx context.Context, tx DBTX, item *models.ShipmentItem) error
+	GetByShipmentID(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.ShipmentItem, error)
+	GetByFulfillmentItemID(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID) ([]*models.ShipmentItem, error)
+	List(ctx context.Context, db DBTX, filter ShipmentItemFilter, p Pagination, s Sort) ([]*models.ShipmentItem, error)
+	Update(ctx context.Context, tx DBTX, item *models.ShipmentItem) error
+	Delete(ctx context.Context, tx DBTX, id uuid.UUID) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.ShipmentItem, error) // <-- ADD
+
+}
+
+// ShipmentItemFilter for filtering list results.
+type ShipmentItemFilter struct {
+	CompanyID          *uuid.UUID
+	ShipmentID         *uuid.UUID
+	FulfillmentItemID  *uuid.UUID
+	MinQuantityShipped *decimal.Decimal
+}
+
+type shipmentItemRepository struct {
+	logger *zap.Logger
+}
+
+// NewShipmentItemRepository creates a new shipment item repository.
+func NewShipmentItemRepository(logger *zap.Logger) ShipmentItemRepository {
+	return &shipmentItemRepository{
+		logger: logger.Named("shipment_item_repo"),
+	}
+}
+
+// validateSort returns ORDER BY clause for allowed fields.
+func (r *shipmentItemRepository) validateSort(s Sort, allowed map[string]bool) (string, error) {
+	if s.Field == "" {
+		return "", fmt.Errorf("sort field required")
+	}
+	if !allowed[s.Field] {
+		return "", fmt.Errorf("invalid sort field: %s", s.Field)
+	}
+	dir := strings.ToUpper(s.Direction)
+	if dir != "ASC" && dir != "DESC" {
+		dir = "ASC"
+	}
+	return fmt.Sprintf("ORDER BY %s %s", s.Field, dir), nil
+}
+
+// validatePagination returns limit and offset.
+func (r *shipmentItemRepository) validatePagination(p Pagination) (int, int) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// buildFilter builds WHERE clause for ShipmentItemFilter.
+func (r *shipmentItemRepository) buildFilter(filter ShipmentItemFilter) (string, []interface{}) {
+	var conds []string
+	var args []interface{}
+	idx := 1
+
+	if filter.CompanyID != nil {
+		conds = append(conds, fmt.Sprintf("si.company_id = $%d", idx))
+		args = append(args, *filter.CompanyID)
+		idx++
+	}
+	if filter.ShipmentID != nil {
+		conds = append(conds, fmt.Sprintf("si.shipment_id = $%d", idx))
+		args = append(args, *filter.ShipmentID)
+		idx++
+	}
+	if filter.FulfillmentItemID != nil {
+		conds = append(conds, fmt.Sprintf("si.fulfillment_item_id = $%d", idx))
+		args = append(args, *filter.FulfillmentItemID)
+		idx++
+	}
+	if filter.MinQuantityShipped != nil {
+		conds = append(conds, fmt.Sprintf("si.quantity_shipped >= $%d", idx))
+		args = append(args, *filter.MinQuantityShipped)
+		idx++
+	}
+
+	if len(conds) == 0 {
+		return "", args
+	}
+	return "WHERE " + strings.Join(conds, " AND "), args
+}
+
+// scanShipmentItem scans a single row into a ShipmentItem model.
+func (r *shipmentItemRepository) scanShipmentItem(s scanner) (*models.ShipmentItem, error) {
+	var item models.ShipmentItem
+	err := s.Scan(
+		&item.ShipmentItemID,
+		&item.ShipmentID,
+		&item.FulfillmentItemID,
+		&item.QuantityShipped,
+		&item.CreatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, inventory_errors.ErrNotFound
+		}
+		return nil, fmt.Errorf("scan shipment item: %w", err)
+	}
+	return &item, nil
+}
+
+// Create inserts a new shipment item.
+func (r *shipmentItemRepository) Create(ctx context.Context, tx DBTX, item *models.ShipmentItem) error {
+	query := `
+		INSERT INTO shipment_items (
+			shipment_item_id, shipment_id, fulfillment_item_id, quantity_shipped, created_at
+		) VALUES ($1, $2, $3, $4, NOW())
+		RETURNING created_at
+	`
+	err := tx.QueryRowContext(ctx, query,
+		item.ShipmentItemID, item.ShipmentID, item.FulfillmentItemID, item.QuantityShipped,
+	).Scan(&item.CreatedAt)
+	if err != nil {
+		r.logger.Error("failed to create shipment item", util.ErrorField(err))
+		return fmt.Errorf("create shipment item: %w", err)
+	}
+	return nil
+}
+
+// GetByShipmentID returns all shipment items for a given shipment.
+func (r *shipmentItemRepository) GetByShipmentID(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.ShipmentItem, error) {
+	query := `
+		SELECT shipment_item_id, shipment_id, fulfillment_item_id, quantity_shipped, created_at
+		FROM shipment_items
+		WHERE shipment_id = $1
+		ORDER BY created_at
+	`
+	rows, err := db.QueryContext(ctx, query, shipmentID)
+	if err != nil {
+		return nil, fmt.Errorf("get by shipment id: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.ShipmentItem
+	for rows.Next() {
+		it, err := r.scanShipmentItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+// GetByFulfillmentItemID returns all shipment items linked to a specific fulfillment order item.
+func (r *shipmentItemRepository) GetByFulfillmentItemID(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID) ([]*models.ShipmentItem, error) {
+	query := `
+		SELECT shipment_item_id, shipment_id, fulfillment_item_id, quantity_shipped, created_at
+		FROM shipment_items
+		WHERE fulfillment_item_id = $1
+		ORDER BY created_at
+	`
+	rows, err := db.QueryContext(ctx, query, fulfillmentItemID)
+	if err != nil {
+		return nil, fmt.Errorf("get by fulfillment item id: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.ShipmentItem
+	for rows.Next() {
+		it, err := r.scanShipmentItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+// List returns a paginated list of shipment items matching the filter.
+func (r *shipmentItemRepository) List(ctx context.Context, db DBTX, filter ShipmentItemFilter, p Pagination, s Sort) ([]*models.ShipmentItem, error) {
+	where, args := r.buildFilter(filter)
+
+	allowedSort := map[string]bool{
+		"created_at":       true,
+		"quantity_shipped": true,
+		"shipment_id":      true,
+	}
+	orderBy, err := r.validateSort(s, allowedSort)
+	if err != nil {
+		orderBy = "ORDER BY created_at DESC"
+	}
+
+	limit, offset := r.validatePagination(p)
+
+	query := fmt.Sprintf(`
+		SELECT shipment_item_id, shipment_id, fulfillment_item_id, quantity_shipped, created_at
+		FROM shipment_items si
+		%s
+		%s
+		LIMIT $%d OFFSET $%d
+	`, where, orderBy, len(args)+1, len(args)+2)
+
+	args = append(args, limit, offset)
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list shipment items: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*models.ShipmentItem
+	for rows.Next() {
+		it, err := r.scanShipmentItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+func (r *shipmentItemRepository) Update(ctx context.Context, tx DBTX, item *models.ShipmentItem) error {
+	query := `UPDATE shipment_items SET quantity_shipped = $2 WHERE shipment_item_id = $1`
+	_, err := tx.ExecContext(ctx, query, item.ShipmentItemID, item.QuantityShipped)
+	return err
+}
+
+func (r *shipmentItemRepository) Delete(ctx context.Context, tx DBTX, id uuid.UUID) error {
+	query := `DELETE FROM shipment_items WHERE shipment_item_id = $1`
+	_, err := tx.ExecContext(ctx, query, id)
+	return err
+}
+func (r *shipmentItemRepository) GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.ShipmentItem, error) {
+	query := `
+        SELECT shipment_item_id, shipment_id, fulfillment_item_id, quantity_shipped, created_at
+        FROM shipment_items
+        WHERE shipment_item_id = $1
+    `
+	row := db.QueryRowContext(ctx, query, id)
+	return r.scanShipmentItem(row)
 }
 
 
@@ -7201,12 +10704,12 @@ func (r *warehouseRepository) BulkCreate(ctx context.Context, db DBTX, warehouse
 // ---------- Read ----------
 func (r *warehouseRepository) GetByID(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseID uuid.UUID) (*models.Warehouse, error) {
 	query := `
-		SELECT warehouse_id, company_id, code, name, location, is_active,
-		       created_at, updated_at, created_by, updated_by,
-		       is_default, location_id, warehouse_type, allow_negative_stock
-		FROM warehouses
-		WHERE company_id = $1 AND warehouse_id = $2
-	`
+        SELECT warehouse_id, company_id, code, name, location, is_active,
+               created_at, updated_at, created_by, updated_by,
+               is_default, location_id, warehouse_type, allow_negative_stock
+        FROM warehouses
+        WHERE company_id = $1 AND warehouse_id = $2
+    `
 	row := db.QueryRowContext(ctx, query, companyID, warehouseID)
 	warehouse, err := r.scanWarehouse(row)
 	if err != nil {
@@ -7215,9 +10718,12 @@ func (r *warehouseRepository) GetByID(ctx context.Context, db DBTX, companyID uu
 	if warehouse == nil {
 		return nil, fmt.Errorf("%w: warehouse %s", inventory_errors.ErrNotFound, warehouseID)
 	}
+	// *** ADD THIS CHECK ***
+	if !warehouse.IsActive {
+		return nil, fmt.Errorf("%w: warehouse %s is inactive", inventory_errors.ErrNotFound, warehouseID)
+	}
 	return warehouse, nil
 }
-
 func (r *warehouseRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Warehouse, error) {
 	query := `
 		SELECT warehouse_id, company_id, code, name, location, is_active,
@@ -7729,6 +11235,7 @@ func (r *reservationRepository) Fulfill(ctx context.Context, db DBTX, reservatio
 }
 
 // UpdateFulfilledQuantity increments the fulfilled quantity and updates status to 'partially_fulfilled' or 'fulfilled' as appropriate.
+// Fixed: uses separate placeholders for SET status and CASE condition to avoid PostgreSQL type mismatch.
 func (r *reservationRepository) UpdateFulfilledQuantity(ctx context.Context, db DBTX, reservationID uuid.UUID, additionalFulfilledQty decimal.Decimal) error {
 	// First get current reservation with lock
 	res, err := r.GetForUpdate(ctx, db, reservationID)
@@ -7746,12 +11253,13 @@ func (r *reservationRepository) UpdateFulfilledQuantity(ctx context.Context, db 
 		newFulfilled = res.Quantity // cap at original quantity
 	}
 
+	// NOTE: $3 is used for the SET status, $4 for the CASE condition – same value but separate placeholder
 	query := `
 		UPDATE reservations
-		SET fulfilled_quantity = $2, status = $3, fulfilled_at = CASE WHEN $3 = 'fulfilled' THEN NOW() ELSE fulfilled_at END
+		SET fulfilled_quantity = $2, status = $3, fulfilled_at = CASE WHEN $4 = 'fulfilled' THEN NOW() ELSE fulfilled_at END
 		WHERE reservation_id = $1
 	`
-	_, err = db.ExecContext(ctx, query, reservationID, newFulfilled, newStatus)
+	_, err = db.ExecContext(ctx, query, reservationID, newFulfilled, newStatus, newStatus)
 	if err != nil {
 		return fmt.Errorf("update fulfilled quantity: %w", err)
 	}

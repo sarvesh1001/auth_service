@@ -32,7 +32,7 @@ func NewProductionHandler(prodService service.ProductionService, logger *zap.Log
 	}
 }
 
-// Request/Response types
+// ---------- Request/Response Types ----------
 
 type createProductionOrderRequest struct {
 	OrderNumber         string  `json:"order_number"`
@@ -53,8 +53,23 @@ type cancelProductionOrderRequest struct {
 }
 
 type completeProductionOrderRequest struct {
-	ProducedQuantity    float64            `json:"produced_quantity"`
-	ComponentQuantities map[string]float64 `json:"component_quantities,omitempty"`
+	ProducedQuantity float64 `json:"produced_quantity"`
+	// ComponentQuantities removed – components must be consumed via separate endpoint
+}
+
+type consumeComponentRequest struct {
+	ComponentID string  `json:"component_id"`
+	Quantity    float64 `json:"quantity"`
+	BatchID     *string `json:"batch_id,omitempty"`
+	Notes       string  `json:"notes,omitempty"`
+}
+
+type recordScrapRequest struct {
+	ComponentID   *string `json:"component_id,omitempty"` // nil = scrap finished good
+	ItemID        string  `json:"item_id"`
+	BatchID       *string `json:"batch_id,omitempty"`
+	ScrapQuantity float64 `json:"scrap_quantity"`
+	Reason        string  `json:"reason"`
 }
 
 type productionOrderResponse struct {
@@ -113,6 +128,8 @@ func toFloat64(d decimal.Decimal) float64 {
 	return f
 }
 
+// ---------- Helper functions ----------
+
 func parseUUIDParam(r *http.Request, param string) (uuid.UUID, error) {
 	idStr := chi.URLParam(r, param)
 	if idStr == "" {
@@ -133,7 +150,7 @@ func getIdempotencyKey(r *http.Request) string {
 	return r.Header.Get("Idempotency-Key")
 }
 
-// Create handles POST /api/v1/inventory/companies/{companyID}/production-orders
+// ---------- Create ----------
 func (h *ProductionHandler) Create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -196,7 +213,6 @@ func (h *ProductionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
 		return
 	}
-	// Parse source reference fields
 	var sourceReferenceID *uuid.UUID
 	if req.SourceReferenceID != nil && *req.SourceReferenceID != "" {
 		id, err := uuid.Parse(*req.SourceReferenceID)
@@ -262,7 +278,7 @@ func (h *ProductionHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Release handles POST /api/v1/inventory/companies/{companyID}/production-orders/{id}/release
+// ---------- Release ----------
 func (h *ProductionHandler) Release(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -309,7 +325,7 @@ func (h *ProductionHandler) Release(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Start handles POST /api/v1/inventory/companies/{companyID}/production-orders/{id}/start
+// ---------- Start ----------
 func (h *ProductionHandler) Start(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -358,7 +374,198 @@ func (h *ProductionHandler) Start(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Complete handles POST /api/v1/inventory/companies/{companyID}/production-orders/{id}/complete
+// ---------- ConsumeComponent (partial consumption) ----------
+func (h *ProductionHandler) ConsumeComponent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	orderID, err := getProductionOrderIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "production:consume") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req consumeComponentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ComponentID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "component_id is required")
+		return
+	}
+	if req.Quantity <= 0 {
+		h.respondWithError(w, http.StatusBadRequest, "quantity must be positive")
+		return
+	}
+	componentID, err := uuid.Parse(req.ComponentID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid component_id")
+		return
+	}
+
+	var batchID *uuid.UUID
+	if req.BatchID != nil && *req.BatchID != "" {
+		id, err := uuid.Parse(*req.BatchID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid batch_id")
+			return
+		}
+		batchID = &id
+	}
+
+	serviceReq := service.ConsumeComponentRequest{
+		ProductionOrderID: orderID,
+		CompanyID:         companyID,
+		ComponentID:       componentID,
+		Quantity:          decimal.NewFromFloat(req.Quantity),
+		BatchID:           batchID,
+		ConsumedBy:        &userID,
+		Notes:             req.Notes,
+	}
+
+	err = h.prodService.ConsumeComponent(ctx, serviceReq, getIdempotencyKey(r))
+	if err != nil {
+		h.logger.Error("failed to consume component", zap.Error(err))
+		switch {
+		case errors.Is(err, inventory_errors.ErrNotFound):
+			h.respondWithError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, inventory_errors.ErrInvalidInput):
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, inventory_errors.ErrInvalidTransition):
+			h.respondWithError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, inventory_errors.ErrInsufficientStock):
+			h.respondWithError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, inventory_errors.ErrInvalidQuantity):
+			h.respondWithError(w, http.StatusUnprocessableEntity, err.Error())
+		default:
+			h.respondWithError(w, http.StatusInternalServerError, "failed to consume component")
+		}
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Component consumed successfully",
+	})
+}
+
+// ---------- RecordScrap ----------
+func (h *ProductionHandler) RecordScrap(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	companyID, err := getCompanyIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	orderID, err := getProductionOrderIDFromRequest(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	userID, err := getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "production:scrap") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req recordScrapRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ItemID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "item_id is required")
+		return
+	}
+	if req.ScrapQuantity <= 0 {
+		h.respondWithError(w, http.StatusBadRequest, "scrap_quantity must be positive")
+		return
+	}
+	itemID, err := uuid.Parse(req.ItemID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid item_id")
+		return
+	}
+
+	var componentID *uuid.UUID
+	if req.ComponentID != nil && *req.ComponentID != "" {
+		id, err := uuid.Parse(*req.ComponentID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid component_id")
+			return
+		}
+		componentID = &id
+	}
+
+	var batchID *uuid.UUID
+	if req.BatchID != nil && *req.BatchID != "" {
+		id, err := uuid.Parse(*req.BatchID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid batch_id")
+			return
+		}
+		batchID = &id
+	}
+
+	serviceReq := service.RecordScrapRequest{
+		ProductionOrderID: orderID,
+		CompanyID:         companyID,
+		ComponentID:       componentID,
+		ItemID:            itemID,
+		BatchID:           batchID,
+		ScrapQuantity:     decimal.NewFromFloat(req.ScrapQuantity),
+		Reason:            req.Reason,
+		RecordedBy:        &userID,
+	}
+
+	err = h.prodService.RecordScrap(ctx, serviceReq, getIdempotencyKey(r))
+	if err != nil {
+		h.logger.Error("failed to record scrap", zap.Error(err))
+		switch {
+		case errors.Is(err, inventory_errors.ErrNotFound):
+			h.respondWithError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, inventory_errors.ErrInvalidInput):
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, inventory_errors.ErrInvalidTransition):
+			h.respondWithError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, inventory_errors.ErrInsufficientStock):
+			h.respondWithError(w, http.StatusConflict, err.Error())
+		default:
+			h.respondWithError(w, http.StatusInternalServerError, "failed to record scrap")
+		}
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Scrap recorded successfully",
+	})
+}
+
+// ---------- Complete ----------
 func (h *ProductionHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -394,22 +601,11 @@ func (h *ProductionHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	componentQuantities := make(map[uuid.UUID]decimal.Decimal)
-	for idStr, qty := range req.ComponentQuantities {
-		compID, err := uuid.Parse(idStr)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid component id: %s", idStr))
-			return
-		}
-		componentQuantities[compID] = decimal.NewFromFloat(qty)
-	}
-
 	serviceReq := service.CompleteProductionRequest{
-		ProductionOrderID:   orderID,
-		CompanyID:           companyID,
-		ProducedQuantity:    decimal.NewFromFloat(req.ProducedQuantity),
-		CompletedBy:         &userID,
-		ComponentQuantities: componentQuantities,
+		ProductionOrderID: orderID,
+		CompanyID:         companyID,
+		ProducedQuantity:  decimal.NewFromFloat(req.ProducedQuantity),
+		CompletedBy:       &userID,
 	}
 
 	err = h.prodService.CompleteProduction(ctx, serviceReq, getIdempotencyKey(r))
@@ -421,8 +617,6 @@ func (h *ProductionHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, inventory_errors.ErrInvalidInput):
 			h.respondWithError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, inventory_errors.ErrInvalidTransition):
-			h.respondWithError(w, http.StatusConflict, err.Error())
-		case errors.Is(err, inventory_errors.ErrInsufficientStock):
 			h.respondWithError(w, http.StatusConflict, err.Error())
 		case errors.Is(err, inventory_errors.ErrInvalidProductionCompletion):
 			h.respondWithError(w, http.StatusUnprocessableEntity, err.Error())
@@ -438,7 +632,7 @@ func (h *ProductionHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Cancel handles POST /api/v1/inventory/companies/{companyID}/production-orders/{id}/cancel
+// ---------- Cancel ----------
 func (h *ProductionHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -498,7 +692,7 @@ func (h *ProductionHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Get handles GET /api/v1/inventory/companies/{companyID}/production-orders/{id}
+// ---------- Get ----------
 func (h *ProductionHandler) Get(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -526,7 +720,7 @@ func (h *ProductionHandler) Get(w http.ResponseWriter, r *http.Request) {
 	order, err := h.prodService.GetProductionOrder(ctx, orderID, companyID)
 	if err != nil {
 		h.logger.Error("failed to get production order", zap.Error(err))
-		if err == inventory_errors.ErrNotFound {
+		if errors.Is(err, inventory_errors.ErrNotFound) {
 			h.respondWithError(w, http.StatusNotFound, err.Error())
 		} else {
 			h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve production order")
@@ -540,7 +734,7 @@ func (h *ProductionHandler) Get(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// List handles GET /api/v1/inventory/companies/{companyID}/production-orders
+// ---------- List ----------
 func (h *ProductionHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	companyID, err := getCompanyIDFromRequest(r)
@@ -560,7 +754,6 @@ func (h *ProductionHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse query parameters
 	query := r.URL.Query()
 	filter := repository.ProductionOrderFilter{
 		CompanyID: companyID,
@@ -606,7 +799,6 @@ func (h *ProductionHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert to response objects
 	items := make([]productionOrderResponse, len(orders))
 	for i, o := range orders {
 		items[i] = toProductionOrderResponse(o)
@@ -623,10 +815,11 @@ func (h *ProductionHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Helper functions
+// ---------- Helper utilities ----------
 
 func (h *ProductionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Integrate with actual permission service
+	// TODO: Integrate with your permission service (e.g., RBAC)
+	// For now, allow all requests.
 	return true
 }
 

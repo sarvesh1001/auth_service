@@ -9,14 +9,47 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type PaymentAllocation struct {
-	AllocationID uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"allocationId"`
-	PaymentID    uuid.UUID `gorm:"type:uuid;not null" json:"paymentId"`
-	InvoiceID    uuid.UUID `gorm:"type:uuid;not null" json:"invoiceId"`
-	Amount       float64   `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
-	CreatedAt    time.Time `gorm:"not null;default:now()" json:"createdAt"`
+	AllocationID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"allocationId"`
+	PaymentID    uuid.UUID       `gorm:"type:uuid;not null" json:"paymentId"`
+	InvoiceID    uuid.UUID       `gorm:"type:uuid;not null" json:"invoiceId"`
+	Amount       decimal.Decimal `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
+	CreatedAt    time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/types.go
+================================================================================
+
+package models
+
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+)
+
+type JSONB map[string]interface{}
+
+func (j JSONB) Value() (driver.Value, error) {
+	return json.Marshal(j)
+}
+
+func (j *JSONB) Scan(value interface{}) error {
+	if value == nil {
+		*j = nil
+		return nil
+	}
+	bytes, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("failed to unmarshal JSONB value: %v", value)
+	}
+	return json.Unmarshal(bytes, j)
 }
 
 
@@ -32,21 +65,22 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Order struct {
 	OrderID            uuid.UUID         `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderId"`
 	CompanyID          uuid.UUID         `gorm:"type:uuid;not null" json:"companyId"`
 	CustomerID         uuid.UUID         `gorm:"type:uuid;not null" json:"customerId"`
-	OrderNumber        string            `gorm:"type:varchar(50);not null" json:"orderNumber"`
+	OrderNumber        string            `gorm:"type:varchar(50);not null;uniqueIndex:idx_order_number" json:"orderNumber"`
 	ExternalRef        *string           `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
 	OrderDate          time.Time         `gorm:"type:date;not null" json:"orderDate"`
-	Status             enums.OrderStatus `gorm:"type:order_status;not null;default:'draft'" json:"status"`
+	Status             enums.OrderStatus `gorm:"type:order_status;not null;default:'draft';check:status IN ('draft','confirmed','processing','shipped','delivered','cancelled','refunded')" json:"status"`
 	Currency           string            `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
-	Subtotal           float64           `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
-	DiscountTotal      float64           `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
-	TaxTotal           float64           `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
-	GrandTotal         float64           `gorm:"->;-:migration" json:"grandTotal"` // generated
+	Subtotal           decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
+	DiscountTotal      decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
+	TaxTotal           decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
+	GrandTotal         decimal.Decimal   `gorm:"->" json:"grandTotal"` // generated
 	Notes              *string           `gorm:"type:text" json:"notes,omitempty"`
 	ShippingAddress    JSONB             `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
 	BillingAddress     JSONB             `gorm:"type:jsonb" json:"billingAddress,omitempty"`
@@ -56,7 +90,7 @@ type Order struct {
 	CancelledAt        *time.Time        `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
 	CancellationReason *string           `gorm:"type:text" json:"cancellationReason,omitempty"`
 	CreatedAt          time.Time         `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt          time.Time         `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt          time.Time         `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy          *uuid.UUID        `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy          *uuid.UUID        `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
@@ -73,20 +107,51 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type TaxSnapshot struct {
-	TaxSnapshotID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"taxSnapshotId"`
-	CompanyID     uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
-	EntityType    string     `gorm:"type:varchar(20);not null" json:"entityType"`
-	EntityID      uuid.UUID  `gorm:"type:uuid;not null" json:"entityId"`
-	LineID        *uuid.UUID `gorm:"type:uuid" json:"lineId,omitempty"`
-	TaxRateID     *uuid.UUID `gorm:"type:uuid" json:"taxRateId,omitempty"`
-	TaxName       *string    `gorm:"type:varchar(100)" json:"taxName,omitempty"`
-	TaxPercentage *float64   `gorm:"type:numeric(5,2)" json:"taxPercentage,omitempty"`
-	TaxableAmount float64    `gorm:"type:numeric(14,4);not null" json:"taxableAmount"`
-	TaxAmount     float64    `gorm:"type:numeric(14,4);not null" json:"taxAmount"`
-	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	TaxSnapshotID uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"taxSnapshotId"`
+	CompanyID     uuid.UUID        `gorm:"type:uuid;not null" json:"companyId"`
+	EntityType    string           `gorm:"type:varchar(20);not null" json:"entityType"`
+	EntityID      uuid.UUID        `gorm:"type:uuid;not null" json:"entityId"`
+	LineID        *uuid.UUID       `gorm:"type:uuid" json:"lineId,omitempty"`
+	TaxRateID     *uuid.UUID       `gorm:"type:uuid" json:"taxRateId,omitempty"`
+	TaxName       *string          `gorm:"type:varchar(100)" json:"taxName,omitempty"`
+	TaxPercentage *decimal.Decimal `gorm:"type:numeric(5,2)" json:"taxPercentage,omitempty"`
+	TaxableAmount decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"taxableAmount"`
+	TaxAmount     decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"taxAmount"`
+	CreatedAt     time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/product.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type Product struct {
+	ProductID       uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"productId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	SKU             string          `gorm:"type:varchar(100);not null;uniqueIndex:idx_product_sku" json:"sku"`
+	Name            string          `gorm:"type:varchar(255);not null" json:"name"`
+	Description     *string         `gorm:"type:text" json:"description,omitempty"`
+	UnitPrice       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	IsActive        bool            `gorm:"not null;default:true" json:"isActive"`
+	InventoryItemID *uuid.UUID      `gorm:"type:uuid;index" json:"inventoryItemId,omitempty"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy       *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy       *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -102,6 +167,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Invoice struct {
@@ -109,26 +175,26 @@ type Invoice struct {
 	CompanyID     uuid.UUID           `gorm:"type:uuid;not null" json:"companyId"`
 	OrderID       *uuid.UUID          `gorm:"type:uuid" json:"orderId,omitempty"`
 	CustomerID    uuid.UUID           `gorm:"type:uuid;not null" json:"customerId"`
-	InvoiceNumber string              `gorm:"type:varchar(50);not null" json:"invoiceNumber"`
+	InvoiceNumber string              `gorm:"type:varchar(50);not null;uniqueIndex:idx_invoice_number" json:"invoiceNumber"`
 	ExternalRef   *string             `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
 	InvoiceDate   time.Time           `gorm:"type:date;not null" json:"invoiceDate"`
 	DueDate       time.Time           `gorm:"type:date;not null" json:"dueDate"`
-	Status        enums.InvoiceStatus `gorm:"type:invoice_status;not null;default:'draft'" json:"status"`
+	Status        enums.InvoiceStatus `gorm:"type:invoice_status;not null;default:'draft';check:status IN ('draft','issued','paid','overdue','cancelled','credited')" json:"status"`
 	Currency      string              `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
-	ExchangeRate  *float64            `gorm:"type:numeric(14,6);default:1" json:"exchangeRate,omitempty"`
-	Subtotal      float64             `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
-	DiscountTotal float64             `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
-	TaxTotal      float64             `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
-	GrandTotal    float64             `gorm:"->;-:migration" json:"grandTotal"` // generated
-	AmountPaid    float64             `gorm:"type:numeric(14,4);not null;default:0" json:"amountPaid"`
-	AmountDue     float64             `gorm:"type:numeric(14,4);not null;default:0" json:"amountDue"`
+	ExchangeRate  *decimal.Decimal    `gorm:"type:numeric(14,6);default:1" json:"exchangeRate,omitempty"`
+	Subtotal      decimal.Decimal     `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
+	DiscountTotal decimal.Decimal     `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
+	TaxTotal      decimal.Decimal     `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
+	GrandTotal    decimal.Decimal     `gorm:"->" json:"grandTotal"`
+	AmountPaid    decimal.Decimal     `gorm:"type:numeric(14,4);not null;default:0" json:"amountPaid"`
+	AmountDue     decimal.Decimal     `gorm:"type:numeric(14,4);not null;default:0" json:"amountDue"`
 	Notes         *string             `gorm:"type:text" json:"notes,omitempty"`
 	IsLocked      bool                `gorm:"default:false" json:"isLocked"`
 	IssuedAt      *time.Time          `gorm:"type:timestamptz" json:"issuedAt,omitempty"`
 	PaidAt        *time.Time          `gorm:"type:timestamptz" json:"paidAt,omitempty"`
 	CancelledAt   *time.Time          `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
 	CreatedAt     time.Time           `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt     time.Time           `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt     time.Time           `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy     *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy     *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
@@ -146,25 +212,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Payment struct {
 	PaymentID       uuid.UUID           `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"paymentId"`
-	CompanyID       uuid.UUID           `gorm:"type:uuid;not null" json:"companyId"`
-	PaymentNumber   string              `gorm:"type:varchar(50);not null" json:"paymentNumber"`
+	CompanyID       uuid.UUID           `gorm:"type:uuid;not null;index" json:"companyId"`
+	PaymentNumber   string              `gorm:"type:varchar(50);not null;uniqueIndex" json:"paymentNumber"`
 	ExternalRef     *string             `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
 	PaymentDate     time.Time           `gorm:"type:date;not null" json:"paymentDate"`
-	Amount          float64             `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
+	Amount          decimal.Decimal     `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
 	PaymentMethod   enums.PaymentMethod `gorm:"type:payment_method;not null" json:"paymentMethod"`
-	Status          enums.PaymentStatus `gorm:"type:payment_status;not null;default:'pending'" json:"status"`
-	ExchangeRate    *float64            `gorm:"type:numeric(14,6);default:1" json:"exchangeRate,omitempty"`
+	Status          enums.PaymentStatus `gorm:"type:payment_status;not null;default:'pending';check:status IN ('pending','processing','completed','failed','refunded','partially_refunded')" json:"status"`
+	ExchangeRate    *decimal.Decimal    `gorm:"type:numeric(14,6);default:1" json:"exchangeRate,omitempty"`
 	Reference       *string             `gorm:"type:varchar(100)" json:"reference,omitempty"`
 	GatewayResponse JSONB               `gorm:"type:jsonb" json:"gatewayResponse,omitempty"`
 	FailureReason   *string             `gorm:"type:text" json:"failureReason,omitempty"`
 	CompletedAt     *time.Time          `gorm:"type:timestamptz" json:"completedAt,omitempty"`
-	RefundedAmount  *float64            `gorm:"type:numeric(14,4);default:0" json:"refundedAmount,omitempty"`
+	RefundedAmount  decimal.Decimal     `gorm:"type:numeric(14,4);default:0" json:"refundedAmount"` // NOT a pointer
 	CreatedAt       time.Time           `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt       time.Time           `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt       time.Time           `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy       *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
@@ -181,19 +248,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type ReturnItem struct {
-	ReturnItemID     uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnItemId"`
-	ReturnID         uuid.UUID  `gorm:"type:uuid;not null" json:"returnId"`
-	OrderItemID      *uuid.UUID `gorm:"type:uuid" json:"orderItemId,omitempty"`
-	ItemID           uuid.UUID  `gorm:"type:uuid;not null" json:"itemId"`
-	ItemNameSnapshot string     `gorm:"type:varchar(255);not null" json:"itemNameSnapshot"`
-	Quantity         float64    `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
-	UnitPrice        float64    `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
-	RefundAmount     float64    `gorm:"type:numeric(14,4);not null" json:"refundAmount"`
-	Reason           *string    `gorm:"type:text" json:"reason,omitempty"`
-	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	ReturnItemID        uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnItemId"`
+	ReturnID            uuid.UUID       `gorm:"type:uuid;not null;index" json:"returnId"`
+	OrderItemID         *uuid.UUID      `gorm:"type:uuid" json:"orderItemId,omitempty"`
+	ProductID           uuid.UUID       `gorm:"type:uuid;not null;index" json:"productId"`
+	ProductNameSnapshot string          `gorm:"type:varchar(255);not null" json:"productNameSnapshot"`
+	Quantity            decimal.Decimal `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice           decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	RefundAmount        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"refundAmount"`
+	Reason              *string         `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt           time.Time       `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 
@@ -208,25 +276,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Return struct {
-	ReturnID     uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnId"`
-	CompanyID    uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
-	OrderID      uuid.UUID  `gorm:"type:uuid;not null" json:"orderId"`
-	InvoiceID    *uuid.UUID `gorm:"type:uuid" json:"invoiceId,omitempty"`
-	CreditNoteID *uuid.UUID `gorm:"type:uuid" json:"creditNoteId,omitempty"`
-	ReturnNumber string     `gorm:"type:varchar(50);not null" json:"returnNumber"`
-	ReturnDate   time.Time  `gorm:"type:date;not null" json:"returnDate"`
-	Reason       *string    `gorm:"type:text" json:"reason,omitempty"`
-	Status       string     `gorm:"type:varchar(20);not null;default:'pending'" json:"status"`
-	TotalRefund  float64    `gorm:"type:numeric(14,4);not null;default:0" json:"totalRefund"`
-	ApprovedAt   *time.Time `gorm:"type:timestamptz" json:"approvedAt,omitempty"`
-	CompletedAt  *time.Time `gorm:"type:timestamptz" json:"completedAt,omitempty"`
-	CreatedAt    time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt    time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
-	CreatedBy    *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy    *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	ReturnID     uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"returnId"`
+	CompanyID    uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	OrderID      uuid.UUID       `gorm:"type:uuid;not null;index" json:"orderId"`
+	InvoiceID    *uuid.UUID      `gorm:"type:uuid" json:"invoiceId,omitempty"`
+	CreditNoteID *uuid.UUID      `gorm:"column:credit_note_id;type:uuid" json:"creditNoteId,omitempty"` // explicit column name
+	ReturnNumber string          `gorm:"type:varchar(50);not null;uniqueIndex" json:"returnNumber"`
+	ReturnDate   time.Time       `gorm:"type:date;not null" json:"returnDate"`
+	Reason       *string         `gorm:"type:text" json:"reason,omitempty"`
+	Status       string          `gorm:"type:varchar(20);not null;default:'pending';check:status IN ('pending','approved','completed','rejected')" json:"status"`
+	TotalRefund  decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalRefund"`
+	ApprovedAt   *time.Time      `gorm:"type:timestamptz" json:"approvedAt,omitempty"`
+	CompletedAt  *time.Time      `gorm:"type:timestamptz" json:"completedAt,omitempty"`
+	CreatedAt    time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt    time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy    *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy    *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -241,20 +310,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type InvoiceItem struct {
-	InvoiceItemID    uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"invoiceItemId"`
-	InvoiceID        uuid.UUID  `gorm:"type:uuid;not null" json:"invoiceId"`
-	ItemID           *uuid.UUID `gorm:"type:uuid" json:"itemId,omitempty"`
-	ItemNameSnapshot string     `gorm:"type:varchar(255);not null" json:"itemNameSnapshot"`
-	Quantity         float64    `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
-	UnitPrice        float64    `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
-	DiscountAmount   *float64   `gorm:"type:numeric(14,4);default:0" json:"discountAmount,omitempty"`
-	TaxAmount        *float64   `gorm:"type:numeric(14,4);default:0" json:"taxAmount,omitempty"`
-	TotalPrice       float64    `gorm:"->;-:migration" json:"totalPrice"` // generated
-	Metadata         JSONB      `gorm:"type:jsonb" json:"metadata,omitempty"`
-	CreatedAt        time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	InvoiceItemID       uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"invoiceItemId"`
+	InvoiceID           uuid.UUID        `gorm:"type:uuid;not null;index" json:"invoiceId"`
+	ProductID           *uuid.UUID       `gorm:"type:uuid;index" json:"productId,omitempty"`
+	ProductNameSnapshot string           `gorm:"type:varchar(255);not null" json:"productNameSnapshot"`
+	Quantity            decimal.Decimal  `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice           decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount      *decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"discountAmount,omitempty"`
+	TaxAmount           *decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"taxAmount,omitempty"`
+	TotalPrice          decimal.Decimal  `gorm:"->" json:"totalPrice"` // generated
+	Metadata            JSONB            `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt           time.Time        `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 
@@ -269,20 +339,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type OrderItem struct {
-	OrderItemID      uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderItemId"`
-	OrderID          uuid.UUID `gorm:"type:uuid;not null" json:"orderId"`
-	ItemID           uuid.UUID `gorm:"type:uuid;not null" json:"itemId"`
-	ItemNameSnapshot string    `gorm:"type:varchar(255);not null" json:"itemNameSnapshot"`
-	Quantity         float64   `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
-	UnitPrice        float64   `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
-	DiscountAmount   *float64  `gorm:"type:numeric(14,4);default:0" json:"discountAmount,omitempty"`
-	TaxAmount        *float64  `gorm:"type:numeric(14,4);default:0" json:"taxAmount,omitempty"`
-	TotalPrice       float64   `gorm:"->;-:migration" json:"totalPrice"` // generated
-	Metadata         JSONB     `gorm:"type:jsonb" json:"metadata,omitempty"`
-	CreatedAt        time.Time `gorm:"not null;default:now()" json:"createdAt"`
+	OrderItemID         uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderItemId"`
+	OrderID             uuid.UUID        `gorm:"type:uuid;not null;index" json:"orderId"`
+	ProductID           uuid.UUID        `gorm:"type:uuid;not null;index" json:"productId"`
+	ProductNameSnapshot string           `gorm:"type:varchar(255);not null" json:"productNameSnapshot"`
+	Quantity            decimal.Decimal  `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice           decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount      *decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"discountAmount,omitempty"`
+	TaxAmount           *decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"taxAmount,omitempty"`
+	TotalPrice          decimal.Decimal  `gorm:"->" json:"totalPrice"` // generated
+	Metadata            JSONB            `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt           time.Time        `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 
@@ -297,28 +368,43 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type Customer struct {
-	CustomerID      uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"customerId"`
-	CompanyID       uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
-	CustomerCode    string     `gorm:"type:varchar(50);not null" json:"customerCode"`
-	Name            string     `gorm:"type:varchar(255);not null" json:"name"`
-	Email           *string    `gorm:"type:varchar(255)" json:"email,omitempty"`
-	Phone           *string    `gorm:"type:varchar(50)" json:"phone,omitempty"`
-	TaxID           *string    `gorm:"type:varchar(100)" json:"taxId,omitempty"`
-	BillingAddress  JSONB      `gorm:"type:jsonb" json:"billingAddress,omitempty"`
-	ShippingAddress JSONB      `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
-	CreditLimit     *float64   `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
-	IsActive        bool       `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt       time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt       time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
-	CreatedBy       *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy       *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
-}
+	CustomerID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"customerId"`
+	CompanyID    uuid.UUID `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerCode string    `gorm:"type:varchar(50);not null;uniqueIndex" json:"customerCode"`
+	Name         string    `gorm:"type:varchar(255);not null" json:"name"`
 
-// JSONB is a helper type for PostgreSQL jsonb; you can use datatypes.JSON from gorm.io/datatypes
-type JSONB map[string]interface{}
+	// Encrypted fields – store ciphertext + metadata
+	EmailEncrypted *string `gorm:"column:email;type:text" json:"-"`
+	EmailDEK       *string `gorm:"column:email_dek;type:text" json:"-"`
+	EmailKeyID     *string `gorm:"column:email_key_id;type:text" json:"-"`
+
+	PhoneEncrypted *string `gorm:"column:phone;type:text" json:"-"`
+	PhoneDEK       *string `gorm:"column:phone_dek;type:text" json:"-"`
+	PhoneKeyID     *string `gorm:"column:phone_key_id;type:text" json:"-"`
+
+	TaxIDEncrypted *string `gorm:"column:tax_id;type:text" json:"-"`
+	TaxIDDEK       *string `gorm:"column:tax_id_dek;type:text" json:"-"`
+	TaxIDKeyID     *string `gorm:"column:tax_id_key_id;type:text" json:"-"`
+
+	BillingAddressEncrypted *string `gorm:"column:billing_address;type:text" json:"-"`
+	BillingAddressDEK       *string `gorm:"column:billing_address_dek;type:text" json:"-"`
+	BillingAddressKeyID     *string `gorm:"column:billing_address_key_id;type:text" json:"-"`
+
+	ShippingAddressEncrypted *string `gorm:"column:shipping_address;type:text" json:"-"`
+	ShippingAddressDEK       *string `gorm:"column:shipping_address_dek;type:text" json:"-"`
+	ShippingAddressKeyID     *string `gorm:"column:shipping_address_key_id;type:text" json:"-"`
+
+	CreditLimit *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
+	IsActive    bool             `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt   time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt   time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy   *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy   *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
 
 
 
@@ -491,7 +577,7 @@ type Promotion struct {
 	IsActive    bool       `gorm:"not null;default:true" json:"isActive"`
 	Priority    *int       `gorm:"type:int;default:0" json:"priority,omitempty"`
 	CreatedAt   time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt   time.Time  `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt   time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy   *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy   *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
@@ -508,17 +594,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type DiscountApplication struct {
-	ApplicationID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"applicationId"`
-	OrderID       *uuid.UUID `gorm:"type:uuid" json:"orderId,omitempty"`
-	InvoiceID     *uuid.UUID `gorm:"type:uuid" json:"invoiceId,omitempty"`
-	DiscountType  string     `gorm:"type:varchar(50);not null" json:"discountType"`
-	DiscountID    *uuid.UUID `gorm:"type:uuid" json:"discountId,omitempty"`
-	DiscountName  *string    `gorm:"type:varchar(255)" json:"discountName,omitempty"`
-	Amount        float64    `gorm:"type:numeric(14,4);not null" json:"amount"`
-	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	ApplicationID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"applicationId"`
+	OrderID       *uuid.UUID      `gorm:"type:uuid" json:"orderId,omitempty"`
+	InvoiceID     *uuid.UUID      `gorm:"type:uuid" json:"invoiceId,omitempty"`
+	DiscountType  string          `gorm:"type:varchar(50);not null" json:"discountType"`
+	DiscountID    *uuid.UUID      `gorm:"type:uuid" json:"discountId,omitempty"`
+	DiscountName  *string         `gorm:"type:varchar(255)" json:"discountName,omitempty"`
+	Amount        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"amount"`
+	CreatedAt     time.Time       `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 
@@ -534,27 +621,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"gorm.io/datatypes"
 )
-
-// JSONB represents a PostgreSQL jsonb field
-type JSONB map[string]interface{}
 
 type Coupon struct {
 	CouponID          uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"couponId"`
 	CompanyID         uuid.UUID          `gorm:"type:uuid;not null" json:"companyId"`
-	Code              string             `gorm:"type:varchar(100);not null" json:"code"`
+	Code              string             `gorm:"type:varchar(100);not null;uniqueIndex:idx_coupon_code" json:"code"`
 	DiscountType      enums.DiscountType `gorm:"type:discount_type;not null" json:"discountType"`
-	DiscountValue     float64            `gorm:"type:numeric(14,4);not null" json:"discountValue"`
-	MaxDiscountAmount *float64           `gorm:"type:numeric(14,4)" json:"maxDiscountAmount,omitempty"`
+	DiscountValue     decimal.Decimal    `gorm:"type:numeric(14,4);not null" json:"discountValue"`
+	MaxDiscountAmount *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"maxDiscountAmount,omitempty"`
 	StartDate         time.Time          `gorm:"type:timestamptz;not null" json:"startDate"`
 	EndDate           time.Time          `gorm:"type:timestamptz;not null" json:"endDate"`
 	UsageLimit        *int               `gorm:"type:int" json:"usageLimit,omitempty"`
 	PerUserLimit      *int               `gorm:"type:int;default:1" json:"perUserLimit,omitempty"`
-	MinOrderAmount    *float64           `gorm:"type:numeric(14,4)" json:"minOrderAmount,omitempty"`
-	ApplicableItems   JSONB              `gorm:"type:jsonb" json:"applicableItems,omitempty"`
+	MinOrderAmount    *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"minOrderAmount,omitempty"`
+	ApplicableItems   datatypes.JSON     `gorm:"type:jsonb" json:"applicableItems,omitempty"`
 	IsActive          bool               `gorm:"not null;default:true" json:"isActive"`
 	CreatedAt         time.Time          `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt         time.Time          `gorm:"not null;default:now()" json:"updatedAt"`
+	UpdatedAt         time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy         *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy         *uuid.UUID         `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
@@ -571,15 +657,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 type CouponUsage struct {
-	UsageID        uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"usageId"`
-	CouponID       uuid.UUID `gorm:"type:uuid;not null" json:"couponId"`
-	CustomerID     uuid.UUID `gorm:"type:uuid;not null" json:"customerId"`
-	OrderID        uuid.UUID `gorm:"type:uuid;not null" json:"orderId"`
-	DiscountAmount float64   `gorm:"type:numeric(14,4);not null" json:"discountAmount"`
-	UsedAt         time.Time `gorm:"type:timestamptz;not null;default:now()" json:"usedAt"`
+	UsageID        uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"usageId"`
+	CouponID       uuid.UUID       `gorm:"type:uuid;not null" json:"couponId"`
+	CustomerID     uuid.UUID       `gorm:"type:uuid;not null" json:"customerId"`
+	OrderID        uuid.UUID       `gorm:"type:uuid;not null" json:"orderId"`
+	DiscountAmount decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"discountAmount"`
+	UsedAt         time.Time       `gorm:"type:timestamptz;not null;default:now()" json:"usedAt"`
 }
 
 
@@ -595,16 +682,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"gorm.io/datatypes"
 )
 
 type PromotionRule struct {
 	RuleID        uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"ruleId"`
 	PromotionID   uuid.UUID          `gorm:"type:uuid;not null" json:"promotionId"`
 	RuleType      string             `gorm:"type:varchar(50);not null" json:"ruleType"`
-	RuleConfig    JSONB              `gorm:"type:jsonb;not null" json:"ruleConfig"`
+	RuleConfig    datatypes.JSON     `gorm:"type:jsonb;not null" json:"ruleConfig"`
 	DiscountType  enums.DiscountType `gorm:"type:discount_type;not null" json:"discountType"`
-	DiscountValue float64            `gorm:"type:numeric(14,4);not null" json:"discountValue"`
-	MaxDiscount   *float64           `gorm:"type:numeric(14,4)" json:"maxDiscount,omitempty"`
+	DiscountValue decimal.Decimal    `gorm:"type:numeric(14,4);not null" json:"discountValue"`
+	MaxDiscount   *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"maxDiscount,omitempty"`
 	CreatedAt     time.Time          `gorm:"not null;default:now()" json:"createdAt"`
 }
 
