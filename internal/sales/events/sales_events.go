@@ -313,3 +313,22 @@ const (
 	EventSalesRepAssigned    = "sales.sales_rep.assigned"
 	EventSalesRepUnassigned  = "sales.sales_rep.unassigned"
 )
+
+// ----------------------------------------------------------------------------
+// Sales Target Events
+// ----------------------------------------------------------------------------
+const (
+	EventSalesTargetSet     = "sales.sales_target.set"
+	EventSalesTargetUpdated = "sales.sales_target.updated"
+	EventSalesTargetDeleted = "sales.sales_target.deleted"
+)
+
+type SalesTargetPayload struct {
+	TargetID     string `json:"target_id"`
+	CompanyID    string `json:"company_id"`
+	SalesRepID   string `json:"sales_rep_id"`
+	PeriodStart  string `json:"period_start"`
+	PeriodEnd    string `json:"period_end"`
+	TargetAmount string `json:"target_amount"`
+	Currency     string `json:"currency"`
+}

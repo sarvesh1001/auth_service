@@ -7,15 +7,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
-	"go.uber.org/zap"
-
 	"auth-service/internal/client"
 	salesEvents "auth-service/internal/sales/events"
 	"auth-service/internal/sales/models/enums"
 	"auth-service/internal/sales/models/sales_analytics"
 	"auth-service/internal/sales/repository"
+	"database/sql"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 // SalesAnalyticsService defines the methods to process sales events.
@@ -81,6 +82,7 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal order payload: %w", err)
 		}
 		return s.onOrderProcessing(ctx, order)
+
 	case salesEvents.EventAutomaticDiscountApplied:
 		var autoPayload struct {
 			CompanyID      string `json:"company_id"`
@@ -107,6 +109,7 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal stacking rule usage payload: %w", err)
 		}
 		return s.onStackingRuleUsed(ctx, stackingPayload)
+
 	case salesEvents.EventCouponApplied:
 		var cp salesEvents.CouponAppliedPayload
 		if err := json.Unmarshal(payload, &cp); err != nil {
@@ -235,6 +238,7 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal quote payload: %w", err)
 		}
 		return s.onQuoteStatusChanged(ctx, quote, enums.QuoteStatusSent, enums.QuoteStatusDraft)
+
 	case salesEvents.EventPromotionApplied:
 		var promoPayload struct {
 			CompanyID      string `json:"company_id"`
@@ -248,6 +252,7 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal promotion applied payload: %w", err)
 		}
 		return s.onPromotionApplied(ctx, promoPayload)
+
 	case salesEvents.EventQuoteAccepted:
 		var quote salesEvents.QuotePayload
 		if err := json.Unmarshal(payload, &quote); err != nil {
@@ -275,6 +280,31 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal quote payload: %w", err)
 		}
 		return s.onQuoteConverted(ctx, quote)
+
+	// Sales target events (new)
+	case salesEvents.EventSalesTargetSet, salesEvents.EventSalesTargetUpdated:
+		var target salesEvents.SalesTargetPayload
+		if err := json.Unmarshal(payload, &target); err != nil {
+			return fmt.Errorf("unmarshal sales target payload: %w", err)
+		}
+		return s.onSalesTargetSet(ctx, target)
+
+	case salesEvents.EventSalesTargetDeleted:
+		var target salesEvents.SalesTargetPayload
+		if err := json.Unmarshal(payload, &target); err != nil {
+			return fmt.Errorf("unmarshal sales target payload: %w", err)
+		}
+		return s.onSalesTargetDeleted(ctx, target)
+
+	// Sales rep events (optional, just log)
+	case salesEvents.EventSalesRepCreated,
+		salesEvents.EventSalesRepActivated,
+		salesEvents.EventSalesRepDeactivated,
+		salesEvents.EventSalesRepDeleted,
+		salesEvents.EventSalesRepAssigned,
+		salesEvents.EventSalesRepUnassigned:
+		s.logger.Info("sales rep event received", zap.String("event_type", eventType))
+		return nil
 
 	default:
 		s.logger.Debug("ignored sales event", zap.String("event_type", eventType))
@@ -440,10 +470,11 @@ func (s *salesAnalyticsService) onOrderConfirmed(ctx context.Context, order sale
 		}
 	}
 
-	// Sales rep performance
+	// Sales rep performance & target achievement & commission fact
 	if order.SalesRepID != "" {
 		salesRepID, err := uuid.Parse(order.SalesRepID)
 		if err == nil {
+			// Performance
 			commissionRate, err := s.getCommissionRate(ctx, tx, companyID, salesRepID, orderDate)
 			if err != nil {
 				s.logger.Warn("failed to get commission rate, using 0", zap.Error(err))
@@ -452,6 +483,16 @@ func (s *salesAnalyticsService) onOrderConfirmed(ctx context.Context, order sale
 			commission := grandTotal.Mul(commissionRate).Div(decimal.NewFromInt(100))
 			if err := s.analyticsRepo.IncrementSalesRepPerformance(ctx, tx, companyID, salesRepID, orderDate, grandTotal, commission); err != nil {
 				s.logger.Error("failed to update sales rep performance", zap.Error(err))
+			}
+
+			// Target achievement: add revenue to target period
+			if err := s.updateTargetAchievement(ctx, tx, companyID, salesRepID, orderDate, grandTotal); err != nil {
+				s.logger.Warn("failed to update target achievement", zap.Error(err))
+			}
+
+			// Commission fact
+			if err := s.recordCommissionFact(ctx, tx, companyID, salesRepID, orderID, grandTotal, commissionRate, commission, orderDate); err != nil {
+				s.logger.Warn("failed to record commission fact", zap.Error(err))
 			}
 		} else {
 			s.logger.Warn("invalid sales_rep_id in order payload", zap.String("sales_rep_id", order.SalesRepID))
@@ -653,7 +694,6 @@ func (s *salesAnalyticsService) getCommissionRate(ctx context.Context, tx reposi
 // Payment & Return handlers
 // ----------------------------------------------------------------------------
 
-// onPaymentCompleted now also updates payment method daily breakdown.
 func (s *salesAnalyticsService) onPaymentCompleted(ctx context.Context, pay salesEvents.PaymentPayload) error {
 	companyID, err := uuid.Parse(pay.CompanyID)
 	if err != nil {
@@ -670,7 +710,7 @@ func (s *salesAnalyticsService) onPaymentCompleted(ctx context.Context, pay sale
 	paymentMethod, err := parsePaymentMethod(pay.PaymentMethod)
 	if err != nil {
 		s.logger.Warn("invalid payment_method in event, skipping method breakdown", zap.String("method", pay.PaymentMethod), zap.Error(err))
-		paymentMethod = enums.PaymentMethodOther // fallback
+		paymentMethod = enums.PaymentMethodOther
 	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -679,26 +719,20 @@ func (s *salesAnalyticsService) onPaymentCompleted(ctx context.Context, pay sale
 	}
 	defer tx.Rollback()
 
-	// Update daily total payments (existing)
 	if err := s.analyticsRepo.AddDailyPayments(ctx, tx, companyID, paymentDate, amount); err != nil {
 		return err
 	}
-	// Update payment method daily breakdown (new)
 	if err := s.analyticsRepo.IncrementPaymentMethodDaily(ctx, tx, companyID, paymentDate, paymentMethod, amount); err != nil {
 		s.logger.Error("failed to update payment method daily", zap.Error(err))
-		// non‑fatal
 	}
 	return tx.Commit()
 }
 
-// onPaymentRefunded handles both full and partial refund events.
-// Also inserts refund_fact if the refund is linked to a return.
 func (s *salesAnalyticsService) onPaymentRefunded(ctx context.Context, pay salesEvents.PaymentPayload, isFullRefund bool) error {
 	companyID, err := uuid.Parse(pay.CompanyID)
 	if err != nil {
 		return fmt.Errorf("invalid company_id: %w", err)
 	}
-	// Refund date – use payment date (or we could use created_at from the event)
 	refundDate, err := time.Parse(time.RFC3339, pay.PaymentDate)
 	if err != nil {
 		refundDate = time.Now()
@@ -714,16 +748,10 @@ func (s *salesAnalyticsService) onPaymentRefunded(ctx context.Context, pay sales
 	}
 	defer tx.Rollback()
 
-	// Increment refund metrics
 	if err := s.analyticsRepo.IncrementRefundMetrics(ctx, tx, companyID, refundDate, refundAmount, isFullRefund); err != nil {
 		return fmt.Errorf("failed to update refund metrics: %w", err)
 	}
 
-	// Find if this refund is associated with a return
-	// The event payload does not contain return_id, so we query payment_refunds table.
-	// We need the refund_id – the event payload does not contain it either.
-	// For a robust solution the event should be extended with refund_id and return_id.
-	// Here we assume the refund event includes a "refund_id" field; if not, we skip.
 	if pay.RefundID != "" {
 		refundID, err := uuid.Parse(pay.RefundID)
 		if err == nil {
@@ -731,13 +759,11 @@ func (s *salesAnalyticsService) onPaymentRefunded(ctx context.Context, pay sales
 			query := `SELECT return_id FROM sales.payment_refunds WHERE refund_id = $1 AND company_id = $2`
 			err = tx.QueryRowContext(ctx, query, refundID, companyID).Scan(&returnID)
 			if err == nil && returnID != uuid.Nil {
-				// Get refund amount and date (already have)
 				refundMethod, _ := parsePaymentMethod(pay.PaymentMethod)
 				status := "completed"
 				if !isFullRefund {
 					status = "partial"
 				}
-				// Original payment ID from the event
 				paymentID, _ := uuid.Parse(pay.PaymentID)
 				fact := &sales_analytics.RefundFact{
 					CompanyID:    companyID,
@@ -787,17 +813,13 @@ func (s *salesAnalyticsService) onReturnCreated(ctx context.Context, payload sal
 	}
 	defer tx.Rollback()
 
-	// 1. Daily return metrics – increment requests
 	if err := s.analyticsRepo.IncrementDailyReturnRequests(ctx, tx, companyID, returnDate); err != nil {
 		return fmt.Errorf("increment return requests: %w", err)
 	}
-
-	// 2. Unique customer per day
 	if err := s.analyticsRepo.IncrementDailyReturnUniqueCustomer(ctx, tx, companyID, returnDate, customerID); err != nil {
 		s.logger.Warn("failed to increment unique customer for return", zap.Error(err))
 	}
 
-	// 3. Insert processing time for 'pending' status
 	pendingFact := &sales_analytics.ReturnProcessingTimeFact{
 		CompanyID: companyID,
 		ReturnID:  returnID,
@@ -808,20 +830,17 @@ func (s *salesAnalyticsService) onReturnCreated(ctx context.Context, payload sal
 		return fmt.Errorf("insert pending processing time: %w", err)
 	}
 
-	// 4. Fetch return items with reasons (from database, because event may not contain reasons)
 	items, err := s.returnRepo.GetItems(ctx, tx, companyID, returnID)
 	if err != nil {
 		return fmt.Errorf("get return items: %w", err)
 	}
 
-	// 5. Record reason facts and product category aggregations
 	for _, it := range items {
-		// Reason fact
 		reasonFact := &sales_analytics.ReturnReasonFact{
 			CompanyID:        companyID,
 			ReturnID:         returnID,
 			ReturnItemID:     it.ReturnItemID,
-			ReasonCode:       nil, // could be derived from it.Reason or a code mapping
+			ReasonCode:       nil,
 			ReasonText:       it.Reason,
 			ProductID:        &it.ProductID,
 			QuantityReturned: it.Quantity,
@@ -832,29 +851,17 @@ func (s *salesAnalyticsService) onReturnCreated(ctx context.Context, payload sal
 			s.logger.Error("failed to insert return reason fact", zap.Error(err))
 		}
 
-		// Product category fact – get product details
 		_, err := s.productRepo.GetByID(ctx, tx, companyID, it.ProductID)
 		if err != nil {
 			s.logger.Warn("product not found for category aggregation", zap.String("product_id", it.ProductID.String()), zap.Error(err))
 			continue
 		}
-		// Determine if this is the first return for this return_id (unique return per category)
-		// We'll treat each return as one “unique return” per category. For simplicity, we increment unique_returns by 1
-		// if this category hasn't been seen for this return. We can track in memory or use a more complex query,
-		// but to keep the example simple we just call IncrementReturnProductCategory with isUniqueReturn = true
-		// for the first product in the return (or we could count later). Here we'll call once per return item
-		// but set unique_returns = 0 for subsequent items. To avoid overcounting, we'll only mark the first item as unique.
-		// A simpler approach: leave unique_returns as 0 and rely on daily return metrics for count of returns.
-		// We'll set isUniqueReturn = false to avoid overcounting.
 		var categoryID *uuid.UUID
 		var categoryName *string
-		// If your Product model has CategoryID/CategoryName, use them; otherwise skip.
-		// For demonstration, we pass nil – you can extend later.
 		if err := s.analyticsRepo.IncrementReturnProductCategory(ctx, tx, companyID, categoryID, categoryName, returnDate, it.Quantity, it.RefundAmount, false); err != nil {
 			s.logger.Error("failed to increment return product category", zap.Error(err))
 		}
 	}
-
 	return tx.Commit()
 }
 
@@ -875,11 +882,9 @@ func (s *salesAnalyticsService) onReturnApproved(ctx context.Context, payload sa
 	}
 	defer tx.Rollback()
 
-	// Close pending status
 	if err := s.analyticsRepo.CloseReturnProcessingTime(ctx, tx, returnID, enums.ReturnStatusPending, approvalDate); err != nil {
 		s.logger.Warn("failed to close pending processing time", zap.Error(err))
 	}
-	// Insert approved status
 	approvedFact := &sales_analytics.ReturnProcessingTimeFact{
 		CompanyID: companyID,
 		ReturnID:  returnID,
@@ -890,8 +895,6 @@ func (s *salesAnalyticsService) onReturnApproved(ctx context.Context, payload sa
 		return fmt.Errorf("insert approved processing time: %w", err)
 	}
 
-	// Update daily metrics – approvals
-	// Use the return date from the return (need to fetch it)
 	ret, err := s.returnRepo.GetByID(ctx, tx, companyID, returnID)
 	if err != nil {
 		return fmt.Errorf("get return for approval date: %w", err)
@@ -919,12 +922,9 @@ func (s *salesAnalyticsService) onReturnRejected(ctx context.Context, payload sa
 	}
 	defer tx.Rollback()
 
-	// Close pending status
 	if err := s.analyticsRepo.CloseReturnProcessingTime(ctx, tx, returnID, enums.ReturnStatusPending, rejectionDate); err != nil {
 		s.logger.Warn("failed to close pending processing time", zap.Error(err))
 	}
-	// Optionally insert rejected status (not required for duration calculation)
-	// Update daily metrics – rejections
 	ret, err := s.returnRepo.GetByID(ctx, tx, companyID, returnID)
 	if err != nil {
 		return fmt.Errorf("get return for rejection date: %w", err)
@@ -956,11 +956,9 @@ func (s *salesAnalyticsService) onReturnCompleted(ctx context.Context, payload s
 	}
 	defer tx.Rollback()
 
-	// Close approved status (if any)
 	if err := s.analyticsRepo.CloseReturnProcessingTime(ctx, tx, returnID, enums.ReturnStatusApproved, completionDate); err != nil {
 		s.logger.Warn("failed to close approved processing time", zap.Error(err))
 	}
-	// Insert completed status
 	completedFact := &sales_analytics.ReturnProcessingTimeFact{
 		CompanyID: companyID,
 		ReturnID:  returnID,
@@ -971,7 +969,6 @@ func (s *salesAnalyticsService) onReturnCompleted(ctx context.Context, payload s
 		return fmt.Errorf("insert completed processing time: %w", err)
 	}
 
-	// Get return details (return date, credit note amount)
 	ret, err := s.returnRepo.GetByID(ctx, tx, companyID, returnID)
 	if err != nil {
 		return fmt.Errorf("get return for completion: %w", err)
@@ -984,12 +981,9 @@ func (s *salesAnalyticsService) onReturnCompleted(ctx context.Context, payload s
 		}
 	}
 
-	// Update daily return metrics – completions
 	if err := s.analyticsRepo.IncrementDailyReturnCompletions(ctx, tx, companyID, ret.ReturnDate, totalRefund, creditNoteAmount); err != nil {
 		return fmt.Errorf("increment daily return completions: %w", err)
 	}
-
-	// Adjust revenue and product returns
 	if err := s.analyticsRepo.AddDailyRevenue(ctx, tx, companyID, ret.ReturnDate, totalRefund.Neg()); err != nil {
 		return err
 	}
@@ -1008,7 +1002,6 @@ func (s *salesAnalyticsService) onReturnCompleted(ctx context.Context, payload s
 			}
 		}
 	}
-	// Update product returns fact
 	items, err := s.returnRepo.GetItems(ctx, tx, companyID, returnID)
 	if err != nil {
 		return fmt.Errorf("get return items for completion: %w", err)
@@ -1021,7 +1014,6 @@ func (s *salesAnalyticsService) onReturnCompleted(ctx context.Context, payload s
 			s.logger.Error("failed to add product returns fact", zap.Error(err))
 		}
 	}
-
 	return tx.Commit()
 }
 
@@ -1029,7 +1021,6 @@ func (s *salesAnalyticsService) onReturnCompleted(ctx context.Context, payload s
 // Invoice Analytics Handlers
 // ----------------------------------------------------------------------------
 
-// onInvoiceCreated inserts the initial draft status into invoice_status_history.
 func (s *salesAnalyticsService) onInvoiceCreated(ctx context.Context, inv salesEvents.InvoicePayload) error {
 	invoiceID, err := uuid.Parse(inv.InvoiceID)
 	if err != nil {
@@ -1059,8 +1050,6 @@ func (s *salesAnalyticsService) onInvoiceCreated(ctx context.Context, inv salesE
 	return tx.Commit()
 }
 
-// onInvoiceIssued closes draft, inserts issued, captures item analytics, updates daily metrics,
-// and refreshes aging snapshot.
 func (s *salesAnalyticsService) onInvoiceIssued(ctx context.Context, inv salesEvents.InvoicePayload) error {
 	invoiceID, err := uuid.Parse(inv.InvoiceID)
 	if err != nil {
@@ -1086,11 +1075,9 @@ func (s *salesAnalyticsService) onInvoiceIssued(ctx context.Context, inv salesEv
 	}
 	defer tx.Rollback()
 
-	// Close draft status
 	if err := s.analyticsRepo.CloseInvoiceStatusHistory(ctx, tx, invoiceID, enums.InvoiceStatusDraft, now); err != nil {
 		s.logger.Warn("failed to close draft invoice status", zap.Error(err))
 	}
-	// Insert issued status
 	history := &sales_analytics.InvoiceStatusHistory{
 		InvoiceID: invoiceID,
 		CompanyID: companyID,
@@ -1100,13 +1087,10 @@ func (s *salesAnalyticsService) onInvoiceIssued(ctx context.Context, inv salesEv
 	if err := s.analyticsRepo.InsertInvoiceStatusHistory(ctx, tx, history); err != nil {
 		return fmt.Errorf("insert issued status: %w", err)
 	}
-
-	// Daily metrics
 	if err := s.analyticsRepo.IncrementDailyInvoiceIssued(ctx, tx, companyID, invoiceDate, grandTotal); err != nil {
 		return err
 	}
 
-	// Invoice item analytics
 	items, err := s.invoiceRepo.GetItems(ctx, tx, companyID, invoiceID)
 	if err != nil {
 		s.logger.Warn("failed to fetch invoice items for analytics", zap.Error(err))
@@ -1143,12 +1127,9 @@ func (s *salesAnalyticsService) onInvoiceIssued(ctx context.Context, inv salesEv
 		}
 	}
 
-	// Refresh aging snapshot as of today
 	if err := s.analyticsRepo.RefreshInvoiceAgingSnapshot(ctx, tx, companyID, now); err != nil {
 		s.logger.Warn("failed to refresh aging snapshot after issuance", zap.Error(err))
 	}
-
-	// Payment term analytics (using event payload, not invoice model)
 	if inv.PaymentTermID != "" {
 		termID, err := uuid.Parse(inv.PaymentTermID)
 		if err == nil {
@@ -1161,8 +1142,6 @@ func (s *salesAnalyticsService) onInvoiceIssued(ctx context.Context, inv salesEv
 	return tx.Commit()
 }
 
-// onInvoicePaid processes payment allocations: closes previous status, inserts paid,
-// updates daily metrics, records early discount if taken, refreshes aging.
 func (s *salesAnalyticsService) onInvoicePaid(ctx context.Context, pay salesEvents.PaymentPayload) error {
 	if len(pay.Allocations) == 0 {
 		return nil
@@ -1187,14 +1166,12 @@ func (s *salesAnalyticsService) onInvoicePaid(ctx context.Context, pay salesEven
 			s.logger.Warn("invalid invoice_id in allocation", zap.Error(err))
 			continue
 		}
-		// Fetch invoice details to get invoice_date, due_date, early discount info
 		invoice, err := s.invoiceRepo.GetByID(ctx, tx, companyID, invoiceID)
 		if err != nil {
 			s.logger.Error("failed to fetch invoice for payment", zap.Error(err))
 			continue
 		}
 
-		// Close previous status (issued or overdue) and insert paid
 		previousStatus := invoice.Status
 		if previousStatus != enums.InvoiceStatusIssued && previousStatus != enums.InvoiceStatusOverdue {
 			s.logger.Warn("invoice paid but status not issued/overdue", zap.String("status", string(previousStatus)))
@@ -1213,16 +1190,11 @@ func (s *salesAnalyticsService) onInvoicePaid(ctx context.Context, pay salesEven
 			continue
 		}
 
-		// Days to pay
 		daysToPay := int(paymentDate.Sub(invoice.InvoiceDate).Hours() / 24)
-
-		// Update daily metrics: total_paid_value, total_invoices_paid, avg_days_to_payment
 		amount, _ := decimal.NewFromString(alloc.Amount)
 		if err := s.analyticsRepo.IncrementDailyInvoicePaid(ctx, tx, companyID, paymentDate, amount, &daysToPay); err != nil {
 			s.logger.Error("failed to update daily paid metrics", zap.Error(err))
 		}
-
-		// Early discount taken?
 		if alloc.IsEarlyDiscount && alloc.DiscountAmount != "" {
 			discountAmt, _ := decimal.NewFromString(alloc.DiscountAmount)
 			if err := s.analyticsRepo.RecordEarlyDiscount(ctx, tx, companyID, paymentDate, discountAmt); err != nil {
@@ -1230,16 +1202,12 @@ func (s *salesAnalyticsService) onInvoicePaid(ctx context.Context, pay salesEven
 			}
 		}
 	}
-
-	// Refresh aging snapshot after payments
 	if err := s.analyticsRepo.RefreshInvoiceAgingSnapshot(ctx, tx, companyID, paymentDate); err != nil {
 		s.logger.Warn("failed to refresh aging snapshot after payment", zap.Error(err))
 	}
 	return tx.Commit()
 }
 
-// onInvoiceOverdue handles EventInvoiceOverdue: close issued status, insert overdue,
-// update daily metrics, refresh aging.
 func (s *salesAnalyticsService) onInvoiceOverdue(ctx context.Context, inv salesEvents.InvoicePayload) error {
 	invoiceID, err := uuid.Parse(inv.InvoiceID)
 	if err != nil {
@@ -1258,7 +1226,6 @@ func (s *salesAnalyticsService) onInvoiceOverdue(ctx context.Context, inv salesE
 	}
 	defer tx.Rollback()
 
-	// Close the issued status (if any)
 	if err := s.analyticsRepo.CloseInvoiceStatusHistory(ctx, tx, invoiceID, enums.InvoiceStatusIssued, overdueDate); err != nil {
 		s.logger.Warn("failed to close issued status for overdue", zap.Error(err))
 	}
@@ -1271,20 +1238,15 @@ func (s *salesAnalyticsService) onInvoiceOverdue(ctx context.Context, inv salesE
 	if err := s.analyticsRepo.InsertInvoiceStatusHistory(ctx, tx, history); err != nil {
 		return fmt.Errorf("insert overdue status: %w", err)
 	}
-
-	// Update daily metrics: total_invoices_overdue, total_overdue_value
 	if err := s.analyticsRepo.IncrementDailyInvoiceOverdue(ctx, tx, companyID, overdueDate, grandTotal); err != nil {
 		return err
 	}
-	// Refresh aging snapshot
 	if err := s.analyticsRepo.RefreshInvoiceAgingSnapshot(ctx, tx, companyID, overdueDate); err != nil {
 		s.logger.Warn("failed to refresh aging snapshot after overdue", zap.Error(err))
 	}
 	return tx.Commit()
 }
 
-// onInvoiceCancelled handles cancellation events: close previous status, insert cancelled,
-// update daily metrics, refresh aging.
 func (s *salesAnalyticsService) onInvoiceCancelled(ctx context.Context, inv salesEvents.InvoicePayload) error {
 	invoiceID, err := uuid.Parse(inv.InvoiceID)
 	if err != nil {
@@ -1302,7 +1264,6 @@ func (s *salesAnalyticsService) onInvoiceCancelled(ctx context.Context, inv sale
 	}
 	defer tx.Rollback()
 
-	// Get current status before closing
 	invoice, err := s.invoiceRepo.GetByID(ctx, tx, companyID, invoiceID)
 	if err != nil {
 		s.logger.Warn("failed to fetch invoice for cancellation", zap.Error(err))
@@ -1320,19 +1281,15 @@ func (s *salesAnalyticsService) onInvoiceCancelled(ctx context.Context, inv sale
 	if err := s.analyticsRepo.InsertInvoiceStatusHistory(ctx, tx, history); err != nil {
 		return fmt.Errorf("insert cancelled status: %w", err)
 	}
-	// Daily metrics: total_invoices_cancelled
 	if err := s.analyticsRepo.IncrementDailyInvoiceCancelled(ctx, tx, companyID, cancelledAt); err != nil {
 		return err
 	}
-	// Refresh aging snapshot (cancelled invoices no longer count as outstanding)
 	if err := s.analyticsRepo.RefreshInvoiceAgingSnapshot(ctx, tx, companyID, cancelledAt); err != nil {
 		s.logger.Warn("failed to refresh aging snapshot after cancellation", zap.Error(err))
 	}
 	return tx.Commit()
 }
 
-// onInvoiceCredited handles credit notes: close previous status, insert credited,
-// refresh aging (credited invoices are considered fulfilled), and insert credit_note_fact if linked to a return.
 func (s *salesAnalyticsService) onInvoiceCredited(ctx context.Context, inv salesEvents.InvoicePayload) error {
 	invoiceID, err := uuid.Parse(inv.InvoiceID)
 	if err != nil {
@@ -1366,22 +1323,19 @@ func (s *salesAnalyticsService) onInvoiceCredited(ctx context.Context, inv sales
 	if err := s.analyticsRepo.InsertInvoiceStatusHistory(ctx, tx, history); err != nil {
 		return fmt.Errorf("insert credited status: %w", err)
 	}
-	// Refresh aging snapshot
 	if err := s.analyticsRepo.RefreshInvoiceAgingSnapshot(ctx, tx, companyID, creditedAt); err != nil {
 		s.logger.Warn("failed to refresh aging snapshot after credit", zap.Error(err))
 	}
 
-	// Check if this invoice is a credit note linked to a return
 	var returnID *uuid.UUID
 	query := `SELECT return_id FROM sales.returns WHERE credit_note_id = $1 AND company_id = $2`
 	err = tx.QueryRowContext(ctx, query, invoiceID, companyID).Scan(&returnID)
 	if err == nil && returnID != nil {
-		// Insert into credit_note_fact
 		fact := &sales_analytics.CreditNoteFact{
 			CompanyID:     companyID,
 			CreditNoteID:  invoiceID,
 			ReturnID:      returnID,
-			IssuedDate:    invoice.InvoiceDate, // or creditedAt
+			IssuedDate:    invoice.InvoiceDate,
 			IssuedAmount:  grandTotal.Abs(),
 			AppliedAmount: decimal.Zero,
 			Status:        "issued",
@@ -1397,7 +1351,6 @@ func (s *salesAnalyticsService) onInvoiceCredited(ctx context.Context, inv sales
 // Quote Analytics Handlers
 // ----------------------------------------------------------------------------
 
-// onQuoteCreated inserts the initial draft status and updates daily quote creation metrics.
 func (s *salesAnalyticsService) onQuoteCreated(ctx context.Context, quote salesEvents.QuotePayload) error {
 	quoteID, err := uuid.Parse(quote.QuoteID)
 	if err != nil {
@@ -1424,7 +1377,6 @@ func (s *salesAnalyticsService) onQuoteCreated(ctx context.Context, quote salesE
 	}
 	defer tx.Rollback()
 
-	// Insert draft status history
 	history := &sales_analytics.QuoteStatusHistory{
 		QuoteID:   quoteID,
 		CompanyID: companyID,
@@ -1434,13 +1386,10 @@ func (s *salesAnalyticsService) onQuoteCreated(ctx context.Context, quote salesE
 	if err := s.analyticsRepo.InsertQuoteStatusHistory(ctx, tx, history); err != nil {
 		return fmt.Errorf("insert quote status history: %w", err)
 	}
-
-	// Increment daily aggregates
 	if err := s.analyticsRepo.IncrementDailyQuoteCreated(ctx, tx, companyID, quoteDate, grandTotal); err != nil {
 		return err
 	}
 
-	// Quote item analytics (if items are present)
 	if quote.Items != nil && len(quote.Items) > 0 {
 		for _, item := range quote.Items {
 			productID, err := uuid.Parse(item.ProductID)
@@ -1486,7 +1435,6 @@ func (s *salesAnalyticsService) onQuoteCreated(ctx context.Context, quote salesE
 	return tx.Commit()
 }
 
-// onQuoteStatusChanged handles status transitions (sent, accepted, rejected, expired).
 func (s *salesAnalyticsService) onQuoteStatusChanged(ctx context.Context, quote salesEvents.QuotePayload, newStatus, previousStatus enums.QuoteStatus) error {
 	quoteID, err := uuid.Parse(quote.QuoteID)
 	if err != nil {
@@ -1504,11 +1452,9 @@ func (s *salesAnalyticsService) onQuoteStatusChanged(ctx context.Context, quote 
 	}
 	defer tx.Rollback()
 
-	// Close the previous status
 	if err := s.analyticsRepo.CloseQuoteStatusHistory(ctx, tx, quoteID, previousStatus, now); err != nil {
 		s.logger.Warn("failed to close previous quote status", zap.String("previous", string(previousStatus)), zap.Error(err))
 	}
-	// Insert new status
 	history := &sales_analytics.QuoteStatusHistory{
 		QuoteID:   quoteID,
 		CompanyID: companyID,
@@ -1521,7 +1467,6 @@ func (s *salesAnalyticsService) onQuoteStatusChanged(ctx context.Context, quote 
 	return tx.Commit()
 }
 
-// onQuoteConverted records the conversion fact and updates daily conversion metrics.
 func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote salesEvents.QuotePayload) error {
 	quoteID, err := uuid.Parse(quote.QuoteID)
 	if err != nil {
@@ -1541,7 +1486,6 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 		return fmt.Errorf("invalid grand_total: %w", err)
 	}
 
-	// Order ID from conversion (must be present in payload)
 	if quote.ConvertedOrderID == "" {
 		s.logger.Warn("quote converted event missing converted_order_id", zap.String("quote_id", quote.QuoteID))
 		return nil
@@ -1551,7 +1495,6 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 		return fmt.Errorf("invalid converted_order_id: %w", err)
 	}
 
-	// Parse quote creation date for conversion time
 	var quoteCreatedAt time.Time
 	if quote.QuoteDate != "" {
 		quoteCreatedAt, _ = time.Parse(time.RFC3339, quote.QuoteDate)
@@ -1568,8 +1511,6 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 			expiryDays = &days
 		}
 	}
-
-	// Order value - assume equal to quote value at conversion
 	orderValue := quoteValue
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -1578,11 +1519,9 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 	}
 	defer tx.Rollback()
 
-	// Close the 'accepted' status (previous status) before inserting 'converted'
 	if err := s.analyticsRepo.CloseQuoteStatusHistory(ctx, tx, quoteID, enums.QuoteStatusAccepted, convertedAt); err != nil {
 		s.logger.Warn("failed to close accepted status", zap.Error(err))
 	}
-	// Insert converted status
 	history := &sales_analytics.QuoteStatusHistory{
 		QuoteID:   quoteID,
 		CompanyID: companyID,
@@ -1593,7 +1532,6 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 		return fmt.Errorf("insert converted status: %w", err)
 	}
 
-	// Insert conversion fact
 	fact := &sales_analytics.QuoteConversionFact{
 		QuoteID:                quoteID,
 		OrderID:                orderID,
@@ -1610,8 +1548,6 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 	if err := s.analyticsRepo.InsertQuoteConversionFact(ctx, tx, fact); err != nil {
 		return fmt.Errorf("insert quote conversion fact: %w", err)
 	}
-
-	// Update daily conversion metrics
 	if err := s.analyticsRepo.IncrementDailyQuoteConverted(ctx, tx, companyID, convertedAt, orderValue); err != nil {
 		return err
 	}
@@ -1619,10 +1555,142 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 }
 
 // ----------------------------------------------------------------------------
+// Sales Target Handlers (new)
+// ----------------------------------------------------------------------------
+
+func (s *salesAnalyticsService) onSalesTargetSet(ctx context.Context, payload salesEvents.SalesTargetPayload) error {
+	companyID, err := uuid.Parse(payload.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	salesRepID, err := uuid.Parse(payload.SalesRepID)
+	if err != nil {
+		return fmt.Errorf("invalid sales_rep_id: %w", err)
+	}
+	periodStart, err := time.Parse(time.RFC3339, payload.PeriodStart)
+	if err != nil {
+		return fmt.Errorf("invalid period_start: %w", err)
+	}
+	periodEnd, err := time.Parse(time.RFC3339, payload.PeriodEnd)
+	if err != nil {
+		return fmt.Errorf("invalid period_end: %w", err)
+	}
+	targetAmount, err := decimal.NewFromString(payload.TargetAmount)
+	if err != nil {
+		return fmt.Errorf("invalid target_amount: %w", err)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	achievement := &sales_analytics.SalesRepTargetAchievement{
+		CompanyID:     companyID,
+		SalesRepID:    salesRepID,
+		PeriodStart:   periodStart,
+		PeriodEnd:     periodEnd,
+		TargetAmount:  targetAmount,
+		ActualRevenue: decimal.Zero,
+		Currency:      payload.Currency,
+	}
+	if err := s.analyticsRepo.UpsertSalesRepTargetAchievement(ctx, tx, achievement); err != nil {
+		return fmt.Errorf("upsert target achievement: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *salesAnalyticsService) onSalesTargetDeleted(ctx context.Context, payload salesEvents.SalesTargetPayload) error {
+	// Optionally set target_amount to 0 or delete the record.
+	// Since the table has a unique constraint, we can set target_amount to 0.
+	companyID, err := uuid.Parse(payload.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	salesRepID, err := uuid.Parse(payload.SalesRepID)
+	if err != nil {
+		return fmt.Errorf("invalid sales_rep_id: %w", err)
+	}
+	periodStart, err := time.Parse(time.RFC3339, payload.PeriodStart)
+	if err != nil {
+		return fmt.Errorf("invalid period_start: %w", err)
+	}
+	periodEnd, err := time.Parse(time.RFC3339, payload.PeriodEnd)
+	if err != nil {
+		return fmt.Errorf("invalid period_end: %w", err)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Instead of deleting, we can set target_amount = 0.
+	updateQuery := `
+		UPDATE sales_analytics.sales_rep_target_achievement
+		SET target_amount = 0, updated_at = NOW()
+		WHERE company_id = $1 AND sales_rep_id = $2 AND period_start = $3 AND period_end = $4
+	`
+	_, err = tx.ExecContext(ctx, updateQuery, companyID, salesRepID, periodStart, periodEnd)
+	if err != nil {
+		return fmt.Errorf("delete target achievement (set 0): %w", err)
+	}
+	return tx.Commit()
+}
+
+// ----------------------------------------------------------------------------
+// Sales Rep Target & Commission Helpers (called from onOrderConfirmed)
+// ----------------------------------------------------------------------------
+
+func (s *salesAnalyticsService) updateTargetAchievement(ctx context.Context, tx repository.DBTX, companyID, salesRepID uuid.UUID, orderDate time.Time, revenue decimal.Decimal) error {
+	// Find target period that contains the order date
+	query := `
+		SELECT period_start, period_end
+		FROM sales.sales_targets
+		WHERE company_id = $1 AND sales_rep_id = $2
+		  AND period_start <= $3 AND period_end >= $3
+	`
+	var periodStart, periodEnd time.Time
+	err := tx.QueryRowContext(ctx, query, companyID, salesRepID, orderDate).Scan(&periodStart, &periodEnd)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// No target set for this period – ignore
+			return nil
+		}
+		return fmt.Errorf("find target period: %w", err)
+	}
+
+	// Add revenue to the achievement record using the repository method
+	if err := s.analyticsRepo.UpdateSalesRepTargetAchievement(ctx, tx, companyID, salesRepID, periodStart, periodEnd, revenue); err != nil {
+		return fmt.Errorf("update target achievement: %w", err)
+	}
+	return nil
+}
+
+func (s *salesAnalyticsService) recordCommissionFact(ctx context.Context, tx repository.DBTX, companyID, salesRepID, orderID uuid.UUID, orderTotal, commissionRate, commissionAmount decimal.Decimal, earnedAt time.Time) error {
+	fact := &sales_analytics.SalesRepCommissionFact{
+		CompanyID:        companyID,
+		SalesRepID:       salesRepID,
+		EntityType:       "order",
+		EntityID:         orderID,
+		CommissionBase:   orderTotal,
+		CommissionRate:   commissionRate,
+		CommissionAmount: commissionAmount,
+		EarnedAt:         earnedAt,
+		PaidAt:           nil,
+	}
+	if err := s.analyticsRepo.UpsertSalesRepCommissionFact(ctx, tx, fact); err != nil {
+		return fmt.Errorf("upsert commission fact: %w", err)
+	}
+	return nil
+}
+
+// ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
 
-// parsePaymentMethod converts a string from the event payload to a PaymentMethod enum.
 func parsePaymentMethod(methodStr string) (enums.PaymentMethod, error) {
 	switch methodStr {
 	case "cash":
@@ -1640,7 +1708,6 @@ func parsePaymentMethod(methodStr string) (enums.PaymentMethod, error) {
 	}
 }
 
-// updateCustomerSpent adjusts customer metrics after a return (existing helper)
 func (s *salesAnalyticsService) updateCustomerSpent(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID, delta decimal.Decimal) error {
 	query := `
         UPDATE sales_analytics.customer_metrics
@@ -1654,7 +1721,6 @@ func (s *salesAnalyticsService) updateCustomerSpent(ctx context.Context, tx repo
 	return err
 }
 
-// onAutomaticDiscountApplied updates automatic_discount_metrics table.
 func (s *salesAnalyticsService) onAutomaticDiscountApplied(ctx context.Context, payload struct {
 	CompanyID      string `json:"company_id"`
 	AutoDiscountID string `json:"auto_discount_id"`
@@ -1694,7 +1760,7 @@ func (s *salesAnalyticsService) onAutomaticDiscountApplied(ctx context.Context, 
 	} else {
 		date = time.Now()
 	}
-	date = date.Truncate(24 * time.Hour) // use only date part
+	date = date.Truncate(24 * time.Hour)
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -1708,7 +1774,6 @@ func (s *salesAnalyticsService) onAutomaticDiscountApplied(ctx context.Context, 
 	return tx.Commit()
 }
 
-// onStackingRuleUsed updates discount_stacking_usage table.
 func (s *salesAnalyticsService) onStackingRuleUsed(ctx context.Context, payload struct {
 	CompanyID        string `json:"company_id"`
 	RuleID           string `json:"rule_id"`
@@ -1792,7 +1857,6 @@ func (s *salesAnalyticsService) onCouponApplied(ctx context.Context, payload sal
 	}
 	defer tx.Rollback()
 
-	// 1. Insert usage fact (idempotent thanks to unique constraint)
 	fact := &sales_analytics.CouponUsageFact{
 		CompanyID:      companyID,
 		CouponID:       couponID,
@@ -1807,35 +1871,28 @@ func (s *salesAnalyticsService) onCouponApplied(ctx context.Context, payload sal
 		return fmt.Errorf("record coupon usage fact: %w", err)
 	}
 
-	// 2. Update daily metrics (includes unique customer tracking)
 	date := usedAt.Truncate(24 * time.Hour)
 	if customerID != nil {
 		if err := s.analyticsRepo.IncrementCouponDailyMetrics(ctx, tx, companyID, couponID, date, discountAmount, orderSubtotal, *customerID); err != nil {
 			return fmt.Errorf("increment daily coupon metrics: %w", err)
 		}
 	} else {
-		// No customer – update without touching unique_customers
 		if err := s.incrementDailyCouponMetricsWithoutCustomer(ctx, tx, companyID, couponID, date, discountAmount, orderSubtotal); err != nil {
 			return fmt.Errorf("increment daily coupon metrics (no customer): %w", err)
 		}
 	}
 
-	// 3. Update lifetime performance summary (handles unique customers via bridge)
 	if err := s.analyticsRepo.UpdateCouponPerformanceSummary(ctx, tx, companyID, couponID, discountAmount, customerID, usedAt); err != nil {
 		return fmt.Errorf("update coupon performance summary: %w", err)
 	}
-
-	// 4. Update per-customer usage
 	if customerID != nil {
 		if err := s.analyticsRepo.UpdateCustomerCouponUsage(ctx, tx, companyID, couponID, *customerID, discountAmount, usedAt); err != nil {
 			return fmt.Errorf("update customer coupon usage: %w", err)
 		}
 	}
-
 	return tx.Commit()
 }
 
-// Helper for the rare case when customerID is nil (e.g., anonymous orders)
 func (s *salesAnalyticsService) incrementDailyCouponMetricsWithoutCustomer(
 	ctx context.Context, tx repository.DBTX,
 	companyID, couponID uuid.UUID,
@@ -1856,7 +1913,6 @@ func (s *salesAnalyticsService) incrementDailyCouponMetricsWithoutCustomer(
 	return err
 }
 
-// onPromotionApplied processes promotion application events and updates promotion analytics tables.
 func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload struct {
 	CompanyID      string `json:"company_id"`
 	PromotionID    string `json:"promotion_id"`
@@ -1887,7 +1943,6 @@ func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload 
 	}
 	date := appliedAt.Truncate(24 * time.Hour)
 
-	// Determine customer ID from the order/invoice if needed
 	var customerID *uuid.UUID
 	var orderSubtotal *decimal.Decimal
 
@@ -1897,7 +1952,6 @@ func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload 
 	}
 	defer tx.Rollback()
 
-	// Fetch customer ID and order subtotal based on entity type
 	switch payload.EntityType {
 	case "order":
 		order, err := s.orderRepo.GetByID(ctx, tx, companyID, entityID)
@@ -1915,10 +1969,8 @@ func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload 
 		orderSubtotal = &invoice.Subtotal
 	default:
 		s.logger.Warn("unknown entity type for promotion usage", zap.String("entity_type", payload.EntityType))
-		// Proceed without customer info (just log)
 	}
 
-	// 1. Record usage fact (idempotent)
 	fact := &sales_analytics.PromotionUsageFact{
 		CompanyID:      companyID,
 		PromotionID:    promotionID,
@@ -1933,13 +1985,11 @@ func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload 
 		return fmt.Errorf("record promotion usage fact: %w", err)
 	}
 
-	// 2. Update daily metrics (including unique customers)
 	if customerID != nil && orderSubtotal != nil {
 		if err := s.analyticsRepo.IncrementPromotionDailyMetrics(ctx, tx, companyID, promotionID, date, discountAmount, *orderSubtotal, *customerID); err != nil {
 			return fmt.Errorf("increment promotion daily metrics: %w", err)
 		}
 	} else {
-		// No customer – still update daily metrics but with unique_customers unchanged
 		query := `
             INSERT INTO sales_analytics.daily_promotion_metrics
                 (company_id, promotion_id, date, times_applied, total_discount_amount, total_order_value, unique_customers, updated_at)
@@ -1955,17 +2005,13 @@ func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload 
 		}
 	}
 
-	// 3. Update overall promotion performance summary
 	if err := s.analyticsRepo.UpdatePromotionPerformanceSummary(ctx, tx, companyID, promotionID, discountAmount, customerID, appliedAt); err != nil {
 		return fmt.Errorf("update promotion performance summary: %w", err)
 	}
-
-	// 4. Update per-customer usage (if customer exists)
 	if customerID != nil {
 		if err := s.analyticsRepo.UpdateCustomerPromotionUsage(ctx, tx, companyID, promotionID, *customerID, discountAmount, appliedAt); err != nil {
 			return fmt.Errorf("update customer promotion usage: %w", err)
 		}
 	}
-
 	return tx.Commit()
 }

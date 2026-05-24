@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -159,7 +160,20 @@ type AnalyticsRepository interface {
 	// CreditNoteFact
 	InsertCreditNoteFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditNoteFact) error
 	UpdateCreditNoteAppliedAmount(ctx context.Context, db DBTX, creditNoteID uuid.UUID, appliedAmount decimal.Decimal, appliedToInvoiceID *uuid.UUID, appliedDate *time.Time, status string) error
+	// Sales rep target achievement
+	UpsertSalesRepTargetAchievement(ctx context.Context, db DBTX, achievement *sales_analytics.SalesRepTargetAchievement) error
+	UpdateSalesRepTargetAchievement(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time, actualRevenue decimal.Decimal) error
+	GetSalesRepTargetAchievement(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*sales_analytics.SalesRepTargetAchievement, error)
 
+	// Sales rep commission fact
+	UpsertSalesRepCommissionFact(ctx context.Context, db DBTX, fact *sales_analytics.SalesRepCommissionFact) error
+	GetSalesRepCommissionFacts(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, from, to *time.Time) ([]*sales_analytics.SalesRepCommissionFact, error)
+	MarkCommissionPaid(ctx context.Context, db DBTX, companyID, factID uuid.UUID, paidAt time.Time) error
+
+	// Sales rep leaderboard snapshot
+	UpsertSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.SalesRepLeaderboardSnapshot) error
+	RefreshSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate, periodStart, periodEnd time.Time) error
+	GetSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) ([]*sales_analytics.SalesRepLeaderboardSnapshot, error)
 	// RefundFact
 	InsertRefundFact(ctx context.Context, db DBTX, fact *sales_analytics.RefundFact) error
 
@@ -2319,4 +2333,272 @@ func (r *analyticsRepository) IncrementReturnProductCategory(ctx context.Context
 		return fmt.Errorf("increment return product category: %w", err)
 	}
 	return nil
+}
+
+// -------------------- Sales Rep Target Achievement --------------------
+
+func (r *analyticsRepository) UpsertSalesRepTargetAchievement(ctx context.Context, db DBTX, achievement *sales_analytics.SalesRepTargetAchievement) error {
+	query := `
+        INSERT INTO sales_analytics.sales_rep_target_achievement
+            (company_id, sales_rep_id, period_start, period_end,
+             target_amount, actual_revenue, currency, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        ON CONFLICT (company_id, sales_rep_id, period_start, period_end) DO UPDATE SET
+            target_amount = EXCLUDED.target_amount,
+            actual_revenue = EXCLUDED.actual_revenue,
+            currency = EXCLUDED.currency,
+            updated_at = NOW()
+        RETURNING id
+    `
+	var id int64
+	err := db.QueryRowContext(ctx, query,
+		achievement.CompanyID,
+		achievement.SalesRepID,
+		achievement.PeriodStart,
+		achievement.PeriodEnd,
+		achievement.TargetAmount,
+		achievement.ActualRevenue,
+		achievement.Currency,
+	).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("upsert sales rep target achievement: %w", err)
+	}
+	achievement.ID = id
+	return nil
+}
+
+func (r *analyticsRepository) UpdateSalesRepTargetAchievement(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time, actualRevenue decimal.Decimal) error {
+	query := `
+        INSERT INTO sales_analytics.sales_rep_target_achievement
+            (company_id, sales_rep_id, period_start, period_end, target_amount, actual_revenue, updated_at)
+        SELECT $1, $2, $3, $4, target_amount, $5, NOW()
+        FROM sales_analytics.sales_rep_target_achievement
+        WHERE company_id = $1 AND sales_rep_id = $2 AND period_start = $3 AND period_end = $4
+        ON CONFLICT (company_id, sales_rep_id, period_start, period_end) DO UPDATE SET
+            actual_revenue = EXCLUDED.actual_revenue,
+            updated_at = NOW()
+    `
+	_, err := db.ExecContext(ctx, query, companyID, salesRepID, periodStart, periodEnd, actualRevenue)
+	if err != nil {
+		return fmt.Errorf("update sales rep target achievement: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) GetSalesRepTargetAchievement(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*sales_analytics.SalesRepTargetAchievement, error) {
+	query := `
+        SELECT id, company_id, sales_rep_id, period_start, period_end,
+               target_amount, actual_revenue, achievement_pct, currency,
+               created_at, updated_at
+        FROM sales_analytics.sales_rep_target_achievement
+        WHERE company_id = $1 AND sales_rep_id = $2 AND period_start = $3 AND period_end = $4
+    `
+	var a sales_analytics.SalesRepTargetAchievement
+	err := db.QueryRowContext(ctx, query, companyID, salesRepID, periodStart, periodEnd).Scan(
+		&a.ID, &a.CompanyID, &a.SalesRepID, &a.PeriodStart, &a.PeriodEnd,
+		&a.TargetAmount, &a.ActualRevenue, &a.AchievementPct, &a.Currency,
+		&a.CreatedAt, &a.UpdatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // not found is not an error
+		}
+		return nil, fmt.Errorf("get sales rep target achievement: %w", err)
+	}
+	return &a, nil
+}
+
+// -------------------- Sales Rep Commission Fact --------------------
+
+func (r *analyticsRepository) UpsertSalesRepCommissionFact(ctx context.Context, db DBTX, fact *sales_analytics.SalesRepCommissionFact) error {
+	query := `
+        INSERT INTO sales_analytics.sales_rep_commission_fact
+            (company_id, sales_rep_id, entity_type, entity_id,
+             commission_base, commission_rate, commission_amount,
+             earned_at, paid_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (company_id, entity_type, entity_id) DO UPDATE SET
+            commission_base = EXCLUDED.commission_base,
+            commission_rate = EXCLUDED.commission_rate,
+            commission_amount = EXCLUDED.commission_amount,
+            earned_at = EXCLUDED.earned_at,
+            paid_at = EXCLUDED.paid_at,
+            created_at = NOW()
+        RETURNING id
+    `
+	var id int64
+	err := db.QueryRowContext(ctx, query,
+		fact.CompanyID, fact.SalesRepID, fact.EntityType, fact.EntityID,
+		fact.CommissionBase, fact.CommissionRate, fact.CommissionAmount,
+		fact.EarnedAt, fact.PaidAt,
+	).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("upsert sales rep commission fact: %w", err)
+	}
+	fact.ID = id
+	return nil
+}
+
+func (r *analyticsRepository) GetSalesRepCommissionFacts(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, from, to *time.Time) ([]*sales_analytics.SalesRepCommissionFact, error) {
+	var args []interface{}
+	conditions := []string{"company_id = $1", "sales_rep_id = $2"}
+	args = append(args, companyID, salesRepID)
+	idx := 3
+	if from != nil {
+		conditions = append(conditions, fmt.Sprintf("earned_at >= $%d", idx))
+		args = append(args, *from)
+		idx++
+	}
+	if to != nil {
+		conditions = append(conditions, fmt.Sprintf("earned_at <= $%d", idx))
+		args = append(args, *to)
+		idx++
+	}
+	whereClause := strings.Join(conditions, " AND ")
+	query := fmt.Sprintf(`
+        SELECT id, company_id, sales_rep_id, entity_type, entity_id,
+               commission_base, commission_rate, commission_amount,
+               earned_at, paid_at, created_at
+        FROM sales_analytics.sales_rep_commission_fact
+        WHERE %s
+        ORDER BY earned_at DESC
+    `, whereClause)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get sales rep commission facts: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*sales_analytics.SalesRepCommissionFact
+	for rows.Next() {
+		var f sales_analytics.SalesRepCommissionFact
+		err := rows.Scan(
+			&f.ID, &f.CompanyID, &f.SalesRepID, &f.EntityType, &f.EntityID,
+			&f.CommissionBase, &f.CommissionRate, &f.CommissionAmount,
+			&f.EarnedAt, &f.PaidAt, &f.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan commission fact: %w", err)
+		}
+		result = append(result, &f)
+	}
+	return result, rows.Err()
+}
+
+func (r *analyticsRepository) MarkCommissionPaid(ctx context.Context, db DBTX, companyID, factID uuid.UUID, paidAt time.Time) error {
+	query := `
+        UPDATE sales_analytics.sales_rep_commission_fact
+        SET paid_at = $3
+        WHERE company_id = $1 AND id = $2 AND paid_at IS NULL
+    `
+	result, err := db.ExecContext(ctx, query, companyID, factID, paidAt)
+	if err != nil {
+		return fmt.Errorf("mark commission paid: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("no unpaid commission fact found for id %s", factID)
+	}
+	return nil
+}
+
+// -------------------- Sales Rep Leaderboard Snapshot --------------------
+
+func (r *analyticsRepository) UpsertSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.SalesRepLeaderboardSnapshot) error {
+	query := `
+        INSERT INTO sales_analytics.sales_rep_leaderboard_snapshot
+            (company_id, snapshot_date, period_start, period_end,
+             sales_rep_id, rank, revenue, orders_count, average_deal, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (company_id, snapshot_date, sales_rep_id) DO UPDATE SET
+            period_start = EXCLUDED.period_start,
+            period_end = EXCLUDED.period_end,
+            rank = EXCLUDED.rank,
+            revenue = EXCLUDED.revenue,
+            orders_count = EXCLUDED.orders_count,
+            average_deal = EXCLUDED.average_deal,
+            created_at = NOW()
+        RETURNING id
+    `
+	var id int64
+	err := db.QueryRowContext(ctx, query,
+		snapshot.CompanyID, snapshot.SnapshotDate, snapshot.PeriodStart, snapshot.PeriodEnd,
+		snapshot.SalesRepID, snapshot.Rank, snapshot.Revenue, snapshot.OrdersCount, snapshot.AverageDeal,
+	).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("upsert sales rep leaderboard snapshot: %w", err)
+	}
+	snapshot.ID = id
+	return nil
+}
+
+// RefreshSalesRepLeaderboardSnapshot computes the leaderboard for the given period and stores it as a snapshot.
+func (r *analyticsRepository) RefreshSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate, periodStart, periodEnd time.Time) error {
+	// Compute leaderboard from orders within the period
+	query := `
+        WITH leaderboard AS (
+            SELECT
+                o.sales_rep_id,
+                COALESCE(SUM(o.grand_total), 0) as revenue,
+                COUNT(o.order_id) as orders_count,
+                COALESCE(AVG(o.grand_total), 0) as avg_deal,
+                ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(o.grand_total), 0) DESC) as rank
+            FROM sales.sales_reps sr
+            LEFT JOIN sales.orders o ON o.sales_rep_id = sr.sales_rep_id
+                AND o.company_id = sr.company_id
+                AND o.order_date BETWEEN $3 AND $4
+                AND o.status IN ('confirmed', 'processing', 'shipped', 'delivered')
+            WHERE sr.company_id = $1 AND sr.is_active = true
+            GROUP BY o.sales_rep_id
+        )
+        INSERT INTO sales_analytics.sales_rep_leaderboard_snapshot
+            (company_id, snapshot_date, period_start, period_end,
+             sales_rep_id, rank, revenue, orders_count, average_deal, created_at)
+        SELECT $1, $2, $3, $4,
+               sales_rep_id, rank, revenue, orders_count, avg_deal, NOW()
+        FROM leaderboard
+        WHERE sales_rep_id IS NOT NULL
+        ON CONFLICT (company_id, snapshot_date, sales_rep_id) DO UPDATE SET
+            period_start = EXCLUDED.period_start,
+            period_end = EXCLUDED.period_end,
+            rank = EXCLUDED.rank,
+            revenue = EXCLUDED.revenue,
+            orders_count = EXCLUDED.orders_count,
+            average_deal = EXCLUDED.average_deal,
+            created_at = NOW()
+    `
+	_, err := db.ExecContext(ctx, query, companyID, snapshotDate, periodStart, periodEnd)
+	if err != nil {
+		return fmt.Errorf("refresh sales rep leaderboard snapshot: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) GetSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) ([]*sales_analytics.SalesRepLeaderboardSnapshot, error) {
+	query := `
+        SELECT id, company_id, snapshot_date, period_start, period_end,
+               sales_rep_id, rank, revenue, orders_count, average_deal, created_at
+        FROM sales_analytics.sales_rep_leaderboard_snapshot
+        WHERE company_id = $1 AND snapshot_date = $2
+        ORDER BY rank ASC
+    `
+	rows, err := db.QueryContext(ctx, query, companyID, snapshotDate)
+	if err != nil {
+		return nil, fmt.Errorf("get sales rep leaderboard snapshot: %w", err)
+	}
+	defer rows.Close()
+
+	var result []*sales_analytics.SalesRepLeaderboardSnapshot
+	for rows.Next() {
+		var s sales_analytics.SalesRepLeaderboardSnapshot
+		err := rows.Scan(
+			&s.ID, &s.CompanyID, &s.SnapshotDate, &s.PeriodStart, &s.PeriodEnd,
+			&s.SalesRepID, &s.Rank, &s.Revenue, &s.OrdersCount, &s.AverageDeal, &s.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan leaderboard snapshot: %w", err)
+		}
+		result = append(result, &s)
+	}
+	return result, rows.Err()
 }

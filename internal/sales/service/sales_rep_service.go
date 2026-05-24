@@ -23,6 +23,10 @@ import (
 )
 
 // ---------------------------------------------------------------------
+// Request / response DTOs
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
 // Service interface
 // ---------------------------------------------------------------------
 
@@ -88,6 +92,7 @@ type salesRepService struct {
 	quoteRepo        repository.QuoteRepository
 	invoiceRepo      repository.InvoiceRepository
 	commissionRepo   repository.SalesRepCommissionRepository
+	targetRepo       repository.SalesTargetRepository // added
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
@@ -101,6 +106,7 @@ func NewSalesRepService(
 	quoteRepo repository.QuoteRepository,
 	invoiceRepo repository.InvoiceRepository,
 	commissionRepo repository.SalesRepCommissionRepository,
+	targetRepo repository.SalesTargetRepository,
 	pgClient *client.PostgresClient,
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
@@ -113,6 +119,7 @@ func NewSalesRepService(
 		quoteRepo:        quoteRepo,
 		invoiceRepo:      invoiceRepo,
 		commissionRepo:   commissionRepo,
+		targetRepo:       targetRepo,
 		pgClient:         pgClient,
 		outboxRepo:       outboxRepo,
 		idempotencyStore: idempotencyStore,
@@ -158,6 +165,30 @@ func (s *salesRepService) emitEvent(ctx context.Context, tx *sql.Tx, rep *models
 	return s.outboxRepo.Store(ctx, tx, event)
 }
 
+func (s *salesRepService) emitSalesTargetEvent(ctx context.Context, tx *sql.Tx, target *models.SalesTarget, eventType string) error {
+	payload := map[string]interface{}{
+		"target_id":     target.TargetID.String(),
+		"company_id":    target.CompanyID.String(),
+		"sales_rep_id":  target.SalesRepID.String(),
+		"period_start":  target.PeriodStart,
+		"period_end":    target.PeriodEnd,
+		"target_amount": target.TargetAmount,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "sales_target",
+		AggregateID:   target.TargetID.String(),
+		EventType:     eventType,
+		Topic:         salesEvents.TopicSalesEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
+}
+
 func (s *salesRepService) validateCreateSalesRep(req *CreateSalesRepRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", salesErrors.ErrInvalidInput)
@@ -175,7 +206,7 @@ func (s *salesRepService) validateCreateSalesRep(req *CreateSalesRepRequest) err
 }
 
 // ---------------------------------------------------------------------
-// CRUD
+// CRUD operations
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error) {
@@ -452,7 +483,7 @@ func (s *salesRepService) IsSalesRepActive(ctx context.Context, companyID, sales
 }
 
 // ---------------------------------------------------------------------
-// Assignment helpers (generic)
+// Assignment helpers
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) assignEntity(ctx context.Context, companyID, salesRepID, entityID uuid.UUID, entityType string, assignedBy uuid.UUID, idempotencyKey string, updateFunc func(*sql.Tx) error) error {
@@ -660,7 +691,7 @@ func (s *salesRepService) GetAssignedInvoices(ctx context.Context, companyID, sa
 }
 
 // ---------------------------------------------------------------------
-// Customer assignments (not supported by data model)
+// Customer assignments (not supported)
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
@@ -702,7 +733,7 @@ func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, sale
 	if comm.CompanyID != companyID || comm.SalesRepID != salesRepID {
 		return fmt.Errorf("%w: commission plan not owned by this sales rep", salesErrors.ErrInvalidInput)
 	}
-	// No actual update needed – the plan is already linked.
+	// No update needed – the plan is already linked.
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	return tx.Commit()
 }
@@ -849,7 +880,7 @@ func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID 
 	defer tx.Rollback()
 
 	query := `
-		SELECT 
+		SELECT
 			sr.sales_rep_id, sr.code, sr.name,
 			COALESCE(SUM(o.grand_total), 0) as total_revenue,
 			COUNT(o.order_id) as total_orders,
@@ -887,15 +918,83 @@ func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID 
 }
 
 // ---------------------------------------------------------------------
-// Sales targets (not implemented)
+// Sales targets (implemented)
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID, idempotencyKey string) error {
-	return fmt.Errorf("sales target management not implemented")
+	logger := s.logger.With(zap.String("method", "SetSalesTarget"), zap.String("idempotency_key", idempotencyKey))
+	if companyID == uuid.Nil || salesRepID == uuid.Nil {
+		return salesErrors.ErrInvalidInput
+	}
+	if req.PeriodStart.After(req.PeriodEnd) {
+		return fmt.Errorf("%w: period_start must be before period_end", salesErrors.ErrInvalidInput)
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – target already set")
+		return nil
+	}
+
+	// Validate sales rep exists and is active
+	active, err := s.repRepo.IsActive(ctx, tx, companyID, salesRepID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return fmt.Errorf("%w: sales rep is not active", salesErrors.ErrInvalidInput)
+	}
+
+	// Upsert: delete existing target for the same period, then insert
+	delQuery := `DELETE FROM sales.sales_targets WHERE company_id=$1 AND sales_rep_id=$2 AND period_start=$3 AND period_end=$4`
+	if _, err := tx.ExecContext(ctx, delQuery, companyID, salesRepID, req.PeriodStart, req.PeriodEnd); err != nil {
+		return fmt.Errorf("delete existing target: %w", err)
+	}
+
+	target := &models.SalesTarget{
+		TargetID:     uuid.New(),
+		CompanyID:    companyID,
+		SalesRepID:   salesRepID,
+		PeriodStart:  req.PeriodStart,
+		PeriodEnd:    req.PeriodEnd,
+		TargetAmount: req.TargetAmount,
+		Currency:     "USD",
+		CreatedBy:    &updatedBy,
+		UpdatedBy:    &updatedBy,
+	}
+	if err := s.targetRepo.Create(ctx, tx, target); err != nil {
+		return fmt.Errorf("create sales target: %w", err)
+	}
+
+	if err := s.emitSalesTargetEvent(ctx, tx, target, salesEvents.EventSalesTargetSet); err != nil {
+		logger.Warn("failed to emit sales target event", zap.Error(err))
+	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "set_sales_target", "sales_target",
+			&target.TargetID, "user", &updatedBy, nil, nil, map[string]interface{}{
+				"sales_rep_id":  salesRepID.String(),
+				"period_start":  req.PeriodStart,
+				"period_end":    req.PeriodEnd,
+				"target_amount": req.TargetAmount,
+			})
+	}
+	return nil
 }
 
 func (s *salesRepService) GetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*models.SalesTarget, error) {
-	return nil, fmt.Errorf("sales target management not implemented")
+	return s.targetRepo.GetByPeriod(ctx, nil, companyID, salesRepID, periodStart, periodEnd)
 }
 
 // ---------------------------------------------------------------------
@@ -923,7 +1022,6 @@ func (s *salesRepService) ValidateAssignment(ctx context.Context, companyID, sal
 	if !active {
 		return fmt.Errorf("%w: sales rep is not active", salesErrors.ErrInvalidInput)
 	}
-	// Additional existence/company checks could be added per entity type.
 	return nil
 }
 

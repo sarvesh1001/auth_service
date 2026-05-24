@@ -1640,3 +1640,66 @@ CREATE TABLE IF NOT EXISTS sales.sales_targets (
 
 CREATE INDEX idx_sales_targets_rep ON sales.sales_targets(sales_rep_id);
 CREATE INDEX idx_sales_targets_period ON sales.sales_targets(period_start, period_end);
+
+
+
+CREATE TABLE sales_analytics.sales_rep_target_achievement (
+    id                 BIGSERIAL PRIMARY KEY,
+    company_id         UUID NOT NULL,
+    sales_rep_id       UUID NOT NULL,
+    period_start       DATE NOT NULL,          -- e.g., 2026-01-01
+    period_end         DATE NOT NULL,          -- e.g., 2026-01-31
+    target_amount      DECIMAL(14,2) NOT NULL, -- from sales.sales_targets
+    actual_revenue     DECIMAL(14,2) NOT NULL DEFAULT 0, -- sum of order/invoice revenue
+    achievement_pct    DECIMAL(5,2) GENERATED ALWAYS AS (
+        CASE WHEN target_amount > 0 
+             THEN (actual_revenue / target_amount) * 100 
+             ELSE 0 
+        END
+    ) STORED,
+    currency           VARCHAR(3) NOT NULL DEFAULT 'USD',
+    created_at         TIMESTAMPTZ DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, sales_rep_id, period_start, period_end)
+);
+
+CREATE INDEX idx_target_achievement_rep ON sales_analytics.sales_rep_target_achievement(sales_rep_id);
+CREATE INDEX idx_target_achievement_period ON sales_analytics.sales_rep_target_achievement(period_start, period_end);
+CREATE INDEX idx_target_achievement_company ON sales_analytics.sales_rep_target_achievement(company_id);
+
+CREATE TABLE sales_analytics.sales_rep_commission_fact (
+    id                BIGSERIAL PRIMARY KEY,
+    company_id        UUID NOT NULL,
+    sales_rep_id      UUID NOT NULL,
+    entity_type       VARCHAR(20) NOT NULL,   -- 'order', 'invoice', 'payment'
+    entity_id         UUID NOT NULL,          -- order_id / invoice_id / payment_id
+    commission_base   DECIMAL(14,4) NOT NULL, -- revenue or profit used for calculation
+    commission_rate   DECIMAL(5,2) NOT NULL,  -- applied rate
+    commission_amount DECIMAL(14,4) NOT NULL, -- calculated amount
+    earned_at         TIMESTAMPTZ NOT NULL,   -- when the commission was earned
+    paid_at           TIMESTAMPTZ,            -- when paid out (if applicable)
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, entity_type, entity_id)  -- avoid double counting
+);
+
+CREATE INDEX idx_commission_fact_rep ON sales_analytics.sales_rep_commission_fact(sales_rep_id);
+CREATE INDEX idx_commission_fact_earned ON sales_analytics.sales_rep_commission_fact(earned_at);
+CREATE INDEX idx_commission_fact_paid ON sales_analytics.sales_rep_commission_fact(paid_at);
+
+CREATE TABLE sales_analytics.sales_rep_leaderboard_snapshot (
+    id                BIGSERIAL PRIMARY KEY,
+    company_id        UUID NOT NULL,
+    snapshot_date     DATE NOT NULL,          -- the date the snapshot was taken (e.g., last day of month)
+    period_start      DATE NOT NULL,          -- start of the ranked period
+    period_end        DATE NOT NULL,          -- end of the ranked period
+    sales_rep_id      UUID NOT NULL,
+    rank              INT NOT NULL,           -- 1 = highest revenue
+    revenue           DECIMAL(14,4) NOT NULL,
+    orders_count      INT NOT NULL,
+    average_deal      DECIMAL(14,4) NOT NULL,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, snapshot_date, sales_rep_id)
+);
+
+CREATE INDEX idx_leaderboard_snapshot_company_date ON sales_analytics.sales_rep_leaderboard_snapshot(company_id, snapshot_date);
+CREATE INDEX idx_leaderboard_snapshot_rep ON sales_analytics.sales_rep_leaderboard_snapshot(sales_rep_id);
