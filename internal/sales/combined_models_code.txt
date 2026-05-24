@@ -55,6 +55,136 @@ func (j *JSONB) Scan(value interface{}) error {
 
 
 ================================================================================
+FILE: ./models/payment_refund.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PaymentRefund struct {
+	RefundID    uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"refundId"`
+	CompanyID   uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	PaymentID   uuid.UUID       `gorm:"type:uuid;not null;index" json:"paymentId"`
+	ReturnID    *uuid.UUID      `gorm:"type:uuid;index" json:"returnId,omitempty"` // added to link refund to return
+	Amount      decimal.Decimal `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
+	Reason      string          `gorm:"type:text;not null" json:"reason"`
+	GatewayRef  *string         `gorm:"type:varchar(100)" json:"gatewayRef,omitempty"`
+	Status      string          `gorm:"type:varchar(20);not null;default:'pending'" json:"status"`
+	RefundedBy  *uuid.UUID      `gorm:"type:uuid" json:"refundedBy,omitempty"`
+	CompletedAt *time.Time      `gorm:"type:timestamptz" json:"completedAt,omitempty"`
+	CreatedAt   time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt   time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/credit_note.go
+================================================================================
+
+package models
+
+// models/credit_note.go
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CreditNote struct {
+	CreditNoteID     uuid.UUID              `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"creditNoteId"`
+	CompanyID        uuid.UUID              `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerID       uuid.UUID              `gorm:"type:uuid;not null;index" json:"customerId"`
+	CreditNoteNumber string                 `gorm:"type:varchar(50);not null;uniqueIndex" json:"creditNoteNumber"`
+	InvoiceID        *uuid.UUID             `gorm:"type:uuid;index" json:"invoiceId,omitempty"` // original invoice (if any)
+	ReturnID         *uuid.UUID             `gorm:"type:uuid;index" json:"returnId,omitempty"`  // linked return (if any)
+	IssueDate        time.Time              `gorm:"type:date;not null" json:"issueDate"`
+	Status           enums.CreditNoteStatus `gorm:"type:varchar(20);not null;default:'draft'" json:"status"`
+	Currency         string                 `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	Subtotal         decimal.Decimal        `gorm:"type:numeric(14,4);not null" json:"subtotal"`
+	TaxTotal         decimal.Decimal        `gorm:"type:numeric(14,4);not null" json:"taxTotal"`
+	TotalAmount      decimal.Decimal        `gorm:"type:numeric(14,4);not null" json:"totalAmount"` // negative or positive? usually negative
+	AmountApplied    decimal.Decimal        `gorm:"type:numeric(14,4);not null;default:0" json:"amountApplied"`
+	RemainingAmount  decimal.Decimal        `gorm:"->;type:numeric(14,4)" json:"remainingAmount"`
+	Reason           *string                `gorm:"type:text" json:"reason,omitempty"`
+	Notes            *string                `gorm:"type:text" json:"notes,omitempty"`
+	IssuedAt         *time.Time             `gorm:"type:timestamptz" json:"issuedAt,omitempty"`
+	VoidedAt         *time.Time             `gorm:"type:timestamptz" json:"voidedAt,omitempty"`
+	VoidReason       *string                `gorm:"type:text" json:"voidReason,omitempty"`
+	CreatedAt        time.Time              `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt        time.Time              `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy        *uuid.UUID             `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy        *uuid.UUID             `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+// models/credit_note_item.go
+type CreditNoteItem struct {
+	CreditNoteItemID    uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"creditNoteItemId"`
+	CreditNoteID        uuid.UUID        `gorm:"type:uuid;not null;index" json:"creditNoteId"`
+	InvoiceItemID       *uuid.UUID       `gorm:"type:uuid" json:"invoiceItemId,omitempty"`
+	ProductID           *uuid.UUID       `gorm:"type:uuid;index" json:"productId,omitempty"`
+	ProductNameSnapshot string           `gorm:"type:varchar(255);not null" json:"productNameSnapshot"`
+	Quantity            decimal.Decimal  `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice           decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	TaxRate             *decimal.Decimal `gorm:"type:numeric(5,2)" json:"taxRate,omitempty"`
+	TaxAmount           decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"taxAmount"`
+	LineAmount          decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"lineAmount"`
+	CreatedAt           time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	CreatedBy           *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
+}
+
+// models/credit_note_application.go
+type CreditNoteApplication struct {
+	ApplicationID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"applicationId"`
+	CreditNoteID  uuid.UUID       `gorm:"type:uuid;not null;index" json:"creditNoteId"`
+	InvoiceID     uuid.UUID       `gorm:"type:uuid;not null;index" json:"invoiceId"`
+	Amount        decimal.Decimal `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
+	AppliedAt     time.Time       `gorm:"type:timestamptz;not null;default:now()" json:"appliedAt"`
+	AppliedBy     *uuid.UUID      `gorm:"type:uuid" json:"appliedBy,omitempty"`
+	CreatedAt     time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/sales_rep.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type SalesRep struct {
+	SalesRepID uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"salesRepId"`
+	CompanyID  uuid.UUID  `gorm:"type:uuid;not null;index" json:"companyId"`
+	UserID     uuid.UUID  `gorm:"type:uuid;not null;index" json:"userId"`
+	Code       string     `gorm:"type:varchar(50);not null;uniqueIndex:idx_sales_rep_code" json:"code"`
+	Name       string     `gorm:"type:varchar(255);not null" json:"name"`
+	Email      *string    `gorm:"type:varchar(255)" json:"email,omitempty"`
+	Phone      *string    `gorm:"type:varchar(50)" json:"phone,omitempty"`
+	IsActive   bool       `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt  time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt  time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy  *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy  *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
 FILE: ./models/order.go
 ================================================================================
 
@@ -89,10 +219,42 @@ type Order struct {
 	DeliveredAt        *time.Time        `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
 	CancelledAt        *time.Time        `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
 	CancellationReason *string           `gorm:"type:text" json:"cancellationReason,omitempty"`
+	SalesRepID         *uuid.UUID        `gorm:"type:uuid;index" json:"salesRepId,omitempty"` // new
 	CreatedAt          time.Time         `gorm:"not null;default:now()" json:"createdAt"`
 	UpdatedAt          time.Time         `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy          *uuid.UUID        `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy          *uuid.UUID        `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/sales_rep_commission.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type SalesRepCommission struct {
+	CommissionID   uuid.UUID                `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"commissionId"`
+	CompanyID      uuid.UUID                `gorm:"type:uuid;not null;index" json:"companyId"`
+	SalesRepID     uuid.UUID                `gorm:"type:uuid;not null;index" json:"salesRepId"`
+	EffectiveFrom  time.Time                `gorm:"type:date;not null" json:"effectiveFrom"`
+	EffectiveTo    *time.Time               `gorm:"type:date" json:"effectiveTo,omitempty"`
+	CommissionRate decimal.Decimal          `gorm:"type:numeric(5,2);not null;check:commission_rate >=0 AND commission_rate <=100" json:"commissionRate"`
+	AppliesTo      enums.CommissionBaseType `gorm:"type:commission_base_type;not null" json:"appliesTo"`
+	ProductID      *uuid.UUID               `gorm:"type:uuid;index" json:"productId,omitempty"`
+	CreatedAt      time.Time                `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time                `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy      *uuid.UUID               `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy      *uuid.UUID               `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -127,6 +289,76 @@ type TaxSnapshot struct {
 
 
 ================================================================================
+FILE: ./models/quote.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type Quote struct {
+	QuoteID          uuid.UUID         `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"quoteId"`
+	CompanyID        uuid.UUID         `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerID       uuid.UUID         `gorm:"type:uuid;not null;index" json:"customerId"`
+	QuoteNumber      string            `gorm:"type:varchar(50);not null;uniqueIndex:idx_quote_number_revision,priority:1" json:"quoteNumber"`
+	Revision         int               `gorm:"not null;default:1;uniqueIndex:idx_quote_number_revision,priority:2" json:"revision"`
+	QuoteDate        time.Time         `gorm:"type:date;not null" json:"quoteDate"`
+	ExpiryDate       *time.Time        `gorm:"type:date" json:"expiryDate,omitempty"`
+	Status           enums.QuoteStatus `gorm:"type:quote_status;not null;default:'draft'" json:"status"`
+	Currency         string            `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	Subtotal         decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
+	DiscountTotal    decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
+	TaxTotal         decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
+	GrandTotal       decimal.Decimal   `gorm:"->" json:"grandTotal"` // generated
+	Notes            *string           `gorm:"type:text" json:"notes,omitempty"`
+	ConvertedOrderID *uuid.UUID        `gorm:"type:uuid;index" json:"convertedOrderId,omitempty"`
+	SalesRepID       *uuid.UUID        `gorm:"type:uuid;index" json:"salesRepId,omitempty"`
+	CreatedAt        time.Time         `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt        time.Time         `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy        *uuid.UUID        `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy        *uuid.UUID        `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/payment_term.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PaymentTerm struct {
+	TermID          uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"termId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	Code            string          `gorm:"type:varchar(50);not null;uniqueIndex:unique_payment_terms_code,priority:2" json:"code"`
+	TermName        string          `gorm:"type:varchar(100);not null;uniqueIndex:unique_payment_terms_name,priority:2" json:"termName"`
+	Description     *string         `gorm:"type:text" json:"description,omitempty"`
+	DueDays         int             `gorm:"not null" json:"dueDays"`
+	DiscountPercent decimal.Decimal `gorm:"type:numeric(5,2);default:0" json:"discountPercent"`
+	DiscountDays    int             `gorm:"default:0" json:"discountDays"`
+	IsActive        bool            `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt       time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy       *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy       *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
 FILE: ./models/product.go
 ================================================================================
 
@@ -152,6 +384,35 @@ type Product struct {
 	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy       *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/quote_item.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type QuoteItem struct {
+	QuoteItemID         uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"quoteItemId"`
+	QuoteID             uuid.UUID       `gorm:"type:uuid;not null;index" json:"quoteId"`
+	ProductID           uuid.UUID       `gorm:"type:uuid;not null;index" json:"productId"`
+	ProductNameSnapshot string          `gorm:"type:varchar(255);not null" json:"productNameSnapshot"`
+	Quantity            decimal.Decimal `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	UnitPrice           decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount      decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"discountAmount"`
+	TaxAmount           decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"taxAmount"`
+	TotalPrice          decimal.Decimal `gorm:"->" json:"totalPrice"` // generated
+	Metadata            JSONB           `gorm:"type:jsonb" json:"metadata,omitempty"`
+	CreatedAt           time.Time       `gorm:"not null;default:now()" json:"createdAt"`
 }
 
 
@@ -193,10 +454,18 @@ type Invoice struct {
 	IssuedAt      *time.Time          `gorm:"type:timestamptz" json:"issuedAt,omitempty"`
 	PaidAt        *time.Time          `gorm:"type:timestamptz" json:"paidAt,omitempty"`
 	CancelledAt   *time.Time          `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
-	CreatedAt     time.Time           `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt     time.Time           `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy     *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy     *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	SalesRepID    *uuid.UUID          `gorm:"type:uuid;index" json:"salesRepId,omitempty"` // new
+
+	// Payment term snapshot fields (immutable once invoice is issued)
+	PaymentTermName      *string          `gorm:"type:varchar(100)" json:"paymentTermName,omitempty"`
+	PaymentDueDays       *int             `gorm:"type:int" json:"paymentDueDays,omitempty"`
+	EarlyDiscountPercent *decimal.Decimal `gorm:"type:numeric(5,2);default:0" json:"earlyDiscountPercent,omitempty"`
+	EarlyDiscountDays    *int             `gorm:"type:int;default:0" json:"earlyDiscountDays,omitempty"`
+
+	CreatedAt time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -257,11 +526,12 @@ type ReturnItem struct {
 	OrderItemID         *uuid.UUID      `gorm:"type:uuid" json:"orderItemId,omitempty"`
 	ProductID           uuid.UUID       `gorm:"type:uuid;not null;index" json:"productId"`
 	ProductNameSnapshot string          `gorm:"type:varchar(255);not null" json:"productNameSnapshot"`
-	Quantity            decimal.Decimal `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"`
+	Quantity            decimal.Decimal `gorm:"type:numeric(14,4);not null;check:quantity > 0" json:"quantity"` // fixed typo
 	UnitPrice           decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
 	RefundAmount        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"refundAmount"`
 	Reason              *string         `gorm:"type:text" json:"reason,omitempty"`
 	CreatedAt           time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	CreatedBy           *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"` // added
 }
 
 
@@ -325,6 +595,36 @@ type InvoiceItem struct {
 	TotalPrice          decimal.Decimal  `gorm:"->" json:"totalPrice"` // generated
 	Metadata            JSONB            `gorm:"type:jsonb" json:"metadata,omitempty"`
 	CreatedAt           time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/credit_check_history.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CreditCheckHistory struct {
+	CreditHistoryID     uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"creditHistoryId"`
+	CompanyID           uuid.UUID        `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerID          uuid.UUID        `gorm:"type:uuid;not null;index" json:"customerId"`
+	ActionType          string           `gorm:"type:varchar(30);not null;index" json:"actionType"` // limit_change, hold, release, approval
+	PreviousLimit       *decimal.Decimal `gorm:"type:numeric(14,2)" json:"previousLimit,omitempty"`
+	NewLimit            *decimal.Decimal `gorm:"type:numeric(14,2)" json:"newLimit,omitempty"`
+	PreviousOutstanding *decimal.Decimal `gorm:"type:numeric(14,2)" json:"previousOutstanding,omitempty"`
+	NewOutstanding      *decimal.Decimal `gorm:"type:numeric(14,2)" json:"newOutstanding,omitempty"`
+	Reason              *string          `gorm:"type:text" json:"reason,omitempty"`
+	ApprovedBy          *uuid.UUID       `gorm:"type:uuid;index" json:"approvedBy,omitempty"`
+	CreatedBy           *uuid.UUID       `gorm:"type:uuid;index" json:"createdBy,omitempty"`
+	CreatedAt           time.Time        `gorm:"not null;default:now();index" json:"createdAt"`
 }
 
 
@@ -398,12 +698,1360 @@ type Customer struct {
 	ShippingAddressDEK       *string `gorm:"column:shipping_address_dek;type:text" json:"-"`
 	ShippingAddressKeyID     *string `gorm:"column:shipping_address_key_id;type:text" json:"-"`
 
-	CreditLimit *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
-	IsActive    bool             `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt   time.Time        `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt   time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy   *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy   *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	// Plaintext fields for API (not stored in DB)
+	Email           *string `gorm:"-" json:"email,omitempty"`
+	Phone           *string `gorm:"-" json:"phone,omitempty"`
+	TaxID           *string `gorm:"-" json:"taxId,omitempty"`
+	BillingAddress  *string `gorm:"-" json:"billingAddress,omitempty"`
+	ShippingAddress *string `gorm:"-" json:"shippingAddress,omitempty"`
+
+	CreditLimit   *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
+	PaymentTermID *uuid.UUID       `gorm:"type:uuid;index" json:"paymentTermId,omitempty"`
+	IsActive      bool             `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt     time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy     *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy     *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/payment_aging_snapshot.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PaymentAgingSnapshot struct {
+	SnapshotID       int64           `gorm:"primaryKey;autoIncrement" json:"snapshotId"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_payment_aging_company_date,priority:1" json:"companyId"`
+	SnapshotDate     time.Time       `gorm:"type:date;not null;uniqueIndex:idx_payment_aging_company_date,priority:2" json:"snapshotDate"`
+	Bucket0_30Days   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucket0_30Days"`
+	Bucket31_60Days  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucket31_60Days"`
+	Bucket61_90Days  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucket61_90Days"`
+	BucketOver90Days decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucketOver90Days"`
+	TotalUnallocated decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalUnallocated"`
+	CreatedAt        time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (PaymentAgingSnapshot) TableName() string {
+	return "sales_analytics.payment_aging_snapshot"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/quote_conversion_facts.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"gorm.io/datatypes"
+)
+
+// QuoteConversionFact records the conversion of a quote into an order.
+type QuoteConversionFact struct {
+	ID                     int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	QuoteID                uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:uq_quote_conversion_quote_order,priority:1" json:"quoteId"`
+	OrderID                uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:uq_quote_conversion_quote_order,priority:2" json:"orderId"`
+	CompanyID              uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	CustomerID             uuid.UUID       `gorm:"type:uuid;not null;index" json:"customerId"`
+	QuoteValueAtConversion decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quoteValueAtConversion"`
+	OrderValueAtConversion decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"orderValueAtConversion"`
+	ConversionTimeSeconds  int             `gorm:"not null" json:"conversionTimeSeconds"`
+	QuoteExpiryDays        *int            `gorm:"type:int" json:"quoteExpiryDays,omitempty"`
+	UsedCouponIDs          datatypes.JSON  `gorm:"type:jsonb" json:"usedCouponIds,omitempty"` // array of UUIDs
+	SalesRepID             *uuid.UUID      `gorm:"type:uuid" json:"salesRepId,omitempty"`
+	ConvertedAt            time.Time       `gorm:"type:timestamptz;not null" json:"convertedAt"`
+	CreatedAt              time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (QuoteConversionFact) TableName() string {
+	return "sales_analytics.quote_conversion_facts"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/product_sales_fact.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// ProductSalesFact stores daily product-level sales for analytics (fact table).
+type ProductSalesFact struct {
+	ID              int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index:idx_product_sales_company_date" json:"companyId"`
+	ProductID       uuid.UUID       `gorm:"type:uuid;not null" json:"productId"`
+	Date            time.Time       `gorm:"type:date;not null;index:idx_product_sales_company_date" json:"date"`
+	QuantitySold    decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"quantitySold"`
+	Revenue         decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"revenue"`
+	DiscountApplied decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"discountApplied"`
+	UpdatedAt       time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (ProductSalesFact) TableName() string {
+	return "sales_analytics.product_sales_fact"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/daily_unique_customer.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// DailyUniqueCustomer tracks which customers made a purchase on a given day.
+// It prevents double‑counting unique customers in the daily_sales aggregate.
+type DailyUniqueCustomer struct {
+	CompanyID  uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Date       time.Time `gorm:"type:date;primaryKey"`
+	CustomerID uuid.UUID `gorm:"type:uuid;primaryKey"`
+}
+
+// TableName returns the full table name including schema.
+func (DailyUniqueCustomer) TableName() string {
+	return "sales_analytics.daily_unique_customers"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/daily_sales.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// DailySales represents daily aggregated sales snapshot.
+type DailySales struct {
+	ID              int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_sales_company_date" json:"companyId"`
+	Date            time.Time       `gorm:"type:date;not null;uniqueIndex:idx_daily_sales_company_date" json:"date"`
+	TotalOrders     int             `gorm:"default:0" json:"totalOrders"`
+	TotalInvoices   int             `gorm:"default:0" json:"totalInvoices"`
+	TotalRevenue    decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalRevenue"`
+	TotalDiscounts  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalDiscounts"`
+	TotalTax        decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalTax"`
+	TotalPayments   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalPayments"`
+	UniqueCustomers int             `gorm:"default:0" json:"uniqueCustomers"`
+	UpdatedAt       time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+// TableName specifies the table name including schema.
+func (DailySales) TableName() string {
+	return "sales_analytics.daily_sales"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/customer_coupon_usage.go
+================================================================================
+
+// FILE: ./models/sales_analytics/customer_coupon_usage.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CustomerCouponUsage struct {
+	CompanyID     uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	CouponID      uuid.UUID       `gorm:"type:uuid;primaryKey" json:"couponId"`
+	CustomerID    uuid.UUID       `gorm:"type:uuid;primaryKey" json:"customerId"`
+	UsageCount    int             `gorm:"not null;default:0" json:"usageCount"`
+	TotalDiscount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscount"`
+	FirstUsedAt   *time.Time      `gorm:"type:timestamptz" json:"firstUsedAt,omitempty"`
+	LastUsedAt    *time.Time      `gorm:"type:timestamptz" json:"lastUsedAt,omitempty"`
+}
+
+func (CustomerCouponUsage) TableName() string {
+	return "sales_analytics.customer_coupon_usage"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/collection_efficiency.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CollectionEfficiency struct {
+	ID                   int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID            uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_collection_efficiency_company_date,priority:1" json:"companyId"`
+	Date                 time.Time        `gorm:"type:date;not null;uniqueIndex:idx_collection_efficiency_company_date,priority:2" json:"date"`
+	DaysSalesOutstanding *decimal.Decimal `gorm:"type:numeric(10,2)" json:"daysSalesOutstanding,omitempty"`
+	CollectionRate       *decimal.Decimal `gorm:"type:numeric(5,2)" json:"collectionRate,omitempty"`
+	TotalReceivables     decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"totalReceivables"`
+	CollectedAmount      decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"collectedAmount"`
+	UpdatedAt            time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CollectionEfficiency) TableName() string {
+	return "sales_analytics.collection_efficiency"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/coupon_bridge.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// DailyCouponUniqueCustomer tracks unique customers per coupon per day.
+// Used to increment unique_customers in daily_coupon_metrics.
+type DailyCouponUniqueCustomer struct {
+	CompanyID  uuid.UUID `gorm:"type:uuid;primaryKey" json:"companyId"`
+	CouponID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"couponId"`
+	Date       time.Time `gorm:"type:date;primaryKey" json:"date"`
+	CustomerID uuid.UUID `gorm:"type:uuid;primaryKey" json:"customerId"`
+}
+
+// TableName returns the table name for DailyCouponUniqueCustomer.
+func (DailyCouponUniqueCustomer) TableName() string {
+	return "sales_analytics.daily_coupon_unique_customers"
+}
+
+// CouponUniqueCustomer tracks unique customers per coupon over its lifetime.
+// Used to increment unique_customers in coupon_performance_summary.
+type CouponUniqueCustomer struct {
+	CompanyID  uuid.UUID `gorm:"type:uuid;primaryKey" json:"companyId"`
+	CouponID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"couponId"`
+	CustomerID uuid.UUID `gorm:"type:uuid;primaryKey" json:"customerId"`
+}
+
+// TableName returns the table name for CouponUniqueCustomer.
+func (CouponUniqueCustomer) TableName() string {
+	return "sales_analytics.coupon_unique_customers"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/invoice_status_history.go
+================================================================================
+
+// FILE: internal/sales/models/sales_analytics/invoice_status_history.go
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+
+	"auth-service/internal/sales/models/enums"
+)
+
+type InvoiceStatusHistory struct {
+	HistoryID       int64               `gorm:"primaryKey;autoIncrement" json:"historyId"`
+	InvoiceID       uuid.UUID           `gorm:"type:uuid;not null;index" json:"invoiceId"`
+	CompanyID       uuid.UUID           `gorm:"type:uuid;not null;index" json:"companyId"`
+	Status          enums.InvoiceStatus `gorm:"type:sales.invoice_status;not null" json:"status"`
+	EnteredAt       time.Time           `gorm:"type:timestamptz;not null" json:"enteredAt"`
+	ExitedAt        *time.Time          `gorm:"type:timestamptz" json:"exitedAt,omitempty"`
+	DurationSeconds int64               `gorm:"->" json:"durationSeconds"` // computed
+	CreatedAt       time.Time           `gorm:"default:now()" json:"createdAt"`
+}
+
+func (InvoiceStatusHistory) TableName() string {
+	return "sales_analytics.invoice_status_history"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/fulfillment_metrics.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/fulfillment_metrics.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// FulfillmentMetrics tracks shipping and delivery performance per order.
+type FulfillmentMetrics struct {
+	ID                      int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	OrderID                 uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex" json:"orderId"`
+	CompanyID               uuid.UUID  `gorm:"type:uuid;not null" json:"companyId"`
+	ConfirmedAt             *time.Time `gorm:"type:timestamptz" json:"confirmedAt,omitempty"`
+	ShippedAt               *time.Time `gorm:"type:timestamptz" json:"shippedAt,omitempty"`
+	DeliveredAt             *time.Time `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
+	ConfirmationToShipHours float64    `gorm:"->" json:"confirmationToShipHours"` // generated
+	ShipToDeliveryHours     float64    `gorm:"->" json:"shipToDeliveryHours"`     // generated
+	Carrier                 *string    `gorm:"type:varchar(100)" json:"carrier,omitempty"`
+	TrackingNumber          *string    `gorm:"type:varchar(100)" json:"trackingNumber,omitempty"`
+	ShippingAddressRegion   *string    `gorm:"type:varchar(100)" json:"shippingAddressRegion,omitempty"`
+	CreatedAt               time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+func (FulfillmentMetrics) TableName() string {
+	return "sales_analytics.fulfillment_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/sales_rep_performance.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/sales_rep_performance.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// SalesRepPerformance aggregates daily metrics per sales representative.
+type SalesRepPerformance struct {
+	ID                int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_sales_rep_performance_company_rep_date,priority:1" json:"companyId"`
+	SalesRepID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_sales_rep_performance_company_rep_date,priority:2" json:"salesRepId"`
+	Date              time.Time       `gorm:"type:date;not null;uniqueIndex:idx_sales_rep_performance_company_rep_date,priority:3" json:"date"`
+	TotalOrders       int             `gorm:"default:0" json:"totalOrders"`
+	TotalRevenue      decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalRevenue"`
+	AverageOrderValue decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"averageOrderValue"`
+	TotalCommission   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalCommission"`
+	UpdatedAt         time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (SalesRepPerformance) TableName() string {
+	return "sales_analytics.sales_rep_performance"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/daily_invoice_metrics.go
+================================================================================
+
+// FILE: internal/sales/models/sales_analytics/daily_invoice_metrics.go
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type DailyInvoiceMetrics struct {
+	ID                      int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID               uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_daily_invoice_metrics_company_date" json:"companyId"`
+	Date                    time.Time        `gorm:"type:date;not null;uniqueIndex:idx_daily_invoice_metrics_company_date" json:"date"`
+	TotalInvoicesIssued     int              `gorm:"default:0" json:"totalInvoicesIssued"`
+	TotalInvoicesPaid       int              `gorm:"default:0" json:"totalInvoicesPaid"`
+	TotalInvoicesOverdue    int              `gorm:"default:0" json:"totalInvoicesOverdue"`
+	TotalInvoicesCancelled  int              `gorm:"default:0" json:"totalInvoicesCancelled"`
+	TotalInvoiceValueIssued decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"totalInvoiceValueIssued"`
+	TotalPaidValue          decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"totalPaidValue"`
+	TotalOverdueValue       decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"totalOverdueValue"`
+	EarlyDiscountTakenCount int              `gorm:"default:0" json:"earlyDiscountTakenCount"`
+	EarlyDiscountAmount     decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"earlyDiscountAmount"`
+	AvgDaysToPayment        *decimal.Decimal `gorm:"type:numeric(10,2)" json:"avgDaysToPayment,omitempty"`
+	UpdatedAt               time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (DailyInvoiceMetrics) TableName() string {
+	return "sales_analytics.daily_invoice_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/invoice_item_analytics.go
+================================================================================
+
+// FILE: internal/sales/models/sales_analytics/invoice_item_analytics.go
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type InvoiceItemAnalytics struct {
+	ID              int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	InvoiceItemID   uuid.UUID       `gorm:"type:uuid;not null;unique" json:"invoiceItemId"`
+	InvoiceID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"invoiceId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	ProductID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"productId"`
+	Quantity        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitPrice       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"discountAmount"`
+	TaxAmount       decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"taxAmount"`
+	TotalLineAmount decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"totalLineAmount"` // unit_price * quantity - discount + tax
+	InvoiceDate     time.Time       `gorm:"type:date;not null;index" json:"invoiceDate"`
+	CreatedAt       time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (InvoiceItemAnalytics) TableName() string {
+	return "sales_analytics.invoice_item_analytics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/return_analysis.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"auth-service/internal/sales/models/enums"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// DailyReturnMetrics aggregates return statistics per day per company.
+type DailyReturnMetrics struct {
+	ID                    int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID             uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_return_metrics_unique,priority:1" json:"companyId"`
+	Date                  time.Time       `gorm:"type:date;not null;uniqueIndex:idx_daily_return_metrics_unique,priority:2" json:"date"`
+	TotalReturnsRequested int             `gorm:"default:0" json:"totalReturnsRequested"`
+	TotalReturnsApproved  int             `gorm:"default:0" json:"totalReturnsApproved"`
+	TotalReturnsCompleted int             `gorm:"default:0" json:"totalReturnsCompleted"`
+	TotalReturnsRejected  int             `gorm:"default:0" json:"totalReturnsRejected"`
+	TotalRefundAmount     decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalRefundAmount"`
+	TotalCreditNoteAmount decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalCreditNoteAmount"`
+	UniqueCustomers       int             `gorm:"default:0" json:"uniqueCustomers"`
+	UpdatedAt             time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (DailyReturnMetrics) TableName() string {
+	return "sales_analytics.daily_return_metrics"
+}
+
+// ReturnReasonFact stores reason details for each return item.
+type ReturnReasonFact struct {
+	ID               int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null;index:idx_return_reason_fact_company_date,priority:1" json:"companyId"`
+	ReturnID         uuid.UUID       `gorm:"type:uuid;not null" json:"returnId"`
+	ReturnItemID     uuid.UUID       `gorm:"type:uuid;not null" json:"returnItemId"`
+	ReasonCode       *string         `gorm:"type:varchar(100);index" json:"reasonCode,omitempty"`
+	ReasonText       *string         `gorm:"type:text" json:"reasonText,omitempty"`
+	ProductID        *uuid.UUID      `gorm:"type:uuid" json:"productId,omitempty"`
+	QuantityReturned decimal.Decimal `gorm:"type:numeric(14,4)" json:"quantityReturned"`
+	RefundAmount     decimal.Decimal `gorm:"type:numeric(14,4)" json:"refundAmount"`
+	ReturnDate       time.Time       `gorm:"type:date;not null;index:idx_return_reason_fact_company_date,priority:2" json:"returnDate"`
+	CreatedAt        time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (ReturnReasonFact) TableName() string {
+	return "sales_analytics.return_reason_fact"
+}
+
+// ReturnProcessingTimeFact tracks time spent in each return status.
+type ReturnProcessingTimeFact struct {
+	ID              int64              `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID       uuid.UUID          `gorm:"type:uuid;not null" json:"companyId"`
+	ReturnID        uuid.UUID          `gorm:"type:uuid;not null;index" json:"returnId"`
+	Status          enums.ReturnStatus `gorm:"type:sales.return_status;not null;index" json:"status"`
+	EnteredAt       time.Time          `gorm:"type:timestamptz;not null" json:"enteredAt"`
+	ExitedAt        *time.Time         `gorm:"type:timestamptz" json:"exitedAt,omitempty"`
+	DurationSeconds int64              `gorm:"->" json:"durationSeconds"`
+	CreatedAt       time.Time          `gorm:"default:now()" json:"createdAt"`
+}
+
+func (ReturnProcessingTimeFact) TableName() string {
+	return "sales_analytics.return_processing_time_fact"
+}
+
+// CreditNoteFact stores facts about credit notes issued against returns.
+type CreditNoteFact struct {
+	ID                 int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID          uuid.UUID       `gorm:"type:uuid;not null;index:idx_credit_note_fact_company_date,priority:1" json:"companyId"`
+	CreditNoteID       uuid.UUID       `gorm:"type:uuid;not null" json:"creditNoteId"`
+	ReturnID           *uuid.UUID      `gorm:"type:uuid;index" json:"returnId,omitempty"`
+	IssuedDate         time.Time       `gorm:"type:date;not null;index:idx_credit_note_fact_company_date,priority:2" json:"issuedDate"`
+	IssuedAmount       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"issuedAmount"`
+	AppliedAmount      decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"appliedAmount"`
+	AppliedToInvoiceID *uuid.UUID      `gorm:"type:uuid" json:"appliedToInvoiceId,omitempty"`
+	AppliedDate        *time.Time      `gorm:"type:date" json:"appliedDate,omitempty"`
+	Status             string          `gorm:"type:varchar(20);default:'issued'" json:"status"`
+	CreatedAt          time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CreditNoteFact) TableName() string {
+	return "sales_analytics.credit_note_fact"
+}
+
+// RefundFact stores facts about monetary refunds issued for returns.
+type RefundFact struct {
+	ID           int64                `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID    uuid.UUID            `gorm:"type:uuid;not null;index:idx_refund_fact_company_date,priority:1" json:"companyId"`
+	RefundID     uuid.UUID            `gorm:"type:uuid;not null" json:"refundId"`
+	ReturnID     uuid.UUID            `gorm:"type:uuid;not null;index" json:"returnId"`
+	PaymentID    uuid.UUID            `gorm:"type:uuid;not null" json:"paymentId"`
+	Amount       decimal.Decimal      `gorm:"type:numeric(14,4);not null" json:"amount"`
+	RefundDate   time.Time            `gorm:"type:date;not null;index:idx_refund_fact_company_date,priority:2" json:"refundDate"`
+	RefundMethod *enums.PaymentMethod `gorm:"type:sales.payment_method" json:"refundMethod,omitempty"`
+	Status       *string              `gorm:"type:varchar(20)" json:"status,omitempty"`
+	CreatedAt    time.Time            `gorm:"default:now()" json:"createdAt"`
+}
+
+func (RefundFact) TableName() string {
+	return "sales_analytics.refund_fact"
+}
+
+// ReturnProductCategoryFact aggregates returns by product category.
+type ReturnProductCategoryFact struct {
+	ID               int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	CategoryID       *uuid.UUID      `gorm:"type:uuid" json:"categoryId,omitempty"`
+	CategoryName     *string         `gorm:"type:varchar(255)" json:"categoryName,omitempty"`
+	ReturnDate       time.Time       `gorm:"type:date;not null" json:"returnDate"`
+	QuantityReturned decimal.Decimal `gorm:"type:numeric(14,4)" json:"quantityReturned"`
+	RefundAmount     decimal.Decimal `gorm:"type:numeric(14,4)" json:"refundAmount"`
+	UniqueReturns    int             `gorm:"default:0" json:"uniqueReturns"`
+	CreatedAt        time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (ReturnProductCategoryFact) TableName() string {
+	return "sales_analytics.return_product_category_fact"
+}
+
+// DailyReturnUniqueCustomer tracks unique customers who made returns per day.
+type DailyReturnUniqueCustomer struct {
+	CompanyID  uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"companyId"`
+	Date       time.Time `gorm:"type:date;not null;primaryKey" json:"date"`
+	CustomerID uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"customerId"`
+}
+
+func (DailyReturnUniqueCustomer) TableName() string {
+	return "sales_analytics.daily_return_unique_customers"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/quote_item_analytics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// QuoteItemAnalytics stores line‑item details for quoted products (snapshot at quote time).
+type QuoteItemAnalytics struct {
+	ID              int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	QuoteItemID     uuid.UUID       `gorm:"type:uuid;not null" json:"quoteItemId"`
+	QuoteID         uuid.UUID       `gorm:"type:uuid;not null;index" json:"quoteId"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"`
+	ProductID       uuid.UUID       `gorm:"type:uuid;not null;index" json:"productId"`
+	Quantity        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitPrice       decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"discountAmount"`
+	TaxAmount       decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"taxAmount"`
+	TotalLineAmount decimal.Decimal `gorm:"->" json:"totalLineAmount"` // generated column
+	QuoteDate       time.Time       `gorm:"type:date;not null;index" json:"quoteDate"`
+	CreatedAt       time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (QuoteItemAnalytics) TableName() string {
+	return "sales_analytics.quote_item_analytics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/coupon_performance_summary.go
+================================================================================
+
+// FILE: ./models/sales_analytics/coupon_performance_summary.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CouponPerformanceSummary struct {
+	CouponID           uuid.UUID        `gorm:"type:uuid;primaryKey" json:"couponId"`
+	CompanyID          uuid.UUID        `gorm:"type:uuid;not null;index" json:"companyId"`
+	TotalTimesUsed     int64            `gorm:"not null;default:0" json:"totalTimesUsed"`
+	TotalDiscountGiven decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscountGiven"`
+	AvgDiscountPerUse  *decimal.Decimal `gorm:"type:numeric(14,4)" json:"avgDiscountPerUse,omitempty"`
+	UniqueCustomers    int              `gorm:"not null;default:0" json:"uniqueCustomers"`
+	LastUsedAt         *time.Time       `gorm:"type:timestamptz" json:"lastUsedAt,omitempty"`
+	UpdatedAt          time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CouponPerformanceSummary) TableName() string {
+	return "sales_analytics.coupon_performance_summary"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/order_hourly_sales.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/order_hourly_sales.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// OrderHourlySales aggregates sales by hour for intraday trends.
+type OrderHourlySales struct {
+	ID              int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID       uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_order_hourly_sales_company_hour,priority:1" json:"companyId"`
+	HourBucket      time.Time       `gorm:"type:timestamptz;not null;uniqueIndex:idx_order_hourly_sales_company_hour,priority:2" json:"hourBucket"` // truncated to hour
+	TotalOrders     int             `gorm:"default:0" json:"totalOrders"`
+	TotalRevenue    decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalRevenue"`
+	UniqueCustomers int             `gorm:"default:0" json:"uniqueCustomers"`
+	UpdatedAt       time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (OrderHourlySales) TableName() string {
+	return "sales_analytics.order_hourly_sales"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/quote_status_history.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// QuoteStatusHistory tracks the time spent in each quote status.
+type QuoteStatusHistory struct {
+	HistoryID       int64             `gorm:"primaryKey;autoIncrement" json:"historyId"`
+	QuoteID         uuid.UUID         `gorm:"type:uuid;not null;index" json:"quoteId"`
+	CompanyID       uuid.UUID         `gorm:"type:uuid;not null;index" json:"companyId"`
+	Status          enums.QuoteStatus `gorm:"type:sales.quote_status;not null" json:"status"`
+	EnteredAt       time.Time         `gorm:"type:timestamptz;not null" json:"enteredAt"`
+	ExitedAt        *time.Time        `gorm:"type:timestamptz" json:"exitedAt,omitempty"`
+	DurationSeconds int64             `gorm:"->" json:"durationSeconds"` // generated column
+	CreatedAt       time.Time         `gorm:"default:now()" json:"createdAt"`
+}
+
+func (QuoteStatusHistory) TableName() string {
+	return "sales_analytics.quote_status_history"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/payment_term_performance.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PaymentTermPerformance struct {
+	ID                         int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID                  uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_payment_term_perf_company_term_date,priority:1" json:"companyId"`
+	PaymentTermID              uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_payment_term_perf_company_term_date,priority:2" json:"paymentTermId"`
+	Date                       time.Time        `gorm:"type:date;not null;uniqueIndex:idx_payment_term_perf_company_term_date,priority:3" json:"date"`
+	TotalInvoices              int              `gorm:"not null;default:0" json:"totalInvoices"`
+	TotalInvoiceAmount         decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"totalInvoiceAmount"`
+	PaidOnTimeCount            int              `gorm:"not null;default:0" json:"paidOnTimeCount"`
+	PaidLateCount              int              `gorm:"not null;default:0" json:"paidLateCount"`
+	EarlyDiscountEligibleCount int              `gorm:"not null;default:0" json:"earlyDiscountEligibleCount"`
+	EarlyDiscountTakenCount    int              `gorm:"not null;default:0" json:"earlyDiscountTakenCount"`
+	EarlyDiscountAmount        decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"earlyDiscountAmount"`
+	AverageDaysToPay           *decimal.Decimal `gorm:"type:numeric(10,2)" json:"averageDaysToPay,omitempty"`
+	UpdatedAt                  time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (PaymentTermPerformance) TableName() string {
+	return "sales_analytics.payment_term_performance"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/customer_metrics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// CustomerMetric stores lifetime value and purchase behaviour per customer.
+type CustomerMetric struct {
+	CustomerID        uuid.UUID       `gorm:"type:uuid;primaryKey" json:"customerId"`
+	CompanyID         uuid.UUID       `gorm:"type:uuid;not null;index:idx_customer_metrics_company" json:"companyId"`
+	FirstOrderDate    *time.Time      `gorm:"type:date" json:"firstOrderDate,omitempty"`
+	LastOrderDate     *time.Time      `gorm:"type:date" json:"lastOrderDate,omitempty"`
+	TotalOrders       int             `gorm:"default:0" json:"totalOrders"`
+	TotalInvoices     int             `gorm:"default:0" json:"totalInvoices"`
+	TotalSpent        decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalSpent"`
+	TotalPayments     decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalPayments"`
+	AverageOrderValue decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"averageOrderValue"`
+	LifetimeValue     decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"lifetimeValue"`
+	UpdatedAt         time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CustomerMetric) TableName() string {
+	return "sales_analytics.customer_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/invoice_aging_snapshot.go
+================================================================================
+
+// FILE: internal/sales/models/sales_analytics/invoice_aging_snapshot.go
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type InvoiceAgingSnapshot struct {
+	SnapshotID       int64           `gorm:"primaryKey;autoIncrement" json:"snapshotId"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_invoice_aging_snapshot_company_date" json:"companyId"`
+	SnapshotDate     time.Time       `gorm:"type:date;not null;uniqueIndex:idx_invoice_aging_snapshot_company_date" json:"snapshotDate"`
+	Bucket0_30Days   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucket0_30Days"`
+	Bucket31_60Days  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucket31_60Days"`
+	Bucket61_90Days  decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucket61_90Days"`
+	BucketOver90Days decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"bucketOver90Days"`
+	TotalOutstanding decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalOutstanding"`
+	CreatedAt        time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (InvoiceAgingSnapshot) TableName() string {
+	return "sales_analytics.invoice_aging_snapshot"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/daily_quote_metrics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// DailyQuoteMetrics aggregates quote metrics per company and day.
+type DailyQuoteMetrics struct {
+	ID                   int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID            uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_quote_metrics_company_date,priority:1" json:"companyId"`
+	Date                 time.Time       `gorm:"type:date;not null;uniqueIndex:idx_daily_quote_metrics_company_date,priority:2" json:"date"`
+	TotalQuotesCreated   int             `gorm:"default:0" json:"totalQuotesCreated"`
+	TotalQuoteValue      decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalQuoteValue"`
+	TotalQuotesConverted int             `gorm:"default:0" json:"totalQuotesConverted"`
+	ConvertedValue       decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"convertedValue"`
+	ConversionRate       decimal.Decimal `gorm:"->" json:"conversionRate"`    // generated column
+	AverageQuoteValue    decimal.Decimal `gorm:"->" json:"averageQuoteValue"` // generated column
+	UpdatedAt            time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (DailyQuoteMetrics) TableName() string {
+	return "sales_analytics.daily_quote_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/daily_coupon_metrics.go
+================================================================================
+
+// FILE: ./models/sales_analytics/daily_coupon_metrics.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type DailyCouponMetric struct {
+	ID                  int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID           uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_coupon_metrics_unique,priority:1" json:"companyId"`
+	CouponID            uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_coupon_metrics_unique,priority:2" json:"couponId"`
+	Date                time.Time       `gorm:"type:date;not null;uniqueIndex:idx_daily_coupon_metrics_unique,priority:3" json:"date"`
+	TimesApplied        int             `gorm:"not null;default:0" json:"timesApplied"`
+	TotalDiscountAmount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscountAmount"`
+	TotalOrderValue     decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalOrderValue"` // sum of order subtotals where coupon applied
+	UniqueCustomers     int             `gorm:"not null;default:0" json:"uniqueCustomers"`
+	UpdatedAt           time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (DailyCouponMetric) TableName() string {
+	return "sales_analytics.daily_coupon_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/automatic_discount_metrics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type AutomaticDiscountMetric struct {
+	ID                  int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID           uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_auto_discount_metrics_company_discount_date,priority:1" json:"companyId"`
+	AutoDiscountID      uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_auto_discount_metrics_company_discount_date,priority:2" json:"autoDiscountId"`
+	Date                time.Time       `gorm:"type:date;not null;uniqueIndex:idx_auto_discount_metrics_company_discount_date,priority:3" json:"date"`
+	TimesApplied        int             `gorm:"not null;default:0" json:"timesApplied"`
+	TotalDiscountAmount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscountAmount"`
+	TotalOrderValue     decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalOrderValue"`
+	UniqueCustomers     int             `gorm:"not null;default:0" json:"uniqueCustomers"`
+	UpdatedAt           time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (AutomaticDiscountMetric) TableName() string {
+	return "sales_analytics.automatic_discount_metrics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/auto_discount_unique_customer.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// AutoDiscountUniqueCustomer tracks unique customers per automatic discount per day.
+// This is a bridge table used to deduplicate customers for daily metrics.
+type AutoDiscountUniqueCustomer struct {
+	CompanyID      uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"companyId"`
+	AutoDiscountID uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"autoDiscountId"`
+	Date           time.Time `gorm:"type:date;not null;primaryKey" json:"date"`
+	CustomerID     uuid.UUID `gorm:"type:uuid;not null;primaryKey" json:"customerId"`
+}
+
+// TableName specifies the table name for GORM.
+func (AutoDiscountUniqueCustomer) TableName() string {
+	return "sales_analytics.auto_discount_unique_customers"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/discount_stacking_usage.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type DiscountStackingUsage struct {
+	ID                    int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID             uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_stacking_usage_company_rule_date,priority:1" json:"companyId"`
+	RuleID                uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_stacking_usage_company_rule_date,priority:2" json:"ruleId"`
+	Date                  time.Time       `gorm:"type:date;not null;uniqueIndex:idx_stacking_usage_company_rule_date,priority:3" json:"date"`
+	TimesUsed             int             `gorm:"not null;default:0" json:"timesUsed"`
+	TotalCombinedDiscount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalCombinedDiscount"`
+	UpdatedAt             time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (DiscountStackingUsage) TableName() string {
+	return "sales_analytics.discount_stacking_usage"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/promotion_analytics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// PromotionUsageFact records each time a promotion is applied to an order or invoice.
+type PromotionUsageFact struct {
+	ID             int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID      uuid.UUID        `gorm:"type:uuid;not null" json:"companyId"`
+	PromotionID    uuid.UUID        `gorm:"type:uuid;not null" json:"promotionId"`
+	EntityType     string           `gorm:"type:varchar(20);not null" json:"entityType"` // 'order', 'invoice'
+	EntityID       uuid.UUID        `gorm:"type:uuid;not null" json:"entityId"`
+	CustomerID     *uuid.UUID       `gorm:"type:uuid" json:"customerId,omitempty"`
+	DiscountAmount decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"discountAmount"`
+	OrderSubtotal  *decimal.Decimal `gorm:"type:numeric(14,4)" json:"orderSubtotal,omitempty"`
+	UsedAt         time.Time        `gorm:"type:timestamptz;not null" json:"usedAt"`
+	CreatedAt      time.Time        `gorm:"default:now()" json:"createdAt"`
+}
+
+func (PromotionUsageFact) TableName() string {
+	return "sales_analytics.promotion_usage_fact"
+}
+
+// DailyPromotionMetric aggregates promotion usage per day.
+type DailyPromotionMetric struct {
+	ID                  int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID           uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_promotion_metrics_unique,priority:1" json:"companyId"`
+	PromotionID         uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_promotion_metrics_unique,priority:2" json:"promotionId"`
+	Date                time.Time       `gorm:"type:date;not null;uniqueIndex:idx_daily_promotion_metrics_unique,priority:3" json:"date"`
+	TimesApplied        int             `gorm:"not null;default:0" json:"timesApplied"`
+	TotalDiscountAmount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscountAmount"`
+	TotalOrderValue     decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalOrderValue"`
+	UniqueCustomers     int             `gorm:"not null;default:0" json:"uniqueCustomers"`
+	UpdatedAt           time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (DailyPromotionMetric) TableName() string {
+	return "sales_analytics.daily_promotion_metrics"
+}
+
+// DailyPromotionUniqueCustomer tracks distinct customers using a promotion on a given day.
+type DailyPromotionUniqueCustomer struct {
+	CompanyID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"companyId"`
+	PromotionID uuid.UUID `gorm:"type:uuid;primaryKey" json:"promotionId"`
+	Date        time.Time `gorm:"type:date;primaryKey" json:"date"`
+	CustomerID  uuid.UUID `gorm:"type:uuid;primaryKey" json:"customerId"`
+}
+
+func (DailyPromotionUniqueCustomer) TableName() string {
+	return "sales_analytics.daily_promotion_unique_customers"
+}
+
+// PromotionPerformanceSummary holds overall promotion performance.
+type PromotionPerformanceSummary struct {
+	PromotionID        uuid.UUID        `gorm:"type:uuid;primaryKey" json:"promotionId"`
+	CompanyID          uuid.UUID        `gorm:"type:uuid;not null;index" json:"companyId"`
+	TotalTimesUsed     int64            `gorm:"not null;default:0" json:"totalTimesUsed"`
+	TotalDiscountGiven decimal.Decimal  `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscountGiven"`
+	AvgDiscountPerUse  *decimal.Decimal `gorm:"type:numeric(14,4)" json:"avgDiscountPerUse,omitempty"`
+	UniqueCustomers    int              `gorm:"not null;default:0" json:"uniqueCustomers"`
+	LastUsedAt         *time.Time       `gorm:"type:timestamptz" json:"lastUsedAt,omitempty"`
+	UpdatedAt          time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (PromotionPerformanceSummary) TableName() string {
+	return "sales_analytics.promotion_performance_summary"
+}
+
+// CustomerPromotionUsage tracks per‑customer promotion usage for per‑user limits and cohort analysis.
+type CustomerPromotionUsage struct {
+	CompanyID     uuid.UUID       `gorm:"type:uuid;primaryKey" json:"companyId"`
+	PromotionID   uuid.UUID       `gorm:"type:uuid;primaryKey" json:"promotionId"`
+	CustomerID    uuid.UUID       `gorm:"type:uuid;primaryKey" json:"customerId"`
+	UsageCount    int             `gorm:"not null;default:0" json:"usageCount"`
+	TotalDiscount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalDiscount"`
+	FirstUsedAt   *time.Time      `gorm:"type:timestamptz" json:"firstUsedAt,omitempty"`
+	LastUsedAt    *time.Time      `gorm:"type:timestamptz" json:"lastUsedAt,omitempty"`
+}
+
+func (CustomerPromotionUsage) TableName() string {
+	return "sales_analytics.customer_promotion_usage"
+}
+
+// PromotionRedemptionRateDaily tracks daily redemption rates if total_available is known.
+type PromotionRedemptionRateDaily struct {
+	ID             int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID      uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_promotion_redemption_rate_unique,priority:1" json:"companyId"`
+	PromotionID    uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_promotion_redemption_rate_unique,priority:2" json:"promotionId"`
+	Date           time.Time        `gorm:"type:date;not null;uniqueIndex:idx_promotion_redemption_rate_unique,priority:3" json:"date"`
+	TotalAvailable *int             `gorm:"type:int" json:"totalAvailable,omitempty"`
+	TimesUsed      int              `gorm:"not null;default:0" json:"timesUsed"`
+	RedemptionRate *decimal.Decimal `gorm:"type:numeric(5,2)" json:"redemptionRate,omitempty"`
+	UpdatedAt      time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (PromotionRedemptionRateDaily) TableName() string {
+	return "sales_analytics.promotion_redemption_rate_daily"
+}
+
+// PromotionUniqueCustomer tracks lifetime unique customers per promotion.
+type PromotionUniqueCustomer struct {
+	CompanyID   uuid.UUID `gorm:"type:uuid;primaryKey"`
+	PromotionID uuid.UUID `gorm:"type:uuid;primaryKey"`
+	CustomerID  uuid.UUID `gorm:"type:uuid;primaryKey"`
+}
+
+func (PromotionUniqueCustomer) TableName() string {
+	return "sales_analytics.promotion_unique_customers"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/order_status_history.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/order_status_history.go
+package sales_analytics
+
+import (
+	"time"
+
+	"auth-service/internal/sales/models/enums"
+
+	"github.com/google/uuid"
+)
+
+// OrderStatusHistory tracks each status transition of an order, including duration.
+type OrderStatusHistory struct {
+	HistoryID       int64             `gorm:"primaryKey;autoIncrement" json:"historyId"`
+	OrderID         uuid.UUID         `gorm:"type:uuid;not null;index" json:"orderId"`
+	CompanyID       uuid.UUID         `gorm:"type:uuid;not null;index" json:"companyId"`
+	Status          enums.OrderStatus `gorm:"type:sales.order_status;not null" json:"status"`
+	EnteredAt       time.Time         `gorm:"type:timestamptz;not null" json:"enteredAt"`
+	ExitedAt        *time.Time        `gorm:"type:timestamptz" json:"exitedAt,omitempty"`
+	DurationSeconds int64             `gorm:"->" json:"durationSeconds"` // generated
+	CreatedAt       time.Time         `gorm:"default:now()" json:"createdAt"`
+}
+
+func (OrderStatusHistory) TableName() string {
+	return "sales_analytics.order_status_history"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/coupon_usage_fact.go
+================================================================================
+
+// FILE: ./models/sales_analytics/coupon_usage_fact.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CouponUsageFact struct {
+	ID             int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID      uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_coupon_usage_fact_unique,priority:1" json:"companyId"`
+	CouponID       uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_coupon_usage_fact_unique,priority:2" json:"couponId"`
+	EntityType     string           `gorm:"type:varchar(20);not null;uniqueIndex:idx_coupon_usage_fact_unique,priority:3" json:"entityType"` // 'order', 'invoice', 'quote'
+	EntityID       uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_coupon_usage_fact_unique,priority:4" json:"entityId"`
+	CustomerID     *uuid.UUID       `gorm:"type:uuid;index" json:"customerId,omitempty"`
+	DiscountAmount decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"discountAmount"`
+	OrderSubtotal  *decimal.Decimal `gorm:"type:numeric(14,4)" json:"orderSubtotal,omitempty"` // base amount before discount
+	UsedAt         time.Time        `gorm:"type:timestamptz;not null;index:idx_coupon_usage_fact_company_date,priority:2" json:"usedAt"`
+	CreatedAt      time.Time        `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CouponUsageFact) TableName() string {
+	return "sales_analytics.coupon_usage_fact"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/product_returns_fact.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/product_returns_fact.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// ProductReturnsFact stores pre-aggregated return metrics per product per day.
+type ProductReturnsFact struct {
+	ID               int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_product_returns_company_product_date,priority:1" json:"companyId"`
+	ProductID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_product_returns_company_product_date,priority:2" json:"productId"`
+	Date             time.Time       `gorm:"type:date;not null;uniqueIndex:idx_product_returns_company_product_date,priority:3" json:"date"`
+	QuantityReturned decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"quantityReturned"`
+	RefundAmount     decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"refundAmount"`
+	UpdatedAt        time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+// TableName specifies the table name for GORM.
+func (ProductReturnsFact) TableName() string {
+	return "sales_analytics.product_returns_fact"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/payment_method_daily.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type PaymentMethodDaily struct {
+	ID            int64               `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID     uuid.UUID           `gorm:"type:uuid;not null;uniqueIndex:idx_payment_method_daily_company_date_method,priority:1" json:"companyId"`
+	Date          time.Time           `gorm:"type:date;not null;uniqueIndex:idx_payment_method_daily_company_date_method,priority:2" json:"date"`
+	PaymentMethod enums.PaymentMethod `gorm:"type:sales.payment_method;not null;uniqueIndex:idx_payment_method_daily_company_date_method,priority:3" json:"paymentMethod"`
+	PaymentCount  int                 `gorm:"default:0" json:"paymentCount"`
+	TotalAmount   decimal.Decimal     `gorm:"type:numeric(14,4);default:0" json:"totalAmount"`
+	AverageAmount decimal.Decimal     `gorm:"->" json:"averageAmount"`
+	UpdatedAt     time.Time           `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (PaymentMethodDaily) TableName() string {
+	return "sales_analytics.payment_method_daily"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/order_cancellation_reasons.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/order_cancellation_reasons.go
+package sales_analytics
+
+import (
+	"time"
+
+	"auth-service/internal/sales/models/enums"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// OrderCancellationReason records why an order was cancelled.
+type OrderCancellationReason struct {
+	ID                      int64             `gorm:"primaryKey;autoIncrement" json:"id"`
+	OrderID                 uuid.UUID         `gorm:"type:uuid;not null" json:"orderId"`
+	CompanyID               uuid.UUID         `gorm:"type:uuid;not null" json:"companyId"`
+	CancellationReason      string            `gorm:"type:text;not null" json:"cancellationReason"`
+	CancelledBy             *uuid.UUID        `gorm:"type:uuid" json:"cancelledBy,omitempty"`
+	CancelledAt             time.Time         `gorm:"type:timestamptz;not null" json:"cancelledAt"`
+	OrderStatusBeforeCancel enums.OrderStatus `gorm:"type:sales.order_status" json:"orderStatusBeforeCancel,omitempty"`
+	OrderTotalBeforeCancel  decimal.Decimal   `gorm:"type:numeric(14,4)" json:"orderTotalBeforeCancel,omitempty"`
+}
+
+func (OrderCancellationReason) TableName() string {
+	return "sales_analytics.order_cancellation_reasons"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/coupon_redemption_rate_daily.go
+================================================================================
+
+// FILE: ./models/sales_analytics/coupon_redemption_rate_daily.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CouponRedemptionRateDaily struct {
+	ID             int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID      uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_redemption_rate_unique,priority:1" json:"companyId"`
+	CouponID       uuid.UUID        `gorm:"type:uuid;not null;uniqueIndex:idx_redemption_rate_unique,priority:2" json:"couponId"`
+	Date           time.Time        `gorm:"type:date;not null;uniqueIndex:idx_redemption_rate_unique,priority:3" json:"date"`
+	TotalIssued    *int             `gorm:"type:int" json:"totalIssued,omitempty"` // total coupons generated (if tracked)
+	TimesUsed      int              `gorm:"not null;default:0" json:"timesUsed"`
+	TotalAvailable *int             `gorm:"type:int" json:"totalAvailable,omitempty"`          // usage_limit * eligible customers – denormalised
+	RedemptionRate *decimal.Decimal `gorm:"type:numeric(5,2)" json:"redemptionRate,omitempty"` // (times_used / total_available) * 100
+	UpdatedAt      time.Time        `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CouponRedemptionRateDaily) TableName() string {
+	return "sales_analytics.coupon_redemption_rate_daily"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/order_item_analytics.go
+================================================================================
+
+// file: internal/sales/models/sales_analytics/order_item_analytics.go
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// OrderItemAnalytics stores line‑level analytics including COGS and profit.
+type OrderItemAnalytics struct {
+	ID              int64            `gorm:"primaryKey;autoIncrement" json:"id"`
+	OrderItemID     uuid.UUID        `gorm:"type:uuid;not null" json:"orderItemId"`
+	OrderID         uuid.UUID        `gorm:"type:uuid;not null" json:"orderId"`
+	CompanyID       uuid.UUID        `gorm:"type:uuid;not null" json:"companyId"`
+	ProductID       uuid.UUID        `gorm:"type:uuid;not null" json:"productId"`
+	Quantity        decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"quantity"`
+	UnitPrice       decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"unitPrice"`
+	DiscountAmount  decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"discountAmount"`
+	TaxAmount       decimal.Decimal  `gorm:"type:numeric(14,4);default:0" json:"taxAmount"`
+	TotalLineAmount decimal.Decimal  `gorm:"type:numeric(14,4);not null" json:"totalLineAmount"`
+	CogsPerUnit     *decimal.Decimal `gorm:"type:numeric(14,4)" json:"cogsPerUnit,omitempty"`
+	Profit          decimal.Decimal  `gorm:"->" json:"profit"` // generated
+	OrderDate       time.Time        `gorm:"type:date;not null" json:"orderDate"`
+	CreatedAt       time.Time        `gorm:"default:now()" json:"createdAt"`
+}
+
+func (OrderItemAnalytics) TableName() string {
+	return "sales_analytics.order_item_analytics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/refund_metrics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type RefundMetrics struct {
+	ID                  int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID           uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_refund_metrics_company_date,priority:1" json:"companyId"`
+	Date                time.Time       `gorm:"type:date;not null;uniqueIndex:idx_refund_metrics_company_date,priority:2" json:"date"`
+	RefundCount         int             `gorm:"default:0" json:"refundCount"`
+	TotalRefundAmount   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalRefundAmount"`
+	AverageRefundAmount decimal.Decimal `gorm:"->" json:"averageRefundAmount"`
+	PartialRefundCount  int             `gorm:"default:0" json:"partialRefundCount"`
+	FullRefundCount     int             `gorm:"default:0" json:"fullRefundCount"`
+	UpdatedAt           time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (RefundMetrics) TableName() string {
+	return "sales_analytics.refund_metrics"
 }
 
 
@@ -469,6 +2117,34 @@ func (m PaymentMethod) String() string { return string(m) }
 
 
 ================================================================================
+FILE: ./models/enums/quote_status.go
+================================================================================
+
+package enums
+
+type QuoteStatus string
+
+const (
+	QuoteStatusDraft     QuoteStatus = "draft"
+	QuoteStatusSent      QuoteStatus = "sent"
+	QuoteStatusAccepted  QuoteStatus = "accepted"
+	QuoteStatusRejected  QuoteStatus = "rejected"
+	QuoteStatusExpired   QuoteStatus = "expired"
+	QuoteStatusConverted QuoteStatus = "converted"
+)
+
+func (s QuoteStatus) IsValid() bool {
+	switch s {
+	case QuoteStatusDraft, QuoteStatusSent, QuoteStatusAccepted,
+		QuoteStatusRejected, QuoteStatusExpired, QuoteStatusConverted:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
 FILE: ./models/enums/payment_status.go
 ================================================================================
 
@@ -495,6 +2171,62 @@ func (s PaymentStatus) IsValid() bool {
 }
 
 func (s PaymentStatus) String() string { return string(s) }
+
+
+
+================================================================================
+FILE: ./models/enums/credit_note_status.go
+================================================================================
+
+// models/enums/credit_note_status.go
+package enums
+
+type CreditNoteStatus string
+
+const (
+	CreditNoteDraft         CreditNoteStatus = "draft"
+	CreditNoteIssued        CreditNoteStatus = "issued"
+	CreditNotePartiallyUsed CreditNoteStatus = "partially_used"
+	CreditNoteFullyUsed     CreditNoteStatus = "fully_used"
+	CreditNoteVoided        CreditNoteStatus = "voided"
+)
+
+func (s CreditNoteStatus) IsValid() bool {
+	switch s {
+	case CreditNoteDraft, CreditNoteIssued, CreditNotePartiallyUsed,
+		CreditNoteFullyUsed, CreditNoteVoided:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/return_status.go
+================================================================================
+
+package enums
+
+type ReturnStatus string
+
+const (
+	ReturnStatusPending   ReturnStatus = "pending"
+	ReturnStatusApproved  ReturnStatus = "approved"
+	ReturnStatusCompleted ReturnStatus = "completed"
+	ReturnStatusRejected  ReturnStatus = "rejected"
+)
+
+func (s ReturnStatus) IsValid() bool {
+	switch s {
+	case ReturnStatusPending, ReturnStatusApproved, ReturnStatusCompleted, ReturnStatusRejected:
+		return true
+	}
+	return false
+}
+func (s ReturnStatus) String() string {
+	return string(s)
+}
 
 
 
@@ -526,6 +2258,30 @@ func (s OrderStatus) IsValid() bool {
 }
 
 func (s OrderStatus) String() string { return string(s) }
+
+
+
+================================================================================
+FILE: ./models/enums/commission_base_type.go
+================================================================================
+
+package enums
+
+type CommissionBaseType string
+
+const (
+	CommissionBaseRevenue    CommissionBaseType = "revenue"
+	CommissionBaseProfit     CommissionBaseType = "profit"
+	CommissionBaseOrderTotal CommissionBaseType = "order_total"
+)
+
+func (c CommissionBaseType) IsValid() bool {
+	switch c {
+	case CommissionBaseRevenue, CommissionBaseProfit, CommissionBaseOrderTotal:
+		return true
+	}
+	return false
+}
 
 
 
@@ -598,14 +2354,50 @@ import (
 )
 
 type DiscountApplication struct {
-	ApplicationID uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"applicationId"`
-	OrderID       *uuid.UUID      `gorm:"type:uuid" json:"orderId,omitempty"`
-	InvoiceID     *uuid.UUID      `gorm:"type:uuid" json:"invoiceId,omitempty"`
-	DiscountType  string          `gorm:"type:varchar(50);not null" json:"discountType"`
-	DiscountID    *uuid.UUID      `gorm:"type:uuid" json:"discountId,omitempty"`
-	DiscountName  *string         `gorm:"type:varchar(255)" json:"discountName,omitempty"`
-	Amount        decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"amount"`
-	CreatedAt     time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	ApplicationID  uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"applicationId"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null;index" json:"companyId"` // ADD THIS
+	OrderID        *uuid.UUID      `gorm:"type:uuid" json:"orderId,omitempty"`
+	InvoiceID      *uuid.UUID      `gorm:"type:uuid" json:"invoiceId,omitempty"`
+	DiscountType   string          `gorm:"type:varchar(50);not null" json:"discountType"`
+	DiscountID     *uuid.UUID      `gorm:"type:uuid" json:"discountId,omitempty"`
+	AutoDiscountID *uuid.UUID      `gorm:"type:uuid" json:"autoDiscountId,omitempty"`
+	DiscountName   *string         `gorm:"type:varchar(255)" json:"discountName,omitempty"`
+	Amount         decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"amount"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+func (DiscountApplication) TableName() string {
+	return "sales.discount_applications"
+}
+
+
+
+================================================================================
+FILE: ./models/discount/discount_priority.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type DiscountPriority struct {
+	PriorityID   uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"priorityId"`
+	CompanyID    uuid.UUID  `gorm:"type:uuid;not null;index" json:"companyId"`
+	DiscountType string     `gorm:"type:varchar(30);not null" json:"discountType"`
+	DiscountID   *uuid.UUID `gorm:"type:uuid" json:"discountId,omitempty"` // NULL means all discounts of that type
+	Priority     int        `gorm:"not null" json:"priority"`
+	CreatedAt    time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt    time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy    *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy    *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+func (DiscountPriority) TableName() string {
+	return "sales.discount_priorities"
 }
 
 
@@ -672,6 +2464,77 @@ type CouponUsage struct {
 
 
 ================================================================================
+FILE: ./models/discount/discount_exclusion.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type DiscountExclusion struct {
+	ExclusionID   uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"exclusionId"`
+	CompanyID     uuid.UUID  `gorm:"type:uuid;not null;index" json:"companyId"`
+	DiscountTypeA string     `gorm:"type:varchar(30);not null" json:"discountTypeA"`
+	DiscountIDA   uuid.UUID  `gorm:"type:uuid;not null" json:"discountIdA"`
+	DiscountTypeB string     `gorm:"type:varchar(30);not null" json:"discountTypeB"`
+	DiscountIDB   uuid.UUID  `gorm:"type:uuid;not null" json:"discountIdB"`
+	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	CreatedBy     *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+}
+
+func (DiscountExclusion) TableName() string {
+	return "sales.discount_exclusions"
+}
+
+
+
+================================================================================
+FILE: ./models/discount/automatic_discount.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"gorm.io/datatypes"
+
+	"auth-service/internal/sales/models/enums"
+)
+
+type AutomaticDiscount struct {
+	AutoDiscountID     uuid.UUID          `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"autoDiscountId"`
+	CompanyID          uuid.UUID          `gorm:"type:uuid;not null;index" json:"companyId"`
+	Name               string             `gorm:"type:varchar(255);not null" json:"name"`
+	Description        *string            `gorm:"type:text" json:"description,omitempty"`
+	DiscountType       enums.DiscountType `gorm:"type:discount_type;not null" json:"discountType"`
+	DiscountValue      decimal.Decimal    `gorm:"type:numeric(14,4);not null" json:"discountValue"`
+	MaxDiscountAmount  *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"maxDiscountAmount,omitempty"`
+	MinOrderAmount     *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"minOrderAmount,omitempty"`
+	ApplicableProducts datatypes.JSON     `gorm:"type:jsonb" json:"applicableProducts,omitempty"`
+	StartDate          time.Time          `gorm:"type:timestamptz;not null" json:"startDate"`
+	EndDate            time.Time          `gorm:"type:timestamptz;not null" json:"endDate"`
+	IsActive           bool               `gorm:"not null;default:true" json:"isActive"`
+	Priority           int                `gorm:"not null;default:0" json:"priority"`
+	CreatedAt          time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt          time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy          *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy          *uuid.UUID         `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+func (AutomaticDiscount) TableName() string {
+	return "sales.automatic_discounts"
+}
+
+
+
+================================================================================
 FILE: ./models/discount/promotion_rule.go
 ================================================================================
 
@@ -723,6 +2586,41 @@ func (d DiscountType) IsValid() bool {
 
 func (d DiscountType) String() string {
 	return string(d)
+}
+
+
+
+================================================================================
+FILE: ./models/discount/stacking_rule.go
+================================================================================
+
+package discount
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	"gorm.io/datatypes"
+)
+
+type DiscountStackingRule struct {
+	RuleID              uuid.UUID        `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"ruleId"`
+	CompanyID           uuid.UUID        `gorm:"type:uuid;not null;index" json:"companyId"`
+	RuleName            string           `gorm:"type:varchar(100);not null" json:"ruleName"`
+	IsActive            bool             `gorm:"not null;default:true" json:"isActive"`
+	PrimaryDiscountType string           `gorm:"type:varchar(30);not null" json:"primaryDiscountType"`
+	PrimaryDiscountID   uuid.UUID        `gorm:"type:uuid;not null" json:"primaryDiscountId"`
+	AllowedTypes        datatypes.JSON   `gorm:"type:jsonb;not null" json:"allowedTypes"`
+	MaxTotalDiscount    *decimal.Decimal `gorm:"type:numeric(14,4)" json:"maxTotalDiscount,omitempty"`
+	CreatedAt           time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt           time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy           *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy           *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+func (DiscountStackingRule) TableName() string {
+	return "sales.discount_stacking_rules"
 }
 
 

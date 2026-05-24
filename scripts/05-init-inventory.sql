@@ -1007,3 +1007,20 @@ ALTER TABLE production_order_components
     DROP COLUMN IF EXISTS actual_quantity,
     DROP CONSTRAINT IF EXISTS fk_prod_comp_movement,
     DROP COLUMN IF EXISTS movement_id;
+
+-- For daily unique customers per coupon
+CREATE TABLE sales_analytics.daily_coupon_unique_customers (
+    company_id UUID NOT NULL,
+    coupon_id UUID NOT NULL,
+    date DATE NOT NULL,
+    customer_id UUID NOT NULL,
+    PRIMARY KEY (company_id, coupon_id, date, customer_id)
+);
+
+-- For overall unique customers per coupon (lifetime)
+CREATE TABLE sales_analytics.coupon_unique_customers (
+    company_id UUID NOT NULL,
+    coupon_id UUID NOT NULL,
+    customer_id UUID NOT NULL,
+    PRIMARY KEY (company_id, coupon_id, customer_id)
+);    

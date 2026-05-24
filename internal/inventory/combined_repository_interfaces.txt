@@ -1,0 +1,750 @@
+
+================================================================================
+FILE: ./repository/packing_list_item_repository.go
+================================================================================
+
+package repository
+
+type PackingListItemRepository interface {
+	Create(ctx context.Context, db DBTX, item *models.PackingListItem) error
+	BulkCreate(ctx context.Context, db DBTX, items []*models.PackingListItem) error
+	GetByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) ([]*models.PackingListItem, error)
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingListItem, error)
+	// AddPackedQty increments the packed quantity by the given delta.
+	AddPackedQty(ctx context.Context, db DBTX, id uuid.UUID, delta decimal.Decimal) error
+	DeleteByPackingList(ctx context.Context, db DBTX, packingListID uuid.UUID) error
+}
+
+
+================================================================================
+FILE: ./repository/item_repository.go
+================================================================================
+
+package repository
+
+type ItemRepository interface {
+	// Core CRUD
+	Create(ctx context.Context, db DBTX, item *models.Item) error
+	BulkCreate(ctx context.Context, db DBTX, items []*models.Item) error
+	GetByID(ctx context.Context, db DBTX, itemID uuid.UUID) (*models.Item, error)
+	GetByIDs(ctx context.Context, db DBTX, itemIDs []uuid.UUID) ([]*models.Item, error)
+	GetBySKU(ctx context.Context, db DBTX, companyID uuid.UUID, sku string) (*models.Item, error)
+	Update(ctx context.Context, db DBTX, item *models.Item) error
+	Delete(ctx context.Context, db DBTX, itemID uuid.UUID) error // soft delete
+	ExistsBySKUExcludingID(ctx context.Context, db DBTX, companyID uuid.UUID, sku string, excludeID uuid.UUID) (bool, error)
+
+	// Listing & filtering
+	List(ctx context.Context, db DBTX, filter ItemFilter, p Pagination, s Sort) ([]*models.Item, error)
+	Count(ctx context.Context, db DBTX, filter ItemFilter) (int64, error)
+	GetAllActiveItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Item, error)
+
+	// Business queries
+	GetByCompany(ctx context.Context, db DBTX, companyID uuid.UUID, p Pagination, s Sort) ([]*models.Item, error)
+	GetActiveItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Item, error)
+	GetByType(ctx context.Context, db DBTX, companyID uuid.UUID, itemType enums.ItemType) ([]*models.Item, error)
+	SearchItems(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit int) ([]*models.Item, error)
+
+	// Inventory / reorder support
+	GetReorderItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*ReorderItem, error)
+	GetLowStockItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*ReorderItem, error)
+
+	// Validation helpers
+	ExistsBySKU(ctx context.Context, db DBTX, companyID uuid.UUID, sku string) (bool, error)
+	ExistsByID(ctx context.Context, db DBTX, itemID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/inventory_cycle_count_repository.go
+================================================================================
+
+package repository
+
+type InventoryCycleCountRepository interface {
+	Create(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error
+	GetByID(ctx context.Context, db DBTX, cycleCountID uuid.UUID) (*models.InventoryCycleCount, error)
+	GetByUnique(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, itemID *uuid.UUID, scheduledDate *time.Time) (*models.InventoryCycleCount, error) // new method
+	UpdateStatus(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, status string, updatedAt time.Time) error
+	CompleteCount(ctx context.Context, tx DBTX, cycleCountID uuid.UUID, countedBy uuid.UUID, actualQuantity decimal.Decimal, adjustmentMovementID *uuid.UUID) error
+	ListByWarehouse(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, filter CycleCountFilter, p Pagination, s Sort) ([]*models.InventoryCycleCount, int64, error)
+	Update(ctx context.Context, tx DBTX, count *models.InventoryCycleCount) error // optional, for full update
+	Delete(ctx context.Context, tx DBTX, cycleCountID uuid.UUID) error
+}
+
+
+================================================================================
+FILE: ./repository/stock_ledger_repository.go
+================================================================================
+
+package repository
+
+type StockLedgerRepository interface {
+	// Write operations (only inserts, never update/delete)
+	Create(ctx context.Context, db DBTX, entry *models.StockLedger) error
+	BulkCreate(ctx context.Context, db DBTX, entries []*models.StockLedger) error
+
+	// FIFO layers – use stored remaining_quantity for performance
+	GetFIFOLayers(ctx context.Context, db DBTX, companyID, itemID uuid.UUID, warehouseID *uuid.UUID, asOfDate time.Time) ([]*FIFOLayer, error)
+
+	// Update remaining quantity after partial allocation (FIFO consumption)
+	UpdateRemainingQuantity(ctx context.Context, db DBTX, ledgerID uuid.UUID, remainingQty decimal.Decimal) error
+
+	// Fetch single / by movement / by item+batch
+	GetByID(ctx context.Context, db DBTX, ledgerID uuid.UUID) (*models.StockLedger, error)
+	GetByMovementID(ctx context.Context, db DBTX, movementID uuid.UUID) ([]*models.StockLedger, error)
+	GetByItemBatch(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, batchID *uuid.UUID) ([]*models.StockLedger, error)
+
+	// FIFO & costing (legacy, may be replaced by GetFIFOLayers)
+	GetAvailableLayersFIFO(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID) ([]*models.StockLedger, error)
+	GetBalanceBeforeDate(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID, date time.Time) (float64, error)
+	GetLatestBalance(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID) (float64, error)
+
+	// List + Count with filters
+	List(ctx context.Context, db DBTX, filter StockLedgerFilter, p Pagination, s Sort) ([]*models.StockLedger, error)
+	Count(ctx context.Context, db DBTX, filter StockLedgerFilter) (int64, error)
+
+	// Audit & time‑series
+	GetLedgerStatement(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID, from, to time.Time) ([]*models.StockLedger, error)
+	GetDailyClosingBalances(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID, from, to time.Time) ([]*DailyBalance, error)
+
+	// Consistency & repair
+	CheckNegativeStock(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID) (bool, error)
+	RebuildRunningBalance(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID) error
+}
+
+
+================================================================================
+FILE: ./repository/shipment_repository.go
+================================================================================
+
+package repository
+
+type ShipmentRepository interface {
+	Create(ctx context.Context, db DBTX, shipment *models.Shipment) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Shipment, error)
+	UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, shippedAt, deliveredAt *time.Time) error
+	GetByFulfillmentOrder(ctx context.Context, db DBTX, fulfillmentOrderID uuid.UUID) ([]*models.Shipment, error)
+	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID, status *string, p Pagination, s Sort) ([]*models.Shipment, int64, error)
+	ExistsByShipmentNumber(ctx context.Context, db DBTX, companyID uuid.UUID, number string) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/fulfillment_repository.go
+================================================================================
+
+package repository
+
+type FulfillmentRepository interface {
+	CreateOrder(ctx context.Context, db DBTX, order *models.FulfillmentOrder) error
+	GetOrderByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.FulfillmentOrder, error)
+	UpdateOrderStatus(ctx context.Context, db DBTX, id uuid.UUID, status string) error
+	GetByReference(ctx context.Context, db DBTX, companyID uuid.UUID, refType string, refID uuid.UUID) ([]*models.FulfillmentOrder, error)
+	ListOrders(ctx context.Context, db DBTX, companyID uuid.UUID, status *string, p Pagination, s Sort) ([]*models.FulfillmentOrder, int64, error)
+
+	AddOrderItems(ctx context.Context, db DBTX, items []*models.FulfillmentOrderItem) error
+	GetOrderItems(ctx context.Context, db DBTX, orderID uuid.UUID) ([]*models.FulfillmentOrderItem, error)
+	UpdateFulfilledQty(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID, fulfilledQty decimal.Decimal, backorderedQty decimal.Decimal) error
+	DeleteOrderItems(ctx context.Context, db DBTX, orderID uuid.UUID) error
+}
+
+
+================================================================================
+FILE: ./repository/production_repository.go
+================================================================================
+
+package repository
+
+type ProductionOrderRepository interface {
+	Create(ctx context.Context, db DBTX, order *models.ProductionOrder) error
+	GetByID(ctx context.Context, db DBTX, orderID, companyID uuid.UUID) (*models.ProductionOrder, error)
+	GetByOrderNumber(ctx context.Context, db DBTX, companyID uuid.UUID, orderNumber string) (*models.ProductionOrder, error)
+	Update(ctx context.Context, db DBTX, order *models.ProductionOrder) error
+	UpdateStatus(ctx context.Context, db DBTX, orderID uuid.UUID, status string, updatedAt time.Time) error
+	List(ctx context.Context, db DBTX, filter ProductionOrderFilter, p Pagination, s Sort) ([]*models.ProductionOrder, error)
+	Count(ctx context.Context, db DBTX, filter ProductionOrderFilter) (int64, error)
+	AddComponent(ctx context.Context, db DBTX, comp *models.ProductionOrderComponent) error
+	GetComponents(ctx context.Context, db DBTX, orderID uuid.UUID) ([]*models.ProductionOrderComponent, error)
+	GetComponentByID(ctx context.Context, db DBTX, componentID uuid.UUID) (*models.ProductionOrderComponent, error)
+	DeleteComponents(ctx context.Context, db DBTX, orderID uuid.UUID) error
+
+	// New methods using consumption & scrap tables
+	GetTotalConsumedQty(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error)
+	GetTotalScrappedQty(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error)
+	GetRemainingToConsume(ctx context.Context, db DBTX, componentID uuid.UUID) (decimal.Decimal, error)
+	CanCompleteOrder(ctx context.Context, db DBTX, orderID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/serial_repository.go
+================================================================================
+
+package repository
+
+type SerialRepository interface {
+	Create(ctx context.Context, db DBTX, serial *models.SerialNumber) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.SerialNumber, error)
+	GetBySerialNumber(ctx context.Context, db DBTX, companyID uuid.UUID, serialNumber string) (*models.SerialNumber, error)
+	GetByItem(ctx context.Context, db DBTX, companyID, itemID uuid.UUID, status *string) ([]*models.SerialNumber, error)
+	UpdateStatus(ctx context.Context, db DBTX, serialID uuid.UUID, status string) error
+	AssignToWarehouse(ctx context.Context, db DBTX, serialID, warehouseID uuid.UUID) error
+	AssignToBatch(ctx context.Context, db DBTX, serialID, batchID uuid.UUID) error
+	List(ctx context.Context, db DBTX, filter SerialFilter, p Pagination, s Sort) ([]*models.SerialNumber, int64, error)
+}
+
+
+================================================================================
+FILE: ./repository/picking_list_item_repository.go
+================================================================================
+
+package repository
+
+type PickingListItemRepository interface {
+	Create(ctx context.Context, tx DBTX, item *models.PickingListItem) error
+	BulkCreate(ctx context.Context, tx DBTX, items []*models.PickingListItem) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PickingListItem, error)
+	GetByPickingList(ctx context.Context, db DBTX, pickingListID uuid.UUID) ([]*models.PickingListItem, error)
+	UpdatePickedQty(ctx context.Context, tx DBTX, pickingItemID uuid.UUID, pickedQty decimal.Decimal) error
+	Update(ctx context.Context, tx DBTX, item *models.PickingListItem) error
+	DeleteByPickingList(ctx context.Context, tx DBTX, pickingListID uuid.UUID) error
+	ListByFulfillmentItem(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID) ([]*models.PickingListItem, error)
+}
+
+
+================================================================================
+FILE: ./repository/production_order_consumption_repository.go
+================================================================================
+
+package repository
+
+type ProductionOrderConsumptionRepository interface {
+	Create(ctx context.Context, db DBTX, consumption *models.ProductionOrderComponentConsumption) error
+	GetByID(ctx context.Context, db DBTX, companyID, consumptionID uuid.UUID) (*models.ProductionOrderComponentConsumption, error)
+	GetByProductionOrder(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) ([]*models.ProductionOrderComponentConsumption, error)
+	GetByComponent(ctx context.Context, db DBTX, companyID, componentID uuid.UUID) ([]*models.ProductionOrderComponentConsumption, error)
+	GetByMovementID(ctx context.Context, db DBTX, companyID, movementID uuid.UUID) (*models.ProductionOrderComponentConsumption, error)
+	GetTotalConsumedByComponent(ctx context.Context, db DBTX, companyID, componentID uuid.UUID) (decimal.Decimal, error)
+	GetTotalConsumedByOrderAndComponent(ctx context.Context, db DBTX, companyID, orderID, componentID uuid.UUID) (decimal.Decimal, error)
+	List(ctx context.Context, db DBTX, filter ConsumptionFilter, p Pagination, s Sort) ([]*models.ProductionOrderComponentConsumption, int64, error)
+	UpdateNotes(ctx context.Context, db DBTX, companyID, consumptionID uuid.UUID, notes string) error
+	Delete(ctx context.Context, db DBTX, companyID, consumptionID uuid.UUID) error
+	ExistsByMovementID(ctx context.Context, db DBTX, companyID, movementID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/vendor_purchase_repo.go
+================================================================================
+
+package repository
+
+type VendorPurchaseRepository interface {
+	// Vendors
+	CreateVendor(ctx context.Context, db DBTX, v *models.Vendor) error
+	GetVendorByID(ctx context.Context, db DBTX, vendorID uuid.UUID) (*models.Vendor, error)
+	GetVendorByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Vendor, error)
+	ListVendors(ctx context.Context, db DBTX, filter VendorFilter, p Pagination, s Sort) ([]*models.Vendor, error)
+	UpdateVendor(ctx context.Context, db DBTX, v *models.Vendor) error
+	DeleteVendor(ctx context.Context, db DBTX, vendorID uuid.UUID) error
+	ExistsVendorByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error)
+
+	// Vendor Tax Identifiers
+	AddVendorTaxIdentifier(ctx context.Context, db DBTX, tax *models.VendorTaxIdentifier) error
+	GetVendorTaxIdentifiers(ctx context.Context, db DBTX, vendorID uuid.UUID) ([]*models.VendorTaxIdentifier, error)
+	GetVendorTaxIdentifierByID(ctx context.Context, db DBTX, taxID uuid.UUID) (*models.VendorTaxIdentifier, error)
+	UpdateVendorTaxIdentifier(ctx context.Context, db DBTX, tax *models.VendorTaxIdentifier) error
+	DeleteVendorTaxIdentifier(ctx context.Context, db DBTX, taxID uuid.UUID) error
+	GetPrimaryTaxIdentifier(ctx context.Context, db DBTX, vendorID uuid.UUID) (*models.VendorTaxIdentifier, error)
+	CountVendors(ctx context.Context, db DBTX, filter VendorFilter) (int64, error)
+	CountPurchaseOrders(ctx context.Context, db DBTX, filter PurchaseOrderFilter) (int64, error)
+
+	// Purchase Orders (soft-delete enabled)
+	CreatePurchaseOrder(ctx context.Context, db DBTX, po *models.PurchaseOrder) error
+	GetPurchaseOrderByID(ctx context.Context, db DBTX, poID uuid.UUID) (*models.PurchaseOrder, error)
+	GetPurchaseOrderByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, poNumber string) (*models.PurchaseOrder, error)
+	ListPurchaseOrders(ctx context.Context, db DBTX, filter PurchaseOrderFilter, p Pagination, s Sort) ([]*models.PurchaseOrder, error)
+	UpdatePurchaseOrder(ctx context.Context, db DBTX, po *models.PurchaseOrder) error
+	UpdatePurchaseOrderStatus(ctx context.Context, db DBTX, poID uuid.UUID, status string) error
+	DeletePurchaseOrder(ctx context.Context, db DBTX, poID uuid.UUID) error // soft delete
+	ExistsPurchaseOrderNumber(ctx context.Context, db DBTX, companyID uuid.UUID, poNumber string) (bool, error)
+
+	// Purchase Order Items
+	AddPurchaseOrderItem(ctx context.Context, db DBTX, item *models.PurchaseOrderItem) error
+	AddPurchaseOrderItems(ctx context.Context, db DBTX, items []*models.PurchaseOrderItem) error
+	GetPurchaseOrderItems(ctx context.Context, db DBTX, poID uuid.UUID) ([]*models.PurchaseOrderItem, error)
+	GetPurchaseOrderItemByID(ctx context.Context, db DBTX, poItemID uuid.UUID) (*models.PurchaseOrderItem, error)
+	UpdatePurchaseOrderItem(ctx context.Context, db DBTX, item *models.PurchaseOrderItem) error
+	UpdatePurchaseOrderItemReceivedQty(ctx context.Context, db DBTX, poItemID uuid.UUID, receivedQty decimal.Decimal) error
+	DeletePurchaseOrderItem(ctx context.Context, db DBTX, poItemID uuid.UUID) error
+
+	// Purchase Order Receipts
+	CreatePurchaseOrderReceipt(ctx context.Context, db DBTX, receipt *models.PurchaseOrderReceipt) error
+	GetPurchaseOrderReceipts(ctx context.Context, db DBTX, poID uuid.UUID) ([]*models.PurchaseOrderReceipt, error)
+	GetPurchaseOrderReceiptByID(ctx context.Context, db DBTX, receiptID uuid.UUID) (*models.PurchaseOrderReceipt, error)
+	DeletePurchaseOrderReceipt(ctx context.Context, db DBTX, receiptID uuid.UUID) error
+
+	// Item Vendors
+	AddItemVendor(ctx context.Context, db DBTX, iv *models.ItemVendor) error
+	GetItemVendors(ctx context.Context, db DBTX, itemID uuid.UUID) ([]*models.ItemVendor, error)
+	GetDefaultItemVendor(ctx context.Context, db DBTX, itemID uuid.UUID) (*models.ItemVendor, error)
+	UpdateItemVendor(ctx context.Context, db DBTX, iv *models.ItemVendor) error
+	DeleteItemVendor(ctx context.Context, db DBTX, itemID, vendorID uuid.UUID) error
+	GetVendorsForItem(ctx context.Context, db DBTX, itemID uuid.UUID) ([]*models.Vendor, error)
+
+	// Helper to ensure only one default vendor per item
+	EnsureSingleDefaultVendor(ctx context.Context, db DBTX, itemID uuid.UUID, keepVendorID uuid.UUID) error
+}
+
+
+================================================================================
+FILE: ./repository/stock_balance_repository.go
+================================================================================
+
+package repository
+
+type StockBalanceRepository interface {
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.StockBalance, error)
+	GetByItemWarehouse(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID) (*models.StockBalance, error)
+	GetAvailableStock(ctx context.Context, db DBTX, companyID, itemID uuid.UUID) ([]*models.StockBalance, error)
+	GetByWarehouse(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) ([]*models.StockBalance, error)
+	GetByItem(ctx context.Context, db DBTX, companyID, itemID uuid.UUID) ([]*models.StockBalance, error)
+	GetByItems(ctx context.Context, db DBTX, companyID uuid.UUID, itemIDs []uuid.UUID) ([]*models.StockBalance, error)
+	GetByWarehouses(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseIDs []uuid.UUID) ([]*models.StockBalance, error)
+	UpsertStock(ctx context.Context, db DBTX, balance *models.StockBalance) error
+	IncreaseStock(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error
+	DecreaseStock(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error
+	ReserveStock(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error
+	ReleaseReservation(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, quantity float64) error
+	GetForUpdate(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID) (*models.StockBalance, error)
+	CheckAvailability(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID, requiredQty float64) (bool, error)
+	GetTotalOnHand(ctx context.Context, db DBTX, companyID, itemID uuid.UUID, warehouseID *uuid.UUID) (decimal.Decimal, error)
+	GetTotalStockByItem(ctx context.Context, db DBTX, companyID, itemID uuid.UUID) (float64, error)
+	GetByWarehouseAndItem(ctx context.Context, db DBTX, companyID, warehouseID, itemID uuid.UUID) (decimal.Decimal, error)
+	GetTotalStockByWarehouse(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) (float64, error)
+	GetLowStockItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.StockBalance, error)
+	GetByFilters(ctx context.Context, db DBTX, filter StockBalanceFilter) ([]*models.StockBalance, error)
+	GetOutOfStockItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.StockBalance, error)
+}
+
+
+================================================================================
+FILE: ./repository/packing_list_repository.go
+================================================================================
+
+package repository
+
+type PackingListRepository interface {
+	Create(ctx context.Context, db DBTX, list *models.PackingList) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.PackingList, error)
+	GetByShipment(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.PackingList, error)
+	UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string, packedAt, verifiedAt *time.Time) error
+	CompletePacking(ctx context.Context, db DBTX, id uuid.UUID, completedAt time.Time) error // <-- NEW
+	VerifyPacking(ctx context.Context, db DBTX, id uuid.UUID, verifiedBy *uuid.UUID, verifiedAt time.Time) error
+	List(ctx context.Context, db DBTX, filter PackingListFilter, p Pagination, s Sort) ([]*models.PackingList, int64, error)
+	UpdateStatusToPacked(ctx context.Context, tx *sql.Tx, packingListID uuid.UUID, packedBy *uuid.UUID, packedAt time.Time) error
+}
+
+
+================================================================================
+FILE: ./repository/batch_repository.go
+================================================================================
+
+package repository
+
+type scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+type BatchRepository interface {
+	// Core CRUD
+	Create(ctx context.Context, db DBTX, batch *models.Batch) error
+	GetByID(ctx context.Context, db DBTX, batchID uuid.UUID) (*models.Batch, error)
+	GetByIDs(ctx context.Context, db DBTX, batchIDs []uuid.UUID) ([]*models.Batch, error)
+	Update(ctx context.Context, db DBTX, batch *models.Batch) error
+	Delete(ctx context.Context, db DBTX, batchID uuid.UUID) error
+
+	// Business queries
+	GetByItem(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, filter BatchFilter, p Pagination, s Sort) ([]*models.Batch, error)
+	GetActiveBatchesByItem(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID) ([]*models.Batch, error)
+	GetBatchByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, batchNumber string) (*models.Batch, error)
+
+	// NEW: light-weight existence check to prevent duplicate batches
+	ExistsByBatchNumber(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, batchNumber string) (bool, error)
+
+	// Inventory critical – allocation & stock
+	GetAvailableBatchesFIFO(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID uuid.UUID, requiredQty float64) ([]*BatchAllocationCandidate, error)
+	GetAvailableBatchesFEFO(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID uuid.UUID, requiredQty float64) ([]*BatchAllocationCandidate, error)
+	GetBatchesWithStock(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID *uuid.UUID) ([]*BatchWithStock, error)
+
+	// Expiry management
+	GetExpiringBatches(ctx context.Context, db DBTX, companyID uuid.UUID, days int) ([]*models.Batch, error)
+	GetExpiredBatches(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Batch, error)
+
+	// Stock operations
+	UpdateRemainingQuantity(ctx context.Context, db DBTX, batchID uuid.UUID, newQty float64) error
+	AdjustBatchQuantity(ctx context.Context, db DBTX, batchID uuid.UUID, delta float64) error
+}
+
+
+================================================================================
+FILE: ./repository/bom_repository.go
+================================================================================
+
+package repository
+
+type BOMRepository interface {
+	// BOM header
+	CreateBOM(ctx context.Context, db DBTX, bom *models.BOM) error
+	GetBOMByID(ctx context.Context, db DBTX, bomID uuid.UUID) (*models.BOM, error)
+	GetActiveBOMByProduct(ctx context.Context, db DBTX, companyID uuid.UUID, productItemID uuid.UUID) (*models.BOM, error)
+	GetBOMVersions(ctx context.Context, db DBTX, companyID uuid.UUID, productItemID uuid.UUID) ([]*models.BOM, error)
+	UpdateBOM(ctx context.Context, db DBTX, bom *models.BOM) error
+	DeactivateBOM(ctx context.Context, db DBTX, bomID uuid.UUID) error
+	DeleteBOM(ctx context.Context, db DBTX, bomID uuid.UUID) error
+
+	// BOM items
+	AddBOMItems(ctx context.Context, db DBTX, items []*models.BOMItem) error
+	ReplaceBOMItems(ctx context.Context, db DBTX, bomID uuid.UUID, items []*models.BOMItem) error
+	GetBOMItems(ctx context.Context, db DBTX, bomID uuid.UUID) ([]*models.BOMItem, error)
+	DeleteBOMItems(ctx context.Context, db DBTX, bomID uuid.UUID) error
+
+	// Single item operations
+	GetBOMItemByID(ctx context.Context, db DBTX, bomItemID uuid.UUID) (*models.BOMItem, error)
+	UpdateBOMItem(ctx context.Context, db DBTX, bomItem *models.BOMItem) error
+	DeleteBOMItem(ctx context.Context, db DBTX, bomItemID uuid.UUID, companyID uuid.UUID) error
+	ExistsBOMByProductAndVersion(ctx context.Context, db DBTX, companyID, productItemID uuid.UUID, version int) (bool, error)
+	ExistsBOMItemByComponent(ctx context.Context, db DBTX, bomID, componentItemID uuid.UUID) (bool, error)
+
+	// BOM explosion
+	ExplodeBOM(ctx context.Context, db DBTX, bomID uuid.UUID, requiredQty decimal.Decimal) ([]*BOMExplosionResult, error)
+	GetDirectComponents(ctx context.Context, db DBTX, bomID uuid.UUID) ([]*models.BOMItem, error)
+	GetBOMByIDAndCompany(ctx context.Context, db DBTX, bomID, companyID uuid.UUID) (*models.BOM, error)
+
+	// Costing
+	CalculateBOMCost(ctx context.Context, db DBTX, bomID uuid.UUID) (*BOMCostResult, error)
+
+	// Paginated list
+	ListBOMs(ctx context.Context, db DBTX, filter BOMFilter, p Pagination, s Sort) ([]*models.BOM, int64, error)
+}
+
+
+================================================================================
+FILE: ./repository/transfer_order_repository.go
+================================================================================
+
+package repository
+
+type TransferOrderRepository interface {
+	// Create creates a new transfer order along with its items (within a transaction)
+	Create(ctx context.Context, db DBTX, order *models.StockTransferOrder, items []*models.StockTransferItem) error
+
+	// GetByID retrieves a transfer order by ID
+	GetByID(ctx context.Context, db DBTX, transferOrderID uuid.UUID) (*models.StockTransferOrder, error)
+
+	// GetByNumber retrieves a transfer order by company and transfer number
+	GetByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, number string) (*models.StockTransferOrder, error)
+
+	// UpdateStatus updates the status and optionally timestamps (dispatched_at / received_at)
+	UpdateStatus(ctx context.Context, db DBTX, transferOrderID uuid.UUID, status string, dispatchedAt, receivedAt *time.Time) error
+
+	// Dispatch marks the order as dispatched and sets dispatched_at
+	Dispatch(ctx context.Context, db DBTX, transferOrderID uuid.UUID, dispatchedAt time.Time) error
+
+	// Receive marks the order as received and sets received_at
+	Receive(ctx context.Context, db DBTX, transferOrderID uuid.UUID, receivedAt time.Time) error
+
+	// Cancel cancels a transfer order (only if not already dispatched/received)
+	Cancel(ctx context.Context, db DBTX, transferOrderID uuid.UUID) error
+
+	// List retrieves transfer orders with optional filters and pagination
+	List(ctx context.Context, db DBTX, filter TransferOrderFilter, p Pagination, s Sort) ([]*models.StockTransferOrder, int64, error)
+
+	// AddItems adds items to an existing transfer order
+	AddItems(ctx context.Context, db DBTX, transferOrderID uuid.UUID, items []*models.StockTransferItem) error
+
+	// GetItems retrieves all items for a transfer order
+	GetItems(ctx context.Context, db DBTX, transferOrderID uuid.UUID) ([]*models.StockTransferItem, error)
+
+	// UpdateItemQuantity updates the quantity of a specific transfer item
+	UpdateItemQuantity(ctx context.Context, db DBTX, transferItemID uuid.UUID, quantity decimal.Decimal) error
+
+	// RemoveItem removes an item from a transfer order
+	RemoveItem(ctx context.Context, db DBTX, transferItemID uuid.UUID) error
+
+	// ExistsByNumber checks if a transfer number already exists for the company
+	ExistsByNumber(ctx context.Context, db DBTX, companyID uuid.UUID, number string) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/location_repository.go
+================================================================================
+
+package repository
+
+type InventoryLocationRepository interface {
+	Create(ctx context.Context, db DBTX, loc *models.InventoryLocation) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.InventoryLocation, error)
+	GetByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string) (*models.InventoryLocation, error)
+	Update(ctx context.Context, db DBTX, loc *models.InventoryLocation) error
+	SoftDelete(ctx context.Context, db DBTX, id uuid.UUID) error
+	List(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
+	GetTree(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID) ([]*models.InventoryLocation, error)
+	ExistsByCode(ctx context.Context, db DBTX, companyID, warehouseID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/movement_repository.go
+================================================================================
+
+package repository
+
+type MovementRepository interface {
+	// Core write
+	CreateMovement(ctx context.Context, db DBTX, movement *models.StockMovement) error
+	BulkCreateMovements(ctx context.Context, db DBTX, movements []*models.StockMovement) error
+	CreateIfNotExists(ctx context.Context, db DBTX, movement *models.StockMovement) (*models.StockMovement, error)
+	UpdateStatus(ctx context.Context, db DBTX, movementID uuid.UUID, status string) error
+	UpdateMovement(ctx context.Context, db DBTX, movement *models.StockMovement) error // for linking reservation/shipment/transfer
+	GetCOGSByPeriod(ctx context.Context, db DBTX, companyID, itemID uuid.UUID, from, to time.Time) (decimal.Decimal, error)
+
+	// Fetch
+	GetByID(ctx context.Context, db DBTX, movementID uuid.UUID) (*models.StockMovement, error)
+	GetByReference(ctx context.Context, db DBTX, companyID uuid.UUID, referenceType string, referenceID uuid.UUID) ([]*models.StockMovement, error)
+	List(ctx context.Context, db DBTX, filter MovementFilter, p Pagination, s Sort) ([]*models.StockMovement, error)
+	Count(ctx context.Context, db DBTX, filter MovementFilter) (int64, error)
+	IsCancelled(ctx context.Context, db DBTX, movementID uuid.UUID) (bool, error)
+
+	// Specialized
+	GetItemMovements(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, from, to time.Time) ([]*models.StockMovement, error)
+	GetWarehouseMovements(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseID uuid.UUID, from, to time.Time) ([]*models.StockMovement, error)
+	GetBatchMovements(ctx context.Context, db DBTX, companyID uuid.UUID, batchID uuid.UUID) ([]*models.StockMovement, error)
+
+	// Transfer support
+	GetTransferMovements(ctx context.Context, db DBTX, companyID uuid.UUID, referenceID uuid.UUID) ([]*models.StockMovement, error)
+
+	// New: fetch by shipment or transfer
+	GetByShipmentID(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.StockMovement, error)
+	GetByTransferOrderID(ctx context.Context, db DBTX, transferOrderID uuid.UUID) ([]*models.StockMovement, error)
+
+	// Validation / checks
+	ExistsByReference(ctx context.Context, db DBTX, companyID uuid.UUID, referenceType string, referenceID uuid.UUID, itemID uuid.UUID, warehouseID uuid.UUID, batchID *uuid.UUID) (bool, error)
+
+	// Costing support
+	GetLatestUnitCost(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID uuid.UUID) (float64, error)
+	GetAverageCost(ctx context.Context, db DBTX, companyID uuid.UUID, itemID uuid.UUID, warehouseID uuid.UUID) (float64, error)
+
+	// Audit
+	GetMovementTrail(ctx context.Context, db DBTX, movementID uuid.UUID) (*MovementTrail, error)
+}
+
+
+================================================================================
+FILE: ./repository/analysis_repo.go
+================================================================================
+
+package repository
+
+type DBTX interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+type InventoryAnalysisRepository interface {
+	// Snapshots
+	BulkInsertSnapshots(ctx context.Context, db DBTX, snapshots []*models.DailyInventorySnapshot) error
+	GetSnapshotByDate(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, warehouseID *uuid.UUID) ([]*models.DailyInventorySnapshot, error)
+	GetSnapshotRange(ctx context.Context, db DBTX, filter SnapshotFilter, p Pagination, s Sort) ([]*models.DailyInventorySnapshot, error)
+	UpsertProductionMetric(ctx context.Context, db DBTX, metric *models.ProductionMetric) error
+	// Aging
+	BulkInsertAging(ctx context.Context, db DBTX, aging []*models.InventoryAging) error
+	GetInventoryAging(ctx context.Context, db DBTX, filter AgingFilter, p Pagination, s Sort) ([]*models.InventoryAging, error)
+
+	// Turnover
+	UpsertTurnoverMetrics(ctx context.Context, db DBTX, metrics *models.InventoryTurnoverMetrics) error
+	GetTurnoverMetrics(ctx context.Context, db DBTX, filter TurnoverFilter, p Pagination, s Sort) ([]*models.InventoryTurnoverMetrics, error)
+	UpsertMovementSummary(ctx context.Context, db DBTX, summary *models.MovementDailySummary) error
+
+	// GetMovementSummary retrieves movement summaries within a date range, optionally filtered by warehouse and item.
+	GetMovementSummary(ctx context.Context, db DBTX, companyID uuid.UUID, from, to time.Time, warehouseID, itemID *uuid.UUID) ([]*models.MovementDailySummary, error)
+
+	// ABC Classification
+	BulkInsertABC(ctx context.Context, db DBTX, records []*models.ABCClassification) error
+	GetABCClassification(ctx context.Context, db DBTX, filter ABCFilter, p Pagination, s Sort) ([]*models.ABCClassification, error)
+
+	// Demand History
+	BulkInsertDemand(ctx context.Context, db DBTX, demand []*models.DemandHistory) error
+	GetDemandHistory(ctx context.Context, db DBTX, filter DemandFilter, p Pagination, s Sort) ([]*models.DemandHistory, error)
+
+	// Advanced Analytics
+	GetInventoryValuationSummary(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time) (*ValuationSummary, error)
+	GetSlowMovingItems(ctx context.Context, db DBTX, companyID uuid.UUID, days int) ([]*SlowMovingItem, error)
+	GetFastMovingItems(ctx context.Context, db DBTX, companyID uuid.UUID, limit int) ([]*FastMovingItem, error)
+	GetStockOutRiskItems(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*StockRiskItem, error)
+}
+
+
+================================================================================
+FILE: ./repository/picking_list_repository.go
+================================================================================
+
+package repository
+
+type PickingListRepository interface {
+	Create(ctx context.Context, db DBTX, pickingList *models.PickingList) error
+	GetByID(ctx context.Context, db DBTX, pickingListID uuid.UUID) (*models.PickingList, error)
+	GetByFulfillmentOrder(ctx context.Context, db DBTX, fulfillmentOrderID uuid.UUID) ([]*models.PickingList, error)
+	UpdateStatus(ctx context.Context, db DBTX, pickingListID uuid.UUID, status string, pickedAt, completedAt *time.Time) error
+	AssignPicker(ctx context.Context, db DBTX, pickingListID, assignedTo uuid.UUID) error
+	ListByCompany(ctx context.Context, db DBTX, companyID uuid.UUID, status *string, limit, offset int) ([]*models.PickingList, int64, error)
+	Delete(ctx context.Context, db DBTX, pickingListID uuid.UUID) error
+}
+
+
+================================================================================
+FILE: ./repository/reorder_repository.go
+================================================================================
+
+package repository
+
+type ReorderOrderRepository interface {
+	Create(ctx context.Context, db DBTX, order *models.ReorderOrder) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.ReorderOrder, error)
+	UpdateStatus(ctx context.Context, db DBTX, id uuid.UUID, status string) error
+	UpdateReference(ctx context.Context, db DBTX, id uuid.UUID, refType string, refID uuid.UUID) error
+	ListPending(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.ReorderOrder, error)
+	ExistsPendingForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error)
+
+	// UpdateOrderWithReference updates status, reference_type, reference_id for a reorder order.
+	UpdateOrderWithReference(ctx context.Context, db DBTX, order *models.ReorderOrder) error
+
+	// ExistsOpenForItem checks for existing reorder with status IN ('pending', 'approved')
+	ExistsOpenForItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) (bool, error)
+	ListByFilters(ctx context.Context, db DBTX, filters ReorderFilters) ([]*models.ReorderOrder, int, error)
+}
+
+
+================================================================================
+FILE: ./repository/serial_number_transaction_repository.go
+================================================================================
+
+package repository
+
+type SerialNumberTransactionRepository interface {
+	Create(ctx context.Context, db DBTX, tx *models.SerialNumberTransaction) error
+	GetByID(ctx context.Context, db DBTX, transactionID uuid.UUID) (*models.SerialNumberTransaction, error)
+	GetBySerialID(ctx context.Context, db DBTX, serialID uuid.UUID, limit, offset int) ([]*models.SerialNumberTransaction, error)
+	GetByMovementID(ctx context.Context, db DBTX, movementID uuid.UUID) ([]*models.SerialNumberTransaction, error)
+	ListByCompany(ctx context.Context, db DBTX, filter SerialNumberTransactionFilter, p Pagination, s Sort) ([]*models.SerialNumberTransaction, int64, error)
+}
+
+
+================================================================================
+FILE: ./repository/production_order_scrap_repository.go
+================================================================================
+
+package repository
+
+type ProductionOrderScrapRepository interface {
+	Create(ctx context.Context, db DBTX, scrap *models.ProductionOrderScrap) error
+	GetByID(ctx context.Context, db DBTX, companyID, scrapID uuid.UUID) (*models.ProductionOrderScrap, error)
+	GetByProductionOrder(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) ([]*models.ProductionOrderScrap, error)
+	GetByComponent(ctx context.Context, db DBTX, companyID, componentID uuid.UUID) ([]*models.ProductionOrderScrap, error)
+	GetByMovementID(ctx context.Context, db DBTX, companyID, movementID uuid.UUID) (*models.ProductionOrderScrap, error)
+	GetTotalScrappedByComponent(ctx context.Context, db DBTX, companyID, componentID uuid.UUID) (decimal.Decimal, error)
+	List(ctx context.Context, db DBTX, filter ScrapFilter, p Pagination, s Sort) ([]*models.ProductionOrderScrap, int64, error)
+	UpdateReason(ctx context.Context, db DBTX, companyID, scrapID uuid.UUID, reason string) error
+	Delete(ctx context.Context, db DBTX, companyID, scrapID uuid.UUID) error
+	ExistsByMovementID(ctx context.Context, db DBTX, companyID, movementID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./repository/shipment_item_repository.go
+================================================================================
+
+package repository
+
+type ShipmentItemRepository interface {
+	Create(ctx context.Context, tx DBTX, item *models.ShipmentItem) error
+	GetByShipmentID(ctx context.Context, db DBTX, shipmentID uuid.UUID) ([]*models.ShipmentItem, error)
+	GetByFulfillmentItemID(ctx context.Context, db DBTX, fulfillmentItemID uuid.UUID) ([]*models.ShipmentItem, error)
+	List(ctx context.Context, db DBTX, filter ShipmentItemFilter, p Pagination, s Sort) ([]*models.ShipmentItem, error)
+	Update(ctx context.Context, tx DBTX, item *models.ShipmentItem) error
+	Delete(ctx context.Context, tx DBTX, id uuid.UUID) error
+	GetByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.ShipmentItem, error) // <-- ADD
+
+}
+
+
+================================================================================
+FILE: ./repository/warehouse_repository.go
+================================================================================
+
+package repository
+
+type WarehouseRepository interface {
+	// Create
+	Create(ctx context.Context, db DBTX, warehouse *models.Warehouse) error
+	BulkCreate(ctx context.Context, db DBTX, warehouses []*models.Warehouse) error
+
+	// Read
+	GetByID(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseID uuid.UUID) (*models.Warehouse, error)
+	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.Warehouse, error)
+	GetByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*models.Warehouse, error)
+	List(ctx context.Context, db DBTX, filter WarehouseFilter, p Pagination, s Sort) ([]*models.Warehouse, error)
+	Count(ctx context.Context, db DBTX, filter WarehouseFilter) (int64, error)
+
+	// Update
+	Update(ctx context.Context, db DBTX, warehouse *models.Warehouse) error
+	UpdateStatus(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseID uuid.UUID, isActive bool) error
+
+	// Delete (soft)
+	SoftDelete(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseID uuid.UUID) error
+
+	// Validation / helpers
+	Exists(ctx context.Context, db DBTX, companyID uuid.UUID, warehouseID uuid.UUID) (bool, error)
+	CodeExists(ctx context.Context, db DBTX, companyID uuid.UUID, code string, excludeID *uuid.UUID) (bool, error)
+
+	// Business helpers
+	GetActiveWarehouses(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.Warehouse, error)
+	GetDefaultWarehouse(ctx context.Context, db DBTX, companyID uuid.UUID) (*models.Warehouse, error)
+}
+
+
+================================================================================
+FILE: ./repository/reservation_repository.go
+================================================================================
+
+package repository
+
+type ReservationRepository interface {
+	// Core state changes
+	Create(ctx context.Context, db DBTX, res *models.Reservation) error
+	BulkCreate(ctx context.Context, db DBTX, reservations []*models.Reservation) error
+	Fulfill(ctx context.Context, db DBTX, reservationID uuid.UUID, fulfilledAt time.Time) error
+	UpdateFulfilledQuantity(ctx context.Context, db DBTX, reservationID uuid.UUID, additionalFulfilledQty decimal.Decimal) error
+	Cancel(ctx context.Context, db DBTX, reservationID uuid.UUID, cancelledAt time.Time) error
+	Expire(ctx context.Context, db DBTX, now time.Time) (int64, error)
+
+	// Fetching
+	GetByID(ctx context.Context, db DBTX, reservationID uuid.UUID) (*models.Reservation, error)
+	GetByReference(ctx context.Context, db DBTX, referenceType string, referenceID uuid.UUID) ([]*models.Reservation, error)
+	GetActiveByItemWarehouse(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) ([]*models.Reservation, error)
+	List(ctx context.Context, db DBTX, filter ReservationFilter, p Pagination, s Sort) ([]*models.Reservation, error)
+	Count(ctx context.Context, db DBTX, filter ReservationFilter) (int64, error)
+	GetActiveByReference(ctx context.Context, db DBTX, companyID uuid.UUID, reservationType string, referenceID uuid.UUID) (*models.Reservation, error)
+
+	// Stock‑aware helpers
+	GetReservedQuantity(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID, batchID *uuid.UUID) (decimal.Decimal, error)
+	GetAvailableToReserve(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID, batchID *uuid.UUID) (decimal.Decimal, error)
+	GetExpiredActive(ctx context.Context, db DBTX, companyID uuid.UUID, now time.Time) ([]*models.Reservation, error)
+
+	// Row‑level locking (critical for concurrency)
+	GetForUpdate(ctx context.Context, db DBTX, reservationID uuid.UUID) (*models.Reservation, error)
+	GetActiveForUpdateByItem(ctx context.Context, db DBTX, companyID, itemID, warehouseID uuid.UUID) ([]*models.Reservation, error)
+}
+

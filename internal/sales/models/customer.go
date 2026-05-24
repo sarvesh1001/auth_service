@@ -34,10 +34,18 @@ type Customer struct {
 	ShippingAddressDEK       *string `gorm:"column:shipping_address_dek;type:text" json:"-"`
 	ShippingAddressKeyID     *string `gorm:"column:shipping_address_key_id;type:text" json:"-"`
 
-	CreditLimit *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
-	IsActive    bool             `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt   time.Time        `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt   time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy   *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy   *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	// Plaintext fields for API (not stored in DB)
+	Email           *string `gorm:"-" json:"email,omitempty"`
+	Phone           *string `gorm:"-" json:"phone,omitempty"`
+	TaxID           *string `gorm:"-" json:"taxId,omitempty"`
+	BillingAddress  *string `gorm:"-" json:"billingAddress,omitempty"`
+	ShippingAddress *string `gorm:"-" json:"shippingAddress,omitempty"`
+
+	CreditLimit   *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
+	PaymentTermID *uuid.UUID       `gorm:"type:uuid;index" json:"paymentTermId,omitempty"`
+	IsActive      bool             `gorm:"not null;default:true" json:"isActive"`
+	CreatedAt     time.Time        `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt     time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy     *uuid.UUID       `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy     *uuid.UUID       `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }

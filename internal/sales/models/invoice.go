@@ -31,8 +31,16 @@ type Invoice struct {
 	IssuedAt      *time.Time          `gorm:"type:timestamptz" json:"issuedAt,omitempty"`
 	PaidAt        *time.Time          `gorm:"type:timestamptz" json:"paidAt,omitempty"`
 	CancelledAt   *time.Time          `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
-	CreatedAt     time.Time           `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt     time.Time           `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy     *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy     *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	SalesRepID    *uuid.UUID          `gorm:"type:uuid;index" json:"salesRepId,omitempty"` // new
+
+	// Payment term snapshot fields (immutable once invoice is issued)
+	PaymentTermName      *string          `gorm:"type:varchar(100)" json:"paymentTermName,omitempty"`
+	PaymentDueDays       *int             `gorm:"type:int" json:"paymentDueDays,omitempty"`
+	EarlyDiscountPercent *decimal.Decimal `gorm:"type:numeric(5,2);default:0" json:"earlyDiscountPercent,omitempty"`
+	EarlyDiscountDays    *int             `gorm:"type:int;default:0" json:"earlyDiscountDays,omitempty"`
+
+	CreatedAt time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }

@@ -16,3 +16,6 @@ func (s ReturnStatus) IsValid() bool {
 	}
 	return false
 }
+func (s ReturnStatus) String() string {
+	return string(s)
+}

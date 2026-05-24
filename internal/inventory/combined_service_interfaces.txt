@@ -1,0 +1,482 @@
+
+================================================================================
+FILE: ./service/inventory_service.go
+================================================================================
+
+package service
+
+type InventoryService interface {
+	// Item operations
+	CreateItem(ctx context.Context, req CreateItemRequest, idempotencyKey string) (*models.Item, error)
+	UpdateItem(ctx context.Context, req UpdateItemRequest, idempotencyKey string) (*models.Item, error)
+	DeleteItem(ctx context.Context, companyID, itemID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	CreateMovementWithTx(ctx context.Context, tx *sql.Tx, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
+
+	// Stock movement (core transactional)
+	CreateMovement(ctx context.Context, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
+
+	// Batch operations
+	CreateBatch(ctx context.Context, req CreateBatchRequest, idempotencyKey string) (*models.Batch, error)
+	AdjustBatch(ctx context.Context, req AdjustBatchRequest, idempotencyKey string) error
+}
+
+
+================================================================================
+FILE: ./service/picking_service.go
+================================================================================
+
+package service
+
+type PickingService interface {
+	GeneratePickingList(ctx context.Context, req GeneratePickingListRequest, idempotencyKey string) (*models.PickingList, error)
+	AssignPicker(ctx context.Context, pickingListID, pickerID uuid.UUID, companyID uuid.UUID, idempotencyKey string) error
+	PickItem(ctx context.Context, pickingItemID uuid.UUID, pickedQty decimal.Decimal, companyID uuid.UUID, idempotencyKey string) error
+	CompletePicking(ctx context.Context, pickingListID uuid.UUID, companyID uuid.UUID, idempotencyKey string) error
+	GetPickingList(ctx context.Context, pickingListID, companyID uuid.UUID) (*models.PickingList, []*models.PickingListItem, error)
+	ListPickingListsByCompany(ctx context.Context, companyID uuid.UUID, status *string, page, pageSize int) ([]*models.PickingList, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/shipment_item_service.go
+================================================================================
+
+package service
+
+type ShipmentItemService interface {
+	// CreateShipmentItems creates one or more shipment items for a given shipment.
+	// Expects items grouped by fulfillment_item_id with quantity shipped.
+	CreateShipmentItems(ctx context.Context, req CreateShipmentItemsRequest, idempotencyKey string) ([]*models.ShipmentItem, error)
+
+	// GetByShipmentID returns all shipment items for a shipment.
+	GetByShipmentID(ctx context.Context, shipmentID uuid.UUID) ([]*models.ShipmentItem, error)
+
+	// GetByFulfillmentItemID returns all shipment items linking to a specific fulfillment order item.
+	GetByFulfillmentItemID(ctx context.Context, fulfillmentItemID uuid.UUID) ([]*models.ShipmentItem, error)
+
+	// GetShipmentItemByID returns a single shipment item by its ID.
+	GetShipmentItemByID(ctx context.Context, shipmentItemID uuid.UUID) (*models.ShipmentItem, error)
+
+	// UpdateShippedQuantity updates the shipped quantity of an existing shipment item (rare, but allowed).
+	UpdateShippedQuantity(ctx context.Context, req UpdateShippedQuantityRequest, idempotencyKey string) (*models.ShipmentItem, error)
+
+	// DeleteShipmentItem removes a shipment item (e.g., if shipment is cancelled before shipping).
+	DeleteShipmentItem(ctx context.Context, shipmentItemID, companyID uuid.UUID, idempotencyKey string) error
+
+	// ListShipmentItems lists shipment items with optional filters.
+	ListShipmentItems(ctx context.Context, filter repository.ShipmentItemFilter, page, pageSize int) ([]*models.ShipmentItem, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/valuation_service.go
+================================================================================
+
+package service
+
+type ValuationService interface {
+	GetItemValuation(ctx context.Context, req ValuationRequest) (*ValuationResult, error)
+	GetCompanyValuation(ctx context.Context, companyID uuid.UUID, asOfDate time.Time) ([]*ValuationResult, error)
+	GetCOGS(ctx context.Context, companyID, itemID uuid.UUID, from, to time.Time) (decimal.Decimal, error)
+	CreateValuationSnapshot(ctx context.Context, companyID uuid.UUID, valuationDate time.Time) error
+}
+
+
+================================================================================
+FILE: ./service/packing_service.go
+================================================================================
+
+package service
+
+type PackingService interface {
+	// GeneratePackingList creates a packing list for a shipment.
+	GeneratePackingList(ctx context.Context, req GeneratePackingListRequest, idempotencyKey string) (*models.PackingList, error)
+
+	// GetPackingListByID retrieves a packing list by ID.
+	GetPackingListByID(ctx context.Context, packingListID uuid.UUID) (*models.PackingList, error)
+
+	// GetPackingListsByShipment retrieves all packing lists for a shipment.
+	GetPackingListsByShipment(ctx context.Context, shipmentID uuid.UUID) ([]*models.PackingList, error)
+
+	// PackItem updates the packed quantity for a specific packing list item.
+	PackItem(ctx context.Context, req PackItemRequest, idempotencyKey string) error
+
+	// BulkPackItems updates multiple packing list items in one transaction.
+	BulkPackItems(ctx context.Context, req BulkPackItemsRequest, idempotencyKey string) error
+
+	// VerifyPacking marks a packing list as verified (quality check).
+	VerifyPacking(ctx context.Context, req VerifyPackingRequest, idempotencyKey string) error
+
+	// CompletePacking marks a packing list as completed (ready for shipping).
+	CompletePacking(ctx context.Context, packingListID uuid.UUID, completedBy *uuid.UUID, idempotencyKey string) error
+
+	// ListPackingLists returns paginated packing lists with optional filters.
+	ListPackingLists(ctx context.Context, filter repository.PackingListFilter, page, pageSize int) ([]*models.PackingList, int64, error)
+
+	// GetPackingListItems retrieves all items for a packing list.
+	GetPackingListItems(ctx context.Context, packingListID uuid.UUID) ([]*models.PackingListItem, error)
+}
+
+
+================================================================================
+FILE: ./service/inventory_location_service.go
+================================================================================
+
+package service
+
+type InventoryLocationService interface {
+	CreateLocation(ctx context.Context, req CreateLocationRequest, idempotencyKey string) (*models.InventoryLocation, error)
+	UpdateLocation(ctx context.Context, req UpdateLocationRequest, idempotencyKey string) (*models.InventoryLocation, error)
+	DeleteLocation(ctx context.Context, companyID, locationID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	GetLocationTree(ctx context.Context, companyID, warehouseID uuid.UUID) ([]*LocationNode, error)
+	GetLocationByID(ctx context.Context, companyID, locationID uuid.UUID) (*models.InventoryLocation, error)
+	ListLocations(ctx context.Context, companyID, warehouseID uuid.UUID, parentID *uuid.UUID, activeOnly bool) ([]*models.InventoryLocation, error)
+}
+
+
+================================================================================
+FILE: ./service/stock_service.go
+================================================================================
+
+package service
+
+type StockService interface {
+	GetAvailableStock(ctx context.Context, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID) (decimal.Decimal, error)
+	GetStockLevels(ctx context.Context, filter StockFilter) ([]*models.StockBalance, error)
+	AdjustStock(ctx context.Context, req AdjustStockRequest, idempotencyKey string) (*models.StockMovement, error)
+	GetBatchPicking(ctx context.Context, companyID, itemID, warehouseID uuid.UUID, requiredQty decimal.Decimal, strategy PickingStrategy) ([]BatchAllocation, error)
+}
+
+
+================================================================================
+FILE: ./service/serial_number_service.go
+================================================================================
+
+package service
+
+type SerialNumberService interface {
+	RegisterSerialNumbers(ctx context.Context, req RegisterSerialNumbersRequest, idempotencyKey string) ([]*models.SerialNumber, error)
+	AssignSerialToWarehouse(ctx context.Context, serialID, warehouseID uuid.UUID, companyID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	AssignSerialToBatch(ctx context.Context, serialID, batchID uuid.UUID, companyID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	UpdateSerialStatus(ctx context.Context, serialID uuid.UUID, companyID uuid.UUID, status string, updatedBy *uuid.UUID, idempotencyKey string) error
+	GetSerialByNumber(ctx context.Context, companyID uuid.UUID, serialNumber string) (*models.SerialNumber, error)
+	GetSerialByID(ctx context.Context, serialID uuid.UUID, companyID uuid.UUID) (*models.SerialNumber, error)
+	ListSerials(ctx context.Context, filter repository.SerialFilter, page, pageSize int) ([]*models.SerialNumber, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/movement_service.go
+================================================================================
+
+package service
+
+type MovementService interface {
+	CreateMovement(ctx context.Context, req CreateMovementRequest, idempotencyKey string) (*models.StockMovement, error)
+	CancelMovement(ctx context.Context, req CancelMovementRequest, idempotencyKey string) error
+	GetMovement(ctx context.Context, movementID uuid.UUID) (*models.StockMovement, error)
+	ListMovements(ctx context.Context, filter repository.MovementFilter, page, pageSize int) ([]*models.StockMovement, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/fulfillment_service.go
+================================================================================
+
+package service
+
+type FulfillmentService interface {
+	CreateFulfillmentOrder(ctx context.Context, req CreateFulfillmentOrderRequest, idempotencyKey string) (*models.FulfillmentOrder, error)
+	AddFulfillmentItems(ctx context.Context, fulfillmentOrderID uuid.UUID, items []FulfillmentOrderItemRequest, idempotencyKey string) error
+	ProcessFulfillmentOrder(ctx context.Context, fulfillmentOrderID uuid.UUID, idempotencyKey string) error
+	AllocateStockToFulfillment(ctx context.Context, fulfillmentOrderID uuid.UUID, idempotencyKey string) error
+	CreateShipment(ctx context.Context, req CreateShipmentRequest, idempotencyKey string) (*models.Shipment, error)
+	Ship(ctx context.Context, shipmentID uuid.UUID, idempotencyKey string) error
+	Deliver(ctx context.Context, shipmentID uuid.UUID, idempotencyKey string) error
+	GetFulfillmentOrder(ctx context.Context, fulfillmentOrderID uuid.UUID) (*models.FulfillmentOrder, error)
+	GetFulfillmentOrderItems(ctx context.Context, fulfillmentOrderID uuid.UUID) ([]*models.FulfillmentOrderItem, error)
+}
+
+
+================================================================================
+FILE: ./service/serial_number_transaction_service.go
+================================================================================
+
+package service
+
+type SerialNumberTransactionService interface {
+	// LogAssignment records when a serial number is assigned to a warehouse and/or batch.
+	LogAssignment(ctx context.Context, db repository.DBTX, req LogAssignmentRequest, idempotencyKey string) error
+
+	// LogStatusChange records when a serial number's status changes.
+	LogStatusChange(ctx context.Context, db repository.DBTX, req LogStatusChangeRequest, idempotencyKey string) error
+
+	// LogShipment records when a serial number is shipped out (sold).
+	LogShipment(ctx context.Context, db repository.DBTX, req LogShipmentRequest, idempotencyKey string) error
+
+	// LogTransfer records when a serial number moves between warehouses and/or batches.
+	LogTransfer(ctx context.Context, db repository.DBTX, req LogTransferRequest, idempotencyKey string) error
+
+	// LogCustom records a generic transaction with a custom type and notes.
+	LogCustom(ctx context.Context, db repository.DBTX, req LogCustomRequest, idempotencyKey string) error
+
+	// GetTransactionHistory retrieves transactions for a given serial number.
+	GetTransactionHistory(ctx context.Context, db repository.DBTX, serialID uuid.UUID, limit, offset int) ([]*models.SerialNumberTransaction, error)
+
+	// ListTransactions lists transactions by company with filters.
+	ListTransactions(ctx context.Context, db repository.DBTX, filter repository.SerialNumberTransactionFilter, page, pageSize int) ([]*models.SerialNumberTransaction, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/warehouse_service.go
+================================================================================
+
+package service
+
+type WarehouseService interface {
+	CreateWarehouse(ctx context.Context, req CreateWarehouseRequest, idempotencyKey string) (*models.Warehouse, error)
+	BulkCreateWarehouses(ctx context.Context, reqs []CreateWarehouseRequest, idempotencyKey string) ([]*models.Warehouse, error)
+	GetWarehouseByID(ctx context.Context, companyID, warehouseID uuid.UUID) (*models.Warehouse, error)
+	GetWarehouseByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Warehouse, error)
+	ListWarehouses(ctx context.Context, filter repository.WarehouseFilter, page, pageSize int) ([]*models.Warehouse, int64, error)
+	UpdateWarehouse(ctx context.Context, req UpdateWarehouseRequest, idempotencyKey string) (*models.Warehouse, error)
+	DeleteWarehouse(ctx context.Context, companyID, warehouseID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	SetWarehouseStatus(ctx context.Context, companyID, warehouseID uuid.UUID, isActive bool, updatedBy *uuid.UUID, idempotencyKey string) error
+}
+
+
+================================================================================
+FILE: ./service/production_service.go
+================================================================================
+
+package service
+
+type ProductionService interface {
+	CreateProductionOrder(ctx context.Context, req CreateProductionOrderRequest, idempotencyKey string) (*models.ProductionOrder, error)
+	ReleaseProductionOrder(ctx context.Context, orderID, companyID uuid.UUID, releasedBy *uuid.UUID, idempotencyKey string) error
+	StartProduction(ctx context.Context, orderID, companyID uuid.UUID, startedBy *uuid.UUID, idempotencyKey string) error
+	CompleteProduction(ctx context.Context, req CompleteProductionRequest, idempotencyKey string) error
+	CancelProductionOrder(ctx context.Context, req CancelProductionOrderRequest, idempotencyKey string) error
+	ConsumeComponent(ctx context.Context, req ConsumeComponentRequest, idempotencyKey string) error
+	RecordScrap(ctx context.Context, req RecordScrapRequest, idempotencyKey string) error
+	GetProductionOrder(ctx context.Context, orderID, companyID uuid.UUID) (*models.ProductionOrder, error)
+	ListProductionOrders(ctx context.Context, filter repository.ProductionOrderFilter, page, pageSize int) ([]*models.ProductionOrder, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/bom_service.go
+================================================================================
+
+package service
+
+type BOMService interface {
+	Create(ctx context.Context, req CreateBOMRequest, idempotencyKey string) (*models.BOM, error)
+	GetByID(ctx context.Context, bomID, companyID uuid.UUID) (*models.BOM, error)
+	Update(ctx context.Context, req UpdateBOMRequest, idempotencyKey string) (*models.BOM, error)
+	Delete(ctx context.Context, bomID, companyID uuid.UUID, idempotencyKey string) error
+	List(ctx context.Context, companyID uuid.UUID, filter BOMFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.BOM, int64, error)
+	GetByProductItemID(ctx context.Context, companyID, productItemID uuid.UUID) ([]*models.BOM, error)
+
+	AddBOMItem(ctx context.Context, req AddBOMItemRequest, idempotencyKey string) (*models.BOMItem, error)
+	UpdateBOMItem(ctx context.Context, req UpdateBOMItemRequest, idempotencyKey string) (*models.BOMItem, error)
+	RemoveBOMItem(ctx context.Context, bomItemID, companyID uuid.UUID, idempotencyKey string) error
+	GetBOMItems(ctx context.Context, bomID, companyID uuid.UUID) ([]*models.BOMItem, error)
+}
+
+
+================================================================================
+FILE: ./service/inventory_query_service.go
+================================================================================
+
+package service
+
+type InventoryQueryService interface {
+	// Stock levels
+	GetCurrentStock(ctx context.Context, companyID, warehouseID, itemID uuid.UUID, batchID *uuid.UUID) (*StockLevel, error)
+	GetAllStockByWarehouse(ctx context.Context, companyID, warehouseID uuid.UUID) ([]*StockLevel, error)
+	GetAllStockByItem(ctx context.Context, companyID, itemID uuid.UUID) ([]*StockLevel, error)
+	GetAllStockByBatch(ctx context.Context, companyID uuid.UUID, batchID uuid.UUID) (*StockLevel, error)
+
+	// Movements
+	GetMovements(ctx context.Context, filter repository.MovementFilter, page, pageSize int) (*PaginatedResult[MovementSummary], error)
+
+	// Low stock & reorder
+	GetLowStockItems(ctx context.Context, companyID uuid.UUID) ([]*repository.ReorderItem, error)
+
+	// Expiring batches
+	GetExpiringBatches(ctx context.Context, companyID uuid.UUID, daysThreshold int) ([]*models.Batch, error)
+
+	// Reservation summary for a reference (e.g., sales order)
+	GetReservationsByReference(ctx context.Context, companyID uuid.UUID, reservationType string, referenceID uuid.UUID) ([]*models.Reservation, error)
+}
+
+
+================================================================================
+FILE: ./service/shipment_service.go
+================================================================================
+
+package service
+
+type ShipmentService interface {
+	// CreateShipment creates a new shipment record.
+	CreateShipment(ctx context.Context, req CreateShipmentRequest, idempotencyKey string) (*models.Shipment, error)
+
+	// GetShipmentByID retrieves a shipment by its ID.
+	GetShipmentByID(ctx context.Context, shipmentID uuid.UUID) (*models.Shipment, error)
+
+	// UpdateShipmentStatus updates the status and timestamps of a shipment.
+	UpdateShipmentStatus(ctx context.Context, req UpdateShipmentStatusRequest, idempotencyKey string) (*models.Shipment, error)
+
+	// GetShipmentsByFulfillmentOrder returns all shipments for a given fulfillment order.
+	GetShipmentsByFulfillmentOrder(ctx context.Context, fulfillmentOrderID uuid.UUID) ([]*models.Shipment, error)
+
+	// ListShipments returns paginated shipments for a company, optionally filtered by status.
+	ListShipments(ctx context.Context, companyID uuid.UUID, status *string, page, pageSize int) ([]*models.Shipment, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/item_application_service.go
+================================================================================
+
+package service
+
+type ItemApplicationService interface {
+	CreateItem(ctx context.Context, req CreateItemRequest, idempotencyKey string) (*models.Item, error)
+	UpdateItem(ctx context.Context, req UpdateItemRequest, idempotencyKey string) (*models.Item, error)
+	DeleteItem(ctx context.Context, companyID, itemID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+
+	GetItemByID(ctx context.Context, companyID, itemID uuid.UUID) (*models.Item, error)
+	ListItems(ctx context.Context, companyID uuid.UUID, filter ItemFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.Item, int64, error)
+	GetLowStockItems(ctx context.Context, companyID uuid.UUID) ([]*repository.ReorderItem, error)
+}
+
+
+================================================================================
+FILE: ./service/reorder_service.go
+================================================================================
+
+package service
+
+type ReorderService interface {
+	CheckAndCreateReorderOrders(ctx context.Context, companyID, itemID, warehouseID uuid.UUID, _ decimal.Decimal) error
+	ProcessPendingOrders(ctx context.Context, companyID uuid.UUID) (int, error)
+	UpdateOrderStatus(ctx context.Context, orderID uuid.UUID, newStatus string) error
+}
+
+
+================================================================================
+FILE: ./service/purchase_order_service.go
+================================================================================
+
+package service
+
+type PurchaseOrderService interface {
+	// Reorder integration
+	CreatePurchaseOrderFromReorder(ctx context.Context, reorder *models.ReorderOrder, idempotencyKey string) (*models.PurchaseOrder, bool, error)
+
+	// Receiving
+	ReceivePurchaseOrder(ctx context.Context, req ReceivePurchaseOrderRequest, idempotencyKey string) (*models.PurchaseOrderReceipt, error)
+
+	// Vendor CRUD
+	CreateVendor(ctx context.Context, req CreateVendorRequest, idempotencyKey string) (*models.Vendor, error)
+	GetVendor(ctx context.Context, vendorID uuid.UUID) (*models.Vendor, error)
+	ListVendors(ctx context.Context, filter repository.VendorFilter, page, pageSize int) ([]*models.Vendor, int64, error)
+	UpdateVendor(ctx context.Context, vendor *models.Vendor, idempotencyKey string) error
+	DeleteVendor(ctx context.Context, vendorID uuid.UUID, idempotencyKey string) error
+
+	// Purchase Order CRUD
+	CreatePurchaseOrder(ctx context.Context, req CreatePurchaseOrderRequest, idempotencyKey string) (*models.PurchaseOrder, error)
+	GetPurchaseOrder(ctx context.Context, poID uuid.UUID) (*models.PurchaseOrder, error)
+	ListPurchaseOrders(ctx context.Context, filter repository.PurchaseOrderFilter, page, pageSize int) ([]*models.PurchaseOrder, int64, error)
+	UpdatePurchaseOrderStatus(ctx context.Context, poID uuid.UUID, newStatus string, idempotencyKey string) error
+	AddPurchaseOrderItems(ctx context.Context, poID uuid.UUID, items []PurchaseOrderItemInput, idempotencyKey string) error
+	GetPurchaseOrderItems(ctx context.Context, poID uuid.UUID) ([]*models.PurchaseOrderItem, error)
+}
+
+
+================================================================================
+FILE: ./service/reservation_service.go
+================================================================================
+
+package service
+
+type ReservationService interface {
+	CreateReservation(ctx context.Context, db repository.DBTX, req CreateReservationRequest, idempotencyKey string) (*models.Reservation, error)
+
+	// GetActiveReservationByReference returns the active (or partially fulfilled) reservation for a given reference and item.
+	GetActiveReservationByReference(ctx context.Context, db repository.DBTX, companyID uuid.UUID, reservationType string, referenceID, itemID uuid.UUID) (*models.Reservation, error)
+
+	// PartialFulfillReservation fulfills a part of a reservation.
+	PartialFulfillReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, quantityFulfilled decimal.Decimal, idempotencyKey string) error
+
+	// FulfillReservation fulfills the entire reservation.
+	FulfillReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, idempotencyKey string) error
+	GetActiveReservationsByReference(ctx context.Context, db repository.DBTX, companyID uuid.UUID, reservationType string, referenceID, itemID uuid.UUID) ([]*models.Reservation, error)
+
+	CancelReservation(ctx context.Context, db repository.DBTX, reservationID, companyID uuid.UUID, idempotencyKey string) error
+	ExpireReservations(ctx context.Context, db repository.DBTX, companyID uuid.UUID) (int64, error)
+}
+
+
+================================================================================
+FILE: ./service/analysis_service.go
+================================================================================
+
+package service
+
+type InventoryAnalyticsService interface {
+	ProcessInventoryEvent(ctx context.Context, eventType string, payload []byte) error
+}
+
+
+================================================================================
+FILE: ./service/cycle_count_service.go
+================================================================================
+
+package service
+
+type CycleCountService interface {
+	CreateCycleCount(ctx context.Context, req CreateCycleCountRequest, idempotencyKey string) (*models.InventoryCycleCount, error)
+	StartCycleCount(ctx context.Context, cycleCountID, companyID uuid.UUID, startedBy *uuid.UUID, idempotencyKey string) error
+	CompleteCycleCount(ctx context.Context, req CompleteCycleCountRequest, idempotencyKey string) error
+	CancelCycleCount(ctx context.Context, cycleCountID, companyID uuid.UUID, cancelledBy *uuid.UUID, reason string, idempotencyKey string) error
+	GetCycleCount(ctx context.Context, cycleCountID, companyID uuid.UUID) (*models.InventoryCycleCount, error)
+	ListCycleCounts(ctx context.Context, filter repository.CycleCountFilter, page, pageSize int) ([]*models.InventoryCycleCount, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/transfer_order_service.go
+================================================================================
+
+package service
+
+type TransferOrderService interface {
+	CreateTransferOrder(ctx context.Context, req CreateTransferOrderRequest, idempotencyKey string) (*models.StockTransferOrder, error)
+	DispatchTransferOrder(ctx context.Context, transferOrderID, companyID uuid.UUID, dispatchedBy *uuid.UUID, idempotencyKey string) error
+	ReceiveTransferOrder(ctx context.Context, transferOrderID, companyID uuid.UUID, receivedBy *uuid.UUID, idempotencyKey string) error
+	CancelTransferOrder(ctx context.Context, transferOrderID, companyID uuid.UUID, cancelledBy *uuid.UUID, reason string, idempotencyKey string) error
+	GetTransferOrder(ctx context.Context, transferOrderID, companyID uuid.UUID) (*models.StockTransferOrder, error)
+	GetTransferOrderItems(ctx context.Context, transferOrderID, companyID uuid.UUID) ([]*models.StockTransferItem, error)
+	ListTransferOrders(ctx context.Context, filter repository.TransferOrderFilter, page, pageSize int) ([]*models.StockTransferOrder, int64, error)
+}
+
+
+================================================================================
+FILE: ./service/analytics_query_service.go
+================================================================================
+
+package service
+
+type AnalyticsQueryService interface {
+	GetSnapshotRange(ctx context.Context, filter repository.SnapshotFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.DailyInventorySnapshot, error)
+	GetTurnoverMetrics(ctx context.Context, filter repository.TurnoverFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.InventoryTurnoverMetrics, error)
+	GetABCClassification(ctx context.Context, filter repository.ABCFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.ABCClassification, error)
+	GetInventoryAging(ctx context.Context, filter repository.AgingFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.InventoryAging, error)
+	GetDemandHistory(ctx context.Context, filter repository.DemandFilter, pagination repository.Pagination, sort repository.Sort) ([]*models.DemandHistory, error)
+	GetMovementSummary(ctx context.Context, companyID uuid.UUID, from, to time.Time, warehouseID, itemID *uuid.UUID) ([]*models.MovementDailySummary, error)
+}
+

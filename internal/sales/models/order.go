@@ -29,6 +29,7 @@ type Order struct {
 	DeliveredAt        *time.Time        `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
 	CancelledAt        *time.Time        `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
 	CancellationReason *string           `gorm:"type:text" json:"cancellationReason,omitempty"`
+	SalesRepID         *uuid.UUID        `gorm:"type:uuid;index" json:"salesRepId,omitempty"` // new
 	CreatedAt          time.Time         `gorm:"not null;default:now()" json:"createdAt"`
 	UpdatedAt          time.Time         `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy          *uuid.UUID        `gorm:"type:uuid" json:"createdBy,omitempty"`
