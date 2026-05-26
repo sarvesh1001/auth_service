@@ -1,0 +1,1043 @@
+
+================================================================================
+FILE: ./service/tax_integration_service.go
+================================================================================
+
+package service
+
+type TaxIntegrationService interface {
+	// Calculation (without persistence)
+	CalculateOrderTaxes(ctx context.Context, req *CalculateOrderTaxRequest) (*TaxCalculationResult, error)
+	CalculateQuoteTaxes(ctx context.Context, req *CalculateQuoteTaxRequest) (*TaxCalculationResult, error)
+	CalculateInvoiceTaxes(ctx context.Context, req *CalculateInvoiceTaxRequest) (*TaxCalculationResult, error)
+	CalculateReturnTaxes(ctx context.Context, req *CalculateReturnTaxRequest) (*TaxCalculationResult, error)
+	CalculateLineTax(ctx context.Context, req *CalculateLineTaxRequest) (*TaxLineResult, error)
+	PreviewTaxes(ctx context.Context, req *TaxPreviewRequest) (*TaxPreviewResult, error)
+
+	// Apply and persist taxes to entities
+	ApplyTaxesToOrder(ctx context.Context, companyID, orderID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
+	ApplyTaxesToQuote(ctx context.Context, companyID, quoteID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
+	ApplyTaxesToInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, appliedBy uuid.UUID, idempotencyKey string) (*TaxCalculationResult, error)
+	RefreshOrderTaxes(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	RefreshInvoiceTaxes(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+
+	// Tax snapshot queries
+	GetOrderTaxBreakdown(ctx context.Context, companyID, orderID uuid.UUID) ([]*TaxBreakdownLine, error)
+	GetInvoiceTaxBreakdown(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*TaxBreakdownLine, error)
+	GetQuoteTaxBreakdown(ctx context.Context, companyID, quoteID uuid.UUID) ([]*TaxBreakdownLine, error)
+
+	// Tax snapshot management
+	CreateTaxSnapshot(ctx context.Context, req *CreateTaxSnapshotRequest) (*models.TaxSnapshot, error)
+	GetTaxSnapshotByID(ctx context.Context, companyID, snapshotID uuid.UUID) (*models.TaxSnapshot, error)
+	GetLatestTaxSnapshot(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) (*models.TaxSnapshot, error)
+	GetTaxSnapshots(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*models.TaxSnapshot, error)
+	RecalculateTaxSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID, recalculatedBy uuid.UUID, idempotencyKey string) (*models.TaxSnapshot, error)
+	ArchiveTaxSnapshot(ctx context.Context, companyID, snapshotID uuid.UUID, archivedBy uuid.UUID, idempotencyKey string) error
+
+	// Existence checks
+	TaxSnapshotExists(ctx context.Context, companyID, snapshotID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/credit_check_service.go
+================================================================================
+
+package service
+
+type CreditCheckService interface {
+	CheckCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, requestedAmount decimal.Decimal) (*CreditCheckResult, error)
+	CheckOrderCreditEligibility(ctx context.Context, companyID, orderID uuid.UUID) (*CreditCheckResult, error)
+	CheckInvoiceCreditEligibility(ctx context.Context, companyID, invoiceID uuid.UUID) (*CreditCheckResult, error)
+	GetCustomerAvailableCredit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetCustomerOutstandingBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetCustomerCreditExposure(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	CanCustomerPlaceOrder(ctx context.Context, companyID, customerID uuid.UUID, orderAmount decimal.Decimal) (bool, error)
+	HoldOrderForCredit(ctx context.Context, companyID, orderID uuid.UUID, reason string, heldBy uuid.UUID) error
+	ReleaseOrderCreditHold(ctx context.Context, companyID, orderID uuid.UUID, reason string, releasedBy uuid.UUID) error
+	IsOrderOnCreditHold(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
+	GetOrdersOnCreditHold(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error)
+	UpdateOrderCreditStatus(ctx context.Context, companyID, orderID uuid.UUID, status enums.CreditCheckStatus, updatedBy uuid.UUID) error
+	SetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, creditLimit decimal.Decimal, updatedBy uuid.UUID) error
+	IncreaseCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, increaseAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error
+	DecreaseCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, decreaseAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error
+	SuspendCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, reason string, suspendedBy uuid.UUID) error
+	RestoreCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, restoredBy uuid.UUID) error
+	GetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	IsCustomerCreditSuspended(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
+	LogCreditCheck(ctx context.Context, req *CreateCreditCheckHistoryRequest) (*models.CreditCheckHistory, error)
+	GetCreditCheckHistoryByID(ctx context.Context, companyID, historyID uuid.UUID) (*models.CreditCheckHistory, error)
+	GetCustomerCreditHistory(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.CreditCheckHistory, int64, error)
+	GetOrderCreditHistory(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.CreditCheckHistory, error)
+	GetFailedCreditChecks(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*models.CreditCheckHistory, error)
+	RunAutomaticCreditReview(ctx context.Context, companyID, customerID uuid.UUID, triggeredBy uuid.UUID) (*CreditReviewResult, error)
+	GetCustomersExceedingCreditLimit(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error)
+	GetCustomersNearCreditLimit(ctx context.Context, companyID uuid.UUID, thresholdPercent decimal.Decimal) ([]*models.Customer, error)
+	GetHighRiskCustomers(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error)
+	GetAveragePaymentDelay(ctx context.Context, companyID, customerID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetCustomerCollectionScore(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetCustomerCreditUtilization(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	ValidateCreditLimit(ctx context.Context, creditLimit decimal.Decimal) error
+	ValidateCreditHold(ctx context.Context, companyID, orderID uuid.UUID) error
+	ValidateCreditRelease(ctx context.Context, companyID, orderID uuid.UUID) error
+	ValidateCreditStatusTransition(ctx context.Context, currentStatus, nextStatus enums.CreditCheckStatus) error
+	GetTotalOutstandingCredit(ctx context.Context, companyID uuid.UUID) (decimal.Decimal, error)
+	GetTotalCreditExposure(ctx context.Context, companyID uuid.UUID) (decimal.Decimal, error)
+	GetAverageCreditUtilization(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetCreditHoldRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	CreditHistoryExists(ctx context.Context, companyID, historyID uuid.UUID) (bool, error)
+	OrderHasCreditIssues(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
+	CustomerExceededCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/sales_rep_commission_service.go
+================================================================================
+
+package service
+
+type SalesRepCommissionService interface {
+	CreateCommissionPlan(ctx context.Context, req *CreateCommissionPlanRequest) (*models.CommissionPlan, error)
+	UpdateCommissionPlan(ctx context.Context, companyID, planID uuid.UUID, req *UpdateCommissionPlanRequest) (*models.CommissionPlan, error)
+	DeleteCommissionPlan(ctx context.Context, companyID, planID uuid.UUID, deletedBy uuid.UUID) error
+	GetCommissionPlanByID(ctx context.Context, companyID, planID uuid.UUID) (*models.CommissionPlan, error)
+	GetCommissionPlanByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.CommissionPlan, error)
+	ListCommissionPlans(ctx context.Context, filter CommissionPlanListFilter, p Pagination, s Sort) ([]*models.CommissionPlan, int64, error)
+	GetActiveCommissionPlans(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*models.CommissionPlan, error)
+
+	CreateCommissionRule(ctx context.Context, req *CreateCommissionRuleRequest) (*models.CommissionRule, error)
+	UpdateCommissionRule(ctx context.Context, companyID, ruleID uuid.UUID, req *UpdateCommissionRuleRequest) (*models.CommissionRule, error)
+	DeleteCommissionRule(ctx context.Context, companyID, ruleID uuid.UUID, deletedBy uuid.UUID) error
+	GetCommissionRuleByID(ctx context.Context, companyID, ruleID uuid.UUID) (*models.CommissionRule, error)
+	GetCommissionRules(ctx context.Context, companyID, planID uuid.UUID) ([]*models.CommissionRule, error)
+	ValidateCommissionRule(ctx context.Context, rule *models.CommissionRule) error
+
+	AssignCommissionPlan(ctx context.Context, companyID, salesRepID, planID uuid.UUID, effectiveFrom time.Time, assignedBy uuid.UUID) error
+	RemoveCommissionPlan(ctx context.Context, companyID, salesRepID uuid.UUID, removedBy uuid.UUID) error
+	GetSalesRepCommissionPlan(ctx context.Context, companyID, salesRepID uuid.UUID, at time.Time) (*models.CommissionPlan, error)
+
+	CalculateOrderCommission(ctx context.Context, companyID, orderID uuid.UUID) (*models.SalesCommission, error)
+	CalculateInvoiceCommission(ctx context.Context, companyID, invoiceID uuid.UUID) (*models.SalesCommission, error)
+	CalculatePaymentCommission(ctx context.Context, companyID, paymentID uuid.UUID) (*models.SalesCommission, error)
+	CalculateCommissionForPeriod(ctx context.Context, companyID, salesRepID uuid.UUID, from, to time.Time) ([]*models.SalesCommission, decimal.Decimal, error)
+	PreviewCommission(ctx context.Context, req *CommissionPreviewRequest) (*CommissionPreviewResult, error)
+
+	ProcessOrderCompletedCommission(ctx context.Context, companyID, orderID uuid.UUID, triggeredBy uuid.UUID) (*models.SalesCommission, error)
+	ProcessInvoicePaidCommission(ctx context.Context, companyID, invoiceID uuid.UUID, triggeredBy uuid.UUID) (*models.SalesCommission, error)
+	ProcessPaymentReceivedCommission(ctx context.Context, companyID, paymentID uuid.UUID, triggeredBy uuid.UUID) (*models.SalesCommission, error)
+	RecalculateCommission(ctx context.Context, companyID, commissionID uuid.UUID, recalculatedBy uuid.UUID) error
+	ReverseCommission(ctx context.Context, companyID, commissionID uuid.UUID, reason string, reversedBy uuid.UUID) error
+
+	CreateCommissionRecord(ctx context.Context, req *CreateSalesCommissionRequest) (*models.SalesCommission, error)
+	UpdateCommissionRecord(ctx context.Context, companyID, commissionID uuid.UUID, req *UpdateSalesCommissionRequest) (*models.SalesCommission, error)
+	GetCommissionByID(ctx context.Context, companyID, commissionID uuid.UUID) (*models.SalesCommission, error)
+	GetCommissionByReference(ctx context.Context, companyID uuid.UUID, referenceType enums.CommissionReferenceType, referenceID uuid.UUID) ([]*models.SalesCommission, error)
+	ListCommissions(ctx context.Context, filter SalesCommissionListFilter, p Pagination, s Sort) ([]*models.SalesCommission, int64, error)
+	GetSalesRepCommissions(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time, p Pagination, s Sort) ([]*models.SalesCommission, int64, error)
+
+	MarkCommissionPending(ctx context.Context, companyID, commissionID uuid.UUID, updatedBy uuid.UUID) error
+	ApproveCommission(ctx context.Context, companyID, commissionID uuid.UUID, approvedBy uuid.UUID) error
+	RejectCommission(ctx context.Context, companyID, commissionID uuid.UUID, reason string, rejectedBy uuid.UUID) error
+	MarkCommissionPaid(ctx context.Context, companyID, commissionID uuid.UUID, paidAt time.Time, paidBy uuid.UUID) error
+	GetPendingCommissions(ctx context.Context, companyID uuid.UUID) ([]*models.SalesCommission, error)
+	GetApprovedCommissions(ctx context.Context, companyID uuid.UUID) ([]*models.SalesCommission, error)
+	GetUnpaidCommissions(ctx context.Context, companyID uuid.UUID) ([]*models.SalesCommission, error)
+
+	ValidateCommissionPlan(ctx context.Context, plan *models.CommissionPlan) error
+	ValidateCommissionCalculation(ctx context.Context, req *CommissionCalculationValidationRequest) error
+	ValidateCommissionStatusTransition(ctx context.Context, current, next enums.CommissionStatus) error
+	CanGenerateCommission(ctx context.Context, companyID uuid.UUID, referenceType enums.CommissionReferenceType, referenceID uuid.UUID) (bool, error)
+
+	GetTotalCommissionAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalPaidCommission(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetOutstandingCommissionLiability(ctx context.Context, companyID uuid.UUID) (decimal.Decimal, error)
+	GetTopSalesRepCommissions(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesCommission, error)
+	GetCommissionSummaryBySalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (*SalesRepCommissionSummary, error)
+	GetCommissionTrend(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*CommissionTrendPoint, error)
+
+	CommissionPlanExists(ctx context.Context, companyID, planID uuid.UUID) (bool, error)
+	CommissionRuleExists(ctx context.Context, companyID, ruleID uuid.UUID) (bool, error)
+	CommissionRecordExists(ctx context.Context, companyID, commissionID uuid.UUID) (bool, error)
+	CommissionAlreadyGenerated(ctx context.Context, companyID uuid.UUID, referenceType enums.CommissionReferenceType, referenceID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/payment_service.go
+================================================================================
+
+package service
+
+type PaymentService interface {
+	CreatePayment(ctx context.Context, req *CreatePaymentRequest) (*models.Payment, error)
+	UpdatePayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, req *UpdatePaymentRequest) (*models.Payment, error)
+	DeletePayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, deletedBy uuid.UUID) error
+	GetPaymentByID(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (*models.Payment, error)
+	GetPaymentByNumber(ctx context.Context, companyID uuid.UUID, paymentNumber string) (*models.Payment, error)
+	GetPaymentByGatewayReference(ctx context.Context, companyID uuid.UUID, gatewayReference string) (*models.Payment, error)
+	ListPayments(ctx context.Context, filter PaymentListFilter, p Pagination, s Sort) ([]*models.Payment, int64, error)
+	SearchPayments(ctx context.Context, companyID uuid.UUID, query string, limit int, offset int) ([]*models.Payment, int64, error)
+	GetPaymentsByCustomer(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Payment, int64, error)
+	GetPaymentsByInvoice(ctx context.Context, companyID uuid.UUID, invoiceID uuid.UUID) ([]*models.Payment, error)
+	RegisterCashPayment(ctx context.Context, req *RegisterCashPaymentRequest) (*models.Payment, error)
+	RegisterCardPayment(ctx context.Context, req *RegisterCardPaymentRequest) (*models.Payment, error)
+	RegisterBankTransferPayment(ctx context.Context, req *RegisterBankTransferPaymentRequest) (*models.Payment, error)
+	RegisterChequePayment(ctx context.Context, req *RegisterChequePaymentRequest) (*models.Payment, error)
+	RegisterWalletPayment(ctx context.Context, req *RegisterWalletPaymentRequest) (*models.Payment, error)
+	ProcessGatewayPayment(ctx context.Context, req *ProcessGatewayPaymentRequest) (*models.Payment, error)
+	ProcessGatewayWebhook(ctx context.Context, req *ProcessGatewayWebhookRequest) error
+	ValidateGatewaySignature(ctx context.Context, gateway string, payload []byte, signature string) error
+	EnsureIdempotentPayment(ctx context.Context, companyID uuid.UUID, idempotencyKey string) (*models.Payment, bool, error)
+	GetPaymentByIdempotencyKey(ctx context.Context, companyID uuid.UUID, idempotencyKey string) (*models.Payment, error)
+	AllocatePayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, invoiceID uuid.UUID, amount decimal.Decimal, allocatedBy uuid.UUID) error
+	AllocatePaymentToInvoices(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, allocations []PaymentAllocationRequest, allocatedBy uuid.UUID) error
+	AutoAllocatePayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, allocatedBy uuid.UUID) error
+	RemoveAllocation(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, allocationID uuid.UUID, removedBy uuid.UUID) error
+	GetPaymentAllocations(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) ([]*models.PaymentAllocation, error)
+	GetUnallocatedAmount(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (decimal.Decimal, error)
+	IsFullyAllocated(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (bool, error)
+	CreateRefund(ctx context.Context, req *CreateRefundRequest) (*models.PaymentRefund, error)
+	RefundFullPayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error)
+	RefundPartialPayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, amount decimal.Decimal, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error)
+	ProcessGatewayRefund(ctx context.Context, req *ProcessGatewayRefundRequest) (*models.PaymentRefund, error)
+	GetRefundByID(ctx context.Context, companyID uuid.UUID, refundID uuid.UUID) (*models.PaymentRefund, error)
+	GetPaymentRefunds(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) ([]*models.PaymentRefund, error)
+	GetRefundedAmount(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (decimal.Decimal, error)
+	IsFullyRefunded(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (bool, error)
+	UpdateStatus(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, status enums.PaymentStatus, updatedBy uuid.UUID) error
+	MarkPending(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, updatedBy uuid.UUID) error
+	MarkProcessing(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, updatedBy uuid.UUID) error
+	MarkCompleted(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, completedAt time.Time, updatedBy uuid.UUID) error
+	MarkFailed(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, reason string, updatedBy uuid.UUID) error
+	CancelPayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, reason string, cancelledBy uuid.UUID) error
+	ReconcilePayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, reconciledBy uuid.UUID) error
+	UnreconcilePayment(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, unreconciledBy uuid.UUID) error
+	GetUnreconciledPayments(ctx context.Context, companyID uuid.UUID) ([]*models.Payment, error)
+	ValidatePayment(ctx context.Context, payment *models.Payment) error
+	ValidatePaymentAllocation(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, invoiceID uuid.UUID, amount decimal.Decimal) error
+	ValidateRefund(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID, amount decimal.Decimal) error
+	ValidatePaymentStatusTransition(ctx context.Context, currentStatus enums.PaymentStatus, nextStatus enums.PaymentStatus) error
+	GetTotalPaymentsReceived(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetTotalRefundedAmount(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetNetCollections(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetPaymentsByMethod(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (map[enums.PaymentMethod]decimal.Decimal, error)
+	GetFailedPayments(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) ([]*models.Payment, error)
+	PaymentExists(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (bool, error)
+	PaymentNumberExists(ctx context.Context, companyID uuid.UUID, paymentNumber string) (bool, error)
+	GatewayTransactionExists(ctx context.Context, companyID uuid.UUID, gatewayTransactionID string) (bool, error)
+	HasRefunds(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/sales_analytics_service.go
+================================================================================
+
+package service
+
+type SalesAnalyticsService interface {
+	ProcessSalesEvent(ctx context.Context, eventType string, payload []byte) error
+}
+
+
+================================================================================
+FILE: ./service/order_service.go
+================================================================================
+
+package service
+
+type OrderService interface {
+	// ORDER CREATION / CRUD
+	CreateDraftOrder(ctx context.Context, req *CreateOrderRequest) (*models.Order, error)
+	UpdateOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, req *UpdateOrderRequest) (*models.Order, error)
+	DeleteOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, deletedBy uuid.UUID) error
+	GetOrderByID(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (*models.Order, error)
+	GetOrderByNumber(ctx context.Context, companyID uuid.UUID, orderNumber string) (*models.Order, error)
+	ListOrders(ctx context.Context, filter OrderListFilter, p Pagination, s Sort) ([]*models.Order, int64, error)
+	SearchOrders(ctx context.Context, companyID uuid.UUID, query string, limit int, offset int) ([]*models.Order, int64, error)
+	GetOrdersByCustomer(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Order, int64, error)
+
+	// ORDER ITEM MANAGEMENT
+	AddItems(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error
+	ReplaceItems(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error
+	RemoveItem(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, orderItemID uuid.UUID, updatedBy uuid.UUID) error
+	GetOrderItems(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) ([]*models.OrderItem, error)
+
+	// PRICING / DISCOUNTS
+	ApplyCoupon(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	RemoveCoupon(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) error
+	ApplyBestDiscounts(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	PreviewPricing(ctx context.Context, req *OrderPricingPreviewRequest) (*OrderPricingPreviewResult, error)
+	RecalculateTotals(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	GetOrderTotals(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal decimal.Decimal, err error)
+
+	// STATUS TRANSITIONS
+	UpdateStatus(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, status enums.OrderStatus, updatedBy uuid.UUID) error
+	ConfirmOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	MarkProcessing(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	MarkShipped(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, shippedAt time.Time, updatedBy uuid.UUID) error
+	MarkDelivered(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, deliveredAt time.Time, updatedBy uuid.UUID) error
+	CancelOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, reason string, cancelledBy uuid.UUID) error
+
+	// SALES REP MANAGEMENT
+	AssignSalesRep(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
+	RemoveSalesRep(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+
+	// ORDER VALIDATION
+	ValidateOrder(ctx context.Context, order *models.Order, items []*models.OrderItem) error
+	ValidateOrderStatusTransition(ctx context.Context, currentStatus enums.OrderStatus, nextStatus enums.OrderStatus) error
+	ValidateOrderItems(ctx context.Context, companyID uuid.UUID, items []*CreateOrderItemRequest) error
+	ValidatePricing(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) error
+
+	// QUERY / ANALYTICS
+	GetPendingOrders(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error)
+	GetOrdersReadyForInvoicing(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error)
+	GetOrderRevenue(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetAverageOrderValue(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetTopOrdersByValue(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*models.Order, error)
+
+	// EXISTENCE / HELPERS
+	OrderExists(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (bool, error)
+	OrderNumberExists(ctx context.Context, companyID uuid.UUID, orderNumber string) (bool, error)
+	HasInvoices(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (bool, error)
+	HasReturns(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/discount_engine_service.go
+================================================================================
+
+package service
+
+type DiscountEngineService interface {
+	// Evaluation
+	EvaluateOrderDiscounts(ctx context.Context, req *EvaluateOrderDiscountsRequest) (*DiscountEvaluationResult, error)
+	EvaluateQuoteDiscounts(ctx context.Context, req *EvaluateQuoteDiscountsRequest) (*DiscountEvaluationResult, error)
+	EvaluateInvoiceDiscounts(ctx context.Context, req *EvaluateInvoiceDiscountsRequest) (*DiscountEvaluationResult, error)
+
+	// Applicable discount retrieval
+	GetApplicableCoupons(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error)
+	GetApplicablePromotions(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error)
+	GetApplicableAutomaticDiscounts(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.AutomaticDiscount, error)
+
+	// Best discount selection
+	GetBestCoupon(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Coupon, decimal.Decimal, error)
+	GetBestPromotion(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Promotion, decimal.Decimal, error)
+	GetBestDiscountCombination(ctx context.Context, req *BestDiscountCombinationRequest) (*DiscountCombinationResult, error)
+
+	// Stacking rules & exclusions
+	ValidateStackingRules(ctx context.Context, couponIDs []uuid.UUID, promotionIDs []uuid.UUID, automaticDiscountIDs []uuid.UUID) error
+	CanStackDiscounts(ctx context.Context, firstDiscountID uuid.UUID, secondDiscountID uuid.UUID) (bool, error)
+	GetStackableDiscounts(ctx context.Context, companyID uuid.UUID, discountID uuid.UUID) ([]uuid.UUID, error)
+
+	// Discount calculations
+	CalculateCouponDiscount(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
+	CalculatePromotionDiscount(ctx context.Context, promotionID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
+	CalculateAutomaticDiscount(ctx context.Context, automaticDiscountID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
+	CalculateCombinedDiscount(ctx context.Context, req *CombinedDiscountCalculationRequest) (*DiscountCalculationResult, error)
+
+	// State‑changing operations (with idempotency & events)
+	ApplyCoupon(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	RemoveCoupon(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, removedBy uuid.UUID) error
+	ApplyPromotion(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error)
+	RemovePromotion(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error
+	ApplyBestDiscounts(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID) (*DiscountApplicationResult, error)
+	ClearDiscounts(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, clearedBy uuid.UUID) error
+
+	// Validation
+	ValidateCoupon(ctx context.Context, companyID uuid.UUID, couponCode string, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error
+	ValidatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error
+	ValidateDiscountEligibility(ctx context.Context, req *DiscountEligibilityRequest) error
+	ValidateDiscountUsageLimits(ctx context.Context, discountID uuid.UUID, customerID *uuid.UUID) error
+
+	// Tracking (for analytics)
+	TrackCouponUsage(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID, customerID *uuid.UUID, entityType string, entityID uuid.UUID, usedAt time.Time) error
+	TrackPromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, entityType string, entityID uuid.UUID, usedAt time.Time) error
+	GetCouponUsageCount(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID) (int64, error)
+	GetPromotionUsageCount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (int64, error)
+
+	// Analytics / reporting
+	GetTopCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error)
+	GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error)
+	GetTotalDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalCouponDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalPromotionDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetAverageDiscountRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+
+	// Existence / expiry
+	CouponExists(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID) (bool, error)
+	PromotionExists(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (bool, error)
+	IsCouponExpired(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID, at time.Time) (bool, error)
+	IsPromotionExpired(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, at time.Time) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/sales_rep_service.go
+================================================================================
+
+package service
+
+type SalesRepService interface {
+	CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error)
+	UpdateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, req *UpdateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error)
+	DeleteSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error
+	GetSalesRepByID(ctx context.Context, companyID, salesRepID uuid.UUID) (*models.SalesRep, error)
+	GetSalesRepByUserID(ctx context.Context, companyID, userID uuid.UUID) (*models.SalesRep, error)
+	GetSalesRepByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.SalesRep, error)
+	ListSalesReps(ctx context.Context, filter SalesRepListFilter, p Pagination, s Sort) ([]*models.SalesRep, int64, error)
+	SearchSalesReps(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.SalesRep, int64, error)
+	GetActiveSalesReps(ctx context.Context, companyID uuid.UUID) ([]*models.SalesRep, error)
+	ActivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	DeactivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	IsSalesRepActive(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error)
+
+	AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
+	RemoveOrderAssignment(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	GetAssignedOrders(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Order, int64, error)
+
+	AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
+	RemoveQuoteAssignment(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	GetAssignedQuotes(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Quote, int64, error)
+
+	AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
+	RemoveInvoiceAssignment(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	GetAssignedInvoices(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Invoice, int64, error)
+
+	AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
+	RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
+	GetAssignedCustomers(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Customer, int64, error)
+	GetCustomerSalesRep(ctx context.Context, companyID, customerID uuid.UUID) (*models.SalesRep, error)
+
+	SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	CalculateCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetEarnedCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetSalesRevenue(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetCollectedRevenue(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetAverageDealSize(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetConversionRate(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTopSalesReps(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error)
+	GetSalesRepLeaderboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*SalesRepLeaderboardEntry, error)
+
+	SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID, idempotencyKey string) error
+	GetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*models.SalesTarget, error)
+
+	ValidateSalesRep(ctx context.Context, rep *models.SalesRep) error
+	ValidateAssignment(ctx context.Context, companyID, salesRepID uuid.UUID, entityType string, entityID uuid.UUID) error
+	CanManageCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID) (bool, error)
+	SalesRepExists(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error)
+	SalesRepCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
+	UserAlreadyLinked(ctx context.Context, companyID, userID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/invoice_service.go
+================================================================================
+
+package service
+
+type InvoiceService interface {
+	CreateDraftInvoice(ctx context.Context, req *CreateInvoiceRequest) (*models.Invoice, error)
+	CreateInvoiceFromOrder(ctx context.Context, companyID, orderID uuid.UUID, req *CreateInvoiceFromOrderRequest) (*models.Invoice, error)
+	CreateInvoiceFromQuote(ctx context.Context, companyID, quoteID uuid.UUID, req *CreateInvoiceFromQuoteRequest) (*models.Invoice, error)
+	UpdateInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, req *UpdateInvoiceRequest) (*models.Invoice, error)
+	DeleteInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, deletedBy uuid.UUID) error
+	GetInvoiceByID(ctx context.Context, companyID, invoiceID uuid.UUID) (*models.Invoice, error)
+	GetInvoiceByNumber(ctx context.Context, companyID uuid.UUID, invoiceNumber string) (*models.Invoice, error)
+	ListInvoices(ctx context.Context, filter InvoiceListFilter, p Pagination, s Sort) ([]*models.Invoice, int64, error)
+	SearchInvoices(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Invoice, int64, error)
+	GetInvoicesByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Invoice, int64, error)
+	GetInvoicesByOrder(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.Invoice, error)
+	AddItems(ctx context.Context, companyID, invoiceID uuid.UUID, items []CreateInvoiceItemRequest, updatedBy uuid.UUID) error
+	ReplaceItems(ctx context.Context, companyID, invoiceID uuid.UUID, items []CreateInvoiceItemRequest, updatedBy uuid.UUID) error
+	RemoveItem(ctx context.Context, companyID, invoiceID, invoiceItemID uuid.UUID, updatedBy uuid.UUID) error
+	GetInvoiceItems(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*models.InvoiceItem, error)
+	CalculatePricing(ctx context.Context, companyID, invoiceID uuid.UUID) error
+	PreviewPricing(ctx context.Context, req *InvoicePricingPreviewRequest) (*InvoicePricingPreviewResult, error)
+	RecalculateTotals(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error
+	GetInvoiceTotals(ctx context.Context, companyID, invoiceID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal, amountPaid, amountDue decimal.Decimal, err error)
+	ApplyManualDiscount(ctx context.Context, companyID, invoiceID uuid.UUID, discountAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error
+	RemoveManualDiscount(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error
+	UpdateStatus(ctx context.Context, companyID, invoiceID uuid.UUID, status enums.InvoiceStatus, updatedBy uuid.UUID) error
+	IssueInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, issuedBy uuid.UUID) error
+	MarkAsPaid(ctx context.Context, companyID, invoiceID uuid.UUID, paidAt time.Time, updatedBy uuid.UUID) error
+	MarkAsOverdue(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error
+	VoidInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, reason string, voidedBy uuid.UUID) error
+	RegisterPayment(ctx context.Context, req *RegisterInvoicePaymentRequest) error
+	ApplyPayment(ctx context.Context, companyID, invoiceID, paymentID uuid.UUID, amount decimal.Decimal, appliedBy uuid.UUID) error
+	RemovePayment(ctx context.Context, companyID, invoiceID, paymentID uuid.UUID, removedBy uuid.UUID) error
+	GetInvoicePayments(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*InvoicePayment, error)
+	GetOutstandingAmount(ctx context.Context, companyID, invoiceID uuid.UUID) (decimal.Decimal, error)
+	HasPartialPayments(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error)
+	RefreshPaymentBalances(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error
+	UpdateDueDate(ctx context.Context, companyID, invoiceID uuid.UUID, dueDate time.Time, updatedBy uuid.UUID) error
+	GetOverdueInvoices(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*models.Invoice, error)
+	GetInvoicesDueSoon(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Invoice, error)
+	SendDueReminder(ctx context.Context, companyID, invoiceID uuid.UUID, triggeredBy uuid.UUID) error
+	SendOverdueReminder(ctx context.Context, companyID, invoiceID uuid.UUID, triggeredBy uuid.UUID) error
+	ValidateCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, invoiceAmount decimal.Decimal) error
+	CanIssueInvoice(ctx context.Context, companyID, invoiceID uuid.UUID) error
+	ValidateInvoice(ctx context.Context, invoice *models.Invoice, items []*models.InvoiceItem) error
+	ValidateInvoiceStatusTransition(ctx context.Context, current, next enums.InvoiceStatus) error
+	ValidateInvoiceItems(ctx context.Context, companyID uuid.UUID, items []CreateInvoiceItemRequest) error
+	ValidatePricing(ctx context.Context, companyID, invoiceID uuid.UUID) error
+	ValidatePayments(ctx context.Context, companyID, invoiceID uuid.UUID) error
+	GetTotalInvoicedRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetCollectedRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetOutstandingReceivables(ctx context.Context, companyID uuid.UUID) (decimal.Decimal, error)
+	GetAveragePaymentTime(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTopOverdueInvoices(ctx context.Context, companyID uuid.UUID, limit int) ([]*models.Invoice, error)
+	InvoiceExists(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error)
+	InvoiceNumberExists(ctx context.Context, companyID uuid.UUID, invoiceNumber string) (bool, error)
+	IsInvoicePaid(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error)
+	IsInvoiceOverdue(ctx context.Context, companyID, invoiceID uuid.UUID, at time.Time) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/pricing_service.go
+================================================================================
+
+package service
+
+type PricingService interface {
+	// Base price resolution
+	GetProductBasePrice(ctx context.Context, companyID, productID uuid.UUID) (decimal.Decimal, error)
+	GetProductsBasePrices(ctx context.Context, companyID uuid.UUID, productIDs []uuid.UUID) (map[uuid.UUID]decimal.Decimal, error)
+
+	// Order pricing
+	CalculateOrderPricing(ctx context.Context, req *CalculateOrderPricingRequest) (*PricingCalculationResult, error)
+	PreviewOrderPricing(ctx context.Context, req *OrderPricingPreviewRequest) (*PricingPreviewResult, error)
+	CalculateOrderTax(ctx context.Context, companyID, orderID uuid.UUID) (decimal.Decimal, error)
+	CalculateOrderDiscounts(ctx context.Context, companyID, orderID uuid.UUID, at time.Time) (*DiscountCalculationResult, error)
+
+	// Quote pricing
+	CalculateQuotePricing(ctx context.Context, req *CalculateQuotePricingRequest) (*PricingCalculationResult, error)
+	PreviewQuotePricing(ctx context.Context, req *QuotePricingPreviewRequest) (*PricingPreviewResult, error)
+	CalculateQuoteTax(ctx context.Context, companyID, quoteID uuid.UUID) (decimal.Decimal, error)
+	CalculateQuoteDiscounts(ctx context.Context, companyID, quoteID uuid.UUID, at time.Time) (*DiscountCalculationResult, error)
+
+	// Invoice pricing
+	CalculateInvoicePricing(ctx context.Context, req *CalculateInvoicePricingRequest) (*PricingCalculationResult, error)
+	PreviewInvoicePricing(ctx context.Context, req *InvoicePricingPreviewRequest) (*PricingPreviewResult, error)
+	CalculateInvoiceTax(ctx context.Context, companyID, invoiceID uuid.UUID) (decimal.Decimal, error)
+	CalculateInvoiceDiscounts(ctx context.Context, companyID, invoiceID uuid.UUID, at time.Time) (*DiscountCalculationResult, error)
+
+	// Tax calculations
+	CalculateLineTax(ctx context.Context, companyID, productID uuid.UUID, lineAmount decimal.Decimal) (decimal.Decimal, error)
+	CalculateTaxAmount(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, taxableAmount decimal.Decimal) (decimal.Decimal, error)
+
+	// Discount engine integration
+	GetApplicableCoupons(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error)
+	GetBestCoupon(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Coupon, decimal.Decimal, error)
+	GetApplicablePromotions(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error)
+	GetBestPromotion(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Promotion, decimal.Decimal, error)
+	CalculateCombinedDiscount(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*DiscountCalculationResult, error)
+	ValidateDiscountCombination(ctx context.Context, couponIDs, promotionIDs []uuid.UUID) error
+
+	// Credit validation
+	GetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetCustomerOutstandingBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	CanCustomerPurchaseAmount(ctx context.Context, companyID, customerID uuid.UUID, amount decimal.Decimal) (bool, error)
+
+	// Validation
+	ValidatePricing(ctx context.Context, req *PricingValidationRequest) error
+	ValidateOrderPricing(ctx context.Context, companyID, orderID uuid.UUID) error
+	ValidateQuotePricing(ctx context.Context, companyID, quoteID uuid.UUID) error
+	ValidateInvoicePricing(ctx context.Context, companyID, invoiceID uuid.UUID) error
+
+	// Analytics
+	GetAverageDiscountRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetEffectiveRevenueAfterDiscounts(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+}
+
+
+================================================================================
+FILE: ./service/customer_service.go
+================================================================================
+
+package service
+
+type CustomerService interface {
+	CreateCustomer(ctx context.Context, req CreateCustomerRequest, idempotencyKey string) (*models.Customer, error)
+	UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest, idempotencyKey string) (*models.Customer, error)
+	DeleteCustomer(ctx context.Context, companyID, customerID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	GetCustomerByID(ctx context.Context, companyID, customerID uuid.UUID) (*models.Customer, error)
+	GetCustomerByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Customer, error)
+	ListCustomers(ctx context.Context, filter CustomerListFilter, p Pagination, s Sort) ([]*models.Customer, int64, error)
+	SearchCustomers(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Customer, int64, error)
+
+	ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	DeactivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+
+	UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID, idempotencyKey string) error
+	GetCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetOutstandingBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	CanCustomerPurchaseAmount(ctx context.Context, companyID, customerID uuid.UUID, amount decimal.Decimal) (bool, error)
+
+	AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	RemovePaymentTerm(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+
+	AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	RemoveSalesRep(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+
+	GetCustomersWithOutstandingInvoices(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error)
+	GetTopCustomersByRevenue(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Customer, error)
+
+	ValidateCustomer(ctx context.Context, customer *models.Customer) error
+	CustomerExists(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
+	IsCustomerActive(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/promotion_service.go
+================================================================================
+
+package service
+
+type PromotionService interface {
+	CreatePromotion(ctx context.Context, req *CreatePromotionRequest) (*discount.Promotion, error)
+	UpdatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, req *UpdatePromotionRequest) (*discount.Promotion, error)
+	DeletePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, deletedBy uuid.UUID) error
+	GetPromotionByID(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (*discount.Promotion, error)
+	GetPromotionByCode(ctx context.Context, companyID uuid.UUID, code string) (*discount.Promotion, error)
+	GetPromotionByName(ctx context.Context, companyID uuid.UUID, name string) (*discount.Promotion, error)
+	ListPromotions(ctx context.Context, filter PromotionListFilter, p Pagination, s Sort) ([]*discount.Promotion, int64, error)
+	SearchPromotions(ctx context.Context, companyID uuid.UUID, query string, limit int, offset int) ([]*discount.Promotion, int64, error)
+	GetActivePromotions(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error)
+	ActivatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, updatedBy uuid.UUID) error
+	DeactivatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, updatedBy uuid.UUID) error
+	ExpirePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, expiredBy uuid.UUID) error
+	IsPromotionActive(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, at time.Time) (bool, error)
+
+	CreatePromotionRule(ctx context.Context, req *CreatePromotionRuleRequest) (*discount.PromotionRule, error)
+	UpdatePromotionRule(ctx context.Context, companyID uuid.UUID, ruleID uuid.UUID, req *UpdatePromotionRuleRequest) (*discount.PromotionRule, error)
+	DeletePromotionRule(ctx context.Context, companyID uuid.UUID, ruleID uuid.UUID, deletedBy uuid.UUID) error
+	GetPromotionRuleByID(ctx context.Context, companyID uuid.UUID, ruleID uuid.UUID) (*discount.PromotionRule, error)
+	GetPromotionRules(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) ([]*discount.PromotionRule, error)
+	ValidatePromotionRule(ctx context.Context, rule *discount.PromotionRule) error
+
+	EvaluatePromotion(ctx context.Context, req *EvaluatePromotionRequest) (*PromotionEvaluationResult, error)
+	EvaluatePromotionRules(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, quantities map[uuid.UUID]decimal.Decimal, orderAmount decimal.Decimal, at time.Time) (*PromotionRuleEvaluationResult, error)
+
+	ValidatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error
+	ValidatePromotionDates(ctx context.Context, promotion *discount.Promotion, at time.Time) error
+	ValidatePromotionUsageLimit(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) error
+	ValidateCustomerPromotionUsageLimit(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) error
+	ValidatePromotionProducts(ctx context.Context, promotionID uuid.UUID, productIDs []uuid.UUID) error
+	ValidatePromotionCategories(ctx context.Context, promotionID uuid.UUID, categoryIDs []uuid.UUID) error
+	CanCustomerUsePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID, at time.Time) (bool, error)
+
+	GetApplicablePromotions(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error)
+	GetAutomaticPromotions(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error)
+	GetBestPromotion(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Promotion, decimal.Decimal, error)
+	ApplyBestPromotions(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID) (*PromotionApplicationResult, error)
+
+	CalculatePromotionDiscount(ctx context.Context, promotionID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
+	CalculateBXGYDiscount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, items []*PromotionItemCalculationInput) (decimal.Decimal, error)
+	CalculateCategoryDiscount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, categoryAmounts map[uuid.UUID]decimal.Decimal) (decimal.Decimal, error)
+	CalculateTieredDiscount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, orderAmount decimal.Decimal) (decimal.Decimal, error)
+
+	ApplyPromotionToOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error)
+	ApplyPromotionToQuote(ctx context.Context, companyID uuid.UUID, quoteID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error)
+	ApplyPromotionToInvoice(ctx context.Context, companyID uuid.UUID, invoiceID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error)
+
+	RemovePromotionFromOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error
+	RemovePromotionFromQuote(ctx context.Context, companyID uuid.UUID, quoteID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error
+	RemovePromotionFromInvoice(ctx context.Context, companyID uuid.UUID, invoiceID uuid.UUID, promotionID uuid.UUID, removedBy uuid.UUID) error
+	ClearPromotions(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, clearedBy uuid.UUID) error
+
+	RecordPromotionUsage(ctx context.Context, req *RecordPromotionUsageRequest) error
+	RecordOrderPromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, orderID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error
+	RecordQuotePromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, quoteID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error
+	RecordInvoicePromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, invoiceID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error
+
+	GetPromotionUsageCount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (int64, error)
+	GetCustomerPromotionUsageCount(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) (int64, error)
+	GetPromotionUsageHistory(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, p Pagination, s Sort) ([]*discount.DiscountApplication, int64, error)
+
+	CanStackPromotion(ctx context.Context, companyID uuid.UUID, firstPromotionID uuid.UUID, secondPromotionID uuid.UUID) (bool, error)
+	ValidatePromotionStacking(ctx context.Context, companyID uuid.UUID, promotionIDs []uuid.UUID) error
+	GetStackablePromotions(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) ([]uuid.UUID, error)
+
+	GetTopPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error)
+	GetMostUsedPromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error)
+	GetHighestRevenuePromotions(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*discount.Promotion, error)
+	GetTotalPromotionDiscountAmount(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetPromotionConversionImpact(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+	GetPromotionRedemptionRate(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
+
+	PromotionExists(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (bool, error)
+	PromotionCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
+	PromotionRuleExists(ctx context.Context, companyID uuid.UUID, ruleID uuid.UUID) (bool, error)
+	IsPromotionExpired(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, at time.Time) (bool, error)
+	IsPromotionUsageLimitReached(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID) (bool, error)
+	IsCustomerPromotionUsageLimitReached(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/credit_note_service.go
+================================================================================
+
+package service
+
+type CreditNoteService interface {
+	CreateDraftCreditNote(ctx context.Context, req *CreateCreditNoteRequest) (*models.CreditNote, error)
+	CreateFromInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, req *CreateCreditNoteFromInvoiceRequest) (*models.CreditNote, error)
+	CreateFromReturn(ctx context.Context, companyID, returnID uuid.UUID, req *CreateCreditNoteFromReturnRequest) (*models.CreditNote, error)
+	UpdateCreditNote(ctx context.Context, companyID, creditNoteID uuid.UUID, req *UpdateCreditNoteRequest) (*models.CreditNote, error)
+	DeleteCreditNote(ctx context.Context, companyID, creditNoteID uuid.UUID, deletedBy uuid.UUID) error
+	GetCreditNoteByID(ctx context.Context, companyID, creditNoteID uuid.UUID) (*models.CreditNote, error)
+	GetCreditNoteByNumber(ctx context.Context, companyID uuid.UUID, creditNoteNumber string) (*models.CreditNote, error)
+	ListCreditNotes(ctx context.Context, filter CreditNoteListFilter, p Pagination, s Sort) ([]*models.CreditNote, int64, error)
+	SearchCreditNotes(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.CreditNote, int64, error)
+	AddItems(ctx context.Context, companyID, creditNoteID uuid.UUID, items []*CreateCreditNoteItemRequest, updatedBy uuid.UUID) error
+	ReplaceItems(ctx context.Context, companyID, creditNoteID uuid.UUID, items []*CreateCreditNoteItemRequest, updatedBy uuid.UUID) error
+	RemoveItem(ctx context.Context, companyID, creditNoteID, creditNoteItemID uuid.UUID, updatedBy uuid.UUID) error
+	GetCreditNoteItems(ctx context.Context, companyID, creditNoteID uuid.UUID) ([]*models.CreditNoteItem, error)
+	CalculateTotals(ctx context.Context, companyID, creditNoteID uuid.UUID) error
+	PreviewTotals(ctx context.Context, req *CreditNotePreviewRequest) (*CreditNotePreviewResult, error)
+	GetCreditNoteTotals(ctx context.Context, companyID, creditNoteID uuid.UUID) (subtotal, taxTotal, totalAmount, remainingAmount decimal.Decimal, err error)
+	UpdateStatus(ctx context.Context, companyID, creditNoteID uuid.UUID, status enums.CreditNoteStatus, updatedBy uuid.UUID) error
+	IssueCreditNote(ctx context.Context, companyID, creditNoteID uuid.UUID, issuedBy uuid.UUID) error
+	VoidCreditNote(ctx context.Context, companyID, creditNoteID uuid.UUID, reason string, voidedBy uuid.UUID) error
+	MarkFullyApplied(ctx context.Context, companyID, creditNoteID uuid.UUID, updatedBy uuid.UUID) error
+	ApplyToInvoice(ctx context.Context, companyID, creditNoteID, invoiceID uuid.UUID, amount decimal.Decimal, appliedBy uuid.UUID) error
+	ApplyToInvoices(ctx context.Context, companyID, creditNoteID uuid.UUID, applications []*CreditNoteApplicationRequest, appliedBy uuid.UUID) error
+	AutoApplyToOutstandingInvoices(ctx context.Context, companyID, creditNoteID uuid.UUID, appliedBy uuid.UUID) error
+	RemoveApplication(ctx context.Context, companyID, creditNoteID, applicationID uuid.UUID, removedBy uuid.UUID) error
+	GetApplications(ctx context.Context, companyID, creditNoteID uuid.UUID) ([]*models.CreditNoteApplication, error)
+	GetRemainingBalance(ctx context.Context, companyID, creditNoteID uuid.UUID) (decimal.Decimal, error)
+	IsFullyApplied(ctx context.Context, companyID, creditNoteID uuid.UUID) (bool, error)
+	GetCustomerCreditBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetUnusedCreditNotes(ctx context.Context, companyID, customerID uuid.UUID) ([]*models.CreditNote, error)
+	ConvertToRefund(ctx context.Context, companyID, creditNoteID uuid.UUID, req *ConvertCreditNoteToRefundRequest) (*models.PaymentRefund, error)
+	ValidateCreditNote(ctx context.Context, creditNote *models.CreditNote, items []*models.CreditNoteItem) error
+	ValidateApplication(ctx context.Context, companyID, creditNoteID, invoiceID uuid.UUID, amount decimal.Decimal) error
+	ValidateStatusTransition(ctx context.Context, currentStatus, nextStatus enums.CreditNoteStatus) error
+	GetTotalCreditIssued(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalCreditApplied(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetOutstandingCredits(ctx context.Context, companyID uuid.UUID) (decimal.Decimal, error)
+	CreditNoteExists(ctx context.Context, companyID, creditNoteID uuid.UUID) (bool, error)
+	CreditNoteNumberExists(ctx context.Context, companyID uuid.UUID, creditNoteNumber string) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/return_service.go
+================================================================================
+
+package service
+
+type ReturnService interface {
+	CreateReturnRequest(ctx context.Context, req *CreateReturnRequest, idempotencyKey string) (*models.Return, error)
+	CreateReturnFromOrder(ctx context.Context, companyID, orderID uuid.UUID, req *CreateReturnFromOrderRequest, idempotencyKey string) (*models.Return, error)
+	CreateReturnFromInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, req *CreateReturnFromInvoiceRequest, idempotencyKey string) (*models.Return, error)
+	UpdateReturnRequest(ctx context.Context, companyID, returnID uuid.UUID, req *UpdateReturnRequest, idempotencyKey string) (*models.Return, error)
+	DeleteReturnRequest(ctx context.Context, companyID, returnID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error
+	GetReturnByID(ctx context.Context, companyID, returnID uuid.UUID) (*models.Return, error)
+	GetReturnByNumber(ctx context.Context, companyID uuid.UUID, returnNumber string) (*models.Return, error)
+	ListReturns(ctx context.Context, filter ReturnListFilter, p Pagination, s Sort) ([]*models.Return, int64, error)
+	SearchReturns(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Return, int64, error)
+	GetReturnsByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Return, int64, error)
+	GetReturnsByOrder(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.Return, error)
+	GetReturnsByInvoice(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*models.Return, error)
+	AddItems(ctx context.Context, companyID, returnID uuid.UUID, items []*CreateReturnItemRequest, updatedBy uuid.UUID) error
+	ReplaceItems(ctx context.Context, companyID, returnID uuid.UUID, items []*CreateReturnItemRequest, updatedBy uuid.UUID) error
+	RemoveItem(ctx context.Context, companyID, returnID, returnItemID uuid.UUID, updatedBy uuid.UUID) error
+	GetReturnItems(ctx context.Context, companyID, returnID uuid.UUID) ([]*models.ReturnItem, error)
+	ApproveReturn(ctx context.Context, companyID, returnID uuid.UUID, approvedBy uuid.UUID) error
+	RejectReturn(ctx context.Context, companyID, returnID uuid.UUID, reason string, rejectedBy uuid.UUID) error
+	CancelReturn(ctx context.Context, companyID, returnID uuid.UUID, reason string, cancelledBy uuid.UUID) error
+	MarkReceived(ctx context.Context, companyID, returnID uuid.UUID, receivedAt time.Time, updatedBy uuid.UUID) error
+	CompleteReturn(ctx context.Context, companyID, returnID uuid.UUID, completedAt time.Time, updatedBy uuid.UUID) error
+	UpdateStatus(ctx context.Context, companyID, returnID uuid.UUID, status enums.ReturnStatus, updatedBy uuid.UUID) error
+	ValidateReturnStatusTransition(ctx context.Context, currentStatus, nextStatus enums.ReturnStatus) error
+	CalculateRefundAmount(ctx context.Context, companyID, returnID uuid.UUID) (subtotal, taxRefund, discountAdjustment, totalRefund decimal.Decimal, err error)
+	CalculatePartialRefund(ctx context.Context, companyID, returnID uuid.UUID, itemIDs []uuid.UUID) (subtotal, taxRefund, discountAdjustment, totalRefund decimal.Decimal, err error)
+	PreviewRefund(ctx context.Context, req *ReturnRefundPreviewRequest) (*ReturnRefundPreviewResult, error)
+	GenerateCreditNote(ctx context.Context, companyID, returnID uuid.UUID, req *GenerateCreditNoteRequest) (*models.Invoice, error)
+	GetCreditNote(ctx context.Context, companyID, returnID uuid.UUID) (*models.Invoice, error)
+	HasCreditNote(ctx context.Context, companyID, returnID uuid.UUID) (bool, error)
+	ProcessRefund(ctx context.Context, req *ProcessReturnRefundRequest) (*models.PaymentRefund, error)
+	ProcessFullRefund(ctx context.Context, companyID, returnID uuid.UUID, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error)
+	ProcessPartialRefund(ctx context.Context, companyID, returnID uuid.UUID, amount decimal.Decimal, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error)
+	GetRefunds(ctx context.Context, companyID, returnID uuid.UUID) ([]*models.PaymentRefund, error)
+	GetRefundedAmount(ctx context.Context, companyID, returnID uuid.UUID) (decimal.Decimal, error)
+	IsFullyRefunded(ctx context.Context, companyID, returnID uuid.UUID) (bool, error)
+	RestockReturnedItems(ctx context.Context, companyID, returnID, warehouseID uuid.UUID, updatedBy uuid.UUID) error
+	MarkItemsAsDamaged(ctx context.Context, companyID, returnID uuid.UUID, itemIDs []uuid.UUID, updatedBy uuid.UUID) error
+	ValidateReturn(ctx context.Context, ret *models.Return, items []*models.ReturnItem) error
+	ValidateReturnItems(ctx context.Context, companyID uuid.UUID, items []*CreateReturnItemRequest) error
+	ValidateReturnEligibility(ctx context.Context, companyID uuid.UUID, orderID, invoiceID *uuid.UUID, itemIDs []uuid.UUID) error
+	ValidateRefund(ctx context.Context, companyID, returnID uuid.UUID, amount decimal.Decimal) error
+	ValidateCreditNoteGeneration(ctx context.Context, companyID, returnID uuid.UUID) error
+	GetPendingReturns(ctx context.Context, companyID uuid.UUID) ([]*models.Return, error)
+	GetApprovedReturns(ctx context.Context, companyID uuid.UUID) ([]*models.Return, error)
+	GetRejectedReturns(ctx context.Context, companyID uuid.UUID) ([]*models.Return, error)
+	GetReturnRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalRefundAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetMostReturnedProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Product, error)
+	ReturnExists(ctx context.Context, companyID, returnID uuid.UUID) (bool, error)
+	ReturnNumberExists(ctx context.Context, companyID uuid.UUID, returnNumber string) (bool, error)
+	IsReturnApproved(ctx context.Context, companyID, returnID uuid.UUID) (bool, error)
+	IsReturnCompleted(ctx context.Context, companyID, returnID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/coupon_service.go
+================================================================================
+
+package service
+
+type CouponService interface {
+	CreateCoupon(ctx context.Context, req *CreateCouponRequest) (*discount.Coupon, error)
+	UpdateCoupon(ctx context.Context, companyID, couponID uuid.UUID, req *UpdateCouponRequest) (*discount.Coupon, error)
+	DeleteCoupon(ctx context.Context, companyID, couponID uuid.UUID, deletedBy uuid.UUID) error
+	GetCouponByID(ctx context.Context, companyID, couponID uuid.UUID) (*discount.Coupon, error)
+	GetCouponByCode(ctx context.Context, companyID uuid.UUID, code string) (*discount.Coupon, error)
+	ListCoupons(ctx context.Context, filter CouponListFilter, p Pagination, s Sort) ([]*discount.Coupon, int64, error)
+	SearchCoupons(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*discount.Coupon, int64, error)
+	GetActiveCoupons(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*discount.Coupon, error)
+
+	ActivateCoupon(ctx context.Context, companyID, couponID uuid.UUID, updatedBy uuid.UUID) error
+	DeactivateCoupon(ctx context.Context, companyID, couponID uuid.UUID, updatedBy uuid.UUID) error
+	IsCouponActive(ctx context.Context, companyID, couponID uuid.UUID, at time.Time) (bool, error)
+	ExpireCoupon(ctx context.Context, companyID, couponID uuid.UUID, expiredBy uuid.UUID) error
+
+	ValidateCoupon(ctx context.Context, companyID uuid.UUID, couponCode string, customerID *uuid.UUID, orderAmount decimal.Decimal, productIDs []uuid.UUID, at time.Time) error
+	ValidateCouponDates(ctx context.Context, coupon *discount.Coupon, at time.Time) error
+	ValidateCouponUsageLimit(ctx context.Context, companyID, couponID uuid.UUID) error
+	ValidateCustomerUsageLimit(ctx context.Context, companyID, couponID, customerID uuid.UUID) error
+	ValidateMinimumOrderAmount(ctx context.Context, coupon *discount.Coupon, orderAmount decimal.Decimal) error
+	ValidateCouponProducts(ctx context.Context, coupon *discount.Coupon, productIDs []uuid.UUID) error
+	CanCustomerUseCoupon(ctx context.Context, companyID, couponID, customerID uuid.UUID, at time.Time) (bool, error)
+
+	CalculateDiscount(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal) (decimal.Decimal, error)
+	CalculateDiscountForProducts(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
+
+	ApplyCouponToOrder(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	ApplyCouponToQuote(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	ApplyCouponToInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+
+	RemoveCouponFromOrder(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, removedBy uuid.UUID) error
+	RemoveCouponFromQuote(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, removedBy uuid.UUID) error
+	RemoveCouponFromInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, couponCode string, removedBy uuid.UUID) error
+
+	RecordCouponUsage(ctx context.Context, req *RecordCouponUsageRequest) error
+	RecordOrderCouponUsage(ctx context.Context, companyID, couponID, orderID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error
+	RecordQuoteCouponUsage(ctx context.Context, companyID, couponID, quoteID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error
+	RecordInvoiceCouponUsage(ctx context.Context, companyID, couponID, invoiceID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error
+
+	GetCouponUsageCount(ctx context.Context, companyID, couponID uuid.UUID) (int64, error)
+	GetCustomerCouponUsageCount(ctx context.Context, companyID, couponID, customerID uuid.UUID) (int64, error)
+	GetCouponUsageHistory(ctx context.Context, companyID, couponID uuid.UUID, p Pagination, s Sort) ([]*discount.CouponUsage, int64, error)
+
+	GetTopCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error)
+	GetMostUsedCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error)
+	GetHighestDiscountCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error)
+	GetTotalCouponDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetCouponRedemptionRate(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+
+	CouponExists(ctx context.Context, companyID, couponID uuid.UUID) (bool, error)
+	CouponCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
+	IsCouponExpired(ctx context.Context, companyID, couponID uuid.UUID, at time.Time) (bool, error)
+	IsCouponUsageLimitReached(ctx context.Context, companyID, couponID uuid.UUID) (bool, error)
+	IsCustomerUsageLimitReached(ctx context.Context, companyID, couponID, customerID uuid.UUID) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/sales_query_service.go
+================================================================================
+
+package service
+
+type SalesQueryService interface {
+	GetSalesDashboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*SalesDashboardSummary, error)
+	GetTodaySalesSummary(ctx context.Context, companyID uuid.UUID) (*TodaySalesSummary, error)
+	GetRealtimeSalesSnapshot(ctx context.Context, companyID uuid.UUID) (*RealtimeSalesSnapshot, error)
+	GetRevenueSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*RevenueSummary, error)
+	GetRevenueTrend(ctx context.Context, companyID uuid.UUID, granularity AnalyticsGranularity, from, to *time.Time) ([]*RevenueTrendPoint, error)
+	GetRevenueByCustomer(ctx context.Context, companyID uuid.UUID, from, to *time.Time, limit int) ([]*CustomerRevenueSummary, error)
+	GetRevenueByProduct(ctx context.Context, companyID uuid.UUID, from, to *time.Time, limit int) ([]*ProductRevenueSummary, error)
+	GetRevenueByCategory(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*CategoryRevenueSummary, error)
+	GetRevenueBySalesRep(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*SalesRepRevenueSummary, error)
+	GetRevenueByPaymentMethod(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*PaymentMethodRevenueSummary, error)
+	GetNetRevenueAfterReturns(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTopCustomers(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*TopCustomerRow, error)
+	GetCustomerSalesSummary(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, from, to *time.Time) (*CustomerSalesSummary, error)
+	GetCustomerLifetimeValue(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID) (decimal.Decimal, error)
+	GetCustomersWithOutstandingBalance(ctx context.Context, companyID uuid.UUID) ([]*CustomerOutstandingBalanceRow, error)
+	GetCustomersWithOverdueInvoices(ctx context.Context, companyID uuid.UUID) ([]*CustomerOverdueSummary, error)
+	GetInactiveCustomers(ctx context.Context, companyID uuid.UUID, since time.Time) ([]*models.Customer, error)
+	GetNewCustomers(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*models.Customer, error)
+	GetOrderSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*OrderSummary, error)
+	GetOrdersByStatus(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*OrderStatusSummary, error)
+	GetTopOrdersByValue(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Order, error)
+	GetAverageOrderValueTrend(ctx context.Context, companyID uuid.UUID, granularity AnalyticsGranularity, from, to *time.Time) ([]*AverageOrderValuePoint, error)
+	GetOrderConversionFunnel(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*OrderConversionFunnel, error)
+	GetQuoteSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*QuoteSummary, error)
+	GetQuoteConversionMetrics(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*QuoteConversionMetrics, error)
+	GetQuotesExpiringSoon(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Quote, error)
+	GetInvoiceSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*InvoiceSummary, error)
+	GetOutstandingReceivablesSummary(ctx context.Context, companyID uuid.UUID) (*OutstandingReceivablesSummary, error)
+	GetOverdueInvoices(ctx context.Context, companyID uuid.UUID, at time.Time, p Pagination, s Sort) ([]*models.Invoice, int64, error)
+	GetOverdueInvoiceAging(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*InvoiceAgingBucket, error)
+	GetInvoicesDueSoon(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Invoice, error)
+	GetInvoiceCollectionTrend(ctx context.Context, companyID uuid.UUID, granularity AnalyticsGranularity, from, to *time.Time) ([]*CollectionTrendPoint, error)
+	GetAverageCollectionDays(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetPaymentSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*PaymentSummary, error)
+	GetPaymentMethodBreakdown(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*PaymentMethodBreakdownRow, error)
+	GetFailedPaymentAnalytics(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*FailedPaymentAnalytics, error)
+	GetRefundSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*RefundSummary, error)
+	GetTopSellingProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*TopSellingProductRow, error)
+	GetLeastSellingProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*LeastSellingProductRow, error)
+	GetProductSalesTrend(ctx context.Context, companyID uuid.UUID, productID uuid.UUID, granularity AnalyticsGranularity, from, to *time.Time) ([]*ProductSalesTrendPoint, error)
+	GetProductsNeverSold(ctx context.Context, companyID uuid.UUID) ([]*models.Product, error)
+	GetMostReturnedProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*MostReturnedProductRow, error)
+	GetReturnSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*ReturnSummary, error)
+	GetReturnRateTrend(ctx context.Context, companyID uuid.UUID, granularity AnalyticsGranularity, from, to *time.Time) ([]*ReturnRateTrendPoint, error)
+	GetRefundLiabilitySummary(ctx context.Context, companyID uuid.UUID) (*RefundLiabilitySummary, error)
+	GetDiscountSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*DiscountSummary, error)
+	GetCouponPerformance(ctx context.Context, companyID uuid.UUID, from, to *time.Time, limit int) ([]*CouponPerformanceRow, error)
+	GetPromotionPerformance(ctx context.Context, companyID uuid.UUID, from, to *time.Time, limit int) ([]*PromotionPerformanceRow, error)
+	GetDiscountImpactOnRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*DiscountRevenueImpact, error)
+	GetTaxSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*TaxSummary, error)
+	GetTaxBreakdownByRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*TaxRateBreakdownRow, error)
+	GetTaxBreakdownByJurisdiction(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*JurisdictionTaxBreakdownRow, error)
+	GetTaxBreakdownByProduct(ctx context.Context, companyID uuid.UUID, from, to *time.Time, limit int) ([]*ProductTaxBreakdownRow, error)
+	GetCollectedTaxTrend(ctx context.Context, companyID uuid.UUID, granularity AnalyticsGranularity, from, to *time.Time) ([]*CollectedTaxTrendPoint, error)
+	GetTaxAuditReport(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*TaxAuditReportRow, error)
+	GetSalesRepPerformance(ctx context.Context, companyID uuid.UUID, salesRepID uuid.UUID, from, to *time.Time) (*SalesRepPerformanceSummary, error)
+	GetSalesLeaderboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time, limit int) ([]*SalesLeaderboardRow, error)
+	GetCommissionSummary(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (*CommissionSummary, error)
+	GetCreditRiskSummary(ctx context.Context, companyID uuid.UUID) (*CreditRiskSummary, error)
+	GetCustomersNearCreditLimit(ctx context.Context, companyID uuid.UUID, thresholdPercent decimal.Decimal) ([]*CustomerCreditUtilizationRow, error)
+	GetCustomersExceedingCreditLimit(ctx context.Context, companyID uuid.UUID) ([]*CustomerCreditExposureRow, error)
+	GetOrdersOnCreditHold(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error)
+	GetSalesReport(ctx context.Context, req *SalesReportRequest) (*SalesReportResult, error)
+	GetTaxReport(ctx context.Context, req *TaxReportRequest) (*TaxReportResult, error)
+	GetReceivablesReport(ctx context.Context, req *ReceivablesReportRequest) (*ReceivablesReportResult, error)
+	GetCustomerStatement(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, from, to *time.Time) (*CustomerStatementResult, error)
+	GetSalesAuditTrail(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID) ([]*SalesAuditEntry, error)
+}
+
+
+================================================================================
+FILE: ./service/product_service.go
+================================================================================
+
+package service
+
+type ProductService interface {
+	CreateProduct(ctx context.Context, req CreateProductRequest, idempotencyKey string) (*models.Product, error)
+	UpdateProduct(ctx context.Context, companyID, productID uuid.UUID, req UpdateProductRequest, idempotencyKey string) (*models.Product, error)
+	DeleteProduct(ctx context.Context, companyID, productID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	GetProductByID(ctx context.Context, companyID, productID uuid.UUID) (*models.Product, error)
+	GetProductBySKU(ctx context.Context, companyID uuid.UUID, sku string) (*models.Product, error)
+	ListProducts(ctx context.Context, filter ProductListFilter, p Pagination, s Sort) ([]*models.Product, int64, error)
+	SearchProducts(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Product, int64, error)
+	ActivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	DeactivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	IsProductActive(ctx context.Context, companyID, productID uuid.UUID) (bool, error)
+	UpdateUnitPrice(ctx context.Context, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID, idempotencyKey string) error
+	GetUnitPrice(ctx context.Context, companyID, productID uuid.UUID) (decimal.Decimal, error)
+	GetProductsByPriceRange(ctx context.Context, companyID uuid.UUID, minPrice, maxPrice *decimal.Decimal) ([]*models.Product, error)
+	LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	UnlinkInventoryItem(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	GetByInventoryItemID(ctx context.Context, companyID, inventoryItemID uuid.UUID) (*models.Product, error)
+	GetTopSellingProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Product, error)
+	GetProductsNeverSold(ctx context.Context, companyID uuid.UUID) ([]*models.Product, error)
+	GetProductsWithReturns(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*models.Product, error)
+	ValidateProduct(ctx context.Context, product *models.Product) error
+	ProductExists(ctx context.Context, companyID, productID uuid.UUID) (bool, error)
+	ProductSKUExists(ctx context.Context, companyID uuid.UUID, sku string) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/quote_service.go
+================================================================================
+
+package service
+
+type QuoteService interface {
+	CreateQuote(ctx context.Context, req *CreateQuoteRequest) (*models.Quote, error)
+	UpdateQuote(ctx context.Context, companyID, quoteID uuid.UUID, req *UpdateQuoteRequest) (*models.Quote, error)
+	DeleteQuote(ctx context.Context, companyID, quoteID uuid.UUID, deletedBy uuid.UUID) error
+	GetQuoteByID(ctx context.Context, companyID, quoteID uuid.UUID) (*models.Quote, error)
+	GetQuoteByNumber(ctx context.Context, companyID uuid.UUID, quoteNumber string, revision int) (*models.Quote, error)
+	ListQuotes(ctx context.Context, filter QuoteListFilter, p Pagination, s Sort) ([]*models.Quote, int64, error)
+	SearchQuotes(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Quote, int64, error)
+	GetQuotesByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Quote, int64, error)
+	AddItems(ctx context.Context, companyID, quoteID uuid.UUID, items []*CreateQuoteItemRequest, updatedBy uuid.UUID) error
+	ReplaceItems(ctx context.Context, companyID, quoteID uuid.UUID, items []*CreateQuoteItemRequest, updatedBy uuid.UUID) error
+	RemoveItem(ctx context.Context, companyID, quoteID, quoteItemID uuid.UUID, updatedBy uuid.UUID) error
+	GetQuoteItems(ctx context.Context, companyID, quoteID uuid.UUID) ([]*models.QuoteItem, error)
+	ApplyCoupon(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	RemoveCoupon(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, updatedBy uuid.UUID) error
+	ApplyBestDiscounts(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
+	PreviewPricing(ctx context.Context, req *QuotePricingPreviewRequest) (*QuotePricingPreviewResult, error)
+	RecalculateTotals(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
+	GetQuoteTotals(ctx context.Context, companyID, quoteID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal decimal.Decimal, err error)
+	CreateRevision(ctx context.Context, companyID, quoteID uuid.UUID, req *CreateQuoteRevisionRequest) (*models.Quote, error)
+	GetLatestRevision(ctx context.Context, companyID uuid.UUID, quoteNumber string) (*models.Quote, error)
+	UpdateStatus(ctx context.Context, companyID, quoteID uuid.UUID, status enums.QuoteStatus, updatedBy uuid.UUID) error
+	MarkSent(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
+	AcceptQuote(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
+	RejectQuote(ctx context.Context, companyID, quoteID uuid.UUID, reason *string, updatedBy uuid.UUID) error
+	ExpireQuote(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
+	GetExpiringQuotes(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Quote, error)
+	ConvertToOrder(ctx context.Context, companyID, quoteID uuid.UUID, req *ConvertQuoteToOrderRequest) (*models.Order, error)
+	IsConverted(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error)
+	AssignSalesRep(ctx context.Context, companyID, quoteID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
+	RemoveSalesRep(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
+	ValidateQuote(ctx context.Context, quote *models.Quote, items []*models.QuoteItem) error
+	ValidateQuoteStatusTransition(ctx context.Context, currentStatus, nextStatus enums.QuoteStatus) error
+	ValidateQuoteItems(ctx context.Context, companyID uuid.UUID, items []*CreateQuoteItemRequest) error
+	ValidatePricing(ctx context.Context, companyID, quoteID uuid.UUID) error
+	ValidateConversion(ctx context.Context, companyID, quoteID uuid.UUID) error
+	GetQuoteConversionRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTotalQuotedRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	QuoteExists(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error)
+	QuoteNumberExists(ctx context.Context, companyID uuid.UUID, quoteNumber string, revision int) (bool, error)
+	IsExpired(ctx context.Context, companyID, quoteID uuid.UUID, at time.Time) (bool, error)
+}
+
+
+================================================================================
+FILE: ./service/payment_term_service.go
+================================================================================
+
+package service
+
+type PaymentTermService interface {
+	CreatePaymentTerm(ctx context.Context, req *CreatePaymentTermRequest, idempotencyKey string) (*models.PaymentTerm, error)
+	UpdatePaymentTerm(ctx context.Context, companyID uuid.UUID, termID uuid.UUID, req *UpdatePaymentTermRequest, idempotencyKey string) (*models.PaymentTerm, error)
+	DeletePaymentTerm(ctx context.Context, companyID uuid.UUID, termID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error
+	GetPaymentTermByID(ctx context.Context, companyID uuid.UUID, termID uuid.UUID) (*models.PaymentTerm, error)
+	GetPaymentTermByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.PaymentTerm, error)
+	GetPaymentTermByName(ctx context.Context, companyID uuid.UUID, termName string) (*models.PaymentTerm, error)
+	ListPaymentTerms(ctx context.Context, filter PaymentTermListFilter, p Pagination, s Sort) ([]*models.PaymentTerm, int64, error)
+	SearchPaymentTerms(ctx context.Context, companyID uuid.UUID, query string, limit int, offset int) ([]*models.PaymentTerm, int64, error)
+	GetActivePaymentTerms(ctx context.Context, companyID uuid.UUID) ([]*models.PaymentTerm, error)
+	ActivatePaymentTerm(ctx context.Context, companyID uuid.UUID, termID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	DeactivatePaymentTerm(ctx context.Context, companyID uuid.UUID, termID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	IsPaymentTermActive(ctx context.Context, companyID uuid.UUID, termID uuid.UUID) (bool, error)
+	CalculateDueDate(ctx context.Context, companyID uuid.UUID, termID uuid.UUID, invoiceDate time.Time) (time.Time, error)
+	CalculateEarlyPaymentDiscount(ctx context.Context, companyID uuid.UUID, termID uuid.UUID, invoiceAmount decimal.Decimal, paymentDate time.Time, invoiceDate time.Time) (decimal.Decimal, error)
+	AssignPaymentTermToCustomer(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, termID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	RemovePaymentTermFromCustomer(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
+	ValidatePaymentTerm(ctx context.Context, term *models.PaymentTerm) error
+	PaymentTermExists(ctx context.Context, companyID uuid.UUID, termID uuid.UUID) (bool, error)
+	PaymentTermCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error)
+}
+

@@ -1703,3 +1703,316 @@ CREATE TABLE sales_analytics.sales_rep_leaderboard_snapshot (
 
 CREATE INDEX idx_leaderboard_snapshot_company_date ON sales_analytics.sales_rep_leaderboard_snapshot(company_id, snapshot_date);
 CREATE INDEX idx_leaderboard_snapshot_rep ON sales_analytics.sales_rep_leaderboard_snapshot(sales_rep_id);
+
+-- Commission plans
+CREATE TABLE IF NOT EXISTS sales.commission_plans (
+    plan_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    code             VARCHAR(50) NOT NULL,
+    name             VARCHAR(255) NOT NULL,
+    description      TEXT,
+    effective_from   DATE NOT NULL,
+    effective_to     DATE,
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID,
+    updated_by       UUID,
+    CONSTRAINT fk_commission_plans_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_commission_plans_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_commission_plans_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    UNIQUE(company_id, code)
+);
+
+-- Commission rules
+CREATE TABLE IF NOT EXISTS sales.commission_rules (
+    rule_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    plan_id          UUID NOT NULL,
+    rule_type        VARCHAR(20) NOT NULL, -- 'flat','tiered','product','category'
+    applies_to       sales.commission_base_type NOT NULL,
+    product_id       UUID,
+    tier_min         NUMERIC(14,4),
+    tier_max         NUMERIC(14,4),
+    rate             NUMERIC(14,4) NOT NULL,
+    is_percentage    BOOLEAN NOT NULL DEFAULT true,
+    priority         INT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID,
+    updated_by       UUID,
+    CONSTRAINT fk_commission_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_commission_rules_plan FOREIGN KEY (plan_id) REFERENCES sales.commission_plans(plan_id) ON DELETE CASCADE,
+    CONSTRAINT fk_commission_rules_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id) ON DELETE SET NULL,
+    CONSTRAINT fk_commission_rules_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_commission_rules_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
+
+-- Sales commissions (actual earned records)
+CREATE TABLE IF NOT EXISTS sales.sales_commissions (
+    commission_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id         UUID NOT NULL,
+    sales_rep_id       UUID NOT NULL,
+    reference_type     VARCHAR(20) NOT NULL, -- 'order','invoice','payment'
+    reference_id       UUID NOT NULL,
+    commission_base    NUMERIC(14,4) NOT NULL,
+    commission_rate    NUMERIC(14,4) NOT NULL,
+    commission_amount  NUMERIC(14,4) NOT NULL,
+    status             VARCHAR(20) NOT NULL DEFAULT 'pending',
+    earned_at          TIMESTAMPTZ NOT NULL,
+    paid_at            TIMESTAMPTZ,
+    approved_at        TIMESTAMPTZ,
+    rejected_at        TIMESTAMPTZ,
+    reject_reason      TEXT,
+    notes              TEXT,
+    rule_id            UUID,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by         UUID,
+    updated_by         UUID,
+    CONSTRAINT fk_sales_commissions_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_sales_commissions_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
+    CONSTRAINT fk_sales_commissions_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_sales_commissions_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_sales_commissions_rule FOREIGN KEY (rule_id) REFERENCES sales.commission_rules(rule_id) ON DELETE SET NULL,
+    UNIQUE(company_id, reference_type, reference_id)
+);
+
+-- Sales rep commission assignments (which plan is active for a rep at a time)
+CREATE TABLE IF NOT EXISTS sales.sales_rep_commission_assignments (
+    assignment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    sales_rep_id     UUID NOT NULL,
+    plan_id          UUID NOT NULL,
+    effective_from   DATE NOT NULL,
+    effective_to     DATE,
+    assigned_by      UUID,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_assignments_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_plan FOREIGN KEY (plan_id) REFERENCES sales.commission_plans(plan_id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_assigned_by FOREIGN KEY (assigned_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
+
+-- Indexes
+CREATE INDEX idx_commission_plans_company ON sales.commission_plans(company_id);
+CREATE INDEX idx_commission_plans_dates ON sales.commission_plans(effective_from, effective_to);
+CREATE INDEX idx_commission_rules_plan ON sales.commission_rules(plan_id);
+CREATE INDEX idx_commission_rules_product ON sales.commission_rules(product_id);
+CREATE INDEX idx_sales_commissions_rep ON sales.sales_commissions(sales_rep_id);
+CREATE INDEX idx_sales_commissions_reference ON sales.sales_commissions(reference_type, reference_id);
+CREATE INDEX idx_sales_commissions_status ON sales.sales_commissions(status);
+CREATE INDEX idx_sales_commissions_earned ON sales.sales_commissions(earned_at);
+CREATE INDEX idx_assignments_rep ON sales.sales_rep_commission_assignments(sales_rep_id);
+CREATE INDEX idx_assignments_dates ON sales.sales_rep_commission_assignments(effective_from, effective_to);
+
+-- Triggers for updated_at
+CREATE TRIGGER update_commission_plans_updated_at BEFORE UPDATE ON sales.commission_plans FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_commission_rules_updated_at BEFORE UPDATE ON sales.commission_rules FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_sales_commissions_updated_at BEFORE UPDATE ON sales.sales_commissions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+
+
+ALTER TABLE sales_analytics.sales_rep_commission_fact
+ADD COLUMN plan_id UUID,
+ADD COLUMN rule_id UUID;
+
+CREATE INDEX idx_commission_fact_plan ON sales_analytics.sales_rep_commission_fact(plan_id);
+CREATE INDEX idx_commission_fact_rule ON sales_analytics.sales_rep_commission_fact(rule_id);
+CREATE TABLE sales_analytics.commission_plan_daily (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    plan_id UUID NOT NULL,
+    date DATE NOT NULL,
+    total_commissions_earned DECIMAL(14,4) NOT NULL DEFAULT 0,
+    total_commissions_paid DECIMAL(14,4) NOT NULL DEFAULT 0,
+    commission_count INT NOT NULL DEFAULT 0,
+    average_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+    unique_sales_reps INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, plan_id, date)
+);
+CREATE INDEX idx_commission_plan_daily_company_date ON sales_analytics.commission_plan_daily(company_id, date);
+
+CREATE TABLE sales_analytics.commission_rule_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    rule_id UUID NOT NULL,
+    plan_id UUID NOT NULL,
+    date DATE NOT NULL,
+    times_applied INT NOT NULL DEFAULT 0,
+    total_commission_base DECIMAL(14,4) NOT NULL DEFAULT 0,
+    total_commission_amount DECIMAL(14,4) NOT NULL DEFAULT 0,
+    avg_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, rule_id, date)
+);
+CREATE INDEX idx_commission_rule_fact_plan ON sales_analytics.commission_rule_fact(plan_id);
+
+CREATE TABLE sales_analytics.commission_assignment_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    plan_id UUID NOT NULL,
+    assigned_at DATE NOT NULL,
+    removed_at DATE,  -- NULL if still active
+    duration_days INT GENERATED ALWAYS AS (EXTRACT(DAY FROM (COALESCE(removed_at, CURRENT_DATE) - assigned_at))) STORED,
+    assigned_by UUID,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_assignment_fact_rep ON sales_analytics.commission_assignment_fact(sales_rep_id);
+CREATE INDEX idx_assignment_fact_plan ON sales_analytics.commission_assignment_fact(plan_id);
+
+CREATE TABLE sales_analytics.commission_lifecycle (
+    commission_id UUID PRIMARY KEY,
+    company_id UUID NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    reference_type VARCHAR(20) NOT NULL,
+    reference_id UUID NOT NULL,
+    earned_at TIMESTAMPTZ NOT NULL,
+    approved_at TIMESTAMPTZ,
+    paid_at TIMESTAMPTZ,
+    rejected_at TIMESTAMPTZ,
+    approval_delay_hours DECIMAL(10,2) GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (approved_at - earned_at))/3600) STORED,
+    payment_delay_hours DECIMAL(10,2) GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (paid_at - approved_at))/3600) STORED,
+    current_status VARCHAR(20) NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_commission_lifecycle_status ON sales_analytics.commission_lifecycle(current_status);
+
+CREATE TABLE sales_analytics.commission_forecast_snapshot (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    snapshot_date DATE NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    expected_commission_from_open_orders DECIMAL(14,4) DEFAULT 0,
+    expected_commission_from_open_invoices DECIMAL(14,4) DEFAULT 0,
+    total_expected_commission DECIMAL(14,4) DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, snapshot_date, sales_rep_id)
+);
+CREATE INDEX idx_commission_forecast_rep ON sales_analytics.commission_forecast_snapshot(sales_rep_id); 
+
+ALTER TABLE sales.orders ADD COLUMN credit_hold BOOLEAN DEFAULT false;
+ALTER TABLE sales.orders ADD COLUMN credit_status VARCHAR(20) DEFAULT 'approved';
+-- credit_status values: 'pending', 'approved', 'rejected', 'hold'
+
+
+
+
+CREATE TABLE IF NOT EXISTS sales_analytics.credit_check_fact (
+    id               BIGSERIAL PRIMARY KEY,
+    company_id       UUID NOT NULL,
+    customer_id      UUID NOT NULL,
+    check_id         UUID,                        -- references credit_check_history.credit_history_id (optional)
+    check_type       VARCHAR(20) NOT NULL,        -- 'customer_limit', 'order_eligibility', 'invoice_eligibility'
+    result           VARCHAR(20) NOT NULL,        -- 'approved', 'denied', 'suspended'
+    requested_amount DECIMAL(14,4) NOT NULL,
+    current_limit    DECIMAL(14,2) NOT NULL,
+    current_outstanding DECIMAL(14,4) NOT NULL,
+    available_credit DECIMAL(14,4) NOT NULL,
+    reason           TEXT,
+    checked_at       TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_credit_check_fact_company_date ON sales_analytics.credit_check_fact(company_id, checked_at);
+CREATE INDEX idx_credit_check_fact_customer ON sales_analytics.credit_check_fact(customer_id);
+CREATE INDEX idx_credit_check_fact_result ON sales_analytics.credit_check_fact(result);
+
+CREATE TABLE IF NOT EXISTS sales_analytics.daily_credit_metrics (
+    id                         BIGSERIAL PRIMARY KEY,
+    company_id                 UUID NOT NULL,
+    date                       DATE NOT NULL,
+    total_checks               INT DEFAULT 0,
+    checks_passed              INT DEFAULT 0,
+    checks_failed              INT DEFAULT 0,
+    total_order_value_checked  DECIMAL(14,4) DEFAULT 0,
+    total_invoice_value_checked DECIMAL(14,4) DEFAULT 0,
+    avg_available_credit       DECIMAL(14,4) DEFAULT 0,
+    avg_credit_utilization     DECIMAL(5,2) DEFAULT 0,
+    updated_at                 TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, date)
+);
+
+CREATE INDEX idx_daily_credit_metrics_company_date ON sales_analytics.daily_credit_metrics(company_id, date);
+
+CREATE TABLE IF NOT EXISTS sales_analytics.credit_hold_fact (
+    id              BIGSERIAL PRIMARY KEY,
+    order_id        UUID NOT NULL,
+    company_id      UUID NOT NULL,
+    customer_id     UUID NOT NULL,
+    hold_started_at TIMESTAMPTZ NOT NULL,
+    hold_ended_at   TIMESTAMPTZ,
+    duration_seconds BIGINT GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (hold_ended_at - hold_started_at))) STORED,
+    reason          TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(order_id, hold_started_at)
+);
+
+CREATE INDEX idx_credit_hold_fact_order ON sales_analytics.credit_hold_fact(order_id);
+CREATE INDEX idx_credit_hold_fact_company_date ON sales_analytics.credit_hold_fact(company_id, hold_started_at);
+CREATE INDEX idx_credit_hold_fact_customer ON sales_analytics.credit_hold_fact(customer_id);
+
+CREATE TABLE IF NOT EXISTS sales_analytics.credit_limit_change_fact (
+    id               BIGSERIAL PRIMARY KEY,
+    company_id       UUID NOT NULL,
+    customer_id      UUID NOT NULL,
+    previous_limit   DECIMAL(14,2) NOT NULL,
+    new_limit        DECIMAL(14,2) NOT NULL,
+    change_amount    DECIMAL(14,2) GENERATED ALWAYS AS (new_limit - previous_limit) STORED,
+    change_reason    TEXT,
+    changed_by       UUID,
+    changed_at       TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_credit_limit_change_company ON sales_analytics.credit_limit_change_fact(company_id, changed_at);
+CREATE INDEX idx_credit_limit_change_customer ON sales_analytics.credit_limit_change_fact(customer_id);
+
+CREATE TABLE IF NOT EXISTS sales_analytics.customer_credit_daily_snapshot (
+    snapshot_id      BIGSERIAL PRIMARY KEY,
+    company_id       UUID NOT NULL,
+    customer_id      UUID NOT NULL,
+    snapshot_date    DATE NOT NULL,
+    credit_limit     DECIMAL(14,2) NOT NULL,
+    outstanding_balance DECIMAL(14,4) NOT NULL,
+    available_credit DECIMAL(14,4) NOT NULL,
+    utilization_pct  DECIMAL(5,2) GENERATED ALWAYS AS (
+        CASE WHEN credit_limit > 0 THEN (outstanding_balance / credit_limit) * 100 ELSE 0 END
+    ) STORED,
+    is_suspended     BOOLEAN DEFAULT FALSE,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, customer_id, snapshot_date)
+);
+
+CREATE INDEX idx_customer_credit_snapshot_company_date ON sales_analytics.customer_credit_daily_snapshot(company_id, snapshot_date);
+CREATE INDEX idx_customer_credit_snapshot_customer ON sales_analytics.customer_credit_daily_snapshot(customer_id);
+
+CREATE MATERIALIZED VIEW sales_analytics.current_customer_credit AS
+SELECT
+    c.customer_id,
+    c.company_id,
+    COALESCE(c.credit_limit, 0) AS credit_limit,
+    COALESCE(SUM(i.amount_due), 0) AS outstanding_balance,
+    COALESCE(c.credit_limit, 0) - COALESCE(SUM(i.amount_due), 0) AS available_credit,
+    CASE WHEN COALESCE(c.credit_limit, 0) > 0
+         THEN (COALESCE(SUM(i.amount_due), 0) / c.credit_limit) * 100
+         ELSE 0
+    END AS utilization_pct,
+    EXISTS (
+        SELECT 1 FROM sales.credit_check_history h
+        WHERE h.customer_id = c.customer_id
+          AND h.action_type = 'suspend'
+          AND h.created_at > COALESCE(
+              (SELECT MAX(created_at) FROM sales.credit_check_history
+               WHERE customer_id = c.customer_id AND action_type = 'restore'),
+              '0001-01-01'
+          )
+    ) AS is_suspended
+FROM sales.customers c
+LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id AND i.status NOT IN ('paid', 'cancelled')
+GROUP BY c.customer_id, c.company_id, c.credit_limit;
+
+CREATE UNIQUE INDEX idx_current_credit_customer ON sales_analytics.current_customer_credit(customer_id);
+CREATE INDEX idx_current_credit_company ON sales_analytics.current_customer_credit(company_id);
+

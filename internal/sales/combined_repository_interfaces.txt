@@ -1,5 +1,35 @@
 
 ================================================================================
+FILE: ./repository/sales_commission_repository.go
+================================================================================
+
+package repository
+
+type SalesCommissionRepository interface {
+	// Commission records
+	Create(ctx context.Context, db DBTX, comm *models.SalesCommission) error
+	GetByID(ctx context.Context, db DBTX, companyID, commissionID uuid.UUID) (*models.SalesCommission, error)
+	Update(ctx context.Context, db DBTX, comm *models.SalesCommission) error
+	Exists(ctx context.Context, db DBTX, companyID, commissionID uuid.UUID) (bool, error)
+	GetByReference(ctx context.Context, db DBTX, companyID uuid.UUID, refType enums.CommissionReferenceType, refID uuid.UUID) ([]*models.SalesCommission, error)
+	GetBySalesRepAndPeriod(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, from, to time.Time) ([]*models.SalesCommission, error)
+	List(ctx context.Context, db DBTX, filter SalesCommissionFilter, p Pagination, s Sort) ([]*models.SalesCommission, int64, error)
+	GetTotalCommission(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time, status *enums.CommissionStatus, salesRepID *uuid.UUID) (decimal.Decimal, error)
+	CountByStatus(ctx context.Context, db DBTX, companyID uuid.UUID, status enums.CommissionStatus, salesRepID *uuid.UUID) (int64, error)
+	GetTopByAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesCommission, error)
+	GetTrend(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) ([]*CommissionTrendPoint, error)
+	GetByStatus(ctx context.Context, db DBTX, companyID uuid.UUID, status enums.CommissionStatus) ([]*models.SalesCommission, error)
+	GetUnpaid(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.SalesCommission, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, commissionID uuid.UUID) (*models.SalesCommission, error)
+
+	// Assignments
+	CreateAssignment(ctx context.Context, db DBTX, assignment *models.SalesRepCommissionAssignment) error
+	DeactivateCurrentAssignment(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, effectiveTo time.Time) error
+	GetAssignmentAt(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, at time.Time) (*models.SalesRepCommissionAssignment, error)
+}
+
+
+================================================================================
 FILE: ./repository/discount_exclusion_repository.go
 ================================================================================
 
@@ -87,6 +117,24 @@ type InvoiceRepository interface {
 
 
 ================================================================================
+FILE: ./repository/commission_rule_repository.go
+================================================================================
+
+package repository
+
+type CommissionRuleRepository interface {
+	Create(ctx context.Context, db DBTX, rule *models.CommissionRule) error
+	GetByID(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (*models.CommissionRule, error)
+	Update(ctx context.Context, db DBTX, rule *models.CommissionRule) error
+	Delete(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) error
+	DeleteByPlan(ctx context.Context, db DBTX, companyID, planID uuid.UUID) error
+	GetByPlan(ctx context.Context, db DBTX, companyID, planID uuid.UUID) ([]*models.CommissionRule, error)
+	Exists(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (bool, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (*models.CommissionRule, error)
+}
+
+
+================================================================================
 FILE: ./repository/sales_rep_commission_repository.go
 ================================================================================
 
@@ -150,6 +198,24 @@ type ProductRepository interface {
 
 	// Concurrency / locking
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, productID uuid.UUID) (*models.Product, error)
+}
+
+
+================================================================================
+FILE: ./repository/sales_target_repository.go
+================================================================================
+
+package repository
+
+type SalesTargetRepository interface {
+	Create(ctx context.Context, db DBTX, target *models.SalesTarget) error
+	GetByID(ctx context.Context, db DBTX, companyID, targetID uuid.UUID) (*models.SalesTarget, error)
+	GetByPeriod(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*models.SalesTarget, error)
+	Update(ctx context.Context, db DBTX, target *models.SalesTarget) error
+	Delete(ctx context.Context, db DBTX, companyID, targetID uuid.UUID) error
+	List(ctx context.Context, db DBTX, filter SalesTargetFilter, p Pagination, s Sort) ([]*models.SalesTarget, int64, error)
+	Exists(ctx context.Context, db DBTX, companyID, targetID uuid.UUID) (bool, error)
+	ExistsForPeriod(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (bool, error)
 }
 
 
@@ -691,6 +757,7 @@ type SalesRepRepository interface {
 	List(ctx context.Context, db DBTX, filter SalesRepFilter, p Pagination, s Sort) ([]*models.SalesRep, int64, error)
 	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.SalesRep, int64, error)
 	GetActiveSalesReps(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.SalesRep, error)
+	ExistsByUserID(ctx context.Context, db DBTX, companyID, userID uuid.UUID) (bool, error)
 	GetTopSalesRepsByRevenue(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (*models.SalesRep, error)
 }
@@ -1378,10 +1445,60 @@ type AnalyticsRepository interface {
 	// CreditNoteFact
 	InsertCreditNoteFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditNoteFact) error
 	UpdateCreditNoteAppliedAmount(ctx context.Context, db DBTX, creditNoteID uuid.UUID, appliedAmount decimal.Decimal, appliedToInvoiceID *uuid.UUID, appliedDate *time.Time, status string) error
+	// Sales rep target achievement
+	UpsertSalesRepTargetAchievement(ctx context.Context, db DBTX, achievement *sales_analytics.SalesRepTargetAchievement) error
+	UpdateSalesRepTargetAchievement(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time, actualRevenue decimal.Decimal) error
+	GetSalesRepTargetAchievement(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*sales_analytics.SalesRepTargetAchievement, error)
 
+	// Sales rep commission fact
+	UpsertSalesRepCommissionFact(ctx context.Context, db DBTX, fact *sales_analytics.SalesRepCommissionFact) error
+	GetSalesRepCommissionFacts(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, from, to *time.Time) ([]*sales_analytics.SalesRepCommissionFact, error)
+	MarkCommissionPaid(ctx context.Context, db DBTX, companyID, factID uuid.UUID, paidAt time.Time) error
+
+	// Sales rep leaderboard snapshot
+	UpsertSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.SalesRepLeaderboardSnapshot) error
+	RefreshSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate, periodStart, periodEnd time.Time) error
+	GetSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) ([]*sales_analytics.SalesRepLeaderboardSnapshot, error)
 	// RefundFact
 	InsertRefundFact(ctx context.Context, db DBTX, fact *sales_analytics.RefundFact) error
+	// CommissionPlanDaily
+	UpsertCommissionPlanDaily(ctx context.Context, db DBTX, daily *sales_analytics.CommissionPlanDaily) error
+	IncrementCommissionPlanDaily(ctx context.Context, db DBTX, companyID, planID uuid.UUID, date time.Time, earnedAmount, paidAmount decimal.Decimal, rate decimal.Decimal, salesRepID uuid.UUID) error
 
+	// CommissionRuleFact
+	UpsertCommissionRuleFact(ctx context.Context, db DBTX, fact *sales_analytics.CommissionRuleFact) error
+	IncrementCommissionRuleFact(ctx context.Context, db DBTX, companyID, ruleID, planID uuid.UUID, date time.Time, commissionBase, commissionAmount decimal.Decimal, rate decimal.Decimal) error
+
+	// CommissionAssignmentFact
+	InsertCommissionAssignmentFact(ctx context.Context, db DBTX, fact *sales_analytics.CommissionAssignmentFact) error
+	CloseCommissionAssignmentFact(ctx context.Context, db DBTX, companyID, salesRepID, planID uuid.UUID, removedAt time.Time) error
+
+	// CommissionLifecycle
+	InsertCommissionLifecycle(ctx context.Context, db DBTX, lifecycle *sales_analytics.CommissionLifecycle) error
+	UpdateCommissionLifecycle(ctx context.Context, db DBTX, commissionID uuid.UUID, status string, approvedAt, paidAt, rejectedAt *time.Time) error
+	// CreditCheckFact
+	InsertCreditCheckFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditCheckFact) error
+
+	// DailyCreditMetrics
+	UpsertDailyCreditMetrics(ctx context.Context, db DBTX, metrics *sales_analytics.DailyCreditMetrics) error
+	IncrementDailyCreditMetrics(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, passed bool, requestedAmount decimal.Decimal, checkType string, availableCredit decimal.Decimal, utilizationPct decimal.Decimal) error
+
+	// CreditHoldFact
+	InsertCreditHoldFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditHoldFact) error
+	CloseCreditHoldFact(ctx context.Context, db DBTX, orderID uuid.UUID, holdEndedAt time.Time) error
+
+	// CreditLimitChangeFact
+	InsertCreditLimitChangeFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditLimitChangeFact) error
+
+	// CustomerCreditDailySnapshot
+	UpsertCustomerCreditDailySnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.CustomerCreditDailySnapshot) error
+	RefreshCustomerCreditDailySnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
+
+	// CurrentCustomerCredit (materialized view)
+	RefreshCurrentCustomerCredit(ctx context.Context, db DBTX) error
+	// CommissionForecastSnapshot
+	UpsertCommissionForecastSnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.CommissionForecastSnapshot) error
+	RefreshCommissionForecastSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
 	// ReturnProductCategoryFact
 	UpsertReturnProductCategoryFact(ctx context.Context, db DBTX, fact *sales_analytics.ReturnProductCategoryFact) error
 	IncrementReturnProductCategory(ctx context.Context, db DBTX, companyID uuid.UUID, categoryID *uuid.UUID, categoryName *string, returnDate time.Time, quantity decimal.Decimal, refundAmount decimal.Decimal, isUniqueReturn bool) error
@@ -1414,6 +1531,25 @@ type PaymentTermRepository interface {
 	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.PaymentTerm, int64, error)
 	GetActiveTerms(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.PaymentTerm, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, termID uuid.UUID) (*models.PaymentTerm, error)
+}
+
+
+================================================================================
+FILE: ./repository/commission_plan_repository.go
+================================================================================
+
+package repository
+
+type CommissionPlanRepository interface {
+	Create(ctx context.Context, db DBTX, plan *models.CommissionPlan) error
+	GetByID(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (*models.CommissionPlan, error)
+	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.CommissionPlan, error)
+	Update(ctx context.Context, db DBTX, plan *models.CommissionPlan) error
+	Delete(ctx context.Context, db DBTX, companyID, planID uuid.UUID) error
+	Exists(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (bool, error)
+	List(ctx context.Context, db DBTX, filter CommissionPlanFilter, p Pagination, s Sort) ([]*models.CommissionPlan, int64, error)
+	GetActivePlans(ctx context.Context, db DBTX, companyID uuid.UUID, at time.Time) ([]*models.CommissionPlan, error)
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (*models.CommissionPlan, error)
 }
 
 

@@ -37,6 +37,7 @@ var (
 	// Quantity / Amount
 	ErrInvalidQuantity = errors.New("sales: invalid quantity")
 	ErrInvalidAmount   = errors.New("sales: invalid amount")
+	ErrInvalidState    = errors.New("sales: invalid state transition")
 
 	// Payment Terms (added)
 	ErrPaymentTermInactive = errors.New("sales: payment term is inactive")

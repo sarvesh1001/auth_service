@@ -1,5 +1,34 @@
 
 ================================================================================
+FILE: ./models/commission_plan.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type CommissionPlan struct {
+	PlanID        uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	CompanyID     uuid.UUID  `gorm:"type:uuid;not null;index"`
+	Code          string     `gorm:"type:varchar(50);not null;uniqueIndex:idx_plan_company_code"`
+	Name          string     `gorm:"type:varchar(255);not null"`
+	Description   *string    `gorm:"type:text"`
+	EffectiveFrom time.Time  `gorm:"type:date;not null"`
+	EffectiveTo   *time.Time `gorm:"type:date"`
+	IsActive      bool       `gorm:"default:true"`
+	CreatedAt     time.Time  `gorm:"default:now()"`
+	UpdatedAt     time.Time  `gorm:"autoUpdateTime"`
+	CreatedBy     *uuid.UUID
+	UpdatedBy     *uuid.UUID
+}
+
+
+
+================================================================================
 FILE: ./models/payment_allocation.go
 ================================================================================
 
@@ -18,6 +47,31 @@ type PaymentAllocation struct {
 	InvoiceID    uuid.UUID       `gorm:"type:uuid;not null" json:"invoiceId"`
 	Amount       decimal.Decimal `gorm:"type:numeric(14,4);not null;check:amount > 0" json:"amount"`
 	CreatedAt    time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/sales_rep_commission_assignment.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type SalesRepCommissionAssignment struct {
+	AssignmentID  uuid.UUID  `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	CompanyID     uuid.UUID  `gorm:"type:uuid;not null;index"`
+	SalesRepID    uuid.UUID  `gorm:"type:uuid;not null;index"`
+	PlanID        uuid.UUID  `gorm:"type:uuid;not null"`
+	EffectiveFrom time.Time  `gorm:"type:date;not null"`
+	EffectiveTo   *time.Time `gorm:"type:date"`
+	AssignedBy    *uuid.UUID
+	CreatedAt     time.Time `gorm:"default:now()"`
 }
 
 
@@ -80,6 +134,45 @@ type PaymentRefund struct {
 	CompletedAt *time.Time      `gorm:"type:timestamptz" json:"completedAt,omitempty"`
 	CreatedAt   time.Time       `gorm:"not null;default:now()" json:"createdAt"`
 	UpdatedAt   time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+}
+
+
+
+================================================================================
+FILE: ./models/sales_commission.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type SalesCommission struct {
+	CommissionID     uuid.UUID                     `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	CompanyID        uuid.UUID                     `gorm:"type:uuid;not null;index"`
+	SalesRepID       uuid.UUID                     `gorm:"type:uuid;not null;index"`
+	ReferenceType    enums.CommissionReferenceType `gorm:"type:varchar(20);not null"`
+	ReferenceID      uuid.UUID                     `gorm:"type:uuid;not null"`
+	CommissionBase   decimal.Decimal               `gorm:"type:numeric(14,4);not null"`
+	CommissionRate   decimal.Decimal               `gorm:"type:numeric(14,4);not null"`
+	CommissionAmount decimal.Decimal               `gorm:"type:numeric(14,4);not null"`
+	Status           enums.CommissionStatus        `gorm:"type:varchar(20);default:'pending'"`
+	EarnedAt         time.Time                     `gorm:"type:timestamptz;not null"`
+	PaidAt           *time.Time                    `gorm:"type:timestamptz"`
+	ApprovedAt       *time.Time                    `gorm:"type:timestamptz"`
+	RejectedAt       *time.Time                    `gorm:"type:timestamptz"`
+	RejectReason     *string                       `gorm:"type:text"`
+	Notes            *string                       `gorm:"type:text"`
+	RuleID           *uuid.UUID                    `gorm:"type:uuid"`
+	CreatedAt        time.Time                     `gorm:"default:now()"`
+	UpdatedAt        time.Time                     `gorm:"autoUpdateTime"`
+	CreatedBy        *uuid.UUID
+	UpdatedBy        *uuid.UUID
 }
 
 
@@ -199,31 +292,33 @@ import (
 )
 
 type Order struct {
-	OrderID            uuid.UUID         `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderId"`
-	CompanyID          uuid.UUID         `gorm:"type:uuid;not null" json:"companyId"`
-	CustomerID         uuid.UUID         `gorm:"type:uuid;not null" json:"customerId"`
-	OrderNumber        string            `gorm:"type:varchar(50);not null;uniqueIndex:idx_order_number" json:"orderNumber"`
-	ExternalRef        *string           `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
-	OrderDate          time.Time         `gorm:"type:date;not null" json:"orderDate"`
-	Status             enums.OrderStatus `gorm:"type:order_status;not null;default:'draft';check:status IN ('draft','confirmed','processing','shipped','delivered','cancelled','refunded')" json:"status"`
-	Currency           string            `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
-	Subtotal           decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
-	DiscountTotal      decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
-	TaxTotal           decimal.Decimal   `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
-	GrandTotal         decimal.Decimal   `gorm:"->" json:"grandTotal"` // generated
-	Notes              *string           `gorm:"type:text" json:"notes,omitempty"`
-	ShippingAddress    JSONB             `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
-	BillingAddress     JSONB             `gorm:"type:jsonb" json:"billingAddress,omitempty"`
-	ConfirmedAt        *time.Time        `gorm:"type:timestamptz" json:"confirmedAt,omitempty"`
-	ShippedAt          *time.Time        `gorm:"type:timestamptz" json:"shippedAt,omitempty"`
-	DeliveredAt        *time.Time        `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
-	CancelledAt        *time.Time        `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
-	CancellationReason *string           `gorm:"type:text" json:"cancellationReason,omitempty"`
-	SalesRepID         *uuid.UUID        `gorm:"type:uuid;index" json:"salesRepId,omitempty"` // new
-	CreatedAt          time.Time         `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt          time.Time         `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy          *uuid.UUID        `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy          *uuid.UUID        `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	OrderID            uuid.UUID               `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"orderId"`
+	CompanyID          uuid.UUID               `gorm:"type:uuid;not null" json:"companyId"`
+	CustomerID         uuid.UUID               `gorm:"type:uuid;not null" json:"customerId"`
+	OrderNumber        string                  `gorm:"type:varchar(50);not null;uniqueIndex:idx_order_number" json:"orderNumber"`
+	ExternalRef        *string                 `gorm:"type:varchar(100)" json:"externalRef,omitempty"`
+	OrderDate          time.Time               `gorm:"type:date;not null" json:"orderDate"`
+	Status             enums.OrderStatus       `gorm:"type:order_status;not null;default:'draft';check:status IN ('draft','confirmed','processing','shipped','delivered','cancelled','refunded')" json:"status"`
+	Currency           string                  `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	Subtotal           decimal.Decimal         `gorm:"type:numeric(14,4);not null;default:0" json:"subtotal"`
+	DiscountTotal      decimal.Decimal         `gorm:"type:numeric(14,4);not null;default:0" json:"discountTotal"`
+	TaxTotal           decimal.Decimal         `gorm:"type:numeric(14,4);not null;default:0" json:"taxTotal"`
+	GrandTotal         decimal.Decimal         `gorm:"->" json:"grandTotal"` // generated
+	Notes              *string                 `gorm:"type:text" json:"notes,omitempty"`
+	ShippingAddress    JSONB                   `gorm:"type:jsonb" json:"shippingAddress,omitempty"`
+	BillingAddress     JSONB                   `gorm:"type:jsonb" json:"billingAddress,omitempty"`
+	ConfirmedAt        *time.Time              `gorm:"type:timestamptz" json:"confirmedAt,omitempty"`
+	ShippedAt          *time.Time              `gorm:"type:timestamptz" json:"shippedAt,omitempty"`
+	DeliveredAt        *time.Time              `gorm:"type:timestamptz" json:"deliveredAt,omitempty"`
+	CancelledAt        *time.Time              `gorm:"type:timestamptz" json:"cancelledAt,omitempty"`
+	CancellationReason *string                 `gorm:"type:text" json:"cancellationReason,omitempty"`
+	SalesRepID         *uuid.UUID              `gorm:"type:uuid;index" json:"salesRepId,omitempty"`
+	CreditHold         bool                    `gorm:"default:false" json:"creditHold"`
+	CreditStatus       enums.CreditCheckStatus `gorm:"type:varchar(20);default:'approved'" json:"creditStatus"`
+	CreatedAt          time.Time               `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt          time.Time               `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy          *uuid.UUID              `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy          *uuid.UUID              `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }
 
 
@@ -328,6 +423,35 @@ type Quote struct {
 
 
 ================================================================================
+FILE: ./models/sales_target.go
+================================================================================
+
+package models
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type SalesTarget struct {
+	TargetID     uuid.UUID       `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"targetId"`
+	CompanyID    uuid.UUID       `gorm:"type:uuid;not null" json:"companyId"`
+	SalesRepID   uuid.UUID       `gorm:"type:uuid;not null" json:"salesRepId"`
+	PeriodStart  time.Time       `gorm:"type:date;not null" json:"periodStart"`
+	PeriodEnd    time.Time       `gorm:"type:date;not null" json:"periodEnd"`
+	TargetAmount decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"targetAmount"`
+	Currency     string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	CreatedAt    time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt    time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy    *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy    *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
 FILE: ./models/payment_term.go
 ================================================================================
 
@@ -354,6 +478,40 @@ type PaymentTerm struct {
 	UpdatedAt       time.Time       `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID      `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy       *uuid.UUID      `gorm:"type:uuid" json:"updatedBy,omitempty"`
+}
+
+
+
+================================================================================
+FILE: ./models/commission_rule.go
+================================================================================
+
+package models
+
+import (
+	"auth-service/internal/sales/models/enums"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+type CommissionRule struct {
+	RuleID       uuid.UUID                `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
+	CompanyID    uuid.UUID                `gorm:"type:uuid;not null;index"`
+	PlanID       uuid.UUID                `gorm:"type:uuid;not null;index"`
+	RuleType     enums.CommissionRuleType `gorm:"type:varchar(20);not null"`
+	AppliesTo    enums.CommissionBaseType `gorm:"type:sales.commission_base_type;not null"`
+	ProductID    *uuid.UUID               `gorm:"type:uuid"`
+	TierMin      *decimal.Decimal         `gorm:"type:numeric(14,4)"`
+	TierMax      *decimal.Decimal         `gorm:"type:numeric(14,4)"`
+	Rate         decimal.Decimal          `gorm:"type:numeric(14,4);not null"`
+	IsPercentage bool                     `gorm:"default:true"`
+	Priority     int                      `gorm:"default:0"`
+	CreatedAt    time.Time                `gorm:"default:now()"`
+	UpdatedAt    time.Time                `gorm:"autoUpdateTime"`
+	CreatedBy    *uuid.UUID
+	UpdatedBy    *uuid.UUID
 }
 
 
@@ -1080,6 +1238,129 @@ func (SalesRepPerformance) TableName() string {
 
 
 ================================================================================
+FILE: ./models/sales_analytics/credit_check_analysis.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// CreditCheckFact represents each credit eligibility check performed.
+type CreditCheckFact struct {
+	ID                 int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID          uuid.UUID       `gorm:"type:uuid;not null;index:idx_credit_check_fact_company_date,priority:1;index:idx_credit_check_fact_company" json:"companyId"`
+	CustomerID         uuid.UUID       `gorm:"type:uuid;not null;index:idx_credit_check_fact_customer" json:"customerId"`
+	CheckID            *uuid.UUID      `gorm:"type:uuid;index" json:"checkId,omitempty"`                                   // optional reference to credit_check_history
+	CheckType          string          `gorm:"type:varchar(20);not null" json:"checkType"`                                 // customer_limit, order_eligibility, invoice_eligibility
+	Result             string          `gorm:"type:varchar(20);not null;index:idx_credit_check_fact_result" json:"result"` // approved, denied, suspended
+	RequestedAmount    decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"requestedAmount"`
+	CurrentLimit       decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"currentLimit"`
+	CurrentOutstanding decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"currentOutstanding"`
+	AvailableCredit    decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"availableCredit"`
+	Reason             *string         `gorm:"type:text" json:"reason,omitempty"`
+	CheckedAt          time.Time       `gorm:"type:timestamptz;not null;index:idx_credit_check_fact_company_date,priority:2" json:"checkedAt"`
+	CreatedAt          time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CreditCheckFact) TableName() string {
+	return "sales_analytics.credit_check_fact"
+}
+
+// DailyCreditMetrics holds aggregated credit metrics per company per day.
+type DailyCreditMetrics struct {
+	ID                       int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID                uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_daily_credit_metrics_company_date,priority:1" json:"companyId"`
+	Date                     time.Time       `gorm:"type:date;not null;uniqueIndex:idx_daily_credit_metrics_company_date,priority:2" json:"date"`
+	TotalChecks              int             `gorm:"default:0" json:"totalChecks"`
+	ChecksPassed             int             `gorm:"default:0" json:"checksPassed"`
+	ChecksFailed             int             `gorm:"default:0" json:"checksFailed"`
+	TotalOrderValueChecked   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalOrderValueChecked"`
+	TotalInvoiceValueChecked decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalInvoiceValueChecked"`
+	AvgAvailableCredit       decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"avgAvailableCredit"`
+	AvgCreditUtilization     decimal.Decimal `gorm:"type:numeric(5,2);default:0" json:"avgCreditUtilization"` // percentage
+	UpdatedAt                time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (DailyCreditMetrics) TableName() string {
+	return "sales_analytics.daily_credit_metrics"
+}
+
+// CreditHoldFact tracks when orders are placed on credit hold and when they are released.
+type CreditHoldFact struct {
+	ID              int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	OrderID         uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex:idx_credit_hold_fact_order_hold,priority:1" json:"orderId"`
+	CompanyID       uuid.UUID  `gorm:"type:uuid;not null;index:idx_credit_hold_fact_company_date,priority:1;index:idx_credit_hold_fact_company" json:"companyId"`
+	CustomerID      uuid.UUID  `gorm:"type:uuid;not null;index:idx_credit_hold_fact_customer" json:"customerId"`
+	HoldStartedAt   time.Time  `gorm:"type:timestamptz;not null;uniqueIndex:idx_credit_hold_fact_order_hold,priority:2;index:idx_credit_hold_fact_company_date,priority:2" json:"holdStartedAt"`
+	HoldEndedAt     *time.Time `gorm:"type:timestamptz" json:"holdEndedAt,omitempty"`
+	DurationSeconds *int64     `gorm:"->" json:"durationSeconds,omitempty"` // computed
+	Reason          *string    `gorm:"type:text" json:"reason,omitempty"`
+	CreatedAt       time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CreditHoldFact) TableName() string {
+	return "sales_analytics.credit_hold_fact"
+}
+
+// CreditLimitChangeFact records detailed history of credit limit adjustments.
+type CreditLimitChangeFact struct {
+	ID            int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID     uuid.UUID       `gorm:"type:uuid;not null;index:idx_credit_limit_change_company,priority:1;index:idx_credit_limit_change_company_date" json:"companyId"`
+	CustomerID    uuid.UUID       `gorm:"type:uuid;not null;index:idx_credit_limit_change_customer" json:"customerId"`
+	PreviousLimit decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"previousLimit"`
+	NewLimit      decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"newLimit"`
+	ChangeAmount  decimal.Decimal `gorm:"->" json:"changeAmount"` // computed
+	ChangeReason  *string         `gorm:"type:text" json:"changeReason,omitempty"`
+	ChangedBy     *uuid.UUID      `gorm:"type:uuid" json:"changedBy,omitempty"`
+	ChangedAt     time.Time       `gorm:"type:timestamptz;not null;index:idx_credit_limit_change_company,priority:2" json:"changedAt"`
+	CreatedAt     time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CreditLimitChangeFact) TableName() string {
+	return "sales_analytics.credit_limit_change_fact"
+}
+
+// CustomerCreditDailySnapshot provides a point-in-time view of each customer’s credit situation.
+type CustomerCreditDailySnapshot struct {
+	SnapshotID         int64           `gorm:"primaryKey;autoIncrement" json:"snapshotId"`
+	CompanyID          uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_customer_credit_snapshot_unique,priority:1;index:idx_customer_credit_snapshot_company_date" json:"companyId"`
+	CustomerID         uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_customer_credit_snapshot_unique,priority:2;index:idx_customer_credit_snapshot_customer" json:"customerId"`
+	SnapshotDate       time.Time       `gorm:"type:date;not null;uniqueIndex:idx_customer_credit_snapshot_unique,priority:3;index:idx_customer_credit_snapshot_company_date,priority:2" json:"snapshotDate"`
+	CreditLimit        decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"creditLimit"`
+	OutstandingBalance decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"outstandingBalance"`
+	AvailableCredit    decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"availableCredit"`
+	UtilizationPct     decimal.Decimal `gorm:"->" json:"utilizationPct"` // computed
+	IsSuspended        bool            `gorm:"default:false" json:"isSuspended"`
+	CreatedAt          time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CustomerCreditDailySnapshot) TableName() string {
+	return "sales_analytics.customer_credit_daily_snapshot"
+}
+
+// CurrentCustomerCredit is a materialized view reflecting real-time credit status per customer.
+type CurrentCustomerCredit struct {
+	CustomerID         uuid.UUID       `gorm:"type:uuid;primaryKey;index:idx_current_credit_customer" json:"customerId"`
+	CompanyID          uuid.UUID       `gorm:"type:uuid;not null;index:idx_current_credit_company" json:"companyId"`
+	CreditLimit        decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"creditLimit"`
+	OutstandingBalance decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"outstandingBalance"`
+	AvailableCredit    decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"availableCredit"`
+	UtilizationPct     decimal.Decimal `gorm:"type:numeric(5,2)" json:"utilizationPct"` // computed in view
+	IsSuspended        bool            `json:"isSuspended"`
+}
+
+func (CurrentCustomerCredit) TableName() string {
+	return "sales_analytics.current_customer_credit"
+}
+
+
+
+================================================================================
 FILE: ./models/sales_analytics/daily_invoice_metrics.go
 ================================================================================
 
@@ -1320,6 +1601,171 @@ type QuoteItemAnalytics struct {
 
 func (QuoteItemAnalytics) TableName() string {
 	return "sales_analytics.quote_item_analytics"
+}
+
+
+
+================================================================================
+FILE: ./models/sales_analytics/sales_rep_analytics.go
+================================================================================
+
+package sales_analytics
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+)
+
+// SalesRepTargetAchievement represents the sales_analytics.sales_rep_target_achievement table.
+type SalesRepTargetAchievement struct {
+	ID             int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID      uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_company_rep_period,priority:1" json:"companyId"`
+	SalesRepID     uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_company_rep_period,priority:2" json:"salesRepId"`
+	PeriodStart    time.Time       `gorm:"type:date;not null;uniqueIndex:idx_company_rep_period,priority:3" json:"periodStart"`
+	PeriodEnd      time.Time       `gorm:"type:date;not null;uniqueIndex:idx_company_rep_period,priority:4" json:"periodEnd"`
+	TargetAmount   decimal.Decimal `gorm:"type:numeric(14,2);not null" json:"targetAmount"`
+	ActualRevenue  decimal.Decimal `gorm:"type:numeric(14,2);not null;default:0" json:"actualRevenue"`
+	AchievementPct decimal.Decimal `gorm:"->" json:"achievementPct"` // generated column
+	Currency       string          `gorm:"type:varchar(3);not null;default:'USD'" json:"currency"`
+	CreatedAt      time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt      time.Time       `gorm:"not null;default:now()" json:"updatedAt"`
+}
+
+func (SalesRepTargetAchievement) TableName() string {
+	return "sales_analytics.sales_rep_target_achievement"
+}
+
+// SalesRepCommissionFact represents the sales_analytics.sales_rep_commission_fact table.
+// Updated with plan_id and rule_id columns.
+type SalesRepCommissionFact struct {
+	ID               int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID        uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_company_entity,priority:1" json:"companyId"`
+	SalesRepID       uuid.UUID       `gorm:"type:uuid;not null;index:idx_commission_fact_rep" json:"salesRepId"`
+	EntityType       string          `gorm:"type:varchar(20);not null;uniqueIndex:idx_company_entity,priority:2" json:"entityType"` // 'order', 'invoice', 'payment'
+	EntityID         uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_company_entity,priority:3" json:"entityId"`
+	CommissionBase   decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"commissionBase"`
+	CommissionRate   decimal.Decimal `gorm:"type:numeric(5,2);not null" json:"commissionRate"`
+	CommissionAmount decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"commissionAmount"`
+	EarnedAt         time.Time       `gorm:"type:timestamptz;not null;index:idx_commission_fact_earned" json:"earnedAt"`
+	PaidAt           *time.Time      `gorm:"type:timestamptz;index:idx_commission_fact_paid" json:"paidAt,omitempty"`
+	PlanID           *uuid.UUID      `gorm:"type:uuid;index:idx_commission_fact_plan" json:"planId,omitempty"`
+	RuleID           *uuid.UUID      `gorm:"type:uuid;index:idx_commission_fact_rule" json:"ruleId,omitempty"`
+	CreatedAt        time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+func (SalesRepCommissionFact) TableName() string {
+	return "sales_analytics.sales_rep_commission_fact"
+}
+
+// SalesRepLeaderboardSnapshot represents the sales_analytics.sales_rep_leaderboard_snapshot table.
+type SalesRepLeaderboardSnapshot struct {
+	ID           int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID    uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_company_snapshot_rep,priority:1" json:"companyId"`
+	SnapshotDate time.Time       `gorm:"type:date;not null;uniqueIndex:idx_company_snapshot_rep,priority:2;index:idx_leaderboard_snapshot_company_date" json:"snapshotDate"`
+	PeriodStart  time.Time       `gorm:"type:date;not null" json:"periodStart"`
+	PeriodEnd    time.Time       `gorm:"type:date;not null" json:"periodEnd"`
+	SalesRepID   uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_company_snapshot_rep,priority:3;index:idx_leaderboard_snapshot_rep" json:"salesRepId"`
+	Rank         int             `gorm:"not null" json:"rank"`
+	Revenue      decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"revenue"`
+	OrdersCount  int             `gorm:"not null" json:"ordersCount"`
+	AverageDeal  decimal.Decimal `gorm:"type:numeric(14,4);not null" json:"averageDeal"`
+	CreatedAt    time.Time       `gorm:"not null;default:now()" json:"createdAt"`
+}
+
+func (SalesRepLeaderboardSnapshot) TableName() string {
+	return "sales_analytics.sales_rep_leaderboard_snapshot"
+}
+
+// CommissionPlanDaily represents the sales_analytics.commission_plan_daily table.
+type CommissionPlanDaily struct {
+	ID                     int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID              uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_commission_plan_daily_company_plan_date,priority:1" json:"companyId"`
+	PlanID                 uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_commission_plan_daily_company_plan_date,priority:2" json:"planId"`
+	Date                   time.Time       `gorm:"type:date;not null;uniqueIndex:idx_commission_plan_daily_company_plan_date,priority:3" json:"date"`
+	TotalCommissionsEarned decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalCommissionsEarned"`
+	TotalCommissionsPaid   decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalCommissionsPaid"`
+	CommissionCount        int             `gorm:"not null;default:0" json:"commissionCount"`
+	AverageRate            decimal.Decimal `gorm:"type:numeric(10,2);not null;default:0" json:"averageRate"`
+	UniqueSalesReps        int             `gorm:"not null;default:0" json:"uniqueSalesReps"`
+	UpdatedAt              time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CommissionPlanDaily) TableName() string {
+	return "sales_analytics.commission_plan_daily"
+}
+
+// CommissionRuleFact represents the sales_analytics.commission_rule_fact table.
+type CommissionRuleFact struct {
+	ID                    int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID             uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_commission_rule_fact_company_rule_date,priority:1" json:"companyId"`
+	RuleID                uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_commission_rule_fact_company_rule_date,priority:2" json:"ruleId"`
+	PlanID                uuid.UUID       `gorm:"type:uuid;not null;index:idx_commission_rule_fact_plan" json:"planId"`
+	Date                  time.Time       `gorm:"type:date;not null;uniqueIndex:idx_commission_rule_fact_company_rule_date,priority:3" json:"date"`
+	TimesApplied          int             `gorm:"not null;default:0" json:"timesApplied"`
+	TotalCommissionBase   decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalCommissionBase"`
+	TotalCommissionAmount decimal.Decimal `gorm:"type:numeric(14,4);not null;default:0" json:"totalCommissionAmount"`
+	AvgRate               decimal.Decimal `gorm:"type:numeric(10,2);not null;default:0" json:"avgRate"`
+	UpdatedAt             time.Time       `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CommissionRuleFact) TableName() string {
+	return "sales_analytics.commission_rule_fact"
+}
+
+// CommissionAssignmentFact represents the sales_analytics.commission_assignment_fact table.
+type CommissionAssignmentFact struct {
+	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID    uuid.UUID  `gorm:"type:uuid;not null;index:idx_assignment_fact_company" json:"companyId"`
+	SalesRepID   uuid.UUID  `gorm:"type:uuid;not null;index:idx_assignment_fact_rep" json:"salesRepId"`
+	PlanID       uuid.UUID  `gorm:"type:uuid;not null;index:idx_assignment_fact_plan" json:"planId"`
+	AssignedAt   time.Time  `gorm:"type:date;not null" json:"assignedAt"`
+	RemovedAt    *time.Time `gorm:"type:date" json:"removedAt,omitempty"`
+	DurationDays int        `gorm:"->" json:"durationDays"` // generated column
+	AssignedBy   *uuid.UUID `gorm:"type:uuid" json:"assignedBy,omitempty"`
+	CreatedAt    time.Time  `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CommissionAssignmentFact) TableName() string {
+	return "sales_analytics.commission_assignment_fact"
+}
+
+// CommissionLifecycle represents the sales_analytics.commission_lifecycle table.
+type CommissionLifecycle struct {
+	CommissionID       uuid.UUID  `gorm:"type:uuid;primaryKey" json:"commissionId"`
+	CompanyID          uuid.UUID  `gorm:"type:uuid;not null;index" json:"companyId"`
+	SalesRepID         uuid.UUID  `gorm:"type:uuid;not null;index" json:"salesRepId"`
+	ReferenceType      string     `gorm:"type:varchar(20);not null" json:"referenceType"`
+	ReferenceID        uuid.UUID  `gorm:"type:uuid;not null" json:"referenceId"`
+	EarnedAt           time.Time  `gorm:"type:timestamptz;not null" json:"earnedAt"`
+	ApprovedAt         *time.Time `gorm:"type:timestamptz" json:"approvedAt,omitempty"`
+	PaidAt             *time.Time `gorm:"type:timestamptz" json:"paidAt,omitempty"`
+	RejectedAt         *time.Time `gorm:"type:timestamptz" json:"rejectedAt,omitempty"`
+	ApprovalDelayHours *float64   `gorm:"->" json:"approvalDelayHours,omitempty"` // generated column
+	PaymentDelayHours  *float64   `gorm:"->" json:"paymentDelayHours,omitempty"`  // generated column
+	CurrentStatus      string     `gorm:"type:varchar(20);not null;index:idx_commission_lifecycle_status" json:"currentStatus"`
+	UpdatedAt          time.Time  `gorm:"default:now()" json:"updatedAt"`
+}
+
+func (CommissionLifecycle) TableName() string {
+	return "sales_analytics.commission_lifecycle"
+}
+
+// CommissionForecastSnapshot represents the sales_analytics.commission_forecast_snapshot table.
+type CommissionForecastSnapshot struct {
+	ID                                 int64           `gorm:"primaryKey;autoIncrement" json:"id"`
+	CompanyID                          uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_commission_forecast_company_date_rep,priority:1" json:"companyId"`
+	SnapshotDate                       time.Time       `gorm:"type:date;not null;uniqueIndex:idx_commission_forecast_company_date_rep,priority:2" json:"snapshotDate"`
+	SalesRepID                         uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex:idx_commission_forecast_company_date_rep,priority:3;index:idx_commission_forecast_rep" json:"salesRepId"`
+	ExpectedCommissionFromOpenOrders   decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"expectedCommissionFromOpenOrders"`
+	ExpectedCommissionFromOpenInvoices decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"expectedCommissionFromOpenInvoices"`
+	TotalExpectedCommission            decimal.Decimal `gorm:"type:numeric(14,4);default:0" json:"totalExpectedCommission"`
+	CreatedAt                          time.Time       `gorm:"default:now()" json:"createdAt"`
+}
+
+func (CommissionForecastSnapshot) TableName() string {
+	return "sales_analytics.commission_forecast_snapshot"
 }
 
 
@@ -2113,6 +2559,66 @@ func (m PaymentMethod) IsValid() bool {
 }
 
 func (m PaymentMethod) String() string { return string(m) }
+
+
+
+================================================================================
+FILE: ./models/enums/credit_check_status.go
+================================================================================
+
+package enums
+
+type CreditCheckStatus string
+
+const (
+	CreditCheckPending  CreditCheckStatus = "pending"
+	CreditCheckApproved CreditCheckStatus = "approved"
+	CreditCheckRejected CreditCheckStatus = "rejected"
+	CreditCheckHold     CreditCheckStatus = "hold"
+)
+
+func (s CreditCheckStatus) IsValid() bool {
+	switch s {
+	case CreditCheckPending, CreditCheckApproved, CreditCheckRejected, CreditCheckHold:
+		return true
+	}
+	return false
+}
+
+
+
+================================================================================
+FILE: ./models/enums/commission.go
+================================================================================
+
+package enums
+
+type CommissionReferenceType string
+
+const (
+	CommissionReferenceTypeOrder   CommissionReferenceType = "order"
+	CommissionReferenceTypeInvoice CommissionReferenceType = "invoice"
+	CommissionReferenceTypePayment CommissionReferenceType = "payment"
+)
+
+type CommissionStatus string
+
+const (
+	CommissionStatusPending  CommissionStatus = "pending"
+	CommissionStatusApproved CommissionStatus = "approved"
+	CommissionStatusPaid     CommissionStatus = "paid"
+	CommissionStatusRejected CommissionStatus = "rejected"
+	CommissionStatusReversed CommissionStatus = "reversed"
+)
+
+type CommissionRuleType string
+
+const (
+	CommissionRuleTypeFlat     CommissionRuleType = "flat"
+	CommissionRuleTypeTiered   CommissionRuleType = "tiered"
+	CommissionRuleTypeProduct  CommissionRuleType = "product"
+	CommissionRuleTypeCategory CommissionRuleType = "category"
+)
 
 
 

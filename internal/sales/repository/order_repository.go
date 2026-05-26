@@ -17,13 +17,13 @@ import (
 )
 
 // -------------------------------------------------------------------------
-// OrderFilter – now includes SalesRepID
+// OrderFilter – includes credit fields
 // -------------------------------------------------------------------------
 
 type OrderFilter struct {
 	CompanyID     uuid.UUID
 	CustomerID    *uuid.UUID
-	SalesRepID    *uuid.UUID // NEW: filter by sales representative
+	SalesRepID    *uuid.UUID
 	OrderIDs      []uuid.UUID
 	Statuses      []enums.OrderStatus
 	OrderNumber   *string
@@ -39,9 +39,11 @@ type OrderFilter struct {
 	CreatedTo     *time.Time
 	UpdatedFrom   *time.Time
 	UpdatedTo     *time.Time
+	CreditHold    *bool                    // NEW: filter by credit hold status
+	CreditStatus  *enums.CreditCheckStatus // NEW: filter by credit status
 }
 
-// OrderRepository interface (unchanged apart from filter)
+// OrderRepository interface (adds credit fields in methods where needed)
 type OrderRepository interface {
 	Create(ctx context.Context, db DBTX, order *models.Order, items []*models.OrderItem) error
 	GetByID(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) (*models.Order, error)
@@ -140,7 +142,7 @@ func (r *orderRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// buildOrderFilter now includes sales_rep_id
+// buildOrderFilter now includes credit_hold and credit_status
 func (r *orderRepository) buildOrderFilter(filter OrderFilter) (string, []interface{}) {
 	var conds []string
 	var args []interface{}
@@ -244,6 +246,16 @@ func (r *orderRepository) buildOrderFilter(filter OrderFilter) (string, []interf
 		args = append(args, *filter.UpdatedTo)
 		idx++
 	}
+	if filter.CreditHold != nil {
+		conds = append(conds, fmt.Sprintf("credit_hold = $%d", idx))
+		args = append(args, *filter.CreditHold)
+		idx++
+	}
+	if filter.CreditStatus != nil {
+		conds = append(conds, fmt.Sprintf("credit_status = $%d", idx))
+		args = append(args, string(*filter.CreditStatus))
+		idx++
+	}
 
 	if len(conds) == 0 {
 		return "", args
@@ -251,13 +263,14 @@ func (r *orderRepository) buildOrderFilter(filter OrderFilter) (string, []interf
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanOrder now includes sales_rep_id
+// scanOrder now includes credit_hold and credit_status
 func (r *orderRepository) scanOrder(s scanner) (*models.Order, error) {
 	var o models.Order
 	var externalRef, notes, cancellationReason sql.NullString
 	var confirmedAt, shippedAt, deliveredAt, cancelledAt sql.NullTime
 	var createdBy, updatedBy, salesRepID uuid.NullUUID
 	var shippingAddress, billingAddress models.JSONB
+	var creditStatus string
 
 	err := s.Scan(
 		&o.OrderID,
@@ -285,6 +298,8 @@ func (r *orderRepository) scanOrder(s scanner) (*models.Order, error) {
 		&o.UpdatedAt,
 		&createdBy,
 		&updatedBy,
+		&o.CreditHold, // new
+		&creditStatus, // new
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -325,6 +340,7 @@ func (r *orderRepository) scanOrder(s scanner) (*models.Order, error) {
 	}
 	o.ShippingAddress = shippingAddress
 	o.BillingAddress = billingAddress
+	o.CreditStatus = enums.CreditCheckStatus(creditStatus)
 	return &o, nil
 }
 
@@ -367,7 +383,7 @@ func (r *orderRepository) scanOrderItem(s scanner) (*models.OrderItem, error) {
 }
 
 // -------------------------------------------------------------------------
-// ORDER CRUD (with sales_rep_id)
+// ORDER CRUD (with credit fields)
 // -------------------------------------------------------------------------
 
 func (r *orderRepository) Create(ctx context.Context, db DBTX, order *models.Order, items []*models.OrderItem) error {
@@ -382,13 +398,15 @@ func (r *orderRepository) Create(ctx context.Context, db DBTX, order *models.Ord
 			order_date, status, currency, subtotal, discount_total, tax_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10, $11,
 			$12, $13, $14,
 			$15, $16, $17, $18, $19,
-			$20, NOW(), NOW(), $21, $22
+			$20, NOW(), NOW(), $21, $22,
+			$23, $24
 		)
 		RETURNING created_at, updated_at
 	`
@@ -415,6 +433,8 @@ func (r *orderRepository) Create(ctx context.Context, db DBTX, order *models.Ord
 		r.nullUUIDParam(order.SalesRepID),
 		r.nullUUIDParam(order.CreatedBy),
 		r.nullUUIDParam(order.UpdatedBy),
+		order.CreditHold,
+		string(order.CreditStatus),
 	).Scan(&order.CreatedAt, &order.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create order", zap.Error(err))
@@ -436,7 +456,8 @@ func (r *orderRepository) GetByID(ctx context.Context, db DBTX, companyID, order
 			order_date, status, currency, subtotal, discount_total, tax_total, grand_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		FROM sales.orders
 		WHERE company_id = $1 AND order_id = $2
 	`
@@ -451,7 +472,8 @@ func (r *orderRepository) GetByNumber(ctx context.Context, db DBTX, companyID uu
 			order_date, status, currency, subtotal, discount_total, tax_total, grand_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		FROM sales.orders
 		WHERE company_id = $1 AND order_number = $2
 	`
@@ -480,8 +502,10 @@ func (r *orderRepository) Update(ctx context.Context, db DBTX, order *models.Ord
 			cancelled_at = $18,
 			cancellation_reason = $19,
 			sales_rep_id = $20,
+			credit_hold = $21,
+			credit_status = $22,
 			updated_at = NOW(),
-			updated_by = $21
+			updated_by = $23
 		WHERE order_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -506,6 +530,8 @@ func (r *orderRepository) Update(ctx context.Context, db DBTX, order *models.Ord
 		order.CancelledAt,
 		r.nullStringParam(order.CancellationReason),
 		r.nullUUIDParam(order.SalesRepID),
+		order.CreditHold,
+		string(order.CreditStatus),
 		r.nullUUIDParam(order.UpdatedBy),
 	).Scan(&order.UpdatedAt)
 	if err != nil {
@@ -862,7 +888,7 @@ func (r *orderRepository) HasReturns(ctx context.Context, db DBTX, companyID, or
 }
 
 // -------------------------------------------------------------------------
-// QUERYING / LISTING
+// QUERYING / LISTING (with credit fields)
 // -------------------------------------------------------------------------
 
 func (r *orderRepository) List(ctx context.Context, db DBTX, filter OrderFilter, p Pagination, s Sort) ([]*models.Order, int64, error) {
@@ -871,14 +897,16 @@ func (r *orderRepository) List(ctx context.Context, db DBTX, filter OrderFilter,
 		return nil, 0, fmt.Errorf("list requires at least company_id filter")
 	}
 	allowedSort := map[string]bool{
-		"order_number": true,
-		"order_date":   true,
-		"status":       true,
-		"customer_id":  true,
-		"subtotal":     true,
-		"grand_total":  true,
-		"created_at":   true,
-		"updated_at":   true,
+		"order_number":  true,
+		"order_date":    true,
+		"status":        true,
+		"customer_id":   true,
+		"subtotal":      true,
+		"grand_total":   true,
+		"created_at":    true,
+		"updated_at":    true,
+		"credit_hold":   true,
+		"credit_status": true,
 	}
 	orderBy, err := r.validateSort(s, allowedSort)
 	if err != nil {
@@ -905,7 +933,8 @@ func (r *orderRepository) List(ctx context.Context, db DBTX, filter OrderFilter,
 			order_date, status, currency, subtotal, discount_total, tax_total, grand_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		FROM sales.orders
 		%s
 		%s
@@ -954,7 +983,8 @@ func (r *orderRepository) Search(ctx context.Context, db DBTX, companyID uuid.UU
 			order_date, status, currency, subtotal, discount_total, tax_total, grand_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		FROM sales.orders
 		WHERE company_id = $1
 		AND (order_number ILIKE $2 OR external_ref ILIKE $3 OR notes ILIKE $4)
@@ -1003,7 +1033,8 @@ func (r *orderRepository) GetOrdersReadyForInvoicing(ctx context.Context, db DBT
 			o.order_date, o.status, o.currency, o.subtotal, o.discount_total, o.tax_total, o.grand_total,
 			o.notes, o.shipping_address, o.billing_address,
 			o.confirmed_at, o.shipped_at, o.delivered_at, o.cancelled_at, o.cancellation_reason,
-			o.sales_rep_id, o.created_at, o.updated_at, o.created_by, o.updated_by
+			o.sales_rep_id, o.created_at, o.updated_at, o.created_by, o.updated_by,
+			o.credit_hold, o.credit_status
 		FROM sales.orders o
 		LEFT JOIN sales.invoices i ON o.order_id = i.order_id
 		WHERE o.company_id = $1
@@ -1113,7 +1144,8 @@ func (r *orderRepository) GetTopOrdersByValue(ctx context.Context, db DBTX, comp
 			order_date, status, currency, subtotal, discount_total, tax_total, grand_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		FROM sales.orders
 		WHERE %s
 		ORDER BY grand_total DESC
@@ -1139,7 +1171,7 @@ func (r *orderRepository) GetTopOrdersByValue(ctx context.Context, db DBTX, comp
 }
 
 // -------------------------------------------------------------------------
-// CONCURRENCY / LOCKING (with sales_rep_id)
+// CONCURRENCY / LOCKING (with credit fields)
 // -------------------------------------------------------------------------
 
 func (r *orderRepository) GetByIDForUpdate(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) (*models.Order, error) {
@@ -1149,7 +1181,8 @@ func (r *orderRepository) GetByIDForUpdate(ctx context.Context, db DBTX, company
 			order_date, status, currency, subtotal, discount_total, tax_total, grand_total,
 			notes, shipping_address, billing_address,
 			confirmed_at, shipped_at, delivered_at, cancelled_at, cancellation_reason,
-			sales_rep_id, created_at, updated_at, created_by, updated_by
+			sales_rep_id, created_at, updated_at, created_by, updated_by,
+			credit_hold, credit_status
 		FROM sales.orders
 		WHERE company_id = $1 AND order_id = $2
 		FOR UPDATE

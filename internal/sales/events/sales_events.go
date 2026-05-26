@@ -332,3 +332,56 @@ type SalesTargetPayload struct {
 	TargetAmount string `json:"target_amount"`
 	Currency     string `json:"currency"`
 }
+
+// Commission events for analytics
+const (
+	EventCommissionCreated  = "sales.commission.created"
+	EventCommissionApproved = "sales.commission.approved"
+	EventCommissionPaid     = "sales.commission.paid"
+	EventCommissionRejected = "sales.commission.rejected"
+	EventCommissionUpdated  = "sales.commission.updated"
+
+	EventCommissionPlanAssigned = "sales.commission_plan.assigned"
+	EventCommissionPlanRemoved  = "sales.commission_plan.removed"
+)
+
+// CommissionPayload is used for EventCommissionCreated
+type CommissionPayload struct {
+	CommissionID     string `json:"commission_id"`
+	CompanyID        string `json:"company_id"`
+	SalesRepID       string `json:"sales_rep_id"`
+	ReferenceType    string `json:"reference_type"` // "order", "invoice", "payment"
+	ReferenceID      string `json:"reference_id"`
+	CommissionBase   string `json:"commission_base"`
+	CommissionRate   string `json:"commission_rate"`
+	CommissionAmount string `json:"commission_amount"`
+	EarnedAt         string `json:"earned_at"` // RFC3339
+	Status           string `json:"status"`
+	PlanID           string `json:"plan_id,omitempty"`
+	RuleID           string `json:"rule_id,omitempty"`
+}
+
+// CommissionStatusPayload for approved/paid/rejected events
+type CommissionStatusPayload struct {
+	CommissionID string `json:"commission_id"`
+	CompanyID    string `json:"company_id"`
+	UpdatedAt    string `json:"updated_at"`       // RFC3339
+	Reason       string `json:"reason,omitempty"` // for rejection
+}
+
+// CommissionAssignmentPayload for assign/remove events
+type CommissionAssignmentPayload struct {
+	CompanyID     string `json:"company_id"`
+	SalesRepID    string `json:"sales_rep_id"`
+	PlanID        string `json:"plan_id"`
+	EffectiveFrom string `json:"effective_from"` // RFC3339 (date)
+	RemovedAt     string `json:"removed_at,omitempty"`
+	AssignedBy    string `json:"assigned_by,omitempty"`
+}
+
+const (
+	EventCustomerCreditLimitChanged = "sales.customer.credit_limit_changed"
+	EventOrderCreditHeld            = "sales.order.credit_held"
+	EventOrderCreditReleased        = "sales.order.credit_released"
+	EventCreditCheckFailed          = "sales.credit_check.failed"
+)

@@ -176,7 +176,44 @@ type AnalyticsRepository interface {
 	GetSalesRepLeaderboardSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) ([]*sales_analytics.SalesRepLeaderboardSnapshot, error)
 	// RefundFact
 	InsertRefundFact(ctx context.Context, db DBTX, fact *sales_analytics.RefundFact) error
+	// CommissionPlanDaily
+	UpsertCommissionPlanDaily(ctx context.Context, db DBTX, daily *sales_analytics.CommissionPlanDaily) error
+	IncrementCommissionPlanDaily(ctx context.Context, db DBTX, companyID, planID uuid.UUID, date time.Time, earnedAmount, paidAmount decimal.Decimal, rate decimal.Decimal, salesRepID uuid.UUID) error
 
+	// CommissionRuleFact
+	UpsertCommissionRuleFact(ctx context.Context, db DBTX, fact *sales_analytics.CommissionRuleFact) error
+	IncrementCommissionRuleFact(ctx context.Context, db DBTX, companyID, ruleID, planID uuid.UUID, date time.Time, commissionBase, commissionAmount decimal.Decimal, rate decimal.Decimal) error
+
+	// CommissionAssignmentFact
+	InsertCommissionAssignmentFact(ctx context.Context, db DBTX, fact *sales_analytics.CommissionAssignmentFact) error
+	CloseCommissionAssignmentFact(ctx context.Context, db DBTX, companyID, salesRepID, planID uuid.UUID, removedAt time.Time) error
+
+	// CommissionLifecycle
+	InsertCommissionLifecycle(ctx context.Context, db DBTX, lifecycle *sales_analytics.CommissionLifecycle) error
+	UpdateCommissionLifecycle(ctx context.Context, db DBTX, commissionID uuid.UUID, status string, approvedAt, paidAt, rejectedAt *time.Time) error
+	// CreditCheckFact
+	InsertCreditCheckFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditCheckFact) error
+
+	// DailyCreditMetrics
+	UpsertDailyCreditMetrics(ctx context.Context, db DBTX, metrics *sales_analytics.DailyCreditMetrics) error
+	IncrementDailyCreditMetrics(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, passed bool, requestedAmount decimal.Decimal, checkType string, availableCredit decimal.Decimal, utilizationPct decimal.Decimal) error
+
+	// CreditHoldFact
+	InsertCreditHoldFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditHoldFact) error
+	CloseCreditHoldFact(ctx context.Context, db DBTX, orderID uuid.UUID, holdEndedAt time.Time) error
+
+	// CreditLimitChangeFact
+	InsertCreditLimitChangeFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditLimitChangeFact) error
+
+	// CustomerCreditDailySnapshot
+	UpsertCustomerCreditDailySnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.CustomerCreditDailySnapshot) error
+	RefreshCustomerCreditDailySnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
+
+	// CurrentCustomerCredit (materialized view)
+	RefreshCurrentCustomerCredit(ctx context.Context, db DBTX) error
+	// CommissionForecastSnapshot
+	UpsertCommissionForecastSnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.CommissionForecastSnapshot) error
+	RefreshCommissionForecastSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error
 	// ReturnProductCategoryFact
 	UpsertReturnProductCategoryFact(ctx context.Context, db DBTX, fact *sales_analytics.ReturnProductCategoryFact) error
 	IncrementReturnProductCategory(ctx context.Context, db DBTX, companyID uuid.UUID, categoryID *uuid.UUID, categoryName *string, returnDate time.Time, quantity decimal.Decimal, refundAmount decimal.Decimal, isUniqueReturn bool) error
@@ -2601,4 +2638,470 @@ func (r *analyticsRepository) GetSalesRepLeaderboardSnapshot(ctx context.Context
 		result = append(result, &s)
 	}
 	return result, rows.Err()
+}
+
+// -------------------- Commission Plan Daily --------------------
+func (r *analyticsRepository) UpsertCommissionPlanDaily(ctx context.Context, db DBTX, daily *sales_analytics.CommissionPlanDaily) error {
+	query := `
+		INSERT INTO sales_analytics.commission_plan_daily
+			(company_id, plan_id, date,
+			 total_commissions_earned, total_commissions_paid,
+			 commission_count, average_rate, unique_sales_reps, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		ON CONFLICT (company_id, plan_id, date) DO UPDATE SET
+			total_commissions_earned = EXCLUDED.total_commissions_earned,
+			total_commissions_paid = EXCLUDED.total_commissions_paid,
+			commission_count = EXCLUDED.commission_count,
+			average_rate = EXCLUDED.average_rate,
+			unique_sales_reps = EXCLUDED.unique_sales_reps,
+			updated_at = NOW()
+	`
+	_, err := db.ExecContext(ctx, query,
+		daily.CompanyID, daily.PlanID, daily.Date,
+		daily.TotalCommissionsEarned, daily.TotalCommissionsPaid,
+		daily.CommissionCount, daily.AverageRate, daily.UniqueSalesReps,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert commission plan daily: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) IncrementCommissionPlanDaily(ctx context.Context, db DBTX, companyID, planID uuid.UUID, date time.Time, earnedAmount, paidAmount decimal.Decimal, rate decimal.Decimal, salesRepID uuid.UUID) error {
+	// Check if this sales rep is already counted for this plan on this day
+	// Requires the bridge table sales_analytics.commission_plan_unique_reps
+	bridgeQuery := `
+		INSERT INTO sales_analytics.commission_plan_unique_reps (company_id, plan_id, date, sales_rep_id)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (company_id, plan_id, date, sales_rep_id) DO NOTHING
+		RETURNING 1
+	`
+	var inserted int
+	err := db.QueryRowContext(ctx, bridgeQuery, companyID, planID, date, salesRepID).Scan(&inserted)
+	isNewRep := err == nil // if no error, a row was inserted -> new unique rep
+
+	var updateQuery string
+	if isNewRep {
+		updateQuery = `
+			INSERT INTO sales_analytics.commission_plan_daily
+				(company_id, plan_id, date,
+				 total_commissions_earned, total_commissions_paid,
+				 commission_count, average_rate, unique_sales_reps, updated_at)
+			VALUES ($1, $2, $3, $4, $5, 1, $6, 1, NOW())
+			ON CONFLICT (company_id, plan_id, date) DO UPDATE SET
+				total_commissions_earned = commission_plan_daily.total_commissions_earned + EXCLUDED.total_commissions_earned,
+				total_commissions_paid = commission_plan_daily.total_commissions_paid + EXCLUDED.total_commissions_paid,
+				commission_count = commission_plan_daily.commission_count + 1,
+				average_rate = (commission_plan_daily.average_rate * commission_plan_daily.commission_count + EXCLUDED.average_rate) / (commission_plan_daily.commission_count + 1),
+				unique_sales_reps = commission_plan_daily.unique_sales_reps + 1,
+				updated_at = NOW()
+		`
+	} else {
+		updateQuery = `
+			INSERT INTO sales_analytics.commission_plan_daily
+				(company_id, plan_id, date,
+				 total_commissions_earned, total_commissions_paid,
+				 commission_count, average_rate, unique_sales_reps, updated_at)
+			VALUES ($1, $2, $3, $4, $5, 1, $6, 0, NOW())
+			ON CONFLICT (company_id, plan_id, date) DO UPDATE SET
+				total_commissions_earned = commission_plan_daily.total_commissions_earned + EXCLUDED.total_commissions_earned,
+				total_commissions_paid = commission_plan_daily.total_commissions_paid + EXCLUDED.total_commissions_paid,
+				commission_count = commission_plan_daily.commission_count + 1,
+				average_rate = (commission_plan_daily.average_rate * commission_plan_daily.commission_count + EXCLUDED.average_rate) / (commission_plan_daily.commission_count + 1),
+				updated_at = NOW()
+		`
+	}
+	_, err = db.ExecContext(ctx, updateQuery, companyID, planID, date, earnedAmount, paidAmount, rate)
+	if err != nil {
+		return fmt.Errorf("increment commission plan daily: %w", err)
+	}
+	return nil
+}
+
+// -------------------- Commission Rule Fact --------------------
+func (r *analyticsRepository) UpsertCommissionRuleFact(ctx context.Context, db DBTX, fact *sales_analytics.CommissionRuleFact) error {
+	query := `
+		INSERT INTO sales_analytics.commission_rule_fact
+			(company_id, rule_id, plan_id, date,
+			 times_applied, total_commission_base, total_commission_amount, avg_rate, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+		ON CONFLICT (company_id, rule_id, date) DO UPDATE SET
+			times_applied = EXCLUDED.times_applied,
+			total_commission_base = EXCLUDED.total_commission_base,
+			total_commission_amount = EXCLUDED.total_commission_amount,
+			avg_rate = EXCLUDED.avg_rate,
+			updated_at = NOW()
+	`
+	_, err := db.ExecContext(ctx, query,
+		fact.CompanyID, fact.RuleID, fact.PlanID, fact.Date,
+		fact.TimesApplied, fact.TotalCommissionBase, fact.TotalCommissionAmount, fact.AvgRate,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert commission rule fact: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) IncrementCommissionRuleFact(ctx context.Context, db DBTX, companyID, ruleID, planID uuid.UUID, date time.Time, commissionBase, commissionAmount decimal.Decimal, rate decimal.Decimal) error {
+	query := `
+		INSERT INTO sales_analytics.commission_rule_fact
+			(company_id, rule_id, plan_id, date,
+			 times_applied, total_commission_base, total_commission_amount, avg_rate, updated_at)
+		VALUES ($1, $2, $3, $4, 1, $5, $6, $7, NOW())
+		ON CONFLICT (company_id, rule_id, date) DO UPDATE SET
+			times_applied = commission_rule_fact.times_applied + 1,
+			total_commission_base = commission_rule_fact.total_commission_base + EXCLUDED.total_commission_base,
+			total_commission_amount = commission_rule_fact.total_commission_amount + EXCLUDED.total_commission_amount,
+			avg_rate = (commission_rule_fact.avg_rate * commission_rule_fact.times_applied + EXCLUDED.avg_rate) / (commission_rule_fact.times_applied + 1),
+			updated_at = NOW()
+	`
+	_, err := db.ExecContext(ctx, query, companyID, ruleID, planID, date, commissionBase, commissionAmount, rate)
+	if err != nil {
+		return fmt.Errorf("increment commission rule fact: %w", err)
+	}
+	return nil
+}
+
+// -------------------- Commission Assignment Fact --------------------
+func (r *analyticsRepository) InsertCommissionAssignmentFact(ctx context.Context, db DBTX, fact *sales_analytics.CommissionAssignmentFact) error {
+	query := `
+		INSERT INTO sales_analytics.commission_assignment_fact
+			(company_id, sales_rep_id, plan_id, assigned_at, removed_at, assigned_by, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+	`
+	_, err := db.ExecContext(ctx, query,
+		fact.CompanyID, fact.SalesRepID, fact.PlanID,
+		fact.AssignedAt, fact.RemovedAt, fact.AssignedBy,
+	)
+	if err != nil {
+		return fmt.Errorf("insert commission assignment fact: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) CloseCommissionAssignmentFact(ctx context.Context, db DBTX, companyID, salesRepID, planID uuid.UUID, removedAt time.Time) error {
+	query := `
+		UPDATE sales_analytics.commission_assignment_fact
+		SET removed_at = $4
+		WHERE company_id = $1 AND sales_rep_id = $2 AND plan_id = $3 AND removed_at IS NULL
+	`
+	result, err := db.ExecContext(ctx, query, companyID, salesRepID, planID, removedAt)
+	if err != nil {
+		return fmt.Errorf("close commission assignment fact: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		// Not an error; assignment might have been never recorded or already closed
+		return nil
+	}
+	return nil
+}
+
+// -------------------- Commission Lifecycle --------------------
+func (r *analyticsRepository) InsertCommissionLifecycle(ctx context.Context, db DBTX, lifecycle *sales_analytics.CommissionLifecycle) error {
+	query := `
+		INSERT INTO sales_analytics.commission_lifecycle
+			(commission_id, company_id, sales_rep_id, reference_type, reference_id,
+			 earned_at, approved_at, paid_at, rejected_at, current_status, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+	`
+	_, err := db.ExecContext(ctx, query,
+		lifecycle.CommissionID, lifecycle.CompanyID, lifecycle.SalesRepID,
+		lifecycle.ReferenceType, lifecycle.ReferenceID,
+		lifecycle.EarnedAt, lifecycle.ApprovedAt, lifecycle.PaidAt, lifecycle.RejectedAt,
+		lifecycle.CurrentStatus,
+	)
+	if err != nil {
+		return fmt.Errorf("insert commission lifecycle: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) UpdateCommissionLifecycle(ctx context.Context, db DBTX, commissionID uuid.UUID, status string, approvedAt, paidAt, rejectedAt *time.Time) error {
+	query := `
+		UPDATE sales_analytics.commission_lifecycle
+		SET current_status = $2,
+		    approved_at = COALESCE($3, approved_at),
+		    paid_at = COALESCE($4, paid_at),
+		    rejected_at = COALESCE($5, rejected_at),
+		    updated_at = NOW()
+		WHERE commission_id = $1
+	`
+	_, err := db.ExecContext(ctx, query, commissionID, status, approvedAt, paidAt, rejectedAt)
+	if err != nil {
+		return fmt.Errorf("update commission lifecycle: %w", err)
+	}
+	return nil
+}
+
+// -------------------- Commission Forecast Snapshot --------------------
+func (r *analyticsRepository) UpsertCommissionForecastSnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.CommissionForecastSnapshot) error {
+	query := `
+		INSERT INTO sales_analytics.commission_forecast_snapshot
+			(company_id, snapshot_date, sales_rep_id,
+			 expected_commission_from_open_orders, expected_commission_from_open_invoices,
+			 total_expected_commission, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		ON CONFLICT (company_id, snapshot_date, sales_rep_id) DO UPDATE SET
+			expected_commission_from_open_orders = EXCLUDED.expected_commission_from_open_orders,
+			expected_commission_from_open_invoices = EXCLUDED.expected_commission_from_open_invoices,
+			total_expected_commission = EXCLUDED.total_expected_commission,
+			created_at = NOW()
+	`
+	_, err := db.ExecContext(ctx, query,
+		snapshot.CompanyID, snapshot.SnapshotDate, snapshot.SalesRepID,
+		snapshot.ExpectedCommissionFromOpenOrders, snapshot.ExpectedCommissionFromOpenInvoices,
+		snapshot.TotalExpectedCommission,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert commission forecast snapshot: %w", err)
+	}
+	return nil
+}
+
+func (r *analyticsRepository) RefreshCommissionForecastSnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error {
+	// Compute expected commissions from pending/approved sales_commissions
+	query := `
+		WITH pending_commissions AS (
+			SELECT
+				sales_rep_id,
+				SUM(commission_amount) as pending_amount
+			FROM sales.sales_commissions
+			WHERE company_id = $1
+			  AND status IN ('pending', 'approved')
+			  AND earned_at <= $2
+			GROUP BY sales_rep_id
+		)
+		INSERT INTO sales_analytics.commission_forecast_snapshot
+			(company_id, snapshot_date, sales_rep_id,
+			 expected_commission_from_open_orders, expected_commission_from_open_invoices,
+			 total_expected_commission, created_at)
+		SELECT
+			$1, $2, sr.sales_rep_id,
+			0, 0, COALESCE(pc.pending_amount, 0), NOW()
+		FROM sales.sales_reps sr
+		LEFT JOIN pending_commissions pc ON sr.sales_rep_id = pc.sales_rep_id
+		WHERE sr.company_id = $1 AND sr.is_active = true
+		ON CONFLICT (company_id, snapshot_date, sales_rep_id) DO UPDATE SET
+			expected_commission_from_open_orders = 0,
+			expected_commission_from_open_invoices = 0,
+			total_expected_commission = EXCLUDED.total_expected_commission,
+			created_at = NOW()
+	`
+	_, err := db.ExecContext(ctx, query, companyID, snapshotDate)
+	if err != nil {
+		return fmt.Errorf("refresh commission forecast snapshot: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) InsertCreditCheckFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditCheckFact) error {
+	query := `
+        INSERT INTO sales_analytics.credit_check_fact
+            (company_id, customer_id, check_id, check_type, result,
+             requested_amount, current_limit, current_outstanding, available_credit,
+             reason, checked_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+    `
+	_, err := db.ExecContext(ctx, query,
+		fact.CompanyID, fact.CustomerID, fact.CheckID, fact.CheckType, fact.Result,
+		fact.RequestedAmount, fact.CurrentLimit, fact.CurrentOutstanding, fact.AvailableCredit,
+		fact.Reason, fact.CheckedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert credit check fact: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) UpsertDailyCreditMetrics(ctx context.Context, db DBTX, metrics *sales_analytics.DailyCreditMetrics) error {
+	query := `
+        INSERT INTO sales_analytics.daily_credit_metrics
+            (company_id, date, total_checks, checks_passed, checks_failed,
+             total_order_value_checked, total_invoice_value_checked,
+             avg_available_credit, avg_credit_utilization, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ON CONFLICT (company_id, date) DO UPDATE SET
+            total_checks = EXCLUDED.total_checks,
+            checks_passed = EXCLUDED.checks_passed,
+            checks_failed = EXCLUDED.checks_failed,
+            total_order_value_checked = EXCLUDED.total_order_value_checked,
+            total_invoice_value_checked = EXCLUDED.total_invoice_value_checked,
+            avg_available_credit = EXCLUDED.avg_available_credit,
+            avg_credit_utilization = EXCLUDED.avg_credit_utilization,
+            updated_at = NOW()
+    `
+	_, err := db.ExecContext(ctx, query,
+		metrics.CompanyID, metrics.Date,
+		metrics.TotalChecks, metrics.ChecksPassed, metrics.ChecksFailed,
+		metrics.TotalOrderValueChecked, metrics.TotalInvoiceValueChecked,
+		metrics.AvgAvailableCredit, metrics.AvgCreditUtilization,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert daily credit metrics: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) IncrementDailyCreditMetrics(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, passed bool, requestedAmount decimal.Decimal, checkType string, availableCredit decimal.Decimal, utilizationPct decimal.Decimal) error {
+	passedInc := 0
+	failedInc := 0
+	if passed {
+		passedInc = 1
+	} else {
+		failedInc = 1
+	}
+
+	orderValueInc := decimal.Zero
+	invoiceValueInc := decimal.Zero
+	if checkType == "order_eligibility" {
+		orderValueInc = requestedAmount
+	} else if checkType == "invoice_eligibility" {
+		invoiceValueInc = requestedAmount
+	}
+
+	query := `
+        INSERT INTO sales_analytics.daily_credit_metrics
+            (company_id, date, total_checks, checks_passed, checks_failed,
+             total_order_value_checked, total_invoice_value_checked,
+             avg_available_credit, avg_credit_utilization, updated_at)
+        VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, NOW())
+        ON CONFLICT (company_id, date) DO UPDATE SET
+            total_checks = daily_credit_metrics.total_checks + 1,
+            checks_passed = daily_credit_metrics.checks_passed + EXCLUDED.checks_passed,
+            checks_failed = daily_credit_metrics.checks_failed + EXCLUDED.checks_failed,
+            total_order_value_checked = daily_credit_metrics.total_order_value_checked + EXCLUDED.total_order_value_checked,
+            total_invoice_value_checked = daily_credit_metrics.total_invoice_value_checked + EXCLUDED.total_invoice_value_checked,
+            avg_available_credit = (daily_credit_metrics.avg_available_credit * daily_credit_metrics.total_checks + EXCLUDED.avg_available_credit) / (daily_credit_metrics.total_checks + 1),
+            avg_credit_utilization = (daily_credit_metrics.avg_credit_utilization * daily_credit_metrics.total_checks + EXCLUDED.avg_credit_utilization) / (daily_credit_metrics.total_checks + 1),
+            updated_at = NOW()
+    `
+	_, err := db.ExecContext(ctx, query,
+		companyID, date,
+		passedInc, failedInc,
+		orderValueInc, invoiceValueInc,
+		availableCredit, utilizationPct,
+	)
+	if err != nil {
+		return fmt.Errorf("increment daily credit metrics: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) InsertCreditHoldFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditHoldFact) error {
+	query := `
+        INSERT INTO sales_analytics.credit_hold_fact
+            (order_id, company_id, customer_id, hold_started_at, hold_ended_at, reason, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        ON CONFLICT (order_id, hold_started_at) DO NOTHING
+    `
+	_, err := db.ExecContext(ctx, query,
+		fact.OrderID, fact.CompanyID, fact.CustomerID,
+		fact.HoldStartedAt, fact.HoldEndedAt, fact.Reason,
+	)
+	if err != nil {
+		return fmt.Errorf("insert credit hold fact: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) CloseCreditHoldFact(ctx context.Context, db DBTX, orderID uuid.UUID, holdEndedAt time.Time) error {
+	query := `
+        UPDATE sales_analytics.credit_hold_fact
+        SET hold_ended_at = $2
+        WHERE order_id = $1 AND hold_ended_at IS NULL
+    `
+	result, err := db.ExecContext(ctx, query, orderID, holdEndedAt)
+	if err != nil {
+		return fmt.Errorf("close credit hold fact: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		r.logger.Warn("no open credit hold fact found to close", zap.String("order_id", orderID.String()))
+	}
+	return nil
+}
+func (r *analyticsRepository) InsertCreditLimitChangeFact(ctx context.Context, db DBTX, fact *sales_analytics.CreditLimitChangeFact) error {
+	query := `
+        INSERT INTO sales_analytics.credit_limit_change_fact
+            (company_id, customer_id, previous_limit, new_limit, change_reason, changed_by, changed_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `
+	_, err := db.ExecContext(ctx, query,
+		fact.CompanyID, fact.CustomerID,
+		fact.PreviousLimit, fact.NewLimit,
+		fact.ChangeReason, fact.ChangedBy, fact.ChangedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert credit limit change fact: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) UpsertCustomerCreditDailySnapshot(ctx context.Context, db DBTX, snapshot *sales_analytics.CustomerCreditDailySnapshot) error {
+	query := `
+        INSERT INTO sales_analytics.customer_credit_daily_snapshot
+            (company_id, customer_id, snapshot_date, credit_limit, outstanding_balance, available_credit, is_suspended, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        ON CONFLICT (company_id, customer_id, snapshot_date) DO UPDATE SET
+            credit_limit = EXCLUDED.credit_limit,
+            outstanding_balance = EXCLUDED.outstanding_balance,
+            available_credit = EXCLUDED.available_credit,
+            is_suspended = EXCLUDED.is_suspended,
+            created_at = NOW()
+    `
+	_, err := db.ExecContext(ctx, query,
+		snapshot.CompanyID, snapshot.CustomerID, snapshot.SnapshotDate,
+		snapshot.CreditLimit, snapshot.OutstandingBalance, snapshot.AvailableCredit,
+		snapshot.IsSuspended,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert customer credit daily snapshot: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) RefreshCustomerCreditDailySnapshot(ctx context.Context, db DBTX, companyID uuid.UUID, snapshotDate time.Time) error {
+	query := `
+        WITH current_credits AS (
+            SELECT
+                c.customer_id,
+                COALESCE(c.credit_limit, 0) AS credit_limit,
+                COALESCE(SUM(i.amount_due), 0) AS outstanding_balance,
+                COALESCE(c.credit_limit, 0) - COALESCE(SUM(i.amount_due), 0) AS available_credit,
+                EXISTS (
+                    SELECT 1 FROM sales.credit_check_history h
+                    WHERE h.customer_id = c.customer_id
+                      AND h.action_type = 'suspend'
+                      AND h.created_at > COALESCE(
+                          (SELECT MAX(created_at) FROM sales.credit_check_history
+                           WHERE customer_id = c.customer_id AND action_type = 'restore'),
+                          '0001-01-01'
+                      )
+                ) AS is_suspended
+            FROM sales.customers c
+            LEFT JOIN sales.invoices i ON i.customer_id = c.customer_id
+                AND i.status NOT IN ('paid', 'cancelled')
+            WHERE c.company_id = $1
+            GROUP BY c.customer_id, c.credit_limit
+        )
+        INSERT INTO sales_analytics.customer_credit_daily_snapshot
+            (company_id, customer_id, snapshot_date, credit_limit, outstanding_balance, available_credit, is_suspended, created_at)
+        SELECT
+            $1, customer_id, $2,
+            credit_limit, outstanding_balance, available_credit, is_suspended, NOW()
+        FROM current_credits
+        ON CONFLICT (company_id, customer_id, snapshot_date) DO UPDATE SET
+            credit_limit = EXCLUDED.credit_limit,
+            outstanding_balance = EXCLUDED.outstanding_balance,
+            available_credit = EXCLUDED.available_credit,
+            is_suspended = EXCLUDED.is_suspended,
+            created_at = NOW()
+    `
+	_, err := db.ExecContext(ctx, query, companyID, snapshotDate)
+	if err != nil {
+		return fmt.Errorf("refresh customer credit daily snapshot: %w", err)
+	}
+	return nil
+}
+func (r *analyticsRepository) RefreshCurrentCustomerCredit(ctx context.Context, db DBTX) error {
+	query := `REFRESH MATERIALIZED VIEW CONCURRENTLY sales_analytics.current_customer_credit`
+	_, err := db.ExecContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("refresh current customer credit materialized view: %w", err)
+	}
+	return nil
 }

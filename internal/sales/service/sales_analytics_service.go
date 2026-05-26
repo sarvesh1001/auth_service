@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -12,7 +13,6 @@ import (
 	"auth-service/internal/sales/models/enums"
 	"auth-service/internal/sales/models/sales_analytics"
 	"auth-service/internal/sales/repository"
-	"database/sql"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
@@ -281,7 +281,7 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 		}
 		return s.onQuoteConverted(ctx, quote)
 
-	// Sales target events (new)
+	// Sales target events
 	case salesEvents.EventSalesTargetSet, salesEvents.EventSalesTargetUpdated:
 		var target salesEvents.SalesTargetPayload
 		if err := json.Unmarshal(payload, &target); err != nil {
@@ -295,6 +295,63 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal sales target payload: %w", err)
 		}
 		return s.onSalesTargetDeleted(ctx, target)
+
+	// Commission events
+	case salesEvents.EventCommissionCreated:
+		var commissionPayload salesEvents.CommissionPayload
+		if err := json.Unmarshal(payload, &commissionPayload); err != nil {
+			return fmt.Errorf("unmarshal commission created payload: %w", err)
+		}
+		return s.onCommissionCreated(ctx, commissionPayload)
+
+	case salesEvents.EventCommissionApproved:
+		var statusPayload salesEvents.CommissionStatusPayload
+		if err := json.Unmarshal(payload, &statusPayload); err != nil {
+			return fmt.Errorf("unmarshal commission approved payload: %w", err)
+		}
+		return s.onCommissionStatusChanged(ctx, statusPayload, enums.CommissionStatusApproved)
+
+	case salesEvents.EventCommissionPaid:
+		var statusPayload salesEvents.CommissionStatusPayload
+		if err := json.Unmarshal(payload, &statusPayload); err != nil {
+			return fmt.Errorf("unmarshal commission paid payload: %w", err)
+		}
+		return s.onCommissionStatusChanged(ctx, statusPayload, enums.CommissionStatusPaid)
+
+	case salesEvents.EventCommissionRejected:
+		var statusPayload salesEvents.CommissionStatusPayload
+		if err := json.Unmarshal(payload, &statusPayload); err != nil {
+			return fmt.Errorf("unmarshal commission rejected payload: %w", err)
+		}
+		return s.onCommissionStatusChanged(ctx, statusPayload, enums.CommissionStatusRejected)
+
+	case salesEvents.EventCommissionUpdated:
+		s.logger.Debug("commission updated event received", zap.String("payload", string(payload)))
+		return nil
+
+	case salesEvents.EventCommissionPlanAssigned:
+		var assignmentPayload salesEvents.CommissionAssignmentPayload
+		if err := json.Unmarshal(payload, &assignmentPayload); err != nil {
+			return fmt.Errorf("unmarshal commission assignment payload: %w", err)
+		}
+		return s.onCommissionPlanAssigned(ctx, assignmentPayload)
+
+	case salesEvents.EventCommissionPlanRemoved:
+		var removalPayload salesEvents.CommissionAssignmentPayload
+		if err := json.Unmarshal(payload, &removalPayload); err != nil {
+			return fmt.Errorf("unmarshal commission removal payload: %w", err)
+		}
+		return s.onCommissionPlanRemoved(ctx, removalPayload)
+
+	// Credit events (new)
+	case salesEvents.EventCustomerCreditLimitChanged:
+		return s.onCreditLimitChanged(ctx, payload)
+	case salesEvents.EventOrderCreditHeld:
+		return s.onOrderCreditHeld(ctx, payload)
+	case salesEvents.EventOrderCreditReleased:
+		return s.onOrderCreditReleased(ctx, payload)
+	case salesEvents.EventCreditCheckFailed:
+		return s.onCreditCheckFailed(ctx, payload)
 
 	// Sales rep events (optional, just log)
 	case salesEvents.EventSalesRepCreated,
@@ -1555,7 +1612,7 @@ func (s *salesAnalyticsService) onQuoteConverted(ctx context.Context, quote sale
 }
 
 // ----------------------------------------------------------------------------
-// Sales Target Handlers (new)
+// Sales Target Handlers
 // ----------------------------------------------------------------------------
 
 func (s *salesAnalyticsService) onSalesTargetSet(ctx context.Context, payload salesEvents.SalesTargetPayload) error {
@@ -1602,8 +1659,6 @@ func (s *salesAnalyticsService) onSalesTargetSet(ctx context.Context, payload sa
 }
 
 func (s *salesAnalyticsService) onSalesTargetDeleted(ctx context.Context, payload salesEvents.SalesTargetPayload) error {
-	// Optionally set target_amount to 0 or delete the record.
-	// Since the table has a unique constraint, we can set target_amount to 0.
 	companyID, err := uuid.Parse(payload.CompanyID)
 	if err != nil {
 		return fmt.Errorf("invalid company_id: %w", err)
@@ -1627,7 +1682,6 @@ func (s *salesAnalyticsService) onSalesTargetDeleted(ctx context.Context, payloa
 	}
 	defer tx.Rollback()
 
-	// Instead of deleting, we can set target_amount = 0.
 	updateQuery := `
 		UPDATE sales_analytics.sales_rep_target_achievement
 		SET target_amount = 0, updated_at = NOW()
@@ -1645,7 +1699,6 @@ func (s *salesAnalyticsService) onSalesTargetDeleted(ctx context.Context, payloa
 // ----------------------------------------------------------------------------
 
 func (s *salesAnalyticsService) updateTargetAchievement(ctx context.Context, tx repository.DBTX, companyID, salesRepID uuid.UUID, orderDate time.Time, revenue decimal.Decimal) error {
-	// Find target period that contains the order date
 	query := `
 		SELECT period_start, period_end
 		FROM sales.sales_targets
@@ -1656,13 +1709,11 @@ func (s *salesAnalyticsService) updateTargetAchievement(ctx context.Context, tx 
 	err := tx.QueryRowContext(ctx, query, companyID, salesRepID, orderDate).Scan(&periodStart, &periodEnd)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// No target set for this period – ignore
 			return nil
 		}
 		return fmt.Errorf("find target period: %w", err)
 	}
 
-	// Add revenue to the achievement record using the repository method
 	if err := s.analyticsRepo.UpdateSalesRepTargetAchievement(ctx, tx, companyID, salesRepID, periodStart, periodEnd, revenue); err != nil {
 		return fmt.Errorf("update target achievement: %w", err)
 	}
@@ -1688,38 +1739,249 @@ func (s *salesAnalyticsService) recordCommissionFact(ctx context.Context, tx rep
 }
 
 // ----------------------------------------------------------------------------
-// Helpers
+// Commission Event Handlers
 // ----------------------------------------------------------------------------
 
-func parsePaymentMethod(methodStr string) (enums.PaymentMethod, error) {
-	switch methodStr {
-	case "cash":
-		return enums.PaymentMethodCash, nil
-	case "card":
-		return enums.PaymentMethodCard, nil
-	case "bank_transfer":
-		return enums.PaymentMethodBankTransfer, nil
-	case "digital_wallet":
-		return enums.PaymentMethodDigitalWallet, nil
-	case "coupon":
-		return enums.PaymentMethodCoupon, nil
-	default:
-		return enums.PaymentMethodOther, nil
+func (s *salesAnalyticsService) onCommissionCreated(ctx context.Context, payload salesEvents.CommissionPayload) error {
+	companyID, err := uuid.Parse(payload.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
 	}
+	salesRepID, err := uuid.Parse(payload.SalesRepID)
+	if err != nil {
+		return fmt.Errorf("invalid sales_rep_id: %w", err)
+	}
+	commissionID, err := uuid.Parse(payload.CommissionID)
+	if err != nil {
+		return fmt.Errorf("invalid commission_id: %w", err)
+	}
+	referenceID, err := uuid.Parse(payload.ReferenceID)
+	if err != nil {
+		return fmt.Errorf("invalid reference_id: %w", err)
+	}
+	earnedAt, err := time.Parse(time.RFC3339, payload.EarnedAt)
+	if err != nil {
+		return fmt.Errorf("invalid earned_at: %w", err)
+	}
+	commissionBase, err := decimal.NewFromString(payload.CommissionBase)
+	if err != nil {
+		return fmt.Errorf("invalid commission_base: %w", err)
+	}
+	commissionRate, err := decimal.NewFromString(payload.CommissionRate)
+	if err != nil {
+		return fmt.Errorf("invalid commission_rate: %w", err)
+	}
+	commissionAmount, err := decimal.NewFromString(payload.CommissionAmount)
+	if err != nil {
+		return fmt.Errorf("invalid commission_amount: %w", err)
+	}
+
+	var planID *uuid.UUID
+	if payload.PlanID != "" {
+		if id, err := uuid.Parse(payload.PlanID); err == nil {
+			planID = &id
+		}
+	}
+	var ruleID *uuid.UUID
+	if payload.RuleID != "" {
+		if id, err := uuid.Parse(payload.RuleID); err == nil {
+			ruleID = &id
+		}
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	fact := &sales_analytics.SalesRepCommissionFact{
+		CompanyID:        companyID,
+		SalesRepID:       salesRepID,
+		EntityType:       payload.ReferenceType,
+		EntityID:         referenceID,
+		CommissionBase:   commissionBase,
+		CommissionRate:   commissionRate,
+		CommissionAmount: commissionAmount,
+		EarnedAt:         earnedAt,
+		PaidAt:           nil,
+		PlanID:           planID,
+		RuleID:           ruleID,
+	}
+	if err := s.analyticsRepo.UpsertSalesRepCommissionFact(ctx, tx, fact); err != nil {
+		return fmt.Errorf("upsert commission fact: %w", err)
+	}
+
+	if planID != nil {
+		date := earnedAt.Truncate(24 * time.Hour)
+		if err := s.analyticsRepo.IncrementCommissionPlanDaily(ctx, tx, companyID, *planID, date,
+			commissionAmount, decimal.Zero, commissionRate, salesRepID); err != nil {
+			s.logger.Warn("failed to increment commission plan daily", zap.Error(err))
+		}
+	}
+
+	if ruleID != nil && planID != nil {
+		date := earnedAt.Truncate(24 * time.Hour)
+		if err := s.analyticsRepo.IncrementCommissionRuleFact(ctx, tx, companyID, *ruleID, *planID, date,
+			commissionBase, commissionAmount, commissionRate); err != nil {
+			s.logger.Warn("failed to increment commission rule fact", zap.Error(err))
+		}
+	}
+
+	lifecycle := &sales_analytics.CommissionLifecycle{
+		CommissionID:  commissionID,
+		CompanyID:     companyID,
+		SalesRepID:    salesRepID,
+		ReferenceType: payload.ReferenceType,
+		ReferenceID:   referenceID,
+		EarnedAt:      earnedAt,
+		CurrentStatus: payload.Status,
+	}
+	if err := s.analyticsRepo.InsertCommissionLifecycle(ctx, tx, lifecycle); err != nil {
+		return fmt.Errorf("insert commission lifecycle: %w", err)
+	}
+
+	return tx.Commit()
 }
 
-func (s *salesAnalyticsService) updateCustomerSpent(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID, delta decimal.Decimal) error {
-	query := `
-        UPDATE sales_analytics.customer_metrics
-        SET total_spent = total_spent + $3,
-            lifetime_value = lifetime_value + $3,
-            average_order_value = CASE WHEN total_orders > 0 THEN (total_spent + $3) / total_orders ELSE 0 END,
-            updated_at = NOW()
-        WHERE company_id = $1 AND customer_id = $2
-    `
-	_, err := tx.ExecContext(ctx, query, companyID, customerID, delta)
-	return err
+func (s *salesAnalyticsService) onCommissionStatusChanged(ctx context.Context, payload salesEvents.CommissionStatusPayload, newStatus enums.CommissionStatus) error {
+	companyID, err := uuid.Parse(payload.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	commissionID, err := uuid.Parse(payload.CommissionID)
+	if err != nil {
+		return fmt.Errorf("invalid commission_id: %w", err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339, payload.UpdatedAt)
+	if err != nil {
+		updatedAt = time.Now()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var planID *uuid.UUID
+	var commissionAmount decimal.Decimal
+	var earnedAt time.Time
+	if newStatus == enums.CommissionStatusPaid {
+		var planIDStr *string
+		var amountStr string
+		var earnedAtStr time.Time
+		query := `SELECT plan_id, commission_amount, earned_at FROM sales_analytics.commission_lifecycle WHERE commission_id = $1 AND company_id = $2`
+		err := tx.QueryRowContext(ctx, query, commissionID, companyID).Scan(&planIDStr, &amountStr, &earnedAtStr)
+		if err == nil && planIDStr != nil {
+			if id, err := uuid.Parse(*planIDStr); err == nil {
+				planID = &id
+			}
+			commissionAmount, _ = decimal.NewFromString(amountStr)
+			earnedAt = earnedAtStr
+		}
+	}
+
+	var approvedAt, paidAt, rejectedAt *time.Time
+	switch newStatus {
+	case enums.CommissionStatusApproved:
+		approvedAt = &updatedAt
+	case enums.CommissionStatusPaid:
+		paidAt = &updatedAt
+	case enums.CommissionStatusRejected:
+		rejectedAt = &updatedAt
+	}
+	if err := s.analyticsRepo.UpdateCommissionLifecycle(ctx, tx, commissionID, string(newStatus), approvedAt, paidAt, rejectedAt); err != nil {
+		return fmt.Errorf("update commission lifecycle: %w", err)
+	}
+
+	if newStatus == enums.CommissionStatusPaid && planID != nil {
+		date := earnedAt.Truncate(24 * time.Hour)
+		if err := s.analyticsRepo.IncrementCommissionPlanDaily(ctx, tx, companyID, *planID, date,
+			decimal.Zero, commissionAmount, decimal.Zero, uuid.Nil); err != nil {
+			s.logger.Warn("failed to increment paid amount in commission plan daily", zap.Error(err))
+		}
+	}
+
+	return tx.Commit()
 }
+
+func (s *salesAnalyticsService) onCommissionPlanAssigned(ctx context.Context, payload salesEvents.CommissionAssignmentPayload) error {
+	companyID, err := uuid.Parse(payload.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	salesRepID, err := uuid.Parse(payload.SalesRepID)
+	if err != nil {
+		return fmt.Errorf("invalid sales_rep_id: %w", err)
+	}
+	planID, err := uuid.Parse(payload.PlanID)
+	if err != nil {
+		return fmt.Errorf("invalid plan_id: %w", err)
+	}
+	effectiveFrom, err := time.Parse(time.RFC3339, payload.EffectiveFrom)
+	if err != nil {
+		return fmt.Errorf("invalid effective_from: %w", err)
+	}
+	var assignedBy *uuid.UUID
+	if payload.AssignedBy != "" {
+		if id, err := uuid.Parse(payload.AssignedBy); err == nil {
+			assignedBy = &id
+		}
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	assignment := &sales_analytics.CommissionAssignmentFact{
+		CompanyID:  companyID,
+		SalesRepID: salesRepID,
+		PlanID:     planID,
+		AssignedAt: effectiveFrom,
+		AssignedBy: assignedBy,
+	}
+	if err := s.analyticsRepo.InsertCommissionAssignmentFact(ctx, tx, assignment); err != nil {
+		return fmt.Errorf("insert commission assignment fact: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *salesAnalyticsService) onCommissionPlanRemoved(ctx context.Context, payload salesEvents.CommissionAssignmentPayload) error {
+	companyID, err := uuid.Parse(payload.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	salesRepID, err := uuid.Parse(payload.SalesRepID)
+	if err != nil {
+		return fmt.Errorf("invalid sales_rep_id: %w", err)
+	}
+	planID, err := uuid.Parse(payload.PlanID)
+	if err != nil {
+		return fmt.Errorf("invalid plan_id: %w", err)
+	}
+	removedAt, err := time.Parse(time.RFC3339, payload.RemovedAt)
+	if err != nil {
+		removedAt = time.Now()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.analyticsRepo.CloseCommissionAssignmentFact(ctx, tx, companyID, salesRepID, planID, removedAt); err != nil {
+		return fmt.Errorf("close commission assignment fact: %w", err)
+	}
+	return tx.Commit()
+}
+
+// ----------------------------------------------------------------------------
+// Promotion and Discount Handlers
+// ----------------------------------------------------------------------------
 
 func (s *salesAnalyticsService) onAutomaticDiscountApplied(ctx context.Context, payload struct {
 	CompanyID      string `json:"company_id"`
@@ -2014,4 +2276,273 @@ func (s *salesAnalyticsService) onPromotionApplied(ctx context.Context, payload 
 		}
 	}
 	return tx.Commit()
+}
+
+// ----------------------------------------------------------------------------
+// Credit Event Handlers
+// ----------------------------------------------------------------------------
+
+func (s *salesAnalyticsService) onCreditLimitChanged(ctx context.Context, payload []byte) error {
+	var data struct {
+		CustomerID    string `json:"customer_id"`
+		CompanyID     string `json:"company_id"`
+		PreviousLimit string `json:"previous_limit"`
+		NewLimit      string `json:"new_limit"`
+		UpdatedBy     string `json:"updated_by"`
+		UpdatedAt     string `json:"updated_at"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("unmarshal credit limit changed payload: %w", err)
+	}
+
+	companyID, err := uuid.Parse(data.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	customerID, err := uuid.Parse(data.CustomerID)
+	if err != nil {
+		return fmt.Errorf("invalid customer_id: %w", err)
+	}
+	prevLimit, err := decimal.NewFromString(data.PreviousLimit)
+	if err != nil {
+		return fmt.Errorf("invalid previous_limit: %w", err)
+	}
+	newLimit, err := decimal.NewFromString(data.NewLimit)
+	if err != nil {
+		return fmt.Errorf("invalid new_limit: %w", err)
+	}
+	changedAt, err := time.Parse(time.RFC3339, data.UpdatedAt)
+	if err != nil {
+		changedAt = time.Now()
+	}
+	var changedBy *uuid.UUID
+	if data.UpdatedBy != "" {
+		if id, err := uuid.Parse(data.UpdatedBy); err == nil {
+			changedBy = &id
+		}
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	fact := &sales_analytics.CreditLimitChangeFact{
+		CompanyID:     companyID,
+		CustomerID:    customerID,
+		PreviousLimit: prevLimit,
+		NewLimit:      newLimit,
+		ChangeReason:  nil,
+		ChangedBy:     changedBy,
+		ChangedAt:     changedAt,
+	}
+	if err := s.analyticsRepo.InsertCreditLimitChangeFact(ctx, tx, fact); err != nil {
+		return fmt.Errorf("insert credit limit change fact: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *salesAnalyticsService) onOrderCreditHeld(ctx context.Context, payload []byte) error {
+	var data struct {
+		OrderID    string `json:"order_id"`
+		CompanyID  string `json:"company_id"`
+		CustomerID string `json:"customer_id"`
+		Reason     string `json:"reason"`
+		HeldBy     string `json:"held_by"`
+		HeldAt     string `json:"held_at"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("unmarshal order credit held payload: %w", err)
+	}
+
+	orderID, err := uuid.Parse(data.OrderID)
+	if err != nil {
+		return fmt.Errorf("invalid order_id: %w", err)
+	}
+	companyID, err := uuid.Parse(data.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	customerID, err := uuid.Parse(data.CustomerID)
+	if err != nil {
+		return fmt.Errorf("invalid customer_id: %w", err)
+	}
+	heldAt, err := time.Parse(time.RFC3339, data.HeldAt)
+	if err != nil {
+		heldAt = time.Now()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	holdFact := &sales_analytics.CreditHoldFact{
+		OrderID:       orderID,
+		CompanyID:     companyID,
+		CustomerID:    customerID,
+		HoldStartedAt: heldAt,
+		Reason:        &data.Reason,
+	}
+	if err := s.analyticsRepo.InsertCreditHoldFact(ctx, tx, holdFact); err != nil {
+		return fmt.Errorf("insert credit hold fact: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *salesAnalyticsService) onOrderCreditReleased(ctx context.Context, payload []byte) error {
+	var data struct {
+		OrderID    string `json:"order_id"`
+		CompanyID  string `json:"company_id"`
+		CustomerID string `json:"customer_id"`
+		Reason     string `json:"reason"`
+		ReleasedBy string `json:"released_by"`
+		ReleasedAt string `json:"released_at"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("unmarshal order credit released payload: %w", err)
+	}
+
+	orderID, err := uuid.Parse(data.OrderID)
+	if err != nil {
+		return fmt.Errorf("invalid order_id: %w", err)
+	}
+	releasedAt, err := time.Parse(time.RFC3339, data.ReleasedAt)
+	if err != nil {
+		releasedAt = time.Now()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := s.analyticsRepo.CloseCreditHoldFact(ctx, tx, orderID, releasedAt); err != nil {
+		return fmt.Errorf("close credit hold fact: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *salesAnalyticsService) onCreditCheckFailed(ctx context.Context, payload []byte) error {
+	var data struct {
+		CheckID            string `json:"check_id"`
+		CompanyID          string `json:"company_id"`
+		CustomerID         string `json:"customer_id"`
+		CheckType          string `json:"check_type"`
+		RequestedAmount    string `json:"requested_amount"`
+		CurrentLimit       string `json:"current_limit"`
+		CurrentOutstanding string `json:"current_outstanding"`
+		AvailableCredit    string `json:"available_credit"`
+		Reason             string `json:"reason"`
+		CheckedAt          string `json:"checked_at"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return fmt.Errorf("unmarshal credit check failed payload: %w", err)
+	}
+
+	companyID, err := uuid.Parse(data.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+	customerID, err := uuid.Parse(data.CustomerID)
+	if err != nil {
+		return fmt.Errorf("invalid customer_id: %w", err)
+	}
+	var checkID *uuid.UUID
+	if data.CheckID != "" {
+		if id, err := uuid.Parse(data.CheckID); err == nil {
+			checkID = &id
+		}
+	}
+	requestedAmount, err := decimal.NewFromString(data.RequestedAmount)
+	if err != nil {
+		return fmt.Errorf("invalid requested_amount: %w", err)
+	}
+	currentLimit, err := decimal.NewFromString(data.CurrentLimit)
+	if err != nil {
+		return fmt.Errorf("invalid current_limit: %w", err)
+	}
+	currentOutstanding, err := decimal.NewFromString(data.CurrentOutstanding)
+	if err != nil {
+		return fmt.Errorf("invalid current_outstanding: %w", err)
+	}
+	availableCredit, err := decimal.NewFromString(data.AvailableCredit)
+	if err != nil {
+		return fmt.Errorf("invalid available_credit: %w", err)
+	}
+	checkedAt, err := time.Parse(time.RFC3339, data.CheckedAt)
+	if err != nil {
+		checkedAt = time.Now()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	fact := &sales_analytics.CreditCheckFact{
+		CompanyID:          companyID,
+		CustomerID:         customerID,
+		CheckID:            checkID,
+		CheckType:          data.CheckType,
+		Result:             "denied",
+		RequestedAmount:    requestedAmount,
+		CurrentLimit:       currentLimit,
+		CurrentOutstanding: currentOutstanding,
+		AvailableCredit:    availableCredit,
+		Reason:             &data.Reason,
+		CheckedAt:          checkedAt,
+	}
+	if err := s.analyticsRepo.InsertCreditCheckFact(ctx, tx, fact); err != nil {
+		return fmt.Errorf("insert credit check fact: %w", err)
+	}
+
+	// Update daily credit metrics
+	utilizationPct := decimal.Zero
+	if currentLimit.GreaterThan(decimal.Zero) {
+		utilizationPct = currentOutstanding.Div(currentLimit).Mul(decimal.NewFromInt(100))
+	}
+	if err := s.analyticsRepo.IncrementDailyCreditMetrics(ctx, tx, companyID, checkedAt.Truncate(24*time.Hour),
+		false, requestedAmount, data.CheckType, availableCredit, utilizationPct); err != nil {
+		s.logger.Warn("failed to increment daily credit metrics", zap.Error(err))
+	}
+	return tx.Commit()
+}
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+
+func parsePaymentMethod(methodStr string) (enums.PaymentMethod, error) {
+	switch methodStr {
+	case "cash":
+		return enums.PaymentMethodCash, nil
+	case "card":
+		return enums.PaymentMethodCard, nil
+	case "bank_transfer":
+		return enums.PaymentMethodBankTransfer, nil
+	case "digital_wallet":
+		return enums.PaymentMethodDigitalWallet, nil
+	case "coupon":
+		return enums.PaymentMethodCoupon, nil
+	default:
+		return enums.PaymentMethodOther, nil
+	}
+}
+
+func (s *salesAnalyticsService) updateCustomerSpent(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID, delta decimal.Decimal) error {
+	query := `
+        UPDATE sales_analytics.customer_metrics
+        SET total_spent = total_spent + $3,
+            lifetime_value = lifetime_value + $3,
+            average_order_value = CASE WHEN total_orders > 0 THEN (total_spent + $3) / total_orders ELSE 0 END,
+            updated_at = NOW()
+        WHERE company_id = $1 AND customer_id = $2
+    `
+	_, err := tx.ExecContext(ctx, query, companyID, customerID, delta)
+	return err
 }

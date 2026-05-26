@@ -453,7 +453,6 @@ func (s *orderService) ApplyCoupon(ctx context.Context, companyID, orderID uuid.
 		return nil, decimal.Zero, fmt.Errorf("%w: cannot apply coupon to order with status %s", salesErrors.ErrInvalidStatus, order.Status)
 	}
 
-	// FIXED: removed tx argument
 	coupon, discountAmount, err := s.discountEngine.ApplyCoupon(ctx, companyID, "order", orderID, couponCode, updatedBy)
 	if err != nil {
 		return nil, decimal.Zero, err
@@ -490,7 +489,6 @@ func (s *orderService) RemoveCoupon(ctx context.Context, companyID, orderID uuid
 		return fmt.Errorf("%w: cannot remove coupon from order with status %s", salesErrors.ErrInvalidStatus, order.Status)
 	}
 
-	// FIXED: removed tx argument
 	if err := s.discountEngine.RemoveCoupon(ctx, companyID, "order", orderID, couponCode, updatedBy); err != nil {
 		return err
 	}
@@ -526,7 +524,6 @@ func (s *orderService) ApplyBestDiscounts(ctx context.Context, companyID, orderI
 		return fmt.Errorf("%w: cannot apply discounts to order with status %s", salesErrors.ErrInvalidStatus, order.Status)
 	}
 
-	// FIXED: removed tx argument
 	_, err = s.discountEngine.ApplyBestDiscounts(ctx, companyID, "order", orderID, updatedBy)
 	if err != nil {
 		return err
@@ -779,6 +776,7 @@ func (s *orderService) CancelOrder(ctx context.Context, companyID, orderID uuid.
 	extra := map[string]interface{}{
 		"status_before_cancel": oldStatus,
 		"cancelled_by":         cancelledBy.String(),
+		"cancellation_reason":  reason,
 	}
 	if err := s.emitOrderEvent(ctx, tx, order, salesEvents.EventOrderCancelled, extra); err != nil {
 		s.logger.Warn("failed to emit order cancelled event", zap.Error(err))
@@ -1298,6 +1296,7 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		Subtotal:        decimal.Zero,
 		DiscountTotal:   decimal.Zero,
 		TaxTotal:        decimal.Zero,
+		// Credit fields will default to false and "approved"
 	}
 
 	if err := s.orderRepo.Create(ctx, tx, order, nil); err != nil {
@@ -1322,7 +1321,6 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		appliedBy = *req.CreatedBy
 	}
 	for _, code := range req.CouponCodes {
-		// FIXED: removed tx argument
 		if _, _, err := s.discountEngine.ApplyCoupon(ctx, req.CompanyID, "order", order.OrderID, code, appliedBy); err != nil {
 			logger.Warn("failed to apply coupon", zap.String("code", code), zap.Error(err))
 		}
