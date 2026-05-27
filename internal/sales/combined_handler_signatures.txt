@@ -1,0 +1,1680 @@
+
+================================================================================
+FILE: ./handler/commission_handler.go
+================================================================================
+
+package handler
+
+func (h *CommissionHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *CommissionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *CommissionHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *CommissionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *CommissionHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *CommissionHandler) mapServiceError(err error) (status int, message string)
+
+func (h *CommissionHandler) CreateCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) UpdateCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) DeleteCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionPlanByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionPlanByCode(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ListCommissionPlans(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetActiveCommissionPlans(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CreateCommissionRule(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) UpdateCommissionRule(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) DeleteCommissionRule(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionRuleByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionRules(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) AssignCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) RemoveCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetSalesRepCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CalculateOrderCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CalculateInvoiceCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CalculatePaymentCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CalculateCommissionForPeriod(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) PreviewCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ProcessOrderCompletedCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ProcessInvoicePaidCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ProcessPaymentReceivedCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) RecalculateCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ReverseCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CreateCommissionRecord(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) UpdateCommissionRecord(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionByReference(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ListCommissions(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetSalesRepCommissions(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) MarkCommissionPending(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) ApproveCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) RejectCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) MarkCommissionPaid(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetPendingCommissions(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetApprovedCommissions(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetUnpaidCommissions(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetTotalCommissionAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetTotalPaidCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetOutstandingCommissionLiability(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetTopSalesRepCommissions(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionSummaryBySalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) GetCommissionTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CommissionPlanExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CommissionRuleExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CommissionRecordExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) CommissionAlreadyGenerated(w http.ResponseWriter, r *http.Request) 
+
+func (h *CommissionHandler) planToResponse(plan *models.CommissionPlan) 
+
+func (h *CommissionHandler) planToSummary(plan *models.CommissionPlan) 
+
+func (h *CommissionHandler) ruleToResponse(rule *models.CommissionRule) 
+
+func (h *CommissionHandler) ruleToSummary(rule *models.CommissionRule) 
+
+func (h *CommissionHandler) commissionToResponse(c *models.SalesCommission) 
+
+
+================================================================================
+FILE: ./handler/coupon_handler.go
+================================================================================
+
+package handler
+
+func (h *CouponHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *CouponHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *CouponHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *CouponHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *CouponHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *CouponHandler) mapServiceError(err error) (status int, message string)
+
+func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) DeleteCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetCouponByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetCouponByCode(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) ListCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) SearchCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetActiveCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) ActivateCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) DeactivateCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) updateCouponActivation(w http.ResponseWriter, r *http.Request, activate bool) 
+
+func (h *CouponHandler) ExpireCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) ValidateCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) CalculateDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) CalculateDiscountForProducts(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) ApplyCouponToOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) ApplyCouponToQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) ApplyCouponToInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) applyCouponToEntity(w http.ResponseWriter, r *http.Request, entityType string) 
+
+func (h *CouponHandler) RemoveCouponFromOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) RemoveCouponFromQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) RemoveCouponFromInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) removeCouponFromEntity(w http.ResponseWriter, r *http.Request, entityType string) 
+
+func (h *CouponHandler) RecordCouponUsage(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetCouponUsageCount(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetCustomerCouponUsageCount(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetCouponUsageHistory(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetTopCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetMostUsedCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetHighestDiscountCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) getTopCouponsByMetric(w http.ResponseWriter, r *http.Request, metric string) 
+
+func (h *CouponHandler) GetTotalCouponDiscountAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) GetCouponRedemptionRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) CouponExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) CouponCodeExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) IsCouponExpired(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) IsCouponUsageLimitReached(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) IsCustomerUsageLimitReached(w http.ResponseWriter, r *http.Request) 
+
+func (h *CouponHandler) couponToResponse(c *discount.Coupon) 
+
+
+================================================================================
+FILE: ./handler/credit_check_handler.go
+================================================================================
+
+package handler
+
+func (h *CreditCheckHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *CreditCheckHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *CreditCheckHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *CreditCheckHandler) getCompanyIDFromQuery(r *http.Request) (uuid.UUID, error)
+
+func (h *CreditCheckHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *CreditCheckHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *CreditCheckHandler) mapServiceError(err error) (status int, message string)
+
+func (h *CreditCheckHandler) toCreditCheckHistoryResponse(history *models.CreditCheckHistory) 
+
+func (h *CreditCheckHandler) CheckCustomerCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) CheckOrderCreditEligibility(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) CheckInvoiceCreditEligibility(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerAvailableCredit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerOutstandingBalance(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerCreditExposure(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) CanCustomerPlaceOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) HoldOrderForCredit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) ReleaseOrderCreditHold(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) IsOrderOnCreditHold(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) UpdateOrderCreditStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) SetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) IncreaseCustomerCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) DecreaseCustomerCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) SuspendCustomerCredit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) RestoreCustomerCredit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) IsCustomerCreditSuspended(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) LogCreditCheck(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCreditCheckHistoryByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerCreditHistory(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetOrderCreditHistory(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetFailedCreditChecks(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) RunAutomaticCreditReview(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomersExceedingCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetHighRiskCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetAveragePaymentDelay(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerCollectionScore(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCustomerCreditUtilization(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetTotalOutstandingCredit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetTotalCreditExposure(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetAverageCreditUtilization(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) GetCreditHoldRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) CreditHistoryExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) OrderHasCreditIssues(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditCheckHandler) CustomerExceededCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/credit_note_handler.go
+================================================================================
+
+package handler
+
+func (h *CreditNoteHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *CreditNoteHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *CreditNoteHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *CreditNoteHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *CreditNoteHandler) mapServiceError(err error) (status int, message string)
+
+func (h *CreditNoteHandler) toCreditNoteResponse(cn *models.CreditNote) 
+
+func (h *CreditNoteHandler) toCreditNoteItemResponse(item *models.CreditNoteItem) 
+
+func (h *CreditNoteHandler) toCreditNoteApplicationResponse(app *models.CreditNoteApplication) 
+
+func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) CreateFromInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) CreateFromReturn(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) UpdateCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) DeleteCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetCreditNoteByNumber(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) SearchCreditNotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) AddItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetCreditNoteItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) CalculateTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) PreviewTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetCreditNoteTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) IssueCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) VoidCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) MarkFullyApplied(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) ApplyToInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) ApplyToInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) AutoApplyToOutstandingInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) RemoveApplication(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetApplications(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetRemainingBalance(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) IsFullyApplied(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetCustomerCreditBalance(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetUnusedCreditNotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) ConvertToRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetTotalCreditIssued(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetTotalCreditApplied(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) GetOutstandingCredits(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) CreditNoteExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CreditNoteHandler) CreditNoteNumberExists(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/customer_handler.go
+================================================================================
+
+package handler
+
+func (h *CustomerHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *CustomerHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *CustomerHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *CustomerHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *CustomerHandler) mapServiceError(err error) (status int, message string)
+
+func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) DeleteCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) GetCustomerByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) GetCustomerByCode(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) SearchCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) ActivateCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) DeactivateCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) UpdateCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) GetCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) GetOutstandingBalance(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) AssignPaymentTerm(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) RemovePaymentTerm(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) GetCustomersWithOutstandingInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) GetTopCustomersByRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) CustomerExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *CustomerHandler) IsCustomerActive(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/discount_handler.go
+================================================================================
+
+package handler
+
+func (h *DiscountHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *DiscountHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *DiscountHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *DiscountHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *DiscountHandler) mapServiceError(err error) (status int, message string)
+
+func (h *DiscountHandler) EvaluateOrderDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) EvaluateQuoteDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) EvaluateInvoiceDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetApplicableCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetApplicablePromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetApplicableAutomaticDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetBestCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetBestPromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetBestDiscountCombination(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) ValidateStackingRules(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) CanStackDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) CalculateCouponDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) CalculatePromotionDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) CalculateAutomaticDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) ApplyPromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) RemovePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) ClearDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) TrackCouponUsage(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) TrackPromotionUsage(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetCouponUsageCount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetPromotionUsageCount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetTopCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetTopPromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetTotalDiscountAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetTotalCouponDiscountAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetTotalPromotionDiscountAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) GetAverageDiscountRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) CouponExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) PromotionExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) IsCouponExpired(w http.ResponseWriter, r *http.Request) 
+
+func (h *DiscountHandler) IsPromotionExpired(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/invoice_handler.go
+================================================================================
+
+package handler
+
+func (h *InvoiceHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *InvoiceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *InvoiceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *InvoiceHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *InvoiceHandler) mapServiceError(err error) (status int, message string)
+
+func (h *InvoiceHandler) toInvoiceResponse(inv *models.Invoice) 
+
+func (h *InvoiceHandler) toInvoiceItemResponse(item *models.InvoiceItem) 
+
+func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) CreateInvoiceFromQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) UpdateInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) DeleteInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoiceByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoiceByNumber(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) ListInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) SearchInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoicesByCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoicesByOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) AddItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) RemoveItem(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoiceItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) CalculatePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoiceTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) ApplyManualDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) RemoveManualDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) IssueInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) MarkAsPaid(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) MarkAsOverdue(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) VoidInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) RegisterPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) ApplyPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) RemovePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoicePayments(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetOutstandingAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) RefreshPaymentBalances(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) UpdateDueDate(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetOverdueInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetInvoicesDueSoon(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) SendDueReminder(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) SendOverdueReminder(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetTotalInvoicedRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetCollectedRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetOutstandingReceivables(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetAveragePaymentTime(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) GetTopOverdueInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) InvoiceExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) IsInvoicePaid(w http.ResponseWriter, r *http.Request) 
+
+func (h *InvoiceHandler) IsInvoiceOverdue(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/order_handler.go
+================================================================================
+
+package handler
+
+func (h *OrderHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *OrderHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *OrderHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *OrderHandler) parseCompanyIDFromQuery(r *http.Request) (uuid.UUID, error)
+
+func (h *OrderHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *OrderHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *OrderHandler) mapServiceError(err error) (status int, message string)
+
+func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) UpdateOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) DeleteOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrderByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrderByNumber(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) ListOrders(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) SearchOrders(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrdersByCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) AddItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) RemoveItem(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrderItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrderTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) ConfirmOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) MarkShipped(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) MarkDelivered(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) CancelOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetPendingOrders(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrdersReadyForInvoicing(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetOrderRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetAverageOrderValue(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) GetTopOrdersByValue(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) OrderExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) HasInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *OrderHandler) HasReturns(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/payment_handler.go
+================================================================================
+
+package handler
+
+func (h *PaymentHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *PaymentHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *PaymentHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *PaymentHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *PaymentHandler) mapServiceError(err error) (status int, message string)
+
+func (h *PaymentHandler) toPaymentResponse(p *models.Payment) 
+
+func (h *PaymentHandler) toRefundResponse(r *models.PaymentRefund) 
+
+func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) UpdatePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) DeletePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentByNumber(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentByGatewayReference(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) ListPayments(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) SearchPayments(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentsByCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentsByInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RegisterCashPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RegisterCardPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RegisterChequePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RegisterWalletPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) ProcessGatewayPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) ProcessGatewayWebhook(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentByIdempotencyKey(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) AllocatePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) AllocatePaymentToInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) AutoAllocatePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RemoveAllocation(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentAllocations(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetUnallocatedAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) CreateRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RefundFullPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) RefundPartialPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) ProcessGatewayRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetRefundByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentRefunds(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetRefundedAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) MarkPending(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) MarkCompleted(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) MarkFailed(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) CancelPayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) ReconcilePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) UnreconcilePayment(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetUnreconciledPayments(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetTotalPaymentsReceived(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetTotalRefundedAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetNetCollections(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetPaymentsByMethod(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GetFailedPayments(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) PaymentExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) PaymentNumberExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) GatewayTransactionExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentHandler) HasRefunds(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/payment_term_handler.go
+================================================================================
+
+package handler
+
+func (h *PaymentTermHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *PaymentTermHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *PaymentTermHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *PaymentTermHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *PaymentTermHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *PaymentTermHandler) mapServiceError(err error) (status int, message string)
+
+func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) DeletePaymentTerm(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) GetPaymentTermByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) GetPaymentTermByCode(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) GetPaymentTermByName(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) ListPaymentTerms(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) SearchPaymentTerms(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) GetActivePaymentTerms(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) UpdatePaymentTermStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) CalculateDueDate(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) CalculateEarlyPaymentDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) AssignPaymentTermToCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *PaymentTermHandler) RemovePaymentTermFromCustomer(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/pricing_handler.go
+================================================================================
+
+package handler
+
+func (h *PricingHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *PricingHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *PricingHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *PricingHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *PricingHandler) mapServiceError(err error) (status int, message string)
+
+func (h *PricingHandler) GetProductBasePrice(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetProductsBasePrices(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateOrderPricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) PreviewOrderPricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateOrderTax(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateOrderDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateQuotePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) PreviewQuotePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateQuoteTax(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateQuoteDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateInvoicePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) PreviewInvoicePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateInvoiceTax(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateInvoiceDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateTaxAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetApplicableCoupons(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetBestCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetApplicablePromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetBestPromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) ValidateDiscountCombination(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetCustomerOutstandingBalance(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) ValidatePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) ValidateOrderPricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) ValidateQuotePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) ValidateInvoicePricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetAverageDiscountRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetTotalDiscountAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PricingHandler) GetEffectiveRevenueAfterDiscounts(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/product_handler.go
+================================================================================
+
+package handler
+
+func (h *ProductHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *ProductHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *ProductHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *ProductHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *ProductHandler) mapServiceError(err error) (status int, message string)
+
+func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) DeleteProduct(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) GetProductByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) GetProductBySKU(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Request) 
+
+func (h *ProductHandler) UnlinkInventoryItem(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/promotion_handler.go
+================================================================================
+
+package handler
+
+func (h *PromotionHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *PromotionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *PromotionHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *PromotionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *PromotionHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *PromotionHandler) mapServiceError(err error) (status int, message string)
+
+func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) DeletePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionByCode(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionByName(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ListPromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) SearchPromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetActivePromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ActivatePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) DeactivatePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ExpirePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) UpdatePromotionRule(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) DeletePromotionRule(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionRuleByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionRules(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ValidatePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) EvaluatePromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) CalculatePromotionDiscount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ApplyPromotionToOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ApplyPromotionToQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ApplyPromotionToInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) applyPromotionToEntity(w http.ResponseWriter, r *http.Request, entityType string) 
+
+func (h *PromotionHandler) RemovePromotionFromOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) RemovePromotionFromQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) RemovePromotionFromInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) removePromotionFromEntity(w http.ResponseWriter, r *http.Request, entityType string) 
+
+func (h *PromotionHandler) ClearPromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) RecordPromotionUsage(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionUsageCount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetCustomerPromotionUsageCount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionUsageHistory(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) CanStackPromotion(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) ValidatePromotionStacking(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetStackablePromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetHighestRevenuePromotions(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetTotalPromotionDiscountAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionConversionImpact(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) GetPromotionRedemptionRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) PromotionExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) PromotionCodeExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) PromotionRuleExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) IsPromotionExpired(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) IsPromotionUsageLimitReached(w http.ResponseWriter, r *http.Request) 
+
+func (h *PromotionHandler) IsCustomerPromotionUsageLimitReached(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/quote_handler.go
+================================================================================
+
+package handler
+
+func (h *QuoteHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *QuoteHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *QuoteHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *QuoteHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *QuoteHandler) mapServiceError(err error) (status int, message string)
+
+func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) DeleteQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetQuoteByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetQuoteByNumber(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) ListQuotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) SearchQuotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetQuoteItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetQuoteTotals(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetLatestRevision(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) MarkSent(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) AcceptQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) RejectQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) ExpireQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetExpiringQuotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) ConvertToOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) IsConverted(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetQuoteConversionRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) GetTotalQuotedRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) QuoteExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *QuoteHandler) IsExpired(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/report_handler.go
+================================================================================
+
+package handler
+
+func (h *ReportHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *ReportHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *ReportHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *ReportHandler) parseTimeQuery(r *http.Request, paramName string) 
+
+func (h *ReportHandler) parseDecimalQuery(r *http.Request, paramName string) 
+
+func (h *ReportHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *ReportHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *ReportHandler) mapServiceError(err error) (status int, message string)
+
+func (h *ReportHandler) GetSalesDashboard(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTodaySalesSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRealtimeSalesSnapshot(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueByCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueByProduct(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueByCategory(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueBySalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRevenueByPaymentMethod(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetNetRevenueAfterReturns(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTopCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomerSalesSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomerLifetimeValue(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomersWithOutstandingBalance(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomersWithOverdueInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetInactiveCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetNewCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOrderSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOrdersByStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTopOrdersByValue(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetAverageOrderValueTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOrderConversionFunnel(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetQuoteSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetQuoteConversionMetrics(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetQuotesExpiringSoon(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetInvoiceSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOutstandingReceivablesSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOverdueInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOverdueInvoiceAging(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetInvoicesDueSoon(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetInvoiceCollectionTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetAverageCollectionDays(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetPaymentSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetPaymentMethodBreakdown(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetFailedPaymentAnalytics(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRefundSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTopSellingProducts(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetLeastSellingProducts(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetProductSalesTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetProductsNeverSold(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetMostReturnedProducts(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetReturnSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetReturnRateTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetRefundLiabilitySummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetDiscountSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCouponPerformance(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetPromotionPerformance(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetDiscountImpactOnRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTaxBreakdownByRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTaxBreakdownByJurisdiction(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTaxBreakdownByProduct(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCollectedTaxTrend(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTaxAuditReport(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetSalesRepPerformance(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetSalesLeaderboard(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCommissionSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCreditRiskSummary(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomersExceedingCreditLimit(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetSalesReport(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetTaxReport(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetReceivablesReport(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetCustomerStatement(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReportHandler) GetSalesAuditTrail(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/return_handler.go
+================================================================================
+
+package handler
+
+func (h *ReturnHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *ReturnHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *ReturnHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *ReturnHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *ReturnHandler) mapServiceError(err error) (status int, message string)
+
+func (h *ReturnHandler) toReturnResponse(r *models.Return) 
+
+func (h *ReturnHandler) toReturnItemResponse(item *models.ReturnItem) 
+
+func (h *ReturnHandler) CreateReturnRequest(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) CreateReturnFromOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) CreateReturnFromInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) UpdateReturnRequest(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) DeleteReturnRequest(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnByNumber(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ListReturns(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) SearchReturns(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnsByCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnsByOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnsByInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) AddItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) RemoveItem(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ApproveReturn(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) RejectReturn(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) CancelReturn(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) MarkReceived(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) CompleteReturn(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) CalculateRefundAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) CalculatePartialRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) PreviewRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GenerateCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) HasCreditNote(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ProcessRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ProcessFullRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ProcessPartialRefund(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetRefunds(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetRefundedAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) RestockReturnedItems(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) MarkItemsAsDamaged(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetPendingReturns(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetApprovedReturns(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetRejectedReturns(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetReturnRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetTotalRefundAmount(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) GetMostReturnedProducts(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ReturnExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) ReturnNumberExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) IsReturnApproved(w http.ResponseWriter, r *http.Request) 
+
+func (h *ReturnHandler) IsReturnCompleted(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/sales_rep_handler.go
+================================================================================
+
+package handler
+
+func (h *SalesRepHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *SalesRepHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *SalesRepHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *SalesRepHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *SalesRepHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *SalesRepHandler) mapServiceError(err error) (status int, message string)
+
+func (h *SalesRepHandler) parsePagination(r *http.Request) (limit, offset int)
+
+func (h *SalesRepHandler) parseSort(r *http.Request) 
+
+func (h *SalesRepHandler) parseTimeRange(r *http.Request) (from, to *time.Time)
+
+func (h *SalesRepHandler) salesRepToSummary(rep *models.SalesRep) 
+
+func (h *SalesRepHandler) salesRepToResponse(rep *models.SalesRep) 
+
+func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) UpdateSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) DeleteSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetSalesRepByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetSalesRepByUserID(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetSalesRepByCode(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) ListSalesReps(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) SearchSalesReps(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetActiveSalesReps(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) ActivateSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) DeactivateSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) updateActivation(w http.ResponseWriter, r *http.Request, activate bool) 
+
+func (h *SalesRepHandler) AssignOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) RemoveOrderAssignment(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetAssignedOrders(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) AssignQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) RemoveQuoteAssignment(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetAssignedQuotes(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) AssignInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) RemoveInvoiceAssignment(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetAssignedInvoices(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) AssignCustomer(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) RemoveCustomerAssignment(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetAssignedCustomers(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetCustomerSalesRep(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) SetCommissionPlan(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) CalculateCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetEarnedCommission(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetSalesRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetCollectedRevenue(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetAverageDealSize(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetConversionRate(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetTopSalesReps(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetSalesRepLeaderboard(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) SetSalesTarget(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) GetSalesTarget(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) SalesRepExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) SalesRepCodeExists(w http.ResponseWriter, r *http.Request) 
+
+func (h *SalesRepHandler) UserAlreadyLinked(w http.ResponseWriter, r *http.Request) 
+
+
+================================================================================
+FILE: ./handler/tax_handler.go
+================================================================================
+
+package handler
+
+func (h *TaxHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+
+func (h *TaxHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+
+func (h *TaxHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+
+func (h *TaxHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+
+func (h *TaxHandler) mapServiceError(err error) (status int, message string)
+
+func (h *TaxHandler) CalculateOrderTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) CalculateQuoteTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) CalculateInvoiceTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) CalculateReturnTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) PreviewTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) ApplyTaxesToOrder(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) ApplyTaxesToQuote(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) ApplyTaxesToInvoice(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) applyTaxesToEntity(w http.ResponseWriter, r *http.Request, entityType string) 
+
+func (h *TaxHandler) RefreshOrderTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) RefreshInvoiceTaxes(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) refreshEntityTaxes(w http.ResponseWriter, r *http.Request, entityType string) 
+
+func (h *TaxHandler) GetOrderTaxBreakdown(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) GetInvoiceTaxBreakdown(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) GetQuoteTaxBreakdown(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) CreateTaxSnapshot(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) GetTaxSnapshotByID(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) GetLatestTaxSnapshot(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) GetTaxSnapshots(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) RecalculateTaxSnapshot(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) ArchiveTaxSnapshot(w http.ResponseWriter, r *http.Request) 
+
+func (h *TaxHandler) TaxSnapshotExists(w http.ResponseWriter, r *http.Request) 
+
