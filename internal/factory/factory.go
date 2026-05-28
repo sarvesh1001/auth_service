@@ -27,6 +27,8 @@ import (
 	hrpostgres "auth-service/internal/hr/repository"
 	hrservice "auth-service/internal/hr/service"
 	"auth-service/internal/infrastructure/audit"
+	"auth-service/internal/infrastructure/idempotency"
+	"auth-service/internal/infrastructure/outbox"
 	"auth-service/internal/inventory"
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
@@ -244,6 +246,12 @@ type Factory struct {
 	// NEW: inventory consumer
 	inventoryConsumer       *consumer.InventoryConsumer
 	inventoryConsumerCancel context.CancelFunc
+	salesInfra              *SalesInfraFactory
+	salesConsumer           *consumer.SalesConsumer // <-- add this
+	salesConsumerCancel     context.CancelFunc      // <-- add this
+
+	outboxRepo       outbox.Repository
+	idempotencyStore idempotency.Store
 
 	// Email sender for notifications
 	emailSender email.Sender
@@ -327,8 +335,16 @@ func NewFactory() (*Factory, error) {
 
 	f.initializeManagers()
 
+	// --------------------------------------------------------------------
+	// Create shared outbox repository and idempotency store
+	// --------------------------------------------------------------------
+	f.outboxRepo = outbox.NewPostgresRepository(f.PostgresClient().DB)
+	pgStore := idempotency.NewPostgresStore(f.PostgresClient().DB)
+	redisCache := idempotency.NewRedisCache(f.RedisClient(), 24*time.Hour)
+	f.idempotencyStore = idempotency.NewHybridStore(pgStore, redisCache)
+
 	// ============================================================
-	// Initialize Academics + Infrastructure Factory
+	// Initialize Academics Infrastructure Factory
 	// ============================================================
 	academicsInfra, err := NewAcademicsInfraFactory(
 		f.PostgresClient(),
@@ -376,7 +392,7 @@ func NewFactory() (*Factory, error) {
 	f.accountingInfra = accountingInfra
 
 	// ============================================================
-	// NEW: Initialize Inventory Infrastructure Factory
+	// Initialize Inventory Infrastructure Factory
 	// ============================================================
 	inventoryInfra, err := NewInventoryInfraFactory(
 		f.PostgresClient(),
@@ -391,6 +407,20 @@ func NewFactory() (*Factory, error) {
 		return nil, fmt.Errorf("failed to initialize inventory infra factory: %w", err)
 	}
 	f.inventoryInfra = inventoryInfra
+
+	// ============================================================
+	// Initialize Sales Infrastructure Factory
+	// ============================================================
+	salesInfra := NewSalesInfraFactory(
+		f.PostgresClient(),
+		f.outboxRepo,
+		f.idempotencyStore,
+		f.GetAuditService(),
+		f.EncryptionManager(),
+		f.accountingInfra.TaxEngineService(), // must exist in AccountingInfraFactory
+		f.logger,
+	)
+	f.salesInfra = salesInfra
 
 	kafkaLoggingMgr, err := f.InitializeKafkaLogging()
 	if err != nil {
@@ -436,7 +466,7 @@ func NewFactory() (*Factory, error) {
 	f.initializePayrollWorker()
 
 	// ============================================================
-	// Initialize analytics, student, accounting, and inventory consumers
+	// Initialize all Kafka consumers (analytics, student, accounting, inventory, sales)
 	// ============================================================
 	if f.kafkaProducer != nil && len(f.config.Kafka.Brokers) > 0 {
 		// Analytics consumer – listens to academics-events topic
@@ -562,8 +592,38 @@ func NewFactory() (*Factory, error) {
 				f.logger.Info("Inventory consumer started", zap.String("topic", inventoryTopic))
 			}
 		}
+
+		// ============================================================
+		// NEW: Sales consumer – listens to sales-events topic
+		// ============================================================
+		salesTopic := "sales-events"
+		salesKafkaConsumer, err := client.NewKafkaConsumer(
+			f.config,
+			salesTopic,
+			"sales-consumer-group",
+			f.logger,
+		)
+		if err != nil {
+			f.logger.Error("Failed to create sales Kafka consumer", zap.Error(err))
+		} else {
+			salesAnalyticsSvc := f.salesInfra.SalesAnalyticsService()
+			f.salesConsumer = consumer.NewSalesConsumer(
+				salesAnalyticsSvc,
+				f.logger,
+				salesKafkaConsumer,
+				salesTopic,
+				f.config.Kafka.Brokers,
+			)
+			ctx, cancel := context.WithCancel(context.Background())
+			f.salesConsumerCancel = cancel
+			go func() {
+				f.salesConsumer.Start(ctx)
+				f.logger.Info("Sales consumer stopped")
+			}()
+			f.logger.Info("Sales consumer started", zap.String("topic", salesTopic))
+		}
 	} else {
-		f.logger.Warn("Kafka not available – analytics, student, accounting, and inventory consumers disabled")
+		f.logger.Warn("Kafka not available – analytics, student, accounting, inventory, and sales consumers disabled")
 	}
 
 	return f, nil
@@ -647,7 +707,7 @@ func (f *Factory) Close() error {
 			}
 		}
 
-		// NEW: Shutdown inventory consumer
+		// Shutdown inventory consumer
 		if f.inventoryConsumerCancel != nil {
 			f.logger.Info("Stopping inventory consumer...")
 			f.inventoryConsumerCancel()
@@ -655,6 +715,17 @@ func (f *Factory) Close() error {
 		if f.inventoryConsumer != nil {
 			if err := f.inventoryConsumer.Close(); err != nil {
 				f.logger.Error("Failed to close inventory consumer", zap.Error(err))
+			}
+		}
+
+		// Shutdown sales consumer
+		if f.salesConsumerCancel != nil {
+			f.logger.Info("Stopping sales consumer...")
+			f.salesConsumerCancel()
+		}
+		if f.salesConsumer != nil {
+			if err := f.salesConsumer.Close(); err != nil {
+				f.logger.Error("Failed to close sales consumer", zap.Error(err))
 			}
 		}
 
@@ -666,6 +737,11 @@ func (f *Factory) Close() error {
 		// Close inventory infra (outbox processor)
 		if f.inventoryInfra != nil {
 			f.inventoryInfra.Close()
+		}
+
+		// Close sales infra (if it has background tasks)
+		if f.salesInfra != nil {
+			f.salesInfra.Close() // implement Close() in SalesInfraFactory if needed
 		}
 
 		if f.postgresClient != nil {
