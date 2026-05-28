@@ -1,0 +1,643 @@
+================================================================================
+CONSTRUCTOR FUNCTIONS EXTRACTED FOR FACTORY INIT
+================================================================================
+
+📄 handler/commission_handler.go
+  • NewCommissionHandler(commissionService service.SalesRepCommissionService, logger *zap.Logger) *CommissionHandler
+
+📄 handler/coupon_handler.go
+  • NewCouponHandler(couponService service.CouponService, logger *zap.Logger) *CouponHandler
+
+📄 handler/credit_check_handler.go
+  • NewCreditCheckHandler(creditCheckService service.CreditCheckService, logger *zap.Logger) *CreditCheckHandler
+
+📄 handler/credit_note_handler.go
+  • NewCreditNoteHandler(creditNoteService service.CreditNoteService, logger *zap.Logger) *CreditNoteHandler
+
+📄 handler/customer_handler.go
+  • NewCustomerHandler(customerService service.CustomerService, logger *zap.Logger) *CustomerHandler
+
+📄 handler/discount_handler.go
+  • NewDiscountHandler(discountService service.DiscountEngineService, logger *zap.Logger) *DiscountHandler
+
+📄 handler/invoice_handler.go
+  • NewInvoiceHandler(invoiceService service.InvoiceService, logger *zap.Logger) *InvoiceHandler
+
+📄 handler/order_handler.go
+  • NewOrderHandler(orderService service.OrderService, logger *zap.Logger) *OrderHandler
+
+📄 handler/payment_handler.go
+  • NewPaymentHandler(paymentService service.PaymentService, logger *zap.Logger) *PaymentHandler
+
+📄 handler/payment_term_handler.go
+  • NewPaymentTermHandler(paymentTermService service.PaymentTermService, logger *zap.Logger) *PaymentTermHandler
+
+📄 handler/pricing_handler.go
+  • NewPricingHandler(pricingService service.PricingService, logger *zap.Logger) *PricingHandler
+
+📄 handler/product_handler.go
+  • NewProductHandler(productService service.ProductService, logger *zap.Logger) *ProductHandler
+
+📄 handler/promotion_handler.go
+  • NewPromotionHandler(promotionService service.PromotionService, logger *zap.Logger) *PromotionHandler
+
+📄 handler/quote_handler.go
+  • NewQuoteHandler(quoteService service.QuoteService, logger *zap.Logger) *QuoteHandler
+
+📄 handler/report_handler.go
+  • NewReportHandler(queryService service.SalesQueryService, logger *zap.Logger) *ReportHandler
+
+📄 handler/return_handler.go
+  • NewReturnHandler(returnService service.ReturnService, logger *zap.Logger) *ReturnHandler
+
+📄 handler/sales_rep_handler.go
+  • NewSalesRepHandler(salesRepService service.SalesRepService, logger *zap.Logger) *SalesRepHandler
+
+📄 handler/tax_handler.go
+  • NewTaxHandler(taxService service.TaxIntegrationService, logger *zap.Logger) *TaxHandler
+
+📄 repository/analytics_repository.go
+  • NewAnalyticsRepository(logger *zap.Logger) AnalyticsRepository
+
+📄 repository/automatic_discount_repository.go
+  • NewAutomaticDiscountRepository(logger *zap.Logger) AutomaticDiscountRepository
+
+📄 repository/commission_plan_repository.go
+  • NewCommissionPlanRepository(logger *zap.Logger) CommissionPlanRepository
+
+📄 repository/commission_rule_repository.go
+  • NewCommissionRuleRepository(logger *zap.Logger) CommissionRuleRepository
+
+📄 repository/coupon_repository.go
+  • NewCouponRepository(logger *zap.Logger) CouponRepository
+
+📄 repository/credit_check_history_repository.go
+  • NewCreditCheckHistoryRepository(logger *zap.Logger) CreditCheckHistoryRepository
+
+📄 repository/credit_note_application_repository.go
+  • NewCreditNoteApplicationRepository(logger *zap.Logger) CreditNoteApplicationRepository
+
+📄 repository/credit_note_repository.go
+  • NewCreditNoteRepository(logger *zap.Logger) CreditNoteRepository
+
+📄 repository/customer_repository.go
+  • NewCustomerRepository(logger *zap.Logger) CustomerRepository
+
+📄 repository/discount_exclusion_repository.go
+  • NewDiscountExclusionRepository(logger *zap.Logger) DiscountExclusionRepository
+
+📄 repository/discount_priority_repository.go
+  • NewDiscountPriorityRepository(logger *zap.Logger) DiscountPriorityRepository
+
+📄 repository/discount_usage_repository.go
+  • NewDiscountUsageRepository(logger *zap.Logger) DiscountUsageRepository
+
+📄 repository/invoice_repository.go
+  • NewInvoiceRepository(logger *zap.Logger) InvoiceRepository
+
+📄 repository/order_repository.go
+  • NewOrderRepository(logger *zap.Logger) OrderRepository
+
+📄 repository/payment_refund_repository.go
+  • NewPaymentRefundRepository(logger *zap.Logger) PaymentRefundRepository
+
+📄 repository/payment_repository.go
+  • NewPaymentRepository(logger *zap.Logger) PaymentRepository
+
+📄 repository/payment_term_repository.go
+  • NewPaymentTermRepository(logger *zap.Logger) PaymentTermRepository
+
+📄 repository/pricing_repository.go
+  • NewPricingRepository(logger *zap.Logger) PricingRepository
+
+📄 repository/product_repository.go
+  • NewProductRepository(logger *zap.Logger) ProductRepository
+
+📄 repository/promotion_repository.go
+  • NewPromotionRepository(logger *zap.Logger) PromotionRepository
+
+📄 repository/quote_repository.go
+  • NewQuoteRepository(logger *zap.Logger) QuoteRepository
+
+📄 repository/return_repository.go
+  • NewReturnRepository(logger *zap.Logger) ReturnRepository
+
+📄 repository/sales_commission_repository.go
+  • NewSalesCommissionRepository(logger *zap.Logger) SalesCommissionRepository
+
+📄 repository/sales_rep_commission_repository.go
+  • NewSalesRepCommissionRepository(logger *zap.Logger) SalesRepCommissionRepository
+
+📄 repository/sales_rep_repository.go
+  • NewSalesRepRepository(logger *zap.Logger) SalesRepRepository
+
+📄 repository/sales_target_repository.go
+  • NewSalesTargetRepository(logger *zap.Logger) SalesTargetRepository
+
+📄 repository/stacking_rule_repository.go
+  • NewStackingRuleRepository(logger *zap.Logger) StackingRuleRepository
+
+📄 repository/tax_snapshot_repository.go
+  • NewTaxSnapshotRepository(logger *zap.Logger) TaxSnapshotRepository
+
+📄 service/coupon_service.go
+  • NewCouponService(couponRepo repository.CouponRepository,
+	usageRepo repository.DiscountUsageRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) CouponService
+
+📄 service/credit_check_service.go
+  • NewCreditCheckService(customerRepo repository.CustomerRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	creditHistoryRepo repository.CreditCheckHistoryRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) CreditCheckService
+
+📄 service/credit_note_service.go
+  • NewCreditNoteService(creditNoteRepo repository.CreditNoteRepository,
+	appRepo repository.CreditNoteApplicationRepository,
+	invoiceRepo repository.InvoiceRepository,
+	invoiceService InvoiceService,
+	paymentService PaymentService,
+	returnRepo repository.ReturnRepository,
+	orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) CreditNoteService
+
+📄 service/customer_service.go
+  • NewCustomerService(customerRepo repository.CustomerRepository,
+	creditHistoryRepo repository.CreditCheckHistoryRepository,
+	paymentTermRepo repository.PaymentTermRepository,
+	salesRepRepo repository.SalesRepRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	encryptionMgr *encryption.EncryptionManager,
+	logger *zap.Logger,) CustomerService
+
+📄 service/discount_engine_service.go
+  • NewDiscountEngineService(couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	autoDiscountRepo repository.AutomaticDiscountRepository,
+	stackingRuleRepo repository.StackingRuleRepository,
+	exclusionRepo repository.DiscountExclusionRepository,
+	priorityRepo repository.DiscountPriorityRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	pricingRepo repository.PricingRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	quoteRepo repository.QuoteRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) DiscountEngineService
+
+📄 service/invoice_service.go
+  • NewInvoiceService(invoiceRepo repository.InvoiceRepository,
+	orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	customerSvc CustomerService,
+	pricingRepo repository.PricingRepository,
+	discountEngine DiscountEngineService,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	paymentRepo repository.PaymentRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) InvoiceService
+
+📄 service/order_service.go
+  • NewOrderService(orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	customerSvc CustomerService,
+	pricingRepo repository.PricingRepository,
+	couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	discountEngine DiscountEngineService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) OrderService
+
+📄 service/payment_service.go
+  • NewPaymentService(paymentRepo repository.PaymentRepository,
+	invoiceRepo repository.InvoiceRepository,
+	refundRepo repository.PaymentRefundRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) PaymentService
+
+📄 service/payment_term_service.go
+  • NewPaymentTermService(repo repository.PaymentTermRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) PaymentTermService
+
+📄 service/pricing_service.go
+  • NewPricingService(pricingRepo repository.PricingRepository,
+	productRepo repository.ProductRepository,
+	couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	customerSvc CustomerService,
+	logger *zap.Logger,) PricingService
+
+📄 service/product_service.go
+  • NewProductService(productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) ProductService
+
+📄 service/promotion_service.go
+  • NewPromotionService(promotionRepo repository.PromotionRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	stackingRuleRepo repository.StackingRuleRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) PromotionService
+
+📄 service/quote_service.go
+  • NewQuoteService(quoteRepo repository.QuoteRepository,
+	orderSvc OrderService, // added
+	productRepo repository.ProductRepository,
+	customerSvc CustomerService,
+	pricingRepo repository.PricingRepository,
+	couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) QuoteService
+
+📄 service/return_service.go
+  • NewReturnService(returnRepo repository.ReturnRepository,
+	paymentRefundRepo repository.PaymentRefundRepository,
+	invoiceRepo repository.InvoiceRepository,
+	orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) ReturnService
+
+📄 service/sales_analytics_service.go
+  • NewSalesAnalyticsService(analyticsRepo repository.AnalyticsRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	commissionRepo repository.SalesRepCommissionRepository,
+	returnRepo repository.ReturnRepository,
+	productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SalesAnalyticsService
+
+📄 service/sales_query_service.go
+  • NewSalesQueryService(analyticsRepo repository.AnalyticsRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	paymentRepo repository.PaymentRepository,
+	returnRepo repository.ReturnRepository,
+	customerRepo repository.CustomerRepository,
+	productRepo repository.ProductRepository,
+	salesRepRepo repository.SalesRepRepository,
+	quoteRepo repository.QuoteRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	creditNoteRepo repository.CreditNoteRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,) SalesQueryService
+
+📄 service/sales_rep_commission_service.go
+  • NewSalesRepCommissionService(planRepo repository.CommissionPlanRepository,
+	ruleRepo repository.CommissionRuleRepository,
+	commissionRepo repository.SalesCommissionRepository,
+	salesRepRepo repository.SalesRepRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	paymentRepo repository.PaymentRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) SalesRepCommissionService
+
+📄 service/sales_rep_service.go
+  • NewSalesRepService(repRepo repository.SalesRepRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	commissionRepo repository.SalesRepCommissionRepository,
+	targetRepo repository.SalesTargetRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) SalesRepService
+
+📄 service/tax_integration_service.go
+  • NewTaxIntegrationService(taxSnapshotRepo repository.TaxSnapshotRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	productRepo repository.ProductRepository,
+	customerRepo repository.CustomerRepository,
+	accountingTaxEngine accountingService.TaxEngineService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,) TaxIntegrationService
+
+
+================================================================================
+CONSTRUCTOR PARAMETER SUMMARY (for dependency injection)
+================================================================================
+
+NewTaxIntegrationService ← taxSnapshotRepo repository.TaxSnapshotRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	productRepo repository.ProductRepository,
+	customerRepo repository.CustomerRepository,
+	accountingTaxEngine accountingService.TaxEngineService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewCreditCheckService ← customerRepo repository.CustomerRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	creditHistoryRepo repository.CreditCheckHistoryRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewSalesRepCommissionService ← planRepo repository.CommissionPlanRepository,
+	ruleRepo repository.CommissionRuleRepository,
+	commissionRepo repository.SalesCommissionRepository,
+	salesRepRepo repository.SalesRepRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	paymentRepo repository.PaymentRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewPaymentService ← paymentRepo repository.PaymentRepository,
+	invoiceRepo repository.InvoiceRepository,
+	refundRepo repository.PaymentRefundRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewSalesAnalyticsService ← analyticsRepo repository.AnalyticsRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	commissionRepo repository.SalesRepCommissionRepository,
+	returnRepo repository.ReturnRepository,
+	productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewOrderService ← orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	customerSvc CustomerService,
+	pricingRepo repository.PricingRepository,
+	couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	discountEngine DiscountEngineService,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewDiscountEngineService ← couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	autoDiscountRepo repository.AutomaticDiscountRepository,
+	stackingRuleRepo repository.StackingRuleRepository,
+	exclusionRepo repository.DiscountExclusionRepository,
+	priorityRepo repository.DiscountPriorityRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	pricingRepo repository.PricingRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	quoteRepo repository.QuoteRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewSalesRepService ← repRepo repository.SalesRepRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	commissionRepo repository.SalesRepCommissionRepository,
+	targetRepo repository.SalesTargetRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewInvoiceService ← invoiceRepo repository.InvoiceRepository,
+	orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	customerSvc CustomerService,
+	pricingRepo repository.PricingRepository,
+	discountEngine DiscountEngineService,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	paymentRepo repository.PaymentRepository,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewPricingService ← pricingRepo repository.PricingRepository,
+	productRepo repository.ProductRepository,
+	couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	customerSvc CustomerService,
+	logger *zap.Logger,
+NewCustomerService ← customerRepo repository.CustomerRepository,
+	creditHistoryRepo repository.CreditCheckHistoryRepository,
+	paymentTermRepo repository.PaymentTermRepository,
+	salesRepRepo repository.SalesRepRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	encryptionMgr *encryption.EncryptionManager,
+	logger *zap.Logger,
+NewPromotionService ← promotionRepo repository.PromotionRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	stackingRuleRepo repository.StackingRuleRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewCreditNoteService ← creditNoteRepo repository.CreditNoteRepository,
+	appRepo repository.CreditNoteApplicationRepository,
+	invoiceRepo repository.InvoiceRepository,
+	invoiceService InvoiceService,
+	paymentService PaymentService,
+	returnRepo repository.ReturnRepository,
+	orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewReturnService ← returnRepo repository.ReturnRepository,
+	paymentRefundRepo repository.PaymentRefundRepository,
+	invoiceRepo repository.InvoiceRepository,
+	orderRepo repository.OrderRepository,
+	productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewCouponService ← couponRepo repository.CouponRepository,
+	usageRepo repository.DiscountUsageRepository,
+	orderRepo repository.OrderRepository,
+	quoteRepo repository.QuoteRepository,
+	invoiceRepo repository.InvoiceRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewSalesQueryService ← analyticsRepo repository.AnalyticsRepository,
+	orderRepo repository.OrderRepository,
+	invoiceRepo repository.InvoiceRepository,
+	paymentRepo repository.PaymentRepository,
+	returnRepo repository.ReturnRepository,
+	customerRepo repository.CustomerRepository,
+	productRepo repository.ProductRepository,
+	salesRepRepo repository.SalesRepRepository,
+	quoteRepo repository.QuoteRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	creditNoteRepo repository.CreditNoteRepository,
+	pgClient *client.PostgresClient,
+	logger *zap.Logger,
+NewProductService ← productRepo repository.ProductRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewQuoteService ← quoteRepo repository.QuoteRepository,
+	orderSvc OrderService, // added
+	productRepo repository.ProductRepository,
+	customerSvc CustomerService,
+	pricingRepo repository.PricingRepository,
+	couponRepo repository.CouponRepository,
+	promotionRepo repository.PromotionRepository,
+	discountUsageRepo repository.DiscountUsageRepository,
+	taxSnapshotRepo repository.TaxSnapshotRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewPaymentTermService ← repo repository.PaymentTermRepository,
+	pgClient *client.PostgresClient,
+	outboxRepo outbox.Repository,
+	idempotencyStore idempotency.Store,
+	auditService *audit.AuditService,
+	logger *zap.Logger,
+NewCreditCheckHandler ← creditCheckService service.CreditCheckService, logger *zap.Logger
+NewOrderHandler ← orderService service.OrderService, logger *zap.Logger
+NewPaymentHandler ← paymentService service.PaymentService, logger *zap.Logger
+NewPromotionHandler ← promotionService service.PromotionService, logger *zap.Logger
+NewCustomerHandler ← customerService service.CustomerService, logger *zap.Logger
+NewReportHandler ← queryService service.SalesQueryService, logger *zap.Logger
+NewPricingHandler ← pricingService service.PricingService, logger *zap.Logger
+NewDiscountHandler ← discountService service.DiscountEngineService, logger *zap.Logger
+NewSalesRepHandler ← salesRepService service.SalesRepService, logger *zap.Logger
+NewInvoiceHandler ← invoiceService service.InvoiceService, logger *zap.Logger
+NewQuoteHandler ← quoteService service.QuoteService, logger *zap.Logger
+NewCommissionHandler ← commissionService service.SalesRepCommissionService, logger *zap.Logger
+NewTaxHandler ← taxService service.TaxIntegrationService, logger *zap.Logger
+NewPaymentTermHandler ← paymentTermService service.PaymentTermService, logger *zap.Logger
+NewCouponHandler ← couponService service.CouponService, logger *zap.Logger
+NewProductHandler ← productService service.ProductService, logger *zap.Logger
+NewCreditNoteHandler ← creditNoteService service.CreditNoteService, logger *zap.Logger
+NewReturnHandler ← returnService service.ReturnService, logger *zap.Logger
+NewSalesCommissionRepository ← logger *zap.Logger
+NewDiscountExclusionRepository ← logger *zap.Logger
+NewInvoiceRepository ← logger *zap.Logger
+NewCommissionRuleRepository ← logger *zap.Logger
+NewSalesRepCommissionRepository ← logger *zap.Logger
+NewProductRepository ← logger *zap.Logger
+NewSalesTargetRepository ← logger *zap.Logger
+NewDiscountUsageRepository ← logger *zap.Logger
+NewPaymentRepository ← logger *zap.Logger
+NewCustomerRepository ← logger *zap.Logger
+NewPricingRepository ← logger *zap.Logger
+NewReturnRepository ← logger *zap.Logger
+NewTaxSnapshotRepository ← logger *zap.Logger
+NewPaymentRefundRepository ← logger *zap.Logger
+NewDiscountPriorityRepository ← logger *zap.Logger
+NewSalesRepRepository ← logger *zap.Logger
+NewPromotionRepository ← logger *zap.Logger
+NewQuoteRepository ← logger *zap.Logger
+NewAutomaticDiscountRepository ← logger *zap.Logger
+NewOrderRepository ← logger *zap.Logger
+NewCreditCheckHistoryRepository ← logger *zap.Logger
+NewCreditNoteRepository ← logger *zap.Logger
+NewCouponRepository ← logger *zap.Logger
+NewCreditNoteApplicationRepository ← logger *zap.Logger
+NewAnalyticsRepository ← logger *zap.Logger
+NewPaymentTermRepository ← logger *zap.Logger
+NewCommissionPlanRepository ← logger *zap.Logger
+NewStackingRuleRepository ← logger *zap.Logger

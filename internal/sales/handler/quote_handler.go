@@ -1,9 +1,7 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -14,7 +12,6 @@ import (
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models/enums"
 	"auth-service/internal/sales/service"
 )
@@ -22,14 +19,14 @@ import (
 // QuoteHandler handles HTTP requests for quote management.
 type QuoteHandler struct {
 	quoteService service.QuoteService
-	logger       *zap.Logger
+	*BaseHandler
 }
 
 // NewQuoteHandler creates a new QuoteHandler.
 func NewQuoteHandler(quoteService service.QuoteService, logger *zap.Logger) *QuoteHandler {
 	return &QuoteHandler{
 		quoteService: quoteService,
-		logger:       logger.Named("quote_handler"),
+		BaseHandler:  &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -146,53 +143,6 @@ type quotePricingPreviewResponse struct {
 }
 
 // ---------- Helper Methods (receiver-specific, no conflicts) ----------
-
-func (h *QuoteHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *QuoteHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Implement real permission check
-	return true
-}
-
-func (h *QuoteHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *QuoteHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *QuoteHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidStatus):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidTransition):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
 
 // ---------- Handler Methods ----------
 
@@ -315,7 +265,7 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -425,7 +375,7 @@ func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) {
 		expiryDate = &exp
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -509,7 +459,7 @@ func (h *QuoteHandler) DeleteQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -936,7 +886,7 @@ func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1023,7 +973,7 @@ func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1081,7 +1031,7 @@ func (h *QuoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1205,7 +1155,7 @@ func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1266,7 +1216,7 @@ func (h *QuoteHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1318,7 +1268,7 @@ func (h *QuoteHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1472,7 +1422,7 @@ func (h *QuoteHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1616,7 +1566,7 @@ func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1781,7 +1731,7 @@ func (h *QuoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1833,7 +1783,7 @@ func (h *QuoteHandler) MarkSent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1885,7 +1835,7 @@ func (h *QuoteHandler) AcceptQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1942,7 +1892,7 @@ func (h *QuoteHandler) RejectQuote(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1994,7 +1944,7 @@ func (h *QuoteHandler) ExpireQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2134,7 +2084,7 @@ func (h *QuoteHandler) ConvertToOrder(w http.ResponseWriter, r *http.Request) {
 		orderDate = time.Now()
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2255,7 +2205,7 @@ func (h *QuoteHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2307,7 +2257,7 @@ func (h *QuoteHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

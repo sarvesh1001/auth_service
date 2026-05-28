@@ -1,20 +1,16 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models"
 	"auth-service/internal/sales/models/enums"
 	"auth-service/internal/sales/service"
@@ -23,14 +19,14 @@ import (
 // InvoiceHandler handles HTTP requests for invoice management.
 type InvoiceHandler struct {
 	invoiceService service.InvoiceService
-	logger         *zap.Logger
+	*BaseHandler
 }
 
 // NewInvoiceHandler creates a new InvoiceHandler.
 func NewInvoiceHandler(invoiceService service.InvoiceService, logger *zap.Logger) *InvoiceHandler {
 	return &InvoiceHandler{
 		invoiceService: invoiceService,
-		logger:         logger.Named("invoice_handler"),
+		BaseHandler:    &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -193,61 +189,6 @@ type invoiceTotalsResponse struct {
 }
 
 // ---------- Helper Functions ----------
-
-func (h *InvoiceHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *InvoiceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Implement real permission check
-	return true
-}
-
-func parseUUIDParamInvoice(r *http.Request, paramName string) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, paramName)
-	if idStr == "" {
-		return uuid.Nil, fmt.Errorf("missing %s parameter", paramName)
-	}
-	return uuid.Parse(idStr)
-}
-
-func (h *InvoiceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *InvoiceHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *InvoiceHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvoiceLocked):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvoicePaid):
-		return http.StatusConflict, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
 
 func (h *InvoiceHandler) toInvoiceResponse(inv *models.Invoice) invoiceResponse {
 	resp := invoiceResponse{
@@ -448,7 +389,7 @@ func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -521,7 +462,7 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -583,7 +524,7 @@ func (h *InvoiceHandler) CreateInvoiceFromQuote(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -640,7 +581,7 @@ func (h *InvoiceHandler) UpdateInvoice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -690,7 +631,7 @@ func (h *InvoiceHandler) DeleteInvoice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1191,7 +1132,7 @@ func (h *InvoiceHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 			Metadata:  it.Metadata,
 		}
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1280,7 +1221,7 @@ func (h *InvoiceHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 			Metadata:  it.Metadata,
 		}
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1331,7 +1272,7 @@ func (h *InvoiceHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1422,7 +1363,7 @@ func (h *InvoiceHandler) CalculatePricing(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1503,7 +1444,7 @@ func (h *InvoiceHandler) RecalculateTotals(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1608,7 +1549,7 @@ func (h *InvoiceHandler) ApplyManualDiscount(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid discount_amount")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1654,7 +1595,7 @@ func (h *InvoiceHandler) RemoveManualDiscount(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1710,7 +1651,7 @@ func (h *InvoiceHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid status")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1756,7 +1697,7 @@ func (h *InvoiceHandler) IssueInvoice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1815,7 +1756,7 @@ func (h *InvoiceHandler) MarkAsPaid(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1861,7 +1802,7 @@ func (h *InvoiceHandler) MarkAsOverdue(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1912,7 +1853,7 @@ func (h *InvoiceHandler) VoidInvoice(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1973,7 +1914,7 @@ func (h *InvoiceHandler) RegisterPayment(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2038,7 +1979,7 @@ func (h *InvoiceHandler) ApplyPayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2089,7 +2030,7 @@ func (h *InvoiceHandler) RemovePayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2225,7 +2166,7 @@ func (h *InvoiceHandler) RefreshPaymentBalances(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2281,7 +2222,7 @@ func (h *InvoiceHandler) UpdateDueDate(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid due_date")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2442,7 +2383,7 @@ func (h *InvoiceHandler) SendDueReminder(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2488,7 +2429,7 @@ func (h *InvoiceHandler) SendOverdueReminder(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

@@ -1,34 +1,30 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/service"
 )
 
 // PaymentTermHandler handles HTTP requests for payment term management.
 type PaymentTermHandler struct {
 	paymentTermService service.PaymentTermService
-	logger             *zap.Logger
+	*BaseHandler
 }
 
 // NewPaymentTermHandler creates a new PaymentTermHandler.
 func NewPaymentTermHandler(paymentTermService service.PaymentTermService, logger *zap.Logger) *PaymentTermHandler {
 	return &PaymentTermHandler{
 		paymentTermService: paymentTermService,
-		logger:             logger.Named("payment_term_handler"),
+		BaseHandler:        &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -113,57 +109,6 @@ type paymentTermSummary struct {
 
 // ---------- Helper Functions ----------
 
-func (h *PaymentTermHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *PaymentTermHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Implement real permission check
-	return true
-}
-
-func (h *PaymentTermHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, paramName)
-	if idStr == "" {
-		return uuid.Nil, fmt.Errorf("missing %s parameter", paramName)
-	}
-	return uuid.Parse(idStr)
-}
-
-func (h *PaymentTermHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *PaymentTermHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *PaymentTermHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
-
 // ---------- Handler Methods ----------
 
 // CreatePaymentTerm handles POST /payment-terms
@@ -222,7 +167,7 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -322,7 +267,7 @@ func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Re
 		discountPercent = &dp
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -397,7 +342,7 @@ func (h *PaymentTermHandler) DeletePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -866,7 +811,7 @@ func (h *PaymentTermHandler) UpdatePaymentTermStatus(w http.ResponseWriter, r *h
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -932,7 +877,7 @@ func (h *PaymentTermHandler) CalculateDueDate(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1014,7 +959,7 @@ func (h *PaymentTermHandler) CalculateEarlyPaymentDiscount(w http.ResponseWriter
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1081,7 +1026,7 @@ func (h *PaymentTermHandler) AssignPaymentTermToCustomer(w http.ResponseWriter, 
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1146,7 +1091,7 @@ func (h *PaymentTermHandler) RemovePaymentTermFromCustomer(w http.ResponseWriter
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

@@ -1,20 +1,16 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models/discount"
 	"auth-service/internal/sales/service"
 )
@@ -22,14 +18,14 @@ import (
 // PromotionHandler handles HTTP requests for promotion management.
 type PromotionHandler struct {
 	promotionService service.PromotionService
-	logger           *zap.Logger
+	*BaseHandler
 }
 
 // NewPromotionHandler creates a new PromotionHandler.
 func NewPromotionHandler(promotionService service.PromotionService, logger *zap.Logger) *PromotionHandler {
 	return &PromotionHandler{
 		promotionService: promotionService,
-		logger:           logger.Named("promotion_handler"),
+		BaseHandler:      &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -133,57 +129,6 @@ type recordUsageRequest struct {
 
 // ---------- Helper Functions ----------
 
-func (h *PromotionHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *PromotionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Implement real permission check
-	return true
-}
-
-func (h *PromotionHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, paramName)
-	if idStr == "" {
-		return uuid.Nil, fmt.Errorf("missing %s parameter", paramName)
-	}
-	return uuid.Parse(idStr)
-}
-
-func (h *PromotionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *PromotionHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *PromotionHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
-
 // ---------- Promotion CRUD ----------
 
 // CreatePromotion handles POST /promotions
@@ -239,7 +184,7 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -323,7 +268,7 @@ func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -412,7 +357,7 @@ func (h *PromotionHandler) DeletePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -871,7 +816,7 @@ func (h *PromotionHandler) ActivatePromotion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -923,7 +868,7 @@ func (h *PromotionHandler) DeactivatePromotion(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -975,7 +920,7 @@ func (h *PromotionHandler) ExpirePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1039,7 +984,7 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1133,7 +1078,7 @@ func (h *PromotionHandler) UpdatePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1222,7 +1167,7 @@ func (h *PromotionHandler) DeletePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1647,7 +1592,7 @@ func (h *PromotionHandler) ApplyPromotionToOrder(w http.ResponseWriter, r *http.
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1717,7 +1662,7 @@ func (h *PromotionHandler) applyPromotionToEntity(w http.ResponseWriter, r *http
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1806,7 +1751,7 @@ func (h *PromotionHandler) removePromotionFromEntity(w http.ResponseWriter, r *h
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1872,7 +1817,7 @@ func (h *PromotionHandler) ClearPromotions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1948,7 +1893,7 @@ func (h *PromotionHandler) RecordPromotionUsage(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2267,7 +2212,7 @@ func (h *PromotionHandler) ValidatePromotionStacking(w http.ResponseWriter, r *h
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

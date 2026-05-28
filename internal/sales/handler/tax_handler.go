@@ -3,9 +3,7 @@ package handler
 
 import (
 	"auth-service/internal/sales/models"
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,19 +12,18 @@ import (
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/service"
 )
 
 type TaxHandler struct {
 	taxService service.TaxIntegrationService
-	logger     *zap.Logger
+	*BaseHandler
 }
 
 func NewTaxHandler(taxService service.TaxIntegrationService, logger *zap.Logger) *TaxHandler {
 	return &TaxHandler{
-		taxService: taxService,
-		logger:     logger.Named("tax_handler"),
+		taxService:  taxService,
+		BaseHandler: &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -141,56 +138,6 @@ type taxSnapshotResponse struct {
 // ---------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------
-
-func (h *TaxHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *TaxHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// In real implementation, check RBAC.
-	return true
-}
-
-func (h *TaxHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *TaxHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *TaxHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
-
-func parseDecimal(s string) (decimal.Decimal, error) {
-	if s == "" {
-		return decimal.Zero, nil
-	}
-	return decimal.NewFromString(s)
-}
 
 // ---------------------------------------------------------------------
 // Endpoint implementations
@@ -631,7 +578,7 @@ func (h *TaxHandler) applyTaxesToEntity(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -706,7 +653,7 @@ func (h *TaxHandler) refreshEntityTaxes(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1111,7 +1058,7 @@ func (h *TaxHandler) RecalculateTaxSnapshot(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1158,7 +1105,7 @@ func (h *TaxHandler) ArchiveTaxSnapshot(w http.ResponseWriter, r *http.Request) 
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

@@ -1,20 +1,16 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models"
 	"auth-service/internal/sales/models/enums"
 	"auth-service/internal/sales/service"
@@ -22,13 +18,13 @@ import (
 
 type ReturnHandler struct {
 	returnService service.ReturnService
-	logger        *zap.Logger
+	*BaseHandler
 }
 
 func NewReturnHandler(returnService service.ReturnService, logger *zap.Logger) *ReturnHandler {
 	return &ReturnHandler{
 		returnService: returnService,
-		logger:        logger.Named("return_handler"),
+		BaseHandler:   &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -156,61 +152,6 @@ type markDamagedRequest struct {
 }
 
 // Helper functions
-
-func (h *ReturnHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *ReturnHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// Simplified; real implementation should check RBAC
-	return true
-}
-
-func parseUUIDParamReturn(r *http.Request, paramName string) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, paramName)
-	if idStr == "" {
-		return uuid.Nil, fmt.Errorf("missing %s parameter", paramName)
-	}
-	return uuid.Parse(idStr)
-}
-
-func (h *ReturnHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *ReturnHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *ReturnHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidStatus):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidTransition):
-		return http.StatusBadRequest, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
 
 // Conversion helpers
 
@@ -350,7 +291,7 @@ func (h *ReturnHandler) CreateReturnRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -416,7 +357,7 @@ func (h *ReturnHandler) CreateReturnFromOrder(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -514,7 +455,7 @@ func (h *ReturnHandler) CreateReturnFromInvoice(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -608,7 +549,7 @@ func (h *ReturnHandler) UpdateReturnRequest(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -658,7 +599,7 @@ func (h *ReturnHandler) DeleteReturnRequest(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1172,7 +1113,7 @@ func (h *ReturnHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 			Reason:      it.Reason,
 		}
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1251,7 +1192,7 @@ func (h *ReturnHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 			Reason:      it.Reason,
 		}
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1300,7 +1241,7 @@ func (h *ReturnHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1387,7 +1328,7 @@ func (h *ReturnHandler) ApproveReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1438,7 +1379,7 @@ func (h *ReturnHandler) RejectReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1489,7 +1430,7 @@ func (h *ReturnHandler) CancelReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1548,7 +1489,7 @@ func (h *ReturnHandler) MarkReceived(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1592,7 +1533,7 @@ func (h *ReturnHandler) CompleteReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1648,7 +1589,7 @@ func (h *ReturnHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid status")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1879,7 +1820,7 @@ func (h *ReturnHandler) GenerateCreditNote(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	// No body needed – service only requires IssuedBy
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2014,7 +1955,7 @@ func (h *ReturnHandler) ProcessRefund(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2072,7 +2013,7 @@ func (h *ReturnHandler) ProcessFullRefund(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2129,7 +2070,7 @@ func (h *ReturnHandler) ProcessPartialRefund(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2261,7 +2202,7 @@ func (h *ReturnHandler) RestockReturnedItems(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid warehouse_id")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2319,7 +2260,7 @@ func (h *ReturnHandler) MarkItemsAsDamaged(w http.ResponseWriter, r *http.Reques
 		}
 		itemIDs[i] = uid
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

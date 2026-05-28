@@ -9,6 +9,7 @@ var (
 	ErrDuplicate        = errors.New("sales: duplicate record")
 	ErrConflict         = errors.New("sales: conflict")
 	ErrPermissionDenied = errors.New("sales: permission denied")
+	ErrUnauthorized     = errors.New("sales: unauthorized") // <-- ADD THIS
 
 	// Status transitions
 	ErrInvalidStatus     = errors.New("sales: invalid status")
@@ -39,7 +40,7 @@ var (
 	ErrInvalidAmount   = errors.New("sales: invalid amount")
 	ErrInvalidState    = errors.New("sales: invalid state transition")
 
-	// Payment Terms (added)
+	// Payment Terms
 	ErrPaymentTermInactive = errors.New("sales: payment term is inactive")
 	ErrPaymentTermAssigned = errors.New("sales: payment term is assigned to customers and cannot be deleted")
 )

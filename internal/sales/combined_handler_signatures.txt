@@ -1,21 +1,42 @@
 
 ================================================================================
-FILE: ./handler/commission_handler.go
+FILE: ./handler/base_handler.go
 ================================================================================
 
 package handler
 
-func (h *CommissionHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
+func (h *BaseHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
 
-func (h *CommissionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
+func (h *BaseHandler) hasPermission(ctx context.Context, companyID, userID uuid.UUID, perm string) 
 
-func (h *CommissionHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+func (h *BaseHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
 
-func (h *CommissionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
+func (h *BaseHandler) respondWithError(w http.ResponseWriter, status int, message string) 
 
-func (h *CommissionHandler) respondWithError(w http.ResponseWriter, status int, message string) 
+func (h *BaseHandler) mapServiceError(err error) (status int, message string)
 
-func (h *CommissionHandler) mapServiceError(err error) (status int, message string)
+func (h *BaseHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
+
+func (h *BaseHandler) parsePagination(r *http.Request) (limit, offset int)
+
+func (h *BaseHandler) parseSort(r *http.Request) (field, direction string)
+
+func (h *BaseHandler) parseTimeRange(r *http.Request) (from, to *time.Time)
+
+func (h *BaseHandler) getIdempotencyKey(r *http.Request) 
+
+func (h *BaseHandler) getCompanyIDFromQuery(r *http.Request) (uuid.UUID, error)
+
+func (h *BaseHandler) parseCompanyIDFromQuery(r *http.Request) (uuid.UUID, error)
+
+func (h *BaseHandler) parseTimeQuery(r *http.Request, paramName string) 
+
+
+================================================================================
+FILE: ./handler/commission_handler.go
+================================================================================
+
+package handler
 
 func (h *CommissionHandler) CreateCommissionPlan(w http.ResponseWriter, r *http.Request) 
 
@@ -130,18 +151,6 @@ FILE: ./handler/coupon_handler.go
 
 package handler
 
-func (h *CouponHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *CouponHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *CouponHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *CouponHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *CouponHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *CouponHandler) mapServiceError(err error) (status int, message string)
-
 func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) 
 
 func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) 
@@ -226,20 +235,6 @@ FILE: ./handler/credit_check_handler.go
 ================================================================================
 
 package handler
-
-func (h *CreditCheckHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *CreditCheckHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *CreditCheckHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *CreditCheckHandler) getCompanyIDFromQuery(r *http.Request) (uuid.UUID, error)
-
-func (h *CreditCheckHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *CreditCheckHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *CreditCheckHandler) mapServiceError(err error) (status int, message string)
 
 func (h *CreditCheckHandler) toCreditCheckHistoryResponse(history *models.CreditCheckHistory) 
 
@@ -326,16 +321,6 @@ FILE: ./handler/credit_note_handler.go
 
 package handler
 
-func (h *CreditNoteHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *CreditNoteHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *CreditNoteHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *CreditNoteHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *CreditNoteHandler) mapServiceError(err error) (status int, message string)
-
 func (h *CreditNoteHandler) toCreditNoteResponse(cn *models.CreditNote) 
 
 func (h *CreditNoteHandler) toCreditNoteItemResponse(item *models.CreditNoteItem) 
@@ -419,16 +404,6 @@ FILE: ./handler/customer_handler.go
 
 package handler
 
-func (h *CustomerHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *CustomerHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *CustomerHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *CustomerHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *CustomerHandler) mapServiceError(err error) (status int, message string)
-
 func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request) 
 
 func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request) 
@@ -477,16 +452,6 @@ FILE: ./handler/discount_handler.go
 ================================================================================
 
 package handler
-
-func (h *DiscountHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *DiscountHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *DiscountHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *DiscountHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *DiscountHandler) mapServiceError(err error) (status int, message string)
 
 func (h *DiscountHandler) EvaluateOrderDiscounts(w http.ResponseWriter, r *http.Request) 
 
@@ -564,16 +529,6 @@ FILE: ./handler/invoice_handler.go
 ================================================================================
 
 package handler
-
-func (h *InvoiceHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *InvoiceHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *InvoiceHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *InvoiceHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *InvoiceHandler) mapServiceError(err error) (status int, message string)
 
 func (h *InvoiceHandler) toInvoiceResponse(inv *models.Invoice) 
 
@@ -676,20 +631,6 @@ FILE: ./handler/order_handler.go
 
 package handler
 
-func (h *OrderHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *OrderHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *OrderHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *OrderHandler) parseCompanyIDFromQuery(r *http.Request) (uuid.UUID, error)
-
-func (h *OrderHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *OrderHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *OrderHandler) mapServiceError(err error) (status int, message string)
-
 func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) 
 
 func (h *OrderHandler) UpdateOrder(w http.ResponseWriter, r *http.Request) 
@@ -764,16 +705,6 @@ FILE: ./handler/payment_handler.go
 ================================================================================
 
 package handler
-
-func (h *PaymentHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *PaymentHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *PaymentHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *PaymentHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *PaymentHandler) mapServiceError(err error) (status int, message string)
 
 func (h *PaymentHandler) toPaymentResponse(p *models.Payment) 
 
@@ -884,18 +815,6 @@ FILE: ./handler/payment_term_handler.go
 
 package handler
 
-func (h *PaymentTermHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *PaymentTermHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *PaymentTermHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *PaymentTermHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *PaymentTermHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *PaymentTermHandler) mapServiceError(err error) (status int, message string)
-
 func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Request) 
 
 func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Request) 
@@ -930,16 +849,6 @@ FILE: ./handler/pricing_handler.go
 ================================================================================
 
 package handler
-
-func (h *PricingHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *PricingHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *PricingHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *PricingHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *PricingHandler) mapServiceError(err error) (status int, message string)
 
 func (h *PricingHandler) GetProductBasePrice(w http.ResponseWriter, r *http.Request) 
 
@@ -1012,16 +921,6 @@ FILE: ./handler/product_handler.go
 
 package handler
 
-func (h *ProductHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *ProductHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *ProductHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *ProductHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *ProductHandler) mapServiceError(err error) (status int, message string)
-
 func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) 
 
 func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) 
@@ -1048,18 +947,6 @@ FILE: ./handler/promotion_handler.go
 ================================================================================
 
 package handler
-
-func (h *PromotionHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *PromotionHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *PromotionHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *PromotionHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *PromotionHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *PromotionHandler) mapServiceError(err error) (status int, message string)
 
 func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Request) 
 
@@ -1164,16 +1051,6 @@ FILE: ./handler/quote_handler.go
 
 package handler
 
-func (h *QuoteHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *QuoteHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *QuoteHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *QuoteHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *QuoteHandler) mapServiceError(err error) (status int, message string)
-
 func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) 
 
 func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) 
@@ -1246,22 +1123,6 @@ FILE: ./handler/report_handler.go
 ================================================================================
 
 package handler
-
-func (h *ReportHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *ReportHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *ReportHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *ReportHandler) parseTimeQuery(r *http.Request, paramName string) 
-
-func (h *ReportHandler) parseDecimalQuery(r *http.Request, paramName string) 
-
-func (h *ReportHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *ReportHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *ReportHandler) mapServiceError(err error) (status int, message string)
 
 func (h *ReportHandler) GetSalesDashboard(w http.ResponseWriter, r *http.Request) 
 
@@ -1404,16 +1265,6 @@ FILE: ./handler/return_handler.go
 
 package handler
 
-func (h *ReturnHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *ReturnHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *ReturnHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *ReturnHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *ReturnHandler) mapServiceError(err error) (status int, message string)
-
 func (h *ReturnHandler) toReturnResponse(r *models.Return) 
 
 func (h *ReturnHandler) toReturnItemResponse(item *models.ReturnItem) 
@@ -1515,18 +1366,6 @@ FILE: ./handler/sales_rep_handler.go
 
 package handler
 
-func (h *SalesRepHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *SalesRepHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *SalesRepHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error)
-
-func (h *SalesRepHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *SalesRepHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *SalesRepHandler) mapServiceError(err error) (status int, message string)
-
 func (h *SalesRepHandler) parsePagination(r *http.Request) (limit, offset int)
 
 func (h *SalesRepHandler) parseSort(r *http.Request) 
@@ -1621,16 +1460,6 @@ FILE: ./handler/tax_handler.go
 ================================================================================
 
 package handler
-
-func (h *TaxHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error)
-
-func (h *TaxHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) 
-
-func (h *TaxHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) 
-
-func (h *TaxHandler) respondWithError(w http.ResponseWriter, status int, message string) 
-
-func (h *TaxHandler) mapServiceError(err error) (status int, message string)
 
 func (h *TaxHandler) CalculateOrderTaxes(w http.ResponseWriter, r *http.Request) 
 

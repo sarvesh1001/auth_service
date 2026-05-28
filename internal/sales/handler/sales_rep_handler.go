@@ -1,20 +1,16 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models"
 	"auth-service/internal/sales/service"
 )
@@ -22,14 +18,14 @@ import (
 // SalesRepHandler handles HTTP requests for sales representative management.
 type SalesRepHandler struct {
 	salesRepService service.SalesRepService
-	logger          *zap.Logger
+	*BaseHandler
 }
 
 // NewSalesRepHandler creates a new SalesRepHandler.
 func NewSalesRepHandler(salesRepService service.SalesRepService, logger *zap.Logger) *SalesRepHandler {
 	return &SalesRepHandler{
 		salesRepService: salesRepService,
-		logger:          logger.Named("sales_rep_handler"),
+		BaseHandler:     &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
@@ -139,59 +135,6 @@ type leaderboardResponse struct {
 }
 
 // ---------- Helper Functions ----------
-
-func (h *SalesRepHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *SalesRepHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: Implement real permission check
-	return true
-}
-
-func (h *SalesRepHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, paramName)
-	if idStr == "" {
-		return uuid.Nil, fmt.Errorf("missing %s parameter", paramName)
-	}
-	return uuid.Parse(idStr)
-}
-
-func (h *SalesRepHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *SalesRepHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *SalesRepHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrPermissionDenied):
-		return http.StatusForbidden, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
 
 func (h *SalesRepHandler) parsePagination(r *http.Request) (limit, offset int) {
 	limit = 20
@@ -323,7 +266,7 @@ func (h *SalesRepHandler) CreateSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -402,7 +345,7 @@ func (h *SalesRepHandler) UpdateSalesRep(w http.ResponseWriter, r *http.Request)
 		UpdatedBy: &userID,
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -455,7 +398,7 @@ func (h *SalesRepHandler) DeleteSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -827,7 +770,7 @@ func (h *SalesRepHandler) updateActivation(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -900,7 +843,7 @@ func (h *SalesRepHandler) AssignOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -963,7 +906,7 @@ func (h *SalesRepHandler) RemoveOrderAssignment(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1080,7 +1023,7 @@ func (h *SalesRepHandler) AssignQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1143,7 +1086,7 @@ func (h *SalesRepHandler) RemoveQuoteAssignment(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1260,7 +1203,7 @@ func (h *SalesRepHandler) AssignInvoice(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1323,7 +1266,7 @@ func (h *SalesRepHandler) RemoveInvoiceAssignment(w http.ResponseWriter, r *http
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1454,7 +1397,7 @@ func (h *SalesRepHandler) SetCommissionPlan(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1870,7 +1813,7 @@ func (h *SalesRepHandler) SetSalesTarget(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return

@@ -3,102 +3,32 @@
 package handler
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/service"
 )
 
 // ReportHandler handles read‑only analytics and report requests.
 type ReportHandler struct {
 	queryService service.SalesQueryService
-	logger       *zap.Logger
+	*BaseHandler
 }
 
 // NewReportHandler creates a new ReportHandler.
 func NewReportHandler(queryService service.SalesQueryService, logger *zap.Logger) *ReportHandler {
 	return &ReportHandler{
 		queryService: queryService,
-		logger:       logger.Named("report_handler"),
+		BaseHandler:  &BaseHandler{logger: logger.Named("commission_handler")},
 	}
 }
 
 // ---------- Helper Functions ----------
-
-func (h *ReportHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok || userIDStr == "" {
-		return uuid.Nil, errors.New("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *ReportHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// TODO: integrate with real permission system
-	return true
-}
-
-func (h *ReportHandler) parseUUIDParam(r *http.Request, paramName string) (uuid.UUID, error) {
-	idStr := chi.URLParam(r, paramName)
-	if idStr == "" {
-		return uuid.Nil, errors.New("missing parameter")
-	}
-	return uuid.Parse(idStr)
-}
-
-func (h *ReportHandler) parseTimeQuery(r *http.Request, paramName string) *time.Time {
-	if s := r.URL.Query().Get(paramName); s != "" {
-		if t, err := time.Parse(time.RFC3339, s); err == nil {
-			return &t
-		}
-	}
-	return nil
-}
-
-func (h *ReportHandler) parseDecimalQuery(r *http.Request, paramName string) *decimal.Decimal {
-	if s := r.URL.Query().Get(paramName); s != "" {
-		if d, err := decimal.NewFromString(s); err == nil {
-			return &d
-		}
-	}
-	return nil
-}
-
-func (h *ReportHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *ReportHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *ReportHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
 
 // ---------- Handler Methods ----------
 

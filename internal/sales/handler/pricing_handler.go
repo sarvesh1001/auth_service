@@ -1,12 +1,8 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,13 +10,12 @@ import (
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 
-	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/service"
 )
 
 type PricingHandler struct {
 	pricingService service.PricingService
-	logger         *zap.Logger
+	*BaseHandler
 	// Simple idempotency cache (replace with real store)
 	idempotencyCache map[string]interface{}
 }
@@ -28,7 +23,7 @@ type PricingHandler struct {
 func NewPricingHandler(pricingService service.PricingService, logger *zap.Logger) *PricingHandler {
 	return &PricingHandler{
 		pricingService:   pricingService,
-		logger:           logger.Named("pricing_handler"),
+		BaseHandler:      &BaseHandler{logger: logger.Named("commission_handler")},
 		idempotencyCache: make(map[string]interface{}),
 	}
 }
@@ -36,93 +31,6 @@ func NewPricingHandler(pricingService service.PricingService, logger *zap.Logger
 // ---------------------------------------------------------------------
 // Helper methods
 // ---------------------------------------------------------------------
-
-func (h *PricingHandler) getUserIDFromContext(ctx context.Context) (uuid.UUID, error) {
-	userIDStr, ok := ctx.Value("user_id").(string)
-	if !ok {
-		return uuid.Nil, fmt.Errorf("user ID not found in context")
-	}
-	return uuid.Parse(userIDStr)
-}
-
-func (h *PricingHandler) hasPermission(ctx context.Context, companyID uuid.UUID, userID uuid.UUID, permission string) bool {
-	// Placeholder – implement real permission check
-	return true
-}
-
-func parseQueryUUID(r *http.Request, key string) (uuid.UUID, error) {
-	val := r.URL.Query().Get(key)
-	if val == "" {
-		return uuid.Nil, fmt.Errorf("missing %s query parameter", key)
-	}
-	return uuid.Parse(val)
-}
-
-func parseQueryTime(r *http.Request, key string) (*time.Time, error) {
-	val := r.URL.Query().Get(key)
-	if val == "" {
-		return nil, nil
-	}
-	t, err := time.Parse(time.RFC3339, val)
-	if err != nil {
-		return nil, fmt.Errorf("invalid %s format (RFC3339)", key)
-	}
-	return &t, nil
-}
-
-func parseQueryDecimal(r *http.Request, key string) (*decimal.Decimal, error) {
-	val := r.URL.Query().Get(key)
-	if val == "" {
-		return nil, nil
-	}
-	d, err := decimal.NewFromString(val)
-	if err != nil {
-		return nil, fmt.Errorf("invalid %s decimal", key)
-	}
-	return &d, nil
-}
-
-func parseQueryBool(r *http.Request, key string) (*bool, error) {
-	val := r.URL.Query().Get(key)
-	if val == "" {
-		return nil, nil
-	}
-	b, err := strconv.ParseBool(val)
-	if err != nil {
-		return nil, fmt.Errorf("invalid %s boolean", key)
-	}
-	return &b, nil
-}
-
-func (h *PricingHandler) respondWithJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		h.logger.Error("failed to encode JSON response", zap.Error(err))
-	}
-}
-
-func (h *PricingHandler) respondWithError(w http.ResponseWriter, status int, message string) {
-	h.respondWithJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
-}
-
-func (h *PricingHandler) mapServiceError(err error) (status int, message string) {
-	switch {
-	case errors.Is(err, salesErrors.ErrNotFound):
-		return http.StatusNotFound, err.Error()
-	case errors.Is(err, salesErrors.ErrDuplicate):
-		return http.StatusConflict, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidInput):
-		return http.StatusBadRequest, err.Error()
-	case errors.Is(err, salesErrors.ErrInvalidState):
-		return http.StatusConflict, err.Error()
-	default:
-		return http.StatusInternalServerError, "internal server error"
-	}
-}
 
 // ---------------------------------------------------------------------
 // GET /pricing/product-base-price
@@ -318,7 +226,7 @@ func (h *PricingHandler) CalculateOrderPricing(w http.ResponseWriter, r *http.Re
 		return
 	}
 	// Idempotency: check cache (simple)
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -376,7 +284,7 @@ func (h *PricingHandler) PreviewOrderPricing(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -549,7 +457,7 @@ func (h *PricingHandler) CalculateQuotePricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -607,7 +515,7 @@ func (h *PricingHandler) PreviewQuotePricing(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -779,7 +687,7 @@ func (h *PricingHandler) CalculateInvoicePricing(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -837,7 +745,7 @@ func (h *PricingHandler) PreviewInvoicePricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -975,7 +883,7 @@ func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1039,7 +947,7 @@ func (h *PricingHandler) CalculateTaxAmount(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1449,7 +1357,7 @@ func (h *PricingHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1520,7 +1428,7 @@ func (h *PricingHandler) ValidateDiscountCombination(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1747,7 +1655,7 @@ func (h *PricingHandler) ValidatePricing(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1809,7 +1717,7 @@ func (h *PricingHandler) ValidateOrderPricing(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1864,7 +1772,7 @@ func (h *PricingHandler) ValidateQuotePricing(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
@@ -1919,7 +1827,7 @@ func (h *PricingHandler) ValidateInvoicePricing(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	idempotencyKey := r.Header.Get("Idempotency-Key")
+	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
 			h.respondWithJSON(w, http.StatusOK, cached)
