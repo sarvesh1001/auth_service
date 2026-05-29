@@ -26,6 +26,7 @@ CREATE SCHEMA IF NOT EXISTS attendance;
 CREATE SCHEMA IF NOT EXISTS biometric;   
 CREATE SCHEMA IF NOT EXISTS outbox;
 CREATE SCHEMA IF NOT EXISTS sales;
+CREATE SCHEMA IF NOT EXISTS sales_analytics;
 
 
 -- =====================================================

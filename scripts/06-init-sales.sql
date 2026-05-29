@@ -1,7 +1,5 @@
-
 -- =====================================================
 -- COMPLETE SALES MODULE SCHEMA (DIRECT CREATION)
--- Includes all tables, enums, constraints, indexes, triggers
 -- No ALTER statements – everything created in final form
 -- =====================================================
 
@@ -19,6 +17,31 @@ CREATE TYPE sales.payment_method AS ENUM ('cash', 'card', 'bank_transfer', 'digi
 CREATE TYPE sales.discount_type AS ENUM ('percentage', 'fixed_amount', 'buy_x_get_y');
 CREATE TYPE sales.quote_status AS ENUM ('draft', 'sent', 'accepted', 'rejected', 'expired', 'converted');
 CREATE TYPE sales.commission_base_type AS ENUM ('revenue', 'profit', 'order_total');
+CREATE TYPE sales.credit_note_status AS ENUM ('draft', 'issued', 'partially_used', 'fully_used', 'voided');
+
+-- =====================================================
+-- PAYMENT TERMS (created before customers)
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.payment_terms (
+    term_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id      UUID NOT NULL,
+    code            VARCHAR(50) NOT NULL,
+    term_name       VARCHAR(100) NOT NULL,
+    description     TEXT,
+    due_days        INT NOT NULL,
+    discount_percent NUMERIC(5,2) DEFAULT 0,
+    discount_days   INT DEFAULT 0,
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID,
+    updated_by      UUID,
+    CONSTRAINT fk_payment_terms_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_payment_terms_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_payment_terms_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    UNIQUE (company_id, code),
+    UNIQUE (company_id, term_name)
+);
 
 -- =====================================================
 -- CUSTOMERS (with encryption fields for PII)
@@ -57,11 +80,6 @@ CREATE TABLE IF NOT EXISTS sales.customers (
     UNIQUE (company_id, customer_code)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_customers_email ON sales.customers (company_id, email) WHERE email IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_customers_company ON sales.customers(company_id);
-CREATE INDEX IF NOT EXISTS idx_customers_code ON sales.customers(company_id, customer_code);
-CREATE INDEX IF NOT EXISTS idx_customers_payment_term ON sales.customers(payment_term_id);
-
 -- =====================================================
 -- PRODUCTS
 -- =====================================================
@@ -85,36 +103,6 @@ CREATE TABLE IF NOT EXISTS sales.products (
     UNIQUE (company_id, sku)
 );
 
-CREATE INDEX IF NOT EXISTS idx_products_company ON sales.products(company_id);
-CREATE INDEX IF NOT EXISTS idx_products_inventory_item ON sales.products(inventory_item_id) WHERE inventory_item_id IS NOT NULL;
-
--- =====================================================
--- PAYMENT TERMS (created before customers)
--- =====================================================
-CREATE TABLE IF NOT EXISTS sales.payment_terms (
-    term_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id      UUID NOT NULL,
-    code            VARCHAR(50) NOT NULL,
-    term_name       VARCHAR(100) NOT NULL,
-    description     TEXT,
-    due_days        INT NOT NULL,
-    discount_percent NUMERIC(5,2) DEFAULT 0,
-    discount_days   INT DEFAULT 0,
-    is_active       BOOLEAN NOT NULL DEFAULT true,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID,
-    updated_by      UUID,
-    CONSTRAINT fk_payment_terms_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_payment_terms_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_payment_terms_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    UNIQUE (company_id, code),
-    UNIQUE (company_id, term_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_payment_terms_company ON sales.payment_terms(company_id);
-CREATE INDEX IF NOT EXISTS idx_payment_terms_code ON sales.payment_terms(company_id, code);
-
 -- =====================================================
 -- SALES REPS
 -- =====================================================
@@ -137,9 +125,6 @@ CREATE TABLE IF NOT EXISTS sales.sales_reps (
     CONSTRAINT fk_sales_reps_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
     UNIQUE (company_id, code)
 );
-
-CREATE INDEX IF NOT EXISTS idx_sales_reps_company ON sales.sales_reps(company_id);
-CREATE INDEX IF NOT EXISTS idx_sales_reps_user ON sales.sales_reps(user_id);
 
 -- =====================================================
 -- ORDERS
@@ -166,6 +151,8 @@ CREATE TABLE IF NOT EXISTS sales.orders (
     delivered_at       TIMESTAMPTZ,
     cancelled_at       TIMESTAMPTZ,
     cancellation_reason TEXT,
+    credit_hold        BOOLEAN DEFAULT false,
+    credit_status      VARCHAR(20) DEFAULT 'approved',   -- 'pending', 'approved', 'rejected', 'hold'
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by         UUID,
@@ -177,15 +164,6 @@ CREATE TABLE IF NOT EXISTS sales.orders (
     CONSTRAINT fk_orders_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
     UNIQUE (company_id, order_number)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_orders_external_ref ON sales.orders (company_id, external_ref) WHERE external_ref IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_orders_company ON sales.orders(company_id);
-CREATE INDEX IF NOT EXISTS idx_orders_customer ON sales.orders(customer_id);
-CREATE INDEX IF NOT EXISTS idx_orders_date ON sales.orders(order_date);
-CREATE INDEX IF NOT EXISTS idx_orders_status ON sales.orders(status);
-CREATE INDEX IF NOT EXISTS idx_orders_number ON sales.orders(company_id, order_number);
-CREATE INDEX IF NOT EXISTS idx_orders_ext ON sales.orders(company_id, external_ref) WHERE external_ref IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_orders_sales_rep ON sales.orders(sales_rep_id);
 
 -- =====================================================
 -- ORDER ITEMS
@@ -205,9 +183,6 @@ CREATE TABLE IF NOT EXISTS sales.order_items (
     CONSTRAINT fk_order_items_order FOREIGN KEY (order_id) REFERENCES sales.orders(order_id) ON DELETE CASCADE,
     CONSTRAINT fk_order_items_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_order_items_order ON sales.order_items(order_id);
-CREATE INDEX IF NOT EXISTS idx_order_items_product ON sales.order_items(product_id);
 
 -- =====================================================
 -- INVOICES
@@ -253,16 +228,6 @@ CREATE TABLE IF NOT EXISTS sales.invoices (
     UNIQUE (company_id, invoice_number)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_invoices_external_ref ON sales.invoices (company_id, external_ref) WHERE external_ref IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_invoices_company ON sales.invoices(company_id);
-CREATE INDEX IF NOT EXISTS idx_invoices_customer ON sales.invoices(customer_id);
-CREATE INDEX IF NOT EXISTS idx_invoices_order ON sales.invoices(order_id);
-CREATE INDEX IF NOT EXISTS idx_invoices_date ON sales.invoices(invoice_date);
-CREATE INDEX IF NOT EXISTS idx_invoices_status ON sales.invoices(status);
-CREATE INDEX IF NOT EXISTS idx_invoices_due ON sales.invoices(due_date) WHERE status NOT IN ('paid', 'cancelled');
-CREATE INDEX IF NOT EXISTS idx_invoices_ext ON sales.invoices(company_id, external_ref) WHERE external_ref IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_invoices_sales_rep ON sales.invoices(sales_rep_id);
-
 -- =====================================================
 -- INVOICE ITEMS
 -- =====================================================
@@ -281,9 +246,6 @@ CREATE TABLE IF NOT EXISTS sales.invoice_items (
     CONSTRAINT fk_invoice_items_invoice FOREIGN KEY (invoice_id) REFERENCES sales.invoices(invoice_id) ON DELETE CASCADE,
     CONSTRAINT fk_invoice_items_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id) ON DELETE SET NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON sales.invoice_items(invoice_id);
-CREATE INDEX IF NOT EXISTS idx_invoice_items_product ON sales.invoice_items(product_id) WHERE product_id IS NOT NULL;
 
 -- =====================================================
 -- PAYMENTS
@@ -313,12 +275,6 @@ CREATE TABLE IF NOT EXISTS sales.payments (
     UNIQUE (company_id, payment_number)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_payments_external_ref ON sales.payments (company_id, external_ref) WHERE external_ref IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_payments_company ON sales.payments(company_id);
-CREATE INDEX IF NOT EXISTS idx_payments_status ON sales.payments(status);
-CREATE INDEX IF NOT EXISTS idx_payments_date ON sales.payments(payment_date);
-CREATE INDEX IF NOT EXISTS idx_payments_ext ON sales.payments(company_id, external_ref) WHERE external_ref IS NOT NULL;
-
 -- =====================================================
 -- PAYMENT ALLOCATIONS
 -- =====================================================
@@ -331,33 +287,6 @@ CREATE TABLE IF NOT EXISTS sales.payment_allocations (
     CONSTRAINT fk_alloc_payment FOREIGN KEY (payment_id) REFERENCES sales.payments(payment_id) ON DELETE CASCADE,
     CONSTRAINT fk_alloc_invoice FOREIGN KEY (invoice_id) REFERENCES sales.invoices(invoice_id) ON DELETE CASCADE
 );
-
-CREATE INDEX IF NOT EXISTS idx_payment_allocations_payment ON sales.payment_allocations(payment_id);
-CREATE INDEX IF NOT EXISTS idx_payment_allocations_invoice ON sales.payment_allocations(invoice_id);
-
--- =====================================================
--- PAYMENT REFUNDS
--- =====================================================
-CREATE TABLE IF NOT EXISTS sales.payment_refunds (
-    refund_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id     UUID NOT NULL,
-    payment_id     UUID NOT NULL,
-    amount         NUMERIC(14,4) NOT NULL CHECK (amount > 0),
-    reason         TEXT NOT NULL,
-    gateway_ref    VARCHAR(100),
-    status         VARCHAR(20) NOT NULL DEFAULT 'pending',
-    refunded_by    UUID,
-    completed_at   TIMESTAMPTZ,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_refunds_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_refunds_payment FOREIGN KEY (payment_id) REFERENCES sales.payments(payment_id) ON DELETE CASCADE,
-    CONSTRAINT fk_refunds_user FOREIGN KEY (refunded_by) REFERENCES users(user_id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_payment_refunds_payment ON sales.payment_refunds(payment_id);
-CREATE INDEX IF NOT EXISTS idx_payment_refunds_status ON sales.payment_refunds(status);
-CREATE INDEX IF NOT EXISTS idx_payment_refunds_date ON sales.payment_refunds(created_at);
 
 -- =====================================================
 -- RETURNS
@@ -388,10 +317,6 @@ CREATE TABLE IF NOT EXISTS sales.returns (
     UNIQUE (company_id, return_number)
 );
 
-CREATE INDEX IF NOT EXISTS idx_returns_company ON sales.returns(company_id);
-CREATE INDEX IF NOT EXISTS idx_returns_order ON sales.returns(order_id);
-CREATE INDEX IF NOT EXISTS idx_returns_status ON sales.returns(status);
-
 -- =====================================================
 -- RETURN ITEMS
 -- =====================================================
@@ -413,8 +338,27 @@ CREATE TABLE IF NOT EXISTS sales.return_items (
     CONSTRAINT fk_return_items_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_return_items_return ON sales.return_items(return_id);
-CREATE INDEX IF NOT EXISTS idx_return_items_product ON sales.return_items(product_id);
+-- =====================================================
+-- PAYMENT REFUNDS
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.payment_refunds (
+    refund_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id     UUID NOT NULL,
+    payment_id     UUID NOT NULL,
+    return_id      UUID NULL,                         -- column added directly
+    amount         NUMERIC(14,4) NOT NULL CHECK (amount > 0),
+    reason         TEXT NOT NULL,
+    gateway_ref    VARCHAR(100),
+    status         VARCHAR(20) NOT NULL DEFAULT 'pending',
+    refunded_by    UUID,
+    completed_at   TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_refunds_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_refunds_payment FOREIGN KEY (payment_id) REFERENCES sales.payments(payment_id) ON DELETE CASCADE,
+    CONSTRAINT fk_payment_refunds_return FOREIGN KEY (return_id) REFERENCES sales.returns(return_id) ON DELETE SET NULL,
+    CONSTRAINT fk_refunds_user FOREIGN KEY (refunded_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
 
 -- =====================================================
 -- COUPONS
@@ -443,10 +387,6 @@ CREATE TABLE IF NOT EXISTS sales.coupons (
     UNIQUE (company_id, code)
 );
 
-CREATE INDEX IF NOT EXISTS idx_coupons_company ON sales.coupons(company_id);
-CREATE INDEX IF NOT EXISTS idx_coupons_code ON sales.coupons(code);
-CREATE INDEX IF NOT EXISTS idx_coupons_dates ON sales.coupons(start_date, end_date) WHERE is_active = true;
-
 -- =====================================================
 -- COUPON USAGES
 -- =====================================================
@@ -462,9 +402,6 @@ CREATE TABLE IF NOT EXISTS sales.coupon_usages (
     CONSTRAINT fk_coupon_usage_order FOREIGN KEY (order_id) REFERENCES sales.orders(order_id),
     UNIQUE (coupon_id, customer_id, order_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_coupon_usages_coupon ON sales.coupon_usages(coupon_id);
-CREATE INDEX IF NOT EXISTS idx_coupon_usages_customer ON sales.coupon_usages(customer_id);
 
 -- =====================================================
 -- PROMOTIONS
@@ -487,9 +424,6 @@ CREATE TABLE IF NOT EXISTS sales.promotions (
     CONSTRAINT fk_promotions_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_promotions_company ON sales.promotions(company_id);
-CREATE INDEX IF NOT EXISTS idx_promotions_dates ON sales.promotions(start_date, end_date) WHERE is_active = true;
-
 -- =====================================================
 -- PROMOTION RULES
 -- =====================================================
@@ -504,8 +438,6 @@ CREATE TABLE IF NOT EXISTS sales.promotion_rules (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_promotion_rules_promotion FOREIGN KEY (promotion_id) REFERENCES sales.promotions(promotion_id) ON DELETE CASCADE
 );
-
-CREATE INDEX IF NOT EXISTS idx_promotion_rules_promotion ON sales.promotion_rules(promotion_id);
 
 -- =====================================================
 -- AUTOMATIC DISCOUNTS
@@ -533,10 +465,6 @@ CREATE TABLE IF NOT EXISTS sales.automatic_discounts (
     CONSTRAINT fk_auto_discount_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_auto_discount_company ON sales.automatic_discounts(company_id);
-CREATE INDEX IF NOT EXISTS idx_auto_discount_dates ON sales.automatic_discounts(start_date, end_date) WHERE is_active = true;
-CREATE INDEX IF NOT EXISTS idx_auto_discount_priority ON sales.automatic_discounts(company_id, priority);
-
 -- =====================================================
 -- DISCOUNT STACKING RULES
 -- =====================================================
@@ -559,9 +487,6 @@ CREATE TABLE IF NOT EXISTS sales.discount_stacking_rules (
     UNIQUE(company_id, primary_discount_type, primary_discount_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_stacking_primary ON sales.discount_stacking_rules(company_id, primary_discount_type, primary_discount_id);
-CREATE INDEX IF NOT EXISTS idx_stacking_active ON sales.discount_stacking_rules(company_id, is_active);
-
 -- =====================================================
 -- DISCOUNT EXCLUSIONS
 -- =====================================================
@@ -578,8 +503,6 @@ CREATE TABLE IF NOT EXISTS sales.discount_exclusions (
     CONSTRAINT fk_exclusion_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
     UNIQUE(company_id, discount_type_a, discount_id_a, discount_type_b, discount_id_b)
 );
-
-CREATE INDEX IF NOT EXISTS idx_exclusion_pair ON sales.discount_exclusions(company_id, discount_type_a, discount_id_a);
 
 -- =====================================================
 -- DISCOUNT PRIORITIES
@@ -599,9 +522,6 @@ CREATE TABLE IF NOT EXISTS sales.discount_priorities (
     CONSTRAINT fk_priority_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
     UNIQUE(company_id, discount_type, discount_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_priority_company_type ON sales.discount_priorities(company_id, discount_type);
-CREATE INDEX IF NOT EXISTS idx_priority_value ON sales.discount_priorities(company_id, priority);
 
 -- =====================================================
 -- DISCOUNT APPLICATIONS (includes automatic discounts)
@@ -625,9 +545,6 @@ CREATE TABLE IF NOT EXISTS sales.discount_applications (
     CHECK ((discount_id IS NOT NULL AND auto_discount_id IS NULL) OR (discount_id IS NULL AND auto_discount_id IS NOT NULL))
 );
 
-CREATE INDEX IF NOT EXISTS idx_discount_applications_order ON sales.discount_applications(order_id) WHERE order_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_discount_applications_invoice ON sales.discount_applications(invoice_id) WHERE invoice_id IS NOT NULL;
-
 -- =====================================================
 -- TAX SNAPSHOTS
 -- =====================================================
@@ -645,10 +562,6 @@ CREATE TABLE IF NOT EXISTS sales.tax_snapshots (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_tax_snapshots_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
 );
-
-CREATE INDEX IF NOT EXISTS idx_tax_snapshots_entity ON sales.tax_snapshots(entity_type, entity_id);
-CREATE INDEX IF NOT EXISTS idx_tax_snapshots_line ON sales.tax_snapshots(line_id) WHERE line_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_tax_snapshots_company ON sales.tax_snapshots(company_id);
 
 -- =====================================================
 -- QUOTES
@@ -683,14 +596,6 @@ CREATE TABLE IF NOT EXISTS sales.quotes (
     UNIQUE (company_id, quote_number, revision)
 );
 
-CREATE INDEX IF NOT EXISTS idx_quotes_company ON sales.quotes(company_id);
-CREATE INDEX IF NOT EXISTS idx_quotes_customer ON sales.quotes(customer_id);
-CREATE INDEX IF NOT EXISTS idx_quotes_status ON sales.quotes(status);
-CREATE INDEX IF NOT EXISTS idx_quotes_date ON sales.quotes(quote_date);
-CREATE INDEX IF NOT EXISTS idx_quotes_converted_order ON sales.quotes(converted_order_id);
-CREATE INDEX IF NOT EXISTS idx_quotes_sales_rep ON sales.quotes(sales_rep_id);
-CREATE INDEX IF NOT EXISTS idx_quotes_expiry ON sales.quotes(expiry_date) WHERE expiry_date IS NOT NULL;
-
 -- =====================================================
 -- QUOTE ITEMS
 -- =====================================================
@@ -710,11 +615,8 @@ CREATE TABLE IF NOT EXISTS sales.quote_items (
     CONSTRAINT fk_quote_items_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_quote_items_quote ON sales.quote_items(quote_id);
-CREATE INDEX IF NOT EXISTS idx_quote_items_product ON sales.quote_items(product_id);
-
 -- =====================================================
--- SALES REP COMMISSIONS
+-- SALES REP COMMISSIONS (legacy)
 -- =====================================================
 CREATE TABLE IF NOT EXISTS sales.sales_rep_commissions (
     commission_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -738,11 +640,6 @@ CREATE TABLE IF NOT EXISTS sales.sales_rep_commissions (
     CONSTRAINT chk_commission_dates CHECK (effective_to IS NULL OR effective_to >= effective_from)
 );
 
-CREATE INDEX IF NOT EXISTS idx_commissions_rep ON sales.sales_rep_commissions(sales_rep_id);
-CREATE INDEX IF NOT EXISTS idx_commissions_product ON sales.sales_rep_commissions(product_id) WHERE product_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_commissions_date ON sales.sales_rep_commissions(effective_from, effective_to);
-CREATE INDEX IF NOT EXISTS idx_commissions_rate ON sales.sales_rep_commissions(commission_rate);
-
 -- =====================================================
 -- CREDIT CHECK HISTORY
 -- =====================================================
@@ -765,10 +662,277 @@ CREATE TABLE IF NOT EXISTS sales.credit_check_history (
     CONSTRAINT fk_credit_history_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_credit_history_customer ON sales.credit_check_history(customer_id);
-CREATE INDEX IF NOT EXISTS idx_credit_history_action ON sales.credit_check_history(action_type);
-CREATE INDEX IF NOT EXISTS idx_credit_history_date ON sales.credit_check_history(created_at);
-CREATE INDEX IF NOT EXISTS idx_credit_history_created_by ON sales.credit_check_history(created_by);
+-- =====================================================
+-- CREDIT NOTES
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.credit_notes (
+    credit_note_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id          UUID NOT NULL,
+    customer_id         UUID NOT NULL,
+    credit_note_number  VARCHAR(50) NOT NULL,
+    invoice_id          UUID,
+    return_id           UUID,
+    issue_date          DATE NOT NULL,
+    status              sales.credit_note_status NOT NULL DEFAULT 'draft',
+    currency            VARCHAR(3) NOT NULL DEFAULT 'USD',
+    subtotal            NUMERIC(14,4) NOT NULL,
+    tax_total           NUMERIC(14,4) NOT NULL,
+    total_amount        NUMERIC(14,4) NOT NULL,
+    amount_applied      NUMERIC(14,4) NOT NULL DEFAULT 0,
+    remaining_amount    NUMERIC(14,4) GENERATED ALWAYS AS (total_amount - amount_applied) STORED,
+    reason              TEXT,
+    notes               TEXT,
+    issued_at           TIMESTAMPTZ,
+    voided_at           TIMESTAMPTZ,
+    void_reason         TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          UUID,
+    updated_by          UUID,
+    CONSTRAINT fk_credit_notes_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_credit_notes_customer FOREIGN KEY (customer_id) REFERENCES sales.customers(customer_id),
+    CONSTRAINT fk_credit_notes_invoice FOREIGN KEY (invoice_id) REFERENCES sales.invoices(invoice_id) ON DELETE SET NULL,
+    CONSTRAINT fk_credit_notes_return FOREIGN KEY (return_id) REFERENCES sales.returns(return_id) ON DELETE SET NULL,
+    CONSTRAINT fk_credit_notes_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_credit_notes_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    UNIQUE (company_id, credit_note_number)
+);
+
+-- =====================================================
+-- CREDIT NOTE ITEMS
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.credit_note_items (
+    credit_note_item_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    credit_note_id        UUID NOT NULL,
+    invoice_item_id       UUID,
+    product_id            UUID,
+    product_name_snapshot VARCHAR(255) NOT NULL,
+    quantity              NUMERIC(14,4) NOT NULL CHECK (quantity > 0),
+    unit_price            NUMERIC(14,4) NOT NULL,
+    tax_rate              NUMERIC(5,2),
+    tax_amount            NUMERIC(14,4) DEFAULT 0,
+    line_amount           NUMERIC(14,4) NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by            UUID,
+    CONSTRAINT fk_credit_items_credit_note FOREIGN KEY (credit_note_id) REFERENCES sales.credit_notes(credit_note_id) ON DELETE CASCADE,
+    CONSTRAINT fk_credit_items_invoice_item FOREIGN KEY (invoice_item_id) REFERENCES sales.invoice_items(invoice_item_id) ON DELETE SET NULL,
+    CONSTRAINT fk_credit_items_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id) ON DELETE SET NULL,
+    CONSTRAINT fk_credit_items_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
+
+-- =====================================================
+-- CREDIT NOTE APPLICATIONS
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.credit_note_applications (
+    application_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    credit_note_id  UUID NOT NULL,
+    invoice_id      UUID NOT NULL,
+    amount          NUMERIC(14,4) NOT NULL CHECK (amount > 0),
+    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    applied_by      UUID,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_cn_app_credit_note FOREIGN KEY (credit_note_id) REFERENCES sales.credit_notes(credit_note_id) ON DELETE CASCADE,
+    CONSTRAINT fk_cn_app_invoice FOREIGN KEY (invoice_id) REFERENCES sales.invoices(invoice_id) ON DELETE CASCADE,
+    CONSTRAINT fk_cn_applied_by FOREIGN KEY (applied_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
+
+-- =====================================================
+-- SALES TARGETS
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.sales_targets (
+    target_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id      UUID NOT NULL,
+    sales_rep_id    UUID NOT NULL,
+    period_start    DATE NOT NULL,
+    period_end      DATE NOT NULL,
+    target_amount   NUMERIC(14,2) NOT NULL,
+    currency        VARCHAR(3) NOT NULL DEFAULT 'USD',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      UUID,
+    updated_by      UUID,
+    CONSTRAINT fk_targets_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_targets_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
+    CONSTRAINT fk_targets_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_targets_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    UNIQUE(company_id, sales_rep_id, period_start, period_end)
+);
+
+-- =====================================================
+-- COMMISSION PLANS
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.commission_plans (
+    plan_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    code             VARCHAR(50) NOT NULL,
+    name             VARCHAR(255) NOT NULL,
+    description      TEXT,
+    effective_from   DATE NOT NULL,
+    effective_to     DATE,
+    is_active        BOOLEAN NOT NULL DEFAULT true,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID,
+    updated_by       UUID,
+    CONSTRAINT fk_commission_plans_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_commission_plans_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_commission_plans_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    UNIQUE(company_id, code)
+);
+
+-- =====================================================
+-- COMMISSION RULES
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.commission_rules (
+    rule_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    plan_id          UUID NOT NULL,
+    rule_type        VARCHAR(20) NOT NULL, -- 'flat','tiered','product','category'
+    applies_to       sales.commission_base_type NOT NULL,
+    product_id       UUID,
+    tier_min         NUMERIC(14,4),
+    tier_max         NUMERIC(14,4),
+    rate             NUMERIC(14,4) NOT NULL,
+    is_percentage    BOOLEAN NOT NULL DEFAULT true,
+    priority         INT NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       UUID,
+    updated_by       UUID,
+    CONSTRAINT fk_commission_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_commission_rules_plan FOREIGN KEY (plan_id) REFERENCES sales.commission_plans(plan_id) ON DELETE CASCADE,
+    CONSTRAINT fk_commission_rules_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id) ON DELETE SET NULL,
+    CONSTRAINT fk_commission_rules_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_commission_rules_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
+
+-- =====================================================
+-- SALES COMMISSIONS (actual earned)
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.sales_commissions (
+    commission_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id         UUID NOT NULL,
+    sales_rep_id       UUID NOT NULL,
+    reference_type     VARCHAR(20) NOT NULL, -- 'order','invoice','payment'
+    reference_id       UUID NOT NULL,
+    commission_base    NUMERIC(14,4) NOT NULL,
+    commission_rate    NUMERIC(14,4) NOT NULL,
+    commission_amount  NUMERIC(14,4) NOT NULL,
+    status             VARCHAR(20) NOT NULL DEFAULT 'pending',
+    earned_at          TIMESTAMPTZ NOT NULL,
+    paid_at            TIMESTAMPTZ,
+    approved_at        TIMESTAMPTZ,
+    rejected_at        TIMESTAMPTZ,
+    reject_reason      TEXT,
+    notes              TEXT,
+    rule_id            UUID,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by         UUID,
+    updated_by         UUID,
+    CONSTRAINT fk_sales_commissions_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_sales_commissions_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
+    CONSTRAINT fk_sales_commissions_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_sales_commissions_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
+    CONSTRAINT fk_sales_commissions_rule FOREIGN KEY (rule_id) REFERENCES sales.commission_rules(rule_id) ON DELETE SET NULL,
+    UNIQUE(company_id, reference_type, reference_id)
+);
+
+-- =====================================================
+-- SALES REP COMMISSION ASSIGNMENTS
+-- =====================================================
+CREATE TABLE IF NOT EXISTS sales.sales_rep_commission_assignments (
+    assignment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id       UUID NOT NULL,
+    sales_rep_id     UUID NOT NULL,
+    plan_id          UUID NOT NULL,
+    effective_from   DATE NOT NULL,
+    effective_to     DATE,
+    assigned_by      UUID,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_assignments_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_plan FOREIGN KEY (plan_id) REFERENCES sales.commission_plans(plan_id) ON DELETE CASCADE,
+    CONSTRAINT fk_assignments_assigned_by FOREIGN KEY (assigned_by) REFERENCES users(user_id) ON DELETE SET NULL
+);
+
+-- =====================================================
+-- FUNCTIONS & TRIGGERS
+-- =====================================================
+
+-- Update invoice paid amount and status
+CREATE OR REPLACE FUNCTION sales.update_invoice_paid_amount()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE sales.invoices
+    SET amount_paid = COALESCE(
+        (SELECT SUM(amount) FROM sales.payment_allocations pa
+         JOIN sales.payments p ON pa.payment_id = p.payment_id
+         WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'),
+        0
+    ),
+    amount_due = grand_total - COALESCE(
+        (SELECT SUM(amount) FROM sales.payment_allocations pa
+         JOIN sales.payments p ON pa.payment_id = p.payment_id
+         WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'),
+        0
+    ),
+    status = CASE
+        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
+                       JOIN sales.payments p ON pa.payment_id = p.payment_id
+                       WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) >= grand_total THEN 'paid'
+        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
+                       JOIN sales.payments p ON pa.payment_id = p.payment_id
+                       WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) > 0 THEN 'issued'
+        ELSE status
+    END,
+    paid_at = CASE
+        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
+                       JOIN sales.payments p ON pa.payment_id = p.payment_id
+                       WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) >= grand_total THEN NOW()
+        ELSE paid_at
+    END,
+    updated_at = NOW()
+    WHERE invoice_id = NEW.invoice_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Generic updated_at function
+CREATE OR REPLACE FUNCTION sales.update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Triggers for updated_at
+CREATE TRIGGER update_customers_updated_at BEFORE UPDATE ON sales.customers FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_products_updated_at BEFORE UPDATE ON sales.products FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON sales.orders FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_invoices_updated_at BEFORE UPDATE ON sales.invoices FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON sales.payments FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_returns_updated_at BEFORE UPDATE ON sales.returns FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_coupons_updated_at BEFORE UPDATE ON sales.coupons FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_promotions_updated_at BEFORE UPDATE ON sales.promotions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_payment_terms_updated_at BEFORE UPDATE ON sales.payment_terms FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_quotes_updated_at BEFORE UPDATE ON sales.quotes FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_sales_reps_updated_at BEFORE UPDATE ON sales.sales_reps FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_commissions_updated_at BEFORE UPDATE ON sales.sales_rep_commissions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_auto_discount_updated_at BEFORE UPDATE ON sales.automatic_discounts FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_stacking_updated_at BEFORE UPDATE ON sales.discount_stacking_rules FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_priority_updated_at BEFORE UPDATE ON sales.discount_priorities FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_payment_refunds_updated_at BEFORE UPDATE ON sales.payment_refunds FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_commission_plans_updated_at BEFORE UPDATE ON sales.commission_plans FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_commission_rules_updated_at BEFORE UPDATE ON sales.commission_rules FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+CREATE TRIGGER update_sales_commissions_updated_at BEFORE UPDATE ON sales.sales_commissions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+
+-- Trigger for invoice paid amount
+CREATE TRIGGER trg_update_invoice_paid_amount
+    AFTER INSERT OR UPDATE ON sales.payment_allocations
+    FOR EACH ROW
+    EXECUTE FUNCTION sales.update_invoice_paid_amount();
 
 -- =====================================================
 -- ANALYTICS TABLES
@@ -817,13 +981,15 @@ CREATE TABLE IF NOT EXISTS sales_analytics.product_sales_fact (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Daily unique customers (to avoid double counting)
+-- Daily unique customers
 CREATE TABLE IF NOT EXISTS sales_analytics.daily_unique_customers (
     company_id UUID NOT NULL,
     date DATE NOT NULL,
     customer_id UUID NOT NULL,
     PRIMARY KEY (company_id, date, customer_id)
 );
+
+-- Auto discount unique customers
 CREATE TABLE IF NOT EXISTS sales_analytics.auto_discount_unique_customers (
     company_id       UUID NOT NULL,
     auto_discount_id UUID NOT NULL,
@@ -831,6 +997,7 @@ CREATE TABLE IF NOT EXISTS sales_analytics.auto_discount_unique_customers (
     customer_id      UUID NOT NULL,
     PRIMARY KEY (company_id, auto_discount_id, date, customer_id)
 );
+
 -- Product returns fact
 CREATE TABLE IF NOT EXISTS sales_analytics.product_returns_fact (
     id BIGSERIAL PRIMARY KEY,
@@ -1165,22 +1332,23 @@ CREATE TABLE IF NOT EXISTS sales_analytics.discount_stacking_usage (
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(company_id, rule_id, date)
 );
+
+-- Coupon usage fact
 CREATE TABLE sales_analytics.coupon_usage_fact (
     id              BIGSERIAL PRIMARY KEY,
     company_id      UUID NOT NULL,
     coupon_id       UUID NOT NULL,
     entity_type     VARCHAR(20) NOT NULL,       -- 'order', 'invoice', 'quote'
     entity_id       UUID NOT NULL,
-    customer_id     UUID,                       -- can be NULL if anonymous
+    customer_id     UUID,
     discount_amount DECIMAL(14,4) NOT NULL,
-    order_subtotal  DECIMAL(14,4),              -- base amount before discount
+    order_subtotal  DECIMAL(14,4),
     used_at         TIMESTAMPTZ NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, coupon_id, entity_type, entity_id)  -- avoid duplicates
+    UNIQUE(company_id, coupon_id, entity_type, entity_id)
 );
-CREATE INDEX idx_coupon_usage_fact_company_date ON sales_analytics.coupon_usage_fact(company_id, used_at);
-CREATE INDEX idx_coupon_usage_fact_coupon ON sales_analytics.coupon_usage_fact(coupon_id);
-CREATE INDEX idx_coupon_usage_fact_customer ON sales_analytics.coupon_usage_fact(customer_id);
+
+-- Daily coupon metrics
 CREATE TABLE sales_analytics.daily_coupon_metrics (
     id                  BIGSERIAL PRIMARY KEY,
     company_id          UUID NOT NULL,
@@ -1188,13 +1356,13 @@ CREATE TABLE sales_analytics.daily_coupon_metrics (
     date                DATE NOT NULL,
     times_applied       INT NOT NULL DEFAULT 0,
     total_discount_amount DECIMAL(14,4) NOT NULL DEFAULT 0,
-    total_order_value   DECIMAL(14,4) NOT NULL DEFAULT 0,   -- sum of order subtotals where coupon applied
+    total_order_value   DECIMAL(14,4) NOT NULL DEFAULT 0,
     unique_customers    INT NOT NULL DEFAULT 0,
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(company_id, coupon_id, date)
 );
-CREATE INDEX idx_daily_coupon_metrics_company_date ON sales_analytics.daily_coupon_metrics(company_id, date);
-CREATE INDEX idx_daily_coupon_metrics_coupon ON sales_analytics.daily_coupon_metrics(coupon_id);
+
+-- Customer coupon usage
 CREATE TABLE sales_analytics.customer_coupon_usage (
     company_id      UUID NOT NULL,
     coupon_id       UUID NOT NULL,
@@ -1205,19 +1373,22 @@ CREATE TABLE sales_analytics.customer_coupon_usage (
     last_used_at    TIMESTAMPTZ,
     PRIMARY KEY (company_id, coupon_id, customer_id)
 );
-CREATE INDEX idx_customer_coupon_usage_customer ON sales_analytics.customer_coupon_usage(customer_id);
+
+-- Coupon redemption rate daily
 CREATE TABLE sales_analytics.coupon_redemption_rate_daily (
     id                  BIGSERIAL PRIMARY KEY,
     company_id          UUID NOT NULL,
     coupon_id           UUID NOT NULL,
     date                DATE NOT NULL,
-    total_issued        INT,          -- total coupons generated (if you track that)
+    total_issued        INT,
     times_used          INT NOT NULL DEFAULT 0,
-    total_available     INT,          -- usage_limit * (number of eligible customers?) – can be denormalised
-    redemption_rate     DECIMAL(5,2), -- (times_used / total_available) * 100
+    total_available     INT,
+    redemption_rate     DECIMAL(5,2),
     updated_at          TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(company_id, coupon_id, date)
 );
+
+-- Coupon performance summary
 CREATE TABLE sales_analytics.coupon_performance_summary (
     coupon_id           UUID PRIMARY KEY,
     company_id          UUID NOT NULL,
@@ -1228,6 +1399,387 @@ CREATE TABLE sales_analytics.coupon_performance_summary (
     last_used_at        TIMESTAMPTZ,
     updated_at          TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Promotion usage fact
+CREATE TABLE sales_analytics.promotion_usage_fact (
+    id              BIGSERIAL PRIMARY KEY,
+    company_id      UUID NOT NULL,
+    promotion_id    UUID NOT NULL,
+    entity_type     VARCHAR(20) NOT NULL,
+    entity_id       UUID NOT NULL,
+    customer_id     UUID,
+    discount_amount DECIMAL(14,4) NOT NULL,
+    order_subtotal  DECIMAL(14,4),
+    used_at         TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, promotion_id, entity_type, entity_id)
+);
+
+-- Daily promotion metrics
+CREATE TABLE sales_analytics.daily_promotion_metrics (
+    id                  BIGSERIAL PRIMARY KEY,
+    company_id          UUID NOT NULL,
+    promotion_id        UUID NOT NULL,
+    date                DATE NOT NULL,
+    times_applied       INT NOT NULL DEFAULT 0,
+    total_discount_amount DECIMAL(14,4) NOT NULL DEFAULT 0,
+    total_order_value   DECIMAL(14,4) NOT NULL DEFAULT 0,
+    unique_customers    INT NOT NULL DEFAULT 0,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(company_id, promotion_id, date)
+);
+
+-- Daily promotion unique customers
+CREATE TABLE sales_analytics.daily_promotion_unique_customers (
+    company_id      UUID NOT NULL,
+    promotion_id    UUID NOT NULL,
+    date            DATE NOT NULL,
+    customer_id     UUID NOT NULL,
+    PRIMARY KEY (company_id, promotion_id, date, customer_id)
+);
+
+-- Promotion performance summary
+CREATE TABLE sales_analytics.promotion_performance_summary (
+    promotion_id            UUID PRIMARY KEY,
+    company_id              UUID NOT NULL,
+    total_times_used        BIGINT NOT NULL DEFAULT 0,
+    total_discount_given    DECIMAL(14,4) NOT NULL DEFAULT 0,
+    avg_discount_per_use    DECIMAL(14,4),
+    unique_customers        INT NOT NULL DEFAULT 0,
+    last_used_at            TIMESTAMPTZ,
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Customer promotion usage
+CREATE TABLE sales_analytics.customer_promotion_usage (
+    company_id      UUID NOT NULL,
+    promotion_id    UUID NOT NULL,
+    customer_id     UUID NOT NULL,
+    usage_count     INT NOT NULL DEFAULT 0,
+    total_discount  DECIMAL(14,4) NOT NULL DEFAULT 0,
+    first_used_at   TIMESTAMPTZ,
+    last_used_at    TIMESTAMPTZ,
+    PRIMARY KEY (company_id, promotion_id, customer_id)
+);
+
+-- Promotion redemption rate daily
+CREATE TABLE sales_analytics.promotion_redemption_rate_daily (
+    id                  BIGSERIAL PRIMARY KEY,
+    company_id          UUID NOT NULL,
+    promotion_id        UUID NOT NULL,
+    date                DATE NOT NULL,
+    total_available     INT,
+    times_used          INT NOT NULL DEFAULT 0,
+    redemption_rate     DECIMAL(5,2),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, promotion_id, date)
+);
+
+-- Promotion unique customers (global)
+CREATE TABLE sales_analytics.promotion_unique_customers (
+    company_id   UUID NOT NULL,
+    promotion_id UUID NOT NULL,
+    customer_id  UUID NOT NULL,
+    PRIMARY KEY (company_id, promotion_id, customer_id)
+);
+
+-- Daily return metrics
+CREATE TABLE sales_analytics.daily_return_metrics (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    date DATE NOT NULL,
+    total_returns_requested INT DEFAULT 0,
+    total_returns_approved INT DEFAULT 0,
+    total_returns_completed INT DEFAULT 0,
+    total_returns_rejected INT DEFAULT 0,
+    total_refund_amount DECIMAL(14,4) DEFAULT 0,
+    total_credit_note_amount DECIMAL(14,4) DEFAULT 0,
+    unique_customers INT DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, date)
+);
+
+-- Return reason fact
+CREATE TABLE sales_analytics.return_reason_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    return_id UUID NOT NULL,
+    return_item_id UUID NOT NULL,
+    reason_code VARCHAR(100),
+    reason_text TEXT,
+    product_id UUID,
+    quantity_returned DECIMAL(14,4),
+    refund_amount DECIMAL(14,4),
+    return_date DATE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Return processing time fact
+CREATE TABLE sales_analytics.return_processing_time_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    return_id UUID NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    entered_at TIMESTAMPTZ NOT NULL,
+    exited_at TIMESTAMPTZ,
+    duration_seconds BIGINT GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (exited_at - entered_at))) STORED,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Credit note fact
+CREATE TABLE sales_analytics.credit_note_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    credit_note_id UUID NOT NULL,
+    return_id UUID,
+    issued_date DATE NOT NULL,
+    issued_amount DECIMAL(14,4) NOT NULL,
+    applied_amount DECIMAL(14,4) DEFAULT 0,
+    applied_to_invoice_id UUID,
+    applied_date DATE,
+    status VARCHAR(20) DEFAULT 'issued',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Refund fact
+CREATE TABLE sales_analytics.refund_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    refund_id UUID NOT NULL,
+    return_id UUID NOT NULL,
+    payment_id UUID NOT NULL,
+    amount DECIMAL(14,4) NOT NULL,
+    refund_date DATE NOT NULL,
+    refund_method sales.payment_method,
+    status VARCHAR(20),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Return product category fact
+CREATE TABLE sales_analytics.return_product_category_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    category_id UUID,
+    category_name VARCHAR(255),
+    return_date DATE NOT NULL,
+    quantity_returned DECIMAL(14,4),
+    refund_amount DECIMAL(14,4),
+    unique_returns INT DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Daily return unique customers
+CREATE TABLE sales_analytics.daily_return_unique_customers (
+    company_id UUID NOT NULL,
+    date DATE NOT NULL,
+    customer_id UUID NOT NULL,
+    PRIMARY KEY (company_id, date, customer_id)
+);
+
+-- Sales rep target achievement
+CREATE TABLE sales_analytics.sales_rep_target_achievement (
+    id                 BIGSERIAL PRIMARY KEY,
+    company_id         UUID NOT NULL,
+    sales_rep_id       UUID NOT NULL,
+    period_start       DATE NOT NULL,
+    period_end         DATE NOT NULL,
+    target_amount      DECIMAL(14,2) NOT NULL,
+    actual_revenue     DECIMAL(14,2) NOT NULL DEFAULT 0,
+    achievement_pct    DECIMAL(5,2) GENERATED ALWAYS AS (
+        CASE WHEN target_amount > 0 
+             THEN (actual_revenue / target_amount) * 100 
+             ELSE 0 
+        END
+    ) STORED,
+    currency           VARCHAR(3) NOT NULL DEFAULT 'USD',
+    created_at         TIMESTAMPTZ DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, sales_rep_id, period_start, period_end)
+);
+
+-- Sales rep commission fact (with plan_id and rule_id included directly)
+CREATE TABLE sales_analytics.sales_rep_commission_fact (
+    id                BIGSERIAL PRIMARY KEY,
+    company_id        UUID NOT NULL,
+    sales_rep_id      UUID NOT NULL,
+    entity_type       VARCHAR(20) NOT NULL,
+    entity_id         UUID NOT NULL,
+    commission_base   DECIMAL(14,4) NOT NULL,
+    commission_rate   DECIMAL(5,2) NOT NULL,
+    commission_amount DECIMAL(14,4) NOT NULL,
+    earned_at         TIMESTAMPTZ NOT NULL,
+    paid_at           TIMESTAMPTZ,
+    plan_id           UUID,
+    rule_id           UUID,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, entity_type, entity_id)
+);
+
+-- Sales rep leaderboard snapshot
+CREATE TABLE sales_analytics.sales_rep_leaderboard_snapshot (
+    id                BIGSERIAL PRIMARY KEY,
+    company_id        UUID NOT NULL,
+    snapshot_date     DATE NOT NULL,
+    period_start      DATE NOT NULL,
+    period_end        DATE NOT NULL,
+    sales_rep_id      UUID NOT NULL,
+    rank              INT NOT NULL,
+    revenue           DECIMAL(14,4) NOT NULL,
+    orders_count      INT NOT NULL,
+    average_deal      DECIMAL(14,4) NOT NULL,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, snapshot_date, sales_rep_id)
+);
+
+-- Commission plan daily
+CREATE TABLE sales_analytics.commission_plan_daily (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    plan_id UUID NOT NULL,
+    date DATE NOT NULL,
+    total_commissions_earned DECIMAL(14,4) NOT NULL DEFAULT 0,
+    total_commissions_paid DECIMAL(14,4) NOT NULL DEFAULT 0,
+    commission_count INT NOT NULL DEFAULT 0,
+    average_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+    unique_sales_reps INT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, plan_id, date)
+);
+
+-- Commission rule fact
+CREATE TABLE sales_analytics.commission_rule_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    rule_id UUID NOT NULL,
+    plan_id UUID NOT NULL,
+    date DATE NOT NULL,
+    times_applied INT NOT NULL DEFAULT 0,
+    total_commission_base DECIMAL(14,4) NOT NULL DEFAULT 0,
+    total_commission_amount DECIMAL(14,4) NOT NULL DEFAULT 0,
+    avg_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, rule_id, date)
+);
+
+CREATE TABLE sales_analytics.commission_assignment_fact (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    plan_id UUID NOT NULL,
+    assigned_at DATE NOT NULL,
+    removed_at DATE,
+    duration_days INT GENERATED ALWAYS AS (COALESCE(removed_at, CURRENT_DATE) - assigned_at) STORED,
+    assigned_by UUID,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- Commission lifecycle
+CREATE TABLE sales_analytics.commission_lifecycle (
+    commission_id UUID PRIMARY KEY,
+    company_id UUID NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    reference_type VARCHAR(20) NOT NULL,
+    reference_id UUID NOT NULL,
+    earned_at TIMESTAMPTZ NOT NULL,
+    approved_at TIMESTAMPTZ,
+    paid_at TIMESTAMPTZ,
+    rejected_at TIMESTAMPTZ,
+    approval_delay_hours DECIMAL(10,2) GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (approved_at - earned_at))/3600) STORED,
+    payment_delay_hours DECIMAL(10,2) GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (paid_at - approved_at))/3600) STORED,
+    current_status VARCHAR(20) NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Commission forecast snapshot
+CREATE TABLE sales_analytics.commission_forecast_snapshot (
+    id BIGSERIAL PRIMARY KEY,
+    company_id UUID NOT NULL,
+    snapshot_date DATE NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    expected_commission_from_open_orders DECIMAL(14,4) DEFAULT 0,
+    expected_commission_from_open_invoices DECIMAL(14,4) DEFAULT 0,
+    total_expected_commission DECIMAL(14,4) DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, snapshot_date, sales_rep_id)
+);
+
+-- Credit check fact
+CREATE TABLE IF NOT EXISTS sales_analytics.credit_check_fact (
+    id               BIGSERIAL PRIMARY KEY,
+    company_id       UUID NOT NULL,
+    customer_id      UUID NOT NULL,
+    check_id         UUID,
+    check_type       VARCHAR(20) NOT NULL,
+    result           VARCHAR(20) NOT NULL,
+    requested_amount DECIMAL(14,4) NOT NULL,
+    current_limit    DECIMAL(14,2) NOT NULL,
+    current_outstanding DECIMAL(14,4) NOT NULL,
+    available_credit DECIMAL(14,4) NOT NULL,
+    reason           TEXT,
+    checked_at       TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Daily credit metrics
+CREATE TABLE IF NOT EXISTS sales_analytics.daily_credit_metrics (
+    id                         BIGSERIAL PRIMARY KEY,
+    company_id                 UUID NOT NULL,
+    date                       DATE NOT NULL,
+    total_checks               INT DEFAULT 0,
+    checks_passed              INT DEFAULT 0,
+    checks_failed              INT DEFAULT 0,
+    total_order_value_checked  DECIMAL(14,4) DEFAULT 0,
+    total_invoice_value_checked DECIMAL(14,4) DEFAULT 0,
+    avg_available_credit       DECIMAL(14,4) DEFAULT 0,
+    avg_credit_utilization     DECIMAL(5,2) DEFAULT 0,
+    updated_at                 TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, date)
+);
+
+-- Credit hold fact
+CREATE TABLE IF NOT EXISTS sales_analytics.credit_hold_fact (
+    id              BIGSERIAL PRIMARY KEY,
+    order_id        UUID NOT NULL,
+    company_id      UUID NOT NULL,
+    customer_id     UUID NOT NULL,
+    hold_started_at TIMESTAMPTZ NOT NULL,
+    hold_ended_at   TIMESTAMPTZ,
+    duration_seconds BIGINT GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (hold_ended_at - hold_started_at))) STORED,
+    reason          TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(order_id, hold_started_at)
+);
+
+-- Credit limit change fact
+CREATE TABLE IF NOT EXISTS sales_analytics.credit_limit_change_fact (
+    id               BIGSERIAL PRIMARY KEY,
+    company_id       UUID NOT NULL,
+    customer_id      UUID NOT NULL,
+    previous_limit   DECIMAL(14,2) NOT NULL,
+    new_limit        DECIMAL(14,2) NOT NULL,
+    change_amount    DECIMAL(14,2) GENERATED ALWAYS AS (new_limit - previous_limit) STORED,
+    change_reason    TEXT,
+    changed_by       UUID,
+    changed_at       TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Customer credit daily snapshot
+CREATE TABLE IF NOT EXISTS sales_analytics.customer_credit_daily_snapshot (
+    snapshot_id      BIGSERIAL PRIMARY KEY,
+    company_id       UUID NOT NULL,
+    customer_id      UUID NOT NULL,
+    snapshot_date    DATE NOT NULL,
+    credit_limit     DECIMAL(14,2) NOT NULL,
+    outstanding_balance DECIMAL(14,4) NOT NULL,
+    available_credit DECIMAL(14,4) NOT NULL,
+    utilization_pct  DECIMAL(5,2) GENERATED ALWAYS AS (
+        CASE WHEN credit_limit > 0 THEN (outstanding_balance / credit_limit) * 100 ELSE 0 END
+    ) STORED,
+    is_suspended     BOOLEAN DEFAULT FALSE,
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(company_id, customer_id, snapshot_date)
+);
+
 -- =====================================================
 -- INDEXES FOR ANALYTICS TABLES
 -- =====================================================
@@ -1264,730 +1816,59 @@ CREATE INDEX IF NOT EXISTS idx_collection_efficiency_company_date ON sales_analy
 CREATE INDEX IF NOT EXISTS idx_auto_discount_metrics_company_date ON sales_analytics.automatic_discount_metrics(company_id, date);
 CREATE INDEX IF NOT EXISTS idx_auto_discount_metrics_discount ON sales_analytics.automatic_discount_metrics(auto_discount_id);
 CREATE INDEX IF NOT EXISTS idx_stacking_usage_rule ON sales_analytics.discount_stacking_usage(rule_id);
+CREATE INDEX IF NOT EXISTS idx_coupon_usage_fact_company_date ON sales_analytics.coupon_usage_fact(company_id, used_at);
+CREATE INDEX IF NOT EXISTS idx_coupon_usage_fact_coupon ON sales_analytics.coupon_usage_fact(coupon_id);
+CREATE INDEX IF NOT EXISTS idx_coupon_usage_fact_customer ON sales_analytics.coupon_usage_fact(customer_id);
+CREATE INDEX IF NOT EXISTS idx_daily_coupon_metrics_company_date ON sales_analytics.daily_coupon_metrics(company_id, date);
+CREATE INDEX IF NOT EXISTS idx_daily_coupon_metrics_coupon ON sales_analytics.daily_coupon_metrics(coupon_id);
+CREATE INDEX IF NOT EXISTS idx_customer_coupon_usage_customer ON sales_analytics.customer_coupon_usage(customer_id);
+CREATE INDEX IF NOT EXISTS idx_promotion_usage_fact_company_date ON sales_analytics.promotion_usage_fact(company_id, used_at);
+CREATE INDEX IF NOT EXISTS idx_promotion_usage_fact_promotion ON sales_analytics.promotion_usage_fact(promotion_id);
+CREATE INDEX IF NOT EXISTS idx_promotion_usage_fact_customer ON sales_analytics.promotion_usage_fact(customer_id);
+CREATE INDEX IF NOT EXISTS idx_daily_promotion_metrics_company_date ON sales_analytics.daily_promotion_metrics(company_id, date);
+CREATE INDEX IF NOT EXISTS idx_daily_promotion_metrics_promotion ON sales_analytics.daily_promotion_metrics(promotion_id);
+CREATE INDEX IF NOT EXISTS idx_promotion_performance_company ON sales_analytics.promotion_performance_summary(company_id);
+CREATE INDEX IF NOT EXISTS idx_customer_promotion_usage_customer ON sales_analytics.customer_promotion_usage(customer_id);
+CREATE INDEX IF NOT EXISTS idx_daily_return_metrics_company_date ON sales_analytics.daily_return_metrics(company_id, date);
+CREATE INDEX IF NOT EXISTS idx_return_reason_fact_company_date ON sales_analytics.return_reason_fact(company_id, return_date);
+CREATE INDEX IF NOT EXISTS idx_return_reason_fact_reason ON sales_analytics.return_reason_fact(reason_code);
+CREATE INDEX IF NOT EXISTS idx_return_processing_time_return ON sales_analytics.return_processing_time_fact(return_id);
+CREATE INDEX IF NOT EXISTS idx_return_processing_time_status ON sales_analytics.return_processing_time_fact(status);
+CREATE INDEX IF NOT EXISTS idx_credit_note_fact_company_date ON sales_analytics.credit_note_fact(company_id, issued_date);
+CREATE INDEX IF NOT EXISTS idx_credit_note_fact_return ON sales_analytics.credit_note_fact(return_id);
+CREATE INDEX IF NOT EXISTS idx_refund_fact_return ON sales_analytics.refund_fact(return_id);
+CREATE INDEX IF NOT EXISTS idx_refund_fact_company_date ON sales_analytics.refund_fact(company_id, refund_date);
+CREATE INDEX IF NOT EXISTS idx_target_achievement_rep ON sales_analytics.sales_rep_target_achievement(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_target_achievement_period ON sales_analytics.sales_rep_target_achievement(period_start, period_end);
+CREATE INDEX IF NOT EXISTS idx_target_achievement_company ON sales_analytics.sales_rep_target_achievement(company_id);
+CREATE INDEX IF NOT EXISTS idx_commission_fact_rep ON sales_analytics.sales_rep_commission_fact(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_commission_fact_earned ON sales_analytics.sales_rep_commission_fact(earned_at);
+CREATE INDEX IF NOT EXISTS idx_commission_fact_paid ON sales_analytics.sales_rep_commission_fact(paid_at);
+CREATE INDEX IF NOT EXISTS idx_commission_fact_plan ON sales_analytics.sales_rep_commission_fact(plan_id);
+CREATE INDEX IF NOT EXISTS idx_commission_fact_rule ON sales_analytics.sales_rep_commission_fact(rule_id);
+CREATE INDEX IF NOT EXISTS idx_leaderboard_snapshot_company_date ON sales_analytics.sales_rep_leaderboard_snapshot(company_id, snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_leaderboard_snapshot_rep ON sales_analytics.sales_rep_leaderboard_snapshot(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_commission_plan_daily_company_date ON sales_analytics.commission_plan_daily(company_id, date);
+CREATE INDEX IF NOT EXISTS idx_commission_rule_fact_plan ON sales_analytics.commission_rule_fact(plan_id);
+CREATE INDEX IF NOT EXISTS idx_assignment_fact_rep ON sales_analytics.commission_assignment_fact(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_assignment_fact_plan ON sales_analytics.commission_assignment_fact(plan_id);
+CREATE INDEX IF NOT EXISTS idx_commission_lifecycle_status ON sales_analytics.commission_lifecycle(current_status);
+CREATE INDEX IF NOT EXISTS idx_commission_forecast_rep ON sales_analytics.commission_forecast_snapshot(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_credit_check_fact_company_date ON sales_analytics.credit_check_fact(company_id, checked_at);
+CREATE INDEX IF NOT EXISTS idx_credit_check_fact_customer ON sales_analytics.credit_check_fact(customer_id);
+CREATE INDEX IF NOT EXISTS idx_credit_check_fact_result ON sales_analytics.credit_check_fact(result);
+CREATE INDEX IF NOT EXISTS idx_daily_credit_metrics_company_date ON sales_analytics.daily_credit_metrics(company_id, date);
+CREATE INDEX IF NOT EXISTS idx_credit_hold_fact_order ON sales_analytics.credit_hold_fact(order_id);
+CREATE INDEX IF NOT EXISTS idx_credit_hold_fact_company_date ON sales_analytics.credit_hold_fact(company_id, hold_started_at);
+CREATE INDEX IF NOT EXISTS idx_credit_hold_fact_customer ON sales_analytics.credit_hold_fact(customer_id);
+CREATE INDEX IF NOT EXISTS idx_credit_limit_change_company ON sales_analytics.credit_limit_change_fact(company_id, changed_at);
+CREATE INDEX IF NOT EXISTS idx_credit_limit_change_customer ON sales_analytics.credit_limit_change_fact(customer_id);
+CREATE INDEX IF NOT EXISTS idx_customer_credit_snapshot_company_date ON sales_analytics.customer_credit_daily_snapshot(company_id, snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_customer_credit_snapshot_customer ON sales_analytics.customer_credit_daily_snapshot(customer_id);
 
 -- =====================================================
--- FUNCTIONS & TRIGGERS
+-- MATERIALIZED VIEW: Current customer credit status
 -- =====================================================
-
--- Update invoice paid amount and status
-CREATE OR REPLACE FUNCTION sales.update_invoice_paid_amount()
-RETURNS TRIGGER AS $$
-BEGIN
-    UPDATE sales.invoices
-    SET amount_paid = COALESCE(
-        (SELECT SUM(amount) FROM sales.payment_allocations pa
-         JOIN sales.payments p ON pa.payment_id = p.payment_id
-         WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'),
-        0
-    ),
-    amount_due = grand_total - COALESCE(
-        (SELECT SUM(amount) FROM sales.payment_allocations pa
-         JOIN sales.payments p ON pa.payment_id = p.payment_id
-         WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'),
-        0
-    ),
-    status = CASE
-        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
-                       JOIN sales.payments p ON pa.payment_id = p.payment_id
-                       WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) >= grand_total THEN 'paid'
-        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
-                       JOIN sales.payments p ON pa.payment_id = p.payment_id
-                       WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) > 0 THEN 'issued'
-        ELSE status
-    END,
-    paid_at = CASE
-        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
-                       JOIN sales.payments p ON pa.payment_id = p.payment_id
-                       WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) >= grand_total THEN NOW()
-        ELSE paid_at
-    END,
-    updated_at = NOW()
-    WHERE invoice_id = NEW.invoice_id;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Generic updated_at function
-CREATE OR REPLACE FUNCTION sales.update_updated_at_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Triggers for updated_at on all relevant tables
-CREATE TRIGGER update_customers_updated_at BEFORE UPDATE ON sales.customers FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_products_updated_at BEFORE UPDATE ON sales.products FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON sales.orders FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_invoices_updated_at BEFORE UPDATE ON sales.invoices FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_payments_updated_at BEFORE UPDATE ON sales.payments FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_returns_updated_at BEFORE UPDATE ON sales.returns FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_coupons_updated_at BEFORE UPDATE ON sales.coupons FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_promotions_updated_at BEFORE UPDATE ON sales.promotions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_payment_terms_updated_at BEFORE UPDATE ON sales.payment_terms FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_quotes_updated_at BEFORE UPDATE ON sales.quotes FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_sales_reps_updated_at BEFORE UPDATE ON sales.sales_reps FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_commissions_updated_at BEFORE UPDATE ON sales.sales_rep_commissions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_auto_discount_updated_at BEFORE UPDATE ON sales.automatic_discounts FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_stacking_updated_at BEFORE UPDATE ON sales.discount_stacking_rules FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_priority_updated_at BEFORE UPDATE ON sales.discount_priorities FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_payment_refunds_updated_at BEFORE UPDATE ON sales.payment_refunds FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-
--- Trigger for invoice paid amount
-CREATE TRIGGER trg_update_invoice_paid_amount
-    AFTER INSERT OR UPDATE ON sales.payment_allocations
-    FOR EACH ROW
-    EXECUTE FUNCTION sales.update_invoice_paid_amount();
-
--- =====================================================
--- END OF SCRIPT
--- =====================================================
-
--- Fact table: each time a promotion is applied to an order or invoice
-CREATE TABLE sales_analytics.promotion_usage_fact (
-    id              BIGSERIAL PRIMARY KEY,
-    company_id      UUID NOT NULL,
-    promotion_id    UUID NOT NULL,
-    entity_type     VARCHAR(20) NOT NULL,   -- 'order', 'invoice'
-    entity_id       UUID NOT NULL,
-    customer_id     UUID,                   -- can be NULL for anonymous
-    discount_amount DECIMAL(14,4) NOT NULL,
-    order_subtotal  DECIMAL(14,4),          -- base amount before discount
-    used_at         TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, promotion_id, entity_type, entity_id)
-);
-
-CREATE INDEX idx_promotion_usage_fact_company_date ON sales_analytics.promotion_usage_fact(company_id, used_at);
-CREATE INDEX idx_promotion_usage_fact_promotion ON sales_analytics.promotion_usage_fact(promotion_id);
-CREATE INDEX idx_promotion_usage_fact_customer ON sales_analytics.promotion_usage_fact(customer_id);
-
--- Daily aggregated metrics per promotion
-CREATE TABLE sales_analytics.daily_promotion_metrics (
-    id                  BIGSERIAL PRIMARY KEY,
-    company_id          UUID NOT NULL,
-    promotion_id        UUID NOT NULL,
-    date                DATE NOT NULL,
-    times_applied       INT NOT NULL DEFAULT 0,
-    total_discount_amount DECIMAL(14,4) NOT NULL DEFAULT 0,
-    total_order_value   DECIMAL(14,4) NOT NULL DEFAULT 0,   -- sum of order subtotals where promotion applied
-    unique_customers    INT NOT NULL DEFAULT 0,
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(company_id, promotion_id, date)
-);
-
-CREATE INDEX idx_daily_promotion_metrics_company_date ON sales_analytics.daily_promotion_metrics(company_id, date);
-CREATE INDEX idx_daily_promotion_metrics_promotion ON sales_analytics.daily_promotion_metrics(promotion_id);
-
--- Bridge table to track unique customers per promotion per day (for accurate unique_customers count)
-CREATE TABLE sales_analytics.daily_promotion_unique_customers (
-    company_id      UUID NOT NULL,
-    promotion_id    UUID NOT NULL,
-    date            DATE NOT NULL,
-    customer_id     UUID NOT NULL,
-    PRIMARY KEY (company_id, promotion_id, date, customer_id)
-);
-
--- Overall promotion performance summary
-CREATE TABLE sales_analytics.promotion_performance_summary (
-    promotion_id            UUID PRIMARY KEY,
-    company_id              UUID NOT NULL,
-    total_times_used        BIGINT NOT NULL DEFAULT 0,
-    total_discount_given    DECIMAL(14,4) NOT NULL DEFAULT 0,
-    avg_discount_per_use    DECIMAL(14,4),
-    unique_customers        INT NOT NULL DEFAULT 0,
-    last_used_at            TIMESTAMPTZ,
-    updated_at              TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_promotion_performance_company ON sales_analytics.promotion_performance_summary(company_id);
-
--- Per‑customer promotion usage (for per‑user limits and cohort analysis)
-CREATE TABLE sales_analytics.customer_promotion_usage (
-    company_id      UUID NOT NULL,
-    promotion_id    UUID NOT NULL,
-    customer_id     UUID NOT NULL,
-    usage_count     INT NOT NULL DEFAULT 0,
-    total_discount  DECIMAL(14,4) NOT NULL DEFAULT 0,
-    first_used_at   TIMESTAMPTZ,
-    last_used_at    TIMESTAMPTZ,
-    PRIMARY KEY (company_id, promotion_id, customer_id)
-);
-
-CREATE INDEX idx_customer_promotion_usage_customer ON sales_analytics.customer_promotion_usage(customer_id);
-
-CREATE TABLE sales_analytics.promotion_redemption_rate_daily (
-    id                  BIGSERIAL PRIMARY KEY,
-    company_id          UUID NOT NULL,
-    promotion_id        UUID NOT NULL,
-    date                DATE NOT NULL,
-    total_available     INT,               -- e.g., number of coupons issued, or number of eligible customers
-    times_used          INT NOT NULL DEFAULT 0,
-    redemption_rate     DECIMAL(5,2),      -- (times_used / total_available) * 100
-    updated_at          TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, promotion_id, date)
-);
-CREATE TABLE sales_analytics.promotion_unique_customers (
-    company_id   UUID NOT NULL,
-    promotion_id UUID NOT NULL,
-    customer_id  UUID NOT NULL,
-    PRIMARY KEY (company_id, promotion_id, customer_id)
-);
-
-ALTER TABLE sales.payment_refunds ADD COLUMN return_id UUID NULL;
-ALTER TABLE sales.payment_refunds ADD CONSTRAINT fk_payment_refunds_return FOREIGN KEY (return_id) REFERENCES sales.returns(return_id) ON DELETE SET NULL;
-CREATE INDEX idx_payment_refunds_return ON sales.payment_refunds(return_id);
-
-
-CREATE TABLE sales_analytics.daily_return_metrics (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    date DATE NOT NULL,
-    total_returns_requested INT DEFAULT 0,
-    total_returns_approved INT DEFAULT 0,
-    total_returns_completed INT DEFAULT 0,
-    total_returns_rejected INT DEFAULT 0,
-    total_refund_amount DECIMAL(14,4) DEFAULT 0,
-    total_credit_note_amount DECIMAL(14,4) DEFAULT 0,
-    unique_customers INT DEFAULT 0,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, date)
-);
-CREATE INDEX idx_daily_return_metrics_company_date ON sales_analytics.daily_return_metrics(company_id, date);
-
-CREATE TABLE sales_analytics.return_reason_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    return_id UUID NOT NULL,
-    return_item_id UUID NOT NULL,
-    reason_code VARCHAR(100),
-    reason_text TEXT,
-    product_id UUID,
-    quantity_returned DECIMAL(14,4),
-    refund_amount DECIMAL(14,4),
-    return_date DATE NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_return_reason_fact_company_date ON sales_analytics.return_reason_fact(company_id, return_date);
-CREATE INDEX idx_return_reason_fact_reason ON sales_analytics.return_reason_fact(reason_code);
-
-CREATE TABLE sales_analytics.return_processing_time_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    return_id UUID NOT NULL,
-    status sales.return_status NOT NULL,
-    entered_at TIMESTAMPTZ NOT NULL,
-    exited_at TIMESTAMPTZ,
-    duration_seconds BIGINT GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (exited_at - entered_at))) STORED,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_return_processing_time_return ON sales_analytics.return_processing_time_fact(return_id);
-CREATE INDEX idx_return_processing_time_status ON sales_analytics.return_processing_time_fact(status);
-CREATE TABLE sales_analytics.credit_note_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    credit_note_id UUID NOT NULL,
-    return_id UUID,
-    issued_date DATE NOT NULL,
-    issued_amount DECIMAL(14,4) NOT NULL,
-    applied_amount DECIMAL(14,4) DEFAULT 0,
-    applied_to_invoice_id UUID,
-    applied_date DATE,
-    status VARCHAR(20) DEFAULT 'issued',
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_credit_note_fact_company_date ON sales_analytics.credit_note_fact(company_id, issued_date);
-CREATE INDEX idx_credit_note_fact_return ON sales_analytics.credit_note_fact(return_id);
-
-CREATE TABLE sales_analytics.refund_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    refund_id UUID NOT NULL,
-    return_id UUID NOT NULL,
-    payment_id UUID NOT NULL,
-    amount DECIMAL(14,4) NOT NULL,
-    refund_date DATE NOT NULL,
-    refund_method sales.payment_method,
-    status VARCHAR(20),
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_refund_fact_return ON sales_analytics.refund_fact(return_id);
-CREATE INDEX idx_refund_fact_company_date ON sales_analytics.refund_fact(company_id, refund_date);
-
-CREATE TABLE sales_analytics.return_product_category_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    category_id UUID,
-    category_name VARCHAR(255),
-    return_date DATE NOT NULL,
-    quantity_returned DECIMAL(14,4),
-    refund_amount DECIMAL(14,4),
-    unique_returns INT DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE sales_analytics.daily_return_unique_customers (
-    company_id UUID NOT NULL,
-    date DATE NOT NULL,
-    customer_id UUID NOT NULL,
-    PRIMARY KEY (company_id, date, customer_id)
-);
-
--- Enum for credit note status
-CREATE TYPE sales.credit_note_status AS ENUM ('draft', 'issued', 'partially_used', 'fully_used', 'voided');
-
--- Main credit notes table
-CREATE TABLE IF NOT EXISTS sales.credit_notes (
-    credit_note_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id          UUID NOT NULL,
-    customer_id         UUID NOT NULL,
-    credit_note_number  VARCHAR(50) NOT NULL,
-    invoice_id          UUID,                           -- original invoice (if any)
-    return_id           UUID,                           -- linked return (if any)
-    issue_date          DATE NOT NULL,
-    status              sales.credit_note_status NOT NULL DEFAULT 'draft',
-    currency            VARCHAR(3) NOT NULL DEFAULT 'USD',
-    subtotal            NUMERIC(14,4) NOT NULL,
-    tax_total           NUMERIC(14,4) NOT NULL,
-    total_amount        NUMERIC(14,4) NOT NULL,         -- negative value (credit)
-    amount_applied      NUMERIC(14,4) NOT NULL DEFAULT 0,
-    remaining_amount    NUMERIC(14,4) GENERATED ALWAYS AS (total_amount - amount_applied) STORED,
-    reason              TEXT,
-    notes               TEXT,
-    issued_at           TIMESTAMPTZ,
-    voided_at           TIMESTAMPTZ,
-    void_reason         TEXT,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by          UUID,
-    updated_by          UUID,
-    CONSTRAINT fk_credit_notes_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_credit_notes_customer FOREIGN KEY (customer_id) REFERENCES sales.customers(customer_id),
-    CONSTRAINT fk_credit_notes_invoice FOREIGN KEY (invoice_id) REFERENCES sales.invoices(invoice_id) ON DELETE SET NULL,
-    CONSTRAINT fk_credit_notes_return FOREIGN KEY (return_id) REFERENCES sales.returns(return_id) ON DELETE SET NULL,
-    CONSTRAINT fk_credit_notes_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_credit_notes_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    UNIQUE (company_id, credit_note_number)
-);
-
-CREATE INDEX idx_credit_notes_company ON sales.credit_notes(company_id);
-CREATE INDEX idx_credit_notes_customer ON sales.credit_notes(customer_id);
-CREATE INDEX idx_credit_notes_invoice ON sales.credit_notes(invoice_id);
-CREATE INDEX idx_credit_notes_return ON sales.credit_notes(return_id);
-CREATE INDEX idx_credit_notes_status ON sales.credit_notes(status);
-CREATE INDEX idx_credit_notes_issue_date ON sales.credit_notes(issue_date);
-
--- Credit note items (line details)
-CREATE TABLE IF NOT EXISTS sales.credit_note_items (
-    credit_note_item_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    credit_note_id        UUID NOT NULL,
-    invoice_item_id       UUID,
-    product_id            UUID,
-    product_name_snapshot VARCHAR(255) NOT NULL,
-    quantity              NUMERIC(14,4) NOT NULL CHECK (quantity > 0),
-    unit_price            NUMERIC(14,4) NOT NULL,
-    tax_rate              NUMERIC(5,2),
-    tax_amount            NUMERIC(14,4) DEFAULT 0,
-    line_amount           NUMERIC(14,4) NOT NULL,
-    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by            UUID,
-    CONSTRAINT fk_credit_items_credit_note FOREIGN KEY (credit_note_id) REFERENCES sales.credit_notes(credit_note_id) ON DELETE CASCADE,
-    CONSTRAINT fk_credit_items_invoice_item FOREIGN KEY (invoice_item_id) REFERENCES sales.invoice_items(invoice_item_id) ON DELETE SET NULL,
-    CONSTRAINT fk_credit_items_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id) ON DELETE SET NULL,
-    CONSTRAINT fk_credit_items_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
-);
-
-CREATE INDEX idx_credit_items_credit_note ON sales.credit_note_items(credit_note_id);
-CREATE INDEX idx_credit_items_product ON sales.credit_note_items(product_id);
-
--- Application of credit notes to invoices (partial/full)
-CREATE TABLE IF NOT EXISTS sales.credit_note_applications (
-    application_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    credit_note_id  UUID NOT NULL,
-    invoice_id      UUID NOT NULL,
-    amount          NUMERIC(14,4) NOT NULL CHECK (amount > 0),
-    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    applied_by      UUID,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_cn_app_credit_note FOREIGN KEY (credit_note_id) REFERENCES sales.credit_notes(credit_note_id) ON DELETE CASCADE,
-    CONSTRAINT fk_cn_app_invoice FOREIGN KEY (invoice_id) REFERENCES sales.invoices(invoice_id) ON DELETE CASCADE,
-    CONSTRAINT fk_cn_applied_by FOREIGN KEY (applied_by) REFERENCES users(user_id) ON DELETE SET NULL
-);
-
-CREATE INDEX idx_cn_app_credit_note ON sales.credit_note_applications(credit_note_id);
-CREATE INDEX idx_cn_app_invoice ON sales.credit_note_applications(invoice_id);
-
--- Sales targets for representatives
-CREATE TABLE IF NOT EXISTS sales.sales_targets (
-    target_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id      UUID NOT NULL,
-    sales_rep_id    UUID NOT NULL,
-    period_start    DATE NOT NULL,
-    period_end      DATE NOT NULL,
-    target_amount   NUMERIC(14,2) NOT NULL,
-    currency        VARCHAR(3) NOT NULL DEFAULT 'USD',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by      UUID,
-    updated_by      UUID,
-    CONSTRAINT fk_targets_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_targets_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
-    CONSTRAINT fk_targets_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_targets_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    UNIQUE(company_id, sales_rep_id, period_start, period_end)
-);
-
-CREATE INDEX idx_sales_targets_rep ON sales.sales_targets(sales_rep_id);
-CREATE INDEX idx_sales_targets_period ON sales.sales_targets(period_start, period_end);
-
-
-
-CREATE TABLE sales_analytics.sales_rep_target_achievement (
-    id                 BIGSERIAL PRIMARY KEY,
-    company_id         UUID NOT NULL,
-    sales_rep_id       UUID NOT NULL,
-    period_start       DATE NOT NULL,          -- e.g., 2026-01-01
-    period_end         DATE NOT NULL,          -- e.g., 2026-01-31
-    target_amount      DECIMAL(14,2) NOT NULL, -- from sales.sales_targets
-    actual_revenue     DECIMAL(14,2) NOT NULL DEFAULT 0, -- sum of order/invoice revenue
-    achievement_pct    DECIMAL(5,2) GENERATED ALWAYS AS (
-        CASE WHEN target_amount > 0 
-             THEN (actual_revenue / target_amount) * 100 
-             ELSE 0 
-        END
-    ) STORED,
-    currency           VARCHAR(3) NOT NULL DEFAULT 'USD',
-    created_at         TIMESTAMPTZ DEFAULT NOW(),
-    updated_at         TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, sales_rep_id, period_start, period_end)
-);
-
-CREATE INDEX idx_target_achievement_rep ON sales_analytics.sales_rep_target_achievement(sales_rep_id);
-CREATE INDEX idx_target_achievement_period ON sales_analytics.sales_rep_target_achievement(period_start, period_end);
-CREATE INDEX idx_target_achievement_company ON sales_analytics.sales_rep_target_achievement(company_id);
-
-CREATE TABLE sales_analytics.sales_rep_commission_fact (
-    id                BIGSERIAL PRIMARY KEY,
-    company_id        UUID NOT NULL,
-    sales_rep_id      UUID NOT NULL,
-    entity_type       VARCHAR(20) NOT NULL,   -- 'order', 'invoice', 'payment'
-    entity_id         UUID NOT NULL,          -- order_id / invoice_id / payment_id
-    commission_base   DECIMAL(14,4) NOT NULL, -- revenue or profit used for calculation
-    commission_rate   DECIMAL(5,2) NOT NULL,  -- applied rate
-    commission_amount DECIMAL(14,4) NOT NULL, -- calculated amount
-    earned_at         TIMESTAMPTZ NOT NULL,   -- when the commission was earned
-    paid_at           TIMESTAMPTZ,            -- when paid out (if applicable)
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, entity_type, entity_id)  -- avoid double counting
-);
-
-CREATE INDEX idx_commission_fact_rep ON sales_analytics.sales_rep_commission_fact(sales_rep_id);
-CREATE INDEX idx_commission_fact_earned ON sales_analytics.sales_rep_commission_fact(earned_at);
-CREATE INDEX idx_commission_fact_paid ON sales_analytics.sales_rep_commission_fact(paid_at);
-
-CREATE TABLE sales_analytics.sales_rep_leaderboard_snapshot (
-    id                BIGSERIAL PRIMARY KEY,
-    company_id        UUID NOT NULL,
-    snapshot_date     DATE NOT NULL,          -- the date the snapshot was taken (e.g., last day of month)
-    period_start      DATE NOT NULL,          -- start of the ranked period
-    period_end        DATE NOT NULL,          -- end of the ranked period
-    sales_rep_id      UUID NOT NULL,
-    rank              INT NOT NULL,           -- 1 = highest revenue
-    revenue           DECIMAL(14,4) NOT NULL,
-    orders_count      INT NOT NULL,
-    average_deal      DECIMAL(14,4) NOT NULL,
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, snapshot_date, sales_rep_id)
-);
-
-CREATE INDEX idx_leaderboard_snapshot_company_date ON sales_analytics.sales_rep_leaderboard_snapshot(company_id, snapshot_date);
-CREATE INDEX idx_leaderboard_snapshot_rep ON sales_analytics.sales_rep_leaderboard_snapshot(sales_rep_id);
-
--- Commission plans
-CREATE TABLE IF NOT EXISTS sales.commission_plans (
-    plan_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    code             VARCHAR(50) NOT NULL,
-    name             VARCHAR(255) NOT NULL,
-    description      TEXT,
-    effective_from   DATE NOT NULL,
-    effective_to     DATE,
-    is_active        BOOLEAN NOT NULL DEFAULT true,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by       UUID,
-    updated_by       UUID,
-    CONSTRAINT fk_commission_plans_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_commission_plans_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_commission_plans_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    UNIQUE(company_id, code)
-);
-
--- Commission rules
-CREATE TABLE IF NOT EXISTS sales.commission_rules (
-    rule_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    plan_id          UUID NOT NULL,
-    rule_type        VARCHAR(20) NOT NULL, -- 'flat','tiered','product','category'
-    applies_to       sales.commission_base_type NOT NULL,
-    product_id       UUID,
-    tier_min         NUMERIC(14,4),
-    tier_max         NUMERIC(14,4),
-    rate             NUMERIC(14,4) NOT NULL,
-    is_percentage    BOOLEAN NOT NULL DEFAULT true,
-    priority         INT NOT NULL DEFAULT 0,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by       UUID,
-    updated_by       UUID,
-    CONSTRAINT fk_commission_rules_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_commission_rules_plan FOREIGN KEY (plan_id) REFERENCES sales.commission_plans(plan_id) ON DELETE CASCADE,
-    CONSTRAINT fk_commission_rules_product FOREIGN KEY (product_id) REFERENCES sales.products(product_id) ON DELETE SET NULL,
-    CONSTRAINT fk_commission_rules_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_commission_rules_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL
-);
-
--- Sales commissions (actual earned records)
-CREATE TABLE IF NOT EXISTS sales.sales_commissions (
-    commission_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id         UUID NOT NULL,
-    sales_rep_id       UUID NOT NULL,
-    reference_type     VARCHAR(20) NOT NULL, -- 'order','invoice','payment'
-    reference_id       UUID NOT NULL,
-    commission_base    NUMERIC(14,4) NOT NULL,
-    commission_rate    NUMERIC(14,4) NOT NULL,
-    commission_amount  NUMERIC(14,4) NOT NULL,
-    status             VARCHAR(20) NOT NULL DEFAULT 'pending',
-    earned_at          TIMESTAMPTZ NOT NULL,
-    paid_at            TIMESTAMPTZ,
-    approved_at        TIMESTAMPTZ,
-    rejected_at        TIMESTAMPTZ,
-    reject_reason      TEXT,
-    notes              TEXT,
-    rule_id            UUID,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by         UUID,
-    updated_by         UUID,
-    CONSTRAINT fk_sales_commissions_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_sales_commissions_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
-    CONSTRAINT fk_sales_commissions_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_sales_commissions_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    CONSTRAINT fk_sales_commissions_rule FOREIGN KEY (rule_id) REFERENCES sales.commission_rules(rule_id) ON DELETE SET NULL,
-    UNIQUE(company_id, reference_type, reference_id)
-);
-
--- Sales rep commission assignments (which plan is active for a rep at a time)
-CREATE TABLE IF NOT EXISTS sales.sales_rep_commission_assignments (
-    assignment_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    company_id       UUID NOT NULL,
-    sales_rep_id     UUID NOT NULL,
-    plan_id          UUID NOT NULL,
-    effective_from   DATE NOT NULL,
-    effective_to     DATE,
-    assigned_by      UUID,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_assignments_company FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE,
-    CONSTRAINT fk_assignments_rep FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE CASCADE,
-    CONSTRAINT fk_assignments_plan FOREIGN KEY (plan_id) REFERENCES sales.commission_plans(plan_id) ON DELETE CASCADE,
-    CONSTRAINT fk_assignments_assigned_by FOREIGN KEY (assigned_by) REFERENCES users(user_id) ON DELETE SET NULL
-);
-
--- Indexes
-CREATE INDEX idx_commission_plans_company ON sales.commission_plans(company_id);
-CREATE INDEX idx_commission_plans_dates ON sales.commission_plans(effective_from, effective_to);
-CREATE INDEX idx_commission_rules_plan ON sales.commission_rules(plan_id);
-CREATE INDEX idx_commission_rules_product ON sales.commission_rules(product_id);
-CREATE INDEX idx_sales_commissions_rep ON sales.sales_commissions(sales_rep_id);
-CREATE INDEX idx_sales_commissions_reference ON sales.sales_commissions(reference_type, reference_id);
-CREATE INDEX idx_sales_commissions_status ON sales.sales_commissions(status);
-CREATE INDEX idx_sales_commissions_earned ON sales.sales_commissions(earned_at);
-CREATE INDEX idx_assignments_rep ON sales.sales_rep_commission_assignments(sales_rep_id);
-CREATE INDEX idx_assignments_dates ON sales.sales_rep_commission_assignments(effective_from, effective_to);
-
--- Triggers for updated_at
-CREATE TRIGGER update_commission_plans_updated_at BEFORE UPDATE ON sales.commission_plans FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_commission_rules_updated_at BEFORE UPDATE ON sales.commission_rules FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-CREATE TRIGGER update_sales_commissions_updated_at BEFORE UPDATE ON sales.sales_commissions FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
-
-
-ALTER TABLE sales_analytics.sales_rep_commission_fact
-ADD COLUMN plan_id UUID,
-ADD COLUMN rule_id UUID;
-
-CREATE INDEX idx_commission_fact_plan ON sales_analytics.sales_rep_commission_fact(plan_id);
-CREATE INDEX idx_commission_fact_rule ON sales_analytics.sales_rep_commission_fact(rule_id);
-CREATE TABLE sales_analytics.commission_plan_daily (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    plan_id UUID NOT NULL,
-    date DATE NOT NULL,
-    total_commissions_earned DECIMAL(14,4) NOT NULL DEFAULT 0,
-    total_commissions_paid DECIMAL(14,4) NOT NULL DEFAULT 0,
-    commission_count INT NOT NULL DEFAULT 0,
-    average_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
-    unique_sales_reps INT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, plan_id, date)
-);
-CREATE INDEX idx_commission_plan_daily_company_date ON sales_analytics.commission_plan_daily(company_id, date);
-
-CREATE TABLE sales_analytics.commission_rule_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    rule_id UUID NOT NULL,
-    plan_id UUID NOT NULL,
-    date DATE NOT NULL,
-    times_applied INT NOT NULL DEFAULT 0,
-    total_commission_base DECIMAL(14,4) NOT NULL DEFAULT 0,
-    total_commission_amount DECIMAL(14,4) NOT NULL DEFAULT 0,
-    avg_rate DECIMAL(10,2) NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, rule_id, date)
-);
-CREATE INDEX idx_commission_rule_fact_plan ON sales_analytics.commission_rule_fact(plan_id);
-
-CREATE TABLE sales_analytics.commission_assignment_fact (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    sales_rep_id UUID NOT NULL,
-    plan_id UUID NOT NULL,
-    assigned_at DATE NOT NULL,
-    removed_at DATE,  -- NULL if still active
-    duration_days INT GENERATED ALWAYS AS (EXTRACT(DAY FROM (COALESCE(removed_at, CURRENT_DATE) - assigned_at))) STORED,
-    assigned_by UUID,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_assignment_fact_rep ON sales_analytics.commission_assignment_fact(sales_rep_id);
-CREATE INDEX idx_assignment_fact_plan ON sales_analytics.commission_assignment_fact(plan_id);
-
-CREATE TABLE sales_analytics.commission_lifecycle (
-    commission_id UUID PRIMARY KEY,
-    company_id UUID NOT NULL,
-    sales_rep_id UUID NOT NULL,
-    reference_type VARCHAR(20) NOT NULL,
-    reference_id UUID NOT NULL,
-    earned_at TIMESTAMPTZ NOT NULL,
-    approved_at TIMESTAMPTZ,
-    paid_at TIMESTAMPTZ,
-    rejected_at TIMESTAMPTZ,
-    approval_delay_hours DECIMAL(10,2) GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (approved_at - earned_at))/3600) STORED,
-    payment_delay_hours DECIMAL(10,2) GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (paid_at - approved_at))/3600) STORED,
-    current_status VARCHAR(20) NOT NULL,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_commission_lifecycle_status ON sales_analytics.commission_lifecycle(current_status);
-
-CREATE TABLE sales_analytics.commission_forecast_snapshot (
-    id BIGSERIAL PRIMARY KEY,
-    company_id UUID NOT NULL,
-    snapshot_date DATE NOT NULL,
-    sales_rep_id UUID NOT NULL,
-    expected_commission_from_open_orders DECIMAL(14,4) DEFAULT 0,
-    expected_commission_from_open_invoices DECIMAL(14,4) DEFAULT 0,
-    total_expected_commission DECIMAL(14,4) DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, snapshot_date, sales_rep_id)
-);
-CREATE INDEX idx_commission_forecast_rep ON sales_analytics.commission_forecast_snapshot(sales_rep_id); 
-
-ALTER TABLE sales.orders ADD COLUMN credit_hold BOOLEAN DEFAULT false;
-ALTER TABLE sales.orders ADD COLUMN credit_status VARCHAR(20) DEFAULT 'approved';
--- credit_status values: 'pending', 'approved', 'rejected', 'hold'
-
-
-
-
-CREATE TABLE IF NOT EXISTS sales_analytics.credit_check_fact (
-    id               BIGSERIAL PRIMARY KEY,
-    company_id       UUID NOT NULL,
-    customer_id      UUID NOT NULL,
-    check_id         UUID,                        -- references credit_check_history.credit_history_id (optional)
-    check_type       VARCHAR(20) NOT NULL,        -- 'customer_limit', 'order_eligibility', 'invoice_eligibility'
-    result           VARCHAR(20) NOT NULL,        -- 'approved', 'denied', 'suspended'
-    requested_amount DECIMAL(14,4) NOT NULL,
-    current_limit    DECIMAL(14,2) NOT NULL,
-    current_outstanding DECIMAL(14,4) NOT NULL,
-    available_credit DECIMAL(14,4) NOT NULL,
-    reason           TEXT,
-    checked_at       TIMESTAMPTZ NOT NULL,
-    created_at       TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_credit_check_fact_company_date ON sales_analytics.credit_check_fact(company_id, checked_at);
-CREATE INDEX idx_credit_check_fact_customer ON sales_analytics.credit_check_fact(customer_id);
-CREATE INDEX idx_credit_check_fact_result ON sales_analytics.credit_check_fact(result);
-
-CREATE TABLE IF NOT EXISTS sales_analytics.daily_credit_metrics (
-    id                         BIGSERIAL PRIMARY KEY,
-    company_id                 UUID NOT NULL,
-    date                       DATE NOT NULL,
-    total_checks               INT DEFAULT 0,
-    checks_passed              INT DEFAULT 0,
-    checks_failed              INT DEFAULT 0,
-    total_order_value_checked  DECIMAL(14,4) DEFAULT 0,
-    total_invoice_value_checked DECIMAL(14,4) DEFAULT 0,
-    avg_available_credit       DECIMAL(14,4) DEFAULT 0,
-    avg_credit_utilization     DECIMAL(5,2) DEFAULT 0,
-    updated_at                 TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, date)
-);
-
-CREATE INDEX idx_daily_credit_metrics_company_date ON sales_analytics.daily_credit_metrics(company_id, date);
-
-CREATE TABLE IF NOT EXISTS sales_analytics.credit_hold_fact (
-    id              BIGSERIAL PRIMARY KEY,
-    order_id        UUID NOT NULL,
-    company_id      UUID NOT NULL,
-    customer_id     UUID NOT NULL,
-    hold_started_at TIMESTAMPTZ NOT NULL,
-    hold_ended_at   TIMESTAMPTZ,
-    duration_seconds BIGINT GENERATED ALWAYS AS (EXTRACT(EPOCH FROM (hold_ended_at - hold_started_at))) STORED,
-    reason          TEXT,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(order_id, hold_started_at)
-);
-
-CREATE INDEX idx_credit_hold_fact_order ON sales_analytics.credit_hold_fact(order_id);
-CREATE INDEX idx_credit_hold_fact_company_date ON sales_analytics.credit_hold_fact(company_id, hold_started_at);
-CREATE INDEX idx_credit_hold_fact_customer ON sales_analytics.credit_hold_fact(customer_id);
-
-CREATE TABLE IF NOT EXISTS sales_analytics.credit_limit_change_fact (
-    id               BIGSERIAL PRIMARY KEY,
-    company_id       UUID NOT NULL,
-    customer_id      UUID NOT NULL,
-    previous_limit   DECIMAL(14,2) NOT NULL,
-    new_limit        DECIMAL(14,2) NOT NULL,
-    change_amount    DECIMAL(14,2) GENERATED ALWAYS AS (new_limit - previous_limit) STORED,
-    change_reason    TEXT,
-    changed_by       UUID,
-    changed_at       TIMESTAMPTZ NOT NULL,
-    created_at       TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_credit_limit_change_company ON sales_analytics.credit_limit_change_fact(company_id, changed_at);
-CREATE INDEX idx_credit_limit_change_customer ON sales_analytics.credit_limit_change_fact(customer_id);
-
-CREATE TABLE IF NOT EXISTS sales_analytics.customer_credit_daily_snapshot (
-    snapshot_id      BIGSERIAL PRIMARY KEY,
-    company_id       UUID NOT NULL,
-    customer_id      UUID NOT NULL,
-    snapshot_date    DATE NOT NULL,
-    credit_limit     DECIMAL(14,2) NOT NULL,
-    outstanding_balance DECIMAL(14,4) NOT NULL,
-    available_credit DECIMAL(14,4) NOT NULL,
-    utilization_pct  DECIMAL(5,2) GENERATED ALWAYS AS (
-        CASE WHEN credit_limit > 0 THEN (outstanding_balance / credit_limit) * 100 ELSE 0 END
-    ) STORED,
-    is_suspended     BOOLEAN DEFAULT FALSE,
-    created_at       TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(company_id, customer_id, snapshot_date)
-);
-
-CREATE INDEX idx_customer_credit_snapshot_company_date ON sales_analytics.customer_credit_daily_snapshot(company_id, snapshot_date);
-CREATE INDEX idx_customer_credit_snapshot_customer ON sales_analytics.customer_credit_daily_snapshot(customer_id);
-
 CREATE MATERIALIZED VIEW sales_analytics.current_customer_credit AS
 SELECT
     c.customer_id,
@@ -2016,3 +1897,117 @@ GROUP BY c.customer_id, c.company_id, c.credit_limit;
 CREATE UNIQUE INDEX idx_current_credit_customer ON sales_analytics.current_customer_credit(customer_id);
 CREATE INDEX idx_current_credit_company ON sales_analytics.current_customer_credit(company_id);
 
+-- =====================================================
+-- ADDITIONAL INDEXES (from original script)
+-- =====================================================
+CREATE INDEX IF NOT EXISTS idx_customers_company ON sales.customers(company_id);
+CREATE INDEX IF NOT EXISTS idx_customers_code ON sales.customers(company_id, customer_code);
+CREATE INDEX IF NOT EXISTS idx_customers_payment_term ON sales.customers(payment_term_id);
+CREATE INDEX IF NOT EXISTS idx_products_company ON sales.products(company_id);
+CREATE INDEX IF NOT EXISTS idx_products_inventory_item ON sales.products(inventory_item_id) WHERE inventory_item_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_payment_terms_company ON sales.payment_terms(company_id);
+CREATE INDEX IF NOT EXISTS idx_payment_terms_code ON sales.payment_terms(company_id, code);
+CREATE INDEX IF NOT EXISTS idx_sales_reps_company ON sales.sales_reps(company_id);
+CREATE INDEX IF NOT EXISTS idx_sales_reps_user ON sales.sales_reps(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_orders_external_ref ON sales.orders (company_id, external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_company ON sales.orders(company_id);
+CREATE INDEX IF NOT EXISTS idx_orders_customer ON sales.orders(customer_id);
+CREATE INDEX IF NOT EXISTS idx_orders_date ON sales.orders(order_date);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON sales.orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_number ON sales.orders(company_id, order_number);
+CREATE INDEX IF NOT EXISTS idx_orders_ext ON sales.orders(company_id, external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_sales_rep ON sales.orders(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_order ON sales.order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_product ON sales.order_items(product_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_invoices_external_ref ON sales.invoices (company_id, external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_invoices_company ON sales.invoices(company_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_customer ON sales.invoices(customer_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_order ON sales.invoices(order_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_date ON sales.invoices(invoice_date);
+CREATE INDEX IF NOT EXISTS idx_invoices_status ON sales.invoices(status);
+CREATE INDEX IF NOT EXISTS idx_invoices_due ON sales.invoices(due_date) WHERE status NOT IN ('paid', 'cancelled');
+CREATE INDEX IF NOT EXISTS idx_invoices_ext ON sales.invoices(company_id, external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_invoices_sales_rep ON sales.invoices(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON sales.invoice_items(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_items_product ON sales.invoice_items(product_id) WHERE product_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_payments_external_ref ON sales.payments (company_id, external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_payments_company ON sales.payments(company_id);
+CREATE INDEX IF NOT EXISTS idx_payments_status ON sales.payments(status);
+CREATE INDEX IF NOT EXISTS idx_payments_date ON sales.payments(payment_date);
+CREATE INDEX IF NOT EXISTS idx_payments_ext ON sales.payments(company_id, external_ref) WHERE external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_payment_allocations_payment ON sales.payment_allocations(payment_id);
+CREATE INDEX IF NOT EXISTS idx_payment_allocations_invoice ON sales.payment_allocations(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_payment_refunds_payment ON sales.payment_refunds(payment_id);
+CREATE INDEX IF NOT EXISTS idx_payment_refunds_status ON sales.payment_refunds(status);
+CREATE INDEX IF NOT EXISTS idx_payment_refunds_date ON sales.payment_refunds(created_at);
+CREATE INDEX IF NOT EXISTS idx_payment_refunds_return ON sales.payment_refunds(return_id);
+CREATE INDEX IF NOT EXISTS idx_returns_company ON sales.returns(company_id);
+CREATE INDEX IF NOT EXISTS idx_returns_order ON sales.returns(order_id);
+CREATE INDEX IF NOT EXISTS idx_returns_status ON sales.returns(status);
+CREATE INDEX IF NOT EXISTS idx_return_items_return ON sales.return_items(return_id);
+CREATE INDEX IF NOT EXISTS idx_return_items_product ON sales.return_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_coupons_company ON sales.coupons(company_id);
+CREATE INDEX IF NOT EXISTS idx_coupons_code ON sales.coupons(code);
+CREATE INDEX IF NOT EXISTS idx_coupons_dates ON sales.coupons(start_date, end_date) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_coupon_usages_coupon ON sales.coupon_usages(coupon_id);
+CREATE INDEX IF NOT EXISTS idx_coupon_usages_customer ON sales.coupon_usages(customer_id);
+CREATE INDEX IF NOT EXISTS idx_promotions_company ON sales.promotions(company_id);
+CREATE INDEX IF NOT EXISTS idx_promotions_dates ON sales.promotions(start_date, end_date) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_promotion_rules_promotion ON sales.promotion_rules(promotion_id);
+CREATE INDEX IF NOT EXISTS idx_auto_discount_company ON sales.automatic_discounts(company_id);
+CREATE INDEX IF NOT EXISTS idx_auto_discount_dates ON sales.automatic_discounts(start_date, end_date) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_auto_discount_priority ON sales.automatic_discounts(company_id, priority);
+CREATE INDEX IF NOT EXISTS idx_stacking_primary ON sales.discount_stacking_rules(company_id, primary_discount_type, primary_discount_id);
+CREATE INDEX IF NOT EXISTS idx_stacking_active ON sales.discount_stacking_rules(company_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_exclusion_pair ON sales.discount_exclusions(company_id, discount_type_a, discount_id_a);
+CREATE INDEX IF NOT EXISTS idx_priority_company_type ON sales.discount_priorities(company_id, discount_type);
+CREATE INDEX IF NOT EXISTS idx_priority_value ON sales.discount_priorities(company_id, priority);
+CREATE INDEX IF NOT EXISTS idx_discount_applications_order ON sales.discount_applications(order_id) WHERE order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_discount_applications_invoice ON sales.discount_applications(invoice_id) WHERE invoice_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tax_snapshots_entity ON sales.tax_snapshots(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_tax_snapshots_line ON sales.tax_snapshots(line_id) WHERE line_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tax_snapshots_company ON sales.tax_snapshots(company_id);
+CREATE INDEX IF NOT EXISTS idx_quotes_company ON sales.quotes(company_id);
+CREATE INDEX IF NOT EXISTS idx_quotes_customer ON sales.quotes(customer_id);
+CREATE INDEX IF NOT EXISTS idx_quotes_status ON sales.quotes(status);
+CREATE INDEX IF NOT EXISTS idx_quotes_date ON sales.quotes(quote_date);
+CREATE INDEX IF NOT EXISTS idx_quotes_converted_order ON sales.quotes(converted_order_id);
+CREATE INDEX IF NOT EXISTS idx_quotes_sales_rep ON sales.quotes(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_quotes_expiry ON sales.quotes(expiry_date) WHERE expiry_date IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_quote_items_quote ON sales.quote_items(quote_id);
+CREATE INDEX IF NOT EXISTS idx_quote_items_product ON sales.quote_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_commissions_rep ON sales.sales_rep_commissions(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_commissions_product ON sales.sales_rep_commissions(product_id) WHERE product_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_commissions_date ON sales.sales_rep_commissions(effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_commissions_rate ON sales.sales_rep_commissions(commission_rate);
+CREATE INDEX IF NOT EXISTS idx_credit_history_customer ON sales.credit_check_history(customer_id);
+CREATE INDEX IF NOT EXISTS idx_credit_history_action ON sales.credit_check_history(action_type);
+CREATE INDEX IF NOT EXISTS idx_credit_history_date ON sales.credit_check_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_credit_history_created_by ON sales.credit_check_history(created_by);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_company ON sales.credit_notes(company_id);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_customer ON sales.credit_notes(customer_id);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_invoice ON sales.credit_notes(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_return ON sales.credit_notes(return_id);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_status ON sales.credit_notes(status);
+CREATE INDEX IF NOT EXISTS idx_credit_notes_issue_date ON sales.credit_notes(issue_date);
+CREATE INDEX IF NOT EXISTS idx_credit_items_credit_note ON sales.credit_note_items(credit_note_id);
+CREATE INDEX IF NOT EXISTS idx_credit_items_product ON sales.credit_note_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_cn_app_credit_note ON sales.credit_note_applications(credit_note_id);
+CREATE INDEX IF NOT EXISTS idx_cn_app_invoice ON sales.credit_note_applications(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_sales_targets_rep ON sales.sales_targets(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_sales_targets_period ON sales.sales_targets(period_start, period_end);
+CREATE INDEX IF NOT EXISTS idx_commission_plans_company ON sales.commission_plans(company_id);
+CREATE INDEX IF NOT EXISTS idx_commission_plans_dates ON sales.commission_plans(effective_from, effective_to);
+CREATE INDEX IF NOT EXISTS idx_commission_rules_plan ON sales.commission_rules(plan_id);
+CREATE INDEX IF NOT EXISTS idx_commission_rules_product ON sales.commission_rules(product_id);
+CREATE INDEX IF NOT EXISTS idx_sales_commissions_rep ON sales.sales_commissions(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_sales_commissions_reference ON sales.sales_commissions(reference_type, reference_id);
+CREATE INDEX IF NOT EXISTS idx_sales_commissions_status ON sales.sales_commissions(status);
+CREATE INDEX IF NOT EXISTS idx_sales_commissions_earned ON sales.sales_commissions(earned_at);
+CREATE INDEX IF NOT EXISTS idx_assignments_rep ON sales.sales_rep_commission_assignments(sales_rep_id);
+CREATE INDEX IF NOT EXISTS idx_assignments_dates ON sales.sales_rep_commission_assignments(effective_from, effective_to);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_customers_email ON sales.customers (company_id, email) WHERE email IS NOT NULL;
+
+-- =====================================================
+-- END OF SCRIPT
+-- =====================================================

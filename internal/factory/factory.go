@@ -33,6 +33,7 @@ import (
 	"auth-service/internal/repository/postgres"
 	"auth-service/internal/repository/redis"
 	"auth-service/internal/repository/scylla"
+	"auth-service/internal/sales"
 	"auth-service/internal/service"
 	"auth-service/internal/sms"
 	"auth-service/internal/tls"
@@ -3117,10 +3118,32 @@ func (f *Factory) InitializeHandlers() error {
 		AnalyticsHandler:          f.accountingInfra.AnalyticsHandler(),
 		PeriodLockHandler:         f.accountingInfra.PeriodLockHandler(),
 	}
-
-	// Retrieve inventory handlers from the inventory infrastructure factory
 	inventoryHandlers := f.GetInventoryHandlers()
 
+	// Retrieve inventory handlers from the inventory infrastructure factory
+	// Add salesHandlers construction:
+	salesHandlers := &sales.SalesHandlers{
+		CommissionHandler:  f.salesInfra.CommissionHandler(),
+		CouponHandler:      f.salesInfra.CouponHandler(),
+		CreditCheckHandler: f.salesInfra.CreditCheckHandler(),
+		CreditNoteHandler:  f.salesInfra.CreditNoteHandler(),
+		CustomerHandler:    f.salesInfra.CustomerHandler(),
+		DiscountHandler:    f.salesInfra.DiscountHandler(),
+		InvoiceHandler:     f.salesInfra.InvoiceHandler(),
+		OrderHandler:       f.salesInfra.OrderHandler(),
+		PaymentHandler:     f.salesInfra.PaymentHandler(),
+		PaymentTermHandler: f.salesInfra.PaymentTermHandler(),
+		PricingHandler:     f.salesInfra.PricingHandler(),
+		ProductHandler:     f.salesInfra.ProductHandler(),
+		PromotionHandler:   f.salesInfra.PromotionHandler(),
+		QuoteHandler:       f.salesInfra.QuoteHandler(),
+		ReportHandler:      f.salesInfra.ReportHandler(),
+		ReturnHandler:      f.salesInfra.ReturnHandler(),
+		SalesRepHandler:    f.salesInfra.SalesRepHandler(),
+		TaxHandler:         f.salesInfra.TaxHandler(),
+	}
+
+	// Then modify the NewRouter call to include salesHandlers as the last argument:
 	f.router = handler.NewRouter(
 		otpHandler,
 		adminHandler,
@@ -3176,6 +3199,7 @@ func (f *Factory) InitializeHandlers() error {
 		academicHandlers,
 		accountingHandlers,
 		inventoryHandlers,
+		salesHandlers, // <-- added
 	)
 
 	logger.Info("Handlers and router initialized with JWT, bitmask, QR web login, attendance, leave, payroll, biometric, accounting, and inventory systems")
