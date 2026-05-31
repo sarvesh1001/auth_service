@@ -25,14 +25,13 @@ type PromotionHandler struct {
 func NewPromotionHandler(promotionService service.PromotionService, logger *zap.Logger) *PromotionHandler {
 	return &PromotionHandler{
 		promotionService: promotionService,
-		BaseHandler:      &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:      &BaseHandler{logger: logger.Named("promotion_handler")},
 	}
 }
 
-// ---------- Request/Response Types ----------
+// ---------- Request/Response Types (CompanyID removed where present) ----------
 
 type createPromotionRequest struct {
-	CompanyID   string  `json:"company_id"`
 	Name        string  `json:"name"`
 	Description *string `json:"description,omitempty"`
 	StartDate   string  `json:"start_date"`
@@ -98,7 +97,6 @@ type promotionSummary struct {
 }
 
 type evaluatePromotionRequest struct {
-	CompanyID   string  `json:"company_id"`
 	PromotionID string  `json:"promotion_id"`
 	CustomerID  *string `json:"customer_id,omitempty"`
 	OrderAmount string  `json:"order_amount"`
@@ -106,7 +104,6 @@ type evaluatePromotionRequest struct {
 }
 
 type promotionApplyRequest struct {
-	CompanyID   string `json:"company_id"`
 	EntityType  string `json:"entity_type"` // order, quote, invoice
 	EntityID    string `json:"entity_id"`
 	PromotionID string `json:"promotion_id"`
@@ -118,7 +115,6 @@ type applyPromotionResponse struct {
 }
 
 type recordUsageRequest struct {
-	CompanyID      string  `json:"company_id"`
 	PromotionID    string  `json:"promotion_id"`
 	EntityType     string  `json:"entity_type"`
 	EntityID       string  `json:"entity_id"`
@@ -126,8 +122,6 @@ type recordUsageRequest struct {
 	DiscountAmount string  `json:"discount_amount"`
 	UsedAt         string  `json:"used_at"`
 }
-
-// ---------- Helper Functions ----------
 
 // ---------- Promotion CRUD ----------
 
@@ -141,21 +135,18 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createPromotionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	if req.Name == "" {
 		h.respondWithError(w, http.StatusBadRequest, "name is required")
 		return
@@ -246,14 +237,9 @@ func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -341,14 +327,9 @@ func (h *PromotionHandler) DeletePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -387,14 +368,9 @@ func (h *PromotionHandler) GetPromotionByID(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -439,14 +415,9 @@ func (h *PromotionHandler) GetPromotionByID(w http.ResponseWriter, r *http.Reque
 func (h *PromotionHandler) GetPromotionByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -497,14 +468,9 @@ func (h *PromotionHandler) GetPromotionByCode(w http.ResponseWriter, r *http.Req
 func (h *PromotionHandler) GetPromotionByName(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -555,14 +521,9 @@ func (h *PromotionHandler) GetPromotionByName(w http.ResponseWriter, r *http.Req
 func (h *PromotionHandler) ListPromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -588,7 +549,6 @@ func (h *PromotionHandler) ListPromotions(w http.ResponseWriter, r *http.Request
 	if name := r.URL.Query().Get("name"); name != "" {
 		filter.Name = &name
 	}
-	// filter.Search not available - use Name or ignore
 
 	limit := 20
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
@@ -651,14 +611,9 @@ func (h *PromotionHandler) ListPromotions(w http.ResponseWriter, r *http.Request
 func (h *PromotionHandler) SearchPromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -727,14 +682,9 @@ func (h *PromotionHandler) SearchPromotions(w http.ResponseWriter, r *http.Reque
 func (h *PromotionHandler) GetActivePromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -800,14 +750,9 @@ func (h *PromotionHandler) ActivatePromotion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -852,14 +797,9 @@ func (h *PromotionHandler) DeactivatePromotion(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -904,14 +844,9 @@ func (h *PromotionHandler) ExpirePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -952,6 +887,12 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createPromotionRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -965,17 +906,6 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 	promotionID, err := uuid.Parse(req.PromotionID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid promotion_id")
-		return
-	}
-
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 
@@ -1009,7 +939,7 @@ func (h *PromotionHandler) CreatePromotionRule(w http.ResponseWriter, r *http.Re
 		PromotionID:   promotionID,
 		RuleType:      req.RuleType,
 		RuleConfig:    req.RuleConfig,
-		DiscountType:  discount.DiscountType(req.DiscountType), // convert string to DiscountType
+		DiscountType:  discount.DiscountType(req.DiscountType),
 		DiscountValue: discountValue,
 		MaxDiscount:   maxDiscount,
 	}
@@ -1056,14 +986,9 @@ func (h *PromotionHandler) UpdatePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1151,14 +1076,9 @@ func (h *PromotionHandler) DeletePromotionRule(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1197,14 +1117,9 @@ func (h *PromotionHandler) GetPromotionRuleByID(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1254,14 +1169,9 @@ func (h *PromotionHandler) GetPromotionRules(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1317,8 +1227,13 @@ func (h *PromotionHandler) ValidatePromotion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req struct {
-		CompanyID   string   `json:"company_id"`
 		PromotionID string   `json:"promotion_id"`
 		CustomerID  *string  `json:"customer_id,omitempty"`
 		ProductIDs  []string `json:"product_ids"`
@@ -1330,11 +1245,6 @@ func (h *PromotionHandler) ValidatePromotion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	promotionID, err := uuid.Parse(req.PromotionID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid promotion_id")
@@ -1396,17 +1306,13 @@ func (h *PromotionHandler) ValidatePromotion(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// EvaluatePromotion handles POST /promotions/evaluate
-// Update the response struct definition (replace the old evaluatePromotionResponse)
-// Fixed EvaluatePromotion handler
-// Update the response struct (replace the old one)
 type evaluatePromotionResponse struct {
 	Applicable     bool    `json:"is_applicable"`
 	DiscountAmount string  `json:"discount_amount"`
 	Reason         *string `json:"reason,omitempty"`
 }
 
-// Fixed EvaluatePromotion handler
+// EvaluatePromotion handles POST /promotions/evaluate
 func (h *PromotionHandler) EvaluatePromotion(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1416,17 +1322,18 @@ func (h *PromotionHandler) EvaluatePromotion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req evaluatePromotionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	promotionID, err := uuid.Parse(req.PromotionID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid promotion_id")
@@ -1466,7 +1373,6 @@ func (h *PromotionHandler) EvaluatePromotion(w http.ResponseWriter, r *http.Requ
 		CustomerID:  customerID,
 		OrderAmount: orderAmount,
 		At:          at,
-		// ProductIDs omitted if not in service struct
 	}
 	result, err := h.promotionService.EvaluatePromotion(ctx, evalReq)
 	if err != nil {
@@ -1476,7 +1382,7 @@ func (h *PromotionHandler) EvaluatePromotion(w http.ResponseWriter, r *http.Requ
 	}
 
 	resp := evaluatePromotionResponse{
-		Applicable:     result.Applicable, // Use the correct field name
+		Applicable:     result.Applicable,
 		DiscountAmount: result.DiscountAmount.String(),
 		Reason:         &result.Reason,
 	}
@@ -1500,8 +1406,13 @@ func (h *PromotionHandler) CalculatePromotionDiscount(w http.ResponseWriter, r *
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req struct {
-		CompanyID  string   `json:"company_id"`
 		Subtotal   string   `json:"subtotal"`
 		ProductIDs []string `json:"product_ids"`
 	}
@@ -1510,11 +1421,6 @@ func (h *PromotionHandler) CalculatePromotionDiscount(w http.ResponseWriter, r *
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	subtotal, err := decimal.NewFromString(req.Subtotal)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid subtotal")
@@ -1565,17 +1471,18 @@ func (h *PromotionHandler) ApplyPromotionToOrder(w http.ResponseWriter, r *http.
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req promotionApplyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	orderID, err := uuid.Parse(req.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id (order ID)")
@@ -1635,17 +1542,18 @@ func (h *PromotionHandler) applyPromotionToEntity(w http.ResponseWriter, r *http
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req promotionApplyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	entityID, err := uuid.Parse(req.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
@@ -1720,8 +1628,13 @@ func (h *PromotionHandler) removePromotionFromEntity(w http.ResponseWriter, r *h
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req struct {
-		CompanyID   string `json:"company_id"`
 		EntityID    string `json:"entity_id"`
 		PromotionID string `json:"promotion_id"`
 	}
@@ -1730,11 +1643,6 @@ func (h *PromotionHandler) removePromotionFromEntity(w http.ResponseWriter, r *h
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	entityID, err := uuid.Parse(req.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
@@ -1791,8 +1699,13 @@ func (h *PromotionHandler) ClearPromotions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req struct {
-		CompanyID  string `json:"company_id"`
 		EntityType string `json:"entity_type"`
 		EntityID   string `json:"entity_id"`
 	}
@@ -1801,11 +1714,6 @@ func (h *PromotionHandler) ClearPromotions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	entityID, err := uuid.Parse(req.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
@@ -1847,17 +1755,18 @@ func (h *PromotionHandler) RecordPromotionUsage(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req recordUsageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	promotionID, err := uuid.Parse(req.PromotionID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid promotion_id")
@@ -1932,14 +1841,9 @@ func (h *PromotionHandler) GetPromotionUsageCount(w http.ResponseWriter, r *http
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1971,16 +1875,12 @@ func (h *PromotionHandler) GetPromotionUsageCount(w http.ResponseWriter, r *http
 func (h *PromotionHandler) GetCustomerPromotionUsageCount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	promotionIDStr := r.URL.Query().Get("promotion_id")
 	if promotionIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "promotion_id query parameter is required")
@@ -2036,14 +1936,9 @@ func (h *PromotionHandler) GetPromotionUsageHistory(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2118,16 +2013,12 @@ func (h *PromotionHandler) GetPromotionUsageHistory(w http.ResponseWriter, r *ht
 func (h *PromotionHandler) CanStackPromotion(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	firstIDStr := r.URL.Query().Get("first_promotion_id")
 	if firstIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "first_promotion_id query parameter is required")
@@ -2183,8 +2074,13 @@ func (h *PromotionHandler) ValidatePromotionStacking(w http.ResponseWriter, r *h
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req struct {
-		CompanyID    string   `json:"company_id"`
 		PromotionIDs []string `json:"promotion_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -2192,11 +2088,6 @@ func (h *PromotionHandler) ValidatePromotionStacking(w http.ResponseWriter, r *h
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	promotionIDs := make([]uuid.UUID, len(req.PromotionIDs))
 	for i, idStr := range req.PromotionIDs {
 		pid, err := uuid.Parse(idStr)
@@ -2241,14 +2132,9 @@ func (h *PromotionHandler) GetStackablePromotions(w http.ResponseWriter, r *http
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2284,16 +2170,12 @@ func (h *PromotionHandler) GetStackablePromotions(w http.ResponseWriter, r *http
 func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -2353,16 +2235,12 @@ func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Reque
 func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -2422,16 +2300,12 @@ func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.
 func (h *PromotionHandler) GetHighestRevenuePromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -2491,16 +2365,12 @@ func (h *PromotionHandler) GetHighestRevenuePromotions(w http.ResponseWriter, r 
 func (h *PromotionHandler) GetTotalPromotionDiscountAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2548,16 +2418,12 @@ func (h *PromotionHandler) GetPromotionConversionImpact(w http.ResponseWriter, r
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2606,16 +2472,12 @@ func (h *PromotionHandler) GetPromotionRedemptionRate(w http.ResponseWriter, r *
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2664,14 +2526,9 @@ func (h *PromotionHandler) PromotionExists(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2702,16 +2559,12 @@ func (h *PromotionHandler) PromotionExists(w http.ResponseWriter, r *http.Reques
 func (h *PromotionHandler) PromotionCodeExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		h.respondWithError(w, http.StatusBadRequest, "code query parameter is required")
@@ -2751,14 +2604,9 @@ func (h *PromotionHandler) PromotionRuleExists(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2795,16 +2643,12 @@ func (h *PromotionHandler) IsPromotionExpired(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	atStr := r.URL.Query().Get("at")
 	at := time.Now()
 	if atStr != "" {
@@ -2850,14 +2694,9 @@ func (h *PromotionHandler) IsPromotionUsageLimitReached(w http.ResponseWriter, r
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2889,16 +2728,12 @@ func (h *PromotionHandler) IsPromotionUsageLimitReached(w http.ResponseWriter, r
 func (h *PromotionHandler) IsCustomerPromotionUsageLimitReached(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	promotionIDStr := r.URL.Query().Get("promotion_id")
 	if promotionIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "promotion_id query parameter is required")

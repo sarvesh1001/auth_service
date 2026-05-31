@@ -24,14 +24,13 @@ type ReturnHandler struct {
 func NewReturnHandler(returnService service.ReturnService, logger *zap.Logger) *ReturnHandler {
 	return &ReturnHandler{
 		returnService: returnService,
-		BaseHandler:   &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:   &BaseHandler{logger: logger.Named("return_handler")},
 	}
 }
 
 // Request/Response types
 
 type createReturnRequest struct {
-	CompanyID  string                    `json:"company_id"`
 	OrderID    string                    `json:"order_id"`
 	InvoiceID  *string                   `json:"invoice_id,omitempty"`
 	ReturnDate string                    `json:"return_date"`
@@ -123,7 +122,6 @@ type partialRefundRequest struct {
 }
 
 type previewRefundRequest struct {
-	CompanyID string              `json:"company_id"`
 	OrderID   *string             `json:"order_id,omitempty"`
 	InvoiceID *string             `json:"invoice_id,omitempty"`
 	Items     []previewRefundItem `json:"items"`
@@ -216,19 +214,20 @@ func (h *ReturnHandler) CreateReturnRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.OrderID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and order_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.OrderID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "order_id is required")
 		return
 	}
 	orderID, err := uuid.Parse(req.OrderID)
@@ -304,7 +303,7 @@ func (h *ReturnHandler) CreateReturnRequest(w http.ResponseWriter, r *http.Reque
 		ReturnDate: returnDate,
 		Reason:     req.Reason,
 		Items:      items,
-		CreatedBy:  userID, // not pointer
+		CreatedBy:  userID,
 	}
 	ret, err := h.returnService.CreateReturnRequest(ctx, &svcReq, idempotencyKey)
 	if err != nil {
@@ -329,6 +328,13 @@ func (h *ReturnHandler) CreateReturnFromOrder(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createReturnFromOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -341,16 +347,6 @@ func (h *ReturnHandler) CreateReturnFromOrder(w http.ResponseWriter, r *http.Req
 	orderID, err := uuid.Parse(req.OrderID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid order_id")
-		return
-	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
@@ -427,6 +423,13 @@ func (h *ReturnHandler) CreateReturnFromInvoice(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createReturnFromInvoiceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -439,16 +442,6 @@ func (h *ReturnHandler) CreateReturnFromInvoice(w http.ResponseWriter, r *http.R
 	invoiceID, err := uuid.Parse(req.InvoiceID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid invoice_id")
-		return
-	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
@@ -530,16 +523,13 @@ func (h *ReturnHandler) UpdateReturnRequest(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -585,16 +575,13 @@ func (h *ReturnHandler) DeleteReturnRequest(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -624,16 +611,13 @@ func (h *ReturnHandler) GetReturnByID(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -659,16 +643,13 @@ func (h *ReturnHandler) GetReturnByID(w http.ResponseWriter, r *http.Request) {
 
 func (h *ReturnHandler) GetReturnByNumber(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	returnNumber := r.URL.Query().Get("number")
 	if returnNumber == "" {
 		h.respondWithError(w, http.StatusBadRequest, "number query parameter is required")
@@ -699,16 +680,13 @@ func (h *ReturnHandler) GetReturnByNumber(w http.ResponseWriter, r *http.Request
 
 func (h *ReturnHandler) ListReturns(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -721,10 +699,6 @@ func (h *ReturnHandler) ListReturns(w http.ResponseWriter, r *http.Request) {
 	filter := service.ReturnListFilter{CompanyID: companyID}
 	if statusStr := r.URL.Query().Get("status"); statusStr != "" {
 		filter.Statuses = []enums.ReturnStatus{enums.ReturnStatus(statusStr)}
-	}
-	if customerIDStr := r.URL.Query().Get("customer_id"); customerIDStr != "" {
-		// Not directly in filter – we handle via GetReturnsByCustomer instead
-		// For now, ignore customer_id in list filter; use dedicated endpoint
 	}
 	if fromStr := r.URL.Query().Get("from_date"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -792,16 +766,13 @@ func (h *ReturnHandler) ListReturns(w http.ResponseWriter, r *http.Request) {
 
 func (h *ReturnHandler) SearchReturns(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		h.respondWithError(w, http.StatusBadRequest, "q query parameter is required")
@@ -859,16 +830,13 @@ func (h *ReturnHandler) SearchReturns(w http.ResponseWriter, r *http.Request) {
 
 func (h *ReturnHandler) GetReturnsByCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	customerIDStr := r.URL.Query().Get("customer_id")
 	if customerIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "customer_id query parameter is required")
@@ -942,16 +910,13 @@ func (h *ReturnHandler) GetReturnsByCustomer(w http.ResponseWriter, r *http.Requ
 
 func (h *ReturnHandler) GetReturnsByOrder(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	orderIDStr := r.URL.Query().Get("order_id")
 	if orderIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "order_id query parameter is required")
@@ -996,16 +961,13 @@ func (h *ReturnHandler) GetReturnsByOrder(w http.ResponseWriter, r *http.Request
 
 func (h *ReturnHandler) GetReturnsByInvoice(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	invoiceIDStr := r.URL.Query().Get("invoice_id")
 	if invoiceIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "invoice_id query parameter is required")
@@ -1060,16 +1022,13 @@ func (h *ReturnHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1143,16 +1102,13 @@ func (h *ReturnHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1227,16 +1183,13 @@ func (h *ReturnHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1266,16 +1219,13 @@ func (h *ReturnHandler) GetReturnItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1314,16 +1264,13 @@ func (h *ReturnHandler) ApproveReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1358,16 +1305,13 @@ func (h *ReturnHandler) RejectReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1409,16 +1353,13 @@ func (h *ReturnHandler) CancelReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1460,16 +1401,13 @@ func (h *ReturnHandler) MarkReceived(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1519,16 +1457,13 @@ func (h *ReturnHandler) CompleteReturn(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1563,16 +1498,13 @@ func (h *ReturnHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1614,16 +1546,13 @@ func (h *ReturnHandler) CalculateRefundAmount(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1659,16 +1588,13 @@ func (h *ReturnHandler) CalculatePartialRefund(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1718,18 +1644,16 @@ func (h *ReturnHandler) PreviewRefund(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req previewRefundRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 	var orderIDPtr *uuid.UUID
@@ -1755,7 +1679,6 @@ func (h *ReturnHandler) PreviewRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use *service.CreateReturnItemRequest instead of missing ReturnRefundPreviewItem
 	previewItems := make([]*service.CreateReturnItemRequest, len(req.Items))
 	for i, it := range req.Items {
 		quantity, err := decimal.NewFromString(it.Quantity)
@@ -1771,7 +1694,7 @@ func (h *ReturnHandler) PreviewRefund(w http.ResponseWriter, r *http.Request) {
 		previewItems[i] = &service.CreateReturnItemRequest{
 			ProductID: productID,
 			Quantity:  quantity,
-			Reason:    nil, // Reason not needed for preview
+			Reason:    nil,
 		}
 	}
 	svcReq := service.ReturnRefundPreviewRequest{
@@ -1805,21 +1728,17 @@ func (h *ReturnHandler) GenerateCreditNote(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	// No body needed – service only requires IssuedBy
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
@@ -1848,16 +1767,13 @@ func (h *ReturnHandler) GetCreditNote(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1887,16 +1803,13 @@ func (h *ReturnHandler) HasCreditNote(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1931,16 +1844,13 @@ func (h *ReturnHandler) ProcessRefund(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1992,16 +1902,13 @@ func (h *ReturnHandler) ProcessFullRefund(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -2043,16 +1950,13 @@ func (h *ReturnHandler) ProcessPartialRefund(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -2095,16 +1999,13 @@ func (h *ReturnHandler) GetRefunds(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2134,16 +2035,13 @@ func (h *ReturnHandler) GetRefundedAmount(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2178,16 +2076,13 @@ func (h *ReturnHandler) RestockReturnedItems(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -2232,16 +2127,13 @@ func (h *ReturnHandler) MarkItemsAsDamaged(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "return:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -2280,16 +2172,13 @@ func (h *ReturnHandler) MarkItemsAsDamaged(w http.ResponseWriter, r *http.Reques
 
 func (h *ReturnHandler) GetPendingReturns(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2324,16 +2213,13 @@ func (h *ReturnHandler) GetPendingReturns(w http.ResponseWriter, r *http.Request
 
 func (h *ReturnHandler) GetApprovedReturns(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2368,16 +2254,13 @@ func (h *ReturnHandler) GetApprovedReturns(w http.ResponseWriter, r *http.Reques
 
 func (h *ReturnHandler) GetRejectedReturns(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2412,16 +2295,13 @@ func (h *ReturnHandler) GetRejectedReturns(w http.ResponseWriter, r *http.Reques
 
 func (h *ReturnHandler) GetReturnRate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2458,16 +2338,13 @@ func (h *ReturnHandler) GetReturnRate(w http.ResponseWriter, r *http.Request) {
 
 func (h *ReturnHandler) GetTotalRefundAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2504,16 +2381,13 @@ func (h *ReturnHandler) GetTotalRefundAmount(w http.ResponseWriter, r *http.Requ
 
 func (h *ReturnHandler) GetMostReturnedProducts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2561,16 +2435,13 @@ func (h *ReturnHandler) ReturnExists(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2594,16 +2465,13 @@ func (h *ReturnHandler) ReturnExists(w http.ResponseWriter, r *http.Request) {
 
 func (h *ReturnHandler) ReturnNumberExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	returnNumber := r.URL.Query().Get("number")
 	if returnNumber == "" {
 		h.respondWithError(w, http.StatusBadRequest, "number query parameter is required")
@@ -2637,16 +2505,13 @@ func (h *ReturnHandler) IsReturnApproved(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -2676,16 +2541,13 @@ func (h *ReturnHandler) IsReturnCompleted(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "invalid return ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")

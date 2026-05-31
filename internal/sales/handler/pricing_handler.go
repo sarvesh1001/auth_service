@@ -37,7 +37,7 @@ func NewPricingHandler(pricingService service.PricingService, logger *zap.Logger
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetProductBasePrice(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -73,7 +73,7 @@ func (h *PricingHandler) GetProductBasePrice(w http.ResponseWriter, r *http.Requ
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetProductsBasePrices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -122,7 +122,6 @@ func (h *PricingHandler) GetProductsBasePrices(w http.ResponseWriter, r *http.Re
 // POST /pricing/order
 // ---------------------------------------------------------------------
 type calculateOrderPricingRequest struct {
-	CompanyID    string             `json:"company_id"`
 	CustomerID   *string            `json:"customer_id,omitempty"`
 	Lines        []pricingLineInput `json:"lines"`
 	CouponCodes  []string           `json:"coupon_codes,omitempty"`
@@ -164,13 +163,9 @@ func (h *PricingHandler) CalculateOrderPricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var customerID *uuid.UUID
@@ -272,10 +267,12 @@ func (h *PricingHandler) PreviewOrderPricing(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.CompanyID = companyID
 	if len(req.Items) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "at least one item required")
 		return
@@ -312,7 +309,7 @@ func (h *PricingHandler) PreviewOrderPricing(w http.ResponseWriter, r *http.Requ
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CalculateOrderTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -348,7 +345,7 @@ func (h *PricingHandler) CalculateOrderTax(w http.ResponseWriter, r *http.Reques
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CalculateOrderDiscounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -403,10 +400,9 @@ func (h *PricingHandler) CalculateQuotePricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	// reuse same validation and conversion as CalculateOrderPricing
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var customerID *uuid.UUID
@@ -503,10 +499,12 @@ func (h *PricingHandler) PreviewQuotePricing(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.CompanyID = companyID
 	if len(req.Items) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "at least one item required")
 		return
@@ -543,7 +541,7 @@ func (h *PricingHandler) PreviewQuotePricing(w http.ResponseWriter, r *http.Requ
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CalculateQuoteTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -579,7 +577,7 @@ func (h *PricingHandler) CalculateQuoteTax(w http.ResponseWriter, r *http.Reques
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CalculateQuoteDiscounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -634,9 +632,9 @@ func (h *PricingHandler) CalculateInvoicePricing(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var customerID *uuid.UUID
@@ -733,10 +731,12 @@ func (h *PricingHandler) PreviewInvoicePricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.CompanyID = companyID
 	if len(req.Items) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "at least one item required")
 		return
@@ -773,7 +773,7 @@ func (h *PricingHandler) PreviewInvoicePricing(w http.ResponseWriter, r *http.Re
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CalculateInvoiceTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -809,7 +809,7 @@ func (h *PricingHandler) CalculateInvoiceTax(w http.ResponseWriter, r *http.Requ
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CalculateInvoiceDiscounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -852,6 +852,7 @@ func (h *PricingHandler) CalculateInvoiceDiscounts(w http.ResponseWriter, r *htt
 // ---------------------------------------------------------------------
 // POST /pricing/line-tax
 // ---------------------------------------------------------------------
+
 func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -864,9 +865,9 @@ func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	productID, err := uuid.Parse(req.ProductID)
@@ -910,7 +911,6 @@ func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request
 // POST /pricing/tax-amount
 // ---------------------------------------------------------------------
 type calculateTaxAmountRequest struct {
-	CompanyID     string `json:"company_id"`
 	EntityType    string `json:"entity_type"`
 	EntityID      string `json:"entity_id"`
 	TaxableAmount string `json:"taxable_amount"`
@@ -928,9 +928,9 @@ func (h *PricingHandler) CalculateTaxAmount(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -975,7 +975,7 @@ func (h *PricingHandler) CalculateTaxAmount(w http.ResponseWriter, r *http.Reque
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetApplicableCoupons(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1053,7 +1053,7 @@ func (h *PricingHandler) GetApplicableCoupons(w http.ResponseWriter, r *http.Req
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetBestCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1139,7 +1139,7 @@ func (h *PricingHandler) GetBestCoupon(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetApplicablePromotions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1217,7 +1217,7 @@ func (h *PricingHandler) GetApplicablePromotions(w http.ResponseWriter, r *http.
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetBestPromotion(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1302,7 +1302,6 @@ func (h *PricingHandler) GetBestPromotion(w http.ResponseWriter, r *http.Request
 // POST /pricing/combined-discount
 // ---------------------------------------------------------------------
 type calculateCombinedDiscountRequest struct {
-	CompanyID   string     `json:"company_id"`
 	CustomerID  *string    `json:"customer_id,omitempty"`
 	ProductIDs  []string   `json:"product_ids"`
 	OrderAmount string     `json:"order_amount"`
@@ -1321,9 +1320,9 @@ func (h *PricingHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var customerID *uuid.UUID
@@ -1418,10 +1417,9 @@ func (h *PricingHandler) ValidateDiscountCombination(w http.ResponseWriter, r *h
 		}
 		promotionIDs[i] = parsed
 	}
-	// Permission: we need a companyID – we can't deduce from request; require it as query param
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter required")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "pricing:write") {
@@ -1456,7 +1454,7 @@ func (h *PricingHandler) ValidateDiscountCombination(w http.ResponseWriter, r *h
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1492,7 +1490,7 @@ func (h *PricingHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *http.R
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetCustomerOutstandingBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1528,7 +1526,7 @@ func (h *PricingHandler) GetCustomerOutstandingBalance(w http.ResponseWriter, r 
 // ---------------------------------------------------------------------
 func (h *PricingHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1573,7 +1571,6 @@ func (h *PricingHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *htt
 // POST /pricing/validate
 // ---------------------------------------------------------------------
 type validatePricingRequest struct {
-	CompanyID    string             `json:"company_id"`
 	CustomerID   *string            `json:"customer_id,omitempty"`
 	Lines        []pricingLineInput `json:"lines"`
 	CouponIDs    []string           `json:"coupon_ids"`
@@ -1592,9 +1589,9 @@ func (h *PricingHandler) ValidatePricing(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var customerID *uuid.UUID
@@ -1696,16 +1693,15 @@ func (h *PricingHandler) ValidateOrderPricing(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var body struct {
-		CompanyID string `json:"company_id"`
-		OrderID   string `json:"order_id"`
+		OrderID string `json:"order_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(body.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	orderID, err := uuid.Parse(body.OrderID)
@@ -1751,16 +1747,15 @@ func (h *PricingHandler) ValidateQuotePricing(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var body struct {
-		CompanyID string `json:"company_id"`
-		QuoteID   string `json:"quote_id"`
+		QuoteID string `json:"quote_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(body.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	quoteID, err := uuid.Parse(body.QuoteID)
@@ -1806,16 +1801,15 @@ func (h *PricingHandler) ValidateInvoicePricing(w http.ResponseWriter, r *http.R
 		return
 	}
 	var body struct {
-		CompanyID string `json:"company_id"`
 		InvoiceID string `json:"invoice_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(body.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	invoiceID, err := uuid.Parse(body.InvoiceID)
@@ -1855,7 +1849,7 @@ func (h *PricingHandler) ValidateInvoicePricing(w http.ResponseWriter, r *http.R
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetAverageDiscountRate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1896,7 +1890,7 @@ func (h *PricingHandler) GetAverageDiscountRate(w http.ResponseWriter, r *http.R
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetTotalDiscountAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1937,7 +1931,7 @@ func (h *PricingHandler) GetTotalDiscountAmount(w http.ResponseWriter, r *http.R
 // ---------------------------------------------------------------------
 func (h *PricingHandler) GetEffectiveRevenueAfterDiscounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := parseQueryUUID(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return

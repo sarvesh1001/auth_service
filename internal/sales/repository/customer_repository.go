@@ -25,10 +25,12 @@ type CustomerRepository interface {
 	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, customerCode string) (*models.Customer, error)
 	Update(ctx context.Context, db DBTX, customer *models.Customer) error
 	Delete(ctx context.Context, db DBTX, companyID, customerID uuid.UUID) error
+	ExistsByEmailHashExcluding(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string, excludeCustomerID uuid.UUID) (bool, error)
 
 	SetActiveStatus(ctx context.Context, db DBTX, companyID, customerID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
 	Exists(ctx context.Context, db DBTX, companyID, customerID uuid.UUID) (bool, error)
 	ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, customerCode string) (bool, error)
+	ExistsByEmailHash(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string) (bool, error) // NEW
 	IsActive(ctx context.Context, db DBTX, companyID, customerID uuid.UUID) (bool, error)
 
 	ExistsByEncryptedEmail(ctx context.Context, db DBTX, companyID uuid.UUID, emailEncrypted string) (bool, error)
@@ -167,12 +169,13 @@ func (r *customerRepository) buildFilter(filter CustomerFilter) (string, []inter
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanCustomer maps a database row to models.Customer (including encrypted fields + payment_term_id)
+// scanCustomer maps a database row to models.Customer (including encrypted fields + payment_term_id + email_hash)
 func (r *customerRepository) scanCustomer(s scanner) (*models.Customer, error) {
 	var c models.Customer
 	var createdBy, updatedBy uuid.NullUUID
 	var creditLimit sql.NullString
 	var paymentTermID uuid.NullUUID
+	var emailHash sql.NullString
 
 	err := s.Scan(
 		&c.CustomerID,
@@ -190,7 +193,8 @@ func (r *customerRepository) scanCustomer(s scanner) (*models.Customer, error) {
 		&c.UpdatedAt,
 		&createdBy,
 		&updatedBy,
-		&paymentTermID, // new field
+		&paymentTermID,
+		&emailHash, // NEW: email_hash column
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -214,6 +218,9 @@ func (r *customerRepository) scanCustomer(s scanner) (*models.Customer, error) {
 	if paymentTermID.Valid {
 		c.PaymentTermID = &paymentTermID.UUID
 	}
+	if emailHash.Valid {
+		c.EmailHash = &emailHash.String
+	}
 	return &c, nil
 }
 
@@ -231,7 +238,7 @@ func (r *customerRepository) Create(ctx context.Context, db DBTX, customer *mode
 			billing_address, billing_address_dek, billing_address_key_id,
 			shipping_address, shipping_address_dek, shipping_address_key_id,
 			credit_limit, is_active, created_at, updated_at, created_by, updated_by,
-			payment_term_id
+			payment_term_id, email_hash
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7,
@@ -240,7 +247,7 @@ func (r *customerRepository) Create(ctx context.Context, db DBTX, customer *mode
 			$14, $15, $16,
 			$17, $18, $19,
 			$20, $21, NOW(), NOW(), $22, $23,
-			$24
+			$24, $25
 		)
 		RETURNING created_at, updated_at
 	`
@@ -267,6 +274,7 @@ func (r *customerRepository) Create(ctx context.Context, db DBTX, customer *mode
 		r.nullUUIDParam(customer.CreatedBy),
 		r.nullUUIDParam(customer.UpdatedBy),
 		r.nullUUIDParam(customer.PaymentTermID),
+		customer.EmailHash, // NEW
 	).Scan(&customer.CreatedAt, &customer.UpdatedAt)
 
 	if err != nil {
@@ -286,7 +294,7 @@ func (r *customerRepository) GetByID(ctx context.Context, db DBTX, companyID, cu
 			billing_address, billing_address_dek, billing_address_key_id,
 			shipping_address, shipping_address_dek, shipping_address_key_id,
 			credit_limit, is_active, created_at, updated_at, created_by, updated_by,
-			payment_term_id
+			payment_term_id, email_hash
 		FROM sales.customers
 		WHERE company_id = $1 AND customer_id = $2
 	`
@@ -304,7 +312,7 @@ func (r *customerRepository) GetByCode(ctx context.Context, db DBTX, companyID u
 			billing_address, billing_address_dek, billing_address_key_id,
 			shipping_address, shipping_address_dek, shipping_address_key_id,
 			credit_limit, is_active, created_at, updated_at, created_by, updated_by,
-			payment_term_id
+			payment_term_id, email_hash
 		FROM sales.customers
 		WHERE company_id = $1 AND customer_code = $2
 	`
@@ -326,7 +334,8 @@ func (r *customerRepository) Update(ctx context.Context, db DBTX, customer *mode
 			is_active = $21,
 			updated_at = NOW(),
 			updated_by = $22,
-			payment_term_id = $23
+			payment_term_id = $23,
+			email_hash = $24
 		WHERE customer_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -350,6 +359,7 @@ func (r *customerRepository) Update(ctx context.Context, db DBTX, customer *mode
 		customer.IsActive,
 		r.nullUUIDParam(customer.UpdatedBy),
 		r.nullUUIDParam(customer.PaymentTermID),
+		customer.EmailHash, // NEW
 	).Scan(&customer.UpdatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -414,6 +424,17 @@ func (r *customerRepository) ExistsByCode(ctx context.Context, db DBTX, companyI
 	return exists, nil
 }
 
+// NEW: ExistsByEmailHash checks if another customer already uses the same email hash (i.e., same plaintext email)
+func (r *customerRepository) ExistsByEmailHash(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.customers WHERE company_id = $1 AND email_hash = $2)`
+	err := db.QueryRowContext(ctx, query, companyID, emailHash).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists by email hash: %w", err)
+	}
+	return exists, nil
+}
+
 func (r *customerRepository) IsActive(ctx context.Context, db DBTX, companyID, customerID uuid.UUID) (bool, error) {
 	var active bool
 	query := `SELECT is_active FROM sales.customers WHERE company_id = $1 AND customer_id = $2`
@@ -428,7 +449,7 @@ func (r *customerRepository) IsActive(ctx context.Context, db DBTX, companyID, c
 }
 
 // -------------------------------------------------------------------------
-// Uniqueness for encrypted fields
+// Uniqueness for encrypted fields (legacy, kept for compatibility)
 // -------------------------------------------------------------------------
 
 func (r *customerRepository) ExistsByEncryptedEmail(ctx context.Context, db DBTX, companyID uuid.UUID, emailEncrypted string) (bool, error) {
@@ -452,7 +473,7 @@ func (r *customerRepository) ExistsByEncryptedPhone(ctx context.Context, db DBTX
 }
 
 // -------------------------------------------------------------------------
-// Financial / business queries
+// Financial / business queries (also updated to include email_hash)
 // -------------------------------------------------------------------------
 
 func (r *customerRepository) GetCreditLimit(ctx context.Context, db DBTX, companyID, customerID uuid.UUID) (*models.Customer, error) {
@@ -469,7 +490,7 @@ func (r *customerRepository) GetCustomersWithOutstandingInvoices(ctx context.Con
 			c.billing_address, c.billing_address_dek, c.billing_address_key_id,
 			c.shipping_address, c.shipping_address_dek, c.shipping_address_key_id,
 			c.credit_limit, c.is_active, c.created_at, c.updated_at, c.created_by, c.updated_by,
-			c.payment_term_id
+			c.payment_term_id, c.email_hash
 		FROM sales.customers c
 		JOIN sales.invoices i ON c.customer_id = i.customer_id
 		WHERE c.company_id = $1 AND i.status NOT IN ('paid', 'cancelled') AND i.amount_due > 0
@@ -520,7 +541,7 @@ func (r *customerRepository) GetTopCustomersByRevenue(ctx context.Context, db DB
 			c.billing_address, c.billing_address_dek, c.billing_address_key_id,
 			c.shipping_address, c.shipping_address_dek, c.shipping_address_key_id,
 			c.credit_limit, c.is_active, c.created_at, c.updated_at, c.created_by, c.updated_by,
-			c.payment_term_id
+			c.payment_term_id, c.email_hash
 		FROM sales.customers c
 		JOIN sales.invoices i ON c.customer_id = i.customer_id
 		WHERE %s
@@ -547,7 +568,7 @@ func (r *customerRepository) GetTopCustomersByRevenue(ctx context.Context, db DB
 }
 
 // -------------------------------------------------------------------------
-// Listing & Search
+// Listing & Search (updated to include email_hash)
 // -------------------------------------------------------------------------
 
 func (r *customerRepository) List(ctx context.Context, db DBTX, filter CustomerFilter, p Pagination, s Sort) ([]*models.Customer, int64, error) {
@@ -590,7 +611,7 @@ func (r *customerRepository) List(ctx context.Context, db DBTX, filter CustomerF
 			billing_address, billing_address_dek, billing_address_key_id,
 			shipping_address, shipping_address_dek, shipping_address_key_id,
 			credit_limit, is_active, created_at, updated_at, created_by, updated_by,
-			payment_term_id
+			payment_term_id, email_hash
 		FROM sales.customers
 		%s
 		%s
@@ -642,7 +663,7 @@ func (r *customerRepository) Search(ctx context.Context, db DBTX, companyID uuid
 			billing_address, billing_address_dek, billing_address_key_id,
 			shipping_address, shipping_address_dek, shipping_address_key_id,
 			credit_limit, is_active, created_at, updated_at, created_by, updated_by,
-			payment_term_id
+			payment_term_id, email_hash
 		FROM sales.customers
 		WHERE company_id = $1
 		AND (customer_code ILIKE $2 OR name ILIKE $3 OR email ILIKE $4)
@@ -681,11 +702,17 @@ func (r *customerRepository) GetByIDForUpdate(ctx context.Context, db DBTX, comp
 			billing_address, billing_address_dek, billing_address_key_id,
 			shipping_address, shipping_address_dek, shipping_address_key_id,
 			credit_limit, is_active, created_at, updated_at, created_by, updated_by,
-			payment_term_id
+			payment_term_id, email_hash
 		FROM sales.customers
 		WHERE company_id = $1 AND customer_id = $2
 		FOR UPDATE
 	`
 	row := db.QueryRowContext(ctx, query, companyID, customerID)
 	return r.scanCustomer(row)
+}
+func (r *customerRepository) ExistsByEmailHashExcluding(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string, excludeCustomerID uuid.UUID) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.customers WHERE company_id = $1 AND email_hash = $2 AND customer_id != $3)`
+	err := db.QueryRowContext(ctx, query, companyID, emailHash, excludeCustomerID).Scan(&exists)
+	return exists, err
 }

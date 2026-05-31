@@ -149,7 +149,7 @@ func (h *CreditCheckHandler) CheckCustomerCreditLimit(w http.ResponseWriter, r *
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -221,7 +221,7 @@ func (h *CreditCheckHandler) CheckOrderCreditEligibility(w http.ResponseWriter, 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -287,7 +287,7 @@ func (h *CreditCheckHandler) CheckInvoiceCreditEligibility(w http.ResponseWriter
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -347,7 +347,7 @@ func (h *CreditCheckHandler) GetCustomerAvailableCredit(w http.ResponseWriter, r
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -386,7 +386,7 @@ func (h *CreditCheckHandler) GetCustomerOutstandingBalance(w http.ResponseWriter
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -425,7 +425,7 @@ func (h *CreditCheckHandler) GetCustomerCreditExposure(w http.ResponseWriter, r 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -464,7 +464,7 @@ func (h *CreditCheckHandler) CanCustomerPlaceOrder(w http.ResponseWriter, r *htt
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -520,7 +520,7 @@ func (h *CreditCheckHandler) HoldOrderForCredit(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -571,7 +571,7 @@ func (h *CreditCheckHandler) ReleaseOrderCreditHold(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -616,7 +616,7 @@ func (h *CreditCheckHandler) IsOrderOnCreditHold(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -649,7 +649,7 @@ func (h *CreditCheckHandler) IsOrderOnCreditHold(w http.ResponseWriter, r *http.
 
 func (h *CreditCheckHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -693,7 +693,7 @@ func (h *CreditCheckHandler) UpdateOrderCreditStatus(w http.ResponseWriter, r *h
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -750,7 +750,7 @@ func (h *CreditCheckHandler) SetCustomerCreditLimit(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -807,7 +807,7 @@ func (h *CreditCheckHandler) IncreaseCustomerCreditLimit(w http.ResponseWriter, 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -864,7 +864,7 @@ func (h *CreditCheckHandler) DecreaseCustomerCreditLimit(w http.ResponseWriter, 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -921,7 +921,7 @@ func (h *CreditCheckHandler) SuspendCustomerCredit(w http.ResponseWriter, r *htt
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -972,7 +972,7 @@ func (h *CreditCheckHandler) RestoreCustomerCredit(w http.ResponseWriter, r *htt
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1011,7 +1011,7 @@ func (h *CreditCheckHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1050,7 +1050,7 @@ func (h *CreditCheckHandler) IsCustomerCreditSuspended(w http.ResponseWriter, r 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1095,7 +1095,7 @@ func (h *CreditCheckHandler) LogCreditCheck(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1185,7 +1185,7 @@ func (h *CreditCheckHandler) GetCreditCheckHistoryByID(w http.ResponseWriter, r 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1225,7 +1225,7 @@ func (h *CreditCheckHandler) GetCustomerCreditHistory(w http.ResponseWriter, r *
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1299,7 +1299,7 @@ func (h *CreditCheckHandler) GetOrderCreditHistory(w http.ResponseWriter, r *htt
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1336,7 +1336,7 @@ func (h *CreditCheckHandler) GetOrderCreditHistory(w http.ResponseWriter, r *htt
 
 func (h *CreditCheckHandler) GetFailedCreditChecks(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1398,7 +1398,7 @@ func (h *CreditCheckHandler) RunAutomaticCreditReview(w http.ResponseWriter, r *
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1431,7 +1431,7 @@ func (h *CreditCheckHandler) RunAutomaticCreditReview(w http.ResponseWriter, r *
 
 func (h *CreditCheckHandler) GetCustomersExceedingCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1463,7 +1463,7 @@ func (h *CreditCheckHandler) GetCustomersExceedingCreditLimit(w http.ResponseWri
 
 func (h *CreditCheckHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1506,7 +1506,7 @@ func (h *CreditCheckHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, 
 
 func (h *CreditCheckHandler) GetHighRiskCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1544,7 +1544,7 @@ func (h *CreditCheckHandler) GetAveragePaymentDelay(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1597,7 +1597,7 @@ func (h *CreditCheckHandler) GetCustomerCollectionScore(w http.ResponseWriter, r
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1636,7 +1636,7 @@ func (h *CreditCheckHandler) GetCustomerCreditUtilization(w http.ResponseWriter,
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1669,7 +1669,7 @@ func (h *CreditCheckHandler) GetCustomerCreditUtilization(w http.ResponseWriter,
 
 func (h *CreditCheckHandler) GetTotalOutstandingCredit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1701,7 +1701,7 @@ func (h *CreditCheckHandler) GetTotalOutstandingCredit(w http.ResponseWriter, r 
 
 func (h *CreditCheckHandler) GetTotalCreditExposure(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1733,7 +1733,7 @@ func (h *CreditCheckHandler) GetTotalCreditExposure(w http.ResponseWriter, r *ht
 
 func (h *CreditCheckHandler) GetAverageCreditUtilization(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1779,7 +1779,7 @@ func (h *CreditCheckHandler) GetAverageCreditUtilization(w http.ResponseWriter, 
 
 func (h *CreditCheckHandler) GetCreditHoldRate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1831,7 +1831,7 @@ func (h *CreditCheckHandler) CreditHistoryExists(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1870,7 +1870,7 @@ func (h *CreditCheckHandler) OrderHasCreditIssues(w http.ResponseWriter, r *http
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1909,7 +1909,7 @@ func (h *CreditCheckHandler) CustomerExceededCreditLimit(w http.ResponseWriter, 
 		return
 	}
 
-	companyID, err := h.getCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return

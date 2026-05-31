@@ -23,39 +23,33 @@ type DiscountHandler struct {
 func NewDiscountHandler(discountService service.DiscountEngineService, logger *zap.Logger) *DiscountHandler {
 	return &DiscountHandler{
 		discountService: discountService,
-		BaseHandler:     &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:     &BaseHandler{logger: logger.Named("discount_handler")},
 	}
 }
-
-// ---------- Helper Functions ----------
 
 // ---------- Request/Response Types ----------
 
 type evaluateOrderDiscountsRequest struct {
-	CompanyID string `json:"company_id"`
-	OrderID   string `json:"order_id"`
+	OrderID string `json:"order_id"`
 }
 
 type evaluateQuoteDiscountsRequest struct {
-	CompanyID string `json:"company_id"`
-	QuoteID   string `json:"quote_id"`
+	QuoteID string `json:"quote_id"`
 }
 
 type evaluateInvoiceDiscountsRequest struct {
-	CompanyID string `json:"company_id"`
 	InvoiceID string `json:"invoice_id"`
 }
 
+// The following structs are currently unused but kept for completeness.
 type getApplicableCouponsRequest struct {
-	CompanyID   string   `json:"company_id"`
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 	OrderAmount string   `json:"order_amount"`
-	At          string   `json:"at"` // RFC3339 timestamp
+	At          string   `json:"at"`
 }
 
 type getBestCouponRequest struct {
-	CompanyID   string   `json:"company_id"`
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 	OrderAmount string   `json:"order_amount"`
@@ -63,7 +57,6 @@ type getBestCouponRequest struct {
 }
 
 type getApplicablePromotionsRequest struct {
-	CompanyID   string   `json:"company_id"`
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 	OrderAmount string   `json:"order_amount"`
@@ -71,7 +64,6 @@ type getApplicablePromotionsRequest struct {
 }
 
 type getBestPromotionRequest struct {
-	CompanyID   string   `json:"company_id"`
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 	OrderAmount string   `json:"order_amount"`
@@ -79,7 +71,6 @@ type getBestPromotionRequest struct {
 }
 
 type bestDiscountCombinationRequest struct {
-	CompanyID   string   `json:"company_id"`
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 	OrderAmount string   `json:"order_amount"`
@@ -87,41 +78,35 @@ type bestDiscountCombinationRequest struct {
 }
 
 type validateStackingRulesRequest struct {
-	CompanyID            string   `json:"company_id"`
 	CouponIDs            []string `json:"coupon_ids,omitempty"`
 	PromotionIDs         []string `json:"promotion_ids,omitempty"`
 	AutomaticDiscountIDs []string `json:"automatic_discount_ids,omitempty"`
 }
 
 type canStackDiscountsRequest struct {
-	CompanyID        string `json:"company_id"`
 	FirstDiscountID  string `json:"first_discount_id"`
 	SecondDiscountID string `json:"second_discount_id"`
 }
 
 type calculateCouponDiscountRequest struct {
-	CompanyID  string   `json:"company_id"`
 	CouponID   string   `json:"coupon_id"`
 	Subtotal   string   `json:"subtotal"`
 	ProductIDs []string `json:"product_ids,omitempty"`
 }
 
 type calculatePromotionDiscountRequest struct {
-	CompanyID   string   `json:"company_id"`
 	PromotionID string   `json:"promotion_id"`
 	Subtotal    string   `json:"subtotal"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 }
 
 type calculateAutomaticDiscountRequest struct {
-	CompanyID           string   `json:"company_id"`
 	AutomaticDiscountID string   `json:"automatic_discount_id"`
 	Subtotal            string   `json:"subtotal"`
 	ProductIDs          []string `json:"product_ids,omitempty"`
 }
 
 type combinedDiscountCalculationRequest struct {
-	CompanyID   string   `json:"company_id"`
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
 	OrderAmount string   `json:"order_amount"`
@@ -129,7 +114,6 @@ type combinedDiscountCalculationRequest struct {
 }
 
 type applyCouponRequest struct {
-	CompanyID  string `json:"company_id"`
 	EntityType string `json:"entity_type"` // order, quote, invoice
 	EntityID   string `json:"entity_id"`
 	CouponCode string `json:"coupon_code"`
@@ -137,21 +121,20 @@ type applyCouponRequest struct {
 }
 
 type removeCouponRequest struct {
-	CompanyID  string `json:"company_id"`
 	EntityType string `json:"entity_type"`
 	EntityID   string `json:"entity_id"`
 	CouponCode string `json:"coupon_code"`
 	RemovedBy  string `json:"removed_by"`
 }
+
 type applyPromotionRequest struct {
-	CompanyID   string `json:"company_id"`
 	EntityType  string `json:"entity_type"`
 	EntityID    string `json:"entity_id"`
 	PromotionID string `json:"promotion_id"`
 	AppliedBy   string `json:"applied_by"`
 }
+
 type removePromotionRequest struct {
-	CompanyID   string `json:"company_id"`
 	EntityType  string `json:"entity_type"`
 	EntityID    string `json:"entity_id"`
 	PromotionID string `json:"promotion_id"`
@@ -159,21 +142,18 @@ type removePromotionRequest struct {
 }
 
 type applyBestDiscountsRequest struct {
-	CompanyID  string `json:"company_id"`
 	EntityType string `json:"entity_type"`
 	EntityID   string `json:"entity_id"`
 	AppliedBy  string `json:"applied_by"`
 }
 
 type clearDiscountsRequest struct {
-	CompanyID  string `json:"company_id"`
 	EntityType string `json:"entity_type"`
 	EntityID   string `json:"entity_id"`
 	ClearedBy  string `json:"cleared_by"`
 }
 
 type trackCouponUsageRequest struct {
-	CompanyID  string  `json:"company_id"`
 	CouponID   string  `json:"coupon_id"`
 	CustomerID *string `json:"customer_id,omitempty"`
 	EntityType string  `json:"entity_type"`
@@ -182,7 +162,6 @@ type trackCouponUsageRequest struct {
 }
 
 type trackPromotionUsageRequest struct {
-	CompanyID   string  `json:"company_id"`
 	PromotionID string  `json:"promotion_id"`
 	CustomerID  *string `json:"customer_id,omitempty"`
 	EntityType  string  `json:"entity_type"`
@@ -202,19 +181,20 @@ func (h *DiscountHandler) EvaluateOrderDiscounts(w http.ResponseWriter, r *http.
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req evaluateOrderDiscountsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.OrderID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and order_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.OrderID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "order_id is required")
 		return
 	}
 	orderID, err := uuid.Parse(req.OrderID)
@@ -262,18 +242,19 @@ func (h *DiscountHandler) EvaluateQuoteDiscounts(w http.ResponseWriter, r *http.
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req evaluateQuoteDiscountsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.QuoteID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and quote_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.QuoteID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "quote_id is required")
 		return
 	}
 	quoteID, err := uuid.Parse(req.QuoteID)
@@ -321,18 +302,19 @@ func (h *DiscountHandler) EvaluateInvoiceDiscounts(w http.ResponseWriter, r *htt
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req evaluateInvoiceDiscountsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.InvoiceID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and invoice_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.InvoiceID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "invoice_id is required")
 		return
 	}
 	invoiceID, err := uuid.Parse(req.InvoiceID)
@@ -380,14 +362,9 @@ func (h *DiscountHandler) GetApplicableCoupons(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -405,16 +382,10 @@ func (h *DiscountHandler) GetApplicableCoupons(w http.ResponseWriter, r *http.Re
 	}
 
 	productIDs := []uuid.UUID{}
-	if products := r.URL.Query().Get("product_ids"); products != "" {
-		// product_ids can be comma-separated UUIDs
-		// For simplicity, we assume single product_id or list handling. Here we'll parse list.
-		// Since the service expects []uuid.UUID, we'll handle a comma-separated string.
-		// But the query param might be repeated. We'll read all values from r.URL.Query()["product_ids"]
-		for _, p := range r.URL.Query()["product_ids"] {
-			parsed, err := uuid.Parse(p)
-			if err == nil {
-				productIDs = append(productIDs, parsed)
-			}
+	for _, p := range r.URL.Query()["product_ids"] {
+		parsed, err := uuid.Parse(p)
+		if err == nil {
+			productIDs = append(productIDs, parsed)
 		}
 	}
 
@@ -463,14 +434,9 @@ func (h *DiscountHandler) GetApplicablePromotions(w http.ResponseWriter, r *http
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -540,14 +506,9 @@ func (h *DiscountHandler) GetApplicableAutomaticDiscounts(w http.ResponseWriter,
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -617,14 +578,9 @@ func (h *DiscountHandler) GetBestCoupon(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -695,14 +651,9 @@ func (h *DiscountHandler) GetBestPromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -773,20 +724,22 @@ func (h *DiscountHandler) GetBestDiscountCombination(w http.ResponseWriter, r *h
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req bestDiscountCombinationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.OrderAmount == "" || req.At == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, order_amount, and at are required")
+	if req.OrderAmount == "" || req.At == "" {
+		h.respondWithError(w, http.StatusBadRequest, "order_amount and at are required")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
+
 	var customerID *uuid.UUID
 	if req.CustomerID != nil && *req.CustomerID != "" {
 		parsed, err := uuid.Parse(*req.CustomerID)
@@ -858,18 +811,15 @@ func (h *DiscountHandler) ValidateStackingRules(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req validateStackingRulesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 
@@ -936,14 +886,9 @@ func (h *DiscountHandler) CanStackDiscounts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -993,18 +938,19 @@ func (h *DiscountHandler) CalculateCouponDiscount(w http.ResponseWriter, r *http
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req calculateCouponDiscountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.CouponID == "" || req.Subtotal == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, coupon_id, and subtotal are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.CouponID == "" || req.Subtotal == "" {
+		h.respondWithError(w, http.StatusBadRequest, "coupon_id and subtotal are required")
 		return
 	}
 	couponID, err := uuid.Parse(req.CouponID)
@@ -1062,18 +1008,19 @@ func (h *DiscountHandler) CalculatePromotionDiscount(w http.ResponseWriter, r *h
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req calculatePromotionDiscountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.PromotionID == "" || req.Subtotal == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, promotion_id, and subtotal are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.PromotionID == "" || req.Subtotal == "" {
+		h.respondWithError(w, http.StatusBadRequest, "promotion_id and subtotal are required")
 		return
 	}
 	promotionID, err := uuid.Parse(req.PromotionID)
@@ -1131,18 +1078,19 @@ func (h *DiscountHandler) CalculateAutomaticDiscount(w http.ResponseWriter, r *h
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req calculateAutomaticDiscountRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.AutomaticDiscountID == "" || req.Subtotal == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, automatic_discount_id, and subtotal are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.AutomaticDiscountID == "" || req.Subtotal == "" {
+		h.respondWithError(w, http.StatusBadRequest, "automatic_discount_id and subtotal are required")
 		return
 	}
 	autoID, err := uuid.Parse(req.AutomaticDiscountID)
@@ -1200,18 +1148,19 @@ func (h *DiscountHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *ht
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req combinedDiscountCalculationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.OrderAmount == "" || req.At == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, order_amount, and at are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.OrderAmount == "" || req.At == "" {
+		h.respondWithError(w, http.StatusBadRequest, "order_amount and at are required")
 		return
 	}
 	var customerID *uuid.UUID
@@ -1285,18 +1234,19 @@ func (h *DiscountHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req applyCouponRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.EntityType == "" || req.EntityID == "" || req.CouponCode == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, entity_id, and coupon_code are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.EntityType == "" || req.EntityID == "" || req.CouponCode == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type, entity_id, and coupon_code are required")
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -1346,18 +1296,19 @@ func (h *DiscountHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req removeCouponRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.EntityType == "" || req.EntityID == "" || req.CouponCode == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, entity_id, and coupon_code are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.EntityType == "" || req.EntityID == "" || req.CouponCode == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type, entity_id, and coupon_code are required")
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -1406,18 +1357,19 @@ func (h *DiscountHandler) ApplyPromotion(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req applyPromotionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.EntityType == "" || req.EntityID == "" || req.PromotionID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, entity_id, and promotion_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.EntityType == "" || req.EntityID == "" || req.PromotionID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type, entity_id, and promotion_id are required")
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -1472,18 +1424,19 @@ func (h *DiscountHandler) RemovePromotion(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req removePromotionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.EntityType == "" || req.EntityID == "" || req.PromotionID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, entity_id, and promotion_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.EntityType == "" || req.EntityID == "" || req.PromotionID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type, entity_id, and promotion_id are required")
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -1537,18 +1490,19 @@ func (h *DiscountHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req applyBestDiscountsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.EntityType == "" || req.EntityID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, and entity_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.EntityType == "" || req.EntityID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type and entity_id are required")
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -1597,18 +1551,19 @@ func (h *DiscountHandler) ClearDiscounts(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req clearDiscountsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.EntityType == "" || req.EntityID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, and entity_id are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.EntityType == "" || req.EntityID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type and entity_id are required")
 		return
 	}
 	entityID, err := uuid.Parse(req.EntityID)
@@ -1657,18 +1612,19 @@ func (h *DiscountHandler) TrackCouponUsage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req trackCouponUsageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.CouponID == "" || req.EntityType == "" || req.EntityID == "" || req.UsedAt == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, coupon_id, entity_type, entity_id, and used_at are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.CouponID == "" || req.EntityType == "" || req.EntityID == "" || req.UsedAt == "" {
+		h.respondWithError(w, http.StatusBadRequest, "coupon_id, entity_type, entity_id, and used_at are required")
 		return
 	}
 	couponID, err := uuid.Parse(req.CouponID)
@@ -1731,18 +1687,19 @@ func (h *DiscountHandler) TrackPromotionUsage(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req trackPromotionUsageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.CompanyID == "" || req.PromotionID == "" || req.EntityType == "" || req.EntityID == "" || req.UsedAt == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, promotion_id, entity_type, entity_id, and used_at are required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.PromotionID == "" || req.EntityType == "" || req.EntityID == "" || req.UsedAt == "" {
+		h.respondWithError(w, http.StatusBadRequest, "promotion_id, entity_type, entity_id, and used_at are required")
 		return
 	}
 	promotionID, err := uuid.Parse(req.PromotionID)
@@ -1805,15 +1762,15 @@ func (h *DiscountHandler) GetCouponUsageCount(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	couponIDStr := r.URL.Query().Get("coupon_id")
-	if companyIDStr == "" || couponIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and coupon_id query parameters are required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	couponIDStr := r.URL.Query().Get("coupon_id")
+	if couponIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "coupon_id query parameter is required")
 		return
 	}
 	couponID, err := uuid.Parse(couponIDStr)
@@ -1851,15 +1808,15 @@ func (h *DiscountHandler) GetPromotionUsageCount(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	promotionIDStr := r.URL.Query().Get("promotion_id")
-	if companyIDStr == "" || promotionIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and promotion_id query parameters are required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	promotionIDStr := r.URL.Query().Get("promotion_id")
+	if promotionIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "promotion_id query parameter is required")
 		return
 	}
 	promotionID, err := uuid.Parse(promotionIDStr)
@@ -1897,16 +1854,12 @@ func (h *DiscountHandler) GetTopCoupons(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		l, err := strconv.Atoi(limitStr)
@@ -1957,16 +1910,12 @@ func (h *DiscountHandler) GetTopPromotions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		l, err := strconv.Atoi(limitStr)
@@ -2017,16 +1966,12 @@ func (h *DiscountHandler) GetTotalDiscountAmount(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2070,16 +2015,12 @@ func (h *DiscountHandler) GetTotalCouponDiscountAmount(w http.ResponseWriter, r 
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2123,16 +2064,12 @@ func (h *DiscountHandler) GetTotalPromotionDiscountAmount(w http.ResponseWriter,
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2176,16 +2113,12 @@ func (h *DiscountHandler) GetAverageDiscountRate(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2229,15 +2162,15 @@ func (h *DiscountHandler) CouponExists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	couponIDStr := r.URL.Query().Get("coupon_id")
-	if companyIDStr == "" || couponIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and coupon_id query parameters are required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	couponIDStr := r.URL.Query().Get("coupon_id")
+	if couponIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "coupon_id query parameter is required")
 		return
 	}
 	couponID, err := uuid.Parse(couponIDStr)
@@ -2275,15 +2208,15 @@ func (h *DiscountHandler) PromotionExists(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	promotionIDStr := r.URL.Query().Get("promotion_id")
-	if companyIDStr == "" || promotionIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and promotion_id query parameters are required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	promotionIDStr := r.URL.Query().Get("promotion_id")
+	if promotionIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "promotion_id query parameter is required")
 		return
 	}
 	promotionID, err := uuid.Parse(promotionIDStr)
@@ -2321,15 +2254,15 @@ func (h *DiscountHandler) IsCouponExpired(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	couponIDStr := r.URL.Query().Get("coupon_id")
-	if companyIDStr == "" || couponIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and coupon_id query parameters are required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	couponIDStr := r.URL.Query().Get("coupon_id")
+	if couponIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "coupon_id query parameter is required")
 		return
 	}
 	couponID, err := uuid.Parse(couponIDStr)
@@ -2372,15 +2305,15 @@ func (h *DiscountHandler) IsPromotionExpired(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	promotionIDStr := r.URL.Query().Get("promotion_id")
-	if companyIDStr == "" || promotionIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and promotion_id query parameters are required")
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	promotionIDStr := r.URL.Query().Get("promotion_id")
+	if promotionIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "promotion_id query parameter is required")
 		return
 	}
 	promotionID, err := uuid.Parse(promotionIDStr)

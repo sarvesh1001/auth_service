@@ -112,8 +112,15 @@ CREATE TABLE IF NOT EXISTS sales.sales_reps (
     user_id          UUID NOT NULL,
     code             VARCHAR(50) NOT NULL,
     name             VARCHAR(255) NOT NULL,
-    email            VARCHAR(255),
-    phone            VARCHAR(50),
+    -- Encrypted email fields
+    email            TEXT,                     -- kept for backward compatibility, can be dropped later
+    email_dek        TEXT,
+    email_key_id     TEXT,
+    email_hash       VARCHAR(64),              -- SHA‑256 of plain email (for uniqueness & search)
+    -- Encrypted phone fields
+    phone            TEXT,              -- kept for backward compatibility
+    phone_dek        TEXT,
+    phone_key_id     TEXT,
     is_active        BOOLEAN NOT NULL DEFAULT true,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -123,9 +130,13 @@ CREATE TABLE IF NOT EXISTS sales.sales_reps (
     CONSTRAINT fk_sales_reps_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_sales_reps_created_by FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL,
     CONSTRAINT fk_sales_reps_updated_by FOREIGN KEY (updated_by) REFERENCES users(user_id) ON DELETE SET NULL,
-    UNIQUE (company_id, code)
+    UNIQUE (company_id, code),
+    -- Email uniqueness is enforced via hash
+    CONSTRAINT uniq_sales_reps_email_hash UNIQUE (company_id, email_hash)
 );
 
+-- Index for fast email lookup (when plain email is not stored)
+CREATE INDEX idx_sales_reps_email_hash ON sales.sales_reps (company_id, email_hash) WHERE email_hash IS NOT NULL;
 -- =====================================================
 -- ORDERS
 -- =====================================================
@@ -1668,7 +1679,7 @@ CREATE TABLE sales_analytics.commission_assignment_fact (
     plan_id UUID NOT NULL,
     assigned_at DATE NOT NULL,
     removed_at DATE,
-    duration_days INT GENERATED ALWAYS AS (COALESCE(removed_at, CURRENT_DATE) - assigned_at) STORED,
+    duration_days INT,   -- not generated; compute as COALESCE(removed_at, CURRENT_DATE) - assigned_at in queries
     assigned_by UUID,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -2011,3 +2022,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_customers_email ON sales.customers (compa
 -- =====================================================
 -- END OF SCRIPT
 -- =====================================================
+
+
+-- Add email_hash column
+ALTER TABLE sales.customers ADD COLUMN email_hash VARCHAR(64);
+
+-- Create unique index (ignoring NULLs for customers without email)
+CREATE UNIQUE INDEX uniq_customers_email_hash ON sales.customers (company_id, email_hash) WHERE email_hash IS NOT NULL;

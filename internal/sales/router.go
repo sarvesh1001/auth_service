@@ -24,9 +24,9 @@ type SalesHandlers struct {
 	PricingHandler     *handler.PricingHandler
 	ProductHandler     *handler.ProductHandler
 	PromotionHandler   *handler.PromotionHandler
-	QuoteHandler       *handler.QuoteHandler  // new
-	TaxHandler         *handler.TaxHandler    // new
-	ReportHandler      *handler.ReportHandler // <-- new
+	QuoteHandler       *handler.QuoteHandler
+	TaxHandler         *handler.TaxHandler
+	ReportHandler      *handler.ReportHandler
 	ReturnHandler      *handler.ReturnHandler
 	SalesRepHandler    *handler.SalesRepHandler
 }
@@ -39,561 +39,561 @@ func RegisterSalesRoutes(
 	jwtService *service.JWTService,
 ) {
 	// ---------------------------------------------------------------------
-	// Commission routes
+	// Commission routes (mapped to sales.deal permissions)
 	// ---------------------------------------------------------------------
 	r.Route("/sales/commissions", func(r chi.Router) {
 		// Commission Plan endpoints
 		r.Route("/plans", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/", handlers.CommissionHandler.CreateCommissionPlan)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/", handlers.CommissionHandler.ListCommissionPlans)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/active", handlers.CommissionHandler.GetActiveCommissionPlans)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/by-code", handlers.CommissionHandler.GetCommissionPlanByCode)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/{id}/exists", handlers.CommissionHandler.CommissionPlanExists)
 
 			r.Route("/{id}", func(r chi.Router) {
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/", handlers.CommissionHandler.GetCommissionPlanByID)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Put("/", handlers.CommissionHandler.UpdateCommissionPlan)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Delete("/", handlers.CommissionHandler.DeleteCommissionPlan)
 			})
 		})
 
 		// Commission Rule endpoints
 		r.Route("/rules", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/", handlers.CommissionHandler.CreateCommissionRule)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/", handlers.CommissionHandler.GetCommissionRules)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/{id}/exists", handlers.CommissionHandler.CommissionRuleExists)
 
 			r.Route("/{id}", func(r chi.Router) {
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/", handlers.CommissionHandler.GetCommissionRuleByID)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Put("/", handlers.CommissionHandler.UpdateCommissionRule)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Delete("/", handlers.CommissionHandler.DeleteCommissionRule)
 			})
 		})
 
 		// Sales Rep – Commission Plan Assignment
 		r.Route("/sales-reps/{salesRepId}", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/plan", handlers.CommissionHandler.AssignCommissionPlan)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Delete("/plan", handlers.CommissionHandler.RemoveCommissionPlan)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/plan", handlers.CommissionHandler.GetSalesRepCommissionPlan)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/commissions", handlers.CommissionHandler.GetSalesRepCommissions)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/commission-summary", handlers.CommissionHandler.GetCommissionSummaryBySalesRep)
 		})
 
 		// Commission Calculation
 		r.Route("/calculate", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/order", handlers.CommissionHandler.CalculateOrderCommission)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/invoice", handlers.CommissionHandler.CalculateInvoiceCommission)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/payment", handlers.CommissionHandler.CalculatePaymentCommission)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/period", handlers.CommissionHandler.CalculateCommissionForPeriod)
 		})
 
 		// Preview Commission
-		r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Post("/preview", handlers.CommissionHandler.PreviewCommission)
 
 		// Process Commissions from events
 		r.Route("/process", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/order", handlers.CommissionHandler.ProcessOrderCompletedCommission)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/invoice", handlers.CommissionHandler.ProcessInvoicePaidCommission)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/payment", handlers.CommissionHandler.ProcessPaymentReceivedCommission)
 		})
 
 		// Commission Records
 		r.Route("/records", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/", handlers.CommissionHandler.CreateCommissionRecord)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/", handlers.CommissionHandler.ListCommissions)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/by-reference", handlers.CommissionHandler.GetCommissionByReference)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/already-generated", handlers.CommissionHandler.CommissionAlreadyGenerated)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/pending", handlers.CommissionHandler.GetPendingCommissions)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/approved", handlers.CommissionHandler.GetApprovedCommissions)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/unpaid", handlers.CommissionHandler.GetUnpaidCommissions)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/total", handlers.CommissionHandler.GetTotalCommissionAmount)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/total-paid", handlers.CommissionHandler.GetTotalPaidCommission)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/outstanding-liability", handlers.CommissionHandler.GetOutstandingCommissionLiability)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/top-sales-reps", handlers.CommissionHandler.GetTopSalesRepCommissions)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/trend", handlers.CommissionHandler.GetCommissionTrend)
 
 			r.Route("/{id}", func(r chi.Router) {
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/", handlers.CommissionHandler.GetCommissionByID)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Put("/", handlers.CommissionHandler.UpdateCommissionRecord)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/exists", handlers.CommissionHandler.CommissionRecordExists)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/pending", handlers.CommissionHandler.MarkCommissionPending)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/approve", handlers.CommissionHandler.ApproveCommission)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/reject", handlers.CommissionHandler.RejectCommission)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/paid", handlers.CommissionHandler.MarkCommissionPaid)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/recalculate", handlers.CommissionHandler.RecalculateCommission)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/reverse", handlers.CommissionHandler.ReverseCommission)
 			})
 		})
 	})
 
 	// ---------------------------------------------------------------------
-	// Coupon routes
+	// Coupon routes (mapped to marketing.campaign permissions)
 	// ---------------------------------------------------------------------
 	r.Route("/sales/coupons", func(r chi.Router) {
 		// Create / Update / Delete
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.create", logger)).
 			Post("/", handlers.CouponHandler.CreateCoupon)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.update", logger)).
 			Put("/{id}", handlers.CouponHandler.UpdateCoupon)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.delete", logger)).
 			Delete("/{id}", handlers.CouponHandler.DeleteCoupon)
 
 		// Read operations
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}", handlers.CouponHandler.GetCouponByID)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/by-code", handlers.CouponHandler.GetCouponByCode)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/", handlers.CouponHandler.ListCoupons)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/search", handlers.CouponHandler.SearchCoupons)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/active", handlers.CouponHandler.GetActiveCoupons)
 
 		// Activation / Deactivation / Expiration
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.update", logger)).
 			Post("/{id}/activate", handlers.CouponHandler.ActivateCoupon)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.update", logger)).
 			Post("/{id}/deactivate", handlers.CouponHandler.DeactivateCoupon)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.update", logger)).
 			Post("/{id}/expire", handlers.CouponHandler.ExpireCoupon)
 
 		// Validation & calculation
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Post("/validate", handlers.CouponHandler.ValidateCoupon)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Post("/{id}/calculate", handlers.CouponHandler.CalculateDiscount)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Post("/{id}/calculate-products", handlers.CouponHandler.CalculateDiscountForProducts)
 
 		// Apply / Remove coupon on orders, quotes, invoices
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 			Post("/apply/order", handlers.CouponHandler.ApplyCouponToOrder)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 			Post("/apply/quote", handlers.CouponHandler.ApplyCouponToQuote)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 			Post("/apply/invoice", handlers.CouponHandler.ApplyCouponToInvoice)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 			Delete("/remove/order", handlers.CouponHandler.RemoveCouponFromOrder)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 			Delete("/remove/quote", handlers.CouponHandler.RemoveCouponFromQuote)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 			Delete("/remove/invoice", handlers.CouponHandler.RemoveCouponFromInvoice)
 
 		// Usage tracking
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.update", logger)).
 			Post("/usage", handlers.CouponHandler.RecordCouponUsage)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}/usage-count", handlers.CouponHandler.GetCouponUsageCount)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/customer-usage", handlers.CouponHandler.GetCustomerCouponUsageCount)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}/usage-history", handlers.CouponHandler.GetCouponUsageHistory)
 
 		// Analytics
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/top", handlers.CouponHandler.GetTopCoupons)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/most-used", handlers.CouponHandler.GetMostUsedCoupons)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/highest-discount", handlers.CouponHandler.GetHighestDiscountCoupons)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/total-discount", handlers.CouponHandler.GetTotalCouponDiscountAmount)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}/redemption-rate", handlers.CouponHandler.GetCouponRedemptionRate)
 
 		// Existence & status checks
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/exists", handlers.CouponHandler.CouponCodeExists)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}/exists", handlers.CouponHandler.CouponExists)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}/expired", handlers.CouponHandler.IsCouponExpired)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/{id}/usage-limit-reached", handlers.CouponHandler.IsCouponUsageLimitReached)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.coupon.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("marketing.campaign.view", logger)).
 			Get("/customer-limit-reached", handlers.CouponHandler.IsCustomerUsageLimitReached)
 	})
 
 	// ---------------------------------------------------------------------
-	// Credit Check routes
+	// Credit Check routes (mapped to sales.deal permissions)
 	// ---------------------------------------------------------------------
 	r.Route("/sales/credit", func(r chi.Router) {
-		// --- Credit check operations ---
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.check", logger)).
+		// --- Credit check operations (read-like) ---
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Post("/check/customer", handlers.CreditCheckHandler.CheckCustomerCreditLimit)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.check", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Post("/check/order", handlers.CreditCheckHandler.CheckOrderCreditEligibility)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.check", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Post("/check/invoice", handlers.CreditCheckHandler.CheckInvoiceCreditEligibility)
 
 		// --- Customer credit info (read) ---
 		r.Route("/customers/{id}", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/available-credit", handlers.CreditCheckHandler.GetCustomerAvailableCredit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/outstanding-balance", handlers.CreditCheckHandler.GetCustomerOutstandingBalance)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/credit-exposure", handlers.CreditCheckHandler.GetCustomerCreditExposure)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/can-place-order", handlers.CreditCheckHandler.CanCustomerPlaceOrder)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/credit-limit", handlers.CreditCheckHandler.GetCustomerCreditLimit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/credit-suspended", handlers.CreditCheckHandler.IsCustomerCreditSuspended)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/credit-history", handlers.CreditCheckHandler.GetCustomerCreditHistory)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/avg-payment-delay", handlers.CreditCheckHandler.GetAveragePaymentDelay)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/collection-score", handlers.CreditCheckHandler.GetCustomerCollectionScore)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/credit-utilization", handlers.CreditCheckHandler.GetCustomerCreditUtilization)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/exceeded-limit", handlers.CreditCheckHandler.CustomerExceededCreditLimit)
 
 			// --- Customer credit modifications (write) ---
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Put("/credit-limit", handlers.CreditCheckHandler.SetCustomerCreditLimit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/credit-limit/increase", handlers.CreditCheckHandler.IncreaseCustomerCreditLimit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/credit-limit/decrease", handlers.CreditCheckHandler.DecreaseCustomerCreditLimit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/credit-suspend", handlers.CreditCheckHandler.SuspendCustomerCredit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/credit-restore", handlers.CreditCheckHandler.RestoreCustomerCredit)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/auto-review", handlers.CreditCheckHandler.RunAutomaticCreditReview)
 		})
 
 		// --- Order credit operations ---
 		r.Route("/orders", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 				Get("/on-hold", handlers.CreditCheckHandler.GetOrdersOnCreditHold)
 
 			r.Route("/{id}", func(r chi.Router) {
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/hold", handlers.CreditCheckHandler.HoldOrderForCredit)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Post("/release-hold", handlers.CreditCheckHandler.ReleaseOrderCreditHold)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/on-hold", handlers.CreditCheckHandler.IsOrderOnCreditHold)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 					Put("/credit-status", handlers.CreditCheckHandler.UpdateOrderCreditStatus)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/credit-history", handlers.CreditCheckHandler.GetOrderCreditHistory)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/has-credit-issues", handlers.CreditCheckHandler.OrderHasCreditIssues)
 			})
 		})
 
 		// --- Credit history logs ---
 		r.Route("/history", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/", handlers.CreditCheckHandler.LogCreditCheck)
 
 			r.Route("/{id}", func(r chi.Router) {
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/", handlers.CreditCheckHandler.GetCreditCheckHistoryByID)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 					Get("/exists", handlers.CreditCheckHandler.CreditHistoryExists)
 			})
 		})
 
 		// --- Analytics and reports ---
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/failed-checks", handlers.CreditCheckHandler.GetFailedCreditChecks)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/customers/exceeding-limit", handlers.CreditCheckHandler.GetCustomersExceedingCreditLimit)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/customers/near-limit", handlers.CreditCheckHandler.GetCustomersNearCreditLimit)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/customers/high-risk", handlers.CreditCheckHandler.GetHighRiskCustomers)
 
 		// --- Global totals / metrics ---
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/totals/outstanding", handlers.CreditCheckHandler.GetTotalOutstandingCredit)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/totals/credit-exposure", handlers.CreditCheckHandler.GetTotalCreditExposure)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/totals/average-utilization", handlers.CreditCheckHandler.GetAverageCreditUtilization)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/totals/credit-hold-rate", handlers.CreditCheckHandler.GetCreditHoldRate)
 	})
 
 	// ---------------------------------------------------------------------
-	// Credit Notes routes
+	// Credit Notes routes (mapped to finance.invoice permissions)
 	// ---------------------------------------------------------------------
 	r.Route("/sales/credit-notes", func(r chi.Router) {
 		// Create operations
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.create", logger)).
 			Post("/", handlers.CreditNoteHandler.CreateDraftCreditNote)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.create", logger)).
 			Post("/from-invoice", handlers.CreditNoteHandler.CreateFromInvoice)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.create", logger)).
 			Post("/from-return", handlers.CreditNoteHandler.CreateFromReturn)
 
 		// Read operations (list, search, get by number)
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/", handlers.CreditNoteHandler.ListCreditNotes)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/search", handlers.CreditNoteHandler.SearchCreditNotes)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/by-number", handlers.CreditNoteHandler.GetCreditNoteByNumber)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/exists/number", handlers.CreditNoteHandler.CreditNoteNumberExists)
 
 		// Analytics endpoints
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/total-issued", handlers.CreditNoteHandler.GetTotalCreditIssued)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/total-applied", handlers.CreditNoteHandler.GetTotalCreditApplied)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Get("/outstanding", handlers.CreditNoteHandler.GetOutstandingCredits)
 
 		// Customer-specific credit note operations
 		r.Route("/customers/{customerId}", func(r chi.Router) {
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/credit-balance", handlers.CreditNoteHandler.GetCustomerCreditBalance)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/unused", handlers.CreditNoteHandler.GetUnusedCreditNotes)
 		})
 
 		// Preview totals (no persistence)
-		r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+		r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 			Post("/preview", handlers.CreditNoteHandler.PreviewTotals)
 
 		// Single credit note operations (by ID)
 		r.Route("/{id}", func(r chi.Router) {
 			// Basic CRUD
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/", handlers.CreditNoteHandler.GetCreditNoteByID)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Put("/", handlers.CreditNoteHandler.UpdateCreditNote)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.delete", logger)).
 				Delete("/", handlers.CreditNoteHandler.DeleteCreditNote)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/exists", handlers.CreditNoteHandler.CreditNoteExists)
 
 			// Items
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Post("/items", handlers.CreditNoteHandler.AddItems)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Put("/items", handlers.CreditNoteHandler.ReplaceItems)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Delete("/items/{itemId}", handlers.CreditNoteHandler.RemoveItem)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/items", handlers.CreditNoteHandler.GetCreditNoteItems)
 
 			// Totals
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Post("/calculate", handlers.CreditNoteHandler.CalculateTotals)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/totals", handlers.CreditNoteHandler.GetCreditNoteTotals)
 
 			// Status changes
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Post("/issue", handlers.CreditNoteHandler.IssueCreditNote)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Post("/void", handlers.CreditNoteHandler.VoidCreditNote)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Post("/mark-fully-applied", handlers.CreditNoteHandler.MarkFullyApplied)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Put("/status", handlers.CreditNoteHandler.UpdateStatus)
 
 			// Applications
 			r.Route("/applications", func(r chi.Router) {
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 					Post("/invoice", handlers.CreditNoteHandler.ApplyToInvoice)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 					Post("/invoices", handlers.CreditNoteHandler.ApplyToInvoices)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 					Post("/auto", handlers.CreditNoteHandler.AutoApplyToOutstandingInvoices)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 					Get("/", handlers.CreditNoteHandler.GetApplications)
 
-				r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+				r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 					Delete("/{appId}", handlers.CreditNoteHandler.RemoveApplication)
 			})
 
 			// Remaining balance & full application check
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/remaining-balance", handlers.CreditNoteHandler.GetRemainingBalance)
 
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.read", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.view", logger)).
 				Get("/fully-applied", handlers.CreditNoteHandler.IsFullyApplied)
 
 			// Convert to refund
-			r.With(middleware.BitmaskPermissionMiddleware("sales.credit_note.write", logger)).
+			r.With(middleware.BitmaskPermissionMiddleware("finance.invoice.update", logger)).
 				Post("/convert-to-refund", handlers.CreditNoteHandler.ConvertToRefund)
 		})
 	})
 
 	// ---------------------------------------------------------------------
-	// Customer routes (using sales.deal permissions as substitute)
+	// Customer routes (using sales.deal permissions)
 	// ---------------------------------------------------------------------
 	r.Route("/sales/customers", func(r chi.Router) {
 		// Create (uses write permission)
@@ -653,7 +653,7 @@ func RegisterSalesRoutes(
 	})
 
 	// ---------------------------------------------------------------------
-	// Discount Handler routes
+	// Discount Handler routes (using sales.deal permissions)
 	// ---------------------------------------------------------------------
 	r.Route("/sales/discounts", func(r chi.Router) {
 		// --- Evaluate discounts on existing entities (read) ---
@@ -1590,6 +1590,7 @@ func RegisterSalesRoutes(
 		r.With(middleware.BitmaskPermissionMiddleware("finance.tax.view", logger)).
 			Get("/snapshots/{id}/exists", handlers.TaxHandler.TaxSnapshotExists)
 	})
+
 	// ==================== NEW: Reports ====================
 	r.Route("/sales/reports", func(r chi.Router) {
 		// Dashboard & Summary
@@ -1775,8 +1776,8 @@ func RegisterSalesRoutes(
 		r.With(middleware.BitmaskPermissionMiddleware("sales.target.view", logger)).
 			Get("/sales-rep/leaderboard", handlers.ReportHandler.GetSalesLeaderboard)
 
-		r.With(middleware.BitmaskPermissionMiddleware("sales.commission.read", logger)).
-			Get("/commissions/summary", handlers.ReportHandler.GetCommissionSummary)
+		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)). // previously sales.commission.read
+												Get("/commissions/summary", handlers.ReportHandler.GetCommissionSummary)
 
 		// Credit Risk
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
@@ -1808,6 +1809,8 @@ func RegisterSalesRoutes(
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/audit-trail", handlers.ReportHandler.GetSalesAuditTrail)
 	})
+
+	// ==================== SALES REPS ROUTES ====================
 	r.Route("/sales/sales-reps", func(r chi.Router) {
 		// Create sales rep
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.create", logger)).
@@ -1830,8 +1833,8 @@ func RegisterSalesRoutes(
 			r.With(middleware.BitmaskPermissionMiddleware("sales.target.view", logger)).
 				Get("/target", handlers.SalesRepHandler.GetSalesTarget)
 
-			// Commission plan assignment
-			r.With(middleware.BitmaskPermissionMiddleware("sales.commission.write", logger)).
+			// Commission plan assignment (use sales.deal.update as fallback)
+			r.With(middleware.BitmaskPermissionMiddleware("sales.deal.update", logger)).
 				Post("/commission-plan", handlers.SalesRepHandler.SetCommissionPlan)
 
 			// Assignment to orders, quotes, invoices
@@ -2021,5 +2024,4 @@ func RegisterSalesRoutes(
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/number-exists", handlers.ReturnHandler.ReturnNumberExists)
 	})
-
 }

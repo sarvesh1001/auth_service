@@ -1,3 +1,5 @@
+// internal/sales/repository/sales_rep_repository.go
+
 package repository
 
 import (
@@ -15,6 +17,10 @@ import (
 	"auth-service/internal/sales/models"
 )
 
+// -------------------------------------------------------------------------
+// Types & Interface
+// -------------------------------------------------------------------------
+
 type SalesRepRepository interface {
 	Create(ctx context.Context, db DBTX, rep *models.SalesRep) error
 	GetByID(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (*models.SalesRep, error)
@@ -25,15 +31,19 @@ type SalesRepRepository interface {
 	SetActiveStatus(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
 	Exists(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (bool, error)
 	ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error)
+	ExistsByEmailHash(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string) (bool, error)
+	ExistsByEmailHashExcluding(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string, excludeRepID uuid.UUID) (bool, error)
+	ExistsByUserID(ctx context.Context, db DBTX, companyID, userID uuid.UUID) (bool, error)
 	IsActive(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (bool, error)
 	List(ctx context.Context, db DBTX, filter SalesRepFilter, p Pagination, s Sort) ([]*models.SalesRep, int64, error)
 	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.SalesRep, int64, error)
 	GetActiveSalesReps(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.SalesRep, error)
-	ExistsByUserID(ctx context.Context, db DBTX, companyID, userID uuid.UUID) (bool, error)
 	GetTopSalesRepsByRevenue(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (*models.SalesRep, error)
+	UserExists(ctx context.Context, db DBTX, userID uuid.UUID) (bool, error)
 }
 
+// SalesRepFilter excludes Email/Phone because they are encrypted and not searchable via ILIKE.
 type SalesRepFilter struct {
 	CompanyID   uuid.UUID
 	SalesRepIDs []uuid.UUID
@@ -41,8 +51,6 @@ type SalesRepFilter struct {
 	IsActive    *bool
 	Code        *string
 	Name        *string
-	Email       *string
-	Phone       *string
 	CreatedFrom *time.Time
 	CreatedTo   *time.Time
 	UpdatedFrom *time.Time
@@ -58,6 +66,10 @@ func NewSalesRepRepository(logger *zap.Logger) SalesRepRepository {
 		logger: logger.Named("sales_sales_rep_repo"),
 	}
 }
+
+// -------------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------------
 
 func (r *salesRepRepository) nullUUIDParam(id *uuid.UUID) interface{} {
 	if id == nil || *id == uuid.Nil {
@@ -141,16 +153,6 @@ func (r *salesRepRepository) buildSalesRepFilter(filter SalesRepFilter) (string,
 		args = append(args, "%"+*filter.Name+"%")
 		idx++
 	}
-	if filter.Email != nil {
-		conds = append(conds, fmt.Sprintf("email ILIKE $%d", idx))
-		args = append(args, "%"+*filter.Email+"%")
-		idx++
-	}
-	if filter.Phone != nil {
-		conds = append(conds, fmt.Sprintf("phone ILIKE $%d", idx))
-		args = append(args, "%"+*filter.Phone+"%")
-		idx++
-	}
 	if filter.CreatedFrom != nil {
 		conds = append(conds, fmt.Sprintf("created_at >= $%d", idx))
 		args = append(args, *filter.CreatedFrom)
@@ -178,10 +180,11 @@ func (r *salesRepRepository) buildSalesRepFilter(filter SalesRepFilter) (string,
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
+// scanSalesRep reads all encrypted columns and the hash.
 func (r *salesRepRepository) scanSalesRep(s scanner) (*models.SalesRep, error) {
 	var rep models.SalesRep
-	var email, phone sql.NullString
 	var createdBy, updatedBy uuid.NullUUID
+	var emailHash sql.NullString
 
 	err := s.Scan(
 		&rep.SalesRepID,
@@ -189,13 +192,18 @@ func (r *salesRepRepository) scanSalesRep(s scanner) (*models.SalesRep, error) {
 		&rep.UserID,
 		&rep.Code,
 		&rep.Name,
-		&email,
-		&phone,
+		&rep.EmailEncrypted,
+		&rep.EmailDEK,
+		&rep.EmailKeyID,
+		&rep.PhoneEncrypted,
+		&rep.PhoneDEK,
+		&rep.PhoneKeyID,
 		&rep.IsActive,
 		&rep.CreatedAt,
 		&rep.UpdatedAt,
 		&createdBy,
 		&updatedBy,
+		&emailHash,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -203,29 +211,35 @@ func (r *salesRepRepository) scanSalesRep(s scanner) (*models.SalesRep, error) {
 		}
 		return nil, fmt.Errorf("scan sales rep: %w", err)
 	}
-	if email.Valid {
-		rep.Email = &email.String
-	}
-	if phone.Valid {
-		rep.Phone = &phone.String
-	}
+
 	if createdBy.Valid {
 		rep.CreatedBy = &createdBy.UUID
 	}
 	if updatedBy.Valid {
 		rep.UpdatedBy = &updatedBy.UUID
 	}
+	if emailHash.Valid {
+		rep.EmailHash = &emailHash.String
+	}
 	return &rep, nil
 }
 
-// ---------- CRUD ----------
+// -------------------------------------------------------------------------
+// CRUD
+// -------------------------------------------------------------------------
+
 func (r *salesRepRepository) Create(ctx context.Context, db DBTX, rep *models.SalesRep) error {
 	query := `
 		INSERT INTO sales.sales_reps (
 			sales_rep_id, company_id, user_id, code, name,
-			email, phone, is_active, created_at, updated_at, created_by, updated_by
+			email, email_dek, email_key_id, email_hash,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9, $10
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9,
+			$10, $11, $12,
+			$13, NOW(), NOW(), $14, $15
 		)
 		RETURNING created_at, updated_at
 	`
@@ -235,8 +249,13 @@ func (r *salesRepRepository) Create(ctx context.Context, db DBTX, rep *models.Sa
 		rep.UserID,
 		rep.Code,
 		rep.Name,
-		r.nullStringParam(rep.Email),
-		r.nullStringParam(rep.Phone),
+		r.nullStringParam(rep.EmailEncrypted),
+		r.nullStringParam(rep.EmailDEK),
+		r.nullStringParam(rep.EmailKeyID),
+		r.nullStringParam(rep.EmailHash),
+		r.nullStringParam(rep.PhoneEncrypted),
+		r.nullStringParam(rep.PhoneDEK),
+		r.nullStringParam(rep.PhoneKeyID),
 		rep.IsActive,
 		r.nullUUIDParam(rep.CreatedBy),
 		r.nullUUIDParam(rep.UpdatedBy),
@@ -250,9 +269,12 @@ func (r *salesRepRepository) Create(ctx context.Context, db DBTX, rep *models.Sa
 
 func (r *salesRepRepository) GetByID(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (*models.SalesRep, error) {
 	query := `
-		SELECT sales_rep_id, company_id, user_id, code, name,
-		       email, phone, is_active,
-		       created_at, updated_at, created_by, updated_by
+		SELECT 
+			sales_rep_id, company_id, user_id, code, name,
+			email, email_dek, email_key_id,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by,
+			email_hash
 		FROM sales.sales_reps
 		WHERE company_id = $1 AND sales_rep_id = $2
 	`
@@ -262,9 +284,12 @@ func (r *salesRepRepository) GetByID(ctx context.Context, db DBTX, companyID, sa
 
 func (r *salesRepRepository) GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*models.SalesRep, error) {
 	query := `
-		SELECT sales_rep_id, company_id, user_id, code, name,
-		       email, phone, is_active,
-		       created_at, updated_at, created_by, updated_by
+		SELECT 
+			sales_rep_id, company_id, user_id, code, name,
+			email, email_dek, email_key_id,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by,
+			email_hash
 		FROM sales.sales_reps
 		WHERE company_id = $1 AND code = $2
 	`
@@ -274,9 +299,12 @@ func (r *salesRepRepository) GetByCode(ctx context.Context, db DBTX, companyID u
 
 func (r *salesRepRepository) GetByUserID(ctx context.Context, db DBTX, companyID, userID uuid.UUID) (*models.SalesRep, error) {
 	query := `
-		SELECT sales_rep_id, company_id, user_id, code, name,
-		       email, phone, is_active,
-		       created_at, updated_at, created_by, updated_by
+		SELECT 
+			sales_rep_id, company_id, user_id, code, name,
+			email, email_dek, email_key_id,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by,
+			email_hash
 		FROM sales.sales_reps
 		WHERE company_id = $1 AND user_id = $2
 	`
@@ -287,25 +315,33 @@ func (r *salesRepRepository) GetByUserID(ctx context.Context, db DBTX, companyID
 func (r *salesRepRepository) Update(ctx context.Context, db DBTX, rep *models.SalesRep) error {
 	query := `
 		UPDATE sales.sales_reps SET
-			user_id = $3,
-			code = $4,
-			name = $5,
-			email = $6,
-			phone = $7,
-			is_active = $8,
+			code = $3,
+			name = $4,
+			email = $5,
+			email_dek = $6,
+			email_key_id = $7,
+			email_hash = $8,
+			phone = $9,
+			phone_dek = $10,
+			phone_key_id = $11,
+			is_active = $12,
 			updated_at = NOW(),
-			updated_by = $9
+			updated_by = $13
 		WHERE sales_rep_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
 	err := db.QueryRowContext(ctx, query,
 		rep.SalesRepID,
 		rep.CompanyID,
-		rep.UserID,
 		rep.Code,
 		rep.Name,
-		r.nullStringParam(rep.Email),
-		r.nullStringParam(rep.Phone),
+		r.nullStringParam(rep.EmailEncrypted),
+		r.nullStringParam(rep.EmailDEK),
+		r.nullStringParam(rep.EmailKeyID),
+		r.nullStringParam(rep.EmailHash),
+		r.nullStringParam(rep.PhoneEncrypted),
+		r.nullStringParam(rep.PhoneDEK),
+		r.nullStringParam(rep.PhoneKeyID),
 		rep.IsActive,
 		r.nullUUIDParam(rep.UpdatedBy),
 	).Scan(&rep.UpdatedAt)
@@ -331,7 +367,10 @@ func (r *salesRepRepository) Delete(ctx context.Context, db DBTX, companyID, sal
 	return nil
 }
 
-// ---------- Status / Validation ----------
+// -------------------------------------------------------------------------
+// Status & Uniqueness Checks
+// -------------------------------------------------------------------------
+
 func (r *salesRepRepository) SetActiveStatus(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error {
 	query := `
 		UPDATE sales.sales_reps
@@ -353,20 +392,35 @@ func (r *salesRepRepository) Exists(ctx context.Context, db DBTX, companyID, sal
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM sales.sales_reps WHERE company_id = $1 AND sales_rep_id = $2)`
 	err := db.QueryRowContext(ctx, query, companyID, salesRepID).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("exists: %w", err)
-	}
-	return exists, nil
+	return exists, err
 }
 
 func (r *salesRepRepository) ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error) {
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM sales.sales_reps WHERE company_id = $1 AND code = $2)`
 	err := db.QueryRowContext(ctx, query, companyID, code).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("exists by code: %w", err)
-	}
-	return exists, nil
+	return exists, err
+}
+
+func (r *salesRepRepository) ExistsByEmailHash(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.sales_reps WHERE company_id = $1 AND email_hash = $2)`
+	err := db.QueryRowContext(ctx, query, companyID, emailHash).Scan(&exists)
+	return exists, err
+}
+
+func (r *salesRepRepository) ExistsByEmailHashExcluding(ctx context.Context, db DBTX, companyID uuid.UUID, emailHash string, excludeRepID uuid.UUID) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.sales_reps WHERE company_id = $1 AND email_hash = $2 AND sales_rep_id != $3)`
+	err := db.QueryRowContext(ctx, query, companyID, emailHash, excludeRepID).Scan(&exists)
+	return exists, err
+}
+
+func (r *salesRepRepository) ExistsByUserID(ctx context.Context, db DBTX, companyID, userID uuid.UUID) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.sales_reps WHERE company_id = $1 AND user_id = $2)`
+	err := db.QueryRowContext(ctx, query, companyID, userID).Scan(&exists)
+	return exists, err
 }
 
 func (r *salesRepRepository) IsActive(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (bool, error) {
@@ -382,7 +436,10 @@ func (r *salesRepRepository) IsActive(ctx context.Context, db DBTX, companyID, s
 	return active, nil
 }
 
-// ---------- Querying / Listing ----------
+// -------------------------------------------------------------------------
+// Listing & Search
+// -------------------------------------------------------------------------
+
 func (r *salesRepRepository) List(ctx context.Context, db DBTX, filter SalesRepFilter, p Pagination, s Sort) ([]*models.SalesRep, int64, error) {
 	where, args := r.buildSalesRepFilter(filter)
 	if where == "" {
@@ -414,9 +471,12 @@ func (r *salesRepRepository) List(ctx context.Context, db DBTX, filter SalesRepF
 	}
 
 	query := fmt.Sprintf(`
-		SELECT sales_rep_id, company_id, user_id, code, name,
-		       email, phone, is_active,
-		       created_at, updated_at, created_by, updated_by
+		SELECT 
+			sales_rep_id, company_id, user_id, code, name,
+			email, email_dek, email_key_id,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by,
+			email_hash
 		FROM sales.sales_reps
 		%s
 		%s
@@ -443,12 +503,12 @@ func (r *salesRepRepository) List(ctx context.Context, db DBTX, filter SalesRepF
 
 func (r *salesRepRepository) Search(ctx context.Context, db DBTX, companyID uuid.UUID, queryStr string, limit, offset int) ([]*models.SalesRep, int64, error) {
 	searchPattern := "%" + queryStr + "%"
-	baseArgs := []interface{}{companyID, searchPattern, searchPattern, searchPattern}
+	baseArgs := []interface{}{companyID, searchPattern, searchPattern}
 	countQuery := `
 		SELECT COUNT(*)
 		FROM sales.sales_reps
 		WHERE company_id = $1
-		AND (code ILIKE $2 OR name ILIKE $3 OR email ILIKE $4)
+		AND (code ILIKE $2 OR name ILIKE $3)
 	`
 	var total int64
 	err := db.QueryRowContext(ctx, countQuery, baseArgs...).Scan(&total)
@@ -460,14 +520,17 @@ func (r *salesRepRepository) Search(ctx context.Context, db DBTX, companyID uuid
 	}
 
 	dataQuery := `
-		SELECT sales_rep_id, company_id, user_id, code, name,
-		       email, phone, is_active,
-		       created_at, updated_at, created_by, updated_by
+		SELECT 
+			sales_rep_id, company_id, user_id, code, name,
+			email, email_dek, email_key_id,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by,
+			email_hash
 		FROM sales.sales_reps
 		WHERE company_id = $1
-		AND (code ILIKE $2 OR name ILIKE $3 OR email ILIKE $4)
+		AND (code ILIKE $2 OR name ILIKE $3)
 		ORDER BY name ASC
-		LIMIT $5 OFFSET $6
+		LIMIT $4 OFFSET $5
 	`
 	args := append(baseArgs, limit, offset)
 	rows, err := db.QueryContext(ctx, dataQuery, args...)
@@ -496,7 +559,10 @@ func (r *salesRepRepository) GetActiveSalesReps(ctx context.Context, db DBTX, co
 	return reps, err
 }
 
-// ---------- Analytics ----------
+// -------------------------------------------------------------------------
+// Analytics & Locking
+// -------------------------------------------------------------------------
+
 func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error) {
 	where := "i.company_id = $1 AND i.status NOT IN ('cancelled', 'draft')"
 	args := []interface{}{companyID}
@@ -512,10 +578,13 @@ func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DB
 		idx++
 	}
 	query := fmt.Sprintf(`
-		SELECT sr.sales_rep_id, sr.company_id, sr.user_id, sr.code, sr.name,
-		       sr.email, sr.phone, sr.is_active,
-		       sr.created_at, sr.updated_at, sr.created_by, sr.updated_by,
-		       COALESCE(SUM(i.grand_total), 0) as total_revenue
+		SELECT 
+			sr.sales_rep_id, sr.company_id, sr.user_id, sr.code, sr.name,
+			sr.email, sr.email_dek, sr.email_key_id,
+			sr.phone, sr.phone_dek, sr.phone_key_id,
+			sr.is_active, sr.created_at, sr.updated_at, sr.created_by, sr.updated_by,
+			sr.email_hash,
+			COALESCE(SUM(i.grand_total), 0) as total_revenue
 		FROM sales.sales_reps sr
 		LEFT JOIN sales.invoices i ON sr.sales_rep_id = i.sales_rep_id
 		WHERE %s
@@ -537,8 +606,10 @@ func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DB
 		var totalRevenue decimal.Decimal
 		err := rows.Scan(
 			&rep.SalesRepID, &rep.CompanyID, &rep.UserID, &rep.Code, &rep.Name,
-			&rep.Email, &rep.Phone, &rep.IsActive,
-			&rep.CreatedAt, &rep.UpdatedAt, &rep.CreatedBy, &rep.UpdatedBy,
+			&rep.EmailEncrypted, &rep.EmailDEK, &rep.EmailKeyID,
+			&rep.PhoneEncrypted, &rep.PhoneDEK, &rep.PhoneKeyID,
+			&rep.IsActive, &rep.CreatedAt, &rep.UpdatedAt, &rep.CreatedBy, &rep.UpdatedBy,
+			&rep.EmailHash,
 			&totalRevenue,
 		)
 		if err != nil {
@@ -549,12 +620,14 @@ func (r *salesRepRepository) GetTopSalesRepsByRevenue(ctx context.Context, db DB
 	return result, rows.Err()
 }
 
-// ---------- Concurrency / Locking ----------
 func (r *salesRepRepository) GetByIDForUpdate(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID) (*models.SalesRep, error) {
 	query := `
-		SELECT sales_rep_id, company_id, user_id, code, name,
-		       email, phone, is_active,
-		       created_at, updated_at, created_by, updated_by
+		SELECT 
+			sales_rep_id, company_id, user_id, code, name,
+			email, email_dek, email_key_id,
+			phone, phone_dek, phone_key_id,
+			is_active, created_at, updated_at, created_by, updated_by,
+			email_hash
 		FROM sales.sales_reps
 		WHERE company_id = $1 AND sales_rep_id = $2
 		FOR UPDATE
@@ -562,12 +635,14 @@ func (r *salesRepRepository) GetByIDForUpdate(ctx context.Context, db DBTX, comp
 	row := db.QueryRowContext(ctx, query, companyID, salesRepID)
 	return r.scanSalesRep(row)
 }
-func (r *salesRepRepository) ExistsByUserID(ctx context.Context, db DBTX, companyID, userID uuid.UUID) (bool, error) {
+
+// UserExists checks if a user exists in the users table (partitioned by user_id)
+func (r *salesRepRepository) UserExists(ctx context.Context, db DBTX, userID uuid.UUID) (bool, error) {
 	var exists bool
-	query := `SELECT EXISTS(SELECT 1 FROM sales.sales_reps WHERE company_id = $1 AND user_id = $2)`
-	err := db.QueryRowContext(ctx, query, companyID, userID).Scan(&exists)
+	query := `SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)`
+	err := db.QueryRowContext(ctx, query, userID).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("exists by user_id: %w", err)
+		return false, fmt.Errorf("check user existence: %w", err)
 	}
 	return exists, nil
 }

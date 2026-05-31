@@ -34,7 +34,6 @@ func NewCommissionHandler(commissionService service.SalesRepCommissionService, l
 // ---------- Request/Response Types ----------
 
 type createCommissionPlanRequest struct {
-	CompanyID     string                `json:"company_id"`
 	Code          string                `json:"code"`
 	Name          string                `json:"name"`
 	Description   *string               `json:"description,omitempty"`
@@ -77,7 +76,6 @@ type updateCommissionPlanRequest struct {
 }
 
 type createCommissionRuleRequest struct {
-	CompanyID    string  `json:"company_id"`
 	PlanID       string  `json:"plan_id"`
 	RuleType     string  `json:"rule_type"`
 	AppliesTo    string  `json:"applies_to"`
@@ -136,7 +134,6 @@ type calculatePeriodRequest struct {
 }
 
 type previewCommissionRequest struct {
-	CompanyID     string `json:"company_id"`
 	SalesRepID    string `json:"sales_rep_id"`
 	ReferenceType string `json:"reference_type"`
 	ReferenceID   string `json:"reference_id"`
@@ -151,7 +148,6 @@ type previewCommissionResponse struct {
 }
 
 type createCommissionRecordRequest struct {
-	CompanyID        string `json:"company_id"`
 	SalesRepID       string `json:"sales_rep_id"`
 	ReferenceType    string `json:"reference_type"`
 	ReferenceID      string `json:"reference_id"`
@@ -262,17 +258,18 @@ func (h *CommissionHandler) CreateCommissionPlan(w http.ResponseWriter, r *http.
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCommissionPlanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	if req.Code == "" || req.Name == "" {
 		h.respondWithError(w, http.StatusBadRequest, "code and name are required")
 		return
@@ -345,7 +342,6 @@ func (h *CommissionHandler) CreateCommissionPlan(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -396,14 +392,9 @@ func (h *CommissionHandler) UpdateCommissionPlan(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -452,7 +443,6 @@ func (h *CommissionHandler) UpdateCommissionPlan(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -489,14 +479,9 @@ func (h *CommissionHandler) DeleteCommissionPlan(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -506,7 +491,6 @@ func (h *CommissionHandler) DeleteCommissionPlan(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -536,14 +520,9 @@ func (h *CommissionHandler) GetCommissionPlanByID(w http.ResponseWriter, r *http
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -576,16 +555,12 @@ func (h *CommissionHandler) GetCommissionPlanByID(w http.ResponseWriter, r *http
 func (h *CommissionHandler) GetCommissionPlanByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	code := r.URL.Query().Get("code")
 	if code == "" {
 		h.respondWithError(w, http.StatusBadRequest, "code query parameter is required")
@@ -621,14 +596,9 @@ func (h *CommissionHandler) GetCommissionPlanByCode(w http.ResponseWriter, r *ht
 func (h *CommissionHandler) ListCommissionPlans(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -715,16 +685,12 @@ func (h *CommissionHandler) ListCommissionPlans(w http.ResponseWriter, r *http.R
 func (h *CommissionHandler) GetActiveCommissionPlans(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	atStr := r.URL.Query().Get("at")
 	var at time.Time
 	if atStr == "" {
@@ -776,17 +742,18 @@ func (h *CommissionHandler) CreateCommissionRule(w http.ResponseWriter, r *http.
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCommissionRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	planID, err := uuid.Parse(req.PlanID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid plan_id")
@@ -830,7 +797,6 @@ func (h *CommissionHandler) CreateCommissionRule(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -882,14 +848,9 @@ func (h *CommissionHandler) UpdateCommissionRule(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -967,7 +928,6 @@ func (h *CommissionHandler) UpdateCommissionRule(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1004,14 +964,9 @@ func (h *CommissionHandler) DeleteCommissionRule(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1021,7 +976,6 @@ func (h *CommissionHandler) DeleteCommissionRule(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1051,14 +1005,9 @@ func (h *CommissionHandler) GetCommissionRuleByID(w http.ResponseWriter, r *http
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1091,16 +1040,12 @@ func (h *CommissionHandler) GetCommissionRuleByID(w http.ResponseWriter, r *http
 func (h *CommissionHandler) GetCommissionRules(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	planIDStr := r.URL.Query().Get("plan_id")
 	if planIDStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "plan_id query parameter is required")
@@ -1158,14 +1103,9 @@ func (h *CommissionHandler) AssignCommissionPlan(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1191,7 +1131,6 @@ func (h *CommissionHandler) AssignCommissionPlan(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1227,14 +1166,9 @@ func (h *CommissionHandler) RemoveCommissionPlan(w http.ResponseWriter, r *http.
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1244,7 +1178,6 @@ func (h *CommissionHandler) RemoveCommissionPlan(w http.ResponseWriter, r *http.
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1274,16 +1207,12 @@ func (h *CommissionHandler) GetSalesRepCommissionPlan(w http.ResponseWriter, r *
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	atStr := r.URL.Query().Get("at")
 	var at time.Time
 	if atStr == "" {
@@ -1345,14 +1274,9 @@ func (h *CommissionHandler) CalculateOrderCommission(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1361,7 +1285,6 @@ func (h *CommissionHandler) CalculateOrderCommission(w http.ResponseWriter, r *h
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1404,14 +1327,9 @@ func (h *CommissionHandler) CalculateInvoiceCommission(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1420,7 +1338,6 @@ func (h *CommissionHandler) CalculateInvoiceCommission(w http.ResponseWriter, r 
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1463,14 +1380,9 @@ func (h *CommissionHandler) CalculatePaymentCommission(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1479,7 +1391,6 @@ func (h *CommissionHandler) CalculatePaymentCommission(w http.ResponseWriter, r 
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1530,14 +1441,9 @@ func (h *CommissionHandler) CalculateCommissionForPeriod(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:read") {
@@ -1546,7 +1452,6 @@ func (h *CommissionHandler) CalculateCommissionForPeriod(w http.ResponseWriter, 
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1582,11 +1487,13 @@ func (h *CommissionHandler) PreviewCommission(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	companyID, err := uuid.Parse(req.CompanyID)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	salesRepID, err := uuid.Parse(req.SalesRepID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales_rep_id")
@@ -1615,7 +1522,6 @@ func (h *CommissionHandler) PreviewCommission(w http.ResponseWriter, r *http.Req
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1651,6 +1557,7 @@ func (h *CommissionHandler) PreviewCommission(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// ProcessOrderCompletedCommission handles POST /commissions/process-order
 func (h *CommissionHandler) ProcessOrderCompletedCommission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1672,14 +1579,9 @@ func (h *CommissionHandler) ProcessOrderCompletedCommission(w http.ResponseWrite
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1688,7 +1590,6 @@ func (h *CommissionHandler) ProcessOrderCompletedCommission(w http.ResponseWrite
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1731,14 +1632,9 @@ func (h *CommissionHandler) ProcessInvoicePaidCommission(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1747,7 +1643,6 @@ func (h *CommissionHandler) ProcessInvoicePaidCommission(w http.ResponseWriter, 
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1790,14 +1685,9 @@ func (h *CommissionHandler) ProcessPaymentReceivedCommission(w http.ResponseWrit
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1806,7 +1696,6 @@ func (h *CommissionHandler) ProcessPaymentReceivedCommission(w http.ResponseWrit
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1842,14 +1731,9 @@ func (h *CommissionHandler) RecalculateCommission(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1858,7 +1742,6 @@ func (h *CommissionHandler) RecalculateCommission(w http.ResponseWriter, r *http
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1899,14 +1782,9 @@ func (h *CommissionHandler) ReverseCommission(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -1915,7 +1793,6 @@ func (h *CommissionHandler) ReverseCommission(w http.ResponseWriter, r *http.Req
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -1947,17 +1824,18 @@ func (h *CommissionHandler) CreateCommissionRecord(w http.ResponseWriter, r *htt
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCommissionRecordRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	salesRepID, err := uuid.Parse(req.SalesRepID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales_rep_id")
@@ -1996,7 +1874,6 @@ func (h *CommissionHandler) CreateCommissionRecord(w http.ResponseWriter, r *htt
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2047,14 +1924,9 @@ func (h *CommissionHandler) UpdateCommissionRecord(w http.ResponseWriter, r *htt
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2105,7 +1977,6 @@ func (h *CommissionHandler) UpdateCommissionRecord(w http.ResponseWriter, r *htt
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2136,14 +2007,9 @@ func (h *CommissionHandler) GetCommissionByID(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2176,16 +2042,12 @@ func (h *CommissionHandler) GetCommissionByID(w http.ResponseWriter, r *http.Req
 func (h *CommissionHandler) GetCommissionByReference(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	refTypeStr := r.URL.Query().Get("reference_type")
 	if refTypeStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "reference_type query parameter is required")
@@ -2235,14 +2097,9 @@ func (h *CommissionHandler) GetCommissionByReference(w http.ResponseWriter, r *h
 func (h *CommissionHandler) ListCommissions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2349,16 +2206,12 @@ func (h *CommissionHandler) GetSalesRepCommissions(w http.ResponseWriter, r *htt
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2444,14 +2297,9 @@ func (h *CommissionHandler) MarkCommissionPending(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -2460,7 +2308,6 @@ func (h *CommissionHandler) MarkCommissionPending(w http.ResponseWriter, r *http
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2495,14 +2342,9 @@ func (h *CommissionHandler) ApproveCommission(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -2511,7 +2353,6 @@ func (h *CommissionHandler) ApproveCommission(w http.ResponseWriter, r *http.Req
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2552,14 +2393,9 @@ func (h *CommissionHandler) RejectCommission(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -2568,7 +2404,6 @@ func (h *CommissionHandler) RejectCommission(w http.ResponseWriter, r *http.Requ
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2614,14 +2449,9 @@ func (h *CommissionHandler) MarkCommissionPaid(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "commission:write") {
@@ -2630,7 +2460,6 @@ func (h *CommissionHandler) MarkCommissionPaid(w http.ResponseWriter, r *http.Re
 	}
 
 	idempotencyKey := h.getIdempotencyKey(r)
-
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
@@ -2654,14 +2483,9 @@ func (h *CommissionHandler) MarkCommissionPaid(w http.ResponseWriter, r *http.Re
 func (h *CommissionHandler) GetPendingCommissions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2696,14 +2520,9 @@ func (h *CommissionHandler) GetPendingCommissions(w http.ResponseWriter, r *http
 func (h *CommissionHandler) GetApprovedCommissions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2738,14 +2557,9 @@ func (h *CommissionHandler) GetApprovedCommissions(w http.ResponseWriter, r *htt
 func (h *CommissionHandler) GetUnpaidCommissions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2780,16 +2594,12 @@ func (h *CommissionHandler) GetUnpaidCommissions(w http.ResponseWriter, r *http.
 func (h *CommissionHandler) GetTotalCommissionAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2833,16 +2643,12 @@ func (h *CommissionHandler) GetTotalCommissionAmount(w http.ResponseWriter, r *h
 func (h *CommissionHandler) GetTotalPaidCommission(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -2886,14 +2692,9 @@ func (h *CommissionHandler) GetTotalPaidCommission(w http.ResponseWriter, r *htt
 func (h *CommissionHandler) GetOutstandingCommissionLiability(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2926,16 +2727,12 @@ func (h *CommissionHandler) GetOutstandingCommissionLiability(w http.ResponseWri
 func (h *CommissionHandler) GetTopSalesRepCommissions(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	limit := 10
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -2993,16 +2790,12 @@ func (h *CommissionHandler) GetCommissionSummaryBySalesRep(w http.ResponseWriter
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -3055,16 +2848,12 @@ func (h *CommissionHandler) GetCommissionSummaryBySalesRep(w http.ResponseWriter
 func (h *CommissionHandler) GetCommissionTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
 		t, err := time.Parse(time.RFC3339, fromStr)
@@ -3118,14 +2907,9 @@ func (h *CommissionHandler) CommissionPlanExists(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "invalid plan ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3160,14 +2944,9 @@ func (h *CommissionHandler) CommissionRuleExists(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "invalid rule ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3202,14 +2981,9 @@ func (h *CommissionHandler) CommissionRecordExists(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "invalid commission ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3239,16 +3013,12 @@ func (h *CommissionHandler) CommissionRecordExists(w http.ResponseWriter, r *htt
 func (h *CommissionHandler) CommissionAlreadyGenerated(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	refTypeStr := r.URL.Query().Get("reference_type")
 	if refTypeStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "reference_type query parameter is required")

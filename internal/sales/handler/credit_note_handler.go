@@ -1,3 +1,4 @@
+// file: internal/sales/handler/credit_note_handler.go
 package handler
 
 import (
@@ -24,14 +25,13 @@ type CreditNoteHandler struct {
 func NewCreditNoteHandler(creditNoteService service.CreditNoteService, logger *zap.Logger) *CreditNoteHandler {
 	return &CreditNoteHandler{
 		creditNoteService: creditNoteService,
-		BaseHandler:       &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:       &BaseHandler{logger: logger.Named("credit_note_handler")},
 	}
 }
 
 // Request/Response types
 
 type createCreditNoteRequest struct {
-	CompanyID      string                        `json:"company_id"`
 	CustomerID     string                        `json:"customer_id"`
 	CreditNoteDate string                        `json:"credit_note_date"` // was IssueDate
 	Currency       *string                       `json:"currency,omitempty"`
@@ -45,8 +45,6 @@ type createCreditNoteItemRequest struct {
 	Quantity  string  `json:"quantity"`
 	UnitPrice string  `json:"unit_price"`
 	TaxRate   *string `json:"tax_rate,omitempty"`
-	// InvoiceItemID is not needed for direct creation
-	// ProductNameSnapshot and Metadata are removed (service fetches product name)
 }
 
 type createCreditNoteFromInvoiceRequest struct {
@@ -65,7 +63,6 @@ type createCreditNoteFromReturnRequest struct {
 type updateCreditNoteRequest struct {
 	Reason *string `json:"reason,omitempty"`
 	Notes  *string `json:"notes,omitempty"`
-	// Currency and IssueDate removed – not supported by service
 }
 
 type creditNoteResponse struct {
@@ -150,7 +147,6 @@ type creditNoteApplicationRequest struct {
 type convertToRefundRequest struct {
 	PaymentID string `json:"payment_id"`
 	Reason    string `json:"reason"`
-	// PaymentMethod and Notes removed – not in service request
 }
 
 type listCreditNotesResponse struct {
@@ -176,8 +172,6 @@ type creditNoteTotalsResponse struct {
 	TotalAmount     string `json:"total_amount"`
 	RemainingAmount string `json:"remaining_amount"`
 }
-
-// Helper functions
 
 // Conversion helpers
 
@@ -281,20 +275,20 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCreditNoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.CustomerID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id and customer_id are required")
-		return
-	}
-
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.CustomerID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "customer_id is required")
 		return
 	}
 
@@ -351,7 +345,6 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 			Quantity:  quantity,
 			UnitPrice: unitPrice,
 			TaxRate:   taxRate,
-			// InvoiceItemID is not used for direct creation
 		}
 	}
 
@@ -365,7 +358,7 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey // service does not use it; keep for consistency
+	_ = idempotencyKey
 
 	svcReq := &service.CreateCreditNoteRequest{
 		CompanyID:      companyID,
@@ -403,6 +396,12 @@ func (h *CreditNoteHandler) CreateFromInvoice(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCreditNoteFromInvoiceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -417,17 +416,6 @@ func (h *CreditNoteHandler) CreateFromInvoice(w http.ResponseWriter, r *http.Req
 	invoiceID, err := uuid.Parse(req.InvoiceID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid invoice_id")
-		return
-	}
-
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 
@@ -483,6 +471,12 @@ func (h *CreditNoteHandler) CreateFromReturn(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCreditNoteFromReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -497,17 +491,6 @@ func (h *CreditNoteHandler) CreateFromReturn(w http.ResponseWriter, r *http.Requ
 	returnID, err := uuid.Parse(req.ReturnID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return_id")
-		return
-	}
-
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
 		return
 	}
 
@@ -558,14 +541,9 @@ func (h *CreditNoteHandler) UpdateCreditNote(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -621,14 +599,9 @@ func (h *CreditNoteHandler) DeleteCreditNote(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -666,14 +639,9 @@ func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -704,14 +672,9 @@ func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Req
 
 func (h *CreditNoteHandler) GetCreditNoteByNumber(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -748,14 +711,9 @@ func (h *CreditNoteHandler) GetCreditNoteByNumber(w http.ResponseWriter, r *http
 
 func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -852,14 +810,9 @@ func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Reque
 
 func (h *CreditNoteHandler) SearchCreditNotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	query := r.URL.Query().Get("q")
@@ -930,14 +883,9 @@ func (h *CreditNoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1018,14 +966,9 @@ func (h *CreditNoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1107,14 +1050,9 @@ func (h *CreditNoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1148,14 +1086,9 @@ func (h *CreditNoteHandler) GetCreditNoteItems(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1196,14 +1129,9 @@ func (h *CreditNoteHandler) CalculateTotals(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1237,23 +1165,26 @@ func (h *CreditNoteHandler) PreviewTotals(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var req service.CreditNotePreviewRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.CompanyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "company_id required")
 		return
 	}
 	if req.CustomerID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "customer_id required")
 		return
 	}
-	if !h.hasPermission(ctx, req.CompanyID, userID, "credit_note:read") {
+	if !h.hasPermission(ctx, companyID, userID, "credit_note:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
+	// Override company ID from header
+	req.CompanyID = companyID
 	result, err := h.creditNoteService.PreviewTotals(ctx, &req)
 	if err != nil {
 		h.logger.Error("failed to preview totals", zap.Error(err))
@@ -1274,14 +1205,9 @@ func (h *CreditNoteHandler) GetCreditNoteTotals(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1324,14 +1250,9 @@ func (h *CreditNoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1380,14 +1301,9 @@ func (h *CreditNoteHandler) IssueCreditNote(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1426,14 +1342,9 @@ func (h *CreditNoteHandler) VoidCreditNote(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1477,14 +1388,9 @@ func (h *CreditNoteHandler) MarkFullyApplied(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1523,14 +1429,9 @@ func (h *CreditNoteHandler) ApplyToInvoice(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1584,14 +1485,9 @@ func (h *CreditNoteHandler) ApplyToInvoices(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1656,14 +1552,9 @@ func (h *CreditNoteHandler) AutoApplyToOutstandingInvoices(w http.ResponseWriter
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1707,14 +1598,9 @@ func (h *CreditNoteHandler) RemoveApplication(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -1748,14 +1634,9 @@ func (h *CreditNoteHandler) GetApplications(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1791,14 +1672,9 @@ func (h *CreditNoteHandler) GetRemainingBalance(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1830,14 +1706,9 @@ func (h *CreditNoteHandler) IsFullyApplied(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1869,14 +1740,9 @@ func (h *CreditNoteHandler) GetCustomerCreditBalance(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1908,14 +1774,9 @@ func (h *CreditNoteHandler) GetUnusedCreditNotes(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1964,14 +1825,9 @@ func (h *CreditNoteHandler) ConvertToRefund(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
@@ -2026,14 +1882,9 @@ func (h *CreditNoteHandler) ConvertToRefund(w http.ResponseWriter, r *http.Reque
 
 func (h *CreditNoteHandler) GetTotalCreditIssued(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2072,14 +1923,9 @@ func (h *CreditNoteHandler) GetTotalCreditIssued(w http.ResponseWriter, r *http.
 
 func (h *CreditNoteHandler) GetTotalCreditApplied(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2118,14 +1964,9 @@ func (h *CreditNoteHandler) GetTotalCreditApplied(w http.ResponseWriter, r *http
 
 func (h *CreditNoteHandler) GetOutstandingCredits(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2156,14 +1997,9 @@ func (h *CreditNoteHandler) CreditNoteExists(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2189,14 +2025,9 @@ func (h *CreditNoteHandler) CreditNoteExists(w http.ResponseWriter, r *http.Requ
 
 func (h *CreditNoteHandler) CreditNoteNumberExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	number := r.URL.Query().Get("number")

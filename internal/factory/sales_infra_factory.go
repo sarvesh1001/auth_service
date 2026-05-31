@@ -658,12 +658,12 @@ func (f *SalesInfraFactory) SalesRepService() service.SalesRepService {
 			f.outboxRepo,
 			f.idempotencyStore,
 			f.auditService,
+			f.encryptionMgr, // <-- ADDED
 			f.logger,
 		)
 	}
 	return f.salesRepService
 }
-
 func (f *SalesInfraFactory) TaxIntegrationService() service.TaxIntegrationService {
 	if f.taxIntegrationService == nil {
 		f.taxIntegrationService = service.NewTaxIntegrationService(

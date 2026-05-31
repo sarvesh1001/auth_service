@@ -27,14 +27,13 @@ type OrderHandler struct {
 func NewOrderHandler(orderService service.OrderService, logger *zap.Logger) *OrderHandler {
 	return &OrderHandler{
 		orderService: orderService,
-		BaseHandler:  &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:  &BaseHandler{logger: logger.Named("order_handler")},
 	}
 }
 
-// ---------- Request/Response Types ----------
+// ---------- Request/Response Types (CompanyID removed where present) ----------
 
 type createOrderRequest struct {
-	CompanyID       string                   `json:"company_id"`
 	CustomerID      string                   `json:"customer_id"`
 	OrderNumber     *string                  `json:"order_number,omitempty"`
 	ExternalRef     *string                  `json:"external_ref,omitempty"`
@@ -118,8 +117,7 @@ type replaceItemsRequest struct {
 }
 
 type previewPricingRequest struct {
-	CompanyID  string               `json:"company_id"`
-	CustomerID string               `json:"customer_id"`
+	CustomerID string               `json:"customer_id"` // company_id removed
 	Items      []previewPricingItem `json:"items"`
 }
 
@@ -186,6 +184,13 @@ func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Get company from header
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -193,15 +198,6 @@ func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Validation
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	customerID, err := uuid.Parse(req.CustomerID)
 	if err != nil || customerID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
@@ -289,6 +285,12 @@ func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
 	svcReq := &service.CreateOrderRequest{
 		CustomerID:      customerID,
 		OrderNumber:     orderNumber,
@@ -335,7 +337,7 @@ func (h *OrderHandler) UpdateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -381,6 +383,12 @@ func (h *OrderHandler) UpdateOrder(w http.ResponseWriter, r *http.Request) {
 		BillingAddress:  billingAddress,
 	}
 
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
 	updated, err := h.orderService.UpdateOrder(ctx, companyID, orderID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update order", zap.Error(err))
@@ -412,7 +420,7 @@ func (h *OrderHandler) DeleteOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -420,6 +428,12 @@ func (h *OrderHandler) DeleteOrder(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -447,7 +461,7 @@ func (h *OrderHandler) GetOrderByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -483,7 +497,7 @@ func (h *OrderHandler) GetOrderByID(w http.ResponseWriter, r *http.Request) {
 func (h *OrderHandler) GetOrderByNumber(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -525,7 +539,7 @@ func (h *OrderHandler) GetOrderByNumber(w http.ResponseWriter, r *http.Request) 
 func (h *OrderHandler) ListOrders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -542,7 +556,6 @@ func (h *OrderHandler) ListOrders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build filter
 	filter := service.OrderListFilter{
 		CompanyID: companyID,
 	}
@@ -558,13 +571,10 @@ func (h *OrderHandler) ListOrders(w http.ResponseWriter, r *http.Request) {
 			filter.Status = &status
 		}
 	}
-	// Note: From/To date filters are not present in OrderListFilter, so they are omitted.
-	// If needed, they can be added after checking the actual struct definition.
 	if search := r.URL.Query().Get("search"); search != "" {
 		filter.Search = &search
 	}
 
-	// Pagination -> limit/offset
 	limit := 20
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -579,7 +589,6 @@ func (h *OrderHandler) ListOrders(w http.ResponseWriter, r *http.Request) {
 	}
 	pagination := service.Pagination{Limit: limit, Offset: offset}
 
-	// Sorting
 	sort := service.Sort{
 		Field:     r.URL.Query().Get("sort_field"),
 		Direction: r.URL.Query().Get("sort_dir"),
@@ -627,7 +636,7 @@ func (h *OrderHandler) ListOrders(w http.ResponseWriter, r *http.Request) {
 func (h *OrderHandler) SearchOrders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -699,7 +708,7 @@ func (h *OrderHandler) SearchOrders(w http.ResponseWriter, r *http.Request) {
 func (h *OrderHandler) GetOrdersByCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -800,7 +809,7 @@ func (h *OrderHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -854,6 +863,12 @@ func (h *OrderHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
 	err = h.orderService.AddItems(ctx, companyID, orderID, items, userID)
 	if err != nil {
 		h.logger.Error("failed to add items", zap.Error(err))
@@ -884,7 +899,7 @@ func (h *OrderHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -938,6 +953,12 @@ func (h *OrderHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
 	err = h.orderService.ReplaceItems(ctx, companyID, orderID, items, userID)
 	if err != nil {
 		h.logger.Error("failed to replace items", zap.Error(err))
@@ -974,7 +995,7 @@ func (h *OrderHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -982,6 +1003,12 @@ func (h *OrderHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1009,7 +1036,7 @@ func (h *OrderHandler) GetOrderItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1078,7 +1105,7 @@ func (h *OrderHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1096,6 +1123,12 @@ func (h *OrderHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CouponCode == "" {
 		h.respondWithError(w, http.StatusBadRequest, "coupon_code is required")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1140,7 +1173,7 @@ func (h *OrderHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1148,6 +1181,12 @@ func (h *OrderHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1181,7 +1220,7 @@ func (h *OrderHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1189,6 +1228,12 @@ func (h *OrderHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1207,8 +1252,6 @@ func (h *OrderHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request
 }
 
 // PreviewPricing handles POST /orders/preview-pricing
-// PreviewPricing handles POST /orders/preview-pricing
-// PreviewPricing handles POST /orders/preview-pricing
 func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1218,17 +1261,18 @@ func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req previewPricingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	customerID, err := uuid.Parse(req.CustomerID)
 	if err != nil || customerID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
@@ -1244,7 +1288,7 @@ func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build preview items using a local struct then marshal to match service expectation
+	// Build preview items
 	type previewItem struct {
 		ProductID uuid.UUID       `json:"product_id"`
 		Quantity  decimal.Decimal `json:"quantity"`
@@ -1267,7 +1311,6 @@ func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Convert to the service's request type
 	previewReqJSON, _ := json.Marshal(map[string]interface{}{
 		"company_id":  companyID,
 		"customer_id": customerID,
@@ -1280,6 +1323,12 @@ func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
 	result, err := h.orderService.PreviewPricing(ctx, &previewReq)
 	if err != nil {
 		h.logger.Error("failed to preview pricing", zap.Error(err))
@@ -1288,7 +1337,6 @@ func (h *OrderHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return only totals (discount details omitted because the service result does not expose them in a simple format)
 	resp := previewPricingResponse{
 		Subtotal:      result.Subtotal.String(),
 		DiscountTotal: result.DiscountTotal.String(),
@@ -1318,7 +1366,7 @@ func (h *OrderHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1326,6 +1374,12 @@ func (h *OrderHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request)
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1353,7 +1407,7 @@ func (h *OrderHandler) GetOrderTotals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1407,7 +1461,7 @@ func (h *OrderHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1430,6 +1484,12 @@ func (h *OrderHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	newStatus := enums.OrderStatus(req.Status)
 	if !newStatus.IsValid() {
 		h.respondWithError(w, http.StatusBadRequest, "invalid status value")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1463,7 +1523,7 @@ func (h *OrderHandler) ConfirmOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1471,6 +1531,12 @@ func (h *OrderHandler) ConfirmOrder(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1504,7 +1570,7 @@ func (h *OrderHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1512,6 +1578,12 @@ func (h *OrderHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1545,7 +1617,7 @@ func (h *OrderHandler) MarkShipped(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1568,6 +1640,12 @@ func (h *OrderHandler) MarkShipped(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, "invalid shipped_at format")
 			return
 		}
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
 	}
 
 	err = h.orderService.MarkShipped(ctx, companyID, orderID, shippedAt, userID)
@@ -1600,7 +1678,7 @@ func (h *OrderHandler) MarkDelivered(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1623,6 +1701,12 @@ func (h *OrderHandler) MarkDelivered(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, "invalid delivered_at format")
 			return
 		}
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
 	}
 
 	err = h.orderService.MarkDelivered(ctx, companyID, orderID, deliveredAt, userID)
@@ -1655,7 +1739,7 @@ func (h *OrderHandler) CancelOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1673,6 +1757,12 @@ func (h *OrderHandler) CancelOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Reason == "" {
 		h.respondWithError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1706,7 +1796,7 @@ func (h *OrderHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1729,6 +1819,12 @@ func (h *OrderHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 	salesRepID, err := uuid.Parse(req.SalesRepID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid sales_rep_id")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1762,7 +1858,7 @@ func (h *OrderHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1770,6 +1866,12 @@ func (h *OrderHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "order:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1791,7 +1893,7 @@ func (h *OrderHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 func (h *OrderHandler) GetPendingOrders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1837,7 +1939,7 @@ func (h *OrderHandler) GetPendingOrders(w http.ResponseWriter, r *http.Request) 
 func (h *OrderHandler) GetOrdersReadyForInvoicing(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1883,7 +1985,7 @@ func (h *OrderHandler) GetOrdersReadyForInvoicing(w http.ResponseWriter, r *http
 func (h *OrderHandler) GetOrderRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1933,7 +2035,7 @@ func (h *OrderHandler) GetOrderRevenue(w http.ResponseWriter, r *http.Request) {
 func (h *OrderHandler) GetAverageOrderValue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1983,7 +2085,7 @@ func (h *OrderHandler) GetAverageOrderValue(w http.ResponseWriter, r *http.Reque
 func (h *OrderHandler) GetTopOrdersByValue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2055,7 +2157,7 @@ func (h *OrderHandler) OrderExists(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2084,7 +2186,7 @@ func (h *OrderHandler) HasInvoices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2113,7 +2215,7 @@ func (h *OrderHandler) HasReturns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := h.parseCompanyIDFromQuery(r)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return

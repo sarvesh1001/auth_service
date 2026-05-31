@@ -23,16 +23,15 @@ type TaxHandler struct {
 func NewTaxHandler(taxService service.TaxIntegrationService, logger *zap.Logger) *TaxHandler {
 	return &TaxHandler{
 		taxService:  taxService,
-		BaseHandler: &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler: &BaseHandler{logger: logger.Named("tax_handler")},
 	}
 }
 
 // ---------------------------------------------------------------------
-// Request/Response types
+// Request/Response types (company_id removed from request bodies)
 // ---------------------------------------------------------------------
 
 type calculateOrderTaxRequest struct {
-	CompanyID      string                   `json:"company_id"`
 	OrderID        string                   `json:"order_id"`
 	LineItems      []*service.LineItemInput `json:"line_items,omitempty"`
 	CustomerID     *string                  `json:"customer_id,omitempty"`
@@ -40,7 +39,6 @@ type calculateOrderTaxRequest struct {
 }
 
 type calculateQuoteTaxRequest struct {
-	CompanyID      string                   `json:"company_id"`
 	QuoteID        string                   `json:"quote_id"`
 	LineItems      []*service.LineItemInput `json:"line_items,omitempty"`
 	CustomerID     *string                  `json:"customer_id,omitempty"`
@@ -48,7 +46,6 @@ type calculateQuoteTaxRequest struct {
 }
 
 type calculateInvoiceTaxRequest struct {
-	CompanyID      string                   `json:"company_id"`
 	InvoiceID      string                   `json:"invoice_id"`
 	LineItems      []*service.LineItemInput `json:"line_items,omitempty"`
 	CustomerID     *string                  `json:"customer_id,omitempty"`
@@ -56,7 +53,6 @@ type calculateInvoiceTaxRequest struct {
 }
 
 type calculateReturnTaxRequest struct {
-	CompanyID      string                   `json:"company_id"`
 	ReturnID       string                   `json:"return_id"`
 	LineItems      []*service.LineItemInput `json:"line_items,omitempty"`
 	CustomerID     *string                  `json:"customer_id,omitempty"`
@@ -64,7 +60,6 @@ type calculateReturnTaxRequest struct {
 }
 
 type calculateLineTaxRequest struct {
-	CompanyID      string  `json:"company_id"`
 	ProductID      string  `json:"product_id"`
 	LineAmount     string  `json:"line_amount"`
 	TaxableAmount  string  `json:"taxable_amount"`
@@ -74,7 +69,6 @@ type calculateLineTaxRequest struct {
 }
 
 type taxPreviewRequest struct {
-	CompanyID      string                   `json:"company_id"`
 	LineItems      []*service.LineItemInput `json:"line_items"`
 	CustomerID     *string                  `json:"customer_id,omitempty"`
 	BillingAddress *service.AddressInput    `json:"billing_address,omitempty"`
@@ -110,7 +104,6 @@ type taxBreakdownLineResponse struct {
 }
 
 type createTaxSnapshotRequest struct {
-	CompanyID     string  `json:"company_id"`
 	EntityType    string  `json:"entity_type"`
 	EntityID      string  `json:"entity_id"`
 	LineID        *string `json:"line_id,omitempty"`
@@ -146,9 +139,16 @@ type taxSnapshotResponse struct {
 // POST /tax/calculate-order
 func (h *TaxHandler) CalculateOrderTaxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -158,11 +158,6 @@ func (h *TaxHandler) CalculateOrderTaxes(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	orderID, err := uuid.Parse(req.OrderID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid order_id")
@@ -209,9 +204,16 @@ func (h *TaxHandler) CalculateOrderTaxes(w http.ResponseWriter, r *http.Request)
 // POST /tax/calculate-quote
 func (h *TaxHandler) CalculateQuoteTaxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -221,11 +223,6 @@ func (h *TaxHandler) CalculateQuoteTaxes(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	quoteID, err := uuid.Parse(req.QuoteID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote_id")
@@ -272,9 +269,16 @@ func (h *TaxHandler) CalculateQuoteTaxes(w http.ResponseWriter, r *http.Request)
 // POST /tax/calculate-invoice
 func (h *TaxHandler) CalculateInvoiceTaxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -284,11 +288,6 @@ func (h *TaxHandler) CalculateInvoiceTaxes(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	invoiceID, err := uuid.Parse(req.InvoiceID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid invoice_id")
@@ -335,9 +334,16 @@ func (h *TaxHandler) CalculateInvoiceTaxes(w http.ResponseWriter, r *http.Reques
 // POST /tax/calculate-return
 func (h *TaxHandler) CalculateReturnTaxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -347,11 +353,6 @@ func (h *TaxHandler) CalculateReturnTaxes(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	returnID, err := uuid.Parse(req.ReturnID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return_id")
@@ -398,9 +399,16 @@ func (h *TaxHandler) CalculateReturnTaxes(w http.ResponseWriter, r *http.Request
 // POST /tax/calculate-line
 func (h *TaxHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -410,11 +418,6 @@ func (h *TaxHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	productID, err := uuid.Parse(req.ProductID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product_id")
@@ -476,9 +479,16 @@ func (h *TaxHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) {
 // POST /tax/preview
 func (h *TaxHandler) PreviewTaxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -488,11 +498,6 @@ func (h *TaxHandler) PreviewTaxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	var customerID *uuid.UUID
 	if req.CustomerID != nil && *req.CustomerID != "" {
 		parsed, err := uuid.Parse(*req.CustomerID)
@@ -547,26 +552,27 @@ func (h *TaxHandler) ApplyTaxesToInvoice(w http.ResponseWriter, r *http.Request)
 // generic apply handler
 func (h *TaxHandler) applyTaxesToEntity(w http.ResponseWriter, r *http.Request, entityType string) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var body struct {
-		CompanyID string `json:"company_id"`
-		EntityID  string `json:"entity_id"`
+		EntityID string `json:"entity_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(body.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	entityID, err := uuid.Parse(body.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
@@ -622,26 +628,27 @@ func (h *TaxHandler) RefreshInvoiceTaxes(w http.ResponseWriter, r *http.Request)
 
 func (h *TaxHandler) refreshEntityTaxes(w http.ResponseWriter, r *http.Request, entityType string) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var body struct {
-		CompanyID string `json:"company_id"`
-		EntityID  string `json:"entity_id"`
+		EntityID string `json:"entity_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	companyID, err := uuid.Parse(body.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	entityID, err := uuid.Parse(body.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
@@ -680,21 +687,19 @@ func (h *TaxHandler) refreshEntityTaxes(w http.ResponseWriter, r *http.Request, 
 // GET /tax/order-breakdown/{orderId}
 func (h *TaxHandler) GetOrderTaxBreakdown(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	orderID, err := parseUUIDParam(r, "orderId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -722,21 +727,19 @@ func (h *TaxHandler) GetOrderTaxBreakdown(w http.ResponseWriter, r *http.Request
 // GET /tax/invoice-breakdown/{invoiceId}
 func (h *TaxHandler) GetInvoiceTaxBreakdown(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	invoiceID, err := parseUUIDParam(r, "invoiceId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid invoice ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -764,21 +767,19 @@ func (h *TaxHandler) GetInvoiceTaxBreakdown(w http.ResponseWriter, r *http.Reque
 // GET /tax/quote-breakdown/{quoteId}
 func (h *TaxHandler) GetQuoteTaxBreakdown(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	quoteID, err := parseUUIDParam(r, "quoteId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -806,9 +807,16 @@ func (h *TaxHandler) GetQuoteTaxBreakdown(w http.ResponseWriter, r *http.Request
 // POST /tax/snapshots
 func (h *TaxHandler) CreateTaxSnapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -818,11 +826,6 @@ func (h *TaxHandler) CreateTaxSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	entityID, err := uuid.Parse(req.EntityID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
@@ -901,21 +904,19 @@ func (h *TaxHandler) CreateTaxSnapshot(w http.ResponseWriter, r *http.Request) {
 // GET /tax/snapshots/{id}
 func (h *TaxHandler) GetTaxSnapshotByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	snapshotID, err := parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid snapshot ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -943,16 +944,17 @@ func (h *TaxHandler) GetTaxSnapshotByID(w http.ResponseWriter, r *http.Request) 
 // GET /tax/snapshots/latest
 func (h *TaxHandler) GetLatestTaxSnapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	entityType := r.URL.Query().Get("entity_type")
-	entityIDStr := r.URL.Query().Get("entity_id")
-	if companyIDStr == "" || entityType == "" || entityIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, entity_id query parameters are required")
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	entityType := r.URL.Query().Get("entity_type")
+	entityIDStr := r.URL.Query().Get("entity_id")
+	if entityType == "" || entityIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type and entity_id query parameters are required")
 		return
 	}
 	entityID, err := uuid.Parse(entityIDStr)
@@ -960,6 +962,7 @@ func (h *TaxHandler) GetLatestTaxSnapshot(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -987,16 +990,17 @@ func (h *TaxHandler) GetLatestTaxSnapshot(w http.ResponseWriter, r *http.Request
 // GET /tax/snapshots
 func (h *TaxHandler) GetTaxSnapshots(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	entityType := r.URL.Query().Get("entity_type")
-	entityIDStr := r.URL.Query().Get("entity_id")
-	if companyIDStr == "" || entityType == "" || entityIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, entity_type, entity_id query parameters are required")
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+
+	entityType := r.URL.Query().Get("entity_type")
+	entityIDStr := r.URL.Query().Get("entity_id")
+	if entityType == "" || entityIDStr == "" {
+		h.respondWithError(w, http.StatusBadRequest, "entity_type and entity_id query parameters are required")
 		return
 	}
 	entityID, err := uuid.Parse(entityIDStr)
@@ -1004,6 +1008,7 @@ func (h *TaxHandler) GetTaxSnapshots(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid entity_id")
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -1034,26 +1039,25 @@ func (h *TaxHandler) GetTaxSnapshots(w http.ResponseWriter, r *http.Request) {
 // POST /tax/snapshots/{id}/recalculate
 func (h *TaxHandler) RecalculateTaxSnapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	snapshotID, err := parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid snapshot ID")
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1081,26 +1085,25 @@ func (h *TaxHandler) RecalculateTaxSnapshot(w http.ResponseWriter, r *http.Reque
 // DELETE /tax/snapshots/{id}
 func (h *TaxHandler) ArchiveTaxSnapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	snapshotID, err := parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid snapshot ID")
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if !h.hasPermission(ctx, companyID, userID, "tax:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -1127,21 +1130,19 @@ func (h *TaxHandler) ArchiveTaxSnapshot(w http.ResponseWriter, r *http.Request) 
 // GET /tax/snapshots/{id}/exists
 func (h *TaxHandler) TaxSnapshotExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
 	snapshotID, err := parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid snapshot ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")

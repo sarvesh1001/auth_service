@@ -25,14 +25,13 @@ type PaymentHandler struct {
 func NewPaymentHandler(paymentService service.PaymentService, logger *zap.Logger) *PaymentHandler {
 	return &PaymentHandler{
 		paymentService: paymentService,
-		BaseHandler:    &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:    &BaseHandler{logger: logger.Named("payment_handler")},
 	}
 }
 
-// ---------- Request/Response Types ----------
+// ---------- Request/Response Types (CompanyID removed where present) ----------
 
 type createPaymentRequest struct {
-	CompanyID       string        `json:"company_id"`
 	PaymentNumber   string        `json:"payment_number,omitempty"`
 	ExternalRef     *string       `json:"external_ref,omitempty"`
 	PaymentDate     string        `json:"payment_date"`
@@ -43,7 +42,6 @@ type createPaymentRequest struct {
 }
 
 type registerCashPaymentRequest struct {
-	CompanyID   string                     `json:"company_id"`
 	PaymentDate string                     `json:"payment_date"`
 	Amount      string                     `json:"amount"`
 	Reference   *string                    `json:"reference,omitempty"`
@@ -51,7 +49,6 @@ type registerCashPaymentRequest struct {
 }
 
 type registerCardPaymentRequest struct {
-	CompanyID   string                     `json:"company_id"`
 	PaymentDate string                     `json:"payment_date"`
 	Amount      string                     `json:"amount"`
 	CardLast4   string                     `json:"card_last4"`
@@ -62,7 +59,6 @@ type registerCardPaymentRequest struct {
 }
 
 type registerBankTransferPaymentRequest struct {
-	CompanyID       string                     `json:"company_id"`
 	PaymentDate     string                     `json:"payment_date"`
 	Amount          string                     `json:"amount"`
 	BankName        string                     `json:"bank_name"`
@@ -71,7 +67,6 @@ type registerBankTransferPaymentRequest struct {
 }
 
 type registerChequePaymentRequest struct {
-	CompanyID    string                     `json:"company_id"`
 	PaymentDate  string                     `json:"payment_date"`
 	Amount       string                     `json:"amount"`
 	ChequeNumber string                     `json:"cheque_number"`
@@ -80,7 +75,6 @@ type registerChequePaymentRequest struct {
 }
 
 type registerWalletPaymentRequest struct {
-	CompanyID      string                     `json:"company_id"`
 	PaymentDate    string                     `json:"payment_date"`
 	Amount         string                     `json:"amount"`
 	WalletProvider string                     `json:"wallet_provider"`
@@ -89,7 +83,6 @@ type registerWalletPaymentRequest struct {
 }
 
 type processGatewayPaymentRequest struct {
-	CompanyID      string                     `json:"company_id"`
 	GatewayName    string                     `json:"gateway_name"`
 	GatewayToken   string                     `json:"gateway_token"`
 	Amount         string                     `json:"amount"`
@@ -225,7 +218,7 @@ func (h *PaymentHandler) toPaymentResponse(p *models.Payment) paymentResponse {
 		PaymentMethod:   string(p.PaymentMethod),
 		Status:          string(p.Status),
 		Reference:       p.Reference,
-		GatewayResponse: &p.GatewayResponse, // p.GatewayResponse is models.JSONB, we take pointer
+		GatewayResponse: &p.GatewayResponse,
 		FailureReason:   p.FailureReason,
 		RefundedAmount:  p.RefundedAmount.String(),
 		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
@@ -276,20 +269,20 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createPaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.PaymentDate == "" || req.Amount == "" || req.PaymentMethod == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, payment_date, amount, and payment_method are required")
-		return
-	}
-
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+	if req.PaymentDate == "" || req.Amount == "" || req.PaymentMethod == "" {
+		h.respondWithError(w, http.StatusBadRequest, "payment_date, amount, and payment_method are required")
 		return
 	}
 
@@ -321,7 +314,7 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey // service uses idempotency internally
+	_ = idempotencyKey
 
 	svcReq := &service.CreatePaymentRequest{
 		CompanyID:       companyID,
@@ -331,7 +324,7 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		Amount:          amount,
 		PaymentMethod:   method,
 		Reference:       req.Reference,
-		GatewayResponse: *req.GatewayResponse, // dereference because service expects models.JSONB
+		GatewayResponse: *req.GatewayResponse,
 		CreatedBy:       &userID,
 	}
 
@@ -367,14 +360,9 @@ func (h *PaymentHandler) UpdatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -401,7 +389,6 @@ func (h *PaymentHandler) UpdatePayment(w http.ResponseWriter, r *http.Request) {
 		Reference:   req.Reference,
 		UpdatedBy:   &userID,
 	}
-	// GatewayResponse: service expects models.JSONB (value), handler has *models.JSONB
 	if req.GatewayResponse != nil {
 		svcReq.GatewayResponse = *req.GatewayResponse
 	}
@@ -460,14 +447,9 @@ func (h *PaymentHandler) DeletePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -506,14 +488,9 @@ func (h *PaymentHandler) GetPaymentByID(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -545,14 +522,9 @@ func (h *PaymentHandler) GetPaymentByID(w http.ResponseWriter, r *http.Request) 
 // GET /payments/by-number?number=...
 func (h *PaymentHandler) GetPaymentByNumber(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	paymentNumber := r.URL.Query().Get("number")
@@ -589,14 +561,9 @@ func (h *PaymentHandler) GetPaymentByNumber(w http.ResponseWriter, r *http.Reque
 // GET /payments/by-gateway-ref?ref=...
 func (h *PaymentHandler) GetPaymentByGatewayReference(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	gatewayRef := r.URL.Query().Get("ref")
@@ -633,14 +600,9 @@ func (h *PaymentHandler) GetPaymentByGatewayReference(w http.ResponseWriter, r *
 // GET /payments
 func (h *PaymentHandler) ListPayments(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -746,14 +708,9 @@ func (h *PaymentHandler) ListPayments(w http.ResponseWriter, r *http.Request) {
 // GET /payments/search
 func (h *PaymentHandler) SearchPayments(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	query := r.URL.Query().Get("q")
@@ -818,14 +775,9 @@ func (h *PaymentHandler) SearchPayments(w http.ResponseWriter, r *http.Request) 
 // GET /payments?customer_id=...
 func (h *PaymentHandler) GetPaymentsByCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	customerIDStr := r.URL.Query().Get("customer_id")
@@ -906,14 +858,9 @@ func (h *PaymentHandler) GetPaymentsByCustomer(w http.ResponseWriter, r *http.Re
 // GET /payments?invoice_id=...
 func (h *PaymentHandler) GetPaymentsByInvoice(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	invoiceIDStr := r.URL.Query().Get("invoice_id")
@@ -970,22 +917,23 @@ func (h *PaymentHandler) RegisterCashPayment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req registerCashPaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.PaymentDate == "" || req.Amount == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, payment_date, and amount are required")
+	if req.PaymentDate == "" || req.Amount == "" {
+		h.respondWithError(w, http.StatusBadRequest, "payment_date and amount are required")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	paymentDate, err := time.Parse(time.RFC3339, req.PaymentDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment_date")
@@ -1051,22 +999,23 @@ func (h *PaymentHandler) RegisterCardPayment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req registerCardPaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.PaymentDate == "" || req.Amount == "" || req.CardLast4 == "" || req.CardBrand == "" || req.GatewayTxID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, payment_date, amount, card_last4, card_brand, gateway_tx_id are required")
+	if req.PaymentDate == "" || req.Amount == "" || req.CardLast4 == "" || req.CardBrand == "" || req.GatewayTxID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "payment_date, amount, card_last4, card_brand, gateway_tx_id are required")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	paymentDate, err := time.Parse(time.RFC3339, req.PaymentDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment_date")
@@ -1126,12 +1075,17 @@ func (h *PaymentHandler) RegisterCardPayment(w http.ResponseWriter, r *http.Requ
 }
 
 // POST /payments/register/bank-transfer
-// POST /payments/register/bank-transfer
 func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1141,16 +1095,11 @@ func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *h
 		return
 	}
 
-	if req.CompanyID == "" || req.PaymentDate == "" || req.Amount == "" || req.BankName == "" || req.ReferenceNumber == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, payment_date, amount, bank_name, reference_number are required")
+	if req.PaymentDate == "" || req.Amount == "" || req.BankName == "" || req.ReferenceNumber == "" {
+		h.respondWithError(w, http.StatusBadRequest, "payment_date, amount, bank_name, reference_number are required")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	paymentDate, err := time.Parse(time.RFC3339, req.PaymentDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment_date")
@@ -1181,7 +1130,6 @@ func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *h
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
-	// BankName is *string in service request, req.BankName is string
 	bankNameCopy := req.BankName
 	svcReq := &service.RegisterBankTransferPaymentRequest{
 		CompanyID:       companyID,
@@ -1219,22 +1167,23 @@ func (h *PaymentHandler) RegisterChequePayment(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req registerChequePaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.PaymentDate == "" || req.Amount == "" || req.ChequeNumber == "" || req.BankName == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, payment_date, amount, cheque_number, bank_name are required")
+	if req.PaymentDate == "" || req.Amount == "" || req.ChequeNumber == "" || req.BankName == "" {
+		h.respondWithError(w, http.StatusBadRequest, "payment_date, amount, cheque_number, bank_name are required")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	paymentDate, err := time.Parse(time.RFC3339, req.PaymentDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment_date")
@@ -1265,7 +1214,6 @@ func (h *PaymentHandler) RegisterChequePayment(w http.ResponseWriter, r *http.Re
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
-	// BankName is *string in service request, req.BankName is string
 	bankNameCopy := req.BankName
 	svcReq := &service.RegisterChequePaymentRequest{
 		CompanyID:    companyID,
@@ -1303,22 +1251,23 @@ func (h *PaymentHandler) RegisterWalletPayment(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req registerWalletPaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.PaymentDate == "" || req.Amount == "" || req.WalletProvider == "" || req.WalletTxID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, payment_date, amount, wallet_provider, wallet_tx_id are required")
+	if req.PaymentDate == "" || req.Amount == "" || req.WalletProvider == "" || req.WalletTxID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "payment_date, amount, wallet_provider, wallet_tx_id are required")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	paymentDate, err := time.Parse(time.RFC3339, req.PaymentDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment_date")
@@ -1385,22 +1334,23 @@ func (h *PaymentHandler) ProcessGatewayPayment(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req processGatewayPaymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.CompanyID == "" || req.GatewayName == "" || req.GatewayToken == "" || req.Amount == "" || req.PaymentMethod == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id, gateway_name, gateway_token, amount, payment_method are required")
+	if req.GatewayName == "" || req.GatewayToken == "" || req.Amount == "" || req.PaymentMethod == "" {
+		h.respondWithError(w, http.StatusBadRequest, "gateway_name, gateway_token, amount, payment_method are required")
 		return
 	}
 
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	amount, err := decimal.NewFromString(req.Amount)
 	if err != nil || amount.LessThanOrEqual(decimal.Zero) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
@@ -1461,7 +1411,7 @@ func (h *PaymentHandler) ProcessGatewayPayment(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// POST /payments/webhook
+// POST /payments/webhook (no company header required)
 func (h *PaymentHandler) ProcessGatewayWebhook(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var req processGatewayWebhookRequest
@@ -1475,7 +1425,6 @@ func (h *PaymentHandler) ProcessGatewayWebhook(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Validate signature – service will do it
 	svcReq := &service.ProcessGatewayWebhookRequest{
 		GatewayName: req.GatewayName,
 		GatewayTxID: req.GatewayTxID,
@@ -1506,14 +1455,9 @@ func (h *PaymentHandler) GetPaymentByIdempotencyKey(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1555,14 +1499,9 @@ func (h *PaymentHandler) AllocatePayment(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -1620,14 +1559,9 @@ func (h *PaymentHandler) AllocatePaymentToInvoices(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -1689,14 +1623,9 @@ func (h *PaymentHandler) AutoAllocatePayment(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -1743,14 +1672,9 @@ func (h *PaymentHandler) RemoveAllocation(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -1787,14 +1711,9 @@ func (h *PaymentHandler) GetPaymentAllocations(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1839,14 +1758,9 @@ func (h *PaymentHandler) GetUnallocatedAmount(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1886,14 +1800,9 @@ func (h *PaymentHandler) CreateRefund(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -1956,14 +1865,9 @@ func (h *PaymentHandler) RefundFullPayment(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2014,14 +1918,9 @@ func (h *PaymentHandler) RefundPartialPayment(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2078,14 +1977,9 @@ func (h *PaymentHandler) ProcessGatewayRefund(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2142,14 +2036,9 @@ func (h *PaymentHandler) GetRefundByID(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid refund ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2185,14 +2074,9 @@ func (h *PaymentHandler) GetPaymentRefunds(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2231,14 +2115,9 @@ func (h *PaymentHandler) GetRefundedAmount(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2278,14 +2157,9 @@ func (h *PaymentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2338,14 +2212,9 @@ func (h *PaymentHandler) MarkPending(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2386,14 +2255,9 @@ func (h *PaymentHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) 
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2434,14 +2298,9 @@ func (h *PaymentHandler) MarkCompleted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2483,14 +2342,9 @@ func (h *PaymentHandler) MarkFailed(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2541,14 +2395,9 @@ func (h *PaymentHandler) CancelPayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2595,14 +2444,9 @@ func (h *PaymentHandler) ReconcilePayment(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2643,14 +2487,9 @@ func (h *PaymentHandler) UnreconcilePayment(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !h.hasPermission(ctx, companyID, userID, "payment:write") {
@@ -2681,14 +2520,9 @@ func (h *PaymentHandler) UnreconcilePayment(w http.ResponseWriter, r *http.Reque
 // GET /payments/unreconciled
 func (h *PaymentHandler) GetUnreconciledPayments(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2728,14 +2562,9 @@ func (h *PaymentHandler) GetUnreconciledPayments(w http.ResponseWriter, r *http.
 // GET /payments/total-received
 func (h *PaymentHandler) GetTotalPaymentsReceived(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2778,14 +2607,9 @@ func (h *PaymentHandler) GetTotalPaymentsReceived(w http.ResponseWriter, r *http
 // GET /payments/total-refunded
 func (h *PaymentHandler) GetTotalRefundedAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2828,14 +2652,9 @@ func (h *PaymentHandler) GetTotalRefundedAmount(w http.ResponseWriter, r *http.R
 // GET /payments/net-collections
 func (h *PaymentHandler) GetNetCollections(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2878,14 +2697,9 @@ func (h *PaymentHandler) GetNetCollections(w http.ResponseWriter, r *http.Reques
 // GET /payments/by-method
 func (h *PaymentHandler) GetPaymentsByMethod(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2935,14 +2749,9 @@ func (h *PaymentHandler) GetPaymentsByMethod(w http.ResponseWriter, r *http.Requ
 // GET /payments/failed
 func (h *PaymentHandler) GetFailedPayments(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3001,14 +2810,9 @@ func (h *PaymentHandler) PaymentExists(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3037,14 +2841,9 @@ func (h *PaymentHandler) PaymentExists(w http.ResponseWriter, r *http.Request) {
 // GET /payments/number-exists?number=...
 func (h *PaymentHandler) PaymentNumberExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	number := r.URL.Query().Get("number")
@@ -3078,14 +2877,9 @@ func (h *PaymentHandler) PaymentNumberExists(w http.ResponseWriter, r *http.Requ
 // GET /payments/gateway-transaction-exists?id=...
 func (h *PaymentHandler) GatewayTransactionExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	txID := r.URL.Query().Get("id")
@@ -3124,14 +2918,9 @@ func (h *PaymentHandler) HasRefunds(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)

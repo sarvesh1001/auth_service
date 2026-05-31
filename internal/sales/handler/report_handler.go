@@ -24,7 +24,7 @@ type ReportHandler struct {
 func NewReportHandler(queryService service.SalesQueryService, logger *zap.Logger) *ReportHandler {
 	return &ReportHandler{
 		queryService: queryService,
-		BaseHandler:  &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:  &BaseHandler{logger: logger.Named("report_handler")},
 	}
 }
 
@@ -35,7 +35,7 @@ func NewReportHandler(queryService service.SalesQueryService, logger *zap.Logger
 // GetSalesDashboard godoc
 // @Summary Get sales dashboard summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.SalesDashboardSummary
@@ -43,9 +43,9 @@ func NewReportHandler(queryService service.SalesQueryService, logger *zap.Logger
 func (h *ReportHandler) GetSalesDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -78,15 +78,15 @@ func (h *ReportHandler) GetSalesDashboard(w http.ResponseWriter, r *http.Request
 // GetTodaySalesSummary godoc
 // @Summary Get today's sales summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {object} service.TodaySalesSummary
 // @Router /reports/today-sales-summary [get]
 func (h *ReportHandler) GetTodaySalesSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -116,15 +116,15 @@ func (h *ReportHandler) GetTodaySalesSummary(w http.ResponseWriter, r *http.Requ
 // GetRealtimeSalesSnapshot godoc
 // @Summary Get realtime sales snapshot
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {object} service.RealtimeSalesSnapshot
 // @Router /reports/realtime-snapshot [get]
 func (h *ReportHandler) GetRealtimeSalesSnapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -154,7 +154,7 @@ func (h *ReportHandler) GetRealtimeSalesSnapshot(w http.ResponseWriter, r *http.
 // GetRevenueSummary godoc
 // @Summary Get revenue summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.RevenueSummary
@@ -162,9 +162,9 @@ func (h *ReportHandler) GetRealtimeSalesSnapshot(w http.ResponseWriter, r *http.
 func (h *ReportHandler) GetRevenueSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -197,7 +197,7 @@ func (h *ReportHandler) GetRevenueSummary(w http.ResponseWriter, r *http.Request
 // GetRevenueTrend godoc
 // @Summary Get revenue trend over time
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param granularity query string true "daily|weekly|monthly|yearly"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -206,9 +206,9 @@ func (h *ReportHandler) GetRevenueSummary(w http.ResponseWriter, r *http.Request
 func (h *ReportHandler) GetRevenueTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -255,7 +255,7 @@ func (h *ReportHandler) GetRevenueTrend(w http.ResponseWriter, r *http.Request) 
 // GetRevenueByCustomer godoc
 // @Summary Get revenue breakdown by customer
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param limit query int false "Max number of customers" default(20)
@@ -264,9 +264,9 @@ func (h *ReportHandler) GetRevenueTrend(w http.ResponseWriter, r *http.Request) 
 func (h *ReportHandler) GetRevenueByCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -305,7 +305,7 @@ func (h *ReportHandler) GetRevenueByCustomer(w http.ResponseWriter, r *http.Requ
 // GetRevenueByProduct godoc
 // @Summary Get revenue breakdown by product
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param limit query int false "Max number of products" default(20)
@@ -314,9 +314,9 @@ func (h *ReportHandler) GetRevenueByCustomer(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetRevenueByProduct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -355,7 +355,7 @@ func (h *ReportHandler) GetRevenueByProduct(w http.ResponseWriter, r *http.Reque
 // GetRevenueByCategory godoc
 // @Summary Get revenue breakdown by product category
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.CategoryRevenueSummary
@@ -363,9 +363,9 @@ func (h *ReportHandler) GetRevenueByProduct(w http.ResponseWriter, r *http.Reque
 func (h *ReportHandler) GetRevenueByCategory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -398,7 +398,7 @@ func (h *ReportHandler) GetRevenueByCategory(w http.ResponseWriter, r *http.Requ
 // GetRevenueBySalesRep godoc
 // @Summary Get revenue breakdown by sales representative
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.SalesRepRevenueSummary
@@ -406,9 +406,9 @@ func (h *ReportHandler) GetRevenueByCategory(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetRevenueBySalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -441,7 +441,7 @@ func (h *ReportHandler) GetRevenueBySalesRep(w http.ResponseWriter, r *http.Requ
 // GetRevenueByPaymentMethod godoc
 // @Summary Get revenue breakdown by payment method
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.PaymentMethodRevenueSummary
@@ -449,9 +449,9 @@ func (h *ReportHandler) GetRevenueBySalesRep(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetRevenueByPaymentMethod(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -484,7 +484,7 @@ func (h *ReportHandler) GetRevenueByPaymentMethod(w http.ResponseWriter, r *http
 // GetNetRevenueAfterReturns godoc
 // @Summary Get net revenue after returns
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} decimal.Decimal
@@ -492,9 +492,9 @@ func (h *ReportHandler) GetRevenueByPaymentMethod(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetNetRevenueAfterReturns(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -527,7 +527,7 @@ func (h *ReportHandler) GetNetRevenueAfterReturns(w http.ResponseWriter, r *http
 // GetTopCustomers godoc
 // @Summary Get top customers by revenue
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param limit query int false "Max number of customers" default(10)
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -536,9 +536,9 @@ func (h *ReportHandler) GetNetRevenueAfterReturns(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetTopCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -577,7 +577,7 @@ func (h *ReportHandler) GetTopCustomers(w http.ResponseWriter, r *http.Request) 
 // GetCustomerSalesSummary godoc
 // @Summary Get detailed sales summary for a specific customer
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param customer_id path string true "Customer ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -586,9 +586,9 @@ func (h *ReportHandler) GetTopCustomers(w http.ResponseWriter, r *http.Request) 
 func (h *ReportHandler) GetCustomerSalesSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	customerID, err := h.parseUUIDParam(r, "customer_id")
@@ -626,16 +626,16 @@ func (h *ReportHandler) GetCustomerSalesSummary(w http.ResponseWriter, r *http.R
 // GetCustomerLifetimeValue godoc
 // @Summary Get customer lifetime value (LTV)
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param customer_id path string true "Customer ID"
 // @Success 200 {object} decimal.Decimal
 // @Router /reports/customers/{customer_id}/lifetime-value [get]
 func (h *ReportHandler) GetCustomerLifetimeValue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	customerID, err := h.parseUUIDParam(r, "customer_id")
@@ -670,15 +670,15 @@ func (h *ReportHandler) GetCustomerLifetimeValue(w http.ResponseWriter, r *http.
 // GetCustomersWithOutstandingBalance godoc
 // @Summary Get customers with outstanding balance
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {array} service.CustomerOutstandingBalanceRow
 // @Router /reports/customers/outstanding-balance [get]
 func (h *ReportHandler) GetCustomersWithOutstandingBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -708,15 +708,15 @@ func (h *ReportHandler) GetCustomersWithOutstandingBalance(w http.ResponseWriter
 // GetCustomersWithOverdueInvoices godoc
 // @Summary Get customers with overdue invoices
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {array} service.CustomerOverdueSummary
 // @Router /reports/customers/overdue-invoices [get]
 func (h *ReportHandler) GetCustomersWithOverdueInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -746,16 +746,16 @@ func (h *ReportHandler) GetCustomersWithOverdueInvoices(w http.ResponseWriter, r
 // GetInactiveCustomers godoc
 // @Summary Get customers inactive since a given date
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param since query string true "Since date (RFC3339)"
 // @Success 200 {array} models.Customer
 // @Router /reports/customers/inactive [get]
 func (h *ReportHandler) GetInactiveCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -796,7 +796,7 @@ func (h *ReportHandler) GetInactiveCustomers(w http.ResponseWriter, r *http.Requ
 // GetNewCustomers godoc
 // @Summary Get new customers in a date range
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} models.Customer
@@ -804,9 +804,9 @@ func (h *ReportHandler) GetInactiveCustomers(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetNewCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -839,7 +839,7 @@ func (h *ReportHandler) GetNewCustomers(w http.ResponseWriter, r *http.Request) 
 // GetOrderSummary godoc
 // @Summary Get order summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.OrderSummary
@@ -847,9 +847,9 @@ func (h *ReportHandler) GetNewCustomers(w http.ResponseWriter, r *http.Request) 
 func (h *ReportHandler) GetOrderSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -882,7 +882,7 @@ func (h *ReportHandler) GetOrderSummary(w http.ResponseWriter, r *http.Request) 
 // GetOrdersByStatus godoc
 // @Summary Get order counts and totals grouped by status
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.OrderStatusSummary
@@ -890,9 +890,9 @@ func (h *ReportHandler) GetOrderSummary(w http.ResponseWriter, r *http.Request) 
 func (h *ReportHandler) GetOrdersByStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -925,7 +925,7 @@ func (h *ReportHandler) GetOrdersByStatus(w http.ResponseWriter, r *http.Request
 // GetTopOrdersByValue godoc
 // @Summary Get top orders by value
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param limit query int false "Number of orders" default(10)
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -934,9 +934,9 @@ func (h *ReportHandler) GetOrdersByStatus(w http.ResponseWriter, r *http.Request
 func (h *ReportHandler) GetTopOrdersByValue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -975,7 +975,7 @@ func (h *ReportHandler) GetTopOrdersByValue(w http.ResponseWriter, r *http.Reque
 // GetAverageOrderValueTrend godoc
 // @Summary Get average order value trend over time
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param granularity query string true "daily|weekly|monthly|yearly"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -984,9 +984,9 @@ func (h *ReportHandler) GetTopOrdersByValue(w http.ResponseWriter, r *http.Reque
 func (h *ReportHandler) GetAverageOrderValueTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1033,7 +1033,7 @@ func (h *ReportHandler) GetAverageOrderValueTrend(w http.ResponseWriter, r *http
 // GetOrderConversionFunnel godoc
 // @Summary Get order conversion funnel (quote → order)
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.OrderConversionFunnel
@@ -1041,9 +1041,9 @@ func (h *ReportHandler) GetAverageOrderValueTrend(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetOrderConversionFunnel(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1076,7 +1076,7 @@ func (h *ReportHandler) GetOrderConversionFunnel(w http.ResponseWriter, r *http.
 // GetQuoteSummary godoc
 // @Summary Get quote summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.QuoteSummary
@@ -1084,9 +1084,9 @@ func (h *ReportHandler) GetOrderConversionFunnel(w http.ResponseWriter, r *http.
 func (h *ReportHandler) GetQuoteSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1119,7 +1119,7 @@ func (h *ReportHandler) GetQuoteSummary(w http.ResponseWriter, r *http.Request) 
 // GetQuoteConversionMetrics godoc
 // @Summary Get quote conversion metrics
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.QuoteConversionMetrics
@@ -1127,9 +1127,9 @@ func (h *ReportHandler) GetQuoteSummary(w http.ResponseWriter, r *http.Request) 
 func (h *ReportHandler) GetQuoteConversionMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1162,16 +1162,16 @@ func (h *ReportHandler) GetQuoteConversionMetrics(w http.ResponseWriter, r *http
 // GetQuotesExpiringSoon godoc
 // @Summary Get quotes expiring before a given date
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param before query string true "Expiry cutoff date (RFC3339)"
 // @Success 200 {array} models.Quote
 // @Router /reports/quotes-expiring-soon [get]
 func (h *ReportHandler) GetQuotesExpiringSoon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1212,7 +1212,7 @@ func (h *ReportHandler) GetQuotesExpiringSoon(w http.ResponseWriter, r *http.Req
 // GetInvoiceSummary godoc
 // @Summary Get invoice summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.InvoiceSummary
@@ -1220,9 +1220,9 @@ func (h *ReportHandler) GetQuotesExpiringSoon(w http.ResponseWriter, r *http.Req
 func (h *ReportHandler) GetInvoiceSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1255,15 +1255,15 @@ func (h *ReportHandler) GetInvoiceSummary(w http.ResponseWriter, r *http.Request
 // GetOutstandingReceivablesSummary godoc
 // @Summary Get outstanding receivables summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {object} service.OutstandingReceivablesSummary
 // @Router /reports/outstanding-receivables [get]
 func (h *ReportHandler) GetOutstandingReceivablesSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1293,7 +1293,7 @@ func (h *ReportHandler) GetOutstandingReceivablesSummary(w http.ResponseWriter, 
 // GetOverdueInvoices godoc
 // @Summary Get overdue invoices as of a given date
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param at query string true "As of date (RFC3339)"
 // @Param limit query int false "Page size" default(20)
 // @Param offset query int false "Page offset" default(0)
@@ -1304,9 +1304,9 @@ func (h *ReportHandler) GetOutstandingReceivablesSummary(w http.ResponseWriter, 
 func (h *ReportHandler) GetOverdueInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1376,16 +1376,16 @@ func (h *ReportHandler) GetOverdueInvoices(w http.ResponseWriter, r *http.Reques
 // GetOverdueInvoiceAging godoc
 // @Summary Get overdue invoice aging buckets
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param at query string true "As of date (RFC3339)"
 // @Success 200 {array} service.InvoiceAgingBucket
 // @Router /reports/overdue-invoice-aging [get]
 func (h *ReportHandler) GetOverdueInvoiceAging(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1426,16 +1426,16 @@ func (h *ReportHandler) GetOverdueInvoiceAging(w http.ResponseWriter, r *http.Re
 // GetInvoicesDueSoon godoc
 // @Summary Get invoices due before a given date
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param before query string true "Due before date (RFC3339)"
 // @Success 200 {array} models.Invoice
 // @Router /reports/invoices-due-soon [get]
 func (h *ReportHandler) GetInvoicesDueSoon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1476,7 +1476,7 @@ func (h *ReportHandler) GetInvoicesDueSoon(w http.ResponseWriter, r *http.Reques
 // GetInvoiceCollectionTrend godoc
 // @Summary Get invoice collection trend over time
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param granularity query string true "daily|weekly|monthly|yearly"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -1485,9 +1485,9 @@ func (h *ReportHandler) GetInvoicesDueSoon(w http.ResponseWriter, r *http.Reques
 func (h *ReportHandler) GetInvoiceCollectionTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1534,7 +1534,7 @@ func (h *ReportHandler) GetInvoiceCollectionTrend(w http.ResponseWriter, r *http
 // GetAverageCollectionDays godoc
 // @Summary Get average collection days (DSO)
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} decimal.Decimal
@@ -1542,9 +1542,9 @@ func (h *ReportHandler) GetInvoiceCollectionTrend(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetAverageCollectionDays(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1577,7 +1577,7 @@ func (h *ReportHandler) GetAverageCollectionDays(w http.ResponseWriter, r *http.
 // GetPaymentSummary godoc
 // @Summary Get payment summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.PaymentSummary
@@ -1585,9 +1585,9 @@ func (h *ReportHandler) GetAverageCollectionDays(w http.ResponseWriter, r *http.
 func (h *ReportHandler) GetPaymentSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1620,7 +1620,7 @@ func (h *ReportHandler) GetPaymentSummary(w http.ResponseWriter, r *http.Request
 // GetPaymentMethodBreakdown godoc
 // @Summary Get payment method breakdown
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.PaymentMethodBreakdownRow
@@ -1628,9 +1628,9 @@ func (h *ReportHandler) GetPaymentSummary(w http.ResponseWriter, r *http.Request
 func (h *ReportHandler) GetPaymentMethodBreakdown(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1663,7 +1663,7 @@ func (h *ReportHandler) GetPaymentMethodBreakdown(w http.ResponseWriter, r *http
 // GetFailedPaymentAnalytics godoc
 // @Summary Get failed payment analytics
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.FailedPaymentAnalytics
@@ -1671,9 +1671,9 @@ func (h *ReportHandler) GetPaymentMethodBreakdown(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetFailedPaymentAnalytics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1706,7 +1706,7 @@ func (h *ReportHandler) GetFailedPaymentAnalytics(w http.ResponseWriter, r *http
 // GetRefundSummary godoc
 // @Summary Get refund summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.RefundSummary
@@ -1714,9 +1714,9 @@ func (h *ReportHandler) GetFailedPaymentAnalytics(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetRefundSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1749,7 +1749,7 @@ func (h *ReportHandler) GetRefundSummary(w http.ResponseWriter, r *http.Request)
 // GetTopSellingProducts godoc
 // @Summary Get top selling products by revenue
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param limit query int false "Max number of products" default(10)
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -1758,9 +1758,9 @@ func (h *ReportHandler) GetRefundSummary(w http.ResponseWriter, r *http.Request)
 func (h *ReportHandler) GetTopSellingProducts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1799,7 +1799,7 @@ func (h *ReportHandler) GetTopSellingProducts(w http.ResponseWriter, r *http.Req
 // GetLeastSellingProducts godoc
 // @Summary Get least selling products by revenue
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param limit query int false "Max number of products" default(10)
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -1808,9 +1808,9 @@ func (h *ReportHandler) GetTopSellingProducts(w http.ResponseWriter, r *http.Req
 func (h *ReportHandler) GetLeastSellingProducts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1849,7 +1849,7 @@ func (h *ReportHandler) GetLeastSellingProducts(w http.ResponseWriter, r *http.R
 // GetProductSalesTrend godoc
 // @Summary Get sales trend for a specific product
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param product_id path string true "Product ID"
 // @Param granularity query string true "daily|weekly|monthly|yearly"
 // @Param from query string false "Start date (RFC3339)"
@@ -1859,9 +1859,9 @@ func (h *ReportHandler) GetLeastSellingProducts(w http.ResponseWriter, r *http.R
 func (h *ReportHandler) GetProductSalesTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	productID, err := h.parseUUIDParam(r, "product_id")
@@ -1913,15 +1913,15 @@ func (h *ReportHandler) GetProductSalesTrend(w http.ResponseWriter, r *http.Requ
 // GetProductsNeverSold godoc
 // @Summary Get products that have never been sold
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {array} models.Product
 // @Router /reports/products-never-sold [get]
 func (h *ReportHandler) GetProductsNeverSold(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1951,7 +1951,7 @@ func (h *ReportHandler) GetProductsNeverSold(w http.ResponseWriter, r *http.Requ
 // GetMostReturnedProducts godoc
 // @Summary Get most returned products
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param limit query int false "Max number of products" default(10)
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -1960,9 +1960,9 @@ func (h *ReportHandler) GetProductsNeverSold(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetMostReturnedProducts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2001,7 +2001,7 @@ func (h *ReportHandler) GetMostReturnedProducts(w http.ResponseWriter, r *http.R
 // GetReturnSummary godoc
 // @Summary Get return summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.ReturnSummary
@@ -2009,9 +2009,9 @@ func (h *ReportHandler) GetMostReturnedProducts(w http.ResponseWriter, r *http.R
 func (h *ReportHandler) GetReturnSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2044,7 +2044,7 @@ func (h *ReportHandler) GetReturnSummary(w http.ResponseWriter, r *http.Request)
 // GetReturnRateTrend godoc
 // @Summary Get return rate trend over time
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param granularity query string true "daily|weekly|monthly|yearly"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -2053,9 +2053,9 @@ func (h *ReportHandler) GetReturnSummary(w http.ResponseWriter, r *http.Request)
 func (h *ReportHandler) GetReturnRateTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2102,15 +2102,15 @@ func (h *ReportHandler) GetReturnRateTrend(w http.ResponseWriter, r *http.Reques
 // GetRefundLiabilitySummary godoc
 // @Summary Get refund liability summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {object} service.RefundLiabilitySummary
 // @Router /reports/refund-liability-summary [get]
 func (h *ReportHandler) GetRefundLiabilitySummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2140,7 +2140,7 @@ func (h *ReportHandler) GetRefundLiabilitySummary(w http.ResponseWriter, r *http
 // GetDiscountSummary godoc
 // @Summary Get discount summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.DiscountSummary
@@ -2148,9 +2148,9 @@ func (h *ReportHandler) GetRefundLiabilitySummary(w http.ResponseWriter, r *http
 func (h *ReportHandler) GetDiscountSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2183,7 +2183,7 @@ func (h *ReportHandler) GetDiscountSummary(w http.ResponseWriter, r *http.Reques
 // GetCouponPerformance godoc
 // @Summary Get coupon performance metrics
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param limit query int false "Max number of coupons" default(20)
@@ -2192,9 +2192,9 @@ func (h *ReportHandler) GetDiscountSummary(w http.ResponseWriter, r *http.Reques
 func (h *ReportHandler) GetCouponPerformance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2233,7 +2233,7 @@ func (h *ReportHandler) GetCouponPerformance(w http.ResponseWriter, r *http.Requ
 // GetPromotionPerformance godoc
 // @Summary Get promotion performance metrics
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param limit query int false "Max number of promotions" default(20)
@@ -2242,9 +2242,9 @@ func (h *ReportHandler) GetCouponPerformance(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetPromotionPerformance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2283,7 +2283,7 @@ func (h *ReportHandler) GetPromotionPerformance(w http.ResponseWriter, r *http.R
 // GetDiscountImpactOnRevenue godoc
 // @Summary Get discount impact on revenue
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.DiscountRevenueImpact
@@ -2291,9 +2291,9 @@ func (h *ReportHandler) GetPromotionPerformance(w http.ResponseWriter, r *http.R
 func (h *ReportHandler) GetDiscountImpactOnRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2326,7 +2326,7 @@ func (h *ReportHandler) GetDiscountImpactOnRevenue(w http.ResponseWriter, r *htt
 // GetTaxSummary godoc
 // @Summary Get tax summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.TaxSummary
@@ -2334,9 +2334,9 @@ func (h *ReportHandler) GetDiscountImpactOnRevenue(w http.ResponseWriter, r *htt
 func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2369,7 +2369,7 @@ func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 // GetTaxBreakdownByRate godoc
 // @Summary Get tax breakdown by tax rate
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.TaxRateBreakdownRow
@@ -2377,9 +2377,9 @@ func (h *ReportHandler) GetTaxSummary(w http.ResponseWriter, r *http.Request) {
 func (h *ReportHandler) GetTaxBreakdownByRate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2412,7 +2412,7 @@ func (h *ReportHandler) GetTaxBreakdownByRate(w http.ResponseWriter, r *http.Req
 // GetTaxBreakdownByJurisdiction godoc
 // @Summary Get tax breakdown by jurisdiction
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.JurisdictionTaxBreakdownRow
@@ -2420,9 +2420,9 @@ func (h *ReportHandler) GetTaxBreakdownByRate(w http.ResponseWriter, r *http.Req
 func (h *ReportHandler) GetTaxBreakdownByJurisdiction(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2455,7 +2455,7 @@ func (h *ReportHandler) GetTaxBreakdownByJurisdiction(w http.ResponseWriter, r *
 // GetTaxBreakdownByProduct godoc
 // @Summary Get tax breakdown by product
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param limit query int false "Max number of products" default(20)
@@ -2464,9 +2464,9 @@ func (h *ReportHandler) GetTaxBreakdownByJurisdiction(w http.ResponseWriter, r *
 func (h *ReportHandler) GetTaxBreakdownByProduct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2505,7 +2505,7 @@ func (h *ReportHandler) GetTaxBreakdownByProduct(w http.ResponseWriter, r *http.
 // GetCollectedTaxTrend godoc
 // @Summary Get collected tax trend over time
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param granularity query string true "daily|weekly|monthly|yearly"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -2514,9 +2514,9 @@ func (h *ReportHandler) GetTaxBreakdownByProduct(w http.ResponseWriter, r *http.
 func (h *ReportHandler) GetCollectedTaxTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2563,7 +2563,7 @@ func (h *ReportHandler) GetCollectedTaxTrend(w http.ResponseWriter, r *http.Requ
 // GetTaxAuditReport godoc
 // @Summary Get tax audit report
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {array} service.TaxAuditReportRow
@@ -2571,9 +2571,9 @@ func (h *ReportHandler) GetCollectedTaxTrend(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetTaxAuditReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2606,7 +2606,7 @@ func (h *ReportHandler) GetTaxAuditReport(w http.ResponseWriter, r *http.Request
 // GetSalesRepPerformance godoc
 // @Summary Get performance summary for a specific sales representative
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param sales_rep_id path string true "Sales rep ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -2615,9 +2615,9 @@ func (h *ReportHandler) GetTaxAuditReport(w http.ResponseWriter, r *http.Request
 func (h *ReportHandler) GetSalesRepPerformance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	salesRepID, err := h.parseUUIDParam(r, "sales_rep_id")
@@ -2655,7 +2655,7 @@ func (h *ReportHandler) GetSalesRepPerformance(w http.ResponseWriter, r *http.Re
 // GetSalesLeaderboard godoc
 // @Summary Get sales leaderboard
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param limit query int false "Number of top reps" default(10)
@@ -2664,9 +2664,9 @@ func (h *ReportHandler) GetSalesRepPerformance(w http.ResponseWriter, r *http.Re
 func (h *ReportHandler) GetSalesLeaderboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2705,7 +2705,7 @@ func (h *ReportHandler) GetSalesLeaderboard(w http.ResponseWriter, r *http.Reque
 // GetCommissionSummary godoc
 // @Summary Get commission summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Success 200 {object} service.CommissionSummary
@@ -2713,9 +2713,9 @@ func (h *ReportHandler) GetSalesLeaderboard(w http.ResponseWriter, r *http.Reque
 func (h *ReportHandler) GetCommissionSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2748,15 +2748,15 @@ func (h *ReportHandler) GetCommissionSummary(w http.ResponseWriter, r *http.Requ
 // GetCreditRiskSummary godoc
 // @Summary Get credit risk summary
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {object} service.CreditRiskSummary
 // @Router /reports/credit-risk-summary [get]
 func (h *ReportHandler) GetCreditRiskSummary(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2786,16 +2786,16 @@ func (h *ReportHandler) GetCreditRiskSummary(w http.ResponseWriter, r *http.Requ
 // GetCustomersNearCreditLimit godoc
 // @Summary Get customers near their credit limit
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param threshold_percent query string true "Threshold percentage (e.g., 80 for 80%)"
 // @Success 200 {array} service.CustomerCreditUtilizationRow
 // @Router /reports/customers-near-credit-limit [get]
 func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2836,15 +2836,15 @@ func (h *ReportHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, r *ht
 // GetCustomersExceedingCreditLimit godoc
 // @Summary Get customers exceeding their credit limit
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {array} service.CustomerCreditExposureRow
 // @Router /reports/customers-exceeding-credit-limit [get]
 func (h *ReportHandler) GetCustomersExceedingCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2874,15 +2874,15 @@ func (h *ReportHandler) GetCustomersExceedingCreditLimit(w http.ResponseWriter, 
 // GetOrdersOnCreditHold godoc
 // @Summary Get orders currently on credit hold
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Success 200 {array} models.Order
 // @Router /reports/orders-on-credit-hold [get]
 func (h *ReportHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2912,7 +2912,7 @@ func (h *ReportHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Req
 // GetSalesReport godoc
 // @Summary Get comprehensive sales report
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param granularity query string false "daily|weekly|monthly|yearly"
@@ -2922,9 +2922,9 @@ func (h *ReportHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Req
 func (h *ReportHandler) GetSalesReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2977,7 +2977,7 @@ func (h *ReportHandler) GetSalesReport(w http.ResponseWriter, r *http.Request) {
 // GetTaxReport godoc
 // @Summary Get tax report
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
 // @Param granularity query string false "daily|weekly|monthly|yearly"
@@ -2986,9 +2986,9 @@ func (h *ReportHandler) GetSalesReport(w http.ResponseWriter, r *http.Request) {
 func (h *ReportHandler) GetTaxReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3039,16 +3039,16 @@ func (h *ReportHandler) GetTaxReport(w http.ResponseWriter, r *http.Request) {
 // GetReceivablesReport godoc
 // @Summary Get receivables report
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param as_of query string true "Date as of (RFC3339)"
 // @Success 200 {object} service.ReceivablesReportResult
 // @Router /reports/receivables-report [get]
 func (h *ReportHandler) GetReceivablesReport(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	userID, err := h.getUserIDFromContext(ctx)
@@ -3093,7 +3093,7 @@ func (h *ReportHandler) GetReceivablesReport(w http.ResponseWriter, r *http.Requ
 // GetCustomerStatement godoc
 // @Summary Get customer statement for a period
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param customer_id path string true "Customer ID"
 // @Param from query string false "Start date (RFC3339)"
 // @Param to query string false "End date (RFC3339)"
@@ -3102,9 +3102,9 @@ func (h *ReportHandler) GetReceivablesReport(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetCustomerStatement(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	customerID, err := h.parseUUIDParam(r, "customer_id")
@@ -3142,7 +3142,7 @@ func (h *ReportHandler) GetCustomerStatement(w http.ResponseWriter, r *http.Requ
 // GetSalesAuditTrail godoc
 // @Summary Get audit trail for a sales entity
 // @Tags reports
-// @Param company_id query string true "Company ID"
+// @Param X-Company-ID header string true "Company ID"
 // @Param entity_type query string true "Type of entity (order, invoice, quote, etc.)"
 // @Param entity_id query string true "ID of the entity"
 // @Success 200 {array} service.SalesAuditEntry
@@ -3150,9 +3150,9 @@ func (h *ReportHandler) GetCustomerStatement(w http.ResponseWriter, r *http.Requ
 func (h *ReportHandler) GetSalesAuditTrail(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyID, err := h.parseUUIDParam(r, "company_id")
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	entityType := r.URL.Query().Get("entity_type")

@@ -76,6 +76,8 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusForbidden, "permission denied"
 	case errors.Is(err, salesErrors.ErrUnauthorized):
 		return http.StatusUnauthorized, "authentication required"
+	case errors.Is(err, salesErrors.ErrInventoryItemNotFound): // <-- ADDED
+		return http.StatusBadRequest, "inventory item not found or inactive"
 	default:
 		return http.StatusInternalServerError, "internal server error"
 	}
@@ -144,6 +146,7 @@ func (h *BaseHandler) parseTimeRange(r *http.Request) (from, to *time.Time) {
 func (h *BaseHandler) getIdempotencyKey(r *http.Request) string {
 	return r.Header.Get("Idempotency-Key")
 }
+
 func (h *BaseHandler) getCompanyIDFromQuery(r *http.Request) (uuid.UUID, error) {
 	companyIDStr := r.URL.Query().Get("company_id")
 	if companyIDStr == "" {
@@ -151,6 +154,7 @@ func (h *BaseHandler) getCompanyIDFromQuery(r *http.Request) (uuid.UUID, error) 
 	}
 	return uuid.Parse(companyIDStr)
 }
+
 func parseUUIDParamCreditNote(r *http.Request, paramName string) (uuid.UUID, error) {
 	idStr := chi.URLParam(r, paramName)
 	if idStr == "" {
@@ -158,6 +162,7 @@ func parseUUIDParamCreditNote(r *http.Request, paramName string) (uuid.UUID, err
 	}
 	return uuid.Parse(idStr)
 }
+
 func parseUUIDParamInvoice(r *http.Request, paramName string) (uuid.UUID, error) {
 	idStr := chi.URLParam(r, paramName)
 	if idStr == "" {
@@ -165,6 +170,7 @@ func parseUUIDParamInvoice(r *http.Request, paramName string) (uuid.UUID, error)
 	}
 	return uuid.Parse(idStr)
 }
+
 func (h *BaseHandler) parseCompanyIDFromQuery(r *http.Request) (uuid.UUID, error) {
 	companyIDStr := r.URL.Query().Get("company_id")
 	if companyIDStr == "" {
@@ -172,6 +178,7 @@ func (h *BaseHandler) parseCompanyIDFromQuery(r *http.Request) (uuid.UUID, error
 	}
 	return uuid.Parse(companyIDStr)
 }
+
 func parseUUIDParamPayment(r *http.Request, paramName string) (uuid.UUID, error) {
 	idStr := chi.URLParam(r, paramName)
 	if idStr == "" {
@@ -179,6 +186,7 @@ func parseUUIDParamPayment(r *http.Request, paramName string) (uuid.UUID, error)
 	}
 	return uuid.Parse(idStr)
 }
+
 func parseQueryUUID(r *http.Request, key string) (uuid.UUID, error) {
 	val := r.URL.Query().Get(key)
 	if val == "" {
@@ -235,9 +243,23 @@ func parseUUIDParamReturn(r *http.Request, paramName string) (uuid.UUID, error) 
 	}
 	return uuid.Parse(idStr)
 }
+
 func parseDecimal(s string) (decimal.Decimal, error) {
 	if s == "" {
 		return decimal.Zero, nil
 	}
 	return decimal.NewFromString(s)
+}
+
+// getCompanyIDFromHeader extracts and validates the X-Company-ID header.
+func (h *BaseHandler) getCompanyIDFromHeader(r *http.Request) (uuid.UUID, error) {
+	header := r.Header.Get("X-Company-ID")
+	if header == "" {
+		return uuid.Nil, fmt.Errorf("X-Company-ID header is required")
+	}
+	companyID, err := uuid.Parse(header)
+	if err != nil || companyID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("invalid X-Company-ID header")
+	}
+	return companyID, nil
 }

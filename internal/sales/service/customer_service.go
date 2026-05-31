@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -94,6 +97,29 @@ func NewCustomerService(
 }
 
 // ----------------------------------------------------------------------------
+// Validation constants & helpers
+// ----------------------------------------------------------------------------
+
+const (
+	maxCustomerCodeLen = 50
+	maxNameLen         = 255
+	maxEmailLen        = 255
+	maxBillingAddrLen  = 500 // optional limit for billing_address (TEXT column)
+)
+
+var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
+
+func isValidEmail(email string) bool {
+	return emailRegex.MatchString(email)
+}
+
+// hashEmail computes a SHA256 hash of the email (used for uniqueness detection)
+func hashEmail(email string) string {
+	hash := sha256.Sum256([]byte(email))
+	return hex.EncodeToString(hash[:])
+}
+
+// ----------------------------------------------------------------------------
 // Helper functions for encryption/decryption
 // ----------------------------------------------------------------------------
 
@@ -180,7 +206,6 @@ func (s *customerService) decryptCustomer(ctx context.Context, c *models.Custome
 // ----------------------------------------------------------------------------
 
 func (s *customerService) getOutstandingBalance(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	// Sum of amount_due from unpaid invoices (status != 'paid' and not cancelled)
 	query := `
 		SELECT COALESCE(SUM(amount_due), 0)
 		FROM sales.invoices
@@ -225,6 +250,11 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		return nil, err
 	}
 
+	// Additional validation (length, email, payment term, billing address)
+	if err := s.validateCustomerInput(req); err != nil {
+		return nil, err
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -247,12 +277,42 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		return nil, fmt.Errorf("%w: customer_code %s already exists", salesErrors.ErrDuplicate, req.CustomerCode)
 	}
 
+	// Email uniqueness check via hash
+	if req.Email != nil && *req.Email != "" {
+		emailHash := hashEmail(*req.Email)
+		hashExists, err := s.customerRepo.ExistsByEmailHash(ctx, tx, req.CompanyID, emailHash)
+		if err != nil {
+			return nil, fmt.Errorf("check email hash: %w", err)
+		}
+		if hashExists {
+			return nil, fmt.Errorf("%w: email already in use", salesErrors.ErrDuplicate)
+		}
+	}
+
+	// Payment term existence check
+	if req.PaymentTermID != nil {
+		termExists, err := s.paymentTermRepo.Exists(ctx, tx, req.CompanyID, *req.PaymentTermID)
+		if err != nil {
+			return nil, fmt.Errorf("check payment term: %w", err)
+		}
+		if !termExists {
+			return nil, fmt.Errorf("%w: payment_term_id does not exist", salesErrors.ErrInvalidInput)
+		}
+	}
+
 	// Encrypt sensitive fields
 	emailEnc, emailDEK, emailKeyID, _ := s.encryptField(ctx, req.Email, "customer_email")
 	phoneEnc, phoneDEK, phoneKeyID, _ := s.encryptField(ctx, req.Phone, "customer_phone")
 	taxEnc, taxDEK, taxKeyID, _ := s.encryptField(ctx, req.TaxID, "customer_tax_id")
 	billEnc, billDEK, billKeyID, _ := s.encryptField(ctx, req.BillingAddress, "customer_billing")
 	shipEnc, shipDEK, shipKeyID, _ := s.encryptField(ctx, req.ShippingAddr, "customer_shipping")
+
+	// Compute email hash if email present
+	var emailHashPtr *string
+	if req.Email != nil && *req.Email != "" {
+		hash := hashEmail(*req.Email)
+		emailHashPtr = &hash
+	}
 
 	customer := &models.Customer{
 		CustomerID:               uuid.New(),
@@ -262,6 +322,7 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		EmailEncrypted:           emailEnc,
 		EmailDEK:                 emailDEK,
 		EmailKeyID:               emailKeyID,
+		EmailHash:                emailHashPtr,
 		PhoneEncrypted:           phoneEnc,
 		PhoneDEK:                 phoneDEK,
 		PhoneKeyID:               phoneKeyID,
@@ -317,6 +378,7 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 	return customer, nil
 }
 
+// validateCreateCustomer performs basic presence checks.
 func (s *customerService) validateCreateCustomer(req CreateCustomerRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", salesErrors.ErrInvalidInput)
@@ -326,6 +388,29 @@ func (s *customerService) validateCreateCustomer(req CreateCustomerRequest) erro
 	}
 	if req.Name == "" {
 		return fmt.Errorf("%w: name required", salesErrors.ErrInvalidInput)
+	}
+	return nil
+}
+
+// validateCustomerInput performs detailed validation (lengths, email format, billing address length)
+func (s *customerService) validateCustomerInput(req CreateCustomerRequest) error {
+	// Length checks
+	if len(req.CustomerCode) > maxCustomerCodeLen {
+		return fmt.Errorf("%w: customer_code must not exceed %d characters", salesErrors.ErrInvalidInput, maxCustomerCodeLen)
+	}
+	if len(req.Name) > maxNameLen {
+		return fmt.Errorf("%w: name must not exceed %d characters", salesErrors.ErrInvalidInput, maxNameLen)
+	}
+	if req.Email != nil && *req.Email != "" {
+		if len(*req.Email) > maxEmailLen {
+			return fmt.Errorf("%w: email must not exceed %d characters", salesErrors.ErrInvalidInput, maxEmailLen)
+		}
+		if !isValidEmail(*req.Email) {
+			return fmt.Errorf("%w: invalid email format", salesErrors.ErrInvalidInput)
+		}
+	}
+	if req.BillingAddress != nil && *req.BillingAddress != "" && len(*req.BillingAddress) > maxBillingAddrLen {
+		return fmt.Errorf("%w: billing_address must not exceed %d characters", salesErrors.ErrInvalidInput, maxBillingAddrLen)
 	}
 	return nil
 }
@@ -364,6 +449,9 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 	changes := make(map[string]interface{})
 
 	if req.Name != nil && *req.Name != customer.Name {
+		if len(*req.Name) > maxNameLen {
+			return nil, fmt.Errorf("%w: name must not exceed %d characters", salesErrors.ErrInvalidInput, maxNameLen)
+		}
 		changes["name"] = map[string]string{"old": customer.Name, "new": *req.Name}
 		customer.Name = *req.Name
 	}
@@ -372,8 +460,24 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		customer.IsActive = *req.IsActive
 	}
 
-	// Encrypt new values if provided
+	// Handle email update with hash uniqueness check
 	if req.Email != nil {
+		if len(*req.Email) > maxEmailLen {
+			return nil, fmt.Errorf("%w: email must not exceed %d characters", salesErrors.ErrInvalidInput, maxEmailLen)
+		}
+		if !isValidEmail(*req.Email) {
+			return nil, fmt.Errorf("%w: invalid email format", salesErrors.ErrInvalidInput)
+		}
+		// Check uniqueness (exclude current customer)
+		newHash := hashEmail(*req.Email)
+		exists, err := s.customerRepo.ExistsByEmailHashExcluding(ctx, tx, companyID, newHash, customerID)
+		if err != nil {
+			return nil, fmt.Errorf("check email uniqueness: %w", err)
+		}
+		if exists {
+			return nil, fmt.Errorf("%w: email already in use", salesErrors.ErrDuplicate)
+		}
+		// Encrypt and set new hash
 		enc, dek, kid, err := s.encryptField(ctx, req.Email, "customer_email")
 		if err != nil {
 			return nil, err
@@ -381,7 +485,10 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		customer.EmailEncrypted = enc
 		customer.EmailDEK = dek
 		customer.EmailKeyID = kid
+		customer.EmailHash = &newHash
+		changes["email"] = map[string]string{"old": *customer.Email, "new": *req.Email}
 	}
+
 	if req.Phone != nil {
 		enc, dek, kid, err := s.encryptField(ctx, req.Phone, "customer_phone")
 		if err != nil {
@@ -401,6 +508,9 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		customer.TaxIDKeyID = kid
 	}
 	if req.BillingAddress != nil {
+		if len(*req.BillingAddress) > maxBillingAddrLen {
+			return nil, fmt.Errorf("%w: billing_address must not exceed %d characters", salesErrors.ErrInvalidInput, maxBillingAddrLen)
+		}
 		enc, dek, kid, err := s.encryptField(ctx, req.BillingAddress, "customer_billing")
 		if err != nil {
 			return nil, err
@@ -512,7 +622,7 @@ func (s *customerService) DeleteCustomer(ctx context.Context, companyID, custome
 }
 
 // ----------------------------------------------------------------------------
-// GetCustomerByID, GetCustomerByCode, List, Search
+// GetCustomerByID, GetCustomerByCode, List, Search (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) GetCustomerByID(ctx context.Context, companyID, customerID uuid.UUID) (*models.Customer, error) {
@@ -549,8 +659,6 @@ func (s *customerService) ListCustomers(ctx context.Context, filter CustomerList
 		UpdatedFrom:  filter.UpdatedFrom,
 		UpdatedTo:    filter.UpdatedTo,
 	}
-	// If HasOutstandingInvoices is true, we need to join invoices, but repository doesn't support that directly.
-	// We'll handle by filtering after fetching or extend repository. For simplicity, we omit here.
 	customers, total, err := s.customerRepo.List(ctx, nil, repoFilter, repository.Pagination{Limit: p.Limit, Offset: p.Offset}, repository.Sort{Field: srt.Field, Direction: srt.Direction})
 	if err != nil {
 		return nil, 0, err
@@ -573,7 +681,7 @@ func (s *customerService) SearchCustomers(ctx context.Context, companyID uuid.UU
 }
 
 // ----------------------------------------------------------------------------
-// Activate / Deactivate
+// Activate / Deactivate (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
@@ -618,7 +726,7 @@ func (s *customerService) setActiveStatus(ctx context.Context, companyID, custom
 }
 
 // ----------------------------------------------------------------------------
-// Credit Limit Management
+// Credit Limit Management (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID, idempotencyKey string) error {
@@ -685,7 +793,6 @@ func (s *customerService) CanCustomerPurchaseAmount(ctx context.Context, company
 		return false, err
 	}
 	if limit.IsZero() {
-		// No credit limit – allow unless you want to block by default
 		return true, nil
 	}
 	outstanding, err := s.GetOutstandingBalance(ctx, companyID, customerID)
@@ -697,7 +804,7 @@ func (s *customerService) CanCustomerPurchaseAmount(ctx context.Context, company
 }
 
 // ----------------------------------------------------------------------------
-// Payment Term & Sales Rep Assignment
+// Payment Term & Sales Rep Assignment (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
@@ -712,7 +819,6 @@ func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, cust
 		return nil
 	}
 
-	// Verify term exists and is active
 	term, err := s.paymentTermRepo.GetByID(ctx, tx, companyID, termID)
 	if err != nil {
 		return fmt.Errorf("payment term: %w", err)
@@ -755,9 +861,6 @@ func (s *customerService) RemovePaymentTerm(ctx context.Context, companyID, cust
 }
 
 func (s *customerService) AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	// Note: The schema does not have a direct sales_rep_id on customers table.
-	// Instead, sales_rep is linked via orders/invoices. This might be a design gap.
-	// For now, we'll log that assignment is not directly supported.
 	return fmt.Errorf("customer sales rep assignment not supported – assign at order/invoice level")
 }
 
@@ -766,7 +869,7 @@ func (s *customerService) RemoveSalesRep(ctx context.Context, companyID, custome
 }
 
 // ----------------------------------------------------------------------------
-// Reporting Queries
+// Reporting Queries (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) GetCustomersWithOutstandingInvoices(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error) {
@@ -792,7 +895,7 @@ func (s *customerService) GetTopCustomersByRevenue(ctx context.Context, companyI
 }
 
 // ----------------------------------------------------------------------------
-// Validation & Existence
+// Validation & Existence (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) ValidateCustomer(ctx context.Context, customer *models.Customer) error {
@@ -802,7 +905,6 @@ func (s *customerService) ValidateCustomer(ctx context.Context, customer *models
 	if customer.Name == "" {
 		return fmt.Errorf("%w: name required", salesErrors.ErrInvalidInput)
 	}
-	// Additional validations (email format, phone format) can be added.
 	return nil
 }
 
@@ -815,7 +917,7 @@ func (s *customerService) IsCustomerActive(ctx context.Context, companyID, custo
 }
 
 // ----------------------------------------------------------------------------
-// Event Emission
+// Event Emission (unchanged)
 // ----------------------------------------------------------------------------
 
 func (s *customerService) emitCustomerEvent(ctx context.Context, tx repository.DBTX, customer *models.Customer, eventType string) error {

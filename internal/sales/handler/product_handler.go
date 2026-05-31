@@ -31,7 +31,6 @@ func NewProductHandler(productService service.ProductService, logger *zap.Logger
 // ---------- Request/Response Types ----------
 
 type createProductRequest struct {
-	CompanyID       string  `json:"company_id"`
 	SKU             string  `json:"sku"`
 	Name            string  `json:"name"`
 	Description     *string `json:"description,omitempty"`
@@ -89,7 +88,18 @@ type productSummary struct {
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
 }
 
-// ---------- Helper Functions ----------
+// ---------- Helper to extract company ID from header ----------
+func (h *ProductHandler) getCompanyIDFromHeader(r *http.Request) (uuid.UUID, error) {
+	header := r.Header.Get("X-Company-ID")
+	if header == "" {
+		return uuid.Nil, fmt.Errorf("X-Company-ID header is required")
+	}
+	companyID, err := uuid.Parse(header)
+	if err != nil || companyID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("invalid X-Company-ID header")
+	}
+	return companyID, nil
+}
 
 // ---------- Handler Methods ----------
 
@@ -103,6 +113,12 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createProductRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -110,17 +126,16 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validation
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
 	if req.SKU == "" || req.Name == "" || req.UnitPrice == "" {
 		h.respondWithError(w, http.StatusBadRequest, "sku, name, and unit_price are required")
+		return
+	}
+	if len(req.SKU) > 100 {
+		h.respondWithError(w, http.StatusBadRequest, "sku must be at most 100 characters")
+		return
+	}
+	if len(req.Name) > 255 {
+		h.respondWithError(w, http.StatusBadRequest, "name must be at most 255 characters")
 		return
 	}
 	unitPrice, err := decimal.NewFromString(req.UnitPrice)
@@ -132,11 +147,16 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "unit_price cannot be negative")
 		return
 	}
+
 	var inventoryItemID *uuid.UUID
 	if req.InventoryItemID != nil && *req.InventoryItemID != "" {
 		parsed, err := uuid.Parse(*req.InventoryItemID)
 		if err != nil {
 			h.respondWithError(w, http.StatusBadRequest, "invalid inventory_item_id")
+			return
+		}
+		if parsed == uuid.Nil {
+			h.respondWithError(w, http.StatusBadRequest, "inventory_item_id cannot be the nil UUID")
 			return
 		}
 		inventoryItemID = &parsed
@@ -159,7 +179,7 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		Name:            req.Name,
 		Description:     req.Description,
 		UnitPrice:       unitPrice,
-		IsActive:        &req.IsActive, // FIXED: pointer to bool
+		IsActive:        &req.IsActive,
 		InventoryItemID: inventoryItemID,
 		CreatedBy:       &userID,
 	}
@@ -212,14 +232,9 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -319,14 +334,9 @@ func (h *ProductHandler) DeleteProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -365,14 +375,9 @@ func (h *ProductHandler) GetProductByID(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -421,14 +426,9 @@ func (h *ProductHandler) GetProductByID(w http.ResponseWriter, r *http.Request) 
 func (h *ProductHandler) GetProductBySKU(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -483,14 +483,9 @@ func (h *ProductHandler) GetProductBySKU(w http.ResponseWriter, r *http.Request)
 func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -505,7 +500,6 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build filter
 	filter := service.ProductListFilter{
 		CompanyID: companyID,
 	}
@@ -515,12 +509,10 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 			filter.IsActive = &active
 		}
 	}
-	// SKU filter removed – service.ProductListFilter does not have SKU field
 	if search := r.URL.Query().Get("search"); search != "" {
-		filter.Search = &search // FIXED: pointer to string
+		filter.Search = &search
 	}
 
-	// Pagination -> limit/offset
 	limit := 20
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -535,7 +527,6 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	}
 	pagination := service.Pagination{Limit: limit, Offset: offset}
 
-	// Sorting
 	sort := service.Sort{
 		Field:     r.URL.Query().Get("sort_field"),
 		Direction: r.URL.Query().Get("sort_dir"),
@@ -582,7 +573,7 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// UpdateProductStatus handles PATCH /products/{id}/status
+// UpdateProductStatus handles POST /products/{id}/status
 func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -598,14 +589,9 @@ func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -644,7 +630,7 @@ func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// UpdateUnitPrice handles PATCH /products/{id}/price
+// UpdateUnitPrice handles POST /products/{id}/unit-price
 func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -660,14 +646,9 @@ func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -715,7 +696,7 @@ func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// LinkInventoryItem handles POST /products/{id}/inventory
+// LinkInventoryItem handles POST /products/{id}/link-inventory
 func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -731,14 +712,9 @@ func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -759,6 +735,10 @@ func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Reques
 	inventoryItemID, err := uuid.Parse(req.InventoryItemID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid inventory_item_id")
+		return
+	}
+	if inventoryItemID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "inventory_item_id cannot be the nil UUID")
 		return
 	}
 
@@ -782,7 +762,7 @@ func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// UnlinkInventoryItem handles DELETE /products/{id}/inventory
+// UnlinkInventoryItem handles POST /products/{id}/unlink-inventory
 func (h *ProductHandler) UnlinkInventoryItem(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -798,14 +778,9 @@ func (h *ProductHandler) UnlinkInventoryItem(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

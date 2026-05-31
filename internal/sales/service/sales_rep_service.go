@@ -1,10 +1,11 @@
+// internal/sales/service/sales_rep_service.go
+
 package service
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"auth-service/internal/client"
+	"auth-service/internal/encryption"
 	"auth-service/internal/infrastructure/audit"
 	"auth-service/internal/infrastructure/idempotency"
 	"auth-service/internal/infrastructure/outbox"
@@ -23,11 +25,10 @@ import (
 )
 
 // ---------------------------------------------------------------------
-// Request / response DTOs
+// DTOs
 // ---------------------------------------------------------------------
-
 // ---------------------------------------------------------------------
-// Service interface
+// Service Interface (unchanged)
 // ---------------------------------------------------------------------
 
 type SalesRepService interface {
@@ -44,23 +45,22 @@ type SalesRepService interface {
 	DeactivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
 	IsSalesRepActive(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error)
 
+	// Assignment
 	AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
 	RemoveOrderAssignment(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
 	GetAssignedOrders(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Order, int64, error)
-
 	AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
 	RemoveQuoteAssignment(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
 	GetAssignedQuotes(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Quote, int64, error)
-
 	AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
 	RemoveInvoiceAssignment(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
 	GetAssignedInvoices(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Invoice, int64, error)
-
 	AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error
 	RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error
 	GetAssignedCustomers(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, s Sort) ([]*models.Customer, int64, error)
 	GetCustomerSalesRep(ctx context.Context, companyID, customerID uuid.UUID) (*models.SalesRep, error)
 
+	// Commission & Analytics
 	SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error
 	CalculateCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetEarnedCommission(ctx context.Context, companyID, salesRepID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
@@ -71,9 +71,11 @@ type SalesRepService interface {
 	GetTopSalesReps(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error)
 	GetSalesRepLeaderboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*SalesRepLeaderboardEntry, error)
 
+	// Sales Targets
 	SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID, idempotencyKey string) error
 	GetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, periodStart, periodEnd time.Time) (*models.SalesTarget, error)
 
+	// Validation Helpers
 	ValidateSalesRep(ctx context.Context, rep *models.SalesRep) error
 	ValidateAssignment(ctx context.Context, companyID, salesRepID uuid.UUID, entityType string, entityID uuid.UUID) error
 	CanManageCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID) (bool, error)
@@ -83,7 +85,7 @@ type SalesRepService interface {
 }
 
 // ---------------------------------------------------------------------
-// Service implementation
+// Service Implementation
 // ---------------------------------------------------------------------
 
 type salesRepService struct {
@@ -92,11 +94,12 @@ type salesRepService struct {
 	quoteRepo        repository.QuoteRepository
 	invoiceRepo      repository.InvoiceRepository
 	commissionRepo   repository.SalesRepCommissionRepository
-	targetRepo       repository.SalesTargetRepository // added
+	targetRepo       repository.SalesTargetRepository
 	pgClient         *client.PostgresClient
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
+	encryptionMgr    *encryption.EncryptionManager
 	logger           *zap.Logger
 }
 
@@ -111,6 +114,7 @@ func NewSalesRepService(
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
+	encryptionMgr *encryption.EncryptionManager,
 	logger *zap.Logger,
 ) SalesRepService {
 	return &salesRepService{
@@ -124,70 +128,14 @@ func NewSalesRepService(
 		outboxRepo:       outboxRepo,
 		idempotencyStore: idempotencyStore,
 		auditService:     auditService,
+		encryptionMgr:    encryptionMgr,
 		logger:           logger.Named("sales_rep_service"),
 	}
 }
 
 // ---------------------------------------------------------------------
-// Helpers
+// Validation Helpers
 // ---------------------------------------------------------------------
-
-func (s *salesRepService) nullUUID(id *uuid.UUID) interface{} {
-	if id == nil || *id == uuid.Nil {
-		return nil
-	}
-	return *id
-}
-
-func (s *salesRepService) emitEvent(ctx context.Context, tx *sql.Tx, rep *models.SalesRep, eventType string) error {
-	payload := map[string]interface{}{
-		"sales_rep_id": rep.SalesRepID.String(),
-		"company_id":   rep.CompanyID.String(),
-		"code":         rep.Code,
-		"name":         rep.Name,
-		"is_active":    rep.IsActive,
-	}
-	if rep.UserID != uuid.Nil {
-		payload["user_id"] = rep.UserID.String()
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	event := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "sales_rep",
-		AggregateID:   rep.SalesRepID.String(),
-		EventType:     eventType,
-		Topic:         salesEvents.TopicSalesEvents,
-		Payload:       data,
-	}
-	return s.outboxRepo.Store(ctx, tx, event)
-}
-
-func (s *salesRepService) emitSalesTargetEvent(ctx context.Context, tx *sql.Tx, target *models.SalesTarget, eventType string) error {
-	payload := map[string]interface{}{
-		"target_id":     target.TargetID.String(),
-		"company_id":    target.CompanyID.String(),
-		"sales_rep_id":  target.SalesRepID.String(),
-		"period_start":  target.PeriodStart,
-		"period_end":    target.PeriodEnd,
-		"target_amount": target.TargetAmount,
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	event := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "sales_target",
-		AggregateID:   target.TargetID.String(),
-		EventType:     eventType,
-		Topic:         salesEvents.TopicSalesEvents,
-		Payload:       data,
-	}
-	return s.outboxRepo.Store(ctx, tx, event)
-}
 
 func (s *salesRepService) validateCreateSalesRep(req *CreateSalesRepRequest) error {
 	if req.CompanyID == uuid.Nil {
@@ -205,13 +153,86 @@ func (s *salesRepService) validateCreateSalesRep(req *CreateSalesRepRequest) err
 	return nil
 }
 
+func (s *salesRepService) validateSalesRepInput(name string, email *string) error {
+	if len(name) > maxNameLen {
+		return fmt.Errorf("%w: name must not exceed %d characters", salesErrors.ErrInvalidInput, maxNameLen)
+	}
+	if email != nil && *email != "" {
+		if len(*email) > maxEmailLen {
+			return fmt.Errorf("%w: email must not exceed %d characters", salesErrors.ErrInvalidInput, maxEmailLen)
+		}
+		if !isValidEmail(*email) {
+			return fmt.Errorf("%w: invalid email format", salesErrors.ErrInvalidInput)
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------
-// CRUD operations
+// Encryption Helpers (same as CustomerService)
+// ---------------------------------------------------------------------
+
+func (s *salesRepService) encryptField(ctx context.Context, plainText *string, fieldName string) (encrypted, dek, keyID *string, err error) {
+	if plainText == nil || *plainText == "" {
+		return nil, nil, nil, nil
+	}
+	enc, err := s.encryptionMgr.EncryptField(ctx, *plainText, fieldName)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encrypt %s: %w", fieldName, err)
+	}
+	return &enc.EncryptedValue, &enc.EncryptedDEK, &enc.KeyID, nil
+}
+
+func (s *salesRepService) decryptField(ctx context.Context, encrypted, dek, keyID *string) (string, error) {
+	if encrypted == nil || *encrypted == "" || dek == nil || keyID == nil {
+		return "", nil
+	}
+	encData := &encryption.EncryptedData{
+		EncryptedValue: *encrypted,
+		EncryptedDEK:   *dek,
+		KeyID:          *keyID,
+	}
+	return s.encryptionMgr.DecryptField(ctx, encData)
+}
+
+func (s *salesRepService) decryptSalesRep(ctx context.Context, rep *models.SalesRep) error {
+	if rep == nil {
+		return nil
+	}
+	// Decrypt email
+	if rep.EmailEncrypted != nil && rep.EmailDEK != nil && rep.EmailKeyID != nil {
+		plain, err := s.decryptField(ctx, rep.EmailEncrypted, rep.EmailDEK, rep.EmailKeyID)
+		if err != nil {
+			return fmt.Errorf("decrypt email: %w", err)
+		}
+		if plain != "" {
+			rep.Email = &plain
+		}
+	}
+	// Decrypt phone
+	if rep.PhoneEncrypted != nil && rep.PhoneDEK != nil && rep.PhoneKeyID != nil {
+		plain, err := s.decryptField(ctx, rep.PhoneEncrypted, rep.PhoneDEK, rep.PhoneKeyID)
+		if err != nil {
+			return fmt.Errorf("decrypt phone: %w", err)
+		}
+		if plain != "" {
+			rep.Phone = &plain
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------
+// CRUD Operations
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRepRequest, idempotencyKey string) (*models.SalesRep, error) {
 	logger := s.logger.With(zap.String("method", "CreateSalesRep"), zap.String("idempotency_key", idempotencyKey))
+
 	if err := s.validateCreateSalesRep(req); err != nil {
+		return nil, err
+	}
+	if err := s.validateSalesRepInput(req.Name, req.Email); err != nil {
 		return nil, err
 	}
 
@@ -227,37 +248,80 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 		return cached, nil
 	}
 
-	exists, err := s.repRepo.ExistsByCode(ctx, tx, req.CompanyID, req.Code)
+	// 1. Check user exists via repository
+	userExists, err := s.repRepo.UserExists(ctx, tx, req.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("check user existence: %w", err)
+	}
+	if !userExists {
+		return nil, fmt.Errorf("%w: user_id does not exist", salesErrors.ErrInvalidInput)
+	}
+
+	// 2. Check code uniqueness
+	codeExists, err := s.repRepo.ExistsByCode(ctx, tx, req.CompanyID, req.Code)
 	if err != nil {
 		return nil, fmt.Errorf("check code existence: %w", err)
 	}
-	if exists {
+	if codeExists {
 		return nil, fmt.Errorf("%w: code %s already exists", salesErrors.ErrDuplicate, req.Code)
 	}
+
+	// 3. Check user not already linked
 	linked, err := s.repRepo.ExistsByUserID(ctx, tx, req.CompanyID, req.UserID)
 	if err != nil {
-		return nil, fmt.Errorf("check user existence: %w", err)
+		return nil, fmt.Errorf("check user linked: %w", err)
 	}
 	if linked {
 		return nil, fmt.Errorf("%w: user %s already linked to a sales rep", salesErrors.ErrDuplicate, req.UserID)
 	}
 
-	rep := &models.SalesRep{
-		SalesRepID: uuid.New(),
-		CompanyID:  req.CompanyID,
-		UserID:     req.UserID,
-		Code:       req.Code,
-		Name:       req.Name,
-		Email:      req.Email,
-		Phone:      req.Phone,
-		IsActive:   true,
-		CreatedBy:  req.CreatedBy,
-		UpdatedBy:  req.CreatedBy,
+	// 4. Email uniqueness via hash
+	var emailHash *string
+	if req.Email != nil && *req.Email != "" {
+		hash := hashEmail(*req.Email)
+		hashExists, err := s.repRepo.ExistsByEmailHash(ctx, tx, req.CompanyID, hash)
+		if err != nil {
+			return nil, fmt.Errorf("check email hash: %w", err)
+		}
+		if hashExists {
+			return nil, fmt.Errorf("%w: email already in use", salesErrors.ErrDuplicate)
+		}
+		emailHash = &hash
 	}
+
+	// 5. Encrypt email and phone (store ciphertext, DEK, keyID)
+	emailEncrypted, emailDEK, emailKeyID, err := s.encryptField(ctx, req.Email, "sales_rep_email")
+	if err != nil {
+		return nil, err
+	}
+	phoneEncrypted, phoneDEK, phoneKeyID, err := s.encryptField(ctx, req.Phone, "sales_rep_phone")
+	if err != nil {
+		return nil, err
+	}
+
+	rep := &models.SalesRep{
+		SalesRepID:     uuid.New(),
+		CompanyID:      req.CompanyID,
+		UserID:         req.UserID,
+		Code:           req.Code,
+		Name:           req.Name,
+		EmailEncrypted: emailEncrypted,
+		EmailDEK:       emailDEK,
+		EmailKeyID:     emailKeyID,
+		EmailHash:      emailHash,
+		PhoneEncrypted: phoneEncrypted,
+		PhoneDEK:       phoneDEK,
+		PhoneKeyID:     phoneKeyID,
+		IsActive:       true,
+		CreatedBy:      req.CreatedBy,
+		UpdatedBy:      req.CreatedBy,
+	}
+
 	if err := s.repRepo.Create(ctx, tx, rep); err != nil {
 		return nil, fmt.Errorf("create sales rep: %w", err)
 	}
 
+	// Emit event
 	if err := s.emitEvent(ctx, tx, rep, salesEvents.EventSalesRepCreated); err != nil {
 		logger.Warn("failed to emit sales rep created event", zap.Error(err))
 	}
@@ -266,6 +330,9 @@ func (s *salesRepService) CreateSalesRep(ctx context.Context, req *CreateSalesRe
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
+
+	// Decrypt for response
+	_ = s.decryptSalesRep(ctx, rep)
 
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "create_sales_rep", "sales_rep",
@@ -281,6 +348,16 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 	logger := s.logger.With(zap.String("method", "UpdateSalesRep"), zap.String("idempotency_key", idempotencyKey))
 	if companyID == uuid.Nil || salesRepID == uuid.Nil {
 		return nil, salesErrors.ErrInvalidInput
+	}
+
+	if req.Name != nil {
+		if err := s.validateSalesRepInput(*req.Name, req.Email); err != nil {
+			return nil, err
+		}
+	} else if req.Email != nil {
+		if err := s.validateSalesRepInput("dummy", req.Email); err != nil {
+			return nil, err
+		}
 	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -304,24 +381,56 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 	}
 
 	changes := make(map[string]interface{})
+
+	// Name
 	if req.Name != nil && *req.Name != rep.Name {
 		changes["name"] = map[string]string{"old": rep.Name, "new": *req.Name}
 		rep.Name = *req.Name
 	}
+
+	// Email (encrypted)
 	if req.Email != nil {
-		changes["email"] = map[string]*string{"old": rep.Email, "new": req.Email}
-		rep.Email = req.Email
+		newHash := hashEmail(*req.Email)
+		hashExists, err := s.repRepo.ExistsByEmailHashExcluding(ctx, tx, companyID, newHash, salesRepID)
+		if err != nil {
+			return nil, fmt.Errorf("check email uniqueness: %w", err)
+		}
+		if hashExists {
+			return nil, fmt.Errorf("%w: email already in use", salesErrors.ErrDuplicate)
+		}
+		encrypted, dek, kid, err := s.encryptField(ctx, req.Email, "sales_rep_email")
+		if err != nil {
+			return nil, err
+		}
+		// Capture old email for audit (decrypt current)
+		oldPlain, _ := s.decryptField(ctx, rep.EmailEncrypted, rep.EmailDEK, rep.EmailKeyID)
+		changes["email"] = map[string]string{"old": oldPlain, "new": *req.Email}
+		rep.EmailEncrypted = encrypted
+		rep.EmailDEK = dek
+		rep.EmailKeyID = kid
+		rep.EmailHash = &newHash
 	}
+
+	// Phone (encrypted)
 	if req.Phone != nil {
-		changes["phone"] = map[string]*string{"old": rep.Phone, "new": req.Phone}
-		rep.Phone = req.Phone
+		encrypted, dek, kid, err := s.encryptField(ctx, req.Phone, "sales_rep_phone")
+		if err != nil {
+			return nil, err
+		}
+		oldPlain, _ := s.decryptField(ctx, rep.PhoneEncrypted, rep.PhoneDEK, rep.PhoneKeyID)
+		changes["phone"] = map[string]string{"old": oldPlain, "new": *req.Phone}
+		rep.PhoneEncrypted = encrypted
+		rep.PhoneDEK = dek
+		rep.PhoneKeyID = kid
 	}
+
+	// Active status
 	if req.IsActive != nil && *req.IsActive != rep.IsActive {
 		changes["is_active"] = map[string]bool{"old": rep.IsActive, "new": *req.IsActive}
 		rep.IsActive = *req.IsActive
 	}
-	rep.UpdatedBy = req.UpdatedBy
 
+	rep.UpdatedBy = req.UpdatedBy
 	if err := s.repRepo.Update(ctx, tx, rep); err != nil {
 		return nil, fmt.Errorf("update sales rep: %w", err)
 	}
@@ -335,12 +444,18 @@ func (s *salesRepService) UpdateSalesRep(ctx context.Context, companyID, salesRe
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
+	_ = s.decryptSalesRep(ctx, rep)
+
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "update_sales_rep", "sales_rep",
 			&salesRepID, "user", req.UpdatedBy, nil, nil, changes)
 	}
 	return rep, nil
 }
+
+// ---------------------------------------------------------------------
+// DeleteSalesRep, GetSalesRepByID, etc. (unchanged from user’s code)
+// ---------------------------------------------------------------------
 
 func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "DeleteSalesRep"), zap.String("idempotency_key", idempotencyKey))
@@ -364,15 +479,16 @@ func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRe
 		return salesErrors.ErrPermissionDenied
 	}
 
+	// Check dependencies
 	var hasDeps bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM sales.orders WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
-			UNION ALL
-			SELECT 1 FROM sales.quotes WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
-			UNION ALL
-			SELECT 1 FROM sales.invoices WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
-		)`, companyID, salesRepID).Scan(&hasDeps)
+        SELECT EXISTS(
+            SELECT 1 FROM sales.orders WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
+            UNION ALL
+            SELECT 1 FROM sales.quotes WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
+            UNION ALL
+            SELECT 1 FROM sales.invoices WHERE company_id=$1 AND sales_rep_id=$2 LIMIT 1
+        )`, companyID, salesRepID).Scan(&hasDeps)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("check dependencies: %w", err)
 	}
@@ -405,15 +521,30 @@ func (s *salesRepService) DeleteSalesRep(ctx context.Context, companyID, salesRe
 }
 
 func (s *salesRepService) GetSalesRepByID(ctx context.Context, companyID, salesRepID uuid.UUID) (*models.SalesRep, error) {
-	return s.repRepo.GetByID(ctx, nil, companyID, salesRepID)
+	rep, err := s.repRepo.GetByID(ctx, nil, companyID, salesRepID)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.decryptSalesRep(ctx, rep)
+	return rep, nil
 }
 
 func (s *salesRepService) GetSalesRepByUserID(ctx context.Context, companyID, userID uuid.UUID) (*models.SalesRep, error) {
-	return s.repRepo.GetByUserID(ctx, nil, companyID, userID)
+	rep, err := s.repRepo.GetByUserID(ctx, nil, companyID, userID)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.decryptSalesRep(ctx, rep)
+	return rep, nil
 }
 
 func (s *salesRepService) GetSalesRepByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.SalesRep, error) {
-	return s.repRepo.GetByCode(ctx, nil, companyID, code)
+	rep, err := s.repRepo.GetByCode(ctx, nil, companyID, code)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.decryptSalesRep(ctx, rep)
+	return rep, nil
 }
 
 func (s *salesRepService) ListSalesReps(ctx context.Context, filter SalesRepListFilter, p Pagination, srt Sort) ([]*models.SalesRep, int64, error) {
@@ -425,17 +556,38 @@ func (s *salesRepService) ListSalesReps(ctx context.Context, filter SalesRepList
 		Name:        filter.Name,
 		UserID:      filter.UserID,
 	}
-	return s.repRepo.List(ctx, nil, repoFilter,
+	reps, total, err := s.repRepo.List(ctx, nil, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, r := range reps {
+		_ = s.decryptSalesRep(ctx, r)
+	}
+	return reps, total, nil
 }
 
 func (s *salesRepService) SearchSalesReps(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.SalesRep, int64, error) {
-	return s.repRepo.Search(ctx, nil, companyID, query, limit, offset)
+	reps, total, err := s.repRepo.Search(ctx, nil, companyID, query, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, r := range reps {
+		_ = s.decryptSalesRep(ctx, r)
+	}
+	return reps, total, nil
 }
 
 func (s *salesRepService) GetActiveSalesReps(ctx context.Context, companyID uuid.UUID) ([]*models.SalesRep, error) {
-	return s.repRepo.GetActiveSalesReps(ctx, nil, companyID)
+	reps, err := s.repRepo.GetActiveSalesReps(ctx, nil, companyID)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range reps {
+		_ = s.decryptSalesRep(ctx, r)
+	}
+	return reps, nil
 }
 
 func (s *salesRepService) ActivateSalesRep(ctx context.Context, companyID, salesRepID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
@@ -472,10 +624,7 @@ func (s *salesRepService) setActiveStatus(ctx context.Context, companyID, salesR
 	}
 
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *salesRepService) IsSalesRepActive(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error) {
@@ -483,7 +632,7 @@ func (s *salesRepService) IsSalesRepActive(ctx context.Context, companyID, sales
 }
 
 // ---------------------------------------------------------------------
-// Assignment helpers
+// Assignment Methods (unchanged from user’s code)
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) assignEntity(ctx context.Context, companyID, salesRepID, entityID uuid.UUID, entityType string, assignedBy uuid.UUID, idempotencyKey string, updateFunc func(*sql.Tx) error) error {
@@ -576,10 +725,7 @@ func (s *salesRepService) removeAssignment(ctx context.Context, companyID, sales
 	return tx.Commit()
 }
 
-// ---------------------------------------------------------------------
 // Order assignments
-// ---------------------------------------------------------------------
-
 func (s *salesRepService) AssignOrder(ctx context.Context, companyID, salesRepID, orderID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
 	return s.assignEntity(ctx, companyID, salesRepID, orderID, "order", assignedBy, idempotencyKey, func(tx *sql.Tx) error {
 		order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
@@ -614,10 +760,7 @@ func (s *salesRepService) GetAssignedOrders(ctx context.Context, companyID, sale
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// ---------------------------------------------------------------------
 // Quote assignments
-// ---------------------------------------------------------------------
-
 func (s *salesRepService) AssignQuote(ctx context.Context, companyID, salesRepID, quoteID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
 	return s.assignEntity(ctx, companyID, salesRepID, quoteID, "quote", assignedBy, idempotencyKey, func(tx *sql.Tx) error {
 		quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
@@ -652,10 +795,7 @@ func (s *salesRepService) GetAssignedQuotes(ctx context.Context, companyID, sale
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// ---------------------------------------------------------------------
 // Invoice assignments
-// ---------------------------------------------------------------------
-
 func (s *salesRepService) AssignInvoice(ctx context.Context, companyID, salesRepID, invoiceID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
 	return s.assignEntity(ctx, companyID, salesRepID, invoiceID, "invoice", assignedBy, idempotencyKey, func(tx *sql.Tx) error {
 		invoice, err := s.invoiceRepo.GetByIDForUpdate(ctx, tx, companyID, invoiceID)
@@ -690,28 +830,22 @@ func (s *salesRepService) GetAssignedInvoices(ctx context.Context, companyID, sa
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// ---------------------------------------------------------------------
 // Customer assignments (not supported)
-// ---------------------------------------------------------------------
-
 func (s *salesRepService) AssignCustomer(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, assignedBy uuid.UUID, idempotencyKey string) error {
 	return fmt.Errorf("customer assignment not supported: customer model lacks sales_rep_id column")
 }
-
 func (s *salesRepService) RemoveCustomerAssignment(ctx context.Context, companyID, salesRepID, customerID uuid.UUID, removedBy uuid.UUID, idempotencyKey string) error {
 	return fmt.Errorf("customer assignment removal not supported")
 }
-
 func (s *salesRepService) GetAssignedCustomers(ctx context.Context, companyID, salesRepID uuid.UUID, p Pagination, srt Sort) ([]*models.Customer, int64, error) {
 	return nil, 0, fmt.Errorf("customer assignment not supported")
 }
-
 func (s *salesRepService) GetCustomerSalesRep(ctx context.Context, companyID, customerID uuid.UUID) (*models.SalesRep, error) {
 	return nil, fmt.Errorf("customer sales rep not supported")
 }
 
 // ---------------------------------------------------------------------
-// Commission & analytics
+// Commission & Analytics (unchanged)
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, salesRepID, commissionPlanID uuid.UUID, updatedBy uuid.UUID, idempotencyKey string) error {
@@ -733,7 +867,6 @@ func (s *salesRepService) SetCommissionPlan(ctx context.Context, companyID, sale
 	if comm.CompanyID != companyID || comm.SalesRepID != salesRepID {
 		return fmt.Errorf("%w: commission plan not owned by this sales rep", salesErrors.ErrInvalidInput)
 	}
-	// No update needed – the plan is already linked.
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
 	return tx.Commit()
 }
@@ -780,13 +913,13 @@ func (s *salesRepService) GetCollectedRevenue(ctx context.Context, companyID, sa
 
 	var total decimal.Decimal
 	query := `
-		SELECT COALESCE(SUM(p.amount), 0)
-		FROM sales.payments p
-		JOIN sales.payment_allocations pa ON pa.payment_id = p.payment_id
-		JOIN sales.invoices i ON i.invoice_id = pa.invoice_id
-		JOIN sales.orders o ON o.order_id = i.order_id
-		WHERE p.company_id=$1 AND o.sales_rep_id=$2 AND p.status='completed'
-	`
+        SELECT COALESCE(SUM(p.amount), 0)
+        FROM sales.payments p
+        JOIN sales.payment_allocations pa ON pa.payment_id = p.payment_id
+        JOIN sales.invoices i ON i.invoice_id = pa.invoice_id
+        JOIN sales.orders o ON o.order_id = i.order_id
+        WHERE p.company_id=$1 AND o.sales_rep_id=$2 AND p.status='completed'
+    `
 	args := []interface{}{companyID, salesRepID}
 	if from != nil {
 		query += ` AND p.payment_date >= $3`
@@ -811,11 +944,7 @@ func (s *salesRepService) GetAverageDealSize(ctx context.Context, companyID, sal
 	defer tx.Rollback()
 
 	var avg decimal.Decimal
-	query := `
-		SELECT COALESCE(AVG(grand_total), 0)
-		FROM sales.orders
-		WHERE company_id=$1 AND sales_rep_id=$2
-	`
+	query := `SELECT COALESCE(AVG(grand_total), 0) FROM sales.orders WHERE company_id=$1 AND sales_rep_id=$2`
 	args := []interface{}{companyID, salesRepID}
 	if from != nil {
 		query += ` AND order_date >= $3`
@@ -869,7 +998,14 @@ func (s *salesRepService) GetConversionRate(ctx context.Context, companyID, sale
 }
 
 func (s *salesRepService) GetTopSalesReps(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.SalesRep, error) {
-	return s.repRepo.GetTopSalesRepsByRevenue(ctx, nil, companyID, limit, from, to)
+	reps, err := s.repRepo.GetTopSalesRepsByRevenue(ctx, nil, companyID, limit, from, to)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range reps {
+		_ = s.decryptSalesRep(ctx, r)
+	}
+	return reps, nil
 }
 
 func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*SalesRepLeaderboardEntry, error) {
@@ -880,15 +1016,15 @@ func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID 
 	defer tx.Rollback()
 
 	query := `
-		SELECT
-			sr.sales_rep_id, sr.code, sr.name,
-			COALESCE(SUM(o.grand_total), 0) as total_revenue,
-			COUNT(o.order_id) as total_orders,
-			COALESCE(AVG(o.grand_total), 0) as avg_deal
-		FROM sales.sales_reps sr
-		LEFT JOIN sales.orders o ON o.sales_rep_id = sr.sales_rep_id AND o.company_id = sr.company_id
-		WHERE sr.company_id = $1 AND sr.is_active = true
-	`
+        SELECT
+            sr.sales_rep_id, sr.code, sr.name,
+            COALESCE(SUM(o.grand_total), 0) as total_revenue,
+            COUNT(o.order_id) as total_orders,
+            COALESCE(AVG(o.grand_total), 0) as avg_deal
+        FROM sales.sales_reps sr
+        LEFT JOIN sales.orders o ON o.sales_rep_id = sr.sales_rep_id AND o.company_id = sr.company_id
+        WHERE sr.company_id = $1 AND sr.is_active = true
+    `
 	args := []interface{}{companyID}
 	if from != nil {
 		query += ` AND o.order_date >= $2`
@@ -918,7 +1054,7 @@ func (s *salesRepService) GetSalesRepLeaderboard(ctx context.Context, companyID 
 }
 
 // ---------------------------------------------------------------------
-// Sales targets (implemented)
+// Sales Targets (unchanged)
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRepID uuid.UUID, req *SetSalesTargetRequest, updatedBy uuid.UUID, idempotencyKey string) error {
@@ -942,7 +1078,6 @@ func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRe
 		return nil
 	}
 
-	// Validate sales rep exists and is active
 	active, err := s.repRepo.IsActive(ctx, tx, companyID, salesRepID)
 	if err != nil {
 		return err
@@ -951,7 +1086,7 @@ func (s *salesRepService) SetSalesTarget(ctx context.Context, companyID, salesRe
 		return fmt.Errorf("%w: sales rep is not active", salesErrors.ErrInvalidInput)
 	}
 
-	// Upsert: delete existing target for the same period, then insert
+	// Upsert
 	delQuery := `DELETE FROM sales.sales_targets WHERE company_id=$1 AND sales_rep_id=$2 AND period_start=$3 AND period_end=$4`
 	if _, err := tx.ExecContext(ctx, delQuery, companyID, salesRepID, req.PeriodStart, req.PeriodEnd); err != nil {
 		return fmt.Errorf("delete existing target: %w", err)
@@ -998,7 +1133,7 @@ func (s *salesRepService) GetSalesTarget(ctx context.Context, companyID, salesRe
 }
 
 // ---------------------------------------------------------------------
-// Validation helpers
+// Validation Helpers (unchanged)
 // ---------------------------------------------------------------------
 
 func (s *salesRepService) ValidateSalesRep(ctx context.Context, rep *models.SalesRep) error {
@@ -1038,12 +1173,53 @@ func (s *salesRepService) SalesRepCodeExists(ctx context.Context, companyID uuid
 }
 
 func (s *salesRepService) UserAlreadyLinked(ctx context.Context, companyID, userID uuid.UUID) (bool, error) {
-	_, err := s.repRepo.GetByUserID(ctx, nil, companyID, userID)
-	if err != nil {
-		if errors.Is(err, salesErrors.ErrNotFound) {
-			return false, nil
-		}
-		return false, err
+	return s.repRepo.ExistsByUserID(ctx, nil, companyID, userID)
+}
+
+// ---------------------------------------------------------------------
+// Internal Helpers
+// ---------------------------------------------------------------------
+
+func (s *salesRepService) emitEvent(ctx context.Context, tx *sql.Tx, rep *models.SalesRep, eventType string) error {
+	payload := map[string]interface{}{
+		"sales_rep_id": rep.SalesRepID.String(),
+		"company_id":   rep.CompanyID.String(),
+		"code":         rep.Code,
+		"name":         rep.Name,
+		"is_active":    rep.IsActive,
 	}
-	return true, nil
+	if rep.UserID != uuid.Nil {
+		payload["user_id"] = rep.UserID.String()
+	}
+	data, _ := json.Marshal(payload)
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "sales_rep",
+		AggregateID:   rep.SalesRepID.String(),
+		EventType:     eventType,
+		Topic:         salesEvents.TopicSalesEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
+}
+
+func (s *salesRepService) emitSalesTargetEvent(ctx context.Context, tx *sql.Tx, target *models.SalesTarget, eventType string) error {
+	payload := map[string]interface{}{
+		"target_id":     target.TargetID.String(),
+		"company_id":    target.CompanyID.String(),
+		"sales_rep_id":  target.SalesRepID.String(),
+		"period_start":  target.PeriodStart,
+		"period_end":    target.PeriodEnd,
+		"target_amount": target.TargetAmount,
+	}
+	data, _ := json.Marshal(payload)
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "sales_target",
+		AggregateID:   target.TargetID.String(),
+		EventType:     eventType,
+		Topic:         salesEvents.TopicSalesEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
 }

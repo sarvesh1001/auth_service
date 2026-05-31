@@ -1,3 +1,4 @@
+// file: internal/sales/handler/quote_handler.go
 package handler
 
 import (
@@ -26,14 +27,13 @@ type QuoteHandler struct {
 func NewQuoteHandler(quoteService service.QuoteService, logger *zap.Logger) *QuoteHandler {
 	return &QuoteHandler{
 		quoteService: quoteService,
-		BaseHandler:  &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:  &BaseHandler{logger: logger.Named("quote_handler")},
 	}
 }
 
 // ---------- Request/Response Types ----------
 
 type createQuoteRequest struct {
-	CompanyID  string             `json:"company_id"`
 	CustomerID string             `json:"customer_id"`
 	QuoteDate  string             `json:"quote_date"`
 	ExpiryDate *string            `json:"expiry_date,omitempty"`
@@ -130,7 +130,6 @@ type quoteItemResponse struct {
 }
 
 type quotePricingPreviewRequest struct {
-	CompanyID  string             `json:"company_id"`
 	CustomerID string             `json:"customer_id"`
 	Items      []quoteItemRequest `json:"items"`
 }
@@ -141,8 +140,6 @@ type quotePricingPreviewResponse struct {
 	TaxTotal      string `json:"tax_total"`
 	GrandTotal    string `json:"grand_total"`
 }
-
-// ---------- Helper Methods (receiver-specific, no conflicts) ----------
 
 // ---------- Handler Methods ----------
 
@@ -156,6 +153,12 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createQuoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
@@ -163,16 +166,6 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate required fields
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
-
 	if req.CustomerID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "customer_id is required")
 		return
@@ -328,7 +321,7 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id") // using package-level function from product_handler.go
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -340,14 +333,9 @@ func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -431,7 +419,7 @@ func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) DeleteQuote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -443,14 +431,9 @@ func (h *QuoteHandler) DeleteQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -483,20 +466,15 @@ func (h *QuoteHandler) DeleteQuote(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) GetQuoteByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -555,14 +533,9 @@ func (h *QuoteHandler) GetQuoteByID(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) GetQuoteByNumber(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -636,14 +609,9 @@ func (h *QuoteHandler) GetQuoteByNumber(w http.ResponseWriter, r *http.Request) 
 func (h *QuoteHandler) ListQuotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -739,14 +707,9 @@ func (h *QuoteHandler) ListQuotes(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) SearchQuotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -819,7 +782,7 @@ func (h *QuoteHandler) SearchQuotes(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -831,14 +794,9 @@ func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -910,7 +868,7 @@ func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -922,14 +880,9 @@ func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -997,13 +950,13 @@ func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	itemID, err := parseUUIDParam(r, "itemId")
+	itemID, err := h.parseUUIDParam(r, "itemId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid item ID")
 		return
@@ -1015,14 +968,9 @@ func (h *QuoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1055,20 +1003,15 @@ func (h *QuoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) GetQuoteItems(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1115,7 +1058,7 @@ func (h *QuoteHandler) GetQuoteItems(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1127,14 +1070,9 @@ func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1182,7 +1120,7 @@ func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1200,14 +1138,9 @@ func (h *QuoteHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1240,7 +1173,7 @@ func (h *QuoteHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1252,14 +1185,9 @@ func (h *QuoteHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1298,13 +1226,9 @@ func (h *QuoteHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1394,7 +1318,7 @@ func (h *QuoteHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1406,14 +1330,9 @@ func (h *QuoteHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1446,20 +1365,15 @@ func (h *QuoteHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request)
 func (h *QuoteHandler) GetQuoteTotals(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1499,7 +1413,7 @@ func (h *QuoteHandler) GetQuoteTotals(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1511,14 +1425,9 @@ func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1621,14 +1530,9 @@ func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) GetLatestRevision(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1693,7 +1597,7 @@ func (h *QuoteHandler) GetLatestRevision(w http.ResponseWriter, r *http.Request)
 func (h *QuoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1705,14 +1609,9 @@ func (h *QuoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1755,7 +1654,7 @@ func (h *QuoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) MarkSent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1767,14 +1666,9 @@ func (h *QuoteHandler) MarkSent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1807,7 +1701,7 @@ func (h *QuoteHandler) MarkSent(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) AcceptQuote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1819,14 +1713,9 @@ func (h *QuoteHandler) AcceptQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1859,7 +1748,7 @@ func (h *QuoteHandler) AcceptQuote(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) RejectQuote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1871,14 +1760,9 @@ func (h *QuoteHandler) RejectQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1916,7 +1800,7 @@ func (h *QuoteHandler) RejectQuote(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) ExpireQuote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -1928,14 +1812,9 @@ func (h *QuoteHandler) ExpireQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1968,14 +1847,9 @@ func (h *QuoteHandler) ExpireQuote(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) GetExpiringQuotes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2038,7 +1912,7 @@ func (h *QuoteHandler) GetExpiringQuotes(w http.ResponseWriter, r *http.Request)
 func (h *QuoteHandler) ConvertToOrder(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -2050,14 +1924,9 @@ func (h *QuoteHandler) ConvertToOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2116,20 +1985,15 @@ func (h *QuoteHandler) ConvertToOrder(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) IsConverted(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2162,7 +2026,7 @@ func (h *QuoteHandler) IsConverted(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -2174,14 +2038,9 @@ func (h *QuoteHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2229,7 +2088,7 @@ func (h *QuoteHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
@@ -2241,14 +2100,9 @@ func (h *QuoteHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2281,14 +2135,9 @@ func (h *QuoteHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) GetQuoteConversionRate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2344,14 +2193,9 @@ func (h *QuoteHandler) GetQuoteConversionRate(w http.ResponseWriter, r *http.Req
 func (h *QuoteHandler) GetTotalQuotedRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2407,20 +2251,15 @@ func (h *QuoteHandler) GetTotalQuotedRevenue(w http.ResponseWriter, r *http.Requ
 func (h *QuoteHandler) QuoteExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -2452,20 +2291,15 @@ func (h *QuoteHandler) QuoteExists(w http.ResponseWriter, r *http.Request) {
 func (h *QuoteHandler) IsExpired(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	quoteID, err := parseUUIDParam(r, "id")
+	quoteID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid quote ID")
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

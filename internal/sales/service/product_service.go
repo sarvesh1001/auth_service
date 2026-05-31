@@ -109,6 +109,13 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 		return nil, fmt.Errorf("%w: sku %s already exists", salesErrors.ErrDuplicate, req.SKU)
 	}
 
+	// Validate inventory item if provided
+	if req.InventoryItemID != nil {
+		if err := s.validateInventoryItem(ctx, tx, *req.InventoryItemID, req.CompanyID); err != nil {
+			return nil, err
+		}
+	}
+
 	isActive := true
 	if req.IsActive != nil {
 		isActive = *req.IsActive
@@ -182,10 +189,20 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 		return nil, salesErrors.ErrPermissionDenied
 	}
 
+	// Validate inventory item if being changed to a non-nil value
+	if req.InventoryItemID != nil && *req.InventoryItemID != uuid.Nil {
+		if err := s.validateInventoryItem(ctx, tx, *req.InventoryItemID, companyID); err != nil {
+			return nil, err
+		}
+	}
+
 	changes := make(map[string]interface{})
 	emitPriceChanged := false
 
 	if req.Name != nil && *req.Name != product.Name {
+		if len(*req.Name) > 255 {
+			return nil, fmt.Errorf("%w: name exceeds 255 characters", salesErrors.ErrInvalidInput)
+		}
 		changes["name"] = map[string]string{"old": product.Name, "new": *req.Name}
 		product.Name = *req.Name
 	}
@@ -324,7 +341,7 @@ func (s *productService) ListProducts(ctx context.Context, filter ProductListFil
 	repoFilter := repository.ProductFilter{
 		CompanyID:        filter.CompanyID,
 		IsActive:         filter.IsActive,
-		HasInventoryItem: filter.InventoryLinked, // map InventoryLinked -> HasInventoryItem
+		HasInventoryItem: filter.InventoryLinked,
 		MinUnitPrice:     filter.MinPrice,
 		MaxUnitPrice:     filter.MaxPrice,
 		SearchTerm:       filter.Search,
@@ -333,6 +350,7 @@ func (s *productService) ListProducts(ctx context.Context, filter ProductListFil
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
+
 func (s *productService) SearchProducts(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Product, int64, error) {
 	return s.productRepo.Search(ctx, nil, companyID, query, limit, offset)
 }
@@ -451,6 +469,17 @@ func (s *productService) UpdateUnitPrice(ctx context.Context, companyID, product
 }
 
 func (s *productService) LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+	// Validate inventory item exists and is active before linking
+	txCheck, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx for validation: %w", err)
+	}
+	if err := s.validateInventoryItem(ctx, txCheck, inventoryItemID, companyID); err != nil {
+		txCheck.Rollback()
+		return err
+	}
+	txCheck.Rollback() // validation passed, no need to keep this tx
+
 	return s.updateInventoryLink(ctx, companyID, productID, &inventoryItemID, updatedBy, idempotencyKey, salesEvents.EventProductInventoryLinked)
 }
 
@@ -505,6 +534,9 @@ func (s *productService) ValidateProduct(ctx context.Context, product *models.Pr
 	if product.Name == "" {
 		return fmt.Errorf("%w: name required", salesErrors.ErrInvalidInput)
 	}
+	if len(product.Name) > 255 {
+		return fmt.Errorf("%w: name exceeds 255 characters", salesErrors.ErrInvalidInput)
+	}
 	if product.UnitPrice.IsNegative() {
 		return fmt.Errorf("%w: unit_price cannot be negative", salesErrors.ErrInvalidInput)
 	}
@@ -521,8 +553,26 @@ func (s *productService) validateCreateProduct(req CreateProductRequest) error {
 	if req.Name == "" {
 		return fmt.Errorf("%w: name required", salesErrors.ErrInvalidInput)
 	}
+	if len(req.Name) > 255 {
+		return fmt.Errorf("%w: name exceeds 255 characters", salesErrors.ErrInvalidInput)
+	}
 	if req.UnitPrice.IsNegative() {
 		return fmt.Errorf("%w: unit_price cannot be negative", salesErrors.ErrInvalidInput)
+	}
+	return nil
+}
+
+// validateInventoryItem checks that the given item ID exists, is active, and belongs to the company.
+func (s *productService) validateInventoryItem(ctx context.Context, tx repository.DBTX, itemID, companyID uuid.UUID) error {
+	if itemID == uuid.Nil {
+		return fmt.Errorf("%w: inventory_item_id cannot be all-zero UUID", salesErrors.ErrInvalidInput)
+	}
+	exists, err := s.productRepo.ExistsInventoryItemByIDAndCompany(ctx, tx, itemID, companyID)
+	if err != nil {
+		return fmt.Errorf("failed to check inventory item: %w", err)
+	}
+	if !exists {
+		return salesErrors.ErrInventoryItemNotFound
 	}
 	return nil
 }

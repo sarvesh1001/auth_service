@@ -18,6 +18,7 @@ import (
 	a "auth-service/internal/infrastructure/audit"
 	"auth-service/internal/inventory"
 	authMiddleware "auth-service/internal/middleware"
+	"auth-service/internal/sales"
 	"auth-service/internal/service"
 
 	"github.com/go-chi/chi/v5"
@@ -113,6 +114,8 @@ func NewRouter(
 	academicHandlers *AcademicHandlers,
 	accountingHandlers *accounting.AccountingHandlers, // <-- NEW
 	inventoryHandlers *inventory.InventoryHandlers,
+	salesHandlers *sales.SalesHandlers, // <-- NEW
+
 ) chi.Router {
 	router := chi.NewRouter()
 
@@ -1381,7 +1384,7 @@ func NewRouter(
 				// to the public device-authenticated section (above the student login route).
 				// They are now defined at the /api/v1/companies/{companyID}/academics/biometric-device path.
 			}) // end /companies/{companyID}
-
+			sales.RegisterSalesRoutes(r, salesHandlers, logger, jwtService)
 			// Internal leave resolution (not company-scoped)
 			r.Route("/internal/leave", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).

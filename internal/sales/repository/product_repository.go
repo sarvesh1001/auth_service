@@ -37,6 +37,7 @@ type ProductRepository interface {
 	GetByInventoryItemID(ctx context.Context, db DBTX, companyID, inventoryItemID uuid.UUID) (*models.Product, error)
 	ExistsByInventoryItemID(ctx context.Context, db DBTX, companyID, inventoryItemID uuid.UUID) (bool, error)
 	UpdateInventoryItemLink(ctx context.Context, db DBTX, companyID, productID uuid.UUID, inventoryItemID *uuid.UUID, updatedBy *uuid.UUID) error
+	ExistsInventoryItemByIDAndCompany(ctx context.Context, db DBTX, itemID, companyID uuid.UUID) (bool, error) // NEW
 
 	// Pricing
 	UpdateUnitPrice(ctx context.Context, db DBTX, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID) error
@@ -814,4 +815,16 @@ func (r *productRepository) GetByIDForUpdate(ctx context.Context, db DBTX, compa
 	`
 	row := db.QueryRowContext(ctx, query, companyID, productID)
 	return r.scanProduct(row)
+}
+
+// ExistsInventoryItemByIDAndCompany checks if an item exists in the inventory.items table
+// and belongs to the given company. Returns true only if the item is active.
+func (r *productRepository) ExistsInventoryItemByIDAndCompany(ctx context.Context, db DBTX, itemID, companyID uuid.UUID) (bool, error) {
+	query := `SELECT EXISTS(SELECT 1 FROM items WHERE item_id = $1 AND company_id = $2 AND is_active = true)`
+	var exists bool
+	err := db.QueryRowContext(ctx, query, itemID, companyID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check inventory item existence: %w", err)
+	}
+	return exists, nil
 }

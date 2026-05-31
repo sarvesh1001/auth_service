@@ -41,6 +41,7 @@ var (
 	ErrInvalidState    = errors.New("sales: invalid state transition")
 
 	// Payment Terms
-	ErrPaymentTermInactive = errors.New("sales: payment term is inactive")
-	ErrPaymentTermAssigned = errors.New("sales: payment term is assigned to customers and cannot be deleted")
+	ErrPaymentTermInactive   = errors.New("sales: payment term is inactive")
+	ErrPaymentTermAssigned   = errors.New("sales: payment term is assigned to customers and cannot be deleted")
+	ErrInventoryItemNotFound = errors.New("inventory item not found or inactive")
 )

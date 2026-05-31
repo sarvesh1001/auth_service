@@ -17,6 +17,7 @@ type Customer struct {
 	EmailEncrypted *string `gorm:"column:email;type:text" json:"-"`
 	EmailDEK       *string `gorm:"column:email_dek;type:text" json:"-"`
 	EmailKeyID     *string `gorm:"column:email_key_id;type:text" json:"-"`
+	EmailHash      *string `gorm:"column:email_hash;type:varchar(64)" json:"-"`
 
 	PhoneEncrypted *string `gorm:"column:phone;type:text" json:"-"`
 	PhoneDEK       *string `gorm:"column:phone_dek;type:text" json:"-"`

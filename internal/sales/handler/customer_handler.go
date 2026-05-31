@@ -2,9 +2,9 @@ package handler
 
 import (
 	"encoding/json"
-
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -25,14 +25,27 @@ type CustomerHandler struct {
 func NewCustomerHandler(customerService service.CustomerService, logger *zap.Logger) *CustomerHandler {
 	return &CustomerHandler{
 		customerService: customerService,
-		BaseHandler:     &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:     &BaseHandler{logger: logger.Named("customer_handler")},
 	}
+}
+
+// ---------- Validation constants ----------
+const (
+	maxCustomerCodeLen = 50
+	maxNameLen         = 255
+	maxEmailLen        = 255
+	maxBillingAddrLen  = 500 // optional, TEXT in DB but good practice
+)
+
+var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
+
+func isValidEmail(email string) bool {
+	return emailRegex.MatchString(email)
 }
 
 // ---------- Request/Response Types ----------
 
 type createCustomerRequest struct {
-	CompanyID      string  `json:"company_id"`
 	CustomerCode   string  `json:"customer_code"`
 	Name           string  `json:"name"`
 	Email          *string `json:"email,omitempty"`
@@ -97,8 +110,6 @@ type customerSummary struct {
 	CreditLimit  *string `json:"credit_limit,omitempty"`
 }
 
-// ---------- Helper Functions ----------
-
 // ---------- Handler Methods ----------
 
 // CreateCustomer handles POST /customers
@@ -111,30 +122,53 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createCustomerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Validation
-	if req.CompanyID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id is required")
-		return
-	}
-	companyID, err := uuid.Parse(req.CompanyID)
-	if err != nil || companyID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
-	}
+	// ----- VALIDATION BLOCK (fail fast) -----
 	if req.CustomerCode == "" {
 		h.respondWithError(w, http.StatusBadRequest, "customer_code is required")
 		return
 	}
+	if len(req.CustomerCode) > maxCustomerCodeLen {
+		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("customer_code must not exceed %d characters", maxCustomerCodeLen))
+		return
+	}
+
 	if req.Name == "" {
 		h.respondWithError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+	if len(req.Name) > maxNameLen {
+		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("name must not exceed %d characters", maxNameLen))
+		return
+	}
+
+	if req.Email != nil && *req.Email != "" {
+		if len(*req.Email) > maxEmailLen {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("email must not exceed %d characters", maxEmailLen))
+			return
+		}
+		if !isValidEmail(*req.Email) {
+			h.respondWithError(w, http.StatusBadRequest, "invalid email format")
+			return
+		}
+	}
+
+	if req.BillingAddress != nil && *req.BillingAddress != "" && len(*req.BillingAddress) > maxBillingAddrLen {
+		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("billing_address must not exceed %d characters", maxBillingAddrLen))
+		return
+	}
+	// ----- END VALIDATION -----
 
 	var creditLimit *decimal.Decimal
 	if req.CreditLimit != nil && *req.CreditLimit != "" {
@@ -239,14 +273,9 @@ func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -260,6 +289,29 @@ func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	// ----- VALIDATION for update -----
+	if req.Name != nil {
+		if len(*req.Name) > maxNameLen {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("name must not exceed %d characters", maxNameLen))
+			return
+		}
+	}
+	if req.Email != nil && *req.Email != "" {
+		if len(*req.Email) > maxEmailLen {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("email must not exceed %d characters", maxEmailLen))
+			return
+		}
+		if !isValidEmail(*req.Email) {
+			h.respondWithError(w, http.StatusBadRequest, "invalid email format")
+			return
+		}
+	}
+	if req.BillingAddress != nil && *req.BillingAddress != "" && len(*req.BillingAddress) > maxBillingAddrLen {
+		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("billing_address must not exceed %d characters", maxBillingAddrLen))
+		return
+	}
+	// ----- END VALIDATION -----
 
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
@@ -329,14 +381,9 @@ func (h *CustomerHandler) DeleteCustomer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -375,14 +422,9 @@ func (h *CustomerHandler) GetCustomerByID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -438,14 +480,9 @@ func (h *CustomerHandler) GetCustomerByID(w http.ResponseWriter, r *http.Request
 func (h *CustomerHandler) GetCustomerByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -503,18 +540,13 @@ func (h *CustomerHandler) GetCustomerByCode(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// ListCustomers handles GET /customers
+// ListCustomers handles GET /customers (unchanged)
 func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -539,7 +571,6 @@ func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
 			filter.IsActive = &active
 		}
 	}
-	// Note: CustomerListFilter does not have Search field, so we omit it.
 
 	// Pagination -> limit/offset
 	limit := 20
@@ -603,18 +634,13 @@ func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// SearchCustomers handles GET /customers/search
+// SearchCustomers handles GET /customers/search (unchanged)
 func (h *CustomerHandler) SearchCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -699,14 +725,9 @@ func (h *CustomerHandler) ActivateCustomer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -751,14 +772,9 @@ func (h *CustomerHandler) DeactivateCustomer(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -803,14 +819,9 @@ func (h *CustomerHandler) UpdateCreditLimit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -868,14 +879,9 @@ func (h *CustomerHandler) GetCreditLimit(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -916,14 +922,9 @@ func (h *CustomerHandler) GetOutstandingBalance(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -979,14 +980,9 @@ func (h *CustomerHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *ht
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1033,14 +1029,9 @@ func (h *CustomerHandler) AssignPaymentTerm(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1100,14 +1091,9 @@ func (h *CustomerHandler) RemovePaymentTerm(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1152,14 +1138,9 @@ func (h *CustomerHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1219,14 +1200,9 @@ func (h *CustomerHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1259,14 +1235,9 @@ func (h *CustomerHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request)
 func (h *CustomerHandler) GetCustomersWithOutstandingInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1313,14 +1284,9 @@ func (h *CustomerHandler) GetCustomersWithOutstandingInvoices(w http.ResponseWri
 func (h *CustomerHandler) GetTopCustomersByRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1394,14 +1360,9 @@ func (h *CustomerHandler) CustomerExists(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1440,14 +1401,9 @@ func (h *CustomerHandler) IsCustomerActive(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 

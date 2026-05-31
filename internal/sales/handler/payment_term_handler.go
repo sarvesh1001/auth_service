@@ -24,7 +24,7 @@ type PaymentTermHandler struct {
 func NewPaymentTermHandler(paymentTermService service.PaymentTermService, logger *zap.Logger) *PaymentTermHandler {
 	return &PaymentTermHandler{
 		paymentTermService: paymentTermService,
-		BaseHandler:        &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:        &BaseHandler{logger: logger.Named("payment_term_handler")},
 	}
 }
 
@@ -35,9 +35,9 @@ type createPaymentTermRequest struct {
 	TermName        string  `json:"term_name"`
 	Description     *string `json:"description,omitempty"`
 	DueDays         int     `json:"due_days"`
-	DiscountPercent string  `json:"discount_percent"`
-	DiscountDays    int     `json:"discount_days"`
-	IsActive        bool    `json:"is_active"`
+	DiscountPercent string  `json:"discount_percent,omitempty"` // optional, defaults to "0"
+	DiscountDays    int     `json:"discount_days,omitempty"`
+	IsActive        *bool   `json:"is_active,omitempty"` // pointer to distinguish omitted vs false
 }
 
 type createPaymentTermResponse struct {
@@ -107,8 +107,6 @@ type paymentTermSummary struct {
 	Description     *string `json:"description,omitempty"`
 }
 
-// ---------- Helper Functions ----------
-
 // ---------- Handler Methods ----------
 
 // CreatePaymentTerm handles POST /payment-terms
@@ -121,15 +119,33 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	var req createPaymentTermRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Validation
-	if req.Code == "" || req.TermName == "" {
-		h.respondWithError(w, http.StatusBadRequest, "code and term_name are required")
+	// ----- Validation -----
+	if req.Code == "" {
+		h.respondWithError(w, http.StatusBadRequest, "code is required")
+		return
+	}
+	if len(req.Code) > 50 {
+		h.respondWithError(w, http.StatusBadRequest, "code must not exceed 50 characters")
+		return
+	}
+	if req.TermName == "" {
+		h.respondWithError(w, http.StatusBadRequest, "term_name is required")
+		return
+	}
+	if len(req.TermName) > 100 {
+		h.respondWithError(w, http.StatusBadRequest, "term_name must not exceed 100 characters")
 		return
 	}
 	if req.DueDays <= 0 {
@@ -140,8 +156,18 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "discount_days cannot be negative")
 		return
 	}
+	// Business rule: discount_days cannot exceed due_days
+	if req.DiscountDays > req.DueDays {
+		h.respondWithError(w, http.StatusBadRequest, "discount_days cannot exceed due_days")
+		return
+	}
 
-	discountPercent, err := decimal.NewFromString(req.DiscountPercent)
+	// Default discount_percent to "0" if not provided
+	discountPercentStr := req.DiscountPercent
+	if discountPercentStr == "" {
+		discountPercentStr = "0"
+	}
+	discountPercent, err := decimal.NewFromString(discountPercentStr)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid discount_percent")
 		return
@@ -151,15 +177,10 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
-		return
+	// Default is_active to true if omitted
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
 	}
 
 	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
@@ -173,15 +194,15 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	isActive := req.IsActive
 	svcReq := service.CreatePaymentTermRequest{
+		CompanyID:       companyID,
 		Code:            req.Code,
 		TermName:        req.TermName,
 		Description:     req.Description,
 		DueDays:         req.DueDays,
 		DiscountPercent: discountPercent,
 		DiscountDays:    req.DiscountDays,
-		IsActive:        &isActive, // Fix: pass pointer
+		IsActive:        &isActive,
 	}
 
 	term, err := h.paymentTermService.CreatePaymentTerm(ctx, &svcReq, idempotencyKey)
@@ -230,14 +251,9 @@ func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -252,7 +268,6 @@ func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Convert optional discount percent
 	var discountPercent *decimal.Decimal
 	if req.DiscountPercent != nil {
 		dp, err := decimal.NewFromString(*req.DiscountPercent)
@@ -282,7 +297,7 @@ func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Re
 		IsActive:        req.IsActive,
 	}
 
-	updated, err := h.paymentTermService.UpdatePaymentTerm(ctx, companyID, termID, &svcReq, idempotencyKey) // Fix: pass pointer
+	updated, err := h.paymentTermService.UpdatePaymentTerm(ctx, companyID, termID, &svcReq, idempotencyKey)
 	if err != nil {
 		h.logger.Error("failed to update payment term", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -326,14 +341,9 @@ func (h *PaymentTermHandler) DeletePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -372,14 +382,9 @@ func (h *PaymentTermHandler) GetPaymentTermByID(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -426,14 +431,9 @@ func (h *PaymentTermHandler) GetPaymentTermByID(w http.ResponseWriter, r *http.R
 func (h *PaymentTermHandler) GetPaymentTermByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -486,14 +486,9 @@ func (h *PaymentTermHandler) GetPaymentTermByCode(w http.ResponseWriter, r *http
 func (h *PaymentTermHandler) GetPaymentTermByName(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -546,14 +541,9 @@ func (h *PaymentTermHandler) GetPaymentTermByName(w http.ResponseWriter, r *http
 func (h *PaymentTermHandler) ListPaymentTerms(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -568,7 +558,6 @@ func (h *PaymentTermHandler) ListPaymentTerms(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Build filter
 	filter := service.PaymentTermListFilter{
 		CompanyID: companyID,
 	}
@@ -582,7 +571,6 @@ func (h *PaymentTermHandler) ListPaymentTerms(w http.ResponseWriter, r *http.Req
 		filter.Search = &search
 	}
 
-	// Pagination: limit/offset
 	limit := 20
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -597,7 +585,6 @@ func (h *PaymentTermHandler) ListPaymentTerms(w http.ResponseWriter, r *http.Req
 	}
 	pagination := service.Pagination{Limit: limit, Offset: offset}
 
-	// Sorting
 	sort := service.Sort{
 		Field:     r.URL.Query().Get("sort_field"),
 		Direction: r.URL.Query().Get("sort_dir"),
@@ -647,14 +634,9 @@ func (h *PaymentTermHandler) ListPaymentTerms(w http.ResponseWriter, r *http.Req
 func (h *PaymentTermHandler) SearchPaymentTerms(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -725,14 +707,9 @@ func (h *PaymentTermHandler) SearchPaymentTerms(w http.ResponseWriter, r *http.R
 func (h *PaymentTermHandler) GetActivePaymentTerms(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -789,14 +766,9 @@ func (h *PaymentTermHandler) UpdatePaymentTermStatus(w http.ResponseWriter, r *h
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -845,14 +817,9 @@ func (h *PaymentTermHandler) CalculateDueDate(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -911,14 +878,9 @@ func (h *PaymentTermHandler) CalculateEarlyPaymentDiscount(w http.ResponseWriter
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -999,14 +961,9 @@ func (h *PaymentTermHandler) AssignPaymentTermToCustomer(w http.ResponseWriter, 
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -1050,13 +1007,11 @@ func (h *PaymentTermHandler) AssignPaymentTermToCustomer(w http.ResponseWriter, 
 func (h *PaymentTermHandler) RemovePaymentTermFromCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Parse termID from URL (even though service doesn't use it, we keep for route consistency)
-	termID, err := h.parseUUIDParam(r, "id")
+	_, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
 		return
 	}
-	_ = termID // silences unused variable warning
 
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
@@ -1064,14 +1019,9 @@ func (h *PaymentTermHandler) RemovePaymentTermFromCustomer(w http.ResponseWriter
 		return
 	}
 
-	companyIDStr := r.URL.Query().Get("company_id")
-	if companyIDStr == "" {
-		h.respondWithError(w, http.StatusBadRequest, "company_id query parameter is required")
-		return
-	}
-	companyID, err := uuid.Parse(companyIDStr)
+	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid company_id")
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
