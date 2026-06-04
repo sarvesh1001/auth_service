@@ -39,11 +39,11 @@ type OrderFilter struct {
 	CreatedTo     *time.Time
 	UpdatedFrom   *time.Time
 	UpdatedTo     *time.Time
-	CreditHold    *bool                    // NEW: filter by credit hold status
-	CreditStatus  *enums.CreditCheckStatus // NEW: filter by credit status
+	CreditHold    *bool                    // filter by credit hold status
+	CreditStatus  *enums.CreditCheckStatus // filter by credit status
 }
 
-// OrderRepository interface (adds credit fields in methods where needed)
+// OrderRepository interface (includes partial invoicing support)
 type OrderRepository interface {
 	Create(ctx context.Context, db DBTX, order *models.Order, items []*models.OrderItem) error
 	GetByID(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) (*models.Order, error)
@@ -79,6 +79,11 @@ type OrderRepository interface {
 	GetTopOrdersByValue(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Order, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, orderID uuid.UUID) (*models.Order, error)
 	GetItemByIDForUpdate(ctx context.Context, db DBTX, companyID, orderID, orderItemID uuid.UUID) (*models.OrderItem, error)
+
+	// NEW FOR PARTIAL INVOICING
+	GetRemainingQuantities(ctx context.Context, db DBTX, orderID uuid.UUID) (map[uuid.UUID]decimal.Decimal, error)
+	UpdateQuantityInvoiced(ctx context.Context, db DBTX, orderItemID uuid.UUID, invoicedQuantity decimal.Decimal) error
+	DecreaseQuantityInvoiced(ctx context.Context, db DBTX, orderItemID uuid.UUID, amount decimal.Decimal) error
 }
 
 // -------------------------------------------------------------------------
@@ -344,7 +349,7 @@ func (r *orderRepository) scanOrder(s scanner) (*models.Order, error) {
 	return &o, nil
 }
 
-// scanOrderItem unchanged
+// scanOrderItem now includes the `quantity_invoiced` column if present
 func (r *orderRepository) scanOrderItem(s scanner) (*models.OrderItem, error) {
 	var i models.OrderItem
 	var discountAmount, taxAmount sql.NullString
@@ -362,6 +367,7 @@ func (r *orderRepository) scanOrderItem(s scanner) (*models.OrderItem, error) {
 		&i.TotalPrice,
 		&metadata,
 		&i.CreatedAt,
+		&i.QuantityInvoiced, // NEW – scan the new column
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -557,7 +563,7 @@ func (r *orderRepository) Delete(ctx context.Context, db DBTX, companyID, orderI
 }
 
 // -------------------------------------------------------------------------
-// ORDER ITEMS (unchanged)
+// ORDER ITEMS (with quantity_invoiced support)
 // -------------------------------------------------------------------------
 
 func (r *orderRepository) AddItems(ctx context.Context, db DBTX, companyID, orderID uuid.UUID, items []*models.OrderItem) error {
@@ -574,9 +580,10 @@ func (r *orderRepository) AddItems(ctx context.Context, db DBTX, companyID, orde
 	query := `
 		INSERT INTO sales.order_items (
 			order_item_id, order_id, product_id, product_name_snapshot,
-			quantity, unit_price, discount_amount, tax_amount, metadata, created_at
+			quantity, unit_price, discount_amount, tax_amount, metadata, created_at,
+			quantity_invoiced
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10
 		)
 	`
 	for _, item := range items {
@@ -590,6 +597,7 @@ func (r *orderRepository) AddItems(ctx context.Context, db DBTX, companyID, orde
 			item.DiscountAmount,
 			item.TaxAmount,
 			item.Metadata,
+			item.QuantityInvoiced, // default 0, can be set if needed
 		)
 		if err != nil {
 			return fmt.Errorf("add order item: %w", err)
@@ -636,7 +644,8 @@ func (r *orderRepository) GetItems(ctx context.Context, db DBTX, companyID, orde
 	query := `
 		SELECT 
 			order_item_id, order_id, product_id, product_name_snapshot,
-			quantity, unit_price, discount_amount, tax_amount, total_price, metadata, created_at
+			quantity, unit_price, discount_amount, tax_amount, total_price, metadata, created_at,
+			quantity_invoiced
 		FROM sales.order_items
 		WHERE order_id = $1
 		ORDER BY created_at
@@ -668,7 +677,8 @@ func (r *orderRepository) GetItemByID(ctx context.Context, db DBTX, companyID, o
 	query := `
 		SELECT 
 			order_item_id, order_id, product_id, product_name_snapshot,
-			quantity, unit_price, discount_amount, tax_amount, total_price, metadata, created_at
+			quantity, unit_price, discount_amount, tax_amount, total_price, metadata, created_at,
+			quantity_invoiced
 		FROM sales.order_items
 		WHERE order_item_id = $1 AND order_id = $2
 	`
@@ -1195,7 +1205,8 @@ func (r *orderRepository) GetItemByIDForUpdate(ctx context.Context, db DBTX, com
 	query := `
 		SELECT 
 			oi.order_item_id, oi.order_id, oi.product_id, oi.product_name_snapshot,
-			oi.quantity, oi.unit_price, oi.discount_amount, oi.tax_amount, oi.total_price, oi.metadata, oi.created_at
+			oi.quantity, oi.unit_price, oi.discount_amount, oi.tax_amount, oi.total_price, oi.metadata, oi.created_at,
+			oi.quantity_invoiced
 		FROM sales.order_items oi
 		JOIN sales.orders o ON oi.order_id = o.order_id
 		WHERE o.company_id = $1 AND o.order_id = $2 AND oi.order_item_id = $3
@@ -1203,4 +1214,71 @@ func (r *orderRepository) GetItemByIDForUpdate(ctx context.Context, db DBTX, com
 	`
 	row := db.QueryRowContext(ctx, query, companyID, orderID, orderItemID)
 	return r.scanOrderItem(row)
+}
+
+// -------------------------------------------------------------------------
+// NEW METHODS FOR PARTIAL INVOICING
+// -------------------------------------------------------------------------
+
+// GetRemainingQuantities returns a map of order_item_id -> remaining quantity (quantity - quantity_invoiced)
+func (r *orderRepository) GetRemainingQuantities(ctx context.Context, db DBTX, orderID uuid.UUID) (map[uuid.UUID]decimal.Decimal, error) {
+	query := `
+		SELECT order_item_id, quantity - quantity_invoiced AS remaining
+		FROM sales.order_items
+		WHERE order_id = $1
+	`
+	rows, err := db.QueryContext(ctx, query, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("get remaining quantities: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID]decimal.Decimal)
+	for rows.Next() {
+		var itemID uuid.UUID
+		var remaining decimal.Decimal
+		if err := rows.Scan(&itemID, &remaining); err != nil {
+			return nil, err
+		}
+		result[itemID] = remaining
+	}
+	return result, rows.Err()
+}
+
+// UpdateQuantityInvoiced increments the quantity_invoiced for a given order item.
+func (r *orderRepository) UpdateQuantityInvoiced(ctx context.Context, db DBTX, orderItemID uuid.UUID, invoicedQuantity decimal.Decimal) error {
+	query := `
+		UPDATE sales.order_items
+		SET quantity_invoiced = quantity_invoiced + $2,
+		    updated_at = NOW()
+		WHERE order_item_id = $1
+	`
+	res, err := db.ExecContext(ctx, query, orderItemID, invoicedQuantity)
+	if err != nil {
+		return fmt.Errorf("update quantity_invoiced: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return errors.ErrNotFound
+	}
+	return nil
+}
+
+// DecreaseQuantityInvoiced decreases the quantity_invoiced for a given order item (used when an invoice is cancelled/voided).
+func (r *orderRepository) DecreaseQuantityInvoiced(ctx context.Context, db DBTX, orderItemID uuid.UUID, amount decimal.Decimal) error {
+	query := `
+		UPDATE sales.order_items
+		SET quantity_invoiced = quantity_invoiced - $2,
+		    updated_at = NOW()
+		WHERE order_item_id = $1 AND quantity_invoiced >= $2
+	`
+	res, err := db.ExecContext(ctx, query, orderItemID, amount)
+	if err != nil {
+		return fmt.Errorf("decrease quantity_invoiced: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return errors.ErrInvalidState // or a more specific error
+	}
+	return nil
 }

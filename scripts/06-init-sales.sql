@@ -2029,3 +2029,68 @@ ALTER TABLE sales.customers ADD COLUMN email_hash VARCHAR(64);
 
 -- Create unique index (ignoring NULLs for customers without email)
 CREATE UNIQUE INDEX uniq_customers_email_hash ON sales.customers (company_id, email_hash) WHERE email_hash IS NOT NULL;
+
+-- 1. Drop the broken generated column (cannot alter expression directly)
+ALTER TABLE sales.order_items DROP COLUMN total_price;
+
+-- 2. Re‑add it with COALESCE to handle NULLs
+ALTER TABLE sales.order_items ADD COLUMN total_price NUMERIC(14,4) GENERATED ALWAYS AS (
+    (unit_price * quantity) - COALESCE(discount_amount, 0) + COALESCE(tax_amount, 0)
+) STORED;
+ALTER TABLE sales_analytics.product_sales_fact
+ADD CONSTRAINT product_sales_fact_company_product_date_unique
+UNIQUE (company_id, product_id, date);
+
+
+-- Step 1: Add column with default 0
+ALTER TABLE sales.order_items 
+ADD COLUMN quantity_invoiced NUMERIC(14,4) NOT NULL DEFAULT 0;
+
+-- Step 2: Add check constraint (cannot invoice more than ordered)
+ALTER TABLE sales.order_items 
+ADD CONSTRAINT chk_quantity_invoiced 
+CHECK (quantity_invoiced <= quantity AND quantity_invoiced >= 0);
+
+-- Step 3: (Optional) Add an index for faster lookups
+CREATE INDEX idx_order_items_invoiced ON sales.order_items(order_id, product_id) 
+WHERE quantity_invoiced < quantity;
+
+
+
+-- 1. order_item_analytics: unique on order_item_id
+ALTER TABLE sales_analytics.order_item_analytics
+ADD CONSTRAINT order_item_analytics_order_item_id_unique UNIQUE (order_item_id);
+
+-- 2. order_hourly_sales: unique on (company_id, hour_bucket)
+ALTER TABLE sales_analytics.order_hourly_sales
+ADD CONSTRAINT order_hourly_sales_company_hour_unique UNIQUE (company_id, hour_bucket);
+
+-- 3. fulfillment_metrics: unique on order_id
+ALTER TABLE sales_analytics.fulfillment_metrics
+ADD CONSTRAINT fulfillment_metrics_order_id_unique UNIQUE (order_id);
+
+-- 4. product_sales_fact: you already added a unique constraint in the script:
+--    ALTER TABLE sales_analytics.product_sales_fact
+--    ADD CONSTRAINT product_sales_fact_company_product_date_unique UNIQUE (company_id, product_id, date);
+--    If that failed, double‑check it exists. Otherwise run:
+ALTER TABLE sales_analytics.product_sales_fact
+ADD CONSTRAINT product_sales_fact_company_product_date_unique UNIQUE (company_id, product_id, date);
+
+
+-- Add order_item_id column (nullable, because draft invoices from scratch won't have it)
+ALTER TABLE sales.invoice_items 
+ADD COLUMN order_item_id UUID NULL;
+
+-- Add foreign key constraint (optional but recommended)
+ALTER TABLE sales.invoice_items 
+ADD CONSTRAINT fk_invoice_items_order_item 
+FOREIGN KEY (order_item_id) REFERENCES sales.order_items(order_item_id) ON DELETE SET NULL;
+
+-- Create index for faster lookups
+CREATE INDEX idx_invoice_items_order_item ON sales.invoice_items(order_item_id);
+
+
+ALTER TABLE sales.order_items 
+ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();CREATE TRIGGER update_order_items_updated_at 
+BEFORE UPDATE ON sales.order_items 
+FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();

@@ -1,3 +1,6 @@
+// package service
+// filename: invoice_service.go
+
 package service
 
 import (
@@ -22,7 +25,7 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
-// ------------------------ Request/Response DTOs ------------------------
+// ------------------------ DTOs ------------------------
 
 // ------------------------ Service Interface ------------------------
 
@@ -65,8 +68,8 @@ type InvoiceService interface {
 	GetInvoicesDueSoon(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Invoice, error)
 	SendDueReminder(ctx context.Context, companyID, invoiceID uuid.UUID, triggeredBy uuid.UUID) error
 	SendOverdueReminder(ctx context.Context, companyID, invoiceID uuid.UUID, triggeredBy uuid.UUID) error
-	ValidateCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, invoiceAmount decimal.Decimal) error
-	CanIssueInvoice(ctx context.Context, companyID, invoiceID uuid.UUID) error
+	ValidateCustomerCredit(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID, invoiceAmount decimal.Decimal) error
+	CanIssueInvoice(ctx context.Context, tx repository.DBTX, companyID, invoiceID uuid.UUID) error
 	ValidateInvoice(ctx context.Context, invoice *models.Invoice, items []*models.InvoiceItem) error
 	ValidateInvoiceStatusTransition(ctx context.Context, current, next enums.InvoiceStatus) error
 	ValidateInvoiceItems(ctx context.Context, companyID uuid.UUID, items []CreateInvoiceItemRequest) error
@@ -81,6 +84,7 @@ type InvoiceService interface {
 	InvoiceNumberExists(ctx context.Context, companyID uuid.UUID, invoiceNumber string) (bool, error)
 	IsInvoicePaid(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error)
 	IsInvoiceOverdue(ctx context.Context, companyID, invoiceID uuid.UUID, at time.Time) (bool, error)
+	createDraftInvoiceInTx(ctx context.Context, tx repository.DBTX, req *CreateInvoiceRequest) (*models.Invoice, error)
 }
 
 // ------------------------ Implementation ------------------------
@@ -94,6 +98,7 @@ type invoiceService struct {
 	discountEngine   DiscountEngineService
 	taxSnapshotRepo  repository.TaxSnapshotRepository
 	paymentRepo      repository.PaymentRepository
+	paymentTermRepo  repository.PaymentTermRepository
 	outboxRepo       outbox.Repository
 	idempotencyStore idempotency.Store
 	auditService     *audit.AuditService
@@ -110,6 +115,7 @@ func NewInvoiceService(
 	discountEngine DiscountEngineService,
 	taxSnapshotRepo repository.TaxSnapshotRepository,
 	paymentRepo repository.PaymentRepository,
+	paymentTermRepo repository.PaymentTermRepository,
 	outboxRepo outbox.Repository,
 	idempotencyStore idempotency.Store,
 	auditService *audit.AuditService,
@@ -125,6 +131,7 @@ func NewInvoiceService(
 		discountEngine:   discountEngine,
 		taxSnapshotRepo:  taxSnapshotRepo,
 		paymentRepo:      paymentRepo,
+		paymentTermRepo:  paymentTermRepo,
 		outboxRepo:       outboxRepo,
 		idempotencyStore: idempotencyStore,
 		auditService:     auditService,
@@ -133,7 +140,7 @@ func NewInvoiceService(
 	}
 }
 
-// ------------------------ Helper Methods ------------------------
+// ------------------------ Helpers ------------------------
 
 func (s *invoiceService) generateInvoiceNumber(tx repository.DBTX, companyID uuid.UUID) (string, error) {
 	prefix := companyID.String()[:8]
@@ -162,26 +169,26 @@ func (s *invoiceService) recalculateInvoiceTotals(ctx context.Context, tx reposi
 		if it.DiscountAmount != nil {
 			discountTotal = discountTotal.Add(*it.DiscountAmount)
 		}
-		// Calculate tax using pricing repository
 		taxable := lineSubtotal
 		if it.DiscountAmount != nil {
 			taxable = taxable.Sub(*it.DiscountAmount)
 		}
-		tax, err := s.pricingRepo.CalculateLineTax(ctx, tx, companyID, *it.ProductID, taxable)
-		if err != nil {
-			return fmt.Errorf("calculate line tax: %w", err)
+		tax := decimal.Zero
+		if it.ProductID != nil {
+			tax, err = s.pricingRepo.CalculateLineTax(ctx, tx, companyID, *it.ProductID, taxable)
+			if err != nil {
+				s.logger.Warn("failed to calculate line tax", zap.Error(err), zap.String("item_id", it.InvoiceItemID.String()))
+			}
 		}
 		it.TaxAmount = &tax
 		taxTotal = taxTotal.Add(tax)
 
-		// Update tax amount in DB
 		updateQuery := `UPDATE sales.invoice_items SET tax_amount = $1 WHERE invoice_item_id = $2`
 		if _, err := tx.ExecContext(ctx, updateQuery, tax, it.InvoiceItemID); err != nil {
 			return fmt.Errorf("update item tax: %w", err)
 		}
 	}
 
-	// Fetch invoice to update totals
 	inv, err := s.invoiceRepo.GetByID(ctx, tx, companyID, invoiceID)
 	if err != nil {
 		return err
@@ -195,10 +202,8 @@ func (s *invoiceService) recalculateInvoiceTotals(ctx context.Context, tx reposi
 		return fmt.Errorf("update invoice totals: %w", err)
 	}
 
-	// Store tax snapshots
-	if err := s.taxSnapshotRepo.DeleteByEntity(ctx, tx, companyID, "invoice", invoiceID); err != nil {
-		s.logger.Warn("failed to delete old tax snapshots", zap.Error(err))
-	}
+	_ = s.taxSnapshotRepo.DeleteByEntity(ctx, tx, companyID, "invoice", invoiceID)
+
 	for _, it := range items {
 		taxAmount := decimal.Zero
 		if it.TaxAmount != nil {
@@ -283,39 +288,39 @@ func (s *invoiceService) validateStatusTransition(current, next enums.InvoiceSta
 	if !ok {
 		return fmt.Errorf("%w: unknown status %s", salesErrors.ErrInvalidStatus, current)
 	}
-	for _, s := range allowed {
-		if s == next {
+	for _, st := range allowed {
+		if st == next {
 			return nil
 		}
 	}
 	return fmt.Errorf("%w: cannot transition from %s to %s", salesErrors.ErrInvalidTransition, current, next)
 }
 
-// ------------------------ Core CRUD ------------------------
+// ------------------------ Core Operations ------------------------
 
 func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvoiceRequest) (*models.Invoice, error) {
 	logger := s.logger.With(zap.String("method", "CreateDraftInvoice"))
 	if err := s.validateCreateInvoiceRequest(req); err != nil {
 		return nil, err
 	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Idempotency key is optional – we'll use invoice number as key if empty
-	idempKey := req.InvoiceNumber
+	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = uuid.New().String()
 	}
+
 	var cached *models.Invoice
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached invoice")
 		return cached, nil
 	}
 
-	// Determine invoice number
 	invoiceNumber := req.InvoiceNumber
 	if invoiceNumber == "" {
 		invoiceNumber, err = s.generateInvoiceNumber(tx, req.CompanyID)
@@ -331,7 +336,6 @@ func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvo
 		return nil, fmt.Errorf("%w: invoice number %s already exists", salesErrors.ErrDuplicate, invoiceNumber)
 	}
 
-	// Validate customer exists and is active
 	active, err := s.customerSvc.IsCustomerActive(ctx, req.CompanyID, req.CustomerID)
 	if err != nil {
 		return nil, err
@@ -340,7 +344,6 @@ func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvo
 		return nil, salesErrors.ErrCustomerInactive
 	}
 
-	// Validate items and build invoice items
 	invItems := make([]*models.InvoiceItem, 0, len(req.Items))
 	for _, it := range req.Items {
 		prod, err := s.productRepo.GetByID(ctx, tx, req.CompanyID, it.ProductID)
@@ -356,7 +359,7 @@ func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvo
 		}
 		invItem := &models.InvoiceItem{
 			InvoiceItemID:       uuid.New(),
-			InvoiceID:           uuid.Nil, // set after invoice created
+			InvoiceID:           uuid.Nil,
 			ProductID:           &prod.ProductID,
 			ProductNameSnapshot: prod.Name,
 			Quantity:            it.Quantity,
@@ -368,24 +371,28 @@ func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvo
 		invItems = append(invItems, invItem)
 	}
 
-	// Create invoice
 	invoice := &models.Invoice{
-		InvoiceID:     uuid.New(),
-		CompanyID:     req.CompanyID,
-		CustomerID:    req.CustomerID,
-		OrderID:       req.OrderID,
-		InvoiceNumber: invoiceNumber,
-		ExternalRef:   req.ExternalRef,
-		InvoiceDate:   req.InvoiceDate,
-		DueDate:       req.DueDate,
-		Status:        enums.InvoiceStatusDraft,
-		Currency:      req.Currency,
-		Notes:         req.Notes,
-		AmountPaid:    decimal.Zero,
-		AmountDue:     decimal.Zero,
-		IsLocked:      false,
-		CreatedBy:     req.CreatedBy,
-		UpdatedBy:     req.CreatedBy,
+		InvoiceID:            uuid.New(),
+		CompanyID:            req.CompanyID,
+		CustomerID:           req.CustomerID,
+		OrderID:              req.OrderID,
+		InvoiceNumber:        invoiceNumber,
+		ExternalRef:          req.ExternalRef,
+		InvoiceDate:          req.InvoiceDate,
+		DueDate:              req.DueDate,
+		Status:               enums.InvoiceStatusDraft,
+		Currency:             req.Currency,
+		Notes:                req.Notes,
+		AmountPaid:           decimal.Zero,
+		AmountDue:            decimal.Zero,
+		IsLocked:             false,
+		CreatedBy:            req.CreatedBy,
+		UpdatedBy:            req.CreatedBy,
+		SalesRepID:           req.SalesRepID,
+		PaymentTermName:      req.PaymentTermName,
+		PaymentDueDays:       req.PaymentDueDays,
+		EarlyDiscountPercent: req.EarlyDiscountPercent,
+		EarlyDiscountDays:    req.EarlyDiscountDays,
 	}
 	if invoice.Currency == "" {
 		invoice.Currency = "USD"
@@ -400,23 +407,16 @@ func (s *invoiceService) CreateDraftInvoice(ctx context.Context, req *CreateInvo
 	if err := s.invoiceRepo.Create(ctx, tx, invoice, invItems); err != nil {
 		return nil, fmt.Errorf("create invoice: %w", err)
 	}
-
-	// Recalculate totals (taxes)
 	if err := s.recalculateInvoiceTotals(ctx, tx, req.CompanyID, invoice.InvoiceID); err != nil {
 		return nil, err
 	}
-
-	// Refresh invoice with updated totals
 	invoice, err = s.invoiceRepo.GetByID(ctx, tx, req.CompanyID, invoice.InvoiceID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Emit event
 	if err := s.emitInvoiceEvent(ctx, tx, invoice, salesEvents.EventInvoiceCreated, nil); err != nil {
 		logger.Warn("failed to emit invoice created event", zap.Error(err))
 	}
-
 	_ = s.idempotencyStore.Store(ctx, tx, idempKey, invoice)
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -445,55 +445,201 @@ func (s *invoiceService) validateCreateInvoiceRequest(req *CreateInvoiceRequest)
 }
 
 func (s *invoiceService) CreateInvoiceFromOrder(ctx context.Context, companyID, orderID uuid.UUID, req *CreateInvoiceFromOrderRequest) (*models.Invoice, error) {
-	// Fetch order and items, then convert to invoice items
+	logger := s.logger.With(zap.String("method", "CreateInvoiceFromOrder"), zap.String("order_id", orderID.String()))
+
+	// Validate notes length (max 1000) – with logging
+	if req.Notes != nil {
+		notesLen := len(*req.Notes)
+		logger.Info("notes length check", zap.Int("len", notesLen))
+		if notesLen > 1000 {
+			logger.Warn("notes too long", zap.Int("len", notesLen), zap.Int("max", 1000))
+			return nil, fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
+		}
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	order, err := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
+	// 1. Get order (with lock)
+	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 	if err != nil {
 		return nil, err
 	}
+	if order.CompanyID != companyID {
+		return nil, fmt.Errorf("%w: order does not belong to this company", salesErrors.ErrInvalidInput)
+	}
+	// Only confirmed/processing/shipped orders can be invoiced
 	if order.Status != enums.OrderStatusConfirmed && order.Status != enums.OrderStatusProcessing && order.Status != enums.OrderStatusShipped {
 		return nil, fmt.Errorf("%w: only confirmed/processing/shipped orders can be invoiced", salesErrors.ErrInvalidStatus)
 	}
 
+	// 2. Get remaining quantities
+	remainingMap, err := s.orderRepo.GetRemainingQuantities(ctx, tx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("get remaining quantities: %w", err)
+	}
+	if len(remainingMap) == 0 {
+		return nil, fmt.Errorf("%w: order has no items", salesErrors.ErrInvalidInput)
+	}
+
+	// 3. Determine items to invoice
+	var itemsToInvoice []PartialInvoiceItemInput
+	if len(req.Items) == 0 {
+		for orderItemID, remaining := range remainingMap {
+			if remaining.GreaterThan(decimal.Zero) {
+				itemsToInvoice = append(itemsToInvoice, PartialInvoiceItemInput{
+					OrderItemID: orderItemID,
+					Quantity:    remaining,
+				})
+			}
+		}
+	} else {
+		itemsToInvoice = req.Items
+	}
+
+	if len(itemsToInvoice) == 0 {
+		return nil, fmt.Errorf("%w: nothing to invoice (all items fully invoiced)", salesErrors.ErrInvalidInput)
+	}
+
+	// 4. Validate quantities against remaining
+	for _, invItem := range itemsToInvoice {
+		remaining, ok := remainingMap[invItem.OrderItemID]
+		if !ok {
+			return nil, fmt.Errorf("%w: order_item_id %s not found in order", salesErrors.ErrNotFound, invItem.OrderItemID)
+		}
+		if invItem.Quantity.LessThanOrEqual(decimal.Zero) {
+			return nil, fmt.Errorf("%w: quantity must be positive for item %s", salesErrors.ErrInvalidInput, invItem.OrderItemID)
+		}
+		if invItem.Quantity.GreaterThan(remaining) {
+			return nil, fmt.Errorf("%w: cannot invoice %s of item %s, only %s remaining",
+				salesErrors.ErrInvalidAmount,
+				invItem.Quantity.String(),
+				invItem.OrderItemID.String(),
+				remaining.String())
+		}
+	}
+
+	// 5. Fetch customer and payment term info
+	customer, err := s.customerSvc.GetCustomerByID(ctx, companyID, order.CustomerID)
+	if err != nil {
+		return nil, err
+	}
+	var paymentTermName *string
+	var paymentDueDays *int
+	var earlyDiscountPercent *decimal.Decimal
+	var earlyDiscountDays *int
+	if customer.PaymentTermID != nil {
+		term, err := s.paymentTermRepo.GetByID(ctx, tx, companyID, *customer.PaymentTermID)
+		if err == nil && term != nil {
+			paymentTermName = &term.TermName
+			paymentDueDays = &term.DueDays
+			if term.DiscountPercent.GreaterThan(decimal.Zero) {
+				earlyDiscountPercent = &term.DiscountPercent
+				earlyDiscountDays = &term.DiscountDays
+			}
+		} else {
+			logger.Warn("payment term not found", zap.String("term_id", customer.PaymentTermID.String()))
+		}
+	}
+
+	// 6. Build invoice items
 	orderItems, err := s.orderRepo.GetItems(ctx, tx, companyID, orderID)
 	if err != nil {
 		return nil, err
 	}
-	invItems := make([]CreateInvoiceItemRequest, 0, len(orderItems))
+	orderItemMap := make(map[uuid.UUID]*models.OrderItem)
 	for _, oi := range orderItems {
-		invItems = append(invItems, CreateInvoiceItemRequest{
-			ProductID: oi.ProductID,
-			Quantity:  oi.Quantity,
-			UnitPrice: &oi.UnitPrice,
-			Discount:  oi.DiscountAmount,
+		orderItemMap[oi.OrderItemID] = oi
+	}
+
+	invoiceItems := make([]CreateInvoiceItemRequest, 0, len(itemsToInvoice))
+	for _, invItem := range itemsToInvoice {
+		oi, ok := orderItemMap[invItem.OrderItemID]
+		if !ok {
+			return nil, fmt.Errorf("%w: order_item_id %s not found", salesErrors.ErrNotFound, invItem.OrderItemID)
+		}
+		unitPrice := oi.UnitPrice
+		invoiceItems = append(invoiceItems, CreateInvoiceItemRequest{
+			OrderItemID: &oi.OrderItemID,
+			ProductID:   oi.ProductID,
+			Quantity:    invItem.Quantity,
+			UnitPrice:   &unitPrice,
+			Discount:    oi.DiscountAmount,
+			Metadata:    oi.Metadata,
 		})
 	}
-	createReq := &CreateInvoiceRequest{
-		CompanyID:   companyID,
-		CustomerID:  order.CustomerID,
-		OrderID:     &orderID,
-		InvoiceDate: time.Now(),
-		DueDate:     time.Now().Add(30 * 24 * time.Hour),
-		Currency:    order.Currency,
-		Notes:       req.Notes,
-		Items:       invItems,
-		CreatedBy:   &req.CreatedBy,
+
+	// 7. Prepare and validate invoice dates
+	invoiceDate := time.Now()
+	if req.InvoiceDate != "" {
+		if d, err := time.Parse(time.RFC3339, req.InvoiceDate); err == nil {
+			invoiceDate = d
+		}
 	}
-	// Use order number as idempotency key
-	invoice, err := s.CreateDraftInvoice(ctx, createReq)
+	dueDate := invoiceDate.Add(30 * 24 * time.Hour)
+	if req.DueDate != "" {
+		if d, err := time.Parse(time.RFC3339, req.DueDate); err == nil {
+			dueDate = d
+		}
+	}
+	// due_date cannot be before invoice_date
+	if dueDate.Before(invoiceDate) {
+		return nil, fmt.Errorf("%w: due_date cannot be before invoice_date", salesErrors.ErrInvalidInput)
+	}
+
+	// 8. Create draft invoice using helper (within same tx)
+	createReq := &CreateInvoiceRequest{
+		CompanyID:            companyID,
+		CustomerID:           order.CustomerID,
+		OrderID:              &orderID,
+		InvoiceDate:          invoiceDate,
+		DueDate:              dueDate,
+		Currency:             order.Currency,
+		Notes:                req.Notes,
+		Items:                invoiceItems,
+		CreatedBy:            req.CreatedBy,
+		SalesRepID:           order.SalesRepID,
+		PaymentTermName:      paymentTermName,
+		PaymentDueDays:       paymentDueDays,
+		EarlyDiscountPercent: earlyDiscountPercent,
+		EarlyDiscountDays:    earlyDiscountDays,
+	}
+
+	invoice, err := s.createDraftInvoiceInTx(ctx, tx, createReq)
 	if err != nil {
 		return nil, err
 	}
+
+	// 9. Update quantity_invoiced
+	for _, invItem := range itemsToInvoice {
+		if err := s.orderRepo.UpdateQuantityInvoiced(ctx, tx, invItem.OrderItemID, invItem.Quantity); err != nil {
+			return nil, fmt.Errorf("update quantity_invoiced for %s: %w", invItem.OrderItemID, err)
+		}
+	}
+
+	// 10. Commit
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	// 11. Emit events (after commit)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "create_invoice_from_order", "invoice",
+			&invoice.InvoiceID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
+				"order_id": orderID.String(),
+				"items":    itemsToInvoice,
+			})
+	}
+	_ = s.emitInvoiceEvent(ctx, s.pgClient.DB, invoice, salesEvents.EventInvoiceCreated, nil)
+
 	return invoice, nil
 }
 
 func (s *invoiceService) CreateInvoiceFromQuote(ctx context.Context, companyID, quoteID uuid.UUID, req *CreateInvoiceFromQuoteRequest) (*models.Invoice, error) {
-	// Similar to order, but we need QuoteService – for brevity, assume similar pattern
+	// TODO: implement when quote service is available
 	return nil, fmt.Errorf("not implemented yet")
 }
 
@@ -519,7 +665,6 @@ func (s *invoiceService) UpdateInvoice(ctx context.Context, companyID, invoiceID
 	if invoice.Status != enums.InvoiceStatusDraft {
 		return nil, fmt.Errorf("%w: only draft invoices can be updated", salesErrors.ErrInvalidStatus)
 	}
-
 	changes := make(map[string]interface{})
 	if req.DueDate != nil {
 		invoice.DueDate = *req.DueDate
@@ -530,11 +675,16 @@ func (s *invoiceService) UpdateInvoice(ctx context.Context, companyID, invoiceID
 		changes["currency"] = req.Currency
 	}
 	if req.Notes != nil {
+		notesLen := len(*req.Notes)
+		logger.Info("notes length check in update", zap.Int("len", notesLen))
+		if notesLen > 1000 {
+			logger.Warn("notes too long in update", zap.Int("len", notesLen), zap.Int("max", 1000))
+			return nil, fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
+		}
 		invoice.Notes = req.Notes
 		changes["notes"] = req.Notes
 	}
 	invoice.UpdatedBy = req.UpdatedBy
-
 	if err := s.invoiceRepo.Update(ctx, tx, invoice); err != nil {
 		return nil, fmt.Errorf("update invoice: %w", err)
 	}
@@ -595,14 +745,14 @@ func (s *invoiceService) DeleteInvoice(ctx context.Context, companyID, invoiceID
 	return nil
 }
 
-// ------------------------ Retrieval Methods ------------------------
+// ------------------------ Retrieval (no idempotency) ------------------------
 
 func (s *invoiceService) GetInvoiceByID(ctx context.Context, companyID, invoiceID uuid.UUID) (*models.Invoice, error) {
-	return s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	return s.invoiceRepo.GetByID(ctx, s.pgClient.DB, companyID, invoiceID)
 }
 
 func (s *invoiceService) GetInvoiceByNumber(ctx context.Context, companyID uuid.UUID, invoiceNumber string) (*models.Invoice, error) {
-	return s.invoiceRepo.GetByNumber(ctx, nil, companyID, invoiceNumber)
+	return s.invoiceRepo.GetByNumber(ctx, s.pgClient.DB, companyID, invoiceNumber)
 }
 
 func (s *invoiceService) ListInvoices(ctx context.Context, filter InvoiceListFilter, p Pagination, srt Sort) ([]*models.Invoice, int64, error) {
@@ -618,26 +768,26 @@ func (s *invoiceService) ListInvoices(ctx context.Context, filter InvoiceListFil
 	if filter.Status != nil {
 		repoFilter.Statuses = []enums.InvoiceStatus{*filter.Status}
 	}
-	return s.invoiceRepo.List(ctx, nil, repoFilter,
+	return s.invoiceRepo.List(ctx, s.pgClient.DB, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *invoiceService) SearchInvoices(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Invoice, int64, error) {
-	return s.invoiceRepo.Search(ctx, nil, companyID, query, limit, offset)
+	return s.invoiceRepo.Search(ctx, s.pgClient.DB, companyID, query, limit, offset)
 }
 
 func (s *invoiceService) GetInvoicesByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, srt Sort) ([]*models.Invoice, int64, error) {
-	return s.invoiceRepo.GetByCustomer(ctx, nil, companyID, customerID,
+	return s.invoiceRepo.GetByCustomer(ctx, s.pgClient.DB, companyID, customerID,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *invoiceService) GetInvoicesByOrder(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.Invoice, error) {
-	return s.invoiceRepo.GetByOrder(ctx, nil, companyID, orderID)
+	return s.invoiceRepo.GetByOrder(ctx, s.pgClient.DB, companyID, orderID)
 }
 
-// ------------------------ Item Management ------------------------
+// ------------------------ Items (no idempotency) ------------------------
 
 func (s *invoiceService) AddItems(ctx context.Context, companyID, invoiceID uuid.UUID, items []CreateInvoiceItemRequest, updatedBy uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -776,10 +926,10 @@ func (s *invoiceService) RemoveItem(ctx context.Context, companyID, invoiceID, i
 }
 
 func (s *invoiceService) GetInvoiceItems(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*models.InvoiceItem, error) {
-	return s.invoiceRepo.GetItems(ctx, nil, companyID, invoiceID)
+	return s.invoiceRepo.GetItems(ctx, s.pgClient.DB, companyID, invoiceID)
 }
 
-// ------------------------ Pricing ------------------------
+// ------------------------ Pricing (no idempotency) ------------------------
 
 func (s *invoiceService) CalculatePricing(ctx context.Context, companyID, invoiceID uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -797,7 +947,7 @@ func (s *invoiceService) PreviewPricing(ctx context.Context, req *InvoicePricing
 	var subtotal, discountTotal, taxTotal decimal.Decimal
 	lineDetails := make([]InvoicePricingLineDetail, 0, len(req.Items))
 	for _, it := range req.Items {
-		prod, err := s.productRepo.GetByID(ctx, nil, req.CompanyID, it.ProductID)
+		prod, err := s.productRepo.GetByID(ctx, s.pgClient.DB, req.CompanyID, it.ProductID)
 		if err != nil {
 			return nil, err
 		}
@@ -813,7 +963,7 @@ func (s *invoiceService) PreviewPricing(ctx context.Context, req *InvoicePricing
 			discountTotal = discountTotal.Add(discount)
 		}
 		taxable := lineSub.Sub(discount)
-		tax, err := s.pricingRepo.CalculateLineTax(ctx, nil, req.CompanyID, it.ProductID, taxable)
+		tax, err := s.pricingRepo.CalculateLineTax(ctx, s.pgClient.DB, req.CompanyID, it.ProductID, taxable)
 		if err != nil {
 			return nil, err
 		}
@@ -836,6 +986,7 @@ func (s *invoiceService) PreviewPricing(ctx context.Context, req *InvoicePricing
 		LineDetails:   lineDetails,
 	}, nil
 }
+
 func (s *invoiceService) RecalculateTotals(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -857,10 +1008,10 @@ func (s *invoiceService) RecalculateTotals(ctx context.Context, companyID, invoi
 }
 
 func (s *invoiceService) GetInvoiceTotals(ctx context.Context, companyID, invoiceID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal, amountPaid, amountDue decimal.Decimal, err error) {
-	return s.invoiceRepo.GetTotals(ctx, nil, companyID, invoiceID)
+	return s.invoiceRepo.GetTotals(ctx, s.pgClient.DB, companyID, invoiceID)
 }
 
-// ------------------------ Discounts ------------------------
+// ------------------------ Discounts (no idempotency) ------------------------
 
 func (s *invoiceService) ApplyManualDiscount(ctx context.Context, companyID, invoiceID uuid.UUID, discountAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error {
 	if discountAmount.LessThanOrEqual(decimal.Zero) {
@@ -879,17 +1030,6 @@ func (s *invoiceService) ApplyManualDiscount(ctx context.Context, companyID, inv
 	if invoice.Status != enums.InvoiceStatusDraft {
 		return fmt.Errorf("%w: can only apply discount to draft invoice", salesErrors.ErrInvalidStatus)
 	}
-	// Store manual discount in discount_applications table
-	// app := &discount.DiscountApplication{
-	// 	ApplicationID: uuid.New(),
-	// 	InvoiceID:     &invoiceID,
-	// 	DiscountType:  "manual",
-	// 	DiscountName:  &reason,
-	// 	Amount:        discountAmount,
-	// }
-	// We need discount usage repository; assuming we have one
-	// s.discountUsageRepo.Create(ctx, tx, app)
-	// For simplicity, we'll recalculate totals by adding discount to DiscountTotal
 	invoice.DiscountTotal = invoice.DiscountTotal.Add(discountAmount)
 	invoice.GrandTotal = invoice.Subtotal.Sub(invoice.DiscountTotal).Add(invoice.TaxTotal)
 	if err := s.invoiceRepo.Update(ctx, tx, invoice); err != nil {
@@ -899,11 +1039,10 @@ func (s *invoiceService) ApplyManualDiscount(ctx context.Context, companyID, inv
 }
 
 func (s *invoiceService) RemoveManualDiscount(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error {
-	// In a real implementation, you would delete the manual discount application and recalc
 	return fmt.Errorf("not implemented")
 }
 
-// ------------------------ Status Transitions ------------------------
+// ------------------------ Status Transitions (no idempotency) ------------------------
 
 func (s *invoiceService) UpdateStatus(ctx context.Context, companyID, invoiceID uuid.UUID, status enums.InvoiceStatus, updatedBy uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -922,7 +1061,6 @@ func (s *invoiceService) UpdateStatus(ctx context.Context, companyID, invoiceID 
 	if err := s.invoiceRepo.UpdateStatus(ctx, tx, companyID, invoiceID, status, &updatedBy); err != nil {
 		return err
 	}
-	// Emit event based on status
 	var eventType string
 	switch status {
 	case enums.InvoiceStatusIssued:
@@ -958,11 +1096,9 @@ func (s *invoiceService) IssueInvoice(ctx context.Context, companyID, invoiceID 
 	if invoice.Status != enums.InvoiceStatusDraft {
 		return fmt.Errorf("%w: only draft invoices can be issued", salesErrors.ErrInvalidTransition)
 	}
-	// Validate credit limit
-	if err := s.ValidateCustomerCredit(ctx, companyID, invoice.CustomerID, invoice.GrandTotal); err != nil {
+	if err := s.ValidateCustomerCredit(ctx, tx, companyID, invoice.CustomerID, invoice.GrandTotal); err != nil {
 		return err
 	}
-	// Validate pricing consistency
 	if err := s.ValidatePricing(ctx, companyID, invoiceID); err != nil {
 		return err
 	}
@@ -1037,7 +1173,7 @@ func (s *invoiceService) MarkAsOverdue(ctx context.Context, companyID, invoiceID
 func (s *invoiceService) VoidInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, reason string, voidedBy uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -1045,9 +1181,11 @@ func (s *invoiceService) VoidInvoice(ctx context.Context, companyID, invoiceID u
 	if err != nil {
 		return err
 	}
+
 	if invoice.Status == enums.InvoiceStatusPaid {
 		return fmt.Errorf("%w: cannot void a paid invoice", salesErrors.ErrInvalidTransition)
 	}
+
 	hasPayments, err := s.invoiceRepo.HasPayments(ctx, tx, companyID, invoiceID)
 	if err != nil {
 		return err
@@ -1055,28 +1193,51 @@ func (s *invoiceService) VoidInvoice(ctx context.Context, companyID, invoiceID u
 	if hasPayments {
 		return fmt.Errorf("%w: cannot void invoice with existing payments", salesErrors.ErrConflict)
 	}
+
+	items, err := s.invoiceRepo.GetItems(ctx, tx, companyID, invoiceID)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range items {
+		if item.OrderItemID != nil && item.Quantity.GreaterThan(decimal.Zero) {
+			if err := s.orderRepo.DecreaseQuantityInvoiced(ctx, tx, *item.OrderItemID, item.Quantity); err != nil {
+				return fmt.Errorf("failed to revert quantity for order item %s: %w", item.OrderItemID.String(), err)
+			}
+		}
+	}
+
 	if err := s.invoiceRepo.Cancel(ctx, tx, companyID, invoiceID, time.Now(), &voidedBy); err != nil {
 		return err
 	}
+
 	invoice.Status = enums.InvoiceStatusCancelled
 	if err := s.emitInvoiceEvent(ctx, tx, invoice, salesEvents.EventInvoiceCancelled, nil); err != nil {
 		s.logger.Warn("failed to emit invoice cancelled event", zap.Error(err))
 	}
-	return tx.Commit()
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "void_invoice", "invoice",
+			&invoiceID, "user", &voidedBy, nil, nil, map[string]interface{}{
+				"reason": reason,
+			})
+	}
+	return nil
 }
 
-// ------------------------ Payment Handling ------------------------
+// ------------------------ Payments (no idempotency) ------------------------
 
 func (s *invoiceService) RegisterPayment(ctx context.Context, req *RegisterInvoicePaymentRequest) error {
-	// This method would typically be called by a PaymentService after a payment is completed.
-	// It creates a payment allocation and updates invoice balances.
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	// Validate payment exists and is completed
 	payment, err := s.paymentRepo.GetByID(ctx, tx, req.CompanyID, req.PaymentID)
 	if err != nil {
 		return err
@@ -1084,7 +1245,6 @@ func (s *invoiceService) RegisterPayment(ctx context.Context, req *RegisterInvoi
 	if payment.Status != enums.PaymentStatusCompleted {
 		return fmt.Errorf("%w: payment not completed", salesErrors.ErrInvalidStatus)
 	}
-	// Check if already allocated to this invoice
 	existingAlloc, err := s.paymentRepo.GetAllocationsByInvoice(ctx, tx, req.CompanyID, req.InvoiceID)
 	if err != nil {
 		return err
@@ -1103,11 +1263,9 @@ func (s *invoiceService) RegisterPayment(ctx context.Context, req *RegisterInvoi
 	if err := s.paymentRepo.AddAllocations(ctx, tx, req.CompanyID, req.PaymentID, []*models.PaymentAllocation{alloc}); err != nil {
 		return err
 	}
-	// Refresh invoice amount_paid and amount_due via trigger or manual
 	if err := s.invoiceRepo.UpdateAmounts(ctx, tx, req.CompanyID, req.InvoiceID, req.Amount, decimal.Zero, req.AllocatedBy); err != nil {
 		return err
 	}
-	// Check if invoice becomes fully paid and update status accordingly
 	amountDue, err := s.invoiceRepo.GetAmountDue(ctx, tx, req.CompanyID, req.InvoiceID)
 	if err != nil {
 		return err
@@ -1121,7 +1279,6 @@ func (s *invoiceService) RegisterPayment(ctx context.Context, req *RegisterInvoi
 }
 
 func (s *invoiceService) ApplyPayment(ctx context.Context, companyID, invoiceID, paymentID uuid.UUID, amount decimal.Decimal, appliedBy uuid.UUID) error {
-	// Similar to RegisterPayment, but maybe partial allocation
 	return s.RegisterPayment(ctx, &RegisterInvoicePaymentRequest{
 		CompanyID:   companyID,
 		InvoiceID:   invoiceID,
@@ -1138,7 +1295,6 @@ func (s *invoiceService) RemovePayment(ctx context.Context, companyID, invoiceID
 	}
 	defer tx.Rollback()
 
-	// Find allocation and delete
 	allocs, err := s.paymentRepo.GetAllocationsByInvoice(ctx, tx, companyID, invoiceID)
 	if err != nil {
 		return err
@@ -1156,7 +1312,6 @@ func (s *invoiceService) RemovePayment(ctx context.Context, companyID, invoiceID
 	if err := s.paymentRepo.DeleteAllocation(ctx, tx, companyID, paymentID, allocToDelete.AllocationID); err != nil {
 		return err
 	}
-	// Recalculate invoice amounts (trigger will handle, but force refresh)
 	if err := s.invoiceRepo.UpdateAmounts(ctx, tx, companyID, invoiceID, decimal.Zero, decimal.Zero, &removedBy); err != nil {
 		return err
 	}
@@ -1164,7 +1319,7 @@ func (s *invoiceService) RemovePayment(ctx context.Context, companyID, invoiceID
 }
 
 func (s *invoiceService) GetInvoicePayments(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*InvoicePayment, error) {
-	allocs, err := s.paymentRepo.GetAllocationsByInvoice(ctx, nil, companyID, invoiceID)
+	allocs, err := s.paymentRepo.GetAllocationsByInvoice(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return nil, err
 	}
@@ -1180,15 +1335,15 @@ func (s *invoiceService) GetInvoicePayments(ctx context.Context, companyID, invo
 }
 
 func (s *invoiceService) GetOutstandingAmount(ctx context.Context, companyID, invoiceID uuid.UUID) (decimal.Decimal, error) {
-	return s.invoiceRepo.GetAmountDue(ctx, nil, companyID, invoiceID)
+	return s.invoiceRepo.GetAmountDue(ctx, s.pgClient.DB, companyID, invoiceID)
 }
 
 func (s *invoiceService) HasPartialPayments(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error) {
-	amountPaid, err := s.invoiceRepo.GetAmountPaid(ctx, nil, companyID, invoiceID)
+	amountPaid, err := s.invoiceRepo.GetAmountPaid(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return false, err
 	}
-	grandTotal, _, _, _, _, _, err := s.invoiceRepo.GetTotals(ctx, nil, companyID, invoiceID)
+	grandTotal, _, _, _, _, _, err := s.invoiceRepo.GetTotals(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return false, err
 	}
@@ -1196,12 +1351,11 @@ func (s *invoiceService) HasPartialPayments(ctx context.Context, companyID, invo
 }
 
 func (s *invoiceService) RefreshPaymentBalances(ctx context.Context, companyID, invoiceID uuid.UUID, updatedBy uuid.UUID) error {
-	// The database trigger should already keep amounts consistent. This method can force a recalculation.
-	_, _, _, _, amountPaid, amountDue, err := s.invoiceRepo.GetTotals(ctx, nil, companyID, invoiceID)
+	_, _, _, _, amountPaid, amountDue, err := s.invoiceRepo.GetTotals(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
-	if err := s.invoiceRepo.UpdateAmounts(ctx, nil, companyID, invoiceID, amountPaid, amountDue, &updatedBy); err != nil {
+	if err := s.invoiceRepo.UpdateAmounts(ctx, s.pgClient.DB, companyID, invoiceID, amountPaid, amountDue, &updatedBy); err != nil {
 		return err
 	}
 	return nil
@@ -1229,19 +1383,17 @@ func (s *invoiceService) UpdateDueDate(ctx context.Context, companyID, invoiceID
 	return tx.Commit()
 }
 
-// ------------------------ Reporting and Validation ------------------------
+// ------------------------ Reporting & Validation (no idempotency) ------------------------
 
 func (s *invoiceService) GetOverdueInvoices(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*models.Invoice, error) {
-	return s.invoiceRepo.GetOverdueInvoices(ctx, nil, companyID)
+	return s.invoiceRepo.GetOverdueInvoices(ctx, s.pgClient.DB, companyID)
 }
 
 func (s *invoiceService) GetInvoicesDueSoon(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Invoice, error) {
-	// Custom query: invoices with due_date <= before and not paid
 	return nil, fmt.Errorf("not implemented")
 }
 
 func (s *invoiceService) SendDueReminder(ctx context.Context, companyID, invoiceID uuid.UUID, triggeredBy uuid.UUID) error {
-	// Placeholder – would integrate with notification service
 	return nil
 }
 
@@ -1249,7 +1401,7 @@ func (s *invoiceService) SendOverdueReminder(ctx context.Context, companyID, inv
 	return nil
 }
 
-func (s *invoiceService) ValidateCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, invoiceAmount decimal.Decimal) error {
+func (s *invoiceService) ValidateCustomerCredit(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID, invoiceAmount decimal.Decimal) error {
 	canPurchase, err := s.customerSvc.CanCustomerPurchaseAmount(ctx, companyID, customerID, invoiceAmount)
 	if err != nil {
 		return err
@@ -1260,8 +1412,12 @@ func (s *invoiceService) ValidateCustomerCredit(ctx context.Context, companyID, 
 	return nil
 }
 
-func (s *invoiceService) CanIssueInvoice(ctx context.Context, companyID, invoiceID uuid.UUID) error {
-	invoice, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+func (s *invoiceService) CanIssueInvoice(ctx context.Context, tx repository.DBTX, companyID, invoiceID uuid.UUID) error {
+	db := tx
+	if db == nil {
+		db = s.pgClient.DB
+	}
+	invoice, err := s.invoiceRepo.GetByID(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -1271,7 +1427,7 @@ func (s *invoiceService) CanIssueInvoice(ctx context.Context, companyID, invoice
 	if invoice.GrandTotal.LessThanOrEqual(decimal.Zero) {
 		return fmt.Errorf("%w: invoice total must be positive", salesErrors.ErrInvalidAmount)
 	}
-	return s.ValidateCustomerCredit(ctx, companyID, invoice.CustomerID, invoice.GrandTotal)
+	return s.ValidateCustomerCredit(ctx, tx, companyID, invoice.CustomerID, invoice.GrandTotal)
 }
 
 func (s *invoiceService) ValidateInvoice(ctx context.Context, invoice *models.Invoice, items []*models.InvoiceItem) error {
@@ -1304,7 +1460,7 @@ func (s *invoiceService) ValidateInvoiceItems(ctx context.Context, companyID uui
 		if it.Quantity.LessThanOrEqual(decimal.Zero) {
 			return fmt.Errorf("%w: quantity must be positive", salesErrors.ErrInvalidInput)
 		}
-		exists, err := s.productRepo.Exists(ctx, nil, companyID, it.ProductID)
+		exists, err := s.productRepo.Exists(ctx, s.pgClient.DB, companyID, it.ProductID)
 		if err != nil {
 			return err
 		}
@@ -1316,7 +1472,7 @@ func (s *invoiceService) ValidateInvoiceItems(ctx context.Context, companyID uui
 }
 
 func (s *invoiceService) ValidatePricing(ctx context.Context, companyID, invoiceID uuid.UUID) error {
-	items, err := s.invoiceRepo.GetItems(ctx, nil, companyID, invoiceID)
+	items, err := s.invoiceRepo.GetItems(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -1332,7 +1488,7 @@ func (s *invoiceService) ValidatePricing(ctx context.Context, companyID, invoice
 		}
 	}
 	calcGrand := calcSubtotal.Sub(calcDiscount).Add(calcTax)
-	subtotal, discountTotal, taxTotal, grandTotal, _, _, err := s.invoiceRepo.GetTotals(ctx, nil, companyID, invoiceID)
+	subtotal, discountTotal, taxTotal, grandTotal, _, _, err := s.invoiceRepo.GetTotals(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -1343,11 +1499,11 @@ func (s *invoiceService) ValidatePricing(ctx context.Context, companyID, invoice
 }
 
 func (s *invoiceService) ValidatePayments(ctx context.Context, companyID, invoiceID uuid.UUID) error {
-	amountPaid, err := s.invoiceRepo.GetAmountPaid(ctx, nil, companyID, invoiceID)
+	amountPaid, err := s.invoiceRepo.GetAmountPaid(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
-	grandTotal, _, _, _, _, _, err := s.invoiceRepo.GetTotals(ctx, nil, companyID, invoiceID)
+	grandTotal, _, _, _, _, _, err := s.invoiceRepo.GetTotals(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -1357,42 +1513,36 @@ func (s *invoiceService) ValidatePayments(ctx context.Context, companyID, invoic
 	return nil
 }
 
-// ------------------------ Analytics ------------------------
-
 func (s *invoiceService) GetTotalInvoicedRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.invoiceRepo.GetInvoiceRevenue(ctx, nil, companyID, from, to)
+	return s.invoiceRepo.GetInvoiceRevenue(ctx, s.pgClient.DB, companyID, from, to)
 }
 
 func (s *invoiceService) GetCollectedRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.invoiceRepo.GetCollectedRevenue(ctx, nil, companyID, from, to)
+	return s.invoiceRepo.GetCollectedRevenue(ctx, s.pgClient.DB, companyID, from, to)
 }
 
 func (s *invoiceService) GetOutstandingReceivables(ctx context.Context, companyID uuid.UUID) (decimal.Decimal, error) {
-	return s.invoiceRepo.GetOutstandingAmount(ctx, nil, companyID)
+	return s.invoiceRepo.GetOutstandingAmount(ctx, s.pgClient.DB, companyID)
 }
 
 func (s *invoiceService) GetAveragePaymentTime(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	// Placeholder – implement via analytics repo
 	return decimal.Zero, nil
 }
 
 func (s *invoiceService) GetTopOverdueInvoices(ctx context.Context, companyID uuid.UUID, limit int) ([]*models.Invoice, error) {
-	// Custom query
 	return nil, fmt.Errorf("not implemented")
 }
 
-// ------------------------ Existence Helpers ------------------------
-
 func (s *invoiceService) InvoiceExists(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error) {
-	return s.invoiceRepo.Exists(ctx, nil, companyID, invoiceID)
+	return s.invoiceRepo.Exists(ctx, s.pgClient.DB, companyID, invoiceID)
 }
 
 func (s *invoiceService) InvoiceNumberExists(ctx context.Context, companyID uuid.UUID, invoiceNumber string) (bool, error) {
-	return s.invoiceRepo.ExistsByNumber(ctx, nil, companyID, invoiceNumber)
+	return s.invoiceRepo.ExistsByNumber(ctx, s.pgClient.DB, companyID, invoiceNumber)
 }
 
 func (s *invoiceService) IsInvoicePaid(ctx context.Context, companyID, invoiceID uuid.UUID) (bool, error) {
-	inv, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	inv, err := s.invoiceRepo.GetByID(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return false, err
 	}
@@ -1400,9 +1550,157 @@ func (s *invoiceService) IsInvoicePaid(ctx context.Context, companyID, invoiceID
 }
 
 func (s *invoiceService) IsInvoiceOverdue(ctx context.Context, companyID, invoiceID uuid.UUID, at time.Time) (bool, error) {
-	inv, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	inv, err := s.invoiceRepo.GetByID(ctx, s.pgClient.DB, companyID, invoiceID)
 	if err != nil {
 		return false, err
 	}
 	return inv.Status == enums.InvoiceStatusOverdue || (inv.Status == enums.InvoiceStatusIssued && at.After(inv.DueDate)), nil
+}
+
+// createDraftInvoiceInTx creates a draft invoice within an existing transaction.
+// It does not start a new transaction and does not commit.
+func (s *invoiceService) createDraftInvoiceInTx(ctx context.Context, tx repository.DBTX, req *CreateInvoiceRequest) (*models.Invoice, error) {
+	// --- NEW validations with logging ---
+	if req.Notes != nil {
+		notesLen := len(*req.Notes)
+		s.logger.Info("createDraftInvoiceInTx notes length", zap.Int("len", notesLen))
+		if notesLen > 1000 {
+			s.logger.Warn("notes too long in createDraft", zap.Int("len", notesLen), zap.Int("max", 1000))
+			return nil, fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
+		}
+	}
+	if req.DueDate.Before(req.InvoiceDate) {
+		s.logger.Warn("due_date before invoice_date",
+			zap.Time("due_date", req.DueDate),
+			zap.Time("invoice_date", req.InvoiceDate))
+		return nil, fmt.Errorf("%w: due_date cannot be before invoice_date", salesErrors.ErrInvalidInput)
+	}
+	// -----------------------
+
+	// Generate invoice number if missing
+	invoiceNumber := req.InvoiceNumber
+	if invoiceNumber == "" {
+		var err error
+		invoiceNumber, err = s.generateInvoiceNumber(tx, req.CompanyID)
+		if err != nil {
+			return nil, fmt.Errorf("generate invoice number: %w", err)
+		}
+	}
+	exists, err := s.invoiceRepo.ExistsByNumber(ctx, tx, req.CompanyID, invoiceNumber)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, fmt.Errorf("%w: invoice number %s already exists", salesErrors.ErrDuplicate, invoiceNumber)
+	}
+
+	// Validate customer is active
+	active, err := s.customerSvc.IsCustomerActive(ctx, req.CompanyID, req.CustomerID)
+	if err != nil {
+		return nil, err
+	}
+	if !active {
+		return nil, salesErrors.ErrCustomerInactive
+	}
+
+	// Build invoice items
+	invItems := make([]*models.InvoiceItem, 0, len(req.Items))
+	for _, it := range req.Items {
+		var productName string
+		if it.ProductID != uuid.Nil {
+			prod, err := s.productRepo.GetByID(ctx, tx, req.CompanyID, it.ProductID)
+			if err != nil {
+				return nil, fmt.Errorf("product %s: %w", it.ProductID, err)
+			}
+			if !prod.IsActive {
+				return nil, fmt.Errorf("%w: product %s is inactive", salesErrors.ErrProductInactive, prod.SKU)
+			}
+			productName = prod.Name
+		} else if it.OrderItemID != nil {
+			orderItem, err := s.orderRepo.GetItemByID(ctx, tx, req.CompanyID, *req.OrderID, *it.OrderItemID)
+			if err != nil {
+				return nil, fmt.Errorf("order item %s: %w", it.OrderItemID, err)
+			}
+			productName = orderItem.ProductNameSnapshot
+		} else {
+			return nil, fmt.Errorf("%w: either product_id or order_item_id required", salesErrors.ErrInvalidInput)
+		}
+
+		unitPrice := decimal.Zero
+		if it.UnitPrice != nil {
+			unitPrice = *it.UnitPrice
+		} else if it.OrderItemID != nil {
+			orderItem, err := s.orderRepo.GetItemByID(ctx, tx, req.CompanyID, *req.OrderID, *it.OrderItemID)
+			if err != nil {
+				return nil, fmt.Errorf("order item %s: %w", it.OrderItemID, err)
+			}
+			unitPrice = orderItem.UnitPrice
+		} else {
+			return nil, fmt.Errorf("%w: unit_price required", salesErrors.ErrInvalidInput)
+		}
+
+		invItem := &models.InvoiceItem{
+			InvoiceItemID:       uuid.New(),
+			InvoiceID:           uuid.Nil,
+			OrderItemID:         it.OrderItemID,
+			ProductID:           &it.ProductID,
+			ProductNameSnapshot: productName,
+			Quantity:            it.Quantity,
+			UnitPrice:           unitPrice,
+			DiscountAmount:      it.Discount,
+			TaxAmount:           nil,
+			Metadata:            it.Metadata,
+		}
+		invItems = append(invItems, invItem)
+	}
+
+	invoice := &models.Invoice{
+		InvoiceID:            uuid.New(),
+		CompanyID:            req.CompanyID,
+		CustomerID:           req.CustomerID,
+		OrderID:              req.OrderID,
+		InvoiceNumber:        invoiceNumber,
+		ExternalRef:          req.ExternalRef,
+		InvoiceDate:          req.InvoiceDate,
+		DueDate:              req.DueDate,
+		Status:               enums.InvoiceStatusDraft,
+		Currency:             req.Currency,
+		Notes:                req.Notes,
+		AmountPaid:           decimal.Zero,
+		AmountDue:            decimal.Zero,
+		IsLocked:             false,
+		CreatedBy:            req.CreatedBy,
+		UpdatedBy:            req.CreatedBy,
+		SalesRepID:           req.SalesRepID,
+		PaymentTermName:      req.PaymentTermName,
+		PaymentDueDays:       req.PaymentDueDays,
+		EarlyDiscountPercent: req.EarlyDiscountPercent,
+		EarlyDiscountDays:    req.EarlyDiscountDays,
+	}
+	if invoice.Currency == "" {
+		invoice.Currency = "USD"
+	}
+	if invoice.InvoiceDate.IsZero() {
+		invoice.InvoiceDate = time.Now().Truncate(24 * time.Hour)
+	}
+	if invoice.DueDate.IsZero() {
+		invoice.DueDate = invoice.InvoiceDate.Add(30 * 24 * time.Hour)
+	}
+	// Re‑validate after defaults (though unlikely to cause issue, but safe)
+	if invoice.DueDate.Before(invoice.InvoiceDate) {
+		return nil, fmt.Errorf("%w: due_date cannot be before invoice_date", salesErrors.ErrInvalidInput)
+	}
+
+	if err := s.invoiceRepo.Create(ctx, tx, invoice, invItems); err != nil {
+		return nil, fmt.Errorf("create invoice: %w", err)
+	}
+	if err := s.recalculateInvoiceTotals(ctx, tx, req.CompanyID, invoice.InvoiceID); err != nil {
+		return nil, err
+	}
+	// Re‑fetch to get updated totals
+	invoice, err = s.invoiceRepo.GetByID(ctx, tx, req.CompanyID, invoice.InvoiceID)
+	if err != nil {
+		return nil, err
+	}
+	return invoice, nil
 }

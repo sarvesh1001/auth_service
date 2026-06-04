@@ -25,7 +25,10 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
-// CustomerService defines business operations for customers.
+// ---------------------------------------------------------------------
+// Service Interface – no transaction parameters (production‑grade pattern)
+// ---------------------------------------------------------------------
+
 type CustomerService interface {
 	CreateCustomer(ctx context.Context, req CreateCustomerRequest, idempotencyKey string) (*models.Customer, error)
 	UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest, idempotencyKey string) (*models.Customer, error)
@@ -56,6 +59,10 @@ type CustomerService interface {
 	CustomerExists(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
 	IsCustomerActive(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
 }
+
+// ---------------------------------------------------------------------
+// Implementation
+// ---------------------------------------------------------------------
 
 type customerService struct {
 	customerRepo      repository.CustomerRepository
@@ -97,14 +104,13 @@ func NewCustomerService(
 }
 
 // ----------------------------------------------------------------------------
-// Validation constants & helpers
+// Validation helpers
 // ----------------------------------------------------------------------------
-
 const (
 	maxCustomerCodeLen = 50
 	maxNameLen         = 255
 	maxEmailLen        = 255
-	maxBillingAddrLen  = 500 // optional limit for billing_address (TEXT column)
+	maxBillingAddrLen  = 500
 )
 
 var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
@@ -113,16 +119,14 @@ func isValidEmail(email string) bool {
 	return emailRegex.MatchString(email)
 }
 
-// hashEmail computes a SHA256 hash of the email (used for uniqueness detection)
 func hashEmail(email string) string {
 	hash := sha256.Sum256([]byte(email))
 	return hex.EncodeToString(hash[:])
 }
 
 // ----------------------------------------------------------------------------
-// Helper functions for encryption/decryption
+// Encryption helpers
 // ----------------------------------------------------------------------------
-
 func (s *customerService) encryptField(ctx context.Context, plainText *string, fieldName string) (encrypted, dek, keyID *string, err error) {
 	if plainText == nil || *plainText == "" {
 		return nil, nil, nil, nil
@@ -150,11 +154,8 @@ func (s *customerService) decryptCustomer(ctx context.Context, c *models.Custome
 	if c == nil {
 		return nil
 	}
-	var err error
-	var emailStr, phoneStr, taxIDStr string
-
 	if c.EmailEncrypted != nil {
-		emailStr, err = s.decryptField(ctx, c.EmailEncrypted, c.EmailDEK, c.EmailKeyID)
+		emailStr, err := s.decryptField(ctx, c.EmailEncrypted, c.EmailDEK, c.EmailKeyID)
 		if err != nil {
 			return fmt.Errorf("decrypt email: %w", err)
 		}
@@ -163,7 +164,7 @@ func (s *customerService) decryptCustomer(ctx context.Context, c *models.Custome
 		}
 	}
 	if c.PhoneEncrypted != nil {
-		phoneStr, err = s.decryptField(ctx, c.PhoneEncrypted, c.PhoneDEK, c.PhoneKeyID)
+		phoneStr, err := s.decryptField(ctx, c.PhoneEncrypted, c.PhoneDEK, c.PhoneKeyID)
 		if err != nil {
 			return fmt.Errorf("decrypt phone: %w", err)
 		}
@@ -172,7 +173,7 @@ func (s *customerService) decryptCustomer(ctx context.Context, c *models.Custome
 		}
 	}
 	if c.TaxIDEncrypted != nil {
-		taxIDStr, err = s.decryptField(ctx, c.TaxIDEncrypted, c.TaxIDDEK, c.TaxIDKeyID)
+		taxIDStr, err := s.decryptField(ctx, c.TaxIDEncrypted, c.TaxIDDEK, c.TaxIDKeyID)
 		if err != nil {
 			return fmt.Errorf("decrypt tax_id: %w", err)
 		}
@@ -202,10 +203,9 @@ func (s *customerService) decryptCustomer(ctx context.Context, c *models.Custome
 }
 
 // ----------------------------------------------------------------------------
-// Credit limit & outstanding balance helpers
+// Internal helpers for credit & history
 // ----------------------------------------------------------------------------
-
-func (s *customerService) getOutstandingBalance(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
+func (s *customerService) getOutstandingBalance(ctx context.Context, db repository.DBTX, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
 	query := `
 		SELECT COALESCE(SUM(amount_due), 0)
 		FROM sales.invoices
@@ -213,7 +213,7 @@ func (s *customerService) getOutstandingBalance(ctx context.Context, tx reposito
 		AND status NOT IN ('paid', 'cancelled')
 	`
 	var total decimal.Decimal
-	err := tx.QueryRowContext(ctx, query, companyID, customerID).Scan(&total)
+	err := db.QueryRowContext(ctx, query, companyID, customerID).Scan(&total)
 	if err != nil {
 		return decimal.Zero, fmt.Errorf("get outstanding balance: %w", err)
 	}
@@ -240,17 +240,14 @@ func (s *customerService) logCreditHistory(ctx context.Context, tx repository.DB
 }
 
 // ----------------------------------------------------------------------------
-// CreateCustomer
+// CRUD – writes start their own transaction
 // ----------------------------------------------------------------------------
-
 func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomerRequest, idempotencyKey string) (*models.Customer, error) {
 	logger := s.logger.With(zap.String("method", "CreateCustomer"), zap.String("idempotency_key", idempotencyKey))
 
 	if err := s.validateCreateCustomer(req); err != nil {
 		return nil, err
 	}
-
-	// Additional validation (length, email, payment term, billing address)
 	if err := s.validateCustomerInput(req); err != nil {
 		return nil, err
 	}
@@ -261,14 +258,12 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 	}
 	defer tx.Rollback()
 
-	// Check idempotency
 	var cached *models.Customer
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached customer")
 		return cached, nil
 	}
 
-	// Check unique customer_code
 	exists, err := s.customerRepo.ExistsByCode(ctx, tx, req.CompanyID, req.CustomerCode)
 	if err != nil {
 		return nil, fmt.Errorf("check customer_code: %w", err)
@@ -277,7 +272,6 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		return nil, fmt.Errorf("%w: customer_code %s already exists", salesErrors.ErrDuplicate, req.CustomerCode)
 	}
 
-	// Email uniqueness check via hash
 	if req.Email != nil && *req.Email != "" {
 		emailHash := hashEmail(*req.Email)
 		hashExists, err := s.customerRepo.ExistsByEmailHash(ctx, tx, req.CompanyID, emailHash)
@@ -289,7 +283,6 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		}
 	}
 
-	// Payment term existence check
 	if req.PaymentTermID != nil {
 		termExists, err := s.paymentTermRepo.Exists(ctx, tx, req.CompanyID, *req.PaymentTermID)
 		if err != nil {
@@ -300,14 +293,12 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		}
 	}
 
-	// Encrypt sensitive fields
 	emailEnc, emailDEK, emailKeyID, _ := s.encryptField(ctx, req.Email, "customer_email")
 	phoneEnc, phoneDEK, phoneKeyID, _ := s.encryptField(ctx, req.Phone, "customer_phone")
 	taxEnc, taxDEK, taxKeyID, _ := s.encryptField(ctx, req.TaxID, "customer_tax_id")
 	billEnc, billDEK, billKeyID, _ := s.encryptField(ctx, req.BillingAddress, "customer_billing")
 	shipEnc, shipDEK, shipKeyID, _ := s.encryptField(ctx, req.ShippingAddr, "customer_shipping")
 
-	// Compute email hash if email present
 	var emailHashPtr *string
 	if req.Email != nil && *req.Email != "" {
 		hash := hashEmail(*req.Email)
@@ -346,7 +337,6 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		return nil, fmt.Errorf("create customer: %w", err)
 	}
 
-	// Log credit history if credit limit is set
 	if req.CreditLimit != nil && !req.CreditLimit.IsZero() {
 		if err := s.logCreditHistory(ctx, tx, req.CompanyID, customer.CustomerID, "limit_change",
 			nil, req.CreditLimit, nil, nil, nil, nil, req.CreatedBy); err != nil {
@@ -354,19 +344,16 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		}
 	}
 
-	// Emit event
 	if err := s.emitCustomerEvent(ctx, tx, customer, salesEvents.EventCustomerCreated); err != nil {
 		logger.Warn("failed to emit customer created event", zap.Error(err))
 	}
 
-	// Store idempotency result
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, customer)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Decrypt for response
 	_ = s.decryptCustomer(ctx, customer)
 
 	if s.auditService != nil {
@@ -378,7 +365,6 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 	return customer, nil
 }
 
-// validateCreateCustomer performs basic presence checks.
 func (s *customerService) validateCreateCustomer(req CreateCustomerRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", salesErrors.ErrInvalidInput)
@@ -392,9 +378,7 @@ func (s *customerService) validateCreateCustomer(req CreateCustomerRequest) erro
 	return nil
 }
 
-// validateCustomerInput performs detailed validation (lengths, email format, billing address length)
 func (s *customerService) validateCustomerInput(req CreateCustomerRequest) error {
-	// Length checks
 	if len(req.CustomerCode) > maxCustomerCodeLen {
 		return fmt.Errorf("%w: customer_code must not exceed %d characters", salesErrors.ErrInvalidInput, maxCustomerCodeLen)
 	}
@@ -414,10 +398,6 @@ func (s *customerService) validateCustomerInput(req CreateCustomerRequest) error
 	}
 	return nil
 }
-
-// ----------------------------------------------------------------------------
-// UpdateCustomer
-// ----------------------------------------------------------------------------
 
 func (s *customerService) UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest, idempotencyKey string) (*models.Customer, error) {
 	logger := s.logger.With(zap.String("method", "UpdateCustomer"), zap.String("idempotency_key", idempotencyKey))
@@ -460,7 +440,6 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		customer.IsActive = *req.IsActive
 	}
 
-	// Handle email update with hash uniqueness check
 	if req.Email != nil {
 		if len(*req.Email) > maxEmailLen {
 			return nil, fmt.Errorf("%w: email must not exceed %d characters", salesErrors.ErrInvalidInput, maxEmailLen)
@@ -468,7 +447,6 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		if !isValidEmail(*req.Email) {
 			return nil, fmt.Errorf("%w: invalid email format", salesErrors.ErrInvalidInput)
 		}
-		// Check uniqueness (exclude current customer)
 		newHash := hashEmail(*req.Email)
 		exists, err := s.customerRepo.ExistsByEmailHashExcluding(ctx, tx, companyID, newHash, customerID)
 		if err != nil {
@@ -477,16 +455,16 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		if exists {
 			return nil, fmt.Errorf("%w: email already in use", salesErrors.ErrDuplicate)
 		}
-		// Encrypt and set new hash
 		enc, dek, kid, err := s.encryptField(ctx, req.Email, "customer_email")
 		if err != nil {
 			return nil, err
 		}
+		oldPlain, _ := s.decryptField(ctx, customer.EmailEncrypted, customer.EmailDEK, customer.EmailKeyID)
+		changes["email"] = map[string]string{"old": oldPlain, "new": *req.Email}
 		customer.EmailEncrypted = enc
 		customer.EmailDEK = dek
 		customer.EmailKeyID = kid
 		customer.EmailHash = &newHash
-		changes["email"] = map[string]string{"old": *customer.Email, "new": *req.Email}
 	}
 
 	if req.Phone != nil {
@@ -494,6 +472,8 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		if err != nil {
 			return nil, err
 		}
+		oldPlain, _ := s.decryptField(ctx, customer.PhoneEncrypted, customer.PhoneDEK, customer.PhoneKeyID)
+		changes["phone"] = map[string]string{"old": oldPlain, "new": *req.Phone}
 		customer.PhoneEncrypted = enc
 		customer.PhoneDEK = dek
 		customer.PhoneKeyID = kid
@@ -503,6 +483,8 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		if err != nil {
 			return nil, err
 		}
+		oldPlain, _ := s.decryptField(ctx, customer.TaxIDEncrypted, customer.TaxIDDEK, customer.TaxIDKeyID)
+		changes["tax_id"] = map[string]string{"old": oldPlain, "new": *req.TaxID}
 		customer.TaxIDEncrypted = enc
 		customer.TaxIDDEK = dek
 		customer.TaxIDKeyID = kid
@@ -515,6 +497,8 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		if err != nil {
 			return nil, err
 		}
+		oldPlain, _ := s.decryptField(ctx, customer.BillingAddressEncrypted, customer.BillingAddressDEK, customer.BillingAddressKeyID)
+		changes["billing_address"] = map[string]string{"old": oldPlain, "new": *req.BillingAddress}
 		customer.BillingAddressEncrypted = enc
 		customer.BillingAddressDEK = dek
 		customer.BillingAddressKeyID = kid
@@ -524,6 +508,8 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		if err != nil {
 			return nil, err
 		}
+		oldPlain, _ := s.decryptField(ctx, customer.ShippingAddressEncrypted, customer.ShippingAddressDEK, customer.ShippingAddressKeyID)
+		changes["shipping_address"] = map[string]string{"old": oldPlain, "new": *req.ShippingAddr}
 		customer.ShippingAddressEncrypted = enc
 		customer.ShippingAddressDEK = dek
 		customer.ShippingAddressKeyID = kid
@@ -553,10 +539,6 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 	return customer, nil
 }
 
-// ----------------------------------------------------------------------------
-// DeleteCustomer (soft deactivate if has dependencies)
-// ----------------------------------------------------------------------------
-
 func (s *customerService) DeleteCustomer(ctx context.Context, companyID, customerID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error {
 	logger := s.logger.With(zap.String("method", "DeleteCustomer"), zap.String("idempotency_key", idempotencyKey))
 
@@ -580,7 +562,6 @@ func (s *customerService) DeleteCustomer(ctx context.Context, companyID, custome
 		return salesErrors.ErrPermissionDenied
 	}
 
-	// Check if customer has orders or invoices
 	var hasOrders bool
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sales.orders WHERE company_id=$1 AND customer_id=$2 LIMIT 1)`, companyID, customerID).Scan(&hasOrders)
 	if err != nil && err != sql.ErrNoRows {
@@ -593,7 +574,6 @@ func (s *customerService) DeleteCustomer(ctx context.Context, companyID, custome
 	}
 
 	if hasOrders || hasInvoices {
-		// Soft delete – just deactivate
 		if err := s.customerRepo.SetActiveStatus(ctx, tx, companyID, customerID, false, deletedBy); err != nil {
 			return fmt.Errorf("deactivate customer: %w", err)
 		}
@@ -622,11 +602,11 @@ func (s *customerService) DeleteCustomer(ctx context.Context, companyID, custome
 }
 
 // ----------------------------------------------------------------------------
-// GetCustomerByID, GetCustomerByCode, List, Search (unchanged)
+// Read methods – use default DB connection (no transaction needed)
 // ----------------------------------------------------------------------------
-
 func (s *customerService) GetCustomerByID(ctx context.Context, companyID, customerID uuid.UUID) (*models.Customer, error) {
-	customer, err := s.customerRepo.GetByID(ctx, nil, companyID, customerID)
+	db := s.pgClient.DB
+	customer, err := s.customerRepo.GetByID(ctx, db, companyID, customerID)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +617,8 @@ func (s *customerService) GetCustomerByID(ctx context.Context, companyID, custom
 }
 
 func (s *customerService) GetCustomerByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Customer, error) {
-	customer, err := s.customerRepo.GetByCode(ctx, nil, companyID, code)
+	db := s.pgClient.DB
+	customer, err := s.customerRepo.GetByCode(ctx, db, companyID, code)
 	if err != nil {
 		return nil, err
 	}
@@ -648,6 +629,7 @@ func (s *customerService) GetCustomerByCode(ctx context.Context, companyID uuid.
 }
 
 func (s *customerService) ListCustomers(ctx context.Context, filter CustomerListFilter, p Pagination, srt Sort) ([]*models.Customer, int64, error) {
+	db := s.pgClient.DB
 	repoFilter := repository.CustomerFilter{
 		CompanyID:    filter.CompanyID,
 		IsActive:     filter.IsActive,
@@ -659,7 +641,7 @@ func (s *customerService) ListCustomers(ctx context.Context, filter CustomerList
 		UpdatedFrom:  filter.UpdatedFrom,
 		UpdatedTo:    filter.UpdatedTo,
 	}
-	customers, total, err := s.customerRepo.List(ctx, nil, repoFilter, repository.Pagination{Limit: p.Limit, Offset: p.Offset}, repository.Sort{Field: srt.Field, Direction: srt.Direction})
+	customers, total, err := s.customerRepo.List(ctx, db, repoFilter, repository.Pagination{Limit: p.Limit, Offset: p.Offset}, repository.Sort{Field: srt.Field, Direction: srt.Direction})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -670,7 +652,8 @@ func (s *customerService) ListCustomers(ctx context.Context, filter CustomerList
 }
 
 func (s *customerService) SearchCustomers(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Customer, int64, error) {
-	customers, total, err := s.customerRepo.Search(ctx, nil, companyID, query, limit, offset)
+	db := s.pgClient.DB
+	customers, total, err := s.customerRepo.Search(ctx, db, companyID, query, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -681,9 +664,8 @@ func (s *customerService) SearchCustomers(ctx context.Context, companyID uuid.UU
 }
 
 // ----------------------------------------------------------------------------
-// Activate / Deactivate (unchanged)
+// Activation – own transaction
 // ----------------------------------------------------------------------------
-
 func (s *customerService) ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
 	return s.setActiveStatus(ctx, companyID, customerID, true, updatedBy, idempotencyKey)
 }
@@ -708,7 +690,6 @@ func (s *customerService) setActiveStatus(ctx context.Context, companyID, custom
 		return err
 	}
 
-	// Fetch customer for event
 	cust, _ := s.customerRepo.GetByID(ctx, tx, companyID, customerID)
 	if cust != nil {
 		eventType := salesEvents.EventCustomerDeactivated
@@ -726,9 +707,8 @@ func (s *customerService) setActiveStatus(ctx context.Context, companyID, custom
 }
 
 // ----------------------------------------------------------------------------
-// Credit Limit Management (unchanged)
+// Credit limit – writes own transaction, reads use default DB
 // ----------------------------------------------------------------------------
-
 func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID, idempotencyKey string) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -756,13 +736,11 @@ func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, cust
 		return fmt.Errorf("update credit limit: %w", err)
 	}
 
-	// Log credit history
 	if err := s.logCreditHistory(ctx, tx, companyID, customerID, "limit_change",
 		&oldLimit, &newLimit, nil, nil, reason, nil, updatedBy); err != nil {
 		s.logger.Warn("failed to log credit limit change", zap.Error(err))
 	}
 
-	// Emit event
 	_ = s.emitCustomerEvent(ctx, tx, cust, salesEvents.EventCustomerCreditLimitUpdated)
 
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
@@ -773,7 +751,8 @@ func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, cust
 }
 
 func (s *customerService) GetCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	cust, err := s.customerRepo.GetCreditLimit(ctx, nil, companyID, customerID)
+	db := s.pgClient.DB
+	cust, err := s.customerRepo.GetCreditLimit(ctx, db, companyID, customerID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -784,7 +763,7 @@ func (s *customerService) GetCreditLimit(ctx context.Context, companyID, custome
 }
 
 func (s *customerService) GetOutstandingBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	return s.getOutstandingBalance(ctx, nil, companyID, customerID)
+	return s.getOutstandingBalance(ctx, s.pgClient.DB, companyID, customerID)
 }
 
 func (s *customerService) CanCustomerPurchaseAmount(ctx context.Context, companyID, customerID uuid.UUID, amount decimal.Decimal) (bool, error) {
@@ -804,9 +783,8 @@ func (s *customerService) CanCustomerPurchaseAmount(ctx context.Context, company
 }
 
 // ----------------------------------------------------------------------------
-// Payment Term & Sales Rep Assignment (unchanged)
+// Payment term – own transaction
 // ----------------------------------------------------------------------------
-
 func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -860,6 +838,9 @@ func (s *customerService) RemovePaymentTerm(ctx context.Context, companyID, cust
 	return tx.Commit()
 }
 
+// ----------------------------------------------------------------------------
+// Sales rep assignment – not supported
+// ----------------------------------------------------------------------------
 func (s *customerService) AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
 	return fmt.Errorf("customer sales rep assignment not supported – assign at order/invoice level")
 }
@@ -869,11 +850,11 @@ func (s *customerService) RemoveSalesRep(ctx context.Context, companyID, custome
 }
 
 // ----------------------------------------------------------------------------
-// Reporting Queries (unchanged)
+// Reporting – use default DB
 // ----------------------------------------------------------------------------
-
 func (s *customerService) GetCustomersWithOutstandingInvoices(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error) {
-	customers, err := s.customerRepo.GetCustomersWithOutstandingInvoices(ctx, nil, companyID)
+	db := s.pgClient.DB
+	customers, err := s.customerRepo.GetCustomersWithOutstandingInvoices(ctx, db, companyID)
 	if err != nil {
 		return nil, err
 	}
@@ -884,7 +865,8 @@ func (s *customerService) GetCustomersWithOutstandingInvoices(ctx context.Contex
 }
 
 func (s *customerService) GetTopCustomersByRevenue(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Customer, error) {
-	customers, err := s.customerRepo.GetTopCustomersByRevenue(ctx, nil, companyID, limit, from, to)
+	db := s.pgClient.DB
+	customers, err := s.customerRepo.GetTopCustomersByRevenue(ctx, db, companyID, limit, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -895,9 +877,8 @@ func (s *customerService) GetTopCustomersByRevenue(ctx context.Context, companyI
 }
 
 // ----------------------------------------------------------------------------
-// Validation & Existence (unchanged)
+// Validation & existence – use default DB
 // ----------------------------------------------------------------------------
-
 func (s *customerService) ValidateCustomer(ctx context.Context, customer *models.Customer) error {
 	if customer.CustomerCode == "" {
 		return fmt.Errorf("%w: customer_code required", salesErrors.ErrInvalidInput)
@@ -909,17 +890,16 @@ func (s *customerService) ValidateCustomer(ctx context.Context, customer *models
 }
 
 func (s *customerService) CustomerExists(ctx context.Context, companyID, customerID uuid.UUID) (bool, error) {
-	return s.customerRepo.Exists(ctx, nil, companyID, customerID)
+	return s.customerRepo.Exists(ctx, s.pgClient.DB, companyID, customerID)
 }
 
 func (s *customerService) IsCustomerActive(ctx context.Context, companyID, customerID uuid.UUID) (bool, error) {
-	return s.customerRepo.IsActive(ctx, nil, companyID, customerID)
+	return s.customerRepo.IsActive(ctx, s.pgClient.DB, companyID, customerID)
 }
 
 // ----------------------------------------------------------------------------
-// Event Emission (unchanged)
+// Event emission – requires a transaction
 // ----------------------------------------------------------------------------
-
 func (s *customerService) emitCustomerEvent(ctx context.Context, tx repository.DBTX, customer *models.Customer, eventType string) error {
 	sqlTx, ok := tx.(*sql.Tx)
 	if !ok {
@@ -947,7 +927,7 @@ func (s *customerService) emitCustomerEvent(ctx context.Context, tx repository.D
 	return s.outboxRepo.Store(ctx, sqlTx, event)
 }
 
-// Helper
+// Helper for nil UUID
 func (s *customerService) nullUUID(id *uuid.UUID) interface{} {
 	if id == nil || *id == uuid.Nil {
 		return nil

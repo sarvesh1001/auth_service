@@ -917,8 +917,9 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 		CreatedBy:       req.UpdatedBy,
 	}
 
-	// Use OrderService to create the order (reuses all business logic)
-	order, err := s.orderSvc.CreateDraftOrder(ctx, orderReq)
+	// Generate unique idempotency key for this conversion
+	idempotencyKey := fmt.Sprintf("convert-quote-%s", quoteID.String())
+	order, err := s.orderSvc.CreateDraftOrder(ctx, orderReq, idempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("create order from quote: %w", err)
 	}
@@ -949,7 +950,6 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 
 	return order, nil
 }
-
 func (s *quoteService) IsConverted(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error) {
 	return s.quoteRepo.IsConverted(ctx, nil, companyID, quoteID)
 }

@@ -1,4 +1,5 @@
 // file: internal/sales/service/order_service.go
+
 package service
 
 import (
@@ -24,65 +25,84 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
+// ----------------------------------------------------------------------------
+// Allowed currencies (ISO 4217)
+// ----------------------------------------------------------------------------
+var allowedCurrencies = map[string]bool{
+	"USD": true,
+	"EUR": true,
+	"GBP": true,
+	"JPY": true,
+	"CNY": true,
+	"AUD": true,
+	"CAD": true,
+	"CHF": true,
+	"SEK": true,
+	"NZD": true,
+	"MXN": true,
+	"SGD": true,
+	"HKD": true,
+	"NOK": true,
+	"KRW": true,
+	"TRY": true,
+	"RUB": true,
+	"INR": true,
+	"BRL": true,
+	"ZAR": true,
+	// Add any other currencies you support
+}
+
 // ============================================================================
-// OrderService interface (as provided in the prompt)
+// OrderService interface
 // ============================================================================
 
 type OrderService interface {
-	// ORDER CREATION / CRUD
-	CreateDraftOrder(ctx context.Context, req *CreateOrderRequest) (*models.Order, error)
-	UpdateOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, req *UpdateOrderRequest) (*models.Order, error)
-	DeleteOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, deletedBy uuid.UUID) error
-	GetOrderByID(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (*models.Order, error)
+	CreateDraftOrder(ctx context.Context, req *CreateOrderRequest, idempotencyKey string) (*models.Order, error)
+	UpdateOrder(ctx context.Context, companyID, orderID uuid.UUID, req *UpdateOrderRequest, idempotencyKey string) (*models.Order, error)
+	DeleteOrder(ctx context.Context, companyID, orderID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error
+	GetOrderByID(ctx context.Context, companyID, orderID uuid.UUID) (*models.Order, error)
 	GetOrderByNumber(ctx context.Context, companyID uuid.UUID, orderNumber string) (*models.Order, error)
 	ListOrders(ctx context.Context, filter OrderListFilter, p Pagination, s Sort) ([]*models.Order, int64, error)
-	SearchOrders(ctx context.Context, companyID uuid.UUID, query string, limit int, offset int) ([]*models.Order, int64, error)
-	GetOrdersByCustomer(ctx context.Context, companyID uuid.UUID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Order, int64, error)
+	SearchOrders(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Order, int64, error)
+	GetOrdersByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, s Sort) ([]*models.Order, int64, error)
 
-	// ORDER ITEM MANAGEMENT
-	AddItems(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error
-	ReplaceItems(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error
-	RemoveItem(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, orderItemID uuid.UUID, updatedBy uuid.UUID) error
-	GetOrderItems(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) ([]*models.OrderItem, error)
+	AddItems(ctx context.Context, companyID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error
+	ReplaceItems(ctx context.Context, companyID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error
+	RemoveItem(ctx context.Context, companyID, orderID, orderItemID uuid.UUID, updatedBy uuid.UUID) error
+	GetOrderItems(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.OrderItem, error)
 
-	// PRICING / DISCOUNTS
-	ApplyCoupon(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
-	RemoveCoupon(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) error
-	ApplyBestDiscounts(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	ApplyCoupon(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	RemoveCoupon(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, updatedBy uuid.UUID) error
+	ApplyBestDiscounts(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error
 	PreviewPricing(ctx context.Context, req *OrderPricingPreviewRequest) (*OrderPricingPreviewResult, error)
-	RecalculateTotals(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
-	GetOrderTotals(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal decimal.Decimal, err error)
+	RecalculateTotals(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	GetOrderTotals(ctx context.Context, companyID, orderID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal decimal.Decimal, err error)
 
-	// STATUS TRANSITIONS
-	UpdateStatus(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, status enums.OrderStatus, updatedBy uuid.UUID) error
-	ConfirmOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
-	MarkProcessing(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
-	MarkShipped(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, shippedAt time.Time, updatedBy uuid.UUID) error
-	MarkDelivered(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, deliveredAt time.Time, updatedBy uuid.UUID) error
-	CancelOrder(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, reason string, cancelledBy uuid.UUID) error
+	UpdateStatus(ctx context.Context, companyID, orderID uuid.UUID, status enums.OrderStatus, updatedBy uuid.UUID) error
+	ConfirmOrder(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	MarkProcessing(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	MarkShipped(ctx context.Context, companyID, orderID uuid.UUID, shippedAt time.Time, updatedBy uuid.UUID) error
+	MarkDelivered(ctx context.Context, companyID, orderID uuid.UUID, deliveredAt time.Time, updatedBy uuid.UUID) error
+	CancelOrder(ctx context.Context, companyID, orderID uuid.UUID, reason string, cancelledBy uuid.UUID) error
 
-	// SALES REP MANAGEMENT
-	AssignSalesRep(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
-	RemoveSalesRep(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID, updatedBy uuid.UUID) error
+	AssignSalesRep(ctx context.Context, companyID, orderID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
+	RemoveSalesRep(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error
 
-	// ORDER VALIDATION
 	ValidateOrder(ctx context.Context, order *models.Order, items []*models.OrderItem) error
-	ValidateOrderStatusTransition(ctx context.Context, currentStatus enums.OrderStatus, nextStatus enums.OrderStatus) error
+	ValidateOrderStatusTransition(ctx context.Context, currentStatus, nextStatus enums.OrderStatus) error
 	ValidateOrderItems(ctx context.Context, companyID uuid.UUID, items []*CreateOrderItemRequest) error
-	ValidatePricing(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) error
+	ValidatePricing(ctx context.Context, companyID, orderID uuid.UUID) error
 
-	// QUERY / ANALYTICS
 	GetPendingOrders(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error)
 	GetOrdersReadyForInvoicing(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error)
-	GetOrderRevenue(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
-	GetAverageOrderValue(ctx context.Context, companyID uuid.UUID, from *time.Time, to *time.Time) (decimal.Decimal, error)
-	GetTopOrdersByValue(ctx context.Context, companyID uuid.UUID, limit int, from *time.Time, to *time.Time) ([]*models.Order, error)
+	GetOrderRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetAverageOrderValue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTopOrdersByValue(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Order, error)
 
-	// EXISTENCE / HELPERS
-	OrderExists(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (bool, error)
+	OrderExists(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
 	OrderNumberExists(ctx context.Context, companyID uuid.UUID, orderNumber string) (bool, error)
-	HasInvoices(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (bool, error)
-	HasReturns(ctx context.Context, companyID uuid.UUID, orderID uuid.UUID) (bool, error)
+	HasInvoices(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
+	HasReturns(ctx context.Context, companyID, orderID uuid.UUID) (bool, error)
 }
 
 // ============================================================================
@@ -92,6 +112,7 @@ type OrderService interface {
 type orderService struct {
 	orderRepo         repository.OrderRepository
 	productRepo       repository.ProductRepository
+	salesRepRepo      repository.SalesRepRepository // added for existence checks
 	customerSvc       CustomerService
 	pricingRepo       repository.PricingRepository
 	couponRepo        repository.CouponRepository
@@ -110,6 +131,7 @@ type orderService struct {
 func NewOrderService(
 	orderRepo repository.OrderRepository,
 	productRepo repository.ProductRepository,
+	salesRepRepo repository.SalesRepRepository, // new parameter
 	customerSvc CustomerService,
 	pricingRepo repository.PricingRepository,
 	couponRepo repository.CouponRepository,
@@ -126,6 +148,7 @@ func NewOrderService(
 	return &orderService{
 		orderRepo:         orderRepo,
 		productRepo:       productRepo,
+		salesRepRepo:      salesRepRepo,
 		customerSvc:       customerSvc,
 		pricingRepo:       pricingRepo,
 		couponRepo:        couponRepo,
@@ -141,18 +164,29 @@ func NewOrderService(
 	}
 }
 
+// db returns the underlying *sql.DB for read‑only operations outside a transaction.
+func (s *orderService) db() *sql.DB {
+	return s.pgClient.DB
+}
+
 // ----------------------------------------------------------------------------
 // ORDER CREATION / CRUD
 // ----------------------------------------------------------------------------
 
-func (s *orderService) UpdateOrder(ctx context.Context, companyID, orderID uuid.UUID, req *UpdateOrderRequest) (*models.Order, error) {
-	logger := s.logger.With(zap.String("method", "UpdateOrder"))
+func (s *orderService) UpdateOrder(ctx context.Context, companyID, orderID uuid.UUID, req *UpdateOrderRequest, idempotencyKey string) (*models.Order, error) {
+	logger := s.logger.With(zap.String("method", "UpdateOrder"), zap.String("idempotency_key", idempotencyKey))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var cached *models.Order
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached order")
+		return cached, nil
+	}
 
 	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 	if err != nil {
@@ -189,6 +223,9 @@ func (s *orderService) UpdateOrder(ctx context.Context, companyID, orderID uuid.
 		changes["currency"] = req.Currency
 	}
 	if req.Notes != nil {
+		if len(*req.Notes) > 1000 {
+			return nil, fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
+		}
 		order.Notes = req.Notes
 		changes["notes"] = req.Notes
 	}
@@ -215,6 +252,8 @@ func (s *orderService) UpdateOrder(ctx context.Context, companyID, orderID uuid.
 		logger.Warn("failed to emit order updated event", zap.Error(err))
 	}
 
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, order)
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
@@ -227,14 +266,20 @@ func (s *orderService) UpdateOrder(ctx context.Context, companyID, orderID uuid.
 	return order, nil
 }
 
-func (s *orderService) DeleteOrder(ctx context.Context, companyID, orderID uuid.UUID, deletedBy uuid.UUID) error {
-	logger := s.logger.With(zap.String("method", "DeleteOrder"))
+func (s *orderService) DeleteOrder(ctx context.Context, companyID, orderID uuid.UUID, deletedBy uuid.UUID, idempotencyKey string) error {
+	logger := s.logger.With(zap.String("method", "DeleteOrder"), zap.String("idempotency_key", idempotencyKey))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+		logger.Info("idempotent – already deleted")
+		return nil
+	}
 
 	order, err := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
 	if err != nil {
@@ -244,7 +289,6 @@ func (s *orderService) DeleteOrder(ctx context.Context, companyID, orderID uuid.
 		return salesErrors.ErrPermissionDenied
 	}
 
-	// Only draft orders without invoices/returns can be hard deleted
 	hasInvoices, err := s.orderRepo.HasInvoices(ctx, tx, companyID, orderID)
 	if err != nil {
 		return err
@@ -262,6 +306,8 @@ func (s *orderService) DeleteOrder(ctx context.Context, companyID, orderID uuid.
 		return fmt.Errorf("%w: cannot delete order with status %s or existing invoices/returns", salesErrors.ErrInvalidStatus, order.Status)
 	}
 
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -276,11 +322,11 @@ func (s *orderService) DeleteOrder(ctx context.Context, companyID, orderID uuid.
 }
 
 func (s *orderService) GetOrderByID(ctx context.Context, companyID, orderID uuid.UUID) (*models.Order, error) {
-	return s.orderRepo.GetByID(ctx, nil, companyID, orderID)
+	return s.orderRepo.GetByID(ctx, s.db(), companyID, orderID)
 }
 
 func (s *orderService) GetOrderByNumber(ctx context.Context, companyID uuid.UUID, orderNumber string) (*models.Order, error) {
-	return s.orderRepo.GetByNumber(ctx, nil, companyID, orderNumber)
+	return s.orderRepo.GetByNumber(ctx, s.db(), companyID, orderNumber)
 }
 
 func (s *orderService) ListOrders(ctx context.Context, filter OrderListFilter, p Pagination, srt Sort) ([]*models.Order, int64, error) {
@@ -296,17 +342,17 @@ func (s *orderService) ListOrders(ctx context.Context, filter OrderListFilter, p
 	if filter.Status != nil {
 		repoFilter.Statuses = []enums.OrderStatus{*filter.Status}
 	}
-	return s.orderRepo.List(ctx, nil, repoFilter,
+	return s.orderRepo.List(ctx, s.db(), repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *orderService) SearchOrders(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Order, int64, error) {
-	return s.orderRepo.Search(ctx, nil, companyID, query, limit, offset)
+	return s.orderRepo.Search(ctx, s.db(), companyID, query, limit, offset)
 }
 
 func (s *orderService) GetOrdersByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, srt Sort) ([]*models.Order, int64, error) {
-	return s.orderRepo.GetByCustomer(ctx, nil, companyID, customerID,
+	return s.orderRepo.GetByCustomer(ctx, s.db(), companyID, customerID,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
@@ -336,7 +382,7 @@ func (s *orderService) AddItems(ctx context.Context, companyID, orderID uuid.UUI
 	if err := s.addOrderItems(ctx, tx, order, items); err != nil {
 		return err
 	}
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
 	order.UpdatedBy = &updatedBy
@@ -344,10 +390,7 @@ func (s *orderService) AddItems(ctx context.Context, companyID, orderID uuid.UUI
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) ReplaceItems(ctx context.Context, companyID, orderID uuid.UUID, items []*CreateOrderItemRequest, updatedBy uuid.UUID) error {
@@ -368,7 +411,6 @@ func (s *orderService) ReplaceItems(ctx context.Context, companyID, orderID uuid
 		return fmt.Errorf("%w: cannot replace items for order with status %s", salesErrors.ErrInvalidStatus, order.Status)
 	}
 
-	// Delete existing items
 	if err := s.orderRepo.ReplaceItems(ctx, tx, companyID, orderID, nil); err != nil {
 		return fmt.Errorf("clear items: %w", err)
 	}
@@ -378,7 +420,7 @@ func (s *orderService) ReplaceItems(ctx context.Context, companyID, orderID uuid
 			return err
 		}
 	}
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
 	order.UpdatedBy = &updatedBy
@@ -386,10 +428,7 @@ func (s *orderService) ReplaceItems(ctx context.Context, companyID, orderID uuid
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) RemoveItem(ctx context.Context, companyID, orderID, orderItemID uuid.UUID, updatedBy uuid.UUID) error {
@@ -413,7 +452,7 @@ func (s *orderService) RemoveItem(ctx context.Context, companyID, orderID, order
 	if err := s.orderRepo.DeleteItem(ctx, tx, companyID, orderID, orderItemID); err != nil {
 		return err
 	}
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
 	order.UpdatedBy = &updatedBy
@@ -421,14 +460,11 @@ func (s *orderService) RemoveItem(ctx context.Context, companyID, orderID, order
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) GetOrderItems(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.OrderItem, error) {
-	return s.orderRepo.GetItems(ctx, nil, companyID, orderID)
+	return s.orderRepo.GetItems(ctx, s.db(), companyID, orderID)
 }
 
 // ----------------------------------------------------------------------------
@@ -457,7 +493,7 @@ func (s *orderService) ApplyCoupon(ctx context.Context, companyID, orderID uuid.
 	if err != nil {
 		return nil, decimal.Zero, err
 	}
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return nil, decimal.Zero, err
 	}
 	order.UpdatedBy = &updatedBy
@@ -492,7 +528,7 @@ func (s *orderService) RemoveCoupon(ctx context.Context, companyID, orderID uuid
 	if err := s.discountEngine.RemoveCoupon(ctx, companyID, "order", orderID, couponCode, updatedBy); err != nil {
 		return err
 	}
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
 	order.UpdatedBy = &updatedBy
@@ -500,10 +536,7 @@ func (s *orderService) RemoveCoupon(ctx context.Context, companyID, orderID uuid
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) ApplyBestDiscounts(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
@@ -529,7 +562,7 @@ func (s *orderService) ApplyBestDiscounts(ctx context.Context, companyID, orderI
 		return err
 	}
 
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
 	order.UpdatedBy = &updatedBy
@@ -537,10 +570,7 @@ func (s *orderService) ApplyBestDiscounts(ctx context.Context, companyID, orderI
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) RecalculateTotals(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
@@ -557,7 +587,7 @@ func (s *orderService) RecalculateTotals(ctx context.Context, companyID, orderID
 	if order.CompanyID != companyID {
 		return salesErrors.ErrPermissionDenied
 	}
-	if err := s.recalculateOrderTotals(ctx, tx, orderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
 	order.UpdatedBy = &updatedBy
@@ -565,14 +595,11 @@ func (s *orderService) RecalculateTotals(ctx context.Context, companyID, orderID
 		return err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) GetOrderTotals(ctx context.Context, companyID, orderID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal decimal.Decimal, err error) {
-	return s.orderRepo.GetTotals(ctx, nil, companyID, orderID)
+	return s.orderRepo.GetTotals(ctx, s.db(), companyID, orderID)
 }
 
 // ----------------------------------------------------------------------------
@@ -606,10 +633,7 @@ func (s *orderService) UpdateStatus(ctx context.Context, companyID, orderID uuid
 		s.logger.Warn("failed to emit order updated event", zap.Error(err))
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
@@ -630,6 +654,7 @@ func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid
 		return fmt.Errorf("%w: only draft orders can be confirmed", salesErrors.ErrInvalidTransition)
 	}
 
+	// ✅ Pass the transaction tx to IsCustomerActive
 	active, err := s.customerSvc.IsCustomerActive(ctx, companyID, order.CustomerID)
 	if err != nil {
 		return err
@@ -637,6 +662,7 @@ func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid
 	if !active {
 		return salesErrors.ErrCustomerInactive
 	}
+
 	items, err := s.orderRepo.GetItems(ctx, tx, companyID, orderID)
 	if err != nil {
 		return err
@@ -655,6 +681,7 @@ func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid
 		return err
 	}
 
+	// ✅ Pass the transaction tx to CanCustomerPurchaseAmount
 	canPurchase, err := s.customerSvc.CanCustomerPurchaseAmount(ctx, companyID, order.CustomerID, order.GrandTotal)
 	if err != nil {
 		return err
@@ -674,10 +701,7 @@ func (s *orderService) ConfirmOrder(ctx context.Context, companyID, orderID uuid
 		s.logger.Warn("failed to emit order confirmed event", zap.Error(err))
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit tx: %w", err)
-	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *orderService) MarkProcessing(ctx context.Context, companyID, orderID uuid.UUID, updatedBy uuid.UUID) error {
@@ -761,7 +785,6 @@ func (s *orderService) CancelOrder(ctx context.Context, companyID, orderID uuid.
 		return fmt.Errorf("%w: order already cancelled or refunded", salesErrors.ErrInvalidTransition)
 	}
 
-	// Capture status before cancellation for the event
 	oldStatus := order.Status
 
 	now := time.Now()
@@ -772,7 +795,6 @@ func (s *orderService) CancelOrder(ctx context.Context, companyID, orderID uuid.
 	order.CancelledAt = &now
 	order.CancellationReason = &reason
 
-	// Build extra event fields for cancellation
 	extra := map[string]interface{}{
 		"status_before_cancel": oldStatus,
 		"cancelled_by":         cancelledBy.String(),
@@ -859,6 +881,7 @@ func (s *orderService) ValidateOrderStatusTransition(ctx context.Context, curren
 }
 
 func (s *orderService) ValidateOrderItems(ctx context.Context, companyID uuid.UUID, items []*CreateOrderItemRequest) error {
+	db := s.db()
 	for _, it := range items {
 		if it.ProductID == uuid.Nil {
 			return fmt.Errorf("%w: product_id required", salesErrors.ErrInvalidInput)
@@ -866,7 +889,7 @@ func (s *orderService) ValidateOrderItems(ctx context.Context, companyID uuid.UU
 		if it.Quantity.LessThanOrEqual(decimal.Zero) {
 			return fmt.Errorf("%w: quantity must be positive", salesErrors.ErrInvalidInput)
 		}
-		exists, err := s.productRepo.Exists(ctx, nil, companyID, it.ProductID)
+		exists, err := s.productRepo.Exists(ctx, db, companyID, it.ProductID)
 		if err != nil {
 			return err
 		}
@@ -878,11 +901,11 @@ func (s *orderService) ValidateOrderItems(ctx context.Context, companyID uuid.UU
 }
 
 func (s *orderService) ValidatePricing(ctx context.Context, companyID, orderID uuid.UUID) error {
-	subtotal, discountTotal, taxTotal, grandTotal, err := s.orderRepo.GetTotals(ctx, nil, companyID, orderID)
+	subtotal, discountTotal, taxTotal, grandTotal, err := s.orderRepo.GetTotals(ctx, s.db(), companyID, orderID)
 	if err != nil {
 		return err
 	}
-	items, err := s.orderRepo.GetItems(ctx, nil, companyID, orderID)
+	items, err := s.orderRepo.GetItems(ctx, s.db(), companyID, orderID)
 	if err != nil {
 		return err
 	}
@@ -909,23 +932,23 @@ func (s *orderService) ValidatePricing(ctx context.Context, companyID, orderID u
 // ----------------------------------------------------------------------------
 
 func (s *orderService) GetPendingOrders(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error) {
-	return s.orderRepo.GetPendingOrders(ctx, nil, companyID)
+	return s.orderRepo.GetPendingOrders(ctx, s.db(), companyID)
 }
 
 func (s *orderService) GetOrdersReadyForInvoicing(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error) {
-	return s.orderRepo.GetOrdersReadyForInvoicing(ctx, nil, companyID)
+	return s.orderRepo.GetOrdersReadyForInvoicing(ctx, s.db(), companyID)
 }
 
 func (s *orderService) GetOrderRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.orderRepo.GetOrderRevenue(ctx, nil, companyID, from, to)
+	return s.orderRepo.GetOrderRevenue(ctx, s.db(), companyID, from, to)
 }
 
 func (s *orderService) GetAverageOrderValue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.orderRepo.GetAverageOrderValue(ctx, nil, companyID, from, to)
+	return s.orderRepo.GetAverageOrderValue(ctx, s.db(), companyID, from, to)
 }
 
 func (s *orderService) GetTopOrdersByValue(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Order, error) {
-	return s.orderRepo.GetTopOrdersByValue(ctx, nil, companyID, limit, from, to)
+	return s.orderRepo.GetTopOrdersByValue(ctx, s.db(), companyID, limit, from, to)
 }
 
 // ----------------------------------------------------------------------------
@@ -933,19 +956,19 @@ func (s *orderService) GetTopOrdersByValue(ctx context.Context, companyID uuid.U
 // ----------------------------------------------------------------------------
 
 func (s *orderService) OrderExists(ctx context.Context, companyID, orderID uuid.UUID) (bool, error) {
-	return s.orderRepo.Exists(ctx, nil, companyID, orderID)
+	return s.orderRepo.Exists(ctx, s.db(), companyID, orderID)
 }
 
 func (s *orderService) OrderNumberExists(ctx context.Context, companyID uuid.UUID, orderNumber string) (bool, error) {
-	return s.orderRepo.ExistsByNumber(ctx, nil, companyID, orderNumber)
+	return s.orderRepo.ExistsByNumber(ctx, s.db(), companyID, orderNumber)
 }
 
 func (s *orderService) HasInvoices(ctx context.Context, companyID, orderID uuid.UUID) (bool, error) {
-	return s.orderRepo.HasInvoices(ctx, nil, companyID, orderID)
+	return s.orderRepo.HasInvoices(ctx, s.db(), companyID, orderID)
 }
 
 func (s *orderService) HasReturns(ctx context.Context, companyID, orderID uuid.UUID) (bool, error) {
-	return s.orderRepo.HasReturns(ctx, nil, companyID, orderID)
+	return s.orderRepo.HasReturns(ctx, s.db(), companyID, orderID)
 }
 
 // ----------------------------------------------------------------------------
@@ -961,6 +984,10 @@ func (s *orderService) validateCreateOrderRequest(req *CreateOrderRequest) error
 	}
 	if len(req.Items) == 0 {
 		return fmt.Errorf("%w: at least one item required", salesErrors.ErrInvalidInput)
+	}
+	// Currency validation
+	if req.Currency != "" && !allowedCurrencies[req.Currency] {
+		return fmt.Errorf("%w: unsupported currency code %s", salesErrors.ErrInvalidInput, req.Currency)
 	}
 	return s.ValidateOrderItems(context.Background(), req.CompanyID, req.Items)
 }
@@ -995,8 +1022,9 @@ func (s *orderService) addOrderItems(ctx context.Context, tx repository.DBTX, or
 	return s.orderRepo.AddItems(ctx, tx, order.CompanyID, order.OrderID, orderItems)
 }
 
-func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository.DBTX, orderID uuid.UUID) error {
-	order, err := s.orderRepo.GetByID(ctx, tx, uuid.Nil, orderID)
+// recalculateOrderTotals recalculates subtotal, discount, tax, and grand total for the order.
+func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository.DBTX, companyID, orderID uuid.UUID) error {
+	order, err := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
 	if err != nil {
 		return err
 	}
@@ -1006,19 +1034,28 @@ func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository
 	}
 
 	var subtotal, discountTotal, taxTotal decimal.Decimal
+
 	for _, it := range items {
 		lineSubtotal := it.UnitPrice.Mul(it.Quantity)
 		subtotal = subtotal.Add(lineSubtotal)
+
+		// Safely get discount amount (default 0 if nil)
+		discountAmt := decimal.Zero
 		if it.DiscountAmount != nil {
-			discountTotal = discountTotal.Add(*it.DiscountAmount)
+			discountAmt = *it.DiscountAmount
+			discountTotal = discountTotal.Add(discountAmt)
 		}
-		tax, err := s.pricingRepo.CalculateLineTax(ctx, tx, order.CompanyID, it.ProductID, lineSubtotal.Sub(*it.DiscountAmount))
+
+		// Taxable amount = line subtotal - discount
+		taxable := lineSubtotal.Sub(discountAmt)
+		tax, err := s.pricingRepo.CalculateLineTax(ctx, tx, order.CompanyID, it.ProductID, taxable)
 		if err != nil {
 			return fmt.Errorf("calculate line tax: %w", err)
 		}
 		it.TaxAmount = &tax
 		taxTotal = taxTotal.Add(tax)
 
+		// Persist the computed tax
 		updateQuery := `UPDATE sales.order_items SET tax_amount = $1 WHERE order_item_id = $2`
 		if _, err := tx.ExecContext(ctx, updateQuery, tax, it.OrderItemID); err != nil {
 			return fmt.Errorf("update item tax: %w", err)
@@ -1034,22 +1071,31 @@ func (s *orderService) recalculateOrderTotals(ctx context.Context, tx repository
 		return fmt.Errorf("update order totals: %w", err)
 	}
 
-	// Store tax snapshots
+	// Delete old tax snapshots for this order
 	if err := s.taxSnapshotRepo.DeleteByEntity(ctx, tx, order.CompanyID, "order", order.OrderID); err != nil {
 		s.logger.Warn("failed to delete old tax snapshots", zap.Error(err))
 	}
+
+	// Create new tax snapshots
 	for _, it := range items {
 		taxAmount := decimal.Zero
 		if it.TaxAmount != nil {
 			taxAmount = *it.TaxAmount
 		}
+		// Safely compute taxable amount for snapshot
+		discountAmt := decimal.Zero
+		if it.DiscountAmount != nil {
+			discountAmt = *it.DiscountAmount
+		}
+		taxableAmount := it.UnitPrice.Mul(it.Quantity).Sub(discountAmt)
+
 		snapshot := &models.TaxSnapshot{
 			TaxSnapshotID: uuid.New(),
 			CompanyID:     order.CompanyID,
 			EntityType:    "order",
 			EntityID:      order.OrderID,
 			LineID:        &it.OrderItemID,
-			TaxableAmount: it.UnitPrice.Mul(it.Quantity).Sub(*it.DiscountAmount),
+			TaxableAmount: taxableAmount,
 			TaxAmount:     taxAmount,
 		}
 		if err := s.taxSnapshotRepo.Create(ctx, tx, snapshot); err != nil {
@@ -1122,21 +1168,17 @@ func (s *orderService) generateOrderNumber(tx repository.DBTX, companyID uuid.UU
 	return orderNumber, nil
 }
 
-// emitOrderEvent now builds the complete payload with all required fields for analytics.
-// Extra fields can be passed via the extra map (e.g., for cancellations).
 func (s *orderService) emitOrderEvent(ctx context.Context, tx repository.DBTX, order *models.Order, eventType string, extra map[string]interface{}) error {
 	sqlTx, ok := tx.(*sql.Tx)
 	if !ok {
 		return fmt.Errorf("tx is not a *sql.Tx")
 	}
 
-	// Fetch order items
 	items, err := s.orderRepo.GetItems(ctx, tx, order.CompanyID, order.OrderID)
 	if err != nil {
 		return fmt.Errorf("get order items for event: %w", err)
 	}
 
-	// Build order item payloads with OrderItemID
 	orderItems := make([]salesEvents.OrderItemPayload, 0, len(items))
 	for _, it := range items {
 		discountStr := ""
@@ -1157,7 +1199,6 @@ func (s *orderService) emitOrderEvent(ctx context.Context, tx repository.DBTX, o
 		})
 	}
 
-	// Extract shipping region from shipping_address JSONB (if present)
 	shippingRegion := ""
 	if order.ShippingAddress != nil {
 		if region, ok := order.ShippingAddress["region"].(string); ok {
@@ -1167,13 +1208,11 @@ func (s *orderService) emitOrderEvent(ctx context.Context, tx repository.DBTX, o
 		}
 	}
 
-	// Convert SalesRepID pointer to string
 	salesRepIDStr := ""
 	if order.SalesRepID != nil {
 		salesRepIDStr = order.SalesRepID.String()
 	}
 
-	// Build base payload
 	payload := salesEvents.OrderPayload{
 		OrderID:            order.OrderID.String(),
 		CompanyID:          order.CompanyID.String(),
@@ -1184,15 +1223,14 @@ func (s *orderService) emitOrderEvent(ctx context.Context, tx repository.DBTX, o
 		OrderDate:          order.OrderDate.Format(time.RFC3339),
 		Items:              orderItems,
 		SalesRepID:         salesRepIDStr,
-		Carrier:            "", // TODO: populate from shipping service
-		TrackingNumber:     "", // TODO: populate from shipping service
+		Carrier:            "",
+		TrackingNumber:     "",
 		ShippingRegion:     shippingRegion,
 		CancellationReason: "",
 		CancelledBy:        "",
 		StatusBeforeCancel: "",
 	}
 
-	// Override with extra fields for cancellation events
 	if extra != nil {
 		if reason, ok := extra["cancellation_reason"].(string); ok {
 			payload.CancellationReason = reason
@@ -1205,7 +1243,6 @@ func (s *orderService) emitOrderEvent(ctx context.Context, tx repository.DBTX, o
 		}
 	} else if eventType == salesEvents.EventOrderCancelled && order.CancellationReason != nil {
 		payload.CancellationReason = *order.CancellationReason
-		// cancelled_by is not stored in the order model, so it must come from extra
 	}
 
 	data, err := json.Marshal(payload)
@@ -1232,11 +1269,18 @@ func (s *orderService) validatePricing(ctx context.Context, tx repository.DBTX, 
 // CreateDraftOrder
 // ----------------------------------------------------------------------------
 
-func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderRequest) (*models.Order, error) {
-	logger := s.logger.With(zap.String("method", "CreateDraftOrder"))
+// ----------------------------------------------------------------------------
+// CreateDraftOrder
+// ----------------------------------------------------------------------------
+
+func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderRequest, idempotencyKey string) (*models.Order, error) {
+	logger := s.logger.With(zap.String("method", "CreateDraftOrder"), zap.String("idempotency_key", idempotencyKey))
 
 	if err := s.validateCreateOrderRequest(req); err != nil {
 		return nil, err
+	}
+	if req.Notes != nil && len(*req.Notes) > 1000 {
+		return nil, fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
 	}
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -1245,7 +1289,12 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 	}
 	defer tx.Rollback()
 
-	// Generate order number if not provided
+	var cached *models.Order
+	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached order")
+		return cached, nil
+	}
+
 	orderNumber := req.OrderNumber
 	if orderNumber == "" {
 		orderNumber, err = s.generateOrderNumber(tx, req.CompanyID)
@@ -1254,7 +1303,6 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		}
 	}
 
-	// Check uniqueness
 	exists, err := s.orderRepo.ExistsByNumber(ctx, tx, req.CompanyID, orderNumber)
 	if err != nil {
 		return nil, fmt.Errorf("check order number: %w", err)
@@ -1270,6 +1318,22 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		}
 		if exists {
 			return nil, fmt.Errorf("%w: external reference %s already used", salesErrors.ErrDuplicate, *req.ExternalRef)
+		}
+	}
+
+	// ✅ CORRECTED: Validate sales rep ID if provided
+	if req.SalesRepID != nil {
+		// Reject the explicit nil UUID (00000000-0000-0000-0000-000000000000)
+		if *req.SalesRepID == uuid.Nil {
+			return nil, fmt.Errorf("%w: sales_rep_id cannot be the nil UUID", salesErrors.ErrInvalidInput)
+		}
+		// Otherwise check existence in the database
+		repExists, err := s.salesRepRepo.Exists(ctx, tx, req.CompanyID, *req.SalesRepID)
+		if err != nil {
+			return nil, fmt.Errorf("check sales rep existence: %w", err)
+		}
+		if !repExists {
+			return nil, fmt.Errorf("%w: sales_rep_id %s does not exist", salesErrors.ErrInvalidInput, req.SalesRepID.String())
 		}
 	}
 
@@ -1296,26 +1360,22 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		Subtotal:        decimal.Zero,
 		DiscountTotal:   decimal.Zero,
 		TaxTotal:        decimal.Zero,
-		// Credit fields will default to false and "approved"
 	}
 
 	if err := s.orderRepo.Create(ctx, tx, order, nil); err != nil {
 		return nil, fmt.Errorf("create order: %w", err)
 	}
 
-	// Add items
 	if len(req.Items) > 0 {
 		if err := s.addOrderItems(ctx, tx, order, req.Items); err != nil {
 			return nil, err
 		}
 	}
 
-	// Recalculate totals (will also apply discounts if coupons given)
-	if err := s.recalculateOrderTotals(ctx, tx, order.OrderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, req.CompanyID, order.OrderID); err != nil {
 		return nil, fmt.Errorf("recalculate totals: %w", err)
 	}
 
-	// Apply coupons if provided
 	appliedBy := uuid.Nil
 	if req.CreatedBy != nil {
 		appliedBy = *req.CreatedBy
@@ -1326,22 +1386,21 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 		}
 	}
 
-	// Recalc again after coupons
-	if err := s.recalculateOrderTotals(ctx, tx, order.OrderID); err != nil {
+	if err := s.recalculateOrderTotals(ctx, tx, req.CompanyID, order.OrderID); err != nil {
 		return nil, fmt.Errorf("recalculate totals after coupons: %w", err)
 	}
 
-	// Emit event
 	if err := s.emitOrderEvent(ctx, tx, order, salesEvents.EventOrderCreated, nil); err != nil {
 		logger.Warn("failed to emit order created event", zap.Error(err))
 	}
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, order)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Fetch final order with items
-	finalOrder, err := s.orderRepo.GetByID(ctx, nil, req.CompanyID, order.OrderID)
+	finalOrder, err := s.orderRepo.GetByID(ctx, s.db(), req.CompanyID, order.OrderID)
 	if err != nil {
 		return nil, err
 	}
@@ -1357,7 +1416,7 @@ func (s *orderService) CreateDraftOrder(ctx context.Context, req *CreateOrderReq
 }
 
 // ----------------------------------------------------------------------------
-// PreviewPricing (correct implementation)
+// PreviewPricing
 // ----------------------------------------------------------------------------
 
 func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPreviewRequest) (*OrderPricingPreviewResult, error) {
@@ -1365,7 +1424,6 @@ func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPrev
 	if req.At != nil {
 		at = *req.At
 	}
-	// Build product IDs and lines
 	var productIDs []uuid.UUID
 	var lines []PricingLineInput
 	for _, it := range req.Items {
@@ -1374,8 +1432,7 @@ func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPrev
 		if it.UnitPrice != nil {
 			unitPrice = *it.UnitPrice
 		} else {
-			// Fetch product price
-			price, err := s.pricingRepo.GetProductBasePrice(ctx, nil, req.CompanyID, it.ProductID)
+			price, err := s.pricingRepo.GetProductBasePrice(ctx, s.db(), req.CompanyID, it.ProductID)
 			if err != nil {
 				return nil, err
 			}
@@ -1388,7 +1445,6 @@ func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPrev
 		})
 	}
 
-	// Calculate total
 	var subtotal decimal.Decimal
 	for _, line := range lines {
 		price := decimal.Zero
@@ -1398,7 +1454,6 @@ func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPrev
 		subtotal = subtotal.Add(price.Mul(line.Quantity))
 	}
 
-	// Get applicable coupons and promotions
 	_, err := s.discountEngine.GetApplicableCoupons(ctx, req.CompanyID, req.CustomerID, productIDs, subtotal, at)
 	if err != nil {
 		return nil, err
@@ -1408,7 +1463,6 @@ func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPrev
 		return nil, err
 	}
 
-	// Calculate best combination
 	best, err := s.discountEngine.GetBestDiscountCombination(ctx, &BestDiscountCombinationRequest{
 		CompanyID:         req.CompanyID,
 		CustomerID:        req.CustomerID,
@@ -1424,8 +1478,7 @@ func (s *orderService) PreviewPricing(ctx context.Context, req *OrderPricingPrev
 		return nil, err
 	}
 
-	// Estimate tax (simplified)
-	taxTotal, err := s.pricingRepo.CalculateTaxAmount(ctx, nil, req.CompanyID, "order", uuid.Nil, subtotal.Sub(best.DiscountTotal))
+	taxTotal, err := s.pricingRepo.CalculateTaxAmount(ctx, s.db(), req.CompanyID, "order", uuid.Nil, subtotal.Sub(best.DiscountTotal))
 	if err != nil {
 		taxTotal = decimal.Zero
 	}

@@ -1,3 +1,6 @@
+// package repository
+// filename: invoice_repository.go
+
 package repository
 
 import (
@@ -90,7 +93,7 @@ type InvoiceFilter struct {
 
 	CustomerID *uuid.UUID
 	OrderID    *uuid.UUID
-	SalesRepID *uuid.UUID // <-- ADDED
+	SalesRepID *uuid.UUID
 
 	InvoiceIDs []uuid.UUID
 
@@ -220,7 +223,7 @@ func (r *invoiceRepository) buildInvoiceFilter(filter InvoiceFilter) (string, []
 		args = append(args, *filter.OrderID)
 		idx++
 	}
-	if filter.SalesRepID != nil { // <-- ADDED
+	if filter.SalesRepID != nil {
 		conds = append(conds, fmt.Sprintf("sales_rep_id = $%d", idx))
 		args = append(args, *filter.SalesRepID)
 		idx++
@@ -475,22 +478,24 @@ func (r *invoiceRepository) scanInvoice(s scanner) (*models.Invoice, error) {
 	return &inv, nil
 }
 
+// scanInvoiceItem now includes order_item_id and computes TotalPrice from base fields.
+// total_price is a generated column and not selected – we compute it in Go.
 func (r *invoiceRepository) scanInvoiceItem(s scanner) (*models.InvoiceItem, error) {
 	var item models.InvoiceItem
-	var productID uuid.NullUUID
+	var productID, orderItemID uuid.NullUUID
 	var discountAmount, taxAmount sql.NullString
 	var metadata models.JSONB
 
 	err := s.Scan(
 		&item.InvoiceItemID,
 		&item.InvoiceID,
+		&orderItemID, // new column
 		&productID,
 		&item.ProductNameSnapshot,
 		&item.Quantity,
 		&item.UnitPrice,
 		&discountAmount,
 		&taxAmount,
-		&item.TotalPrice,
 		&metadata,
 		&item.CreatedAt,
 	)
@@ -500,21 +505,33 @@ func (r *invoiceRepository) scanInvoiceItem(s scanner) (*models.InvoiceItem, err
 		}
 		return nil, fmt.Errorf("scan invoice item: %w", err)
 	}
+
+	if orderItemID.Valid {
+		item.OrderItemID = &orderItemID.UUID
+	}
 	if productID.Valid {
 		item.ProductID = &productID.UUID
 	}
+	disc := decimal.Zero
 	if discountAmount.Valid {
 		val, err := decimal.NewFromString(discountAmount.String)
 		if err == nil {
+			disc = val
 			item.DiscountAmount = &val
 		}
 	}
+	tax := decimal.Zero
 	if taxAmount.Valid {
 		val, err := decimal.NewFromString(taxAmount.String)
 		if err == nil {
+			tax = val
 			item.TaxAmount = &val
 		}
 	}
+	// Compute total_price = (unit_price * quantity) - discount + tax
+	lineSubtotal := item.UnitPrice.Mul(item.Quantity)
+	item.TotalPrice = lineSubtotal.Sub(disc).Add(tax)
+
 	item.Metadata = metadata
 	return &item, nil
 }
@@ -523,12 +540,14 @@ func (r *invoiceRepository) scanInvoiceItem(s scanner) (*models.InvoiceItem, err
 // CRUD
 // -------------------------------------------------------------------------
 
+// Create inserts a new invoice and its items.
+// grand_total and total_price are generated columns – they are not inserted.
 func (r *invoiceRepository) Create(ctx context.Context, db DBTX, invoice *models.Invoice, items []*models.InvoiceItem) error {
 	query := `
 		INSERT INTO sales.invoices (
 			invoice_id, company_id, order_id, customer_id, invoice_number, external_ref,
 			invoice_date, due_date, status, currency, exchange_rate,
-			subtotal, discount_total, tax_total, grand_total,
+			subtotal, discount_total, tax_total,
 			amount_paid, amount_due, notes, is_locked,
 			issued_at, paid_at, cancelled_at,
 			created_at, updated_at, created_by, updated_by,
@@ -536,17 +555,20 @@ func (r *invoiceRepository) Create(ctx context.Context, db DBTX, invoice *models
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
 			$12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-			NOW(), NOW(), $23, $24,
-			$25, $26, $27, $28, $29
+			$23, $24, $25, $26, $27, $28, $29, $30
 		)
 		RETURNING created_at, updated_at
 	`
+
 	var exchangeRate interface{}
 	if invoice.ExchangeRate != nil {
 		exchangeRate = invoice.ExchangeRate.String()
 	} else {
 		exchangeRate = nil
 	}
+
+	now := time.Now()
+
 	err := db.QueryRowContext(ctx, query,
 		invoice.InvoiceID,
 		invoice.CompanyID,
@@ -562,7 +584,6 @@ func (r *invoiceRepository) Create(ctx context.Context, db DBTX, invoice *models
 		invoice.Subtotal,
 		invoice.DiscountTotal,
 		invoice.TaxTotal,
-		invoice.GrandTotal,
 		invoice.AmountPaid,
 		invoice.AmountDue,
 		invoice.Notes,
@@ -570,6 +591,8 @@ func (r *invoiceRepository) Create(ctx context.Context, db DBTX, invoice *models
 		invoice.IssuedAt,
 		invoice.PaidAt,
 		invoice.CancelledAt,
+		now,
+		now,
 		r.nullUUIDParam(invoice.CreatedBy),
 		r.nullUUIDParam(invoice.UpdatedBy),
 		r.nullUUIDParam(invoice.SalesRepID),
@@ -578,10 +601,12 @@ func (r *invoiceRepository) Create(ctx context.Context, db DBTX, invoice *models
 		r.nullDecimalParam(invoice.EarlyDiscountPercent),
 		r.nullIntParam(invoice.EarlyDiscountDays),
 	).Scan(&invoice.CreatedAt, &invoice.UpdatedAt)
+
 	if err != nil {
 		r.logger.Error("failed to create invoice", zap.Error(err))
 		return fmt.Errorf("create invoice: %w", err)
 	}
+
 	if len(items) > 0 {
 		if err := r.AddItems(ctx, db, invoice.CompanyID, invoice.InvoiceID, items); err != nil {
 			return fmt.Errorf("add invoice items: %w", err)
@@ -639,21 +664,20 @@ func (r *invoiceRepository) Update(ctx context.Context, db DBTX, invoice *models
 			subtotal = $12,
 			discount_total = $13,
 			tax_total = $14,
-			grand_total = $15,
-			amount_paid = $16,
-			amount_due = $17,
-			notes = $18,
-			is_locked = $19,
-			issued_at = $20,
-			paid_at = $21,
-			cancelled_at = $22,
+			amount_paid = $15,
+			amount_due = $16,
+			notes = $17,
+			is_locked = $18,
+			issued_at = $19,
+			paid_at = $20,
+			cancelled_at = $21,
 			updated_at = NOW(),
-			updated_by = $23,
-			sales_rep_id = $24,
-			payment_term_name = $25,
-			payment_due_days = $26,
-			early_discount_percent = $27,
-			early_discount_days = $28
+			updated_by = $22,
+			sales_rep_id = $23,
+			payment_term_name = $24,
+			payment_due_days = $25,
+			early_discount_percent = $26,
+			early_discount_days = $27
 		WHERE invoice_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -678,7 +702,6 @@ func (r *invoiceRepository) Update(ctx context.Context, db DBTX, invoice *models
 		invoice.Subtotal,
 		invoice.DiscountTotal,
 		invoice.TaxTotal,
-		invoice.GrandTotal,
 		invoice.AmountPaid,
 		invoice.AmountDue,
 		invoice.Notes,
@@ -719,12 +742,14 @@ func (r *invoiceRepository) Delete(ctx context.Context, db DBTX, companyID, invo
 // Invoice Items
 // -------------------------------------------------------------------------
 
+// AddItems inserts one or more invoice items. The order_item_id can be nil (for legacy invoices or manual entries).
 func (r *invoiceRepository) AddItems(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID, items []*models.InvoiceItem) error {
 	if len(items) == 0 {
 		return nil
 	}
+	// total_price is a generated column – do NOT insert it
 	valueStrings := make([]string, 0, len(items))
-	args := make([]interface{}, 0, len(items)*11)
+	args := make([]interface{}, 0, len(items)*11) // now 11 placeholders (order_item_id added)
 	idx := 1
 	for _, item := range items {
 		valueStrings = append(valueStrings, fmt.Sprintf(
@@ -733,21 +758,21 @@ func (r *invoiceRepository) AddItems(ctx context.Context, db DBTX, companyID, in
 		args = append(args,
 			item.InvoiceItemID,
 			invoiceID,
+			r.nullUUIDParam(item.OrderItemID), // added order_item_id
 			r.nullUUIDParam(item.ProductID),
 			item.ProductNameSnapshot,
 			item.Quantity,
 			item.UnitPrice,
 			item.DiscountAmount,
 			item.TaxAmount,
-			item.TotalPrice,
 			item.Metadata,
 		)
 		idx += 10
 	}
 	query := fmt.Sprintf(`
 		INSERT INTO sales.invoice_items (
-			invoice_item_id, invoice_id, product_id, product_name_snapshot,
-			quantity, unit_price, discount_amount, tax_amount, total_price, metadata, created_at
+			invoice_item_id, invoice_id, order_item_id, product_id, product_name_snapshot,
+			quantity, unit_price, discount_amount, tax_amount, metadata, created_at
 		) VALUES %s
 	`, strings.Join(valueStrings, ","))
 	_, err := db.ExecContext(ctx, query, args...)
@@ -795,9 +820,9 @@ func (r *invoiceRepository) DeleteItem(ctx context.Context, db DBTX, companyID, 
 func (r *invoiceRepository) GetItems(ctx context.Context, db DBTX, companyID, invoiceID uuid.UUID) ([]*models.InvoiceItem, error) {
 	query := `
 		SELECT 
-			ii.invoice_item_id, ii.invoice_id, ii.product_id, ii.product_name_snapshot,
+			ii.invoice_item_id, ii.invoice_id, ii.order_item_id, ii.product_id, ii.product_name_snapshot,
 			ii.quantity, ii.unit_price, ii.discount_amount, ii.tax_amount,
-			ii.total_price, ii.metadata, ii.created_at
+			ii.metadata, ii.created_at
 		FROM sales.invoice_items ii
 		JOIN sales.invoices i ON ii.invoice_id = i.invoice_id
 		WHERE i.company_id = $1 AND ii.invoice_id = $2
@@ -822,9 +847,9 @@ func (r *invoiceRepository) GetItems(ctx context.Context, db DBTX, companyID, in
 func (r *invoiceRepository) GetItemByID(ctx context.Context, db DBTX, companyID, invoiceID, invoiceItemID uuid.UUID) (*models.InvoiceItem, error) {
 	query := `
 		SELECT 
-			ii.invoice_item_id, ii.invoice_id, ii.product_id, ii.product_name_snapshot,
+			ii.invoice_item_id, ii.invoice_id, ii.order_item_id, ii.product_id, ii.product_name_snapshot,
 			ii.quantity, ii.unit_price, ii.discount_amount, ii.tax_amount,
-			ii.total_price, ii.metadata, ii.created_at
+			ii.metadata, ii.created_at
 		FROM sales.invoice_items ii
 		JOIN sales.invoices i ON ii.invoice_id = i.invoice_id
 		WHERE i.company_id = $1 AND ii.invoice_id = $2 AND ii.invoice_item_id = $3
@@ -860,7 +885,6 @@ func (r *invoiceRepository) RecalculateTotals(ctx context.Context, db DBTX, comp
 			subtotal = COALESCE((SELECT SUM(total_price) FROM sales.invoice_items WHERE invoice_id = $2), 0),
 			discount_total = COALESCE((SELECT SUM(discount_amount) FROM sales.invoice_items WHERE invoice_id = $2), 0),
 			tax_total = COALESCE((SELECT SUM(tax_amount) FROM sales.invoice_items WHERE invoice_id = $2), 0),
-			grand_total = COALESCE((SELECT SUM(total_price) FROM sales.invoice_items WHERE invoice_id = $2), 0),
 			updated_at = NOW()
 		WHERE company_id = $1 AND invoice_id = $2
 	`
@@ -1466,9 +1490,9 @@ func (r *invoiceRepository) GetByIDForUpdate(ctx context.Context, db DBTX, compa
 func (r *invoiceRepository) GetItemByIDForUpdate(ctx context.Context, db DBTX, companyID, invoiceID, invoiceItemID uuid.UUID) (*models.InvoiceItem, error) {
 	query := `
 		SELECT 
-			ii.invoice_item_id, ii.invoice_id, ii.product_id, ii.product_name_snapshot,
+			ii.invoice_item_id, ii.invoice_id, ii.order_item_id, ii.product_id, ii.product_name_snapshot,
 			ii.quantity, ii.unit_price, ii.discount_amount, ii.tax_amount,
-			ii.total_price, ii.metadata, ii.created_at
+			ii.metadata, ii.created_at
 		FROM sales.invoice_items ii
 		JOIN sales.invoices i ON ii.invoice_id = i.invoice_id
 		WHERE i.company_id = $1 AND ii.invoice_id = $2 AND ii.invoice_item_id = $3

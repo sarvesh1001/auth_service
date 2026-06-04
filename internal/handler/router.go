@@ -58,6 +58,7 @@ type AcademicHandlers struct {
 }
 
 // NewRouter creates the main HTTP router with all application routes including academics.
+// NewRouter creates the main HTTP router with all application routes including academics.
 func NewRouter(
 	otpHandler *OTPHandler,
 	adminHandler *AdminHandler,
@@ -239,10 +240,12 @@ func NewRouter(
 		// Student login (public)
 		r.Post("/companies/{companyID}/academics/students/login", academicHandlers.StudentHandler.Login)
 
-		// Protected routes (JWT required)
+		// ========== PROTECTED ROUTES (JWT + session + idempotency) ==========
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware.JWTAuthMiddlewareWithRedis(sessionService, logger))
 			r.Use(authMiddleware.SessionValidationMiddleware(sessionService, logger))
+			// ✅ IdempotencyMiddleware applied to ALL authenticated routes
+			r.Use(IdempotencyMiddleware)
 
 			authHandler.RegisterProtectedRoutes(r)
 
@@ -264,7 +267,7 @@ func NewRouter(
 			// Main company‑scoped routes
 			r.Route("/companies/{companyID}", func(r chi.Router) {
 				r.Use(EnhancedCompanyAccessMiddleware(jwtService, logger))
-				r.Use(IdempotencyMiddleware)
+				// IdempotencyMiddleware is already applied from outer group
 
 				// Company info
 				r.Get("/", adminHandler.GetCompany)
@@ -1384,7 +1387,10 @@ func NewRouter(
 				// to the public device-authenticated section (above the student login route).
 				// They are now defined at the /api/v1/companies/{companyID}/academics/biometric-device path.
 			}) // end /companies/{companyID}
+
+			// Sales routes (outside company path, but still authenticated)
 			sales.RegisterSalesRoutes(r, salesHandlers, logger, jwtService)
+
 			// Internal leave resolution (not company-scoped)
 			r.Route("/internal/leave", func(r chi.Router) {
 				r.With(authMiddleware.BitmaskPermissionMiddleware("hr.employee.update", logger)).

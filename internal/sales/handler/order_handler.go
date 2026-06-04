@@ -175,281 +175,9 @@ type orderItemResponse struct {
 // ---------- Handler Methods ----------
 
 // CreateDraftOrder handles POST /orders
-func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	// Get company from header
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req createOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	// Validation
-	customerID, err := uuid.Parse(req.CustomerID)
-	if err != nil || customerID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
-		return
-	}
-	if len(req.Items) == 0 {
-		h.respondWithError(w, http.StatusBadRequest, "at least one item is required")
-		return
-	}
-
-	var orderDate time.Time
-	if req.OrderDate != nil && *req.OrderDate != "" {
-		orderDate, err = time.Parse(time.RFC3339, *req.OrderDate)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid order_date format, use RFC3339")
-			return
-		}
-	} else {
-		orderDate = time.Now()
-	}
-
-	orderNumber := ""
-	if req.OrderNumber != nil {
-		orderNumber = *req.OrderNumber
-	}
-	currency := "USD"
-	if req.Currency != nil && *req.Currency != "" {
-		currency = *req.Currency
-	}
-
-	var salesRepID *uuid.UUID
-	if req.SalesRepID != nil && *req.SalesRepID != "" {
-		parsed, err := uuid.Parse(*req.SalesRepID)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid sales_rep_id")
-			return
-		}
-		salesRepID = &parsed
-	}
-
-	var shippingAddress models.JSONB
-	if len(req.ShippingAddress) > 0 {
-		shippingAddress = models.JSONB(req.ShippingAddress)
-	}
-	var billingAddress models.JSONB
-	if len(req.BillingAddress) > 0 {
-		billingAddress = models.JSONB(req.BillingAddress)
-	}
-
-	items := make([]*service.CreateOrderItemRequest, len(req.Items))
-	for i, it := range req.Items {
-		productID, err := uuid.Parse(it.ProductID)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid product_id in item %d", i))
-			return
-		}
-		quantity, err := decimal.NewFromString(it.Quantity)
-		if err != nil || quantity.LessThanOrEqual(decimal.Zero) {
-			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid quantity in item %d", i))
-			return
-		}
-		var unitPrice *decimal.Decimal
-		if it.UnitPrice != nil && *it.UnitPrice != "" {
-			up, err := decimal.NewFromString(*it.UnitPrice)
-			if err != nil {
-				h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid unit_price in item %d", i))
-				return
-			}
-			if up.LessThan(decimal.Zero) {
-				h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("unit_price cannot be negative in item %d", i))
-				return
-			}
-			unitPrice = &up
-		}
-		items[i] = &service.CreateOrderItemRequest{
-			ProductID: productID,
-			Quantity:  quantity,
-			UnitPrice: unitPrice,
-			Metadata:  it.Metadata,
-		}
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "order:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	svcReq := &service.CreateOrderRequest{
-		CustomerID:      customerID,
-		OrderNumber:     orderNumber,
-		ExternalRef:     req.ExternalRef,
-		OrderDate:       orderDate,
-		Currency:        currency,
-		Notes:           req.Notes,
-		ShippingAddress: shippingAddress,
-		BillingAddress:  billingAddress,
-		SalesRepID:      salesRepID,
-		Items:           items,
-	}
-
-	order, err := h.orderService.CreateDraftOrder(ctx, svcReq)
-	if err != nil {
-		h.logger.Error("failed to create draft order", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	resp := convertOrderToResponse(order)
-	location := fmt.Sprintf("/orders/%s", order.OrderID)
-	w.Header().Set("Location", location)
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"data":    resp,
-	})
-}
 
 // UpdateOrder handles PUT /orders/{id}
-func (h *OrderHandler) UpdateOrder(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	orderID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "order:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req updateOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	var orderDate *time.Time
-	if req.OrderDate != nil && *req.OrderDate != "" {
-		od, err := time.Parse(time.RFC3339, *req.OrderDate)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid order_date format")
-			return
-		}
-		orderDate = &od
-	}
-
-	var shippingAddress *models.JSONB
-	if len(req.ShippingAddress) > 0 {
-		ja := models.JSONB(req.ShippingAddress)
-		shippingAddress = &ja
-	}
-	var billingAddress *models.JSONB
-	if len(req.BillingAddress) > 0 {
-		ja := models.JSONB(req.BillingAddress)
-		billingAddress = &ja
-	}
-
-	svcReq := &service.UpdateOrderRequest{
-		OrderDate:       orderDate,
-		Currency:        req.Currency,
-		Notes:           req.Notes,
-		ShippingAddress: shippingAddress,
-		BillingAddress:  billingAddress,
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	updated, err := h.orderService.UpdateOrder(ctx, companyID, orderID, svcReq)
-	if err != nil {
-		h.logger.Error("failed to update order", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	resp := convertOrderToResponse(updated)
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    resp,
-	})
-}
-
 // DeleteOrder handles DELETE /orders/{id}
-func (h *OrderHandler) DeleteOrder(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	orderID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "order:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.orderService.DeleteOrder(ctx, companyID, orderID, userID)
-	if err != nil {
-		h.logger.Error("failed to delete order", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "order deleted successfully",
-	})
-}
 
 // GetOrderByID handles GET /orders/{id}
 func (h *OrderHandler) GetOrderByID(w http.ResponseWriter, r *http.Request) {
@@ -2267,4 +1995,288 @@ func convertOrderToResponse(order *models.Order) createOrderResponse {
 		resp.BillingAddress = order.BillingAddress
 	}
 	return resp
+}
+
+// CreateDraftOrder handles POST /orders
+func (h *OrderHandler) CreateDraftOrder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	// Get company from header
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var req createOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validation
+	customerID, err := uuid.Parse(req.CustomerID)
+	if err != nil || customerID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+		return
+	}
+	if len(req.Items) == 0 {
+		h.respondWithError(w, http.StatusBadRequest, "at least one item is required")
+		return
+	}
+
+	var orderDate time.Time
+	if req.OrderDate != nil && *req.OrderDate != "" {
+		orderDate, err = time.Parse(time.RFC3339, *req.OrderDate)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid order_date format, use RFC3339")
+			return
+		}
+	} else {
+		orderDate = time.Now()
+	}
+
+	orderNumber := ""
+	if req.OrderNumber != nil {
+		orderNumber = *req.OrderNumber
+	}
+	currency := "USD"
+	if req.Currency != nil && *req.Currency != "" {
+		currency = *req.Currency
+	}
+
+	var salesRepID *uuid.UUID
+	if req.SalesRepID != nil && *req.SalesRepID != "" {
+		parsed, err := uuid.Parse(*req.SalesRepID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid sales_rep_id")
+			return
+		}
+		salesRepID = &parsed
+	}
+
+	var shippingAddress models.JSONB
+	if len(req.ShippingAddress) > 0 {
+		shippingAddress = models.JSONB(req.ShippingAddress)
+	}
+	var billingAddress models.JSONB
+	if len(req.BillingAddress) > 0 {
+		billingAddress = models.JSONB(req.BillingAddress)
+	}
+
+	items := make([]*service.CreateOrderItemRequest, len(req.Items))
+	for i, it := range req.Items {
+		productID, err := uuid.Parse(it.ProductID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid product_id in item %d", i))
+			return
+		}
+		quantity, err := decimal.NewFromString(it.Quantity)
+		if err != nil || quantity.LessThanOrEqual(decimal.Zero) {
+			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid quantity in item %d", i))
+			return
+		}
+		var unitPrice *decimal.Decimal
+		if it.UnitPrice != nil && *it.UnitPrice != "" {
+			up, err := decimal.NewFromString(*it.UnitPrice)
+			if err != nil {
+				h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("invalid unit_price in item %d", i))
+				return
+			}
+			if up.LessThan(decimal.Zero) {
+				h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("unit_price cannot be negative in item %d", i))
+				return
+			}
+			unitPrice = &up
+		}
+		items[i] = &service.CreateOrderItemRequest{
+			ProductID: productID,
+			Quantity:  quantity,
+			UnitPrice: unitPrice,
+			Metadata:  it.Metadata,
+		}
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "order:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
+	// FIXED: Added CompanyID and CreatedBy
+	svcReq := &service.CreateOrderRequest{
+		CompanyID:       companyID,
+		CustomerID:      customerID,
+		OrderNumber:     orderNumber,
+		ExternalRef:     req.ExternalRef,
+		OrderDate:       orderDate,
+		Currency:        currency,
+		Notes:           req.Notes,
+		ShippingAddress: shippingAddress,
+		BillingAddress:  billingAddress,
+		SalesRepID:      salesRepID,
+		Items:           items,
+		CreatedBy:       &userID,
+	}
+
+	// FIXED: pass idempotencyKey as third argument
+	order, err := h.orderService.CreateDraftOrder(ctx, svcReq, idempotencyKey)
+	if err != nil {
+		h.logger.Error("failed to create draft order", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	resp := convertOrderToResponse(order)
+	location := fmt.Sprintf("/orders/%s", order.OrderID)
+	w.Header().Set("Location", location)
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+// UpdateOrder handles PUT /orders/{id}
+func (h *OrderHandler) UpdateOrder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	orderID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
+		return
+	}
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "order:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req updateOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	var orderDate *time.Time
+	if req.OrderDate != nil && *req.OrderDate != "" {
+		od, err := time.Parse(time.RFC3339, *req.OrderDate)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid order_date format")
+			return
+		}
+		orderDate = &od
+	}
+
+	var shippingAddress *models.JSONB
+	if len(req.ShippingAddress) > 0 {
+		ja := models.JSONB(req.ShippingAddress)
+		shippingAddress = &ja
+	}
+	var billingAddress *models.JSONB
+	if len(req.BillingAddress) > 0 {
+		ja := models.JSONB(req.BillingAddress)
+		billingAddress = &ja
+	}
+
+	svcReq := &service.UpdateOrderRequest{
+		OrderDate:       orderDate,
+		Currency:        req.Currency,
+		Notes:           req.Notes,
+		ShippingAddress: shippingAddress,
+		BillingAddress:  billingAddress,
+		UpdatedBy:       &userID, // ensure UpdatedBy is set
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
+	// FIXED: pass idempotencyKey as fifth argument
+	updated, err := h.orderService.UpdateOrder(ctx, companyID, orderID, svcReq, idempotencyKey)
+	if err != nil {
+		h.logger.Error("failed to update order", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	resp := convertOrderToResponse(updated)
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+// DeleteOrder handles DELETE /orders/{id}
+func (h *OrderHandler) DeleteOrder(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	orderID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
+		return
+	}
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "order:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
+	// FIXED: pass idempotencyKey as fifth argument
+	err = h.orderService.DeleteOrder(ctx, companyID, orderID, userID, idempotencyKey)
+	if err != nil {
+		h.logger.Error("failed to delete order", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "order deleted successfully",
+	})
 }

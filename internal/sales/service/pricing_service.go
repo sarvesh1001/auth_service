@@ -482,7 +482,6 @@ func (s *pricingService) ValidateDiscountCombination(ctx context.Context, coupon
 // ---------------------------------------------------------------------
 // Credit validation (delegated to CustomerService)
 // ---------------------------------------------------------------------
-
 func (s *pricingService) GetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
 	return s.customerSvc.GetCreditLimit(ctx, companyID, customerID)
 }

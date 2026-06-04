@@ -19,16 +19,6 @@ import (
 // Shared types (Pagination, Sort)
 // ================================
 
-type Pagination struct {
-	Limit  int `json:"limit"`
-	Offset int `json:"offset"`
-}
-
-type Sort struct {
-	Field     string `json:"field"`
-	Direction string `json:"direction"` // ASC, DESC
-}
-
 // ================================
 // Customer DTOs
 // ================================
@@ -305,16 +295,6 @@ type PricingPreviewResult struct {
 	GrandTotal        decimal.Decimal
 	AppliedCoupons    []*discount.Coupon
 	AppliedPromotions []*discount.Promotion
-}
-
-type CreateInvoiceFromOrderRequest struct {
-	Notes     *string
-	CreatedBy uuid.UUID
-}
-
-type CreateInvoiceFromQuoteRequest struct {
-	Notes     *string
-	CreatedBy uuid.UUID
 }
 
 // ================================
@@ -699,77 +679,6 @@ type CreditNoteApplicationRequest struct {
 type ConvertCreditNoteToRefundRequest struct {
 	PaymentID uuid.UUID // original payment to refund against
 	Reason    string
-}
-
-type CreateInvoiceRequest struct {
-	CompanyID     uuid.UUID
-	CustomerID    uuid.UUID
-	OrderID       *uuid.UUID
-	InvoiceNumber string
-	ExternalRef   *string
-	InvoiceDate   time.Time
-	DueDate       time.Time
-	Currency      string
-	Notes         *string
-	Items         []CreateInvoiceItemRequest
-	CreatedBy     *uuid.UUID
-}
-
-type CreateInvoiceItemRequest struct {
-	ProductID uuid.UUID
-	Quantity  decimal.Decimal
-	UnitPrice *decimal.Decimal // override default product price
-	Discount  *decimal.Decimal
-	Metadata  models.JSONB
-}
-
-type UpdateInvoiceRequest struct {
-	DueDate   *time.Time
-	Currency  *string
-	Notes     *string
-	UpdatedBy *uuid.UUID
-}
-
-type InvoiceListFilter struct {
-	CompanyID  uuid.UUID
-	CustomerID *uuid.UUID
-	OrderID    *uuid.UUID
-	Status     *enums.InvoiceStatus
-	FromDate   *time.Time
-	ToDate     *time.Time
-	MinTotal   *decimal.Decimal
-	MaxTotal   *decimal.Decimal
-}
-
-type InvoicePricingPreviewResult struct {
-	Subtotal      decimal.Decimal
-	DiscountTotal decimal.Decimal
-	TaxTotal      decimal.Decimal
-	GrandTotal    decimal.Decimal
-	LineDetails   []InvoicePricingLineDetail
-}
-
-type InvoicePricingLineDetail struct {
-	ProductID      uuid.UUID
-	Quantity       decimal.Decimal
-	UnitPrice      decimal.Decimal
-	DiscountAmount decimal.Decimal
-	TaxAmount      decimal.Decimal
-	LineTotal      decimal.Decimal
-}
-
-type RegisterInvoicePaymentRequest struct {
-	CompanyID   uuid.UUID
-	InvoiceID   uuid.UUID
-	PaymentID   uuid.UUID
-	Amount      decimal.Decimal
-	AllocatedBy *uuid.UUID
-}
-
-type InvoicePayment struct {
-	PaymentID   uuid.UUID
-	Amount      decimal.Decimal
-	AllocatedAt time.Time
 }
 
 type CreatePaymentRequest struct {
@@ -1856,4 +1765,112 @@ type TaxBreakdownLine struct {
 	TaxPercentage *decimal.Decimal
 	TaxableAmount decimal.Decimal
 	TaxAmount     decimal.Decimal
+}
+
+type CreateInvoiceRequest struct {
+	CompanyID            uuid.UUID
+	CustomerID           uuid.UUID
+	OrderID              *uuid.UUID
+	InvoiceNumber        string
+	ExternalRef          *string
+	InvoiceDate          time.Time
+	DueDate              time.Time
+	Currency             string
+	Notes                *string
+	Items                []CreateInvoiceItemRequest
+	CreatedBy            *uuid.UUID
+	SalesRepID           *uuid.UUID
+	PaymentTermName      *string
+	PaymentDueDays       *int
+	EarlyDiscountPercent *decimal.Decimal
+	EarlyDiscountDays    *int
+}
+
+type CreateInvoiceItemRequest struct {
+	ProductID   uuid.UUID
+	Quantity    decimal.Decimal
+	UnitPrice   *decimal.Decimal
+	Discount    *decimal.Decimal
+	OrderItemID *uuid.UUID // NEW – links to sales.order_items for partial invoicing & reversal
+	Metadata    models.JSONB
+}
+type CreateInvoiceFromOrderRequest struct {
+	OrderID     string                    `json:"order_id"`
+	Items       []PartialInvoiceItemInput `json:"items,omitempty"` // NEW – if empty, invoice all remaining quantities
+	InvoiceDate string                    `json:"invoice_date,omitempty"`
+	DueDate     string                    `json:"due_date,omitempty"`
+	Notes       *string                   `json:"notes,omitempty"`
+	CreatedBy   *uuid.UUID                `json:"-"` // set by handler
+}
+type CreateInvoiceFromQuoteRequest struct {
+	QuoteID     string     `json:"quote_id"`
+	InvoiceDate string     `json:"invoice_date,omitempty"`
+	DueDate     string     `json:"due_date,omitempty"`
+	Notes       *string    `json:"notes,omitempty"`
+	CreatedBy   *uuid.UUID `json:"-"`
+}
+
+type UpdateInvoiceRequest struct {
+	DueDate   *time.Time `json:"due_date,omitempty"`
+	Currency  *string    `json:"currency,omitempty"`
+	Notes     *string    `json:"notes,omitempty"`
+	UpdatedBy *uuid.UUID
+}
+
+type RegisterInvoicePaymentRequest struct {
+	CompanyID   uuid.UUID
+	InvoiceID   uuid.UUID
+	PaymentID   uuid.UUID
+	Amount      decimal.Decimal
+	AllocatedBy *uuid.UUID
+}
+
+type InvoiceListFilter struct {
+	CompanyID  uuid.UUID
+	CustomerID *uuid.UUID
+	OrderID    *uuid.UUID
+	Status     *enums.InvoiceStatus
+	FromDate   *time.Time
+	ToDate     *time.Time
+	MinTotal   *decimal.Decimal
+	MaxTotal   *decimal.Decimal
+}
+
+type Pagination struct {
+	Limit  int
+	Offset int
+}
+
+type Sort struct {
+	Field     string
+	Direction string
+}
+
+type InvoicePricingPreviewResult struct {
+	Subtotal      decimal.Decimal
+	DiscountTotal decimal.Decimal
+	TaxTotal      decimal.Decimal
+	GrandTotal    decimal.Decimal
+	LineDetails   []InvoicePricingLineDetail
+}
+
+type InvoicePricingLineDetail struct {
+	ProductID      uuid.UUID
+	Quantity       decimal.Decimal
+	UnitPrice      decimal.Decimal
+	DiscountAmount decimal.Decimal
+	TaxAmount      decimal.Decimal
+	LineTotal      decimal.Decimal
+}
+
+type InvoicePayment struct {
+	PaymentID   uuid.UUID
+	Amount      decimal.Decimal
+	AllocatedAt time.Time
+}
+
+// PartialInvoiceItemInput specifies which order items and how much to invoice.
+type PartialInvoiceItemInput struct {
+	OrderItemID uuid.UUID       `json:"order_item_id"`
+	Quantity    decimal.Decimal `json:"quantity"`
 }

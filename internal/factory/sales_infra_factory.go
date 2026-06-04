@@ -435,6 +435,7 @@ func (f *SalesInfraFactory) InvoiceService() service.InvoiceService {
 			f.DiscountEngineService(),
 			f.TaxSnapshotRepo(),
 			f.PaymentRepo(),
+			f.PaymentTermRepo(), // <-- ADDED (required)
 			f.outboxRepo,
 			f.idempotencyStore,
 			f.auditService,
@@ -444,12 +445,12 @@ func (f *SalesInfraFactory) InvoiceService() service.InvoiceService {
 	}
 	return f.invoiceService
 }
-
 func (f *SalesInfraFactory) OrderService() service.OrderService {
 	if f.orderService == nil {
 		f.orderService = service.NewOrderService(
 			f.OrderRepo(),
 			f.ProductRepo(),
+			f.SalesRepRepo(), // <-- ADD THIS LINE
 			f.CustomerService(),
 			f.PricingRepo(),
 			f.CouponRepo(),

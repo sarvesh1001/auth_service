@@ -49,15 +49,24 @@ type createInvoiceItemRequest struct {
 	Quantity            string       `json:"quantity"`
 	UnitPrice           string       `json:"unit_price"`
 	Discount            *string      `json:"discount,omitempty"`
-	Metadata            models.JSONB `json:"metadata,omitempty"` // non-pointer
+	Metadata            models.JSONB `json:"metadata,omitempty"`
+}
+
+// ---------- NEW: Partial invoicing request types ----------
+type partialInvoiceItem struct {
+	OrderItemID string `json:"order_item_id"`
+	Quantity    string `json:"quantity"`
 }
 
 type createInvoiceFromOrderRequest struct {
-	OrderID     string  `json:"order_id"`
-	InvoiceDate string  `json:"invoice_date,omitempty"`
-	DueDate     string  `json:"due_date,omitempty"`
-	Notes       *string `json:"notes,omitempty"`
+	OrderID     string               `json:"order_id"`
+	Items       []partialInvoiceItem `json:"items,omitempty"` // optional – if omitted, invoice all remaining
+	InvoiceDate string               `json:"invoice_date,omitempty"`
+	DueDate     string               `json:"due_date,omitempty"`
+	Notes       *string              `json:"notes,omitempty"`
 }
+
+// -----------------------------------------------------------
 
 type createInvoiceFromQuoteRequest struct {
 	QuoteID     string  `json:"quote_id"`
@@ -276,7 +285,6 @@ func (h *InvoiceHandler) toInvoiceItemResponse(item *models.InvoiceItem) invoice
 		taxStr := item.TaxAmount.String()
 		resp.TaxAmount = &taxStr
 	}
-	// Metadata is models.JSONB, response expects *models.JSONB
 	if item.Metadata != nil {
 		resp.Metadata = &item.Metadata
 	}
@@ -375,7 +383,6 @@ func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Reque
 			}
 			productID = parsed
 		}
-		// Metadata is already models.JSONB (non-pointer)
 		items[i] = service.CreateInvoiceItemRequest{
 			ProductID: productID,
 			Quantity:  quantity,
@@ -395,7 +402,7 @@ func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey // service may ignore it; kept for consistency
+	_ = idempotencyKey
 
 	svcReq := service.CreateInvoiceRequest{
 		CompanyID:   companyID,
@@ -426,26 +433,32 @@ func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Reque
 }
 
 // CreateInvoiceFromOrder handles POST /invoices/from-order
+// This is the method that now supports partial invoicing.
 func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// Get authenticated user ID
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
+	// Get company ID from header
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	// Decode request body
 	var req createInvoiceFromOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	// Validate required fields
 	if req.OrderID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "order_id is required")
 		return
@@ -455,18 +468,54 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, http.StatusBadRequest, "invalid order_id")
 		return
 	}
+
+	// Parse partial invoicing items if present
+	var partialItems []service.PartialInvoiceItemInput
+	if len(req.Items) > 0 {
+		partialItems = make([]service.PartialInvoiceItemInput, 0, len(req.Items))
+		for _, it := range req.Items {
+			orderItemID, err := uuid.Parse(it.OrderItemID)
+			if err != nil {
+				h.respondWithError(w, http.StatusBadRequest, "invalid order_item_id")
+				return
+			}
+			quantity, err := decimal.NewFromString(it.Quantity)
+			if err != nil || quantity.LessThanOrEqual(decimal.Zero) {
+				h.respondWithError(w, http.StatusBadRequest, "invalid quantity")
+				return
+			}
+			partialItems = append(partialItems, service.PartialInvoiceItemInput{
+				OrderItemID: orderItemID,
+				Quantity:    quantity,
+			})
+		}
+	}
+
+	// Permission check
 	if !h.hasPermission(ctx, companyID, userID, "invoice:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
+
+	// Idempotency key (optional, can be used by service)
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	_ = idempotencyKey
+
+	// Build service request with all fields from the incoming request
 	svcReq := service.CreateInvoiceFromOrderRequest{
-		Notes: req.Notes,
+		OrderID:     req.OrderID,     // keep as string, service will parse if needed
+		Items:       partialItems,    // ✅ new: partial invoicing items
+		InvoiceDate: req.InvoiceDate, // ✅ passed to service
+		DueDate:     req.DueDate,     // ✅ passed to service
+		Notes:       req.Notes,
+		CreatedBy:   &userID, // set the authenticated user
 	}
+
+	// Call service
 	invoice, err := h.invoiceService.CreateInvoiceFromOrder(ctx, companyID, orderID, &svcReq)
 	if err != nil {
 		h.logger.Error("failed to create invoice from order", zap.Error(err))
@@ -474,6 +523,8 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 		h.respondWithError(w, status, msg)
 		return
 	}
+
+	// Build response
 	resp := h.toInvoiceResponse(invoice)
 	location := fmt.Sprintf("/invoices/%s", invoice.InvoiceID)
 	w.Header().Set("Location", location)
@@ -875,7 +926,7 @@ func (h *InvoiceHandler) SearchInvoices(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// GetInvoicesByCustomer handles GET /invoices?customer_id=...
+// GetInvoicesByCustomer handles GET /invoices/by-customer
 func (h *InvoiceHandler) GetInvoicesByCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -957,7 +1008,7 @@ func (h *InvoiceHandler) GetInvoicesByCustomer(w http.ResponseWriter, r *http.Re
 	})
 }
 
-// GetInvoicesByOrder handles GET /invoices?order_id=...
+// GetInvoicesByOrder handles GET /invoices/by-order
 func (h *InvoiceHandler) GetInvoicesByOrder(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1330,7 +1381,6 @@ func (h *InvoiceHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) 
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	// Override company ID from header
 	req.CompanyID = companyID
 
 	if !h.hasPermission(ctx, req.CompanyID, userID, "invoice:read") {
@@ -1350,7 +1400,7 @@ func (h *InvoiceHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// RecalculateTotals handles POST /invoices/{id}/recalculate
+// RecalculateTotals handles POST /invoices/{id}/recalculate-totals
 func (h *InvoiceHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -2002,7 +2052,7 @@ func (h *InvoiceHandler) GetOutstandingAmount(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// RefreshPaymentBalances handles POST /invoices/{id}/refresh-payments
+// RefreshPaymentBalances handles POST /invoices/{id}/refresh-balances
 func (h *InvoiceHandler) RefreshPaymentBalances(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 

@@ -62,11 +62,14 @@ func (h *BaseHandler) respondWithError(w http.ResponseWriter, status int, messag
 }
 
 // mapServiceError translates service-layer errors to HTTP status codes and messages.
+// mapServiceError translates service-layer errors to HTTP status codes and messages.
 func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 	switch {
 	case errors.Is(err, salesErrors.ErrNotFound):
 		return http.StatusNotFound, "resource not found"
-	case errors.Is(err, salesErrors.ErrInvalidInput):
+	case errors.Is(err, salesErrors.ErrInvalidInput),
+		errors.Is(err, salesErrors.ErrInvalidAmount),
+		errors.Is(err, salesErrors.ErrInvalidQuantity):
 		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, salesErrors.ErrDuplicate):
 		return http.StatusConflict, "duplicate record"
@@ -76,8 +79,16 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusForbidden, "permission denied"
 	case errors.Is(err, salesErrors.ErrUnauthorized):
 		return http.StatusUnauthorized, "authentication required"
-	case errors.Is(err, salesErrors.ErrInventoryItemNotFound): // <-- ADDED
+	case errors.Is(err, salesErrors.ErrInventoryItemNotFound):
 		return http.StatusBadRequest, "inventory item not found or inactive"
+	// NEW cases:
+	case errors.Is(err, salesErrors.ErrInvalidStatus),
+		errors.Is(err, salesErrors.ErrInvalidTransition):
+		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, salesErrors.ErrCustomerInactive):
+		return http.StatusBadRequest, "customer is inactive"
+	case errors.Is(err, salesErrors.ErrProductInactive):
+		return http.StatusBadRequest, "product is inactive"
 	default:
 		return http.StatusInternalServerError, "internal server error"
 	}
