@@ -1,3 +1,6 @@
+// package service
+// filename: quote_service.go
+
 package service
 
 import (
@@ -23,9 +26,14 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
-// ----------------------------------------------------------------------------
-// Interface definition
-// ----------------------------------------------------------------------------
+// ------------------------ DTOs ------------------------
+
+type Order struct {
+	OrderID     uuid.UUID
+	OrderNumber string
+}
+
+// ------------------------ Service Interface ------------------------
 
 type QuoteService interface {
 	CreateQuote(ctx context.Context, req *CreateQuoteRequest) (*models.Quote, error)
@@ -54,7 +62,7 @@ type QuoteService interface {
 	RejectQuote(ctx context.Context, companyID, quoteID uuid.UUID, reason *string, updatedBy uuid.UUID) error
 	ExpireQuote(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
 	GetExpiringQuotes(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Quote, error)
-	ConvertToOrder(ctx context.Context, companyID, quoteID uuid.UUID, req *ConvertQuoteToOrderRequest) (*models.Order, error)
+	ConvertToOrder(ctx context.Context, companyID, quoteID uuid.UUID, req *ConvertQuoteToOrderRequest) (*Order, error)
 	IsConverted(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error)
 	AssignSalesRep(ctx context.Context, companyID, quoteID, salesRepID uuid.UUID, updatedBy uuid.UUID) error
 	RemoveSalesRep(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error
@@ -70,17 +78,11 @@ type QuoteService interface {
 	IsExpired(ctx context.Context, companyID, quoteID uuid.UUID, at time.Time) (bool, error)
 }
 
-// ----------------------------------------------------------------------------
-// Request / Response types
-// ----------------------------------------------------------------------------
-
-// ----------------------------------------------------------------------------
-// Service implementation
-// ----------------------------------------------------------------------------
+// ------------------------ Implementation ------------------------
 
 type quoteService struct {
 	quoteRepo         repository.QuoteRepository
-	orderSvc          OrderService // changed from orderRepo to OrderService
+	orderSvc          OrderService
 	productRepo       repository.ProductRepository
 	customerSvc       CustomerService
 	pricingRepo       repository.PricingRepository
@@ -97,7 +99,7 @@ type quoteService struct {
 
 func NewQuoteService(
 	quoteRepo repository.QuoteRepository,
-	orderSvc OrderService, // added
+	orderSvc OrderService,
 	productRepo repository.ProductRepository,
 	customerSvc CustomerService,
 	pricingRepo repository.PricingRepository,
@@ -129,13 +131,207 @@ func NewQuoteService(
 	}
 }
 
-// ----------------------------------------------------------------------------
-// CRUD & lifecycle operations
-// ----------------------------------------------------------------------------
+// ------------------------ Helpers ------------------------
+
+func (s *quoteService) generateQuoteNumber(tx repository.DBTX, companyID uuid.UUID) (string, error) {
+	prefix := companyID.String()[:8]
+	timestamp := time.Now().UnixMilli()
+	quoteNumber := fmt.Sprintf("QT-%s-%d", prefix, timestamp)
+	exists, err := s.quoteRepo.ExistsByNumber(context.Background(), tx, companyID, quoteNumber, 1)
+	if err != nil {
+		return "", err
+	}
+	if exists {
+		return fmt.Sprintf("QT-%s-%d-1", prefix, timestamp), nil
+	}
+	return quoteNumber, nil
+}
+
+func (s *quoteService) recalculateQuoteTotals(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID) error {
+	quote, err := s.quoteRepo.GetByID(ctx, tx, companyID, quoteID)
+	if err != nil {
+		return err
+	}
+	if quote.CompanyID != companyID {
+		return salesErrors.ErrPermissionDenied
+	}
+
+	items, err := s.quoteRepo.GetItems(ctx, tx, quote.CompanyID, quoteID)
+	if err != nil {
+		return err
+	}
+
+	var subtotal, discountTotal, taxTotal decimal.Decimal
+	for _, it := range items {
+		lineSubtotal := it.UnitPrice.Mul(it.Quantity)
+		subtotal = subtotal.Add(lineSubtotal)
+		discountTotal = discountTotal.Add(it.DiscountAmount)
+
+		taxable := lineSubtotal.Sub(it.DiscountAmount)
+		tax, err := s.pricingRepo.CalculateLineTax(ctx, tx, quote.CompanyID, it.ProductID, taxable)
+		if err != nil {
+			return fmt.Errorf("calculate line tax: %w", err)
+		}
+		it.TaxAmount = tax
+		taxTotal = taxTotal.Add(tax)
+
+		updateQuery := `UPDATE sales.quote_items SET tax_amount = $1 WHERE quote_item_id = $2`
+		if _, err := tx.ExecContext(ctx, updateQuery, tax, it.QuoteItemID); err != nil {
+			return fmt.Errorf("update item tax: %w", err)
+		}
+	}
+
+	quote.Subtotal = subtotal
+	quote.DiscountTotal = discountTotal
+	quote.TaxTotal = taxTotal
+	quote.GrandTotal = subtotal.Sub(discountTotal).Add(taxTotal)
+
+	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
+		return fmt.Errorf("update quote totals: %w", err)
+	}
+	return nil
+}
+
+func (s *quoteService) addQuoteItems(ctx context.Context, tx repository.DBTX, quote *models.Quote, items []*CreateQuoteItemRequest) error {
+	quoteItems := make([]*models.QuoteItem, 0, len(items))
+	for _, it := range items {
+		product, err := s.productRepo.GetByID(ctx, tx, quote.CompanyID, it.ProductID)
+		if err != nil {
+			return fmt.Errorf("product %s: %w", it.ProductID, err)
+		}
+		if !product.IsActive {
+			return fmt.Errorf("%w: product %s is inactive", salesErrors.ErrProductInactive, product.SKU)
+		}
+		unitPrice := product.UnitPrice
+		if it.UnitPrice != nil {
+			unitPrice = *it.UnitPrice
+		}
+		discount := decimal.Zero
+		if it.DiscountAmount != nil {
+			discount = *it.DiscountAmount
+		}
+		item := &models.QuoteItem{
+			QuoteItemID:         uuid.New(),
+			QuoteID:             quote.QuoteID,
+			ProductID:           product.ProductID,
+			ProductNameSnapshot: product.Name,
+			Quantity:            it.Quantity,
+			UnitPrice:           unitPrice,
+			DiscountAmount:      discount,
+			TaxAmount:           decimal.Zero,
+			Metadata:            it.Metadata,
+		}
+		quoteItems = append(quoteItems, item)
+	}
+	return s.quoteRepo.AddItems(ctx, tx, quote.CompanyID, quote.QuoteID, quoteItems)
+}
+
+func (s *quoteService) applyCouponInternal(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID, couponCode string) (*discount.Coupon, decimal.Decimal, error) {
+	coupon, err := s.couponRepo.ValidateCoupon(ctx, tx, companyID, couponCode, nil, decimal.Zero, nil, time.Now())
+	if err != nil {
+		return nil, decimal.Zero, err
+	}
+	subtotal, _, _, _, err := s.quoteRepo.GetTotals(ctx, tx, companyID, quoteID)
+	if err != nil {
+		return nil, decimal.Zero, err
+	}
+	discountAmount, err := s.couponRepo.CalculateDiscount(ctx, tx, companyID, coupon.CouponID, subtotal)
+	if err != nil {
+		return nil, decimal.Zero, err
+	}
+	return coupon, discountAmount, nil
+}
+
+func (s *quoteService) removeCouponInternal(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID, couponCode string) error {
+	// Implementation depends on discount application storage – placeholder
+	return nil
+}
+
+func (s *quoteService) emitQuoteEvent(ctx context.Context, tx repository.DBTX, quote *models.Quote, eventType string, extra map[string]interface{}) error {
+	sqlTx, ok := tx.(*sql.Tx)
+	if !ok {
+		return fmt.Errorf("tx is not a *sql.Tx")
+	}
+	expiry := ""
+	if quote.ExpiryDate != nil {
+		expiry = quote.ExpiryDate.Format(time.RFC3339)
+	}
+	payload := salesEvents.QuotePayload{
+		QuoteID:     quote.QuoteID.String(),
+		CompanyID:   quote.CompanyID.String(),
+		CustomerID:  quote.CustomerID.String(),
+		QuoteNumber: quote.QuoteNumber,
+		Revision:    quote.Revision,
+		Status:      string(quote.Status),
+		GrandTotal:  quote.GrandTotal.String(),
+		ExpiryDate:  expiry,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "quote",
+		AggregateID:   quote.QuoteID.String(),
+		EventType:     eventType,
+		Topic:         salesEvents.TopicSalesEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, sqlTx, event)
+}
+
+func (s *quoteService) validateStatusTransition(current, next enums.QuoteStatus) error {
+	transitions := map[enums.QuoteStatus][]enums.QuoteStatus{
+		enums.QuoteStatusDraft:     {enums.QuoteStatusSent, enums.QuoteStatusRejected},
+		enums.QuoteStatusSent:      {enums.QuoteStatusAccepted, enums.QuoteStatusRejected, enums.QuoteStatusExpired},
+		enums.QuoteStatusAccepted:  {enums.QuoteStatusConverted},
+		enums.QuoteStatusRejected:  {},
+		enums.QuoteStatusExpired:   {},
+		enums.QuoteStatusConverted: {},
+	}
+	allowed, ok := transitions[current]
+	if !ok {
+		return fmt.Errorf("%w: unknown status %s", salesErrors.ErrInvalidStatus, current)
+	}
+	for _, st := range allowed {
+		if st == next {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: cannot transition from %s to %s", salesErrors.ErrInvalidTransition, current, next)
+}
+
+func (s *quoteService) mapStatusToEvent(status enums.QuoteStatus) string {
+	switch status {
+	case enums.QuoteStatusSent:
+		return salesEvents.EventQuoteSent
+	case enums.QuoteStatusAccepted:
+		return salesEvents.EventQuoteAccepted
+	case enums.QuoteStatusRejected:
+		return salesEvents.EventQuoteRejected
+	case enums.QuoteStatusExpired:
+		return salesEvents.EventQuoteExpired
+	case enums.QuoteStatusConverted:
+		return salesEvents.EventQuoteConverted
+	default:
+		return salesEvents.EventQuoteUpdated
+	}
+}
+
+func (s *quoteService) calcSubtotalFromItems(items []*models.QuoteItem) decimal.Decimal {
+	var total decimal.Decimal
+	for _, it := range items {
+		total = total.Add(it.UnitPrice.Mul(it.Quantity))
+	}
+	return total
+}
+
+// ------------------------ Core Operations ------------------------
 
 func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest) (*models.Quote, error) {
 	logger := s.logger.With(zap.String("method", "CreateQuote"))
-	if err := s.validateCreateQuoteRequest(req); err != nil {
+	if err := s.validateCreateQuoteRequest(ctx, req); err != nil {
 		return nil, err
 	}
 
@@ -145,6 +341,17 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 	}
 	defer tx.Rollback()
 
+	// Idempotency
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
+	var cached *models.Quote
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached quote")
+		return cached, nil
+	}
+
 	quoteNumber := req.QuoteNumber
 	if quoteNumber == "" {
 		quoteNumber, err = s.generateQuoteNumber(tx, req.CompanyID)
@@ -152,7 +359,6 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 			return nil, fmt.Errorf("generate quote number: %w", err)
 		}
 	}
-
 	exists, err := s.quoteRepo.ExistsByNumber(ctx, tx, req.CompanyID, quoteNumber, 1)
 	if err != nil {
 		return nil, fmt.Errorf("check quote number: %w", err)
@@ -192,28 +398,35 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 	if err := s.quoteRepo.Create(ctx, tx, quote, nil); err != nil {
 		return nil, fmt.Errorf("create quote: %w", err)
 	}
-
 	if len(req.Items) > 0 {
 		if err := s.addQuoteItems(ctx, tx, quote, req.Items); err != nil {
 			return nil, err
 		}
 	}
-
-	if err := s.recalculateQuoteTotals(ctx, tx, quote.QuoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, req.CompanyID, quote.QuoteID); err != nil {
 		return nil, fmt.Errorf("recalculate totals: %w", err)
 	}
-
+	// ---- FIX 1: Reload quote after recalc to get correct totals for cache ----
+	quote, err = s.quoteRepo.GetByID(ctx, tx, req.CompanyID, quote.QuoteID)
+	if err != nil {
+		return nil, fmt.Errorf("reload quote after recalculation: %w", err)
+	}
+	// -------------------------------------------------------------------------
 	for _, code := range req.CouponCodes {
 		if _, _, err := s.applyCouponInternal(ctx, tx, req.CompanyID, quote.QuoteID, code); err != nil {
 			logger.Warn("failed to apply coupon", zap.String("code", code), zap.Error(err))
 		}
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quote.QuoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, req.CompanyID, quote.QuoteID); err != nil {
 		return nil, fmt.Errorf("recalculate totals after coupons: %w", err)
 	}
-
 	if err := s.emitQuoteEvent(ctx, tx, quote, salesEvents.EventQuoteCreated, nil); err != nil {
 		logger.Warn("failed to emit quote created event", zap.Error(err))
+	}
+
+	// Store idempotency result before commit
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, quote); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -227,8 +440,24 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 				"revision":     quote.Revision,
 			})
 	}
+	return s.quoteRepo.GetByID(ctx, s.pgClient.DB, req.CompanyID, quote.QuoteID)
+}
 
-	return s.quoteRepo.GetByID(ctx, nil, req.CompanyID, quote.QuoteID)
+func (s *quoteService) validateCreateQuoteRequest(ctx context.Context, req *CreateQuoteRequest) error {
+	if req.CompanyID == uuid.Nil {
+		return fmt.Errorf("%w: company_id required", salesErrors.ErrInvalidInput)
+	}
+	if req.CustomerID == uuid.Nil {
+		return fmt.Errorf("%w: customer_id required", salesErrors.ErrInvalidInput)
+	}
+	if len(req.Items) == 0 {
+		return fmt.Errorf("%w: at least one item required", salesErrors.ErrInvalidInput)
+	}
+	// FIX 2: notes length validation (defense in depth)
+	if req.Notes != nil && len(*req.Notes) > 1000 {
+		return fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
+	}
+	return s.ValidateQuoteItems(ctx, req.CompanyID, req.Items)
 }
 
 func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.UUID, req *UpdateQuoteRequest) (*models.Quote, error) {
@@ -238,6 +467,13 @@ func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := quoteID.String()
+	var cached *models.Quote
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached quote")
+		return cached, nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -260,6 +496,9 @@ func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.
 		changes["currency"] = req.Currency
 	}
 	if req.Notes != nil {
+		if len(*req.Notes) > 1000 {
+			return nil, fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
+		}
 		quote.Notes = req.Notes
 		changes["notes"] = req.Notes
 	}
@@ -272,20 +511,19 @@ func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return nil, fmt.Errorf("update quote: %w", err)
 	}
-
 	if err := s.emitQuoteEvent(ctx, tx, quote, salesEvents.EventQuoteUpdated, nil); err != nil {
 		logger.Warn("failed to emit quote updated event", zap.Error(err))
 	}
-
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, quote); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "update_quote", "quote",
 			&quoteID, "user", req.UpdatedBy, nil, nil, changes)
 	}
-
 	return quote, nil
 }
 
@@ -297,6 +535,13 @@ func (s *quoteService) DeleteQuote(ctx context.Context, companyID, quoteID uuid.
 	}
 	defer tx.Rollback()
 
+	idempKey := quoteID.String()
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – already deleted")
+		return nil
+	}
+
 	quote, err := s.quoteRepo.GetByID(ctx, tx, companyID, quoteID)
 	if err != nil {
 		return err
@@ -307,34 +552,30 @@ func (s *quoteService) DeleteQuote(ctx context.Context, companyID, quoteID uuid.
 	if quote.Status != enums.QuoteStatusDraft {
 		return fmt.Errorf("%w: only draft quotes can be deleted", salesErrors.ErrInvalidStatus)
 	}
-
 	if err := s.quoteRepo.Delete(ctx, tx, companyID, quoteID); err != nil {
 		return fmt.Errorf("delete quote: %w", err)
 	}
-
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "delete_quote", "quote",
 			&quoteID, "user", &deletedBy, nil, nil, nil)
 	}
-
-	logger.Info("quote deleted", zap.String("quote_number", quote.QuoteNumber), zap.Int("revision", quote.Revision))
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Retrieval methods
-// ----------------------------------------------------------------------------
+// ------------------------ Retrieval (read‑only, no idempotency) ------------------------
 
 func (s *quoteService) GetQuoteByID(ctx context.Context, companyID, quoteID uuid.UUID) (*models.Quote, error) {
-	return s.quoteRepo.GetByID(ctx, nil, companyID, quoteID)
+	return s.quoteRepo.GetByID(ctx, s.pgClient.DB, companyID, quoteID)
 }
 
 func (s *quoteService) GetQuoteByNumber(ctx context.Context, companyID uuid.UUID, quoteNumber string, revision int) (*models.Quote, error) {
-	return s.quoteRepo.GetByNumber(ctx, nil, companyID, quoteNumber, revision)
+	return s.quoteRepo.GetByNumber(ctx, s.pgClient.DB, companyID, quoteNumber, revision)
 }
 
 func (s *quoteService) ListQuotes(ctx context.Context, filter QuoteListFilter, p Pagination, srt Sort) ([]*models.Quote, int64, error) {
@@ -350,31 +591,37 @@ func (s *quoteService) ListQuotes(ctx context.Context, filter QuoteListFilter, p
 	if filter.Status != nil {
 		repoFilter.Statuses = []enums.QuoteStatus{*filter.Status}
 	}
-	// SearchTerm does not exist in QuoteFilter – searching is handled by SearchQuotes method.
-	return s.quoteRepo.List(ctx, nil, repoFilter,
+	return s.quoteRepo.List(ctx, s.pgClient.DB, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
+
 func (s *quoteService) SearchQuotes(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Quote, int64, error) {
-	return s.quoteRepo.Search(ctx, nil, companyID, query, limit, offset)
+	return s.quoteRepo.Search(ctx, s.pgClient.DB, companyID, query, limit, offset)
 }
 
 func (s *quoteService) GetQuotesByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, srt Sort) ([]*models.Quote, int64, error) {
-	return s.quoteRepo.GetByCustomer(ctx, nil, companyID, customerID,
+	return s.quoteRepo.GetByCustomer(ctx, s.pgClient.DB, companyID, customerID,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
-// ----------------------------------------------------------------------------
-// Line item management
-// ----------------------------------------------------------------------------
+// ------------------------ Items (write operations with idempotency) ------------------------
 
 func (s *quoteService) AddItems(ctx context.Context, companyID, quoteID uuid.UUID, items []*CreateQuoteItemRequest, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "AddItems"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("add-items-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – items already added")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -386,26 +633,36 @@ func (s *quoteService) AddItems(ctx context.Context, companyID, quoteID uuid.UUI
 	if quote.Status != enums.QuoteStatusDraft {
 		return fmt.Errorf("%w: cannot add items to quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
-
 	if err := s.addQuoteItems(ctx, tx, quote, items); err != nil {
 		return err
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *quoteService) ReplaceItems(ctx context.Context, companyID, quoteID uuid.UUID, items []*CreateQuoteItemRequest, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "ReplaceItems"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("replace-items-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – items already replaced")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -417,7 +674,6 @@ func (s *quoteService) ReplaceItems(ctx context.Context, companyID, quoteID uuid
 	if quote.Status != enums.QuoteStatusDraft {
 		return fmt.Errorf("%w: cannot replace items for quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
-
 	if err := s.quoteRepo.ReplaceItems(ctx, tx, companyID, quoteID, nil); err != nil {
 		return fmt.Errorf("clear items: %w", err)
 	}
@@ -426,22 +682,33 @@ func (s *quoteService) ReplaceItems(ctx context.Context, companyID, quoteID uuid
 			return err
 		}
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *quoteService) RemoveItem(ctx context.Context, companyID, quoteID, quoteItemID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "RemoveItem"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("remove-item-%s-%s", quoteID.String(), quoteItemID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – item already removed")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -453,34 +720,45 @@ func (s *quoteService) RemoveItem(ctx context.Context, companyID, quoteID, quote
 	if quote.Status != enums.QuoteStatusDraft {
 		return fmt.Errorf("%w: cannot remove item from quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
-
 	if err := s.quoteRepo.DeleteItem(ctx, tx, companyID, quoteID, quoteItemID); err != nil {
 		return err
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *quoteService) GetQuoteItems(ctx context.Context, companyID, quoteID uuid.UUID) ([]*models.QuoteItem, error) {
-	return s.quoteRepo.GetItems(ctx, nil, companyID, quoteID)
+	return s.quoteRepo.GetItems(ctx, s.pgClient.DB, companyID, quoteID)
 }
 
-// ----------------------------------------------------------------------------
-// Discount & pricing
-// ----------------------------------------------------------------------------
+// ------------------------ Coupons & Discounts (with idempotency) ------------------------
 
 func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
+	logger := s.logger.With(zap.String("method", "ApplyCoupon"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("apply-coupon-%s-%s", quoteID.String(), couponCode)
+	var cachedResult struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cachedResult); err == nil && cachedResult.Coupon != nil {
+		logger.Info("idempotent – returning cached coupon result")
+		return cachedResult.Coupon, cachedResult.Amount, nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -492,17 +770,24 @@ func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.
 	if quote.Status != enums.QuoteStatusDraft {
 		return nil, decimal.Zero, fmt.Errorf("%w: cannot apply coupon to quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
-
 	coupon, discountAmount, err := s.applyCouponInternal(ctx, tx, companyID, quoteID, couponCode)
 	if err != nil {
 		return nil, decimal.Zero, err
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return nil, decimal.Zero, err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return nil, decimal.Zero, err
+	}
+	// Store result before commit
+	result := struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}{Coupon: coupon, Amount: discountAmount}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, &result); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
@@ -511,11 +796,19 @@ func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.
 }
 
 func (s *quoteService) RemoveCoupon(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "RemoveCoupon"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("remove-coupon-%s-%s", quoteID.String(), couponCode)
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – coupon already removed")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -527,26 +820,36 @@ func (s *quoteService) RemoveCoupon(ctx context.Context, companyID, quoteID uuid
 	if quote.Status != enums.QuoteStatusDraft {
 		return fmt.Errorf("%w: cannot remove coupon from quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
-
 	if err := s.removeCouponInternal(ctx, tx, companyID, quoteID, couponCode); err != nil {
 		return err
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *quoteService) ApplyBestDiscounts(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "ApplyBestDiscounts"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("best-discounts-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – best discounts already applied")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -558,7 +861,6 @@ func (s *quoteService) ApplyBestDiscounts(ctx context.Context, companyID, quoteI
 	if quote.Status != enums.QuoteStatusDraft {
 		return fmt.Errorf("%w: cannot apply discounts to quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
-
 	items, err := s.quoteRepo.GetItems(ctx, tx, companyID, quoteID)
 	if err != nil {
 		return err
@@ -573,12 +875,15 @@ func (s *quoteService) ApplyBestDiscounts(ctx context.Context, companyID, quoteI
 		return err
 	}
 	quote.DiscountTotal = totalDiscount
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	return tx.Commit()
 }
@@ -588,46 +893,34 @@ func (s *quoteService) PreviewPricing(ctx context.Context, req *QuotePricingPrev
 	if req.At != nil {
 		at = *req.At
 	}
-
-	// Convert items to PricingProductLine (used by PricingPreviewInput)
 	productLines := make([]*repository.PricingProductLine, len(req.Items))
 	for idx, it := range req.Items {
 		unitPrice := decimal.Zero
 		if it.UnitPrice != nil {
 			unitPrice = *it.UnitPrice
 		} else {
-			// Fetch current product unit price if not provided
 			var err error
-			unitPrice, err = s.productRepo.GetUnitPrice(ctx, nil, req.CompanyID, it.ProductID)
+			unitPrice, err = s.productRepo.GetUnitPrice(ctx, s.pgClient.DB, req.CompanyID, it.ProductID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get unit price for product %s: %w", it.ProductID, err)
 			}
-		}
-		discount := decimal.Zero
-		if it.DiscountAmount != nil {
-			discount = *it.DiscountAmount
 		}
 		productLines[idx] = &repository.PricingProductLine{
 			ProductID: it.ProductID,
 			Quantity:  it.Quantity,
 			UnitPrice: unitPrice,
-			// Note: PricingProductLine doesn't have DiscountAmount field.
-			// Discounts are applied separately via coupon codes or promotions.
 		}
-		_ = discount // discount will be handled via coupon codes; line‑level discounts not supported in preview
 	}
-
-	preview, err := s.pricingRepo.PreviewOrderPricing(ctx, nil, &repository.PricingPreviewInput{
+	preview, err := s.pricingRepo.PreviewOrderPricing(ctx, s.pgClient.DB, &repository.PricingPreviewInput{
 		CompanyID:    req.CompanyID,
 		CustomerID:   req.CustomerID,
-		ProductLines: productLines, // correct field name
+		ProductLines: productLines,
 		CouponCodes:  req.CouponCodes,
-		PricedAt:     at, // correct field name
+		PricedAt:     at,
 	})
 	if err != nil {
 		return nil, err
 	}
-
 	return &QuotePricingPreviewResult{
 		Subtotal:          preview.Subtotal,
 		DiscountTotal:     preview.DiscountTotal,
@@ -637,12 +930,21 @@ func (s *quoteService) PreviewPricing(ctx context.Context, req *QuotePricingPrev
 		AppliedPromotions: preview.AppliedPromotions,
 	}, nil
 }
+
 func (s *quoteService) RecalculateTotals(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "RecalculateTotals"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("recalc-totals-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – totals already recalculated")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -651,23 +953,24 @@ func (s *quoteService) RecalculateTotals(ctx context.Context, companyID, quoteID
 	if quote.CompanyID != companyID {
 		return salesErrors.ErrPermissionDenied
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, quoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
 		return err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *quoteService) GetQuoteTotals(ctx context.Context, companyID, quoteID uuid.UUID) (subtotal, discountTotal, taxTotal, grandTotal decimal.Decimal, err error) {
-	return s.quoteRepo.GetTotals(ctx, nil, companyID, quoteID)
+	return s.quoteRepo.GetTotals(ctx, s.pgClient.DB, companyID, quoteID)
 }
 
-// ----------------------------------------------------------------------------
-// Revision management
-// ----------------------------------------------------------------------------
+// ------------------------ Revisions (with idempotency) ------------------------
 
 func (s *quoteService) CreateRevision(ctx context.Context, companyID, quoteID uuid.UUID, req *CreateQuoteRevisionRequest) (*models.Quote, error) {
 	logger := s.logger.With(zap.String("method", "CreateRevision"))
@@ -676,6 +979,13 @@ func (s *quoteService) CreateRevision(ctx context.Context, companyID, quoteID uu
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("create-revision-%s", quoteID.String())
+	var cached *models.Quote
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached revision")
+		return cached, nil
+	}
 
 	oldQuote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -715,10 +1025,10 @@ func (s *quoteService) CreateRevision(ctx context.Context, companyID, quoteID uu
 		CreatedBy:     req.UpdatedBy,
 		UpdatedBy:     req.UpdatedBy,
 	}
+
 	if err := s.quoteRepo.Create(ctx, tx, newQuote, nil); err != nil {
 		return nil, fmt.Errorf("create revision: %w", err)
 	}
-
 	var items []*CreateQuoteItemRequest
 	if len(req.Items) > 0 {
 		items = req.Items
@@ -744,11 +1054,14 @@ func (s *quoteService) CreateRevision(ctx context.Context, companyID, quoteID uu
 	for _, code := range req.CouponCodes {
 		_, _, _ = s.applyCouponInternal(ctx, tx, companyID, newQuote.QuoteID, code)
 	}
-	if err := s.recalculateQuoteTotals(ctx, tx, newQuote.QuoteID); err != nil {
+	if err := s.recalculateQuoteTotals(ctx, tx, newQuote.CompanyID, newQuote.QuoteID); err != nil {
 		return nil, err
 	}
 	if err := s.emitQuoteEvent(ctx, tx, newQuote, salesEvents.EventQuoteCreated, nil); err != nil {
 		logger.Warn("failed to emit quote revision event", zap.Error(err))
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, newQuote); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -757,13 +1070,11 @@ func (s *quoteService) CreateRevision(ctx context.Context, companyID, quoteID uu
 }
 
 func (s *quoteService) GetLatestRevision(ctx context.Context, companyID uuid.UUID, quoteNumber string) (*models.Quote, error) {
-	// List all revisions of this quote number and pick the highest revision.
-	// Note: you may want to add a dedicated method to repository for efficiency.
 	filter := repository.QuoteFilter{
 		CompanyID:   companyID,
 		QuoteNumber: &quoteNumber,
 	}
-	quotes, _, err := s.quoteRepo.List(ctx, nil, filter, repository.Pagination{Limit: 1000, Offset: 0}, repository.Sort{Field: "revision", Direction: "DESC"})
+	quotes, _, err := s.quoteRepo.List(ctx, s.pgClient.DB, filter, repository.Pagination{Limit: 1000, Offset: 0}, repository.Sort{Field: "revision", Direction: "DESC"})
 	if err != nil {
 		return nil, err
 	}
@@ -773,16 +1084,22 @@ func (s *quoteService) GetLatestRevision(ctx context.Context, companyID uuid.UUI
 	return quotes[0], nil
 }
 
-// ----------------------------------------------------------------------------
-// Status transitions
-// ----------------------------------------------------------------------------
+// ------------------------ Status Transitions (with idempotency) ------------------------
 
 func (s *quoteService) UpdateStatus(ctx context.Context, companyID, quoteID uuid.UUID, status enums.QuoteStatus, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "UpdateStatus"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("update-status-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – status already updated")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -799,7 +1116,10 @@ func (s *quoteService) UpdateStatus(ctx context.Context, companyID, quoteID uuid
 	}
 	quote.Status = status
 	if err := s.emitQuoteEvent(ctx, tx, quote, s.mapStatusToEvent(status), nil); err != nil {
-		s.logger.Warn("failed to emit status change event", zap.Error(err))
+		logger.Warn("failed to emit status change event", zap.Error(err))
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	return tx.Commit()
 }
@@ -813,11 +1133,19 @@ func (s *quoteService) AcceptQuote(ctx context.Context, companyID, quoteID uuid.
 }
 
 func (s *quoteService) RejectQuote(ctx context.Context, companyID, quoteID uuid.UUID, reason *string, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "RejectQuote"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("reject-quote-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – quote already rejected")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -842,7 +1170,10 @@ func (s *quoteService) RejectQuote(ctx context.Context, companyID, quoteID uuid.
 		return err
 	}
 	if err := s.emitQuoteEvent(ctx, tx, quote, salesEvents.EventQuoteRejected, nil); err != nil {
-		s.logger.Warn("failed to emit reject event", zap.Error(err))
+		logger.Warn("failed to emit reject event", zap.Error(err))
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
 	return tx.Commit()
 }
@@ -852,20 +1183,25 @@ func (s *quoteService) ExpireQuote(ctx context.Context, companyID, quoteID uuid.
 }
 
 func (s *quoteService) GetExpiringQuotes(ctx context.Context, companyID uuid.UUID, before time.Time) ([]*models.Quote, error) {
-	return s.quoteRepo.GetExpiringQuotes(ctx, nil, companyID, before)
+	return s.quoteRepo.GetExpiringQuotes(ctx, s.pgClient.DB, companyID, before)
 }
 
-// ----------------------------------------------------------------------------
-// Conversion to order
-// ----------------------------------------------------------------------------
+// ------------------------ Conversion to Order (with idempotency) ------------------------
 
-func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uuid.UUID, req *ConvertQuoteToOrderRequest) (*models.Order, error) {
+func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uuid.UUID, req *ConvertQuoteToOrderRequest) (*Order, error) {
 	logger := s.logger.With(zap.String("method", "ConvertToOrder"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("convert-quote-%s", quoteID.String())
+	var cached *Order
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached order")
+		return cached, nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -888,7 +1224,6 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 		return nil, fmt.Errorf("%w: quote has expired", salesErrors.ErrInvalidStatus)
 	}
 
-	// Build order creation request from quote
 	items := make([]*CreateOrderItemRequest, 0)
 	quoteItems, err := s.quoteRepo.GetItems(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -904,6 +1239,7 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 			Metadata:       qi.Metadata,
 		})
 	}
+
 	orderReq := &CreateOrderRequest{
 		CompanyID:       quote.CompanyID,
 		CustomerID:      quote.CustomerID,
@@ -916,54 +1252,48 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 		Items:           items,
 		CreatedBy:       req.UpdatedBy,
 	}
-
-	// Generate unique idempotency key for this conversion
-	idempotencyKey := fmt.Sprintf("convert-quote-%s", quoteID.String())
-	order, err := s.orderSvc.CreateDraftOrder(ctx, orderReq, idempotencyKey)
+	order, err := s.orderSvc.CreateDraftOrder(ctx, orderReq, idempKey)
 	if err != nil {
 		return nil, fmt.Errorf("create order from quote: %w", err)
 	}
 
-	// Mark quote as converted (using the same transaction that created the order)
-	// Note: The order was created inside its own transaction, which is already committed.
-	// To keep both consistent, we should use the same transaction. Since CreateDraftOrder
-	// commits its own transaction, we cannot reuse that tx. This is a known limitation.
-	// For true atomicity, you would need to refactor OrderService to accept an existing tx.
-	// Here we simply update the quote in a new transaction, which may lead to inconsistency.
-	// A better approach is to pass the tx into CreateDraftOrder (not implemented).
-	// For now, we do a separate update. In production, modify OrderService to accept a tx.
-	tx2, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
+	if err := s.quoteRepo.ConvertToOrder(ctx, tx, companyID, quoteID, order.OrderID, req.UpdatedBy); err != nil {
 		return nil, err
 	}
-	defer tx2.Rollback()
-	if err := s.quoteRepo.ConvertToOrder(ctx, tx2, companyID, quoteID, order.OrderID, req.UpdatedBy); err != nil {
-		return nil, err
-	}
-	// Emit quote converted event
-	if err := s.emitQuoteEvent(ctx, tx2, quote, salesEvents.EventQuoteConverted, map[string]interface{}{"order_id": order.OrderID.String()}); err != nil {
+	if err := s.emitQuoteEvent(ctx, tx, quote, salesEvents.EventQuoteConverted, map[string]interface{}{"order_id": order.OrderID.String()}); err != nil {
 		logger.Warn("failed to emit quote converted event", zap.Error(err))
 	}
-	if err := tx2.Commit(); err != nil {
+
+	result := &Order{OrderID: order.OrderID, OrderNumber: order.OrderNumber}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, result); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-
-	return order, nil
+	return result, nil
 }
+
 func (s *quoteService) IsConverted(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error) {
-	return s.quoteRepo.IsConverted(ctx, nil, companyID, quoteID)
+	return s.quoteRepo.IsConverted(ctx, s.pgClient.DB, companyID, quoteID)
 }
 
-// ----------------------------------------------------------------------------
-// Sales rep assignment
-// ----------------------------------------------------------------------------
+// ------------------------ Sales Rep Assignment (with idempotency) ------------------------
 
 func (s *quoteService) AssignSalesRep(ctx context.Context, companyID, quoteID, salesRepID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "AssignSalesRep"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("assign-salesrep-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – sales rep already assigned")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -977,15 +1307,26 @@ func (s *quoteService) AssignSalesRep(ctx context.Context, companyID, quoteID, s
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
 func (s *quoteService) RemoveSalesRep(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "RemoveSalesRep"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	idempKey := fmt.Sprintf("remove-salesrep-%s", quoteID.String())
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – sales rep already removed")
+		return nil
+	}
 
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
@@ -999,12 +1340,13 @@ func (s *quoteService) RemoveSalesRep(ctx context.Context, companyID, quoteID uu
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
 		return err
 	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
 	return tx.Commit()
 }
 
-// ----------------------------------------------------------------------------
-// Validation helpers
-// ----------------------------------------------------------------------------
+// ------------------------ Validation Methods (read‑only, no idempotency) ------------------------
 
 func (s *quoteService) ValidateQuote(ctx context.Context, quote *models.Quote, items []*models.QuoteItem) error {
 	if quote.QuoteNumber == "" {
@@ -1028,7 +1370,11 @@ func (s *quoteService) ValidateQuoteStatusTransition(ctx context.Context, curren
 	return s.validateStatusTransition(currentStatus, nextStatus)
 }
 
+// FIX 3: Add overflow prevention in ValidateQuoteItems
 func (s *quoteService) ValidateQuoteItems(ctx context.Context, companyID uuid.UUID, items []*CreateQuoteItemRequest) error {
+	const maxQuantity = 999999
+	const maxUnitPrice = 999999.9999
+
 	for _, it := range items {
 		if it.ProductID == uuid.Nil {
 			return fmt.Errorf("%w: product_id required", salesErrors.ErrInvalidInput)
@@ -1036,7 +1382,13 @@ func (s *quoteService) ValidateQuoteItems(ctx context.Context, companyID uuid.UU
 		if it.Quantity.LessThanOrEqual(decimal.Zero) {
 			return fmt.Errorf("%w: quantity must be positive", salesErrors.ErrInvalidInput)
 		}
-		exists, err := s.productRepo.Exists(ctx, nil, companyID, it.ProductID)
+		if it.Quantity.GreaterThan(decimal.NewFromInt(maxQuantity)) {
+			return fmt.Errorf("quantity %s exceeds maximum allowed %d", it.Quantity.String(), maxQuantity)
+		}
+		if it.UnitPrice != nil && it.UnitPrice.GreaterThan(decimal.NewFromFloat(maxUnitPrice)) {
+			return fmt.Errorf("unit_price %s exceeds maximum allowed %.4f", it.UnitPrice.String(), maxUnitPrice)
+		}
+		exists, err := s.productRepo.Exists(ctx, s.pgClient.DB, companyID, it.ProductID)
 		if err != nil {
 			return err
 		}
@@ -1048,11 +1400,11 @@ func (s *quoteService) ValidateQuoteItems(ctx context.Context, companyID uuid.UU
 }
 
 func (s *quoteService) ValidatePricing(ctx context.Context, companyID, quoteID uuid.UUID) error {
-	subtotal, discountTotal, taxTotal, grandTotal, err := s.quoteRepo.GetTotals(ctx, nil, companyID, quoteID)
+	subtotal, discountTotal, taxTotal, grandTotal, err := s.quoteRepo.GetTotals(ctx, s.pgClient.DB, companyID, quoteID)
 	if err != nil {
 		return err
 	}
-	items, err := s.quoteRepo.GetItems(ctx, nil, companyID, quoteID)
+	items, err := s.quoteRepo.GetItems(ctx, s.pgClient.DB, companyID, quoteID)
 	if err != nil {
 		return err
 	}
@@ -1071,7 +1423,7 @@ func (s *quoteService) ValidatePricing(ctx context.Context, companyID, quoteID u
 }
 
 func (s *quoteService) ValidateConversion(ctx context.Context, companyID, quoteID uuid.UUID) error {
-	quote, err := s.quoteRepo.GetByID(ctx, nil, companyID, quoteID)
+	quote, err := s.quoteRepo.GetByID(ctx, s.pgClient.DB, companyID, quoteID)
 	if err != nil {
 		return err
 	}
@@ -1081,7 +1433,7 @@ func (s *quoteService) ValidateConversion(ctx context.Context, companyID, quoteI
 	if quote.ExpiryDate != nil && time.Now().After(*quote.ExpiryDate) {
 		return fmt.Errorf("%w: quote has expired", salesErrors.ErrInvalidStatus)
 	}
-	converted, err := s.quoteRepo.IsConverted(ctx, nil, companyID, quoteID)
+	converted, err := s.quoteRepo.IsConverted(ctx, s.pgClient.DB, companyID, quoteID)
 	if err != nil {
 		return err
 	}
@@ -1091,235 +1443,24 @@ func (s *quoteService) ValidateConversion(ctx context.Context, companyID, quoteI
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Analytics & reporting
-// ----------------------------------------------------------------------------
+// ------------------------ Reporting & Auxiliary ------------------------
 
 func (s *quoteService) GetQuoteConversionRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.quoteRepo.GetQuoteConversionRate(ctx, nil, companyID, from, to)
+	return s.quoteRepo.GetQuoteConversionRate(ctx, s.pgClient.DB, companyID, from, to)
 }
 
 func (s *quoteService) GetTotalQuotedRevenue(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.quoteRepo.GetTotalQuotedRevenue(ctx, nil, companyID, from, to)
+	return s.quoteRepo.GetTotalQuotedRevenue(ctx, s.pgClient.DB, companyID, from, to)
 }
 
-// ----------------------------------------------------------------------------
-// Existence helpers
-// ----------------------------------------------------------------------------
-
 func (s *quoteService) QuoteExists(ctx context.Context, companyID, quoteID uuid.UUID) (bool, error) {
-	return s.quoteRepo.Exists(ctx, nil, companyID, quoteID)
+	return s.quoteRepo.Exists(ctx, s.pgClient.DB, companyID, quoteID)
 }
 
 func (s *quoteService) QuoteNumberExists(ctx context.Context, companyID uuid.UUID, quoteNumber string, revision int) (bool, error) {
-	return s.quoteRepo.ExistsByNumber(ctx, nil, companyID, quoteNumber, revision)
+	return s.quoteRepo.ExistsByNumber(ctx, s.pgClient.DB, companyID, quoteNumber, revision)
 }
 
 func (s *quoteService) IsExpired(ctx context.Context, companyID, quoteID uuid.UUID, at time.Time) (bool, error) {
-	return s.quoteRepo.IsExpired(ctx, nil, companyID, quoteID, at)
-}
-
-// ----------------------------------------------------------------------------
-// Internal helpers
-// ----------------------------------------------------------------------------
-
-func (s *quoteService) validateCreateQuoteRequest(req *CreateQuoteRequest) error {
-	if req.CompanyID == uuid.Nil {
-		return fmt.Errorf("%w: company_id required", salesErrors.ErrInvalidInput)
-	}
-	if req.CustomerID == uuid.Nil {
-		return fmt.Errorf("%w: customer_id required", salesErrors.ErrInvalidInput)
-	}
-	if len(req.Items) == 0 {
-		return fmt.Errorf("%w: at least one item required", salesErrors.ErrInvalidInput)
-	}
-	return s.ValidateQuoteItems(context.Background(), req.CompanyID, req.Items)
-}
-
-func (s *quoteService) addQuoteItems(ctx context.Context, tx repository.DBTX, quote *models.Quote, items []*CreateQuoteItemRequest) error {
-	quoteItems := make([]*models.QuoteItem, 0, len(items))
-	for _, it := range items {
-		product, err := s.productRepo.GetByID(ctx, tx, quote.CompanyID, it.ProductID)
-		if err != nil {
-			return fmt.Errorf("product %s: %w", it.ProductID, err)
-		}
-		if !product.IsActive {
-			return fmt.Errorf("%w: product %s is inactive", salesErrors.ErrProductInactive, product.SKU)
-		}
-		unitPrice := product.UnitPrice
-		if it.UnitPrice != nil {
-			unitPrice = *it.UnitPrice
-		}
-		discount := decimal.Zero
-		if it.DiscountAmount != nil {
-			discount = *it.DiscountAmount
-		}
-		item := &models.QuoteItem{
-			QuoteItemID:         uuid.New(),
-			QuoteID:             quote.QuoteID,
-			ProductID:           product.ProductID,
-			ProductNameSnapshot: product.Name,
-			Quantity:            it.Quantity,
-			UnitPrice:           unitPrice,
-			DiscountAmount:      discount,
-			TaxAmount:           decimal.Zero,
-			Metadata:            it.Metadata,
-		}
-		quoteItems = append(quoteItems, item)
-	}
-	return s.quoteRepo.AddItems(ctx, tx, quote.CompanyID, quote.QuoteID, quoteItems)
-}
-
-func (s *quoteService) recalculateQuoteTotals(ctx context.Context, tx repository.DBTX, quoteID uuid.UUID) error {
-	quote, err := s.quoteRepo.GetByID(ctx, tx, uuid.Nil, quoteID)
-	if err != nil {
-		return err
-	}
-	items, err := s.quoteRepo.GetItems(ctx, tx, quote.CompanyID, quoteID)
-	if err != nil {
-		return err
-	}
-	var subtotal, discountTotal, taxTotal decimal.Decimal
-	for _, it := range items {
-		lineSubtotal := it.UnitPrice.Mul(it.Quantity)
-		subtotal = subtotal.Add(lineSubtotal)
-		discountTotal = discountTotal.Add(it.DiscountAmount)
-		taxable := lineSubtotal.Sub(it.DiscountAmount)
-		tax, err := s.pricingRepo.CalculateLineTax(ctx, tx, quote.CompanyID, it.ProductID, taxable)
-		if err != nil {
-			return fmt.Errorf("calculate line tax: %w", err)
-		}
-		it.TaxAmount = tax
-		taxTotal = taxTotal.Add(tax)
-		updateQuery := `UPDATE sales.quote_items SET tax_amount = $1 WHERE quote_item_id = $2`
-		if _, err := tx.ExecContext(ctx, updateQuery, tax, it.QuoteItemID); err != nil {
-			return fmt.Errorf("update item tax: %w", err)
-		}
-	}
-	quote.Subtotal = subtotal
-	quote.DiscountTotal = discountTotal
-	quote.TaxTotal = taxTotal
-	// grandTotal is computed by stored generated column, no need to set
-	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
-		return fmt.Errorf("update quote totals: %w", err)
-	}
-	return nil
-}
-
-func (s *quoteService) applyCouponInternal(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID, couponCode string) (*discount.Coupon, decimal.Decimal, error) {
-	coupon, err := s.couponRepo.ValidateCoupon(ctx, tx, companyID, couponCode, nil, decimal.Zero, nil, time.Now())
-	if err != nil {
-		return nil, decimal.Zero, err
-	}
-	subtotal, _, _, _, err := s.quoteRepo.GetTotals(ctx, tx, companyID, quoteID)
-	if err != nil {
-		return nil, decimal.Zero, err
-	}
-	discountAmount, err := s.couponRepo.CalculateDiscount(ctx, tx, companyID, coupon.CouponID, subtotal)
-	if err != nil {
-		return nil, decimal.Zero, err
-	}
-	return coupon, discountAmount, nil
-}
-
-func (s *quoteService) removeCouponInternal(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID, couponCode string) error {
-	// No persistent storage of applied coupons on quote, so nothing to remove.
-	return nil
-}
-
-func (s *quoteService) generateQuoteNumber(tx repository.DBTX, companyID uuid.UUID) (string, error) {
-	prefix := companyID.String()[:8]
-	timestamp := time.Now().UnixMilli()
-	quoteNumber := fmt.Sprintf("QT-%s-%d", prefix, timestamp)
-	exists, err := s.quoteRepo.ExistsByNumber(context.Background(), tx, companyID, quoteNumber, 1)
-	if err != nil {
-		return "", err
-	}
-	if exists {
-		return fmt.Sprintf("QT-%s-%d-1", prefix, timestamp), nil
-	}
-	return quoteNumber, nil
-}
-
-func (s *quoteService) validateStatusTransition(current, next enums.QuoteStatus) error {
-	transitions := map[enums.QuoteStatus][]enums.QuoteStatus{
-		enums.QuoteStatusDraft:     {enums.QuoteStatusSent, enums.QuoteStatusRejected},
-		enums.QuoteStatusSent:      {enums.QuoteStatusAccepted, enums.QuoteStatusRejected, enums.QuoteStatusExpired},
-		enums.QuoteStatusAccepted:  {enums.QuoteStatusConverted},
-		enums.QuoteStatusRejected:  {},
-		enums.QuoteStatusExpired:   {},
-		enums.QuoteStatusConverted: {},
-	}
-	allowed, ok := transitions[current]
-	if !ok {
-		return fmt.Errorf("%w: unknown status %s", salesErrors.ErrInvalidStatus, current)
-	}
-	for _, s := range allowed {
-		if s == next {
-			return nil
-		}
-	}
-	return fmt.Errorf("%w: cannot transition from %s to %s", salesErrors.ErrInvalidTransition, current, next)
-}
-
-func (s *quoteService) mapStatusToEvent(status enums.QuoteStatus) string {
-	switch status {
-	case enums.QuoteStatusSent:
-		return salesEvents.EventQuoteSent
-	case enums.QuoteStatusAccepted:
-		return salesEvents.EventQuoteAccepted
-	case enums.QuoteStatusRejected:
-		return salesEvents.EventQuoteRejected
-	case enums.QuoteStatusExpired:
-		return salesEvents.EventQuoteExpired
-	case enums.QuoteStatusConverted:
-		return salesEvents.EventQuoteConverted
-	default:
-		return salesEvents.EventQuoteUpdated
-	}
-}
-
-func (s *quoteService) emitQuoteEvent(ctx context.Context, tx repository.DBTX, quote *models.Quote, eventType string, extra map[string]interface{}) error {
-	sqlTx, ok := tx.(*sql.Tx)
-	if !ok {
-		return fmt.Errorf("tx is not a *sql.Tx")
-	}
-	expiry := ""
-	if quote.ExpiryDate != nil {
-		expiry = quote.ExpiryDate.Format(time.RFC3339)
-	}
-	payload := salesEvents.QuotePayload{
-		QuoteID:     quote.QuoteID.String(),
-		CompanyID:   quote.CompanyID.String(),
-		CustomerID:  quote.CustomerID.String(),
-		QuoteNumber: quote.QuoteNumber,
-		Revision:    quote.Revision,
-		Status:      string(quote.Status), // fixed
-		GrandTotal:  quote.GrandTotal.String(),
-		ExpiryDate:  expiry, // fixed: empty string if nil
-	}
-	if extra != nil {
-		// optionally merge extra fields (not needed for standard events)
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	event := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "quote",
-		AggregateID:   quote.QuoteID.String(),
-		EventType:     eventType,
-		Topic:         salesEvents.TopicSalesEvents,
-		Payload:       data,
-	}
-	return s.outboxRepo.Store(ctx, sqlTx, event)
-}
-
-func (s *quoteService) calcSubtotalFromItems(items []*models.QuoteItem) decimal.Decimal {
-	var total decimal.Decimal
-	for _, it := range items {
-		total = total.Add(it.UnitPrice.Mul(it.Quantity))
-	}
-	return total
+	return s.quoteRepo.IsExpired(ctx, s.pgClient.DB, companyID, quoteID, at)
 }

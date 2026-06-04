@@ -1165,15 +1165,15 @@ func (s *salesRepService) CanManageCustomer(ctx context.Context, companyID, sale
 }
 
 func (s *salesRepService) SalesRepExists(ctx context.Context, companyID, salesRepID uuid.UUID) (bool, error) {
-	return s.repRepo.Exists(ctx, nil, companyID, salesRepID)
+	return s.repRepo.Exists(ctx, s.pgClient.DB, companyID, salesRepID)
 }
 
 func (s *salesRepService) SalesRepCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error) {
-	return s.repRepo.ExistsByCode(ctx, nil, companyID, code)
+	return s.repRepo.ExistsByCode(ctx, s.pgClient.DB, companyID, code)
 }
 
 func (s *salesRepService) UserAlreadyLinked(ctx context.Context, companyID, userID uuid.UUID) (bool, error) {
-	return s.repRepo.ExistsByUserID(ctx, nil, companyID, userID)
+	return s.repRepo.ExistsByUserID(ctx, s.pgClient.DB, companyID, userID)
 }
 
 // ---------------------------------------------------------------------

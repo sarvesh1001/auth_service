@@ -711,6 +711,8 @@ func (r *quoteRepository) List(ctx context.Context, db DBTX, filter QuoteFilter,
 		"status":       true,
 		"grand_total":  true,
 		"created_at":   true,
+		"revision":     true, // <-- ADD THIS LINE
+
 	}
 	orderBy, err := r.validateSort(s, allowedSort)
 	if err != nil {

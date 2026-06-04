@@ -782,11 +782,15 @@ func (f *SalesInfraFactory) PromotionHandler() *handler.PromotionHandler {
 
 func (f *SalesInfraFactory) QuoteHandler() *handler.QuoteHandler {
 	if f.quoteHandler == nil {
-		f.quoteHandler = handler.NewQuoteHandler(f.QuoteService(), f.logger)
+		f.quoteHandler = handler.NewQuoteHandler(
+			f.QuoteService(),
+			f.CustomerService(),
+			f.SalesRepService(),
+			f.logger,
+		)
 	}
 	return f.quoteHandler
 }
-
 func (f *SalesInfraFactory) ReportHandler() *handler.ReportHandler {
 	if f.reportHandler == nil {
 		f.reportHandler = handler.NewReportHandler(f.SalesQueryService(), f.logger)

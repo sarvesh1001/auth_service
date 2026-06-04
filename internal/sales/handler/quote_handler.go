@@ -1,7 +1,9 @@
 // file: internal/sales/handler/quote_handler.go
+
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,13 +22,22 @@ import (
 // QuoteHandler handles HTTP requests for quote management.
 type QuoteHandler struct {
 	quoteService service.QuoteService
+	customerSvc  service.CustomerService // for customer existence checks
+	salesRepSvc  service.SalesRepService
 	*BaseHandler
 }
 
 // NewQuoteHandler creates a new QuoteHandler.
-func NewQuoteHandler(quoteService service.QuoteService, logger *zap.Logger) *QuoteHandler {
+func NewQuoteHandler(
+	quoteService service.QuoteService,
+	customerSvc service.CustomerService,
+	salesRepSvc service.SalesRepService,
+	logger *zap.Logger,
+) *QuoteHandler {
 	return &QuoteHandler{
 		quoteService: quoteService,
+		customerSvc:  customerSvc,
+		salesRepSvc:  salesRepSvc,
 		BaseHandler:  &BaseHandler{logger: logger.Named("quote_handler")},
 	}
 }
@@ -34,6 +45,7 @@ func NewQuoteHandler(quoteService service.QuoteService, logger *zap.Logger) *Quo
 // ---------- Request/Response Types ----------
 
 type createQuoteRequest struct {
+	CompanyID  *string            `json:"company_id,omitempty"`
 	CustomerID string             `json:"customer_id"`
 	QuoteDate  string             `json:"quote_date"`
 	ExpiryDate *string            `json:"expiry_date,omitempty"`
@@ -141,6 +153,55 @@ type quotePricingPreviewResponse struct {
 	GrandTotal    string `json:"grand_total"`
 }
 
+// Supported currencies
+var supportedCurrencies = map[string]bool{
+	"USD": true,
+	"EUR": true,
+	"GBP": true,
+	"JPY": true,
+	"CAD": true,
+	"AUD": true,
+	"CHF": true,
+	"CNY": true,
+	"INR": true,
+}
+
+// ---------- Helper ----------
+
+// injectIdempotencyKey adds the idempotency key to the request context.
+func (h *QuoteHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
+
+// validateCurrency checks if the currency code is supported.
+func (h *QuoteHandler) validateCurrency(currency string) error {
+	if currency == "" {
+		return nil // default will be applied later
+	}
+	if !supportedCurrencies[currency] {
+		return fmt.Errorf("unsupported currency code: %s", currency)
+	}
+	return nil
+}
+
+// validateQuantityAndUnitPrice performs overflow checks.
+func (h *QuoteHandler) validateQuantityAndUnitPrice(quantity decimal.Decimal, unitPrice decimal.Decimal, idx int) error {
+	const maxQuantity = 999999
+	const maxUnitPrice = 999999.9999
+
+	if quantity.GreaterThan(decimal.NewFromInt(maxQuantity)) {
+		return fmt.Errorf("item[%d] quantity exceeds maximum %d", idx, maxQuantity)
+	}
+	if unitPrice.GreaterThan(decimal.NewFromFloat(maxUnitPrice)) {
+		return fmt.Errorf("item[%d] unit_price exceeds maximum %.4f", idx, maxUnitPrice)
+	}
+	return nil
+}
+
 // ---------- Handler Methods ----------
 
 // CreateQuote handles POST /quotes
@@ -165,7 +226,15 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
+	// Optional company_id in body must match header if provided
+	if req.CompanyID != nil && *req.CompanyID != "" {
+		if *req.CompanyID != companyID.String() {
+			h.respondWithError(w, http.StatusBadRequest, "company_id in body does not match header")
+			return
+		}
+	}
+
+	// Validate customer_id
 	if req.CustomerID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "customer_id is required")
 		return
@@ -176,11 +245,13 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate items
 	if len(req.Items) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "at least one item is required")
 		return
 	}
 
+	// Parse dates
 	var quoteDate time.Time
 	if req.QuoteDate != "" {
 		quoteDate, err = time.Parse(time.RFC3339, req.QuoteDate)
@@ -208,9 +279,38 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		expiryDate = &exp
 	}
 
+	// Expiry date must not be before quote date
+	if expiryDate != nil && expiryDate.Before(quoteDate) {
+		h.respondWithError(w, http.StatusBadRequest, "expiry_date cannot be before quote_date")
+		return
+	}
+
+	// Currency validation
 	currency := req.Currency
 	if currency == "" {
 		currency = "USD"
+	}
+	if err := h.validateCurrency(currency); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Notes length validation
+	if req.Notes != nil && len(*req.Notes) > 1000 {
+		h.respondWithError(w, http.StatusBadRequest, "notes must not exceed 1000 characters")
+		return
+	}
+
+	// Customer existence check
+	customerExists, err := h.customerSvc.CustomerExists(ctx, companyID, customerID)
+	if err != nil {
+		h.logger.Error("failed to check customer existence", zap.Error(err))
+		h.respondWithError(w, http.StatusInternalServerError, "internal error checking customer")
+		return
+	}
+	if !customerExists {
+		h.respondWithError(w, http.StatusNotFound, "customer not found")
+		return
 	}
 
 	var salesRepID *uuid.UUID
@@ -220,9 +320,20 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, "invalid sales_rep_id")
 			return
 		}
+		exists, err := h.salesRepSvc.SalesRepExists(ctx, companyID, parsed)
+		if err != nil {
+			h.logger.Error("failed to check sales rep existence", zap.Error(err))
+			h.respondWithError(w, http.StatusInternalServerError, "internal error checking sales rep")
+			return
+		}
+		if !exists {
+			h.respondWithError(w, http.StatusNotFound, "sales_rep not found")
+			return
+		}
 		salesRepID = &parsed
 	}
 
+	// Build items with overflow validation
 	items := make([]*service.CreateQuoteItemRequest, len(req.Items))
 	for i, it := range req.Items {
 		if it.ProductID == "" {
@@ -244,7 +355,11 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("item[%d] invalid unit_price", i))
 			return
 		}
-		// Take address of unitPrice (copy to avoid loop variable pointer issue)
+		// Overflow checks
+		if err := h.validateQuantityAndUnitPrice(quantity, unitPrice, i); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		up := unitPrice
 		items[i] = &service.CreateQuoteItemRequest{
 			ProductID: productID,
@@ -253,16 +368,19 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Permission check
 	if !h.hasPermission(ctx, companyID, userID, "quote:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
+	// Idempotency
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	svcReq := &service.CreateQuoteRequest{
 		CompanyID:  companyID,
@@ -273,6 +391,7 @@ func (h *QuoteHandler) CreateQuote(w http.ResponseWriter, r *http.Request) {
 		Notes:      req.Notes,
 		SalesRepID: salesRepID,
 		Items:      items,
+		CreatedBy:  &userID,
 	}
 
 	quote, err := h.quoteService.CreateQuote(ctx, svcReq)
@@ -350,6 +469,12 @@ func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Notes length validation
+	if req.Notes != nil && len(*req.Notes) > 1000 {
+		h.respondWithError(w, http.StatusBadRequest, "notes must not exceed 1000 characters")
+		return
+	}
+
 	var expiryDate *time.Time
 	if req.ExpiryDate != nil && *req.ExpiryDate != "" {
 		exp, err := time.Parse(time.RFC3339, *req.ExpiryDate)
@@ -363,16 +488,26 @@ func (h *QuoteHandler) UpdateQuote(w http.ResponseWriter, r *http.Request) {
 		expiryDate = &exp
 	}
 
+	// Currency validation
+	if req.Currency != nil && *req.Currency != "" {
+		if err := h.validateCurrency(*req.Currency); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	svcReq := &service.UpdateQuoteRequest{
 		ExpiryDate: expiryDate,
 		Currency:   req.Currency,
 		Notes:      req.Notes,
+		UpdatedBy:  &userID,
 	}
 
 	updated, err := h.quoteService.UpdateQuote(ctx, companyID, quoteID, svcReq)
@@ -447,6 +582,7 @@ func (h *QuoteHandler) DeleteQuote(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.DeleteQuote(ctx, companyID, quoteID, userID)
 	if err != nil {
@@ -836,6 +972,11 @@ func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("item[%d] invalid unit_price", i))
 			return
 		}
+		// Overflow checks
+		if err := h.validateQuantityAndUnitPrice(quantity, unitPrice, i); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		up := unitPrice
 		items[i] = &service.CreateQuoteItemRequest{
 			ProductID: productID,
@@ -849,6 +990,7 @@ func (h *QuoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.AddItems(ctx, companyID, quoteID, items, userID)
 	if err != nil {
@@ -918,6 +1060,11 @@ func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("item[%d] invalid unit_price", i))
 			return
 		}
+		// Overflow checks
+		if err := h.validateQuantityAndUnitPrice(quantity, unitPrice, i); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		up := unitPrice
 		items[i] = &service.CreateQuoteItemRequest{
 			ProductID: productID,
@@ -931,6 +1078,7 @@ func (h *QuoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.ReplaceItems(ctx, companyID, quoteID, items, userID)
 	if err != nil {
@@ -984,6 +1132,7 @@ func (h *QuoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.RemoveItem(ctx, companyID, quoteID, itemID, userID)
 	if err != nil {
@@ -1098,6 +1247,7 @@ func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	coupon, discount, err := h.quoteService.ApplyCoupon(ctx, companyID, quoteID, req.CouponCode, userID)
 	if err != nil {
@@ -1154,6 +1304,7 @@ func (h *QuoteHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.RemoveCoupon(ctx, companyID, quoteID, couponCode, userID)
 	if err != nil {
@@ -1201,6 +1352,7 @@ func (h *QuoteHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.ApplyBestDiscounts(ctx, companyID, quoteID, userID)
 	if err != nil {
@@ -1266,6 +1418,11 @@ func (h *QuoteHandler) PreviewPricing(w http.ResponseWriter, r *http.Request) {
 		unitPrice, err := decimal.NewFromString(it.UnitPrice)
 		if err != nil || unitPrice.LessThan(decimal.Zero) {
 			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("item[%d] invalid unit_price", i))
+			return
+		}
+		// Overflow checks
+		if err := h.validateQuantityAndUnitPrice(quantity, unitPrice, i); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		up := unitPrice
@@ -1346,6 +1503,7 @@ func (h *QuoteHandler) RecalculateTotals(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.RecalculateTotals(ctx, companyID, quoteID, userID)
 	if err != nil {
@@ -1467,6 +1625,11 @@ func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) {
 			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("item[%d] invalid unit_price", i))
 			return
 		}
+		// Overflow checks
+		if err := h.validateQuantityAndUnitPrice(quantity, unitPrice, i); err != nil {
+			h.respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		up := unitPrice
 		items[i] = &service.CreateQuoteItemRequest{
 			ProductID: productID,
@@ -1480,10 +1643,14 @@ func (h *QuoteHandler) CreateRevision(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	revisionReq := &service.CreateQuoteRevisionRequest{
-		Items: items,
-		Notes: req.Notes,
+		Items:       items,
+		Notes:       req.Notes,
+		UpdatedBy:   &userID,
+		ExpiryDate:  nil, // kept as nil to reuse existing logic
+		CouponCodes: nil,
 	}
 
 	newQuote, err := h.quoteService.CreateRevision(ctx, companyID, quoteID, revisionReq)
@@ -1635,6 +1802,7 @@ func (h *QuoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.UpdateStatus(ctx, companyID, quoteID, enums.QuoteStatus(req.Status), userID)
 	if err != nil {
@@ -1682,6 +1850,7 @@ func (h *QuoteHandler) MarkSent(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.MarkSent(ctx, companyID, quoteID, userID)
 	if err != nil {
@@ -1729,6 +1898,7 @@ func (h *QuoteHandler) AcceptQuote(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.AcceptQuote(ctx, companyID, quoteID, userID)
 	if err != nil {
@@ -1781,6 +1951,7 @@ func (h *QuoteHandler) RejectQuote(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.RejectQuote(ctx, companyID, quoteID, req.Reason, userID)
 	if err != nil {
@@ -1828,6 +1999,7 @@ func (h *QuoteHandler) ExpireQuote(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.ExpireQuote(ctx, companyID, quoteID, userID)
 	if err != nil {
@@ -1958,10 +2130,12 @@ func (h *QuoteHandler) ConvertToOrder(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	convertReq := &service.ConvertQuoteToOrderRequest{
 		OrderDate: orderDate,
 		Notes:     req.Notes,
+		UpdatedBy: &userID,
 	}
 
 	order, err := h.quoteService.ConvertToOrder(ctx, companyID, quoteID, convertReq)
@@ -2069,6 +2243,7 @@ func (h *QuoteHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.AssignSalesRep(ctx, companyID, quoteID, salesRepID, userID)
 	if err != nil {
@@ -2116,6 +2291,7 @@ func (h *QuoteHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	err = h.quoteService.RemoveSalesRep(ctx, companyID, quoteID, userID)
 	if err != nil {
