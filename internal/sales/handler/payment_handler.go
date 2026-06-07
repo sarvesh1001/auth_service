@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,7 +30,7 @@ func NewPaymentHandler(paymentService service.PaymentService, logger *zap.Logger
 	}
 }
 
-// ---------- Request/Response Types (CompanyID removed where present) ----------
+// ---------- Request/Response Types ----------
 
 type createPaymentRequest struct {
 	PaymentNumber   string        `json:"payment_number,omitempty"`
@@ -206,56 +207,14 @@ type paymentsByMethodResponse struct {
 	Total  string `json:"total"`
 }
 
-// ---------- Helper Functions ----------
-func (h *PaymentHandler) toPaymentResponse(p *models.Payment) paymentResponse {
-	resp := paymentResponse{
-		PaymentID:       p.PaymentID.String(),
-		CompanyID:       p.CompanyID.String(),
-		PaymentNumber:   p.PaymentNumber,
-		ExternalRef:     p.ExternalRef,
-		PaymentDate:     p.PaymentDate.Format(time.RFC3339),
-		Amount:          p.Amount.String(),
-		PaymentMethod:   string(p.PaymentMethod),
-		Status:          string(p.Status),
-		Reference:       p.Reference,
-		GatewayResponse: &p.GatewayResponse,
-		FailureReason:   p.FailureReason,
-		RefundedAmount:  p.RefundedAmount.String(),
-		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),
-	}
-	if p.ExchangeRate != nil {
-		rateStr := p.ExchangeRate.String()
-		resp.ExchangeRate = &rateStr
-	}
-	if p.CompletedAt != nil {
-		completedStr := p.CompletedAt.Format(time.RFC3339)
-		resp.CompletedAt = &completedStr
-	}
-	return resp
-}
+// ---------- Helper ----------
 
-func (h *PaymentHandler) toRefundResponse(r *models.PaymentRefund) refundResponse {
-	resp := refundResponse{
-		RefundID:   r.RefundID.String(),
-		CompanyID:  r.CompanyID.String(),
-		PaymentID:  r.PaymentID.String(),
-		Amount:     r.Amount.String(),
-		Reason:     r.Reason,
-		GatewayRef: r.GatewayRef,
-		Status:     r.Status,
-		CreatedAt:  r.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:  r.UpdatedAt.Format(time.RFC3339),
+func (h *PaymentHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
 	}
-	if r.ReturnID != nil {
-		retStr := r.ReturnID.String()
-		resp.ReturnID = &retStr
-	}
-	if r.CompletedAt != nil {
-		compStr := r.CompletedAt.Format(time.RFC3339)
-		resp.CompletedAt = &compStr
-	}
-	return resp
+	return ctx
 }
 
 // ---------- Endpoint Implementations ----------
@@ -314,7 +273,13 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	// Fix: safely handle optional gateway_response
+	gatewayResp := models.JSONB{}
+	if req.GatewayResponse != nil {
+		gatewayResp = *req.GatewayResponse
+	}
 
 	svcReq := &service.CreatePaymentRequest{
 		CompanyID:       companyID,
@@ -324,7 +289,7 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		Amount:          amount,
 		PaymentMethod:   method,
 		Reference:       req.Reference,
-		GatewayResponse: *req.GatewayResponse,
+		GatewayResponse: gatewayResp,
 		CreatedBy:       &userID,
 	}
 
@@ -348,7 +313,7 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 // PUT /payments/{id}
 func (h *PaymentHandler) UpdatePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -382,7 +347,7 @@ func (h *PaymentHandler) UpdatePayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.UpdatePaymentRequest{
 		ExternalRef: req.ExternalRef,
@@ -435,7 +400,7 @@ func (h *PaymentHandler) UpdatePayment(w http.ResponseWriter, r *http.Request) {
 // DELETE /payments/{id}
 func (h *PaymentHandler) DeletePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -463,7 +428,7 @@ func (h *PaymentHandler) DeletePayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.DeletePayment(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -482,7 +447,7 @@ func (h *PaymentHandler) DeletePayment(w http.ResponseWriter, r *http.Request) {
 // GET /payments/{id}
 func (h *PaymentHandler) GetPaymentByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -955,7 +920,7 @@ func (h *PaymentHandler) RegisterCashPayment(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	allocations := make([]service.PaymentAllocationRequest, len(req.Allocations))
 	for i, a := range req.Allocations {
@@ -1037,7 +1002,7 @@ func (h *PaymentHandler) RegisterCardPayment(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	allocations := make([]service.PaymentAllocationRequest, len(req.Allocations))
 	for i, a := range req.Allocations {
@@ -1121,7 +1086,7 @@ func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	allocations := make([]service.PaymentAllocationRequest, len(req.Allocations))
 	for i, a := range req.Allocations {
@@ -1205,7 +1170,7 @@ func (h *PaymentHandler) RegisterChequePayment(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	allocations := make([]service.PaymentAllocationRequest, len(req.Allocations))
 	for i, a := range req.Allocations {
@@ -1289,7 +1254,7 @@ func (h *PaymentHandler) RegisterWalletPayment(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	allocations := make([]service.PaymentAllocationRequest, len(req.Allocations))
 	for i, a := range req.Allocations {
@@ -1375,6 +1340,7 @@ func (h *PaymentHandler) ProcessGatewayPayment(w http.ResponseWriter, r *http.Re
 	if idempotencyKey == "" {
 		idempotencyKey = req.IdempotencyKey
 	}
+	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
 	allocations := make([]service.PaymentAllocationRequest, len(req.Allocations))
 	for i, a := range req.Allocations {
@@ -1489,7 +1455,7 @@ func (h *PaymentHandler) GetPaymentByIdempotencyKey(w http.ResponseWriter, r *ht
 // POST /payments/{id}/allocate
 func (h *PaymentHandler) AllocatePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1530,7 +1496,7 @@ func (h *PaymentHandler) AllocatePayment(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.AllocatePayment(ctx, companyID, paymentID, invoiceID, amount, userID)
 	if err != nil {
@@ -1549,7 +1515,7 @@ func (h *PaymentHandler) AllocatePayment(w http.ResponseWriter, r *http.Request)
 // POST /payments/{id}/allocate-multiple
 func (h *PaymentHandler) AllocatePaymentToInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1594,7 +1560,7 @@ func (h *PaymentHandler) AllocatePaymentToInvoices(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.AllocatePaymentToInvoices(ctx, companyID, paymentID, allocations, userID)
 	if err != nil {
@@ -1613,7 +1579,7 @@ func (h *PaymentHandler) AllocatePaymentToInvoices(w http.ResponseWriter, r *htt
 // POST /payments/{id}/auto-allocate
 func (h *PaymentHandler) AutoAllocatePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1638,7 +1604,7 @@ func (h *PaymentHandler) AutoAllocatePayment(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.AutoAllocatePayment(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -1657,12 +1623,12 @@ func (h *PaymentHandler) AutoAllocatePayment(w http.ResponseWriter, r *http.Requ
 // DELETE /payments/{id}/allocations/{allocId}
 func (h *PaymentHandler) RemoveAllocation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
 	}
-	allocationID, err := parseUUIDParamPayment(r, "allocId")
+	allocationID, err := h.parseUUIDParam(r, "allocId")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid allocation ID")
 		return
@@ -1687,7 +1653,7 @@ func (h *PaymentHandler) RemoveAllocation(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.RemoveAllocation(ctx, companyID, paymentID, allocationID, userID)
 	if err != nil {
@@ -1706,7 +1672,7 @@ func (h *PaymentHandler) RemoveAllocation(w http.ResponseWriter, r *http.Request
 // GET /payments/{id}/allocations
 func (h *PaymentHandler) GetPaymentAllocations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1753,7 +1719,7 @@ func (h *PaymentHandler) GetPaymentAllocations(w http.ResponseWriter, r *http.Re
 // GET /payments/{id}/unallocated
 func (h *PaymentHandler) GetUnallocatedAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1790,7 +1756,7 @@ func (h *PaymentHandler) GetUnallocatedAmount(w http.ResponseWriter, r *http.Req
 // POST /payments/{id}/refunds
 func (h *PaymentHandler) CreateRefund(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1826,7 +1792,7 @@ func (h *PaymentHandler) CreateRefund(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CreateRefundRequest{
 		CompanyID:  companyID,
@@ -1855,7 +1821,7 @@ func (h *PaymentHandler) CreateRefund(w http.ResponseWriter, r *http.Request) {
 // POST /payments/{id}/refund-full
 func (h *PaymentHandler) RefundFullPayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1888,7 +1854,7 @@ func (h *PaymentHandler) RefundFullPayment(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	refund, err := h.paymentService.RefundFullPayment(ctx, companyID, paymentID, req.Reason, userID)
 	if err != nil {
@@ -1908,7 +1874,7 @@ func (h *PaymentHandler) RefundFullPayment(w http.ResponseWriter, r *http.Reques
 // POST /payments/{id}/refund-partial
 func (h *PaymentHandler) RefundPartialPayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -1947,7 +1913,7 @@ func (h *PaymentHandler) RefundPartialPayment(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	refund, err := h.paymentService.RefundPartialPayment(ctx, companyID, paymentID, amount, req.Reason, userID)
 	if err != nil {
@@ -1967,7 +1933,7 @@ func (h *PaymentHandler) RefundPartialPayment(w http.ResponseWriter, r *http.Req
 // POST /payments/{id}/gateway-refund
 func (h *PaymentHandler) ProcessGatewayRefund(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2003,7 +1969,7 @@ func (h *PaymentHandler) ProcessGatewayRefund(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.ProcessGatewayRefundRequest{
 		CompanyID:  companyID,
@@ -2031,7 +1997,7 @@ func (h *PaymentHandler) ProcessGatewayRefund(w http.ResponseWriter, r *http.Req
 // GET /refunds/{id}
 func (h *PaymentHandler) GetRefundByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	refundID, err := parseUUIDParamPayment(r, "id")
+	refundID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid refund ID")
 		return
@@ -2069,7 +2035,7 @@ func (h *PaymentHandler) GetRefundByID(w http.ResponseWriter, r *http.Request) {
 // GET /payments/{id}/refunds
 func (h *PaymentHandler) GetPaymentRefunds(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2110,7 +2076,7 @@ func (h *PaymentHandler) GetPaymentRefunds(w http.ResponseWriter, r *http.Reques
 // GET /payments/{id}/refunded-amount
 func (h *PaymentHandler) GetRefundedAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2147,7 +2113,7 @@ func (h *PaymentHandler) GetRefundedAmount(w http.ResponseWriter, r *http.Reques
 // PATCH /payments/{id}/status
 func (h *PaymentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2183,7 +2149,7 @@ func (h *PaymentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.UpdateStatus(ctx, companyID, paymentID, status, userID)
 	if err != nil {
@@ -2202,7 +2168,7 @@ func (h *PaymentHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 // POST /payments/{id}/mark-pending
 func (h *PaymentHandler) MarkPending(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2227,7 +2193,7 @@ func (h *PaymentHandler) MarkPending(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.MarkPending(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -2245,7 +2211,7 @@ func (h *PaymentHandler) MarkPending(w http.ResponseWriter, r *http.Request) {
 // POST /payments/{id}/mark-processing
 func (h *PaymentHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2270,7 +2236,7 @@ func (h *PaymentHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) 
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.MarkProcessing(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -2288,7 +2254,7 @@ func (h *PaymentHandler) MarkProcessing(w http.ResponseWriter, r *http.Request) 
 // POST /payments/{id}/mark-completed
 func (h *PaymentHandler) MarkCompleted(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2313,7 +2279,7 @@ func (h *PaymentHandler) MarkCompleted(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	completedAt := time.Now()
 	err = h.paymentService.MarkCompleted(ctx, companyID, paymentID, completedAt, userID)
@@ -2332,7 +2298,7 @@ func (h *PaymentHandler) MarkCompleted(w http.ResponseWriter, r *http.Request) {
 // POST /payments/{id}/mark-failed
 func (h *PaymentHandler) MarkFailed(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2367,7 +2333,7 @@ func (h *PaymentHandler) MarkFailed(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.MarkFailed(ctx, companyID, paymentID, req.Reason, userID)
 	if err != nil {
@@ -2385,7 +2351,7 @@ func (h *PaymentHandler) MarkFailed(w http.ResponseWriter, r *http.Request) {
 // POST /payments/{id}/cancel
 func (h *PaymentHandler) CancelPayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2416,7 +2382,7 @@ func (h *PaymentHandler) CancelPayment(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.CancelPayment(ctx, companyID, paymentID, req.Reason, userID)
 	if err != nil {
@@ -2434,7 +2400,7 @@ func (h *PaymentHandler) CancelPayment(w http.ResponseWriter, r *http.Request) {
 // POST /payments/{id}/reconcile
 func (h *PaymentHandler) ReconcilePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2459,7 +2425,7 @@ func (h *PaymentHandler) ReconcilePayment(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.ReconcilePayment(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -2477,7 +2443,7 @@ func (h *PaymentHandler) ReconcilePayment(w http.ResponseWriter, r *http.Request
 // POST /payments/{id}/unreconcile
 func (h *PaymentHandler) UnreconcilePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2502,7 +2468,7 @@ func (h *PaymentHandler) UnreconcilePayment(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.paymentService.UnreconcilePayment(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -2805,7 +2771,7 @@ func (h *PaymentHandler) GetFailedPayments(w http.ResponseWriter, r *http.Reques
 // GET /payments/{id}/exists
 func (h *PaymentHandler) PaymentExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2913,7 +2879,7 @@ func (h *PaymentHandler) GatewayTransactionExists(w http.ResponseWriter, r *http
 // GET /payments/{id}/has-refunds
 func (h *PaymentHandler) HasRefunds(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	paymentID, err := parseUUIDParamPayment(r, "id")
+	paymentID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid payment ID")
 		return
@@ -2945,4 +2911,57 @@ func (h *PaymentHandler) HasRefunds(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"data":    map[string]bool{"has_refunds": has},
 	})
+}
+
+// ---------- Response Helpers ----------
+
+func (h *PaymentHandler) toPaymentResponse(p *models.Payment) paymentResponse {
+	resp := paymentResponse{
+		PaymentID:       p.PaymentID.String(),
+		CompanyID:       p.CompanyID.String(),
+		PaymentNumber:   p.PaymentNumber,
+		ExternalRef:     p.ExternalRef,
+		PaymentDate:     p.PaymentDate.Format(time.RFC3339),
+		Amount:          p.Amount.String(),
+		PaymentMethod:   string(p.PaymentMethod),
+		Status:          string(p.Status),
+		Reference:       p.Reference,
+		GatewayResponse: &p.GatewayResponse,
+		FailureReason:   p.FailureReason,
+		RefundedAmount:  p.RefundedAmount.String(),
+		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),
+	}
+	if p.ExchangeRate != nil {
+		rateStr := p.ExchangeRate.String()
+		resp.ExchangeRate = &rateStr
+	}
+	if p.CompletedAt != nil {
+		completedStr := p.CompletedAt.Format(time.RFC3339)
+		resp.CompletedAt = &completedStr
+	}
+	return resp
+}
+
+func (h *PaymentHandler) toRefundResponse(r *models.PaymentRefund) refundResponse {
+	resp := refundResponse{
+		RefundID:   r.RefundID.String(),
+		CompanyID:  r.CompanyID.String(),
+		PaymentID:  r.PaymentID.String(),
+		Amount:     r.Amount.String(),
+		Reason:     r.Reason,
+		GatewayRef: r.GatewayRef,
+		Status:     r.Status,
+		CreatedAt:  r.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:  r.UpdatedAt.Format(time.RFC3339),
+	}
+	if r.ReturnID != nil {
+		retStr := r.ReturnID.String()
+		resp.ReturnID = &retStr
+	}
+	if r.CompletedAt != nil {
+		compStr := r.CompletedAt.Format(time.RFC3339)
+		resp.CompletedAt = &compStr
+	}
+	return resp
 }

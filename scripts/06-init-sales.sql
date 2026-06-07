@@ -870,35 +870,33 @@ CREATE TABLE IF NOT EXISTS sales.sales_rep_commission_assignments (
 -- =====================================================
 -- FUNCTIONS & TRIGGERS
 -- =====================================================
-
--- Update invoice paid amount and status
 CREATE OR REPLACE FUNCTION sales.update_invoice_paid_amount()
 RETURNS TRIGGER AS $$
 BEGIN
     UPDATE sales.invoices
     SET amount_paid = COALESCE(
-        (SELECT SUM(amount) FROM sales.payment_allocations pa
+        (SELECT SUM(pa.amount) FROM sales.payment_allocations pa
          JOIN sales.payments p ON pa.payment_id = p.payment_id
          WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'),
         0
     ),
     amount_due = grand_total - COALESCE(
-        (SELECT SUM(amount) FROM sales.payment_allocations pa
+        (SELECT SUM(pa.amount) FROM sales.payment_allocations pa
          JOIN sales.payments p ON pa.payment_id = p.payment_id
          WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'),
         0
     ),
     status = CASE
-        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
+        WHEN COALESCE((SELECT SUM(pa.amount) FROM sales.payment_allocations pa
                        JOIN sales.payments p ON pa.payment_id = p.payment_id
                        WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) >= grand_total THEN 'paid'
-        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
+        WHEN COALESCE((SELECT SUM(pa.amount) FROM sales.payment_allocations pa
                        JOIN sales.payments p ON pa.payment_id = p.payment_id
                        WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) > 0 THEN 'issued'
         ELSE status
     END,
     paid_at = CASE
-        WHEN COALESCE((SELECT SUM(amount) FROM sales.payment_allocations pa
+        WHEN COALESCE((SELECT SUM(pa.amount) FROM sales.payment_allocations pa
                        JOIN sales.payments p ON pa.payment_id = p.payment_id
                        WHERE pa.invoice_id = NEW.invoice_id AND p.status = 'completed'), 0) >= grand_total THEN NOW()
         ELSE paid_at
@@ -908,7 +906,6 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
-
 -- Generic updated_at function
 CREATE OR REPLACE FUNCTION sales.update_updated_at_column()
 RETURNS TRIGGER AS $$

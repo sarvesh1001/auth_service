@@ -89,6 +89,8 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusBadRequest, "customer is inactive"
 	case errors.Is(err, salesErrors.ErrProductInactive):
 		return http.StatusBadRequest, "product is inactive"
+	case errors.Is(err, salesErrors.ErrPaymentOverAlloc): // <-- ADDED
+		return http.StatusBadRequest, err.Error()
 	default:
 		return http.StatusInternalServerError, "internal server error"
 	}

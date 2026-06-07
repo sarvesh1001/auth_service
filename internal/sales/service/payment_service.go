@@ -27,7 +27,7 @@ import (
 // =============================================================================
 
 // =============================================================================
-// Service Interface (unchanged – shown as a reminder)
+// Service Interface (unchanged)
 // =============================================================================
 
 type PaymentService interface {
@@ -511,22 +511,26 @@ func (s *paymentService) DeletePayment(ctx context.Context, companyID uuid.UUID,
 }
 
 // --------------------------------------------------------------------------
-// Retrieval methods (read‑only, no idempotency needed)
+// Retrieval methods (read‑only) - now use the default DB connection
 // --------------------------------------------------------------------------
 
 func (s *paymentService) GetPaymentByID(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (*models.Payment, error) {
-	return s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 }
 
 func (s *paymentService) GetPaymentByNumber(ctx context.Context, companyID uuid.UUID, paymentNumber string) (*models.Payment, error) {
-	return s.paymentRepo.GetByNumber(ctx, nil, companyID, paymentNumber)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetByNumber(ctx, db, companyID, paymentNumber)
 }
 
 func (s *paymentService) GetPaymentByGatewayReference(ctx context.Context, companyID uuid.UUID, gatewayReference string) (*models.Payment, error) {
-	return s.paymentRepo.GetByReference(ctx, nil, companyID, gatewayReference)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetByReference(ctx, db, companyID, gatewayReference)
 }
 
 func (s *paymentService) ListPayments(ctx context.Context, filter PaymentListFilter, p Pagination, srt Sort) ([]*models.Payment, int64, error) {
+	db := s.pgClient.DB
 	repoFilter := repository.PaymentFilter{
 		CompanyID: filter.CompanyID,
 	}
@@ -548,18 +552,20 @@ func (s *paymentService) ListPayments(ctx context.Context, filter PaymentListFil
 	if filter.MaxAmount != nil {
 		repoFilter.MaxAmount = filter.MaxAmount
 	}
-	return s.paymentRepo.List(ctx, nil, repoFilter,
+	return s.paymentRepo.List(ctx, db, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *paymentService) SearchPayments(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Payment, int64, error) {
-	return s.paymentRepo.Search(ctx, nil, companyID, query, limit, offset)
+	db := s.pgClient.DB
+	return s.paymentRepo.Search(ctx, db, companyID, query, limit, offset)
 }
 
 func (s *paymentService) GetPaymentsByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, srt Sort) ([]*models.Payment, int64, error) {
-	// As in original – implementation not shown for brevity, kept unchanged
-	invoices, _, err := s.invoiceRepo.GetByCustomer(ctx, nil, companyID, customerID,
+	db := s.pgClient.DB
+	// As in original – but using db instead of nil
+	invoices, _, err := s.invoiceRepo.GetByCustomer(ctx, db, companyID, customerID,
 		repository.Pagination{Limit: 1000, Offset: 0},
 		repository.Sort{Field: "invoice_date", Direction: "DESC"})
 	if err != nil {
@@ -570,7 +576,7 @@ func (s *paymentService) GetPaymentsByCustomer(ctx context.Context, companyID, c
 	}
 	paymentMap := make(map[uuid.UUID]*models.Payment)
 	for _, inv := range invoices {
-		payments, err := s.paymentRepo.GetByInvoice(ctx, nil, companyID, inv.InvoiceID)
+		payments, err := s.paymentRepo.GetByInvoice(ctx, db, companyID, inv.InvoiceID)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -599,42 +605,113 @@ func (s *paymentService) GetPaymentsByCustomer(ctx context.Context, companyID, c
 }
 
 func (s *paymentService) GetPaymentsByInvoice(ctx context.Context, companyID, invoiceID uuid.UUID) ([]*models.Payment, error) {
-	return s.paymentRepo.GetByInvoice(ctx, nil, companyID, invoiceID)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetByInvoice(ctx, db, companyID, invoiceID)
 }
 
 // --------------------------------------------------------------------------
 // Registration methods (each uses idempotency via context)
 // --------------------------------------------------------------------------
 
+// RegisterCashPayment creates a cash payment, marks it completed, and applies allocations in a single atomic transaction.
 func (s *paymentService) RegisterCashPayment(ctx context.Context, req *RegisterCashPaymentRequest) (*models.Payment, error) {
-	createReq := &CreatePaymentRequest{
-		CompanyID:     req.CompanyID,
-		PaymentDate:   req.PaymentDate,
-		Amount:        req.Amount,
-		PaymentMethod: enums.PaymentMethodCash,
-		Reference:     req.Reference,
-		CreatedBy:     &req.CreatedBy,
+	logger := s.logger.With(zap.String("method", "RegisterCashPayment"))
+
+	// Validate request
+	if req.Amount.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("%w: amount must be positive", salesErrors.ErrInvalidAmount)
 	}
-	payment, err := s.CreatePayment(ctx, createReq)
+	if req.PaymentDate.IsZero() {
+		req.PaymentDate = time.Now()
+	}
+
+	// Begin a transaction for the entire operation
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Idempotency key (from context or generate new)
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
+
+	// Check if already processed
+	var cached *models.Payment
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		logger.Info("idempotent – returning cached payment")
+		return cached, nil
+	}
+
+	// --- Step 1: Create the payment (status = pending) ---
+	paymentNumber, err := s.generatePaymentNumber(tx, req.CompanyID)
+	if err != nil {
+		return nil, fmt.Errorf("generate payment number: %w", err)
+	}
+	exists, err := s.paymentRepo.ExistsByNumber(ctx, tx, req.CompanyID, paymentNumber)
 	if err != nil {
 		return nil, err
 	}
+	if exists {
+		return nil, fmt.Errorf("%w: payment number %s already exists", salesErrors.ErrDuplicate, paymentNumber)
+	}
+
+	payment := &models.Payment{
+		PaymentID:     uuid.New(),
+		CompanyID:     req.CompanyID,
+		PaymentNumber: paymentNumber,
+		PaymentDate:   req.PaymentDate,
+		Amount:        req.Amount,
+		PaymentMethod: enums.PaymentMethodCash,
+		Status:        enums.PaymentStatusPending,
+		Reference:     req.Reference,
+		CreatedBy:     &req.CreatedBy,
+		UpdatedBy:     &req.CreatedBy,
+	}
+	if err := s.paymentRepo.Create(ctx, tx, payment, nil); err != nil {
+		return nil, fmt.Errorf("create payment: %w", err)
+	}
+
+	// --- Step 2: Mark as completed (same transaction) ---
+	completedAt := time.Now()
+	if err := s.paymentRepo.MarkCompleted(ctx, tx, req.CompanyID, payment.PaymentID, completedAt, &req.CreatedBy); err != nil {
+		return nil, fmt.Errorf("mark completed: %w", err)
+	}
+	payment.Status = enums.PaymentStatusCompleted
+	payment.CompletedAt = &completedAt
+
+	// --- Step 3: Apply allocations (if any) ---
 	if len(req.Allocations) > 0 {
-		tx, err := s.pgClient.BeginTx(ctx, nil)
-		if err != nil {
-			return nil, err
-		}
-		defer tx.Rollback()
 		if err := s.applyAllocations(ctx, tx, req.CompanyID, payment.PaymentID, req.Allocations, &req.CreatedBy); err != nil {
 			return nil, err
 		}
-		if err := s.MarkCompleted(ctx, req.CompanyID, payment.PaymentID, time.Now(), req.CreatedBy); err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		payment, _ = s.paymentRepo.GetByID(ctx, nil, req.CompanyID, payment.PaymentID)
+	}
+
+	// --- Step 4: Emit event ---
+	if err := s.emitPaymentEvent(ctx, tx, payment, salesEvents.EventPaymentCompleted, nil); err != nil {
+		logger.Warn("failed to emit payment completed event", zap.Error(err))
+	}
+
+	// --- Step 5: Store idempotency result ---
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, payment); err != nil {
+		logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	// Audit log (outside transaction)
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "register_cash_payment", "payment",
+			&payment.PaymentID, "user", &req.CreatedBy, nil, nil, map[string]interface{}{
+				"payment_number": payment.PaymentNumber,
+				"amount":         payment.Amount.String(),
+				"allocations":    len(req.Allocations),
+			})
 	}
 	return payment, nil
 }
@@ -665,7 +742,9 @@ func (s *paymentService) RegisterCardPayment(ctx context.Context, req *RegisterC
 			return nil, err
 		}
 	}
-	return s.paymentRepo.GetByID(ctx, nil, req.CompanyID, payment.PaymentID)
+	// Re-fetch the payment to get updated status and allocations (using default DB)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetByID(ctx, db, req.CompanyID, payment.PaymentID)
 }
 
 func (s *paymentService) RegisterBankTransferPayment(ctx context.Context, req *RegisterBankTransferPaymentRequest) (*models.Payment, error) {
@@ -811,7 +890,8 @@ func (s *paymentService) ProcessGatewayPayment(ctx context.Context, req *Process
 }
 
 func (s *paymentService) ProcessGatewayWebhook(ctx context.Context, req *ProcessGatewayWebhookRequest) error {
-	payment, err := s.paymentRepo.GetByReference(ctx, nil, req.CompanyID, req.GatewayTxID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByReference(ctx, db, req.CompanyID, req.GatewayTxID)
 	if err != nil {
 		return err
 	}
@@ -968,15 +1048,17 @@ func (s *paymentService) RemoveAllocation(ctx context.Context, companyID, paymen
 }
 
 func (s *paymentService) GetPaymentAllocations(ctx context.Context, companyID, paymentID uuid.UUID) ([]*models.PaymentAllocation, error) {
-	return s.paymentRepo.GetAllocations(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetAllocations(ctx, db, companyID, paymentID)
 }
 
 func (s *paymentService) GetUnallocatedAmount(ctx context.Context, companyID, paymentID uuid.UUID) (decimal.Decimal, error) {
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	allocated, err := s.paymentRepo.GetTotalAllocated(ctx, nil, companyID, paymentID)
+	allocated, err := s.paymentRepo.GetTotalAllocated(ctx, db, companyID, paymentID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -1062,7 +1144,8 @@ func (s *paymentService) CreateRefund(ctx context.Context, req *CreateRefundRequ
 }
 
 func (s *paymentService) RefundFullPayment(ctx context.Context, companyID, paymentID uuid.UUID, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error) {
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return nil, err
 	}
@@ -1096,15 +1179,18 @@ func (s *paymentService) ProcessGatewayRefund(ctx context.Context, req *ProcessG
 }
 
 func (s *paymentService) GetRefundByID(ctx context.Context, companyID, refundID uuid.UUID) (*models.PaymentRefund, error) {
-	return s.refundRepo.GetByID(ctx, nil, companyID, refundID)
+	db := s.pgClient.DB
+	return s.refundRepo.GetByID(ctx, db, companyID, refundID)
 }
 
 func (s *paymentService) GetPaymentRefunds(ctx context.Context, companyID, paymentID uuid.UUID) ([]*models.PaymentRefund, error) {
-	return s.refundRepo.GetByPayment(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	return s.refundRepo.GetByPayment(ctx, db, companyID, paymentID)
 }
 
 func (s *paymentService) GetRefundedAmount(ctx context.Context, companyID, paymentID uuid.UUID) (decimal.Decimal, error) {
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -1112,7 +1198,8 @@ func (s *paymentService) GetRefundedAmount(ctx context.Context, companyID, payme
 }
 
 func (s *paymentService) IsFullyRefunded(ctx context.Context, companyID, paymentID uuid.UUID) (bool, error) {
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return false, err
 	}
@@ -1241,7 +1328,8 @@ func (s *paymentService) CancelPayment(ctx context.Context, companyID, paymentID
 }
 
 func (s *paymentService) ReconcilePayment(ctx context.Context, companyID, paymentID uuid.UUID, reconciledBy uuid.UUID) error {
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return err
 	}
@@ -1256,11 +1344,12 @@ func (s *paymentService) UnreconcilePayment(ctx context.Context, companyID, paym
 }
 
 func (s *paymentService) GetUnreconciledPayments(ctx context.Context, companyID uuid.UUID) ([]*models.Payment, error) {
+	db := s.pgClient.DB
 	filter := repository.PaymentFilter{
 		CompanyID: companyID,
 		Statuses:  []enums.PaymentStatus{enums.PaymentStatusPending, enums.PaymentStatusProcessing},
 	}
-	payments, _, err := s.paymentRepo.List(ctx, nil, filter,
+	payments, _, err := s.paymentRepo.List(ctx, db, filter,
 		repository.Pagination{Limit: 1000, Offset: 0},
 		repository.Sort{Field: "payment_date", Direction: "ASC"})
 	return payments, err
@@ -1281,28 +1370,29 @@ func (s *paymentService) ValidatePayment(ctx context.Context, payment *models.Pa
 }
 
 func (s *paymentService) ValidatePaymentAllocation(ctx context.Context, companyID, paymentID, invoiceID uuid.UUID, amount decimal.Decimal) error {
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return err
 	}
 	if payment.Status != enums.PaymentStatusCompleted {
 		return fmt.Errorf("%w: payment not completed", salesErrors.ErrInvalidStatus)
 	}
-	allocated, err := s.paymentRepo.GetTotalAllocated(ctx, nil, companyID, paymentID)
+	allocated, err := s.paymentRepo.GetTotalAllocated(ctx, db, companyID, paymentID)
 	if err != nil {
 		return err
 	}
 	if allocated.Add(amount).GreaterThan(payment.Amount) {
 		return salesErrors.ErrPaymentOverAlloc
 	}
-	invoice, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	invoice, err := s.invoiceRepo.GetByID(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
 	if invoice.Status == enums.InvoiceStatusPaid || invoice.Status == enums.InvoiceStatusCancelled {
 		return fmt.Errorf("%w: invoice cannot accept payment", salesErrors.ErrInvalidStatus)
 	}
-	due, err := s.invoiceRepo.GetAmountDue(ctx, nil, companyID, invoiceID)
+	due, err := s.invoiceRepo.GetAmountDue(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -1320,7 +1410,8 @@ func (s *paymentService) validateRefund(ctx context.Context, companyID, paymentI
 	if amount.LessThanOrEqual(decimal.Zero) {
 		return fmt.Errorf("%w: refund amount must be positive", salesErrors.ErrInvalidAmount)
 	}
-	payment, err := s.paymentRepo.GetByID(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return err
 	}
@@ -1343,11 +1434,13 @@ func (s *paymentService) ValidatePaymentStatusTransition(ctx context.Context, cu
 // --------------------------------------------------------------------------
 
 func (s *paymentService) GetTotalPaymentsReceived(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.paymentRepo.GetCollectedAmount(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetCollectedAmount(ctx, db, companyID, from, to)
 }
 
 func (s *paymentService) GetTotalRefundedAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.paymentRepo.GetRefundedAmountTotal(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetRefundedAmountTotal(ctx, db, companyID, from, to)
 }
 
 func (s *paymentService) GetNetCollections(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
@@ -1363,10 +1456,12 @@ func (s *paymentService) GetNetCollections(ctx context.Context, companyID uuid.U
 }
 
 func (s *paymentService) GetPaymentsByMethod(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (map[enums.PaymentMethod]decimal.Decimal, error) {
-	return s.paymentRepo.GetPaymentMethodBreakdown(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.paymentRepo.GetPaymentMethodBreakdown(ctx, db, companyID, from, to)
 }
 
 func (s *paymentService) GetFailedPayments(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*models.Payment, error) {
+	db := s.pgClient.DB
 	filter := repository.PaymentFilter{
 		CompanyID: companyID,
 		Statuses:  []enums.PaymentStatus{enums.PaymentStatusFailed},
@@ -1377,7 +1472,7 @@ func (s *paymentService) GetFailedPayments(ctx context.Context, companyID uuid.U
 	if to != nil {
 		filter.PaymentDateTo = to
 	}
-	payments, _, err := s.paymentRepo.List(ctx, nil, filter,
+	payments, _, err := s.paymentRepo.List(ctx, db, filter,
 		repository.Pagination{Limit: 1000, Offset: 0},
 		repository.Sort{Field: "payment_date", Direction: "DESC"})
 	return payments, err
@@ -1388,15 +1483,18 @@ func (s *paymentService) GetFailedPayments(ctx context.Context, companyID uuid.U
 // --------------------------------------------------------------------------
 
 func (s *paymentService) PaymentExists(ctx context.Context, companyID, paymentID uuid.UUID) (bool, error) {
-	return s.paymentRepo.Exists(ctx, nil, companyID, paymentID)
+	db := s.pgClient.DB
+	return s.paymentRepo.Exists(ctx, db, companyID, paymentID)
 }
 
 func (s *paymentService) PaymentNumberExists(ctx context.Context, companyID uuid.UUID, paymentNumber string) (bool, error) {
-	return s.paymentRepo.ExistsByNumber(ctx, nil, companyID, paymentNumber)
+	db := s.pgClient.DB
+	return s.paymentRepo.ExistsByNumber(ctx, db, companyID, paymentNumber)
 }
 
 func (s *paymentService) GatewayTransactionExists(ctx context.Context, companyID uuid.UUID, gatewayTransactionID string) (bool, error) {
-	return s.paymentRepo.ExistsByExternalRef(ctx, nil, companyID, gatewayTransactionID)
+	db := s.pgClient.DB
+	return s.paymentRepo.ExistsByExternalRef(ctx, db, companyID, gatewayTransactionID)
 }
 
 func (s *paymentService) HasRefunds(ctx context.Context, companyID, paymentID uuid.UUID) (bool, error) {

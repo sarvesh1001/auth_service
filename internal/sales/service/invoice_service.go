@@ -198,6 +198,10 @@ func (s *invoiceService) recalculateInvoiceTotals(ctx context.Context, tx reposi
 	inv.TaxTotal = taxTotal
 	inv.GrandTotal = subtotal.Sub(discountTotal).Add(taxTotal)
 
+	// ✅ FIX: Set AmountDue correctly (GrandTotal - AmountPaid)
+	// For a new invoice, AmountPaid is 0, so AmountDue = GrandTotal
+	inv.AmountDue = inv.GrandTotal.Sub(inv.AmountPaid)
+
 	if err := s.invoiceRepo.Update(ctx, tx, inv); err != nil {
 		return fmt.Errorf("update invoice totals: %w", err)
 	}
