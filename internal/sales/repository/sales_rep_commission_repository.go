@@ -30,6 +30,8 @@ type SalesRepCommissionRepository interface {
 	GetActiveCommissions(ctx context.Context, db DBTX, companyID uuid.UUID, at time.Time) ([]*models.SalesRepCommission, error)
 	GetTotalCommissionAmount(ctx context.Context, db DBTX, companyID uuid.UUID, salesRepID *uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, commissionID uuid.UUID) (*models.SalesRepCommission, error)
+	// HasOverlappingAssignment checks if the sales rep already has an active assignment on the given date.
+
 }
 
 type SalesRepCommissionFilter struct {

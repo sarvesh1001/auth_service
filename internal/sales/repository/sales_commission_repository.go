@@ -36,7 +36,12 @@ type SalesCommissionRepository interface {
 	GetByStatus(ctx context.Context, db DBTX, companyID uuid.UUID, status enums.CommissionStatus) ([]*models.SalesCommission, error)
 	GetUnpaid(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.SalesCommission, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, commissionID uuid.UUID) (*models.SalesCommission, error)
+	// HasOverlappingAssignment checks if the sales rep already has an active assignment on the given date.
+	HasOverlappingAssignment(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, effectiveFrom time.Time) (bool, error)
+	CountActiveAssignments(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (int64, error)
 
+	// ExistsByReference checks whether a commission record already exists for the given reference (regardless of status).
+	ExistsByReference(ctx context.Context, db DBTX, companyID uuid.UUID, referenceType enums.CommissionReferenceType, referenceID uuid.UUID) (bool, error)
 	// Assignments
 	CreateAssignment(ctx context.Context, db DBTX, assignment *models.SalesRepCommissionAssignment) error
 	DeactivateCurrentAssignment(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, effectiveTo time.Time) error
@@ -761,4 +766,53 @@ func (r *salesCommissionRepository) GetAssignmentAt(ctx context.Context, db DBTX
 	`
 	row := db.QueryRowContext(ctx, query, companyID, salesRepID, at)
 	return r.scanAssignment(row)
+}
+
+// HasOverlappingAssignment implements SalesCommissionRepository.
+func (r *salesCommissionRepository) HasOverlappingAssignment(ctx context.Context, db DBTX, companyID, salesRepID uuid.UUID, effectiveFrom time.Time) (bool, error) {
+	var exists bool
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM sales.sales_rep_commission_assignments
+			WHERE company_id = $1 AND sales_rep_id = $2
+			  AND effective_from <= $3
+			  AND (effective_to IS NULL OR effective_to >= $3)
+		)
+	`
+	err := db.QueryRowContext(ctx, query, companyID, salesRepID, effectiveFrom).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check overlapping assignment: %w", err)
+	}
+	return exists, nil
+}
+
+// ExistsByReference implements SalesCommissionRepository.
+func (r *salesCommissionRepository) ExistsByReference(ctx context.Context, db DBTX, companyID uuid.UUID, referenceType enums.CommissionReferenceType, referenceID uuid.UUID) (bool, error) {
+	var exists bool
+	query := `
+		SELECT EXISTS(
+			SELECT 1 FROM sales.sales_commissions
+			WHERE company_id = $1 AND reference_type = $2 AND reference_id = $3
+		)
+	`
+	err := db.QueryRowContext(ctx, query, companyID, string(referenceType), referenceID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check exists by reference: %w", err)
+	}
+	return exists, nil
+}
+
+// CountActiveAssignments implements SalesCommissionRepository.
+func (r *salesCommissionRepository) CountActiveAssignments(ctx context.Context, db DBTX, companyID, planID uuid.UUID) (int64, error) {
+	query := `
+        SELECT COUNT(*)
+        FROM sales.sales_rep_commission_assignments
+        WHERE company_id = $1 AND plan_id = $2 AND effective_to IS NULL
+    `
+	var count int64
+	err := db.QueryRowContext(ctx, query, companyID, planID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count active assignments: %w", err)
+	}
+	return count, nil
 }

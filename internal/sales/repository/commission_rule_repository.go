@@ -29,6 +29,7 @@ type CommissionRuleRepository interface {
 	GetByPlan(ctx context.Context, db DBTX, companyID, planID uuid.UUID) ([]*models.CommissionRule, error)
 	Exists(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (bool, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, ruleID uuid.UUID) (*models.CommissionRule, error)
+	ExistsByPriority(ctx context.Context, db DBTX, companyID, planID uuid.UUID, priority int) (bool, error)
 }
 
 // CommissionRuleFilter is used for List operations if needed (optional, can add later)
@@ -308,4 +309,13 @@ func (r *commissionRuleRepository) GetByIDForUpdate(ctx context.Context, db DBTX
 	`
 	row := db.QueryRowContext(ctx, query, ruleID, companyID)
 	return r.scanCommissionRule(row)
+}
+func (r *commissionRuleRepository) ExistsByPriority(ctx context.Context, db DBTX, companyID, planID uuid.UUID, priority int) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.commission_rules WHERE company_id = $1 AND plan_id = $2 AND priority = $3)`
+	err := db.QueryRowContext(ctx, query, companyID, planID, priority).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check duplicate priority: %w", err)
+	}
+	return exists, nil
 }

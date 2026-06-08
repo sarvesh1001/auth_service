@@ -2091,3 +2091,11 @@ ALTER TABLE sales.order_items
 ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();CREATE TRIGGER update_order_items_updated_at 
 BEFORE UPDATE ON sales.order_items 
 FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+
+CREATE TABLE IF NOT EXISTS sales_analytics.commission_plan_unique_reps (
+    company_id   UUID NOT NULL,
+    plan_id      UUID NOT NULL,
+    date         DATE NOT NULL,
+    sales_rep_id UUID NOT NULL,
+    PRIMARY KEY (company_id, plan_id, date, sales_rep_id)
+);

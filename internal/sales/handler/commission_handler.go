@@ -1,11 +1,13 @@
-// file: internal/sales/handler/commission_handler.go
+// File: internal/sales/handler/commission_handler.go
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -246,6 +248,15 @@ type commissionTrendPointResponse struct {
 	CommissionAmount string `json:"commission_amount"`
 }
 
+// ---------- Helper: inject idempotency key into context (same pattern as payments) ----------
+func (h *CommissionHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
+
 // ---------- Commission Plan Handlers ----------
 
 // CreateCommissionPlan handles POST /commission-plans
@@ -344,6 +355,20 @@ func (h *CommissionHandler) CreateCommissionPlan(w http.ResponseWriter, r *http.
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	// Check idempotency cache first
+	cachedPlan, err := h.commissionService.GetCommissionPlanByIdempotencyKey(ctx, companyID, idempotencyKey)
+	if err == nil && cachedPlan != nil {
+		h.logger.Info("idempotent – returning cached commission plan")
+		resp := h.planToResponse(cachedPlan)
+		w.Header().Set("Location", fmt.Sprintf("/commission-plans/%s", cachedPlan.PlanID))
+		h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+			"success": true,
+			"data":    resp,
+		})
 		return
 	}
 
@@ -447,6 +472,7 @@ func (h *CommissionHandler) UpdateCommissionPlan(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	plan, err := h.commissionService.UpdateCommissionPlan(ctx, companyID, planID, svcReq)
 	if err != nil {
@@ -495,6 +521,7 @@ func (h *CommissionHandler) DeleteCommissionPlan(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.DeleteCommissionPlan(ctx, companyID, planID, userID)
 	if err != nil {
@@ -801,6 +828,7 @@ func (h *CommissionHandler) CreateCommissionRule(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CreateCommissionRuleRequest{
 		CompanyID:    companyID,
@@ -932,6 +960,7 @@ func (h *CommissionHandler) UpdateCommissionRule(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	rule, err := h.commissionService.UpdateCommissionRule(ctx, companyID, ruleID, svcReq)
 	if err != nil {
@@ -980,6 +1009,7 @@ func (h *CommissionHandler) DeleteCommissionRule(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.DeleteCommissionRule(ctx, companyID, ruleID, userID)
 	if err != nil {
@@ -1135,6 +1165,7 @@ func (h *CommissionHandler) AssignCommissionPlan(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.AssignCommissionPlan(ctx, companyID, salesRepID, planID, effectiveFrom, userID)
 	if err != nil {
@@ -1182,6 +1213,7 @@ func (h *CommissionHandler) RemoveCommissionPlan(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.RemoveCommissionPlan(ctx, companyID, salesRepID, userID)
 	if err != nil {
@@ -1289,6 +1321,7 @@ func (h *CommissionHandler) CalculateOrderCommission(w http.ResponseWriter, r *h
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.CalculateOrderCommission(ctx, companyID, orderID)
 	if err != nil {
@@ -1342,6 +1375,7 @@ func (h *CommissionHandler) CalculateInvoiceCommission(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.CalculateInvoiceCommission(ctx, companyID, invoiceID)
 	if err != nil {
@@ -1395,6 +1429,7 @@ func (h *CommissionHandler) CalculatePaymentCommission(w http.ResponseWriter, r 
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.CalculatePaymentCommission(ctx, companyID, paymentID)
 	if err != nil {
@@ -1456,6 +1491,7 @@ func (h *CommissionHandler) CalculateCommissionForPeriod(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commissions, total, err := h.commissionService.CalculateCommissionForPeriod(ctx, companyID, salesRepID, from, to)
 	if err != nil {
@@ -1526,6 +1562,7 @@ func (h *CommissionHandler) PreviewCommission(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CommissionPreviewRequest{
 		CompanyID:     companyID,
@@ -1594,6 +1631,7 @@ func (h *CommissionHandler) ProcessOrderCompletedCommission(w http.ResponseWrite
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.ProcessOrderCompletedCommission(ctx, companyID, orderID, userID)
 	if err != nil {
@@ -1647,6 +1685,7 @@ func (h *CommissionHandler) ProcessInvoicePaidCommission(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.ProcessInvoicePaidCommission(ctx, companyID, invoiceID, userID)
 	if err != nil {
@@ -1700,6 +1739,7 @@ func (h *CommissionHandler) ProcessPaymentReceivedCommission(w http.ResponseWrit
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.ProcessPaymentReceivedCommission(ctx, companyID, paymentID, userID)
 	if err != nil {
@@ -1746,6 +1786,7 @@ func (h *CommissionHandler) RecalculateCommission(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.RecalculateCommission(ctx, companyID, commissionID, userID)
 	if err != nil {
@@ -1797,6 +1838,7 @@ func (h *CommissionHandler) ReverseCommission(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.ReverseCommission(ctx, companyID, commissionID, req.Reason, userID)
 	if err != nil {
@@ -1878,6 +1920,7 @@ func (h *CommissionHandler) CreateCommissionRecord(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CreateSalesCommissionRequest{
 		CompanyID:        companyID,
@@ -1981,6 +2024,7 @@ func (h *CommissionHandler) UpdateCommissionRecord(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	commission, err := h.commissionService.UpdateCommissionRecord(ctx, companyID, commissionID, svcReq)
 	if err != nil {
@@ -2312,6 +2356,7 @@ func (h *CommissionHandler) MarkCommissionPending(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.MarkCommissionPending(ctx, companyID, commissionID, userID)
 	if err != nil {
@@ -2357,6 +2402,7 @@ func (h *CommissionHandler) ApproveCommission(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.ApproveCommission(ctx, companyID, commissionID, userID)
 	if err != nil {
@@ -2408,6 +2454,7 @@ func (h *CommissionHandler) RejectCommission(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.RejectCommission(ctx, companyID, commissionID, req.Reason, userID)
 	if err != nil {
@@ -2464,6 +2511,7 @@ func (h *CommissionHandler) MarkCommissionPaid(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.commissionService.MarkCommissionPaid(ctx, companyID, commissionID, paidAt, userID)
 	if err != nil {
@@ -2845,12 +2893,30 @@ func (h *CommissionHandler) GetCommissionSummaryBySalesRep(w http.ResponseWriter
 }
 
 // GetCommissionTrend handles GET /commissions/trend
+// isValidGranularity checks if the granularity parameter is supported.
+func isValidGranularity(granularity string) bool {
+	switch strings.ToLower(granularity) {
+	case "daily", "weekly", "monthly":
+		return true
+	default:
+		return false
+	}
+}
+
+// GetCommissionTrend returns commission trend data aggregated by period.
 func (h *CommissionHandler) GetCommissionTrend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate granularity
+	granularity := r.URL.Query().Get("granularity")
+	if granularity != "" && !isValidGranularity(granularity) {
+		h.respondWithError(w, http.StatusBadRequest, "granularity must be daily, weekly, or monthly")
 		return
 	}
 
@@ -2885,6 +2951,8 @@ func (h *CommissionHandler) GetCommissionTrend(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// If granularity is provided, we may want to aggregate further.
+	// For now, the service returns daily points; you can extend aggregation if needed.
 	respPoints := make([]commissionTrendPointResponse, len(points))
 	for i, p := range points {
 		respPoints[i] = commissionTrendPointResponse{
