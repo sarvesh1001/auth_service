@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -28,15 +29,24 @@ type CouponHandler struct {
 func NewCouponHandler(couponService service.CouponService, logger *zap.Logger) *CouponHandler {
 	return &CouponHandler{
 		couponService: couponService,
-		BaseHandler:   &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:   &BaseHandler{logger: logger.Named("coupon_handler")},
 	}
+}
+
+// injectIdempotencyKey adds the idempotency key from the request header into the context.
+func (h *CouponHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
 }
 
 // ---------- Request/Response Types ----------
 
 type createCouponRequest struct {
 	Code              string  `json:"code"`
-	DiscountType      string  `json:"discount_type"` // percentage, fixed_amount, buy_x_get_y
+	DiscountType      string  `json:"discount_type"`
 	DiscountValue     string  `json:"discount_value"`
 	MaxDiscountAmount *string `json:"max_discount_amount,omitempty"`
 	StartDate         string  `json:"start_date"`
@@ -44,7 +54,7 @@ type createCouponRequest struct {
 	UsageLimit        *int    `json:"usage_limit,omitempty"`
 	PerUserLimit      *int    `json:"per_user_limit,omitempty"`
 	MinOrderAmount    *string `json:"min_order_amount,omitempty"`
-	ApplicableItems   *string `json:"applicable_items,omitempty"` // JSON string
+	ApplicableItems   *string `json:"applicable_items,omitempty"`
 }
 
 type createCouponResponse struct {
@@ -95,7 +105,7 @@ type calculateDiscountForProductsRequest struct {
 }
 
 type applyCouponToEntityRequest struct {
-	EntityID   string `json:"entity_id"` // order_id, quote_id, or invoice_id
+	EntityID   string `json:"entity_id"`
 	CouponCode string `json:"coupon_code"`
 }
 
@@ -145,6 +155,7 @@ type couponUsageHistoryResponse struct {
 // CreateCoupon handles POST /coupons
 func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
@@ -164,7 +175,6 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validation
 	if req.Code == "" {
 		h.respondWithError(w, http.StatusBadRequest, "code is required")
 		return
@@ -216,12 +226,6 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := &service.CreateCouponRequest{
 		CompanyID:         companyID,
 		Code:              req.Code,
@@ -234,6 +238,7 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 		PerUserLimit:      req.PerUserLimit,
 		MinOrderAmount:    minOrderAmount,
 		ApplicableItems:   applicableItems,
+		CreatedBy:         &userID,
 	}
 
 	coupon, err := h.couponService.CreateCoupon(ctx, svcReq)
@@ -256,6 +261,7 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 // UpdateCoupon handles PUT /coupons/{id}
 func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	couponID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
@@ -286,7 +292,7 @@ func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	svcReq := &service.UpdateCouponRequest{}
+	svcReq := &service.UpdateCouponRequest{UpdatedBy: &userID}
 	if req.DiscountType != nil {
 		dt := enums.DiscountType(*req.DiscountType)
 		svcReq.DiscountType = &dt
@@ -354,12 +360,6 @@ func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	coupon, err := h.couponService.UpdateCoupon(ctx, companyID, couponID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update coupon", zap.Error(err))
@@ -378,6 +378,7 @@ func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 // DeleteCoupon handles DELETE /coupons/{id}
 func (h *CouponHandler) DeleteCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	couponID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
@@ -399,12 +400,6 @@ func (h *CouponHandler) DeleteCoupon(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "coupon:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -725,18 +720,19 @@ func (h *CouponHandler) GetActiveCoupons(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// ActivateCoupon handles PATCH /coupons/{id}/activate
+// ActivateCoupon handles POST /coupons/{id}/activate
 func (h *CouponHandler) ActivateCoupon(w http.ResponseWriter, r *http.Request) {
 	h.updateCouponActivation(w, r, true)
 }
 
-// DeactivateCoupon handles PATCH /coupons/{id}/deactivate
+// DeactivateCoupon handles POST /coupons/{id}/deactivate
 func (h *CouponHandler) DeactivateCoupon(w http.ResponseWriter, r *http.Request) {
 	h.updateCouponActivation(w, r, false)
 }
 
 func (h *CouponHandler) updateCouponActivation(w http.ResponseWriter, r *http.Request, activate bool) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	couponID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
@@ -758,12 +754,6 @@ func (h *CouponHandler) updateCouponActivation(w http.ResponseWriter, r *http.Re
 
 	if !h.hasPermission(ctx, companyID, userID, "coupon:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -792,6 +782,7 @@ func (h *CouponHandler) updateCouponActivation(w http.ResponseWriter, r *http.Re
 // ExpireCoupon handles POST /coupons/{id}/expire
 func (h *CouponHandler) ExpireCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	couponID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
@@ -813,12 +804,6 @@ func (h *CouponHandler) ExpireCoupon(w http.ResponseWriter, r *http.Request) {
 
 	if !h.hasPermission(ctx, companyID, userID, "coupon:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -941,7 +926,8 @@ func (h *CouponHandler) CalculateDiscount(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	discountAmount, err := h.couponService.CalculateDiscount(ctx, couponID, subtotal)
+	// ✅ FIX: pass companyID
+	discountAmount, err := h.couponService.CalculateDiscount(ctx, companyID, couponID, subtotal)
 	if err != nil {
 		h.logger.Error("failed to calculate discount", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -957,7 +943,6 @@ func (h *CouponHandler) CalculateDiscount(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// CalculateDiscountForProducts handles POST /coupons/{id}/calculate-discount-products
 func (h *CouponHandler) CalculateDiscountForProducts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1002,7 +987,8 @@ func (h *CouponHandler) CalculateDiscountForProducts(w http.ResponseWriter, r *h
 		return
 	}
 
-	discountAmount, err := h.couponService.CalculateDiscountForProducts(ctx, couponID, subtotal, productIDs)
+	// ✅ FIX: pass companyID
+	discountAmount, err := h.couponService.CalculateDiscountForProducts(ctx, companyID, couponID, subtotal, productIDs)
 	if err != nil {
 		h.logger.Error("failed to calculate discount for products", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1035,6 +1021,7 @@ func (h *CouponHandler) ApplyCouponToInvoice(w http.ResponseWriter, r *http.Requ
 
 func (h *CouponHandler) applyCouponToEntity(w http.ResponseWriter, r *http.Request, entityType string) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	var req applyCouponToEntityRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1060,12 +1047,6 @@ func (h *CouponHandler) applyCouponToEntity(w http.ResponseWriter, r *http.Reque
 	}
 	if !h.hasPermission(ctx, companyID, userID, "coupon:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1116,6 +1097,7 @@ func (h *CouponHandler) RemoveCouponFromInvoice(w http.ResponseWriter, r *http.R
 
 func (h *CouponHandler) removeCouponFromEntity(w http.ResponseWriter, r *http.Request, entityType string) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	var req removeCouponFromEntityRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1141,12 +1123,6 @@ func (h *CouponHandler) removeCouponFromEntity(w http.ResponseWriter, r *http.Re
 	}
 	if !h.hasPermission(ctx, companyID, userID, "coupon:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -1177,6 +1153,7 @@ func (h *CouponHandler) removeCouponFromEntity(w http.ResponseWriter, r *http.Re
 // RecordCouponUsage handles POST /coupons/record-usage
 func (h *CouponHandler) RecordCouponUsage(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	var req recordCouponUsageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1229,13 +1206,8 @@ func (h *CouponHandler) RecordCouponUsage(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := &service.RecordCouponUsageRequest{
+		CompanyID:      companyID,
 		CouponID:       couponID,
 		OrderID:        orderID,
 		CustomerID:     customerID,

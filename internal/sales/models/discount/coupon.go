@@ -23,8 +23,10 @@ type Coupon struct {
 	MinOrderAmount    *decimal.Decimal   `gorm:"type:numeric(14,4)" json:"minOrderAmount,omitempty"`
 	ApplicableItems   datatypes.JSON     `gorm:"type:jsonb" json:"applicableItems,omitempty"`
 	IsActive          bool               `gorm:"not null;default:true" json:"isActive"`
-	CreatedAt         time.Time          `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt         time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy         *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy         *uuid.UUID         `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	DeletedAt         *time.Time         `gorm:"index" json:"deletedAt,omitempty"` // ← ADD THIS LINE
+
+	CreatedAt time.Time  `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }

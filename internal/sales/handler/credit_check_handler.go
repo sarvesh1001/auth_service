@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -23,11 +24,24 @@ type CreditCheckHandler struct {
 func NewCreditCheckHandler(creditCheckService service.CreditCheckService, logger *zap.Logger) *CreditCheckHandler {
 	return &CreditCheckHandler{
 		creditCheckService: creditCheckService,
-		BaseHandler:        &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:        &BaseHandler{logger: logger.Named("credit_check_handler")},
 	}
 }
 
-// request/response types
+// ----------------------------------------------------------------------
+// Helper to inject idempotency key into context (same as PaymentHandler)
+// ----------------------------------------------------------------------
+func (h *CreditCheckHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
+
+// ----------------------------------------------------------------------
+// Request/Response Types (unchanged)
+// ----------------------------------------------------------------------
 
 type checkCustomerCreditRequest struct {
 	CustomerID      string `json:"customer_id"`
@@ -102,8 +116,9 @@ type creditHistoryListResponse struct {
 	Offset  int                          `json:"offset"`
 }
 
-// helper methods
-
+// ----------------------------------------------------------------------
+// Helper to convert history model to response
+// ----------------------------------------------------------------------
 func (h *CreditCheckHandler) toCreditCheckHistoryResponse(history *models.CreditCheckHistory) creditCheckHistoryResponse {
 	resp := creditCheckHistoryResponse{
 		CreditHistoryID: history.CreditHistoryID.String(),
@@ -133,7 +148,9 @@ func (h *CreditCheckHandler) toCreditCheckHistoryResponse(history *models.Credit
 	return resp
 }
 
-// endpoint implementations
+// ----------------------------------------------------------------------
+// READ‑ONLY ENDPOINTS (no idempotency)
+// ----------------------------------------------------------------------
 
 func (h *CreditCheckHandler) CheckCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -176,13 +193,6 @@ func (h *CreditCheckHandler) CheckCustomerCreditLimit(w http.ResponseWriter, r *
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-	_ = idempotencyKey
-
 	result, err := h.creditCheckService.CheckCustomerCreditLimit(ctx, companyID, customerID, requestedAmount)
 	if err != nil {
 		h.logger.Error("failed to check customer credit limit", zap.Error(err))
@@ -208,6 +218,7 @@ func (h *CreditCheckHandler) CheckCustomerCreditLimit(w http.ResponseWriter, r *
 }
 
 func (h *CreditCheckHandler) CheckOrderCreditEligibility(w http.ResponseWriter, r *http.Request) {
+	// Similar to CheckCustomerCreditLimit – read‑only, no idempotency
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
@@ -242,13 +253,6 @@ func (h *CreditCheckHandler) CheckOrderCreditEligibility(w http.ResponseWriter, 
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-	_ = idempotencyKey
-
 	result, err := h.creditCheckService.CheckOrderCreditEligibility(ctx, companyID, orderID)
 	if err != nil {
 		h.logger.Error("failed to check order credit eligibility", zap.Error(err))
@@ -258,15 +262,13 @@ func (h *CreditCheckHandler) CheckOrderCreditEligibility(w http.ResponseWriter, 
 	}
 
 	resp := creditCheckResponse{
-		Eligible:         result.Eligible,
-		Reason:           result.Reason,
-		CurrentBalance:   result.CurrentBalance.String(),
-		CreditLimit:      result.CreditLimit.String(),
-		AvailableCredit:  result.AvailableCredit.String(),
-		RequestedAmount:  result.RequestedAmount.String(),
-		OutstandingCount: result.OutstandingCount,
+		Eligible:        result.Eligible,
+		Reason:          result.Reason,
+		CurrentBalance:  result.CurrentBalance.String(),
+		CreditLimit:     result.CreditLimit.String(),
+		AvailableCredit: result.AvailableCredit.String(),
+		RequestedAmount: result.RequestedAmount.String(),
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
@@ -274,6 +276,7 @@ func (h *CreditCheckHandler) CheckOrderCreditEligibility(w http.ResponseWriter, 
 }
 
 func (h *CreditCheckHandler) CheckInvoiceCreditEligibility(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency (copy from original)
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
@@ -308,13 +311,6 @@ func (h *CreditCheckHandler) CheckInvoiceCreditEligibility(w http.ResponseWriter
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-	_ = idempotencyKey
-
 	result, err := h.creditCheckService.CheckInvoiceCreditEligibility(ctx, companyID, invoiceID)
 	if err != nil {
 		h.logger.Error("failed to check invoice credit eligibility", zap.Error(err))
@@ -324,41 +320,38 @@ func (h *CreditCheckHandler) CheckInvoiceCreditEligibility(w http.ResponseWriter
 	}
 
 	resp := creditCheckResponse{
-		Eligible:         result.Eligible,
-		Reason:           result.Reason,
-		CurrentBalance:   result.CurrentBalance.String(),
-		CreditLimit:      result.CreditLimit.String(),
-		AvailableCredit:  result.AvailableCredit.String(),
-		RequestedAmount:  result.RequestedAmount.String(),
-		OutstandingCount: result.OutstandingCount,
+		Eligible:        result.Eligible,
+		Reason:          result.Reason,
+		CurrentBalance:  result.CurrentBalance.String(),
+		CreditLimit:     result.CreditLimit.String(),
+		AvailableCredit: result.AvailableCredit.String(),
+		RequestedAmount: result.RequestedAmount.String(),
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
 	})
 }
 
+// GET /credit/customers/{id}/available-credit
 func (h *CreditCheckHandler) GetCustomerAvailableCredit(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -371,38 +364,35 @@ func (h *CreditCheckHandler) GetCustomerAvailableCredit(w http.ResponseWriter, r
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"available_credit": available.String()},
 	})
 }
 
+// GET /credit/customers/{id}/outstanding-balance
 func (h *CreditCheckHandler) GetCustomerOutstandingBalance(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency (implementation unchanged)
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	balance, err := h.creditCheckService.GetCustomerOutstandingBalance(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to get customer outstanding balance", zap.Error(err))
@@ -410,38 +400,35 @@ func (h *CreditCheckHandler) GetCustomerOutstandingBalance(w http.ResponseWriter
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"outstanding_balance": balance.String()},
 	})
 }
 
+// GET /credit/customers/{id}/credit-exposure
 func (h *CreditCheckHandler) GetCustomerCreditExposure(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	exposure, err := h.creditCheckService.GetCustomerCreditExposure(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to get customer credit exposure", zap.Error(err))
@@ -449,27 +436,26 @@ func (h *CreditCheckHandler) GetCustomerCreditExposure(w http.ResponseWriter, r 
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"credit_exposure": exposure.String()},
 	})
 }
 
+// GET /credit/customers/{id}/can-place-order?amount=...
 func (h *CreditCheckHandler) CanCustomerPlaceOrder(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	amountStr := r.URL.Query().Get("amount")
 	if amountStr == "" {
 		h.respondWithError(w, http.StatusBadRequest, "amount query parameter is required")
@@ -480,18 +466,15 @@ func (h *CreditCheckHandler) CanCustomerPlaceOrder(w http.ResponseWriter, r *htt
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	canPlace, err := h.creditCheckService.CanCustomerPlaceOrder(ctx, companyID, customerID, amount)
 	if err != nil {
 		h.logger.Error("failed to check if customer can place order", zap.Error(err))
@@ -499,140 +482,35 @@ func (h *CreditCheckHandler) CanCustomerPlaceOrder(w http.ResponseWriter, r *htt
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"can_place_order": canPlace},
 	})
 }
 
-func (h *CreditCheckHandler) HoldOrderForCredit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	orderID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req holdOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.HoldOrderForCredit(ctx, companyID, orderID, req.Reason, userID)
-	if err != nil {
-		h.logger.Error("failed to hold order for credit", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "order placed on credit hold",
-	})
-}
-
-func (h *CreditCheckHandler) ReleaseOrderCreditHold(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	orderID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req holdOrderRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.ReleaseOrderCreditHold(ctx, companyID, orderID, req.Reason, userID)
-	if err != nil {
-		h.logger.Error("failed to release order credit hold", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "credit hold released",
-	})
-}
-
+// GET /credit/orders/{id}/on-hold
 func (h *CreditCheckHandler) IsOrderOnCreditHold(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	orderID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	onHold, err := h.creditCheckService.IsOrderOnCreditHold(ctx, companyID, orderID)
 	if err != nil {
 		h.logger.Error("failed to check if order is on credit hold", zap.Error(err))
@@ -640,394 +518,65 @@ func (h *CreditCheckHandler) IsOrderOnCreditHold(w http.ResponseWriter, r *http.
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"on_credit_hold": onHold},
 	})
 }
 
+// GET /credit/orders/on-hold
 func (h *CreditCheckHandler) GetOrdersOnCreditHold(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	orders, err := h.creditCheckService.GetOrdersOnCreditHold(ctx, companyID)
 	if err != nil {
 		h.logger.Error("failed to get orders on credit hold", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve orders")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    orders,
 	})
 }
 
-func (h *CreditCheckHandler) UpdateOrderCreditStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	orderID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req updateOrderCreditStatusRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	status := enums.CreditCheckStatus(req.Status)
-	if !status.IsValid() {
-		h.respondWithError(w, http.StatusBadRequest, "invalid credit status")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.UpdateOrderCreditStatus(ctx, companyID, orderID, status, userID)
-	if err != nil {
-		h.logger.Error("failed to update order credit status", zap.Error(err))
-		statusCode, msg := h.mapServiceError(err)
-		h.respondWithError(w, statusCode, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "order credit status updated",
-	})
-}
-
-func (h *CreditCheckHandler) SetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	customerID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req setCreditLimitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	creditLimit, err := decimal.NewFromString(req.CreditLimit)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid credit_limit")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.SetCustomerCreditLimit(ctx, companyID, customerID, creditLimit, userID)
-	if err != nil {
-		h.logger.Error("failed to set customer credit limit", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "credit limit set",
-	})
-}
-
-func (h *CreditCheckHandler) IncreaseCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	customerID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req increaseDecreaseCreditLimitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	increaseAmount, err := decimal.NewFromString(req.IncreaseAmount)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid increase_amount")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.IncreaseCustomerCreditLimit(ctx, companyID, customerID, increaseAmount, req.Reason, userID)
-	if err != nil {
-		h.logger.Error("failed to increase customer credit limit", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "credit limit increased",
-	})
-}
-
-func (h *CreditCheckHandler) DecreaseCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	customerID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req increaseDecreaseCreditLimitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	decreaseAmount, err := decimal.NewFromString(req.DecreaseAmount)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid decrease_amount")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.DecreaseCustomerCreditLimit(ctx, companyID, customerID, decreaseAmount, req.Reason, userID)
-	if err != nil {
-		h.logger.Error("failed to decrease customer credit limit", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "credit limit decreased",
-	})
-}
-
-func (h *CreditCheckHandler) SuspendCustomerCredit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	customerID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	var req suspendCreditRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.SuspendCustomerCredit(ctx, companyID, customerID, req.Reason, userID)
-	if err != nil {
-		h.logger.Error("failed to suspend customer credit", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "customer credit suspended",
-	})
-}
-
-func (h *CreditCheckHandler) RestoreCustomerCredit(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	customerID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.creditCheckService.RestoreCustomerCredit(ctx, companyID, customerID, userID)
-	if err != nil {
-		h.logger.Error("failed to restore customer credit", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "customer credit restored",
-	})
-}
-
+// GET /credit/customers/{id}/credit-limit
 func (h *CreditCheckHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	limit, err := h.creditCheckService.GetCustomerCreditLimit(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to get customer credit limit", zap.Error(err))
@@ -1035,38 +584,35 @@ func (h *CreditCheckHandler) GetCustomerCreditLimit(w http.ResponseWriter, r *ht
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"credit_limit": limit.String()},
 	})
 }
 
+// GET /credit/customers/{id}/suspended
 func (h *CreditCheckHandler) IsCustomerCreditSuspended(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	suspended, err := h.creditCheckService.IsCustomerCreditSuspended(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to check if customer credit suspended", zap.Error(err))
@@ -1074,134 +620,35 @@ func (h *CreditCheckHandler) IsCustomerCreditSuspended(w http.ResponseWriter, r 
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"suspended": suspended},
 	})
 }
 
-func (h *CreditCheckHandler) LogCreditCheck(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	var req logCreditCheckRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if req.CustomerID == "" {
-		h.respondWithError(w, http.StatusBadRequest, "customer_id is required")
-		return
-	}
-	customerID, err := uuid.Parse(req.CustomerID)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
-		return
-	}
-
-	var previousLimit, newLimit *decimal.Decimal
-	if req.PreviousLimit != nil && *req.PreviousLimit != "" {
-		pl, err := decimal.NewFromString(*req.PreviousLimit)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid previous_limit")
-			return
-		}
-		previousLimit = &pl
-	}
-	if req.NewLimit != nil && *req.NewLimit != "" {
-		nl, err := decimal.NewFromString(*req.NewLimit)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid new_limit")
-			return
-		}
-		newLimit = &nl
-	}
-
-	var approvedBy *uuid.UUID
-	if req.ApprovedBy != nil && *req.ApprovedBy != "" {
-		ab, err := uuid.Parse(*req.ApprovedBy)
-		if err != nil {
-			h.respondWithError(w, http.StatusBadRequest, "invalid approved_by")
-			return
-		}
-		approvedBy = &ab
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-	_ = idempotencyKey
-
-	svcReq := &service.CreateCreditCheckHistoryRequest{
-		CompanyID:     companyID,
-		CustomerID:    customerID,
-		ActionType:    req.ActionType,
-		PreviousLimit: previousLimit,
-		NewLimit:      newLimit,
-		Reason:        req.Reason,
-		ApprovedBy:    approvedBy,
-		CreatedBy:     &userID,
-	}
-
-	history, err := h.creditCheckService.LogCreditCheck(ctx, svcReq)
-	if err != nil {
-		h.logger.Error("failed to log credit check", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	resp := h.toCreditCheckHistoryResponse(history)
-	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
-		"success": true,
-		"data":    resp,
-	})
-}
-
+// GET /credit/history/{id}
 func (h *CreditCheckHandler) GetCreditCheckHistoryByID(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	historyID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid history ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	history, err := h.creditCheckService.GetCreditCheckHistoryByID(ctx, companyID, historyID)
 	if err != nil {
 		h.logger.Error("failed to get credit check history", zap.Error(err))
@@ -1209,7 +656,6 @@ func (h *CreditCheckHandler) GetCreditCheckHistoryByID(w http.ResponseWriter, r 
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditCheckHistoryResponse(history)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -1217,35 +663,30 @@ func (h *CreditCheckHandler) GetCreditCheckHistoryByID(w http.ResponseWriter, r 
 	})
 }
 
+// GET /credit/customers/{id}/history
 func (h *CreditCheckHandler) GetCustomerCreditHistory(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
-	pagination := service.Pagination{
-		Limit:  20,
-		Offset: 0,
-	}
+	pagination := service.Pagination{Limit: 20, Offset: 0}
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
 			pagination.Limit = l
@@ -1266,7 +707,6 @@ func (h *CreditCheckHandler) GetCustomerCreditHistory(w http.ResponseWriter, r *
 	if sort.Direction == "" {
 		sort.Direction = "DESC"
 	}
-
 	history, total, err := h.creditCheckService.GetCustomerCreditHistory(ctx, companyID, customerID, pagination, sort)
 	if err != nil {
 		h.logger.Error("failed to get customer credit history", zap.Error(err))
@@ -1274,7 +714,6 @@ func (h *CreditCheckHandler) GetCustomerCreditHistory(w http.ResponseWriter, r *
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	items := make([]creditCheckHistoryResponse, len(history))
 	for i, hh := range history {
 		items[i] = h.toCreditCheckHistoryResponse(hh)
@@ -1291,31 +730,29 @@ func (h *CreditCheckHandler) GetCustomerCreditHistory(w http.ResponseWriter, r *
 	})
 }
 
+// GET /credit/orders/{id}/history
 func (h *CreditCheckHandler) GetOrderCreditHistory(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	orderID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	history, err := h.creditCheckService.GetOrderCreditHistory(ctx, companyID, orderID)
 	if err != nil {
 		h.logger.Error("failed to get order credit history", zap.Error(err))
@@ -1323,7 +760,6 @@ func (h *CreditCheckHandler) GetOrderCreditHistory(w http.ResponseWriter, r *htt
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	items := make([]creditCheckHistoryResponse, len(history))
 	for i, hh := range history {
 		items[i] = h.toCreditCheckHistoryResponse(hh)
@@ -1334,46 +770,41 @@ func (h *CreditCheckHandler) GetOrderCreditHistory(w http.ResponseWriter, r *htt
 	})
 }
 
+// GET /credit/failed-checks
 func (h *CreditCheckHandler) GetFailedCreditChecks(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
-		t, err := time.Parse(time.RFC3339, fromStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, fromStr); err == nil {
 			from = &t
 		}
 	}
 	if toStr := r.URL.Query().Get("to"); toStr != "" {
-		t, err := time.Parse(time.RFC3339, toStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, toStr); err == nil {
 			to = &t
 		}
 	}
-
 	failed, err := h.creditCheckService.GetFailedCreditChecks(ctx, companyID, from, to)
 	if err != nil {
 		h.logger.Error("failed to get failed credit checks", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve failed checks")
 		return
 	}
-
 	items := make([]creditCheckHistoryResponse, len(failed))
 	for i, f := range failed {
 		items[i] = h.toCreditCheckHistoryResponse(f)
@@ -1384,77 +815,30 @@ func (h *CreditCheckHandler) GetFailedCreditChecks(w http.ResponseWriter, r *htt
 	})
 }
 
-func (h *CreditCheckHandler) RunAutomaticCreditReview(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	customerID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	result, err := h.creditCheckService.RunAutomaticCreditReview(ctx, companyID, customerID, userID)
-	if err != nil {
-		h.logger.Error("failed to run automatic credit review", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"data":    result,
-	})
-}
-
+// GET /credit/customers/exceeding-limit
 func (h *CreditCheckHandler) GetCustomersExceedingCreditLimit(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	customers, err := h.creditCheckService.GetCustomersExceedingCreditLimit(ctx, companyID)
 	if err != nil {
 		h.logger.Error("failed to get customers exceeding credit limit", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve customers")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    customers,
@@ -1466,6 +850,15 @@ func (h *CreditCheckHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
@@ -1480,16 +873,12 @@ func (h *CreditCheckHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, 
 		return
 	}
 
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+	// --- ADD THIS VALIDATION ---
+	if threshold.GreaterThan(decimal.NewFromInt(100)) {
+		h.respondWithError(w, http.StatusBadRequest, "threshold_percent cannot exceed 100")
 		return
 	}
-
-	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
+	// ---------------------------
 
 	customers, err := h.creditCheckService.GetCustomersNearCreditLimit(ctx, companyID, threshold)
 	if err != nil {
@@ -1497,84 +886,76 @@ func (h *CreditCheckHandler) GetCustomersNearCreditLimit(w http.ResponseWriter, 
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve customers")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    customers,
 	})
 }
 
+// GET /credit/customers/high-risk
 func (h *CreditCheckHandler) GetHighRiskCustomers(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	customers, err := h.creditCheckService.GetHighRiskCustomers(ctx, companyID)
 	if err != nil {
 		h.logger.Error("failed to get high risk customers", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to retrieve customers")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    customers,
 	})
 }
 
+// GET /credit/customers/{id}/average-payment-delay
 func (h *CreditCheckHandler) GetAveragePaymentDelay(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
-		t, err := time.Parse(time.RFC3339, fromStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, fromStr); err == nil {
 			from = &t
 		}
 	}
 	if toStr := r.URL.Query().Get("to"); toStr != "" {
-		t, err := time.Parse(time.RFC3339, toStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, toStr); err == nil {
 			to = &t
 		}
 	}
-
 	delay, err := h.creditCheckService.GetAveragePaymentDelay(ctx, companyID, customerID, from, to)
 	if err != nil {
 		h.logger.Error("failed to get average payment delay", zap.Error(err))
@@ -1582,38 +963,35 @@ func (h *CreditCheckHandler) GetAveragePaymentDelay(w http.ResponseWriter, r *ht
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"average_payment_delay_days": delay.String()},
 	})
 }
 
+// GET /credit/customers/{id}/collection-score
 func (h *CreditCheckHandler) GetCustomerCollectionScore(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	score, err := h.creditCheckService.GetCustomerCollectionScore(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to get customer collection score", zap.Error(err))
@@ -1621,38 +999,35 @@ func (h *CreditCheckHandler) GetCustomerCollectionScore(w http.ResponseWriter, r
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"collection_score": score.String()},
 	})
 }
 
+// GET /credit/customers/{id}/utilization
 func (h *CreditCheckHandler) GetCustomerCreditUtilization(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	utilization, err := h.creditCheckService.GetCustomerCreditUtilization(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to get customer credit utilization", zap.Error(err))
@@ -1660,194 +1035,177 @@ func (h *CreditCheckHandler) GetCustomerCreditUtilization(w http.ResponseWriter,
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"credit_utilization": utilization.String()},
 	})
 }
 
+// GET /credit/totals/outstanding
 func (h *CreditCheckHandler) GetTotalOutstandingCredit(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	total, err := h.creditCheckService.GetTotalOutstandingCredit(ctx, companyID)
 	if err != nil {
 		h.logger.Error("failed to get total outstanding credit", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to compute total")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"total_outstanding_credit": total.String()},
 	})
 }
 
+// GET /credit/totals/credit-exposure
 func (h *CreditCheckHandler) GetTotalCreditExposure(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	total, err := h.creditCheckService.GetTotalCreditExposure(ctx, companyID)
 	if err != nil {
 		h.logger.Error("failed to get total credit exposure", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to compute exposure")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"total_credit_exposure": total.String()},
 	})
 }
 
+// GET /credit/totals/average-utilization
 func (h *CreditCheckHandler) GetAverageCreditUtilization(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
-		t, err := time.Parse(time.RFC3339, fromStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, fromStr); err == nil {
 			from = &t
 		}
 	}
 	if toStr := r.URL.Query().Get("to"); toStr != "" {
-		t, err := time.Parse(time.RFC3339, toStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, toStr); err == nil {
 			to = &t
 		}
 	}
-
 	avg, err := h.creditCheckService.GetAverageCreditUtilization(ctx, companyID, from, to)
 	if err != nil {
 		h.logger.Error("failed to get average credit utilization", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to compute average")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"average_credit_utilization": avg.String()},
 	})
 }
 
+// GET /credit/totals/credit-hold-rate
 func (h *CreditCheckHandler) GetCreditHoldRate(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	var from, to *time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
-		t, err := time.Parse(time.RFC3339, fromStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, fromStr); err == nil {
 			from = &t
 		}
 	}
 	if toStr := r.URL.Query().Get("to"); toStr != "" {
-		t, err := time.Parse(time.RFC3339, toStr)
-		if err == nil {
+		if t, err := time.Parse(time.RFC3339, toStr); err == nil {
 			to = &t
 		}
 	}
-
 	rate, err := h.creditCheckService.GetCreditHoldRate(ctx, companyID, from, to)
 	if err != nil {
 		h.logger.Error("failed to get credit hold rate", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to compute rate")
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]string{"credit_hold_rate": rate.String()},
 	})
 }
 
+// GET /credit/history/{id}/exists
 func (h *CreditCheckHandler) CreditHistoryExists(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	historyID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid history ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	exists, err := h.creditCheckService.CreditHistoryExists(ctx, companyID, historyID)
 	if err != nil {
 		h.logger.Error("failed to check credit history exists", zap.Error(err))
@@ -1855,38 +1213,35 @@ func (h *CreditCheckHandler) CreditHistoryExists(w http.ResponseWriter, r *http.
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"exists": exists},
 	})
 }
 
+// GET /credit/orders/{id}/has-issues
 func (h *CreditCheckHandler) OrderHasCreditIssues(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	orderID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	hasIssues, err := h.creditCheckService.OrderHasCreditIssues(ctx, companyID, orderID)
 	if err != nil {
 		h.logger.Error("failed to check order has credit issues", zap.Error(err))
@@ -1894,38 +1249,35 @@ func (h *CreditCheckHandler) OrderHasCreditIssues(w http.ResponseWriter, r *http
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"has_credit_issues": hasIssues},
 	})
 }
 
+// GET /credit/customers/{id}/exceeded-limit
 func (h *CreditCheckHandler) CustomerExceededCreditLimit(w http.ResponseWriter, r *http.Request) {
+	// Read‑only, no idempotency
 	ctx := r.Context()
 	customerID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	exceeded, err := h.creditCheckService.CustomerExceededCreditLimit(ctx, companyID, customerID)
 	if err != nil {
 		h.logger.Error("failed to check if customer exceeded credit limit", zap.Error(err))
@@ -1933,9 +1285,523 @@ func (h *CreditCheckHandler) CustomerExceededCreditLimit(w http.ResponseWriter, 
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    map[string]bool{"exceeded_credit_limit": exceeded},
+	})
+}
+
+// ----------------------------------------------------------------------
+// MUTATING ENDPOINTS (with idempotency)
+// ----------------------------------------------------------------------
+
+// POST /credit/orders/{id}/hold
+func (h *CreditCheckHandler) HoldOrderForCredit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	orderID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req holdOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.HoldOrderForCredit(ctx, companyID, orderID, req.Reason, userID)
+	if err != nil {
+		h.logger.Error("failed to hold order for credit", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "order placed on credit hold",
+	})
+}
+
+// POST /credit/orders/{id}/release-hold
+func (h *CreditCheckHandler) ReleaseOrderCreditHold(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	orderID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req holdOrderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.ReleaseOrderCreditHold(ctx, companyID, orderID, req.Reason, userID)
+	if err != nil {
+		h.logger.Error("failed to release order credit hold", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "credit hold released",
+	})
+}
+
+// PUT /credit/orders/{id}/credit-status
+func (h *CreditCheckHandler) UpdateOrderCreditStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	orderID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid order ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req updateOrderCreditStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	status := enums.CreditCheckStatus(req.Status)
+	if !status.IsValid() {
+		h.respondWithError(w, http.StatusBadRequest, "invalid credit status")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.UpdateOrderCreditStatus(ctx, companyID, orderID, status, userID)
+	if err != nil {
+		h.logger.Error("failed to update order credit status", zap.Error(err))
+		statusCode, msg := h.mapServiceError(err)
+		h.respondWithError(w, statusCode, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "order credit status updated",
+	})
+}
+
+// PUT /credit/customers/{id}/credit-limit
+func (h *CreditCheckHandler) SetCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	customerID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req setCreditLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	creditLimit, err := decimal.NewFromString(req.CreditLimit)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid credit_limit")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.SetCustomerCreditLimit(ctx, companyID, customerID, creditLimit, userID)
+	if err != nil {
+		h.logger.Error("failed to set customer credit limit", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "credit limit set",
+	})
+}
+
+// POST /credit/customers/{id}/credit-limit/increase
+func (h *CreditCheckHandler) IncreaseCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	customerID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req increaseDecreaseCreditLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	increaseAmount, err := decimal.NewFromString(req.IncreaseAmount)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid increase_amount")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.IncreaseCustomerCreditLimit(ctx, companyID, customerID, increaseAmount, req.Reason, userID)
+	if err != nil {
+		h.logger.Error("failed to increase customer credit limit", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "credit limit increased",
+	})
+}
+
+// POST /credit/customers/{id}/credit-limit/decrease
+func (h *CreditCheckHandler) DecreaseCustomerCreditLimit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	customerID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req increaseDecreaseCreditLimitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	decreaseAmount, err := decimal.NewFromString(req.DecreaseAmount)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid decrease_amount")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.DecreaseCustomerCreditLimit(ctx, companyID, customerID, decreaseAmount, req.Reason, userID)
+	if err != nil {
+		h.logger.Error("failed to decrease customer credit limit", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "credit limit decreased",
+	})
+}
+
+// POST /credit/customers/{id}/credit-suspend
+func (h *CreditCheckHandler) SuspendCustomerCredit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	customerID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req suspendCreditRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.SuspendCustomerCredit(ctx, companyID, customerID, req.Reason, userID)
+	if err != nil {
+		h.logger.Error("failed to suspend customer credit", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "customer credit suspended",
+	})
+}
+
+// POST /credit/customers/{id}/credit-restore
+func (h *CreditCheckHandler) RestoreCustomerCredit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	customerID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.creditCheckService.RestoreCustomerCredit(ctx, companyID, customerID, userID)
+	if err != nil {
+		h.logger.Error("failed to restore customer credit", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "customer credit restored",
+	})
+}
+
+// POST /credit/history
+func (h *CreditCheckHandler) LogCreditCheck(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var req logCreditCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.CustomerID == "" {
+		h.respondWithError(w, http.StatusBadRequest, "customer_id is required")
+		return
+	}
+	customerID, err := uuid.Parse(req.CustomerID)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+		return
+	}
+	var previousLimit, newLimit *decimal.Decimal
+	if req.PreviousLimit != nil && *req.PreviousLimit != "" {
+		pl, err := decimal.NewFromString(*req.PreviousLimit)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid previous_limit")
+			return
+		}
+		previousLimit = &pl
+	}
+	if req.NewLimit != nil && *req.NewLimit != "" {
+		nl, err := decimal.NewFromString(*req.NewLimit)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid new_limit")
+			return
+		}
+		newLimit = &nl
+	}
+	var approvedBy *uuid.UUID
+	if req.ApprovedBy != nil && *req.ApprovedBy != "" {
+		ab, err := uuid.Parse(*req.ApprovedBy)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid approved_by")
+			return
+		}
+		approvedBy = &ab
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	svcReq := &service.CreateCreditCheckHistoryRequest{
+		CompanyID:     companyID,
+		CustomerID:    customerID,
+		ActionType:    req.ActionType,
+		PreviousLimit: previousLimit,
+		NewLimit:      newLimit,
+		Reason:        req.Reason,
+		ApprovedBy:    approvedBy,
+		CreatedBy:     &userID,
+	}
+	history, err := h.creditCheckService.LogCreditCheck(ctx, svcReq)
+	if err != nil {
+		h.logger.Error("failed to log credit check", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	resp := h.toCreditCheckHistoryResponse(history)
+	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    resp,
+	})
+}
+
+// POST /credit/customers/{id}/auto-review
+func (h *CreditCheckHandler) RunAutomaticCreditReview(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	customerID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer ID")
+		return
+	}
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.hasPermission(ctx, companyID, userID, "credit:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+	if h.getIdempotencyKey(r) == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	result, err := h.creditCheckService.RunAutomaticCreditReview(ctx, companyID, customerID, userID)
+	if err != nil {
+		h.logger.Error("failed to run automatic credit review", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    result,
 	})
 }

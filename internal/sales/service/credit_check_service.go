@@ -104,7 +104,10 @@ func NewCreditCheckService(
 	}
 }
 
-// Helper: get outstanding balance for a customer (sum of amount_due from unpaid invoices).
+// ----------------------------------------------------------------------
+// Helper methods
+// ----------------------------------------------------------------------
+
 func (s *creditCheckService) getOutstandingBalance(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
 	query := `
         SELECT COALESCE(SUM(amount_due), 0)
@@ -120,7 +123,6 @@ func (s *creditCheckService) getOutstandingBalance(ctx context.Context, tx repos
 	return total, nil
 }
 
-// getCustomerCreditLimit returns the credit limit (0 if not set).
 func (s *creditCheckService) getCustomerCreditLimit(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
 	cust, err := s.customerRepo.GetCreditLimit(ctx, tx, companyID, customerID)
 	if err != nil {
@@ -132,7 +134,6 @@ func (s *creditCheckService) getCustomerCreditLimit(ctx context.Context, tx repo
 	return *cust.CreditLimit, nil
 }
 
-// isCustomerSuspended checks if the customer has a suspension record (via credit history with action_type "suspend" and no restore).
 func (s *creditCheckService) isCustomerSuspended(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID) (bool, error) {
 	query := `
         SELECT EXISTS(
@@ -151,7 +152,6 @@ func (s *creditCheckService) isCustomerSuspended(ctx context.Context, tx reposit
 	return suspended, nil
 }
 
-// logCreditHistory inserts a credit check history record.
 func (s *creditCheckService) logCreditHistory(ctx context.Context, tx repository.DBTX, req *CreateCreditCheckHistoryRequest) error {
 	history := &models.CreditCheckHistory{
 		CreditHistoryID:     uuid.New(),
@@ -169,7 +169,6 @@ func (s *creditCheckService) logCreditHistory(ctx context.Context, tx repository
 	return s.creditHistoryRepo.Create(ctx, tx, history)
 }
 
-// emitEvent sends an outbox event.
 func (s *creditCheckService) emitEvent(ctx context.Context, tx *sql.Tx, aggregateType, aggregateID, eventType string, payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -187,7 +186,7 @@ func (s *creditCheckService) emitEvent(ctx context.Context, tx *sql.Tx, aggregat
 }
 
 // ----------------------------------------------------------------------
-// Core business logic
+// Read‑only methods (all use read‑only transactions)
 // ----------------------------------------------------------------------
 
 func (s *creditCheckService) CheckCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, requestedAmount decimal.Decimal) (*CreditCheckResult, error) {
@@ -219,7 +218,6 @@ func (s *creditCheckService) CheckCustomerCreditLimit(ctx context.Context, compa
 		eligible = false
 		reason = "customer credit is suspended"
 	}
-	// Count outstanding invoices
 	var count int
 	countQuery := `SELECT COUNT(*) FROM sales.invoices WHERE company_id=$1 AND customer_id=$2 AND status NOT IN ('paid','cancelled')`
 	tx.QueryRowContext(ctx, countQuery, companyID, customerID).Scan(&count)
@@ -268,7 +266,6 @@ func (s *creditCheckService) CheckOrderCreditEligibility(ctx context.Context, co
 		eligible = false
 		reason = "customer credit suspended"
 	}
-	// Also check if order already on hold
 	var hold bool
 	tx.QueryRowContext(ctx, `SELECT credit_hold FROM sales.orders WHERE order_id=$1`, orderID).Scan(&hold)
 	if hold {
@@ -290,7 +287,7 @@ func (s *creditCheckService) CheckOrderCreditEligibility(ctx context.Context, co
 func (s *creditCheckService) CheckInvoiceCreditEligibility(ctx context.Context, companyID, invoiceID uuid.UUID) (*CreditCheckResult, error) {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -346,26 +343,31 @@ func (s *creditCheckService) GetCustomerAvailableCredit(ctx context.Context, com
 }
 
 func (s *creditCheckService) GetCustomerOutstandingBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	return s.getOutstandingBalance(ctx, nil, companyID, customerID)
-}
-
-func (s *creditCheckService) GetCustomerCreditExposure(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	limit, err := s.GetCustomerCreditLimit(ctx, companyID, customerID)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	outstanding, err := s.GetCustomerOutstandingBalance(ctx, companyID, customerID)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	// Exposure = outstanding + sum of open order totals (not yet invoiced)
-	var openOrdersTotal decimal.Decimal
-	query := `SELECT COALESCE(SUM(grand_total), 0) FROM sales.orders WHERE company_id=$1 AND customer_id=$2 AND status NOT IN ('cancelled','delivered') AND credit_hold=false`
 	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return decimal.Zero, err
 	}
 	defer tx.Rollback()
+	return s.getOutstandingBalance(ctx, tx, companyID, customerID)
+}
+
+func (s *creditCheckService) GetCustomerCreditExposure(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return decimal.Zero, err
+	}
+	defer tx.Rollback()
+
+	limit, err := s.getCustomerCreditLimit(ctx, tx, companyID, customerID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	outstanding, err := s.getOutstandingBalance(ctx, tx, companyID, customerID)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	var openOrdersTotal decimal.Decimal
+	query := `SELECT COALESCE(SUM(grand_total), 0) FROM sales.orders WHERE company_id=$1 AND customer_id=$2 AND status NOT IN ('cancelled','delivered') AND credit_hold=false`
 	err = tx.QueryRowContext(ctx, query, companyID, customerID).Scan(&openOrdersTotal)
 	if err != nil {
 		return decimal.Zero, err
@@ -385,112 +387,6 @@ func (s *creditCheckService) CanCustomerPlaceOrder(ctx context.Context, companyI
 	return result.Eligible, nil
 }
 
-func (s *creditCheckService) HoldOrderForCredit(ctx context.Context, companyID, orderID uuid.UUID, reason string, heldBy uuid.UUID) error {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	var alreadyHold bool
-	err = tx.QueryRowContext(ctx, `SELECT credit_hold FROM sales.orders WHERE order_id=$1 FOR UPDATE`, orderID).Scan(&alreadyHold)
-	if err != nil {
-		return err
-	}
-	if alreadyHold {
-		return nil
-	}
-
-	_, err = tx.ExecContext(ctx, `UPDATE sales.orders SET credit_hold=true, credit_status='hold', updated_at=NOW() WHERE order_id=$1`, orderID)
-	if err != nil {
-		return err
-	}
-
-	var custID uuid.UUID
-	tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&custID)
-	histReq := &CreateCreditCheckHistoryRequest{
-		CompanyID:  companyID,
-		CustomerID: custID,
-		ActionType: "order_hold",
-		Reason:     &reason,
-		CreatedBy:  &heldBy,
-	}
-	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
-		s.logger.Warn("failed to log order hold history", zap.Error(err))
-	}
-
-	order, _ := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
-	if order != nil {
-		payload := map[string]interface{}{
-			"order_id":    orderID.String(),
-			"company_id":  companyID.String(),
-			"customer_id": order.CustomerID.String(),
-			"reason":      reason,
-			"held_by":     heldBy.String(),
-			"held_at":     time.Now().Format(time.RFC3339),
-		}
-		if err := s.emitEvent(ctx, tx, "order", orderID.String(), salesEvents.EventOrderCreditHeld, payload); err != nil {
-			s.logger.Warn("failed to emit order hold event", zap.Error(err))
-		}
-	}
-	if s.auditService != nil {
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "credit_hold", "order", &orderID, "user", &heldBy, nil, nil, map[string]interface{}{"reason": reason})
-	}
-	return tx.Commit()
-}
-
-func (s *creditCheckService) ReleaseOrderCreditHold(ctx context.Context, companyID, orderID uuid.UUID, reason string, releasedBy uuid.UUID) error {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	var currentlyHold bool
-	err = tx.QueryRowContext(ctx, `SELECT credit_hold FROM sales.orders WHERE order_id=$1 FOR UPDATE`, orderID).Scan(&currentlyHold)
-	if err != nil {
-		return err
-	}
-	if !currentlyHold {
-		return nil
-	}
-
-	_, err = tx.ExecContext(ctx, `UPDATE sales.orders SET credit_hold=false, credit_status='approved', updated_at=NOW() WHERE order_id=$1`, orderID)
-	if err != nil {
-		return err
-	}
-
-	var custID uuid.UUID
-	tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&custID)
-	histReq := &CreateCreditCheckHistoryRequest{
-		CompanyID:  companyID,
-		CustomerID: custID,
-		ActionType: "order_release",
-		Reason:     &reason,
-		CreatedBy:  &releasedBy,
-	}
-	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
-		s.logger.Warn("failed to log order release history", zap.Error(err))
-	}
-
-	order, _ := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
-	if order != nil {
-		payload := map[string]interface{}{
-			"order_id":    orderID.String(),
-			"company_id":  companyID.String(),
-			"customer_id": order.CustomerID.String(),
-			"reason":      reason,
-			"released_by": releasedBy.String(),
-			"released_at": time.Now().Format(time.RFC3339),
-		}
-		_ = s.emitEvent(ctx, tx, "order", orderID.String(), salesEvents.EventOrderCreditReleased, payload)
-	}
-	if s.auditService != nil {
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "credit_release", "order", &orderID, "user", &releasedBy, nil, nil, map[string]interface{}{"reason": reason})
-	}
-	return tx.Commit()
-}
-
 func (s *creditCheckService) IsOrderOnCreditHold(ctx context.Context, companyID, orderID uuid.UUID) (bool, error) {
 	var hold bool
 	err := s.pgClient.DB.QueryRowContext(ctx, `SELECT credit_hold FROM sales.orders WHERE order_id=$1`, orderID).Scan(&hold)
@@ -504,7 +400,6 @@ func (s *creditCheckService) IsOrderOnCreditHold(ctx context.Context, companyID,
 }
 
 func (s *creditCheckService) GetOrdersOnCreditHold(ctx context.Context, companyID uuid.UUID) ([]*models.Order, error) {
-	// Manually query because OrderFilter doesn't have CreditHold field
 	query := `SELECT order_id FROM sales.orders WHERE company_id=$1 AND credit_hold=true`
 	rows, err := s.pgClient.DB.QueryContext(ctx, query, companyID)
 	if err != nil {
@@ -537,239 +432,91 @@ func (s *creditCheckService) GetOrdersOnCreditHold(ctx context.Context, companyI
 	return orders, nil
 }
 
-func (s *creditCheckService) UpdateOrderCreditStatus(ctx context.Context, companyID, orderID uuid.UUID, status enums.CreditCheckStatus, updatedBy uuid.UUID) error {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `UPDATE sales.orders SET credit_status=$1, updated_at=NOW() WHERE order_id=$2`, string(status), orderID)
-	if err != nil {
-		return err
-	}
-	var custID uuid.UUID
-	tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&custID)
-	histReq := &CreateCreditCheckHistoryRequest{
-		CompanyID:  companyID,
-		CustomerID: custID,
-		ActionType: "order_status_change",
-		CreatedBy:  &updatedBy,
-	}
-	_ = s.logCreditHistory(ctx, tx, histReq)
-	return tx.Commit()
-}
-
-func (s *creditCheckService) SetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, creditLimit decimal.Decimal, updatedBy uuid.UUID) error {
-	if err := s.ValidateCreditLimit(ctx, creditLimit); err != nil {
-		return err
-	}
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	cust, err := s.customerRepo.GetByIDForUpdate(ctx, tx, companyID, customerID)
-	if err != nil {
-		return err
-	}
-	oldLimit := decimal.Zero
-	if cust.CreditLimit != nil {
-		oldLimit = *cust.CreditLimit
-	}
-	cust.CreditLimit = &creditLimit
-	cust.UpdatedBy = &updatedBy
-	if err := s.customerRepo.Update(ctx, tx, cust); err != nil {
-		return err
-	}
-
-	histReq := &CreateCreditCheckHistoryRequest{
-		CompanyID:     companyID,
-		CustomerID:    customerID,
-		ActionType:    "limit_change",
-		PreviousLimit: &oldLimit,
-		NewLimit:      &creditLimit,
-		CreatedBy:     &updatedBy,
-	}
-	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
-		s.logger.Warn("failed to log credit limit change", zap.Error(err))
-	}
-
-	payload := map[string]interface{}{
-		"customer_id":    customerID.String(),
-		"company_id":     companyID.String(),
-		"previous_limit": oldLimit.String(),
-		"new_limit":      creditLimit.String(),
-		"updated_by":     updatedBy.String(),
-		"updated_at":     time.Now().Format(time.RFC3339),
-	}
-	if err := s.emitEvent(ctx, tx, "customer", customerID.String(), salesEvents.EventCustomerCreditLimitChanged, payload); err != nil {
-		s.logger.Warn("failed to emit credit limit event", zap.Error(err))
-	}
-
-	if s.auditService != nil {
-		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "set_credit_limit", "customer", &customerID, "user", &updatedBy, nil, nil, map[string]interface{}{
-			"old_limit": oldLimit.String(),
-			"new_limit": creditLimit.String(),
-		})
-	}
-	return tx.Commit()
-}
-
-func (s *creditCheckService) IncreaseCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, increaseAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error {
-	if increaseAmount.LessThanOrEqual(decimal.Zero) {
-		return fmt.Errorf("%w: increase amount must be positive", salesErrors.ErrInvalidInput)
-	}
-	current, err := s.GetCustomerCreditLimit(ctx, companyID, customerID)
-	if err != nil {
-		return err
-	}
-	newLimit := current.Add(increaseAmount)
-	return s.SetCustomerCreditLimit(ctx, companyID, customerID, newLimit, updatedBy)
-}
-
-func (s *creditCheckService) DecreaseCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, decreaseAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error {
-	if decreaseAmount.LessThanOrEqual(decimal.Zero) {
-		return fmt.Errorf("%w: decrease amount must be positive", salesErrors.ErrInvalidInput)
-	}
-	current, err := s.GetCustomerCreditLimit(ctx, companyID, customerID)
-	if err != nil {
-		return err
-	}
-	newLimit := current.Sub(decreaseAmount)
-	if newLimit.LessThan(decimal.Zero) {
-		newLimit = decimal.Zero
-	}
-	return s.SetCustomerCreditLimit(ctx, companyID, customerID, newLimit, updatedBy)
-}
-
-func (s *creditCheckService) SuspendCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, reason string, suspendedBy uuid.UUID) error {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	histReq := &CreateCreditCheckHistoryRequest{
-		CompanyID:  companyID,
-		CustomerID: customerID,
-		ActionType: "suspend",
-		Reason:     &reason,
-		CreatedBy:  &suspendedBy,
-	}
-	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
-		return err
-	}
-	payload := map[string]interface{}{
-		"customer_id":  customerID.String(),
-		"company_id":   companyID.String(),
-		"reason":       reason,
-		"suspended_by": suspendedBy.String(),
-		"suspended_at": time.Now().Format(time.RFC3339),
-	}
-	if err := s.emitEvent(ctx, tx, "customer", customerID.String(), "sales.customer.credit_suspended", payload); err != nil {
-		s.logger.Warn("failed to emit credit suspension event", zap.Error(err))
-	}
-	return tx.Commit()
-}
-
-func (s *creditCheckService) RestoreCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, restoredBy uuid.UUID) error {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	histReq := &CreateCreditCheckHistoryRequest{
-		CompanyID:  companyID,
-		CustomerID: customerID,
-		ActionType: "restore",
-		CreatedBy:  &restoredBy,
-	}
-	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
-		return err
-	}
-	payload := map[string]interface{}{
-		"customer_id": customerID.String(),
-		"company_id":  companyID.String(),
-		"restored_by": restoredBy.String(),
-		"restored_at": time.Now().Format(time.RFC3339),
-	}
-	_ = s.emitEvent(ctx, tx, "customer", customerID.String(), "sales.customer.credit_restored", payload)
-	return tx.Commit()
-}
-
 func (s *creditCheckService) GetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	return s.getCustomerCreditLimit(ctx, nil, companyID, customerID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return decimal.Zero, err
+	}
+	defer tx.Rollback()
+	return s.getCustomerCreditLimit(ctx, tx, companyID, customerID)
 }
 
 func (s *creditCheckService) IsCustomerCreditSuspended(ctx context.Context, companyID, customerID uuid.UUID) (bool, error) {
-	return s.isCustomerSuspended(ctx, nil, companyID, customerID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	return s.isCustomerSuspended(ctx, tx, companyID, customerID)
 }
 
-func (s *creditCheckService) LogCreditCheck(ctx context.Context, req *CreateCreditCheckHistoryRequest) (*models.CreditCheckHistory, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
+func (s *creditCheckService) GetCreditCheckHistoryByID(ctx context.Context, companyID, historyID uuid.UUID) (*models.CreditCheckHistory, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	history := &models.CreditCheckHistory{
-		CreditHistoryID:     uuid.New(),
-		CompanyID:           req.CompanyID,
-		CustomerID:          req.CustomerID,
-		ActionType:          req.ActionType,
-		PreviousLimit:       req.PreviousLimit,
-		NewLimit:            req.NewLimit,
-		PreviousOutstanding: req.PreviousOutstanding,
-		NewOutstanding:      req.NewOutstanding,
-		Reason:              req.Reason,
-		ApprovedBy:          req.ApprovedBy,
-		CreatedBy:           req.CreatedBy,
-	}
-	if err := s.creditHistoryRepo.Create(ctx, tx, history); err != nil {
+	history, err := s.creditHistoryRepo.GetByID(ctx, tx, companyID, historyID)
+	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return history, nil
-}
-
-func (s *creditCheckService) GetCreditCheckHistoryByID(ctx context.Context, companyID, historyID uuid.UUID) (*models.CreditCheckHistory, error) {
-	return s.creditHistoryRepo.GetByID(ctx, nil, companyID, historyID)
+	return history, tx.Commit()
 }
 
 func (s *creditCheckService) GetCustomerCreditHistory(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, srt Sort) ([]*models.CreditCheckHistory, int64, error) {
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+
 	filter := repository.CreditCheckHistoryFilter{
 		CompanyID:  companyID,
 		CustomerID: &customerID,
 	}
-	return s.creditHistoryRepo.List(ctx, nil, filter, repository.Pagination{Limit: p.Limit, Offset: p.Offset}, repository.Sort{Field: srt.Field, Direction: srt.Direction})
+	histories, total, err := s.creditHistoryRepo.List(ctx, tx, filter,
+		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
+		repository.Sort{Field: srt.Field, Direction: srt.Direction})
+	if err != nil {
+		return nil, 0, err
+	}
+	return histories, total, tx.Commit()
 }
 
 func (s *creditCheckService) GetOrderCreditHistory(ctx context.Context, companyID, orderID uuid.UUID) ([]*models.CreditCheckHistory, error) {
-	var customerID uuid.UUID
-	err := s.pgClient.DB.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&customerID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
+	defer tx.Rollback()
+
+	var customerID uuid.UUID
+	err = tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&customerID)
+	if err != nil {
+		return nil, err
+	}
+
 	filter := repository.CreditCheckHistoryFilter{
 		CompanyID:  companyID,
 		CustomerID: &customerID,
 	}
-	histories, _, err := s.creditHistoryRepo.List(ctx, nil, filter, repository.Pagination{Limit: 100}, repository.Sort{Field: "created_at", Direction: "DESC"})
+	histories, _, err := s.creditHistoryRepo.List(ctx, tx, filter,
+		repository.Pagination{Limit: 100},
+		repository.Sort{Field: "created_at", Direction: "DESC"})
 	if err != nil {
 		return nil, err
 	}
+
 	var orderHistories []*models.CreditCheckHistory
 	for _, h := range histories {
 		if h.ActionType == "order_hold" || h.ActionType == "order_release" || h.ActionType == "order_status_change" {
 			orderHistories = append(orderHistories, h)
 		}
 	}
-	return orderHistories, nil
+	return orderHistories, tx.Commit()
 }
 
 func (s *creditCheckService) GetFailedCreditChecks(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*models.CreditCheckHistory, error) {
-	// Direct SQL query because filter lacks FromDate/ToDate
 	query := `
         SELECT credit_history_id, company_id, customer_id, action_type,
                previous_limit, new_limit, previous_outstanding, new_outstanding,
@@ -806,65 +553,6 @@ func (s *creditCheckService) GetFailedCreditChecks(ctx context.Context, companyI
 		failed = append(failed, &h)
 	}
 	return failed, nil
-}
-
-func (s *creditCheckService) RunAutomaticCreditReview(ctx context.Context, companyID, customerID uuid.UUID, triggeredBy uuid.UUID) (*CreditReviewResult, error) {
-	tx, err := s.pgClient.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	limit, err := s.getCustomerCreditLimit(ctx, tx, companyID, customerID)
-	if err != nil {
-		return nil, err
-	}
-	outstanding, err := s.getOutstandingBalance(ctx, tx, companyID, customerID)
-	if err != nil {
-		return nil, err
-	}
-	avgDelay, err := s.GetAveragePaymentDelay(ctx, companyID, customerID, nil, nil)
-	if err != nil {
-		avgDelay = decimal.Zero
-	}
-	var recommendedLimit = limit
-	var action string = "maintain"
-	var reasonReview string = "normal"
-
-	if outstanding.GreaterThan(limit.Mul(decimal.NewFromInt(90)).Div(decimal.NewFromInt(100))) {
-		recommendedLimit = limit.Mul(decimal.NewFromInt(80)).Div(decimal.NewFromInt(100))
-		action = "decrease"
-		reasonReview = "utilization >90%"
-	} else if avgDelay.GreaterThan(decimal.NewFromInt(45)) {
-		recommendedLimit = limit.Mul(decimal.NewFromInt(70)).Div(decimal.NewFromInt(100))
-		action = "decrease"
-		reasonReview = "average payment delay >45 days"
-	} else if avgDelay.LessThan(decimal.NewFromInt(15)) && outstanding.LessThan(limit.Mul(decimal.NewFromInt(50)).Div(decimal.NewFromInt(100))) {
-		recommendedLimit = limit.Mul(decimal.NewFromInt(120)).Div(decimal.NewFromInt(100))
-		action = "increase"
-		reasonReview = "good payment history and low utilization"
-	}
-
-	if action != "maintain" {
-		if action == "increase" {
-			err = s.IncreaseCustomerCreditLimit(ctx, companyID, customerID, recommendedLimit.Sub(limit), reasonReview, triggeredBy)
-		} else if action == "decrease" {
-			err = s.DecreaseCustomerCreditLimit(ctx, companyID, customerID, limit.Sub(recommendedLimit), reasonReview, triggeredBy)
-		}
-		if err != nil {
-			s.logger.Error("auto credit review failed to adjust limit", zap.Error(err))
-		}
-	}
-
-	return &CreditReviewResult{
-		CustomerID:          customerID,
-		PreviousLimit:       limit,
-		RecommendedLimit:    recommendedLimit,
-		CurrentOutstanding:  outstanding,
-		PaymentHistoryScore: decimal.NewFromInt(100).Sub(avgDelay.Mul(decimal.NewFromInt(2))),
-		ActionTaken:         action,
-		Reason:              reasonReview,
-	}, tx.Commit()
 }
 
 func (s *creditCheckService) GetCustomersExceedingCreditLimit(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error) {
@@ -1029,14 +717,19 @@ func (s *creditCheckService) GetCustomerCollectionScore(ctx context.Context, com
 }
 
 func (s *creditCheckService) GetCustomerCreditUtilization(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
-	limit, err := s.GetCustomerCreditLimit(ctx, companyID, customerID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return decimal.Zero, err
+	}
+	defer tx.Rollback()
+	limit, err := s.getCustomerCreditLimit(ctx, tx, companyID, customerID)
 	if err != nil {
 		return decimal.Zero, err
 	}
 	if limit.IsZero() {
 		return decimal.Zero, nil
 	}
-	outstanding, err := s.GetCustomerOutstandingBalance(ctx, companyID, customerID)
+	outstanding, err := s.getOutstandingBalance(ctx, tx, companyID, customerID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -1132,7 +825,16 @@ func (s *creditCheckService) GetCreditHoldRate(ctx context.Context, companyID uu
 }
 
 func (s *creditCheckService) CreditHistoryExists(ctx context.Context, companyID, historyID uuid.UUID) (bool, error) {
-	return s.creditHistoryRepo.Exists(ctx, nil, companyID, historyID)
+	tx, err := s.pgClient.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	exists, err := s.creditHistoryRepo.Exists(ctx, tx, companyID, historyID)
+	if err != nil {
+		return false, err
+	}
+	return exists, tx.Commit()
 }
 
 func (s *creditCheckService) OrderHasCreditIssues(ctx context.Context, companyID, orderID uuid.UUID) (bool, error) {
@@ -1163,4 +865,494 @@ func (s *creditCheckService) CustomerExceededCreditLimit(ctx context.Context, co
 		return false, err
 	}
 	return outstanding.GreaterThan(limit), nil
+}
+
+// ----------------------------------------------------------------------
+// Mutating methods
+// ----------------------------------------------------------------------
+
+func (s *creditCheckService) HoldOrderForCredit(ctx context.Context, companyID, orderID uuid.UUID, reason string, heldBy uuid.UUID) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("hold-order-%s", orderID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		s.logger.Info("idempotent – order already placed on hold", zap.String("order_id", orderID.String()))
+		return nil
+	}
+
+	var alreadyHold bool
+	err = tx.QueryRowContext(ctx, `SELECT credit_hold FROM sales.orders WHERE order_id=$1 FOR UPDATE`, orderID).Scan(&alreadyHold)
+	if err != nil {
+		return err
+	}
+	if alreadyHold {
+		if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+			s.logger.Warn("failed to store idempotency record", zap.Error(err))
+		}
+		return tx.Commit()
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE sales.orders SET credit_hold=true, credit_status='hold', updated_at=NOW() WHERE order_id=$1`, orderID)
+	if err != nil {
+		return err
+	}
+
+	var custID uuid.UUID
+	tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&custID)
+	histReq := &CreateCreditCheckHistoryRequest{
+		CompanyID:  companyID,
+		CustomerID: custID,
+		ActionType: "order_hold",
+		Reason:     &reason,
+		CreatedBy:  &heldBy,
+	}
+	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
+		s.logger.Warn("failed to log order hold history", zap.Error(err))
+	}
+
+	order, _ := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
+	if order != nil {
+		payload := map[string]interface{}{
+			"order_id":    orderID.String(),
+			"company_id":  companyID.String(),
+			"customer_id": order.CustomerID.String(),
+			"reason":      reason,
+			"held_by":     heldBy.String(),
+			"held_at":     time.Now().Format(time.RFC3339),
+		}
+		if err := s.emitEvent(ctx, tx, "order", orderID.String(), salesEvents.EventOrderCreditHeld, payload); err != nil {
+			s.logger.Warn("failed to emit order hold event", zap.Error(err))
+		}
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "credit_hold", "order", &orderID, "user", &heldBy, nil, nil, map[string]interface{}{"reason": reason})
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
+}
+
+func (s *creditCheckService) ReleaseOrderCreditHold(ctx context.Context, companyID, orderID uuid.UUID, reason string, releasedBy uuid.UUID) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("release-order-%s", orderID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		s.logger.Info("idempotent – order hold already released", zap.String("order_id", orderID.String()))
+		return nil
+	}
+
+	var currentlyHold bool
+	err = tx.QueryRowContext(ctx, `SELECT credit_hold FROM sales.orders WHERE order_id=$1 FOR UPDATE`, orderID).Scan(&currentlyHold)
+	if err != nil {
+		return err
+	}
+	// FIX: Return error if order is not on credit hold
+	if !currentlyHold {
+		return fmt.Errorf("%w: order not on credit hold", salesErrors.ErrInvalidState)
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE sales.orders SET credit_hold=false, credit_status='approved', updated_at=NOW() WHERE order_id=$1`, orderID)
+	if err != nil {
+		return err
+	}
+
+	var custID uuid.UUID
+	tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&custID)
+	histReq := &CreateCreditCheckHistoryRequest{
+		CompanyID:  companyID,
+		CustomerID: custID,
+		ActionType: "order_release",
+		Reason:     &reason,
+		CreatedBy:  &releasedBy,
+	}
+	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
+		s.logger.Warn("failed to log order release history", zap.Error(err))
+	}
+
+	order, _ := s.orderRepo.GetByID(ctx, tx, companyID, orderID)
+	if order != nil {
+		payload := map[string]interface{}{
+			"order_id":    orderID.String(),
+			"company_id":  companyID.String(),
+			"customer_id": order.CustomerID.String(),
+			"reason":      reason,
+			"released_by": releasedBy.String(),
+			"released_at": time.Now().Format(time.RFC3339),
+		}
+		_ = s.emitEvent(ctx, tx, "order", orderID.String(), salesEvents.EventOrderCreditReleased, payload)
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "credit_release", "order", &orderID, "user", &releasedBy, nil, nil, map[string]interface{}{"reason": reason})
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
+}
+func (s *creditCheckService) UpdateOrderCreditStatus(ctx context.Context, companyID, orderID uuid.UUID, status enums.CreditCheckStatus, updatedBy uuid.UUID) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update-status-%s", orderID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		s.logger.Info("idempotent – order status already updated", zap.String("order_id", orderID.String()))
+		return nil
+	}
+
+	_, err = tx.ExecContext(ctx, `UPDATE sales.orders SET credit_status=$1, updated_at=NOW() WHERE order_id=$2`, string(status), orderID)
+	if err != nil {
+		return err
+	}
+	var custID uuid.UUID
+	tx.QueryRowContext(ctx, `SELECT customer_id FROM sales.orders WHERE order_id=$1`, orderID).Scan(&custID)
+	histReq := &CreateCreditCheckHistoryRequest{
+		CompanyID:  companyID,
+		CustomerID: custID,
+		ActionType: "order_status_change",
+		CreatedBy:  &updatedBy,
+	}
+	_ = s.logCreditHistory(ctx, tx, histReq)
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
+}
+
+func (s *creditCheckService) SetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, creditLimit decimal.Decimal, updatedBy uuid.UUID) error {
+	if err := s.ValidateCreditLimit(ctx, creditLimit); err != nil {
+		return err
+	}
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("set-limit-%s-%s", companyID.String(), customerID.String())
+	}
+	var cached bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached {
+		s.logger.Info("idempotent – credit limit already set")
+		return nil
+	}
+
+	cust, err := s.customerRepo.GetByIDForUpdate(ctx, tx, companyID, customerID)
+	if err != nil {
+		return err
+	}
+	oldLimit := decimal.Zero
+	if cust.CreditLimit != nil {
+		oldLimit = *cust.CreditLimit
+	}
+	cust.CreditLimit = &creditLimit
+	cust.UpdatedBy = &updatedBy
+	if err := s.customerRepo.Update(ctx, tx, cust); err != nil {
+		return err
+	}
+
+	histReq := &CreateCreditCheckHistoryRequest{
+		CompanyID:     companyID,
+		CustomerID:    customerID,
+		ActionType:    "limit_change",
+		PreviousLimit: &oldLimit,
+		NewLimit:      &creditLimit,
+		CreatedBy:     &updatedBy,
+	}
+	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
+		s.logger.Warn("failed to log credit limit change", zap.Error(err))
+	}
+
+	payload := map[string]interface{}{
+		"customer_id":    customerID.String(),
+		"company_id":     companyID.String(),
+		"previous_limit": oldLimit.String(),
+		"new_limit":      creditLimit.String(),
+		"updated_by":     updatedBy.String(),
+		"updated_at":     time.Now().Format(time.RFC3339),
+	}
+	if err := s.emitEvent(ctx, tx, "customer", customerID.String(), salesEvents.EventCustomerCreditLimitChanged, payload); err != nil {
+		s.logger.Warn("failed to emit credit limit event", zap.Error(err))
+	}
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "set_credit_limit", "customer", &customerID, "user", &updatedBy, nil, nil, map[string]interface{}{
+			"old_limit": oldLimit.String(),
+			"new_limit": creditLimit.String(),
+		})
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
+}
+
+func (s *creditCheckService) IncreaseCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, increaseAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error {
+	if increaseAmount.LessThanOrEqual(decimal.Zero) {
+		return fmt.Errorf("%w: increase amount must be positive", salesErrors.ErrInvalidInput)
+	}
+	current, err := s.GetCustomerCreditLimit(ctx, companyID, customerID)
+	if err != nil {
+		return err
+	}
+	newLimit := current.Add(increaseAmount)
+	return s.SetCustomerCreditLimit(ctx, companyID, customerID, newLimit, updatedBy)
+}
+
+func (s *creditCheckService) DecreaseCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, decreaseAmount decimal.Decimal, reason string, updatedBy uuid.UUID) error {
+	if decreaseAmount.LessThanOrEqual(decimal.Zero) {
+		return fmt.Errorf("%w: decrease amount must be positive", salesErrors.ErrInvalidInput)
+	}
+	current, err := s.GetCustomerCreditLimit(ctx, companyID, customerID)
+	if err != nil {
+		return err
+	}
+	newLimit := current.Sub(decreaseAmount)
+	if newLimit.LessThan(decimal.Zero) {
+		newLimit = decimal.Zero
+	}
+	return s.SetCustomerCreditLimit(ctx, companyID, customerID, newLimit, updatedBy)
+}
+
+func (s *creditCheckService) SuspendCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, reason string, suspendedBy uuid.UUID) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("suspend-%s", customerID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		s.logger.Info("idempotent – customer already suspended")
+		return nil
+	}
+
+	// FIX: Verify customer exists before logging history
+	var exists bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sales.customers WHERE customer_id=$1 AND company_id=$2)`, customerID, companyID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return salesErrors.ErrNotFound
+	}
+
+	histReq := &CreateCreditCheckHistoryRequest{
+		CompanyID:  companyID,
+		CustomerID: customerID,
+		ActionType: "suspend",
+		Reason:     &reason,
+		CreatedBy:  &suspendedBy,
+	}
+	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
+		return err
+	}
+	payload := map[string]interface{}{
+		"customer_id":  customerID.String(),
+		"company_id":   companyID.String(),
+		"reason":       reason,
+		"suspended_by": suspendedBy.String(),
+		"suspended_at": time.Now().Format(time.RFC3339),
+	}
+	if err := s.emitEvent(ctx, tx, "customer", customerID.String(), "sales.customer.credit_suspended", payload); err != nil {
+		s.logger.Warn("failed to emit credit suspension event", zap.Error(err))
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
+}
+func (s *creditCheckService) RestoreCustomerCredit(ctx context.Context, companyID, customerID uuid.UUID, restoredBy uuid.UUID) error {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("restore-%s", customerID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		s.logger.Info("idempotent – customer already restored")
+		return nil
+	}
+
+	// FIX: Verify customer exists before logging history
+	var exists bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sales.customers WHERE customer_id=$1 AND company_id=$2)`, customerID, companyID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return salesErrors.ErrNotFound
+	}
+
+	histReq := &CreateCreditCheckHistoryRequest{
+		CompanyID:  companyID,
+		CustomerID: customerID,
+		ActionType: "restore",
+		CreatedBy:  &restoredBy,
+	}
+	if err := s.logCreditHistory(ctx, tx, histReq); err != nil {
+		return err
+	}
+	payload := map[string]interface{}{
+		"customer_id": customerID.String(),
+		"company_id":  companyID.String(),
+		"restored_by": restoredBy.String(),
+		"restored_at": time.Now().Format(time.RFC3339),
+	}
+	_ = s.emitEvent(ctx, tx, "customer", customerID.String(), "sales.customer.credit_restored", payload)
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
+}
+func (s *creditCheckService) LogCreditCheck(ctx context.Context, req *CreateCreditCheckHistoryRequest) (*models.CreditCheckHistory, error) {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("log-credit-%s", uuid.New().String())
+	}
+	var cached *models.CreditCheckHistory
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		s.logger.Info("idempotent – returning cached history")
+		return cached, nil
+	}
+
+	history := &models.CreditCheckHistory{
+		CreditHistoryID:     uuid.New(),
+		CompanyID:           req.CompanyID,
+		CustomerID:          req.CustomerID,
+		ActionType:          req.ActionType,
+		PreviousLimit:       req.PreviousLimit,
+		NewLimit:            req.NewLimit,
+		PreviousOutstanding: req.PreviousOutstanding,
+		NewOutstanding:      req.NewOutstanding,
+		Reason:              req.Reason,
+		ApprovedBy:          req.ApprovedBy,
+		CreatedBy:           req.CreatedBy,
+	}
+	if err := s.creditHistoryRepo.Create(ctx, tx, history); err != nil {
+		return nil, err
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, history); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return history, nil
+}
+
+func (s *creditCheckService) RunAutomaticCreditReview(ctx context.Context, companyID, customerID uuid.UUID, triggeredBy uuid.UUID) (*CreditReviewResult, error) {
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("auto-review-%s", customerID.String())
+	}
+	var cached *CreditReviewResult
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		s.logger.Info("idempotent – returning cached review result")
+		return cached, nil
+	}
+
+	limit, err := s.getCustomerCreditLimit(ctx, tx, companyID, customerID)
+	if err != nil {
+		return nil, err
+	}
+	outstanding, err := s.getOutstandingBalance(ctx, tx, companyID, customerID)
+	if err != nil {
+		return nil, err
+	}
+	avgDelay, err := s.GetAveragePaymentDelay(ctx, companyID, customerID, nil, nil)
+	if err != nil {
+		avgDelay = decimal.Zero
+	}
+	var recommendedLimit = limit
+	var action string = "maintain"
+	var reasonReview string = "normal"
+
+	if outstanding.GreaterThan(limit.Mul(decimal.NewFromInt(90)).Div(decimal.NewFromInt(100))) {
+		recommendedLimit = limit.Mul(decimal.NewFromInt(80)).Div(decimal.NewFromInt(100))
+		action = "decrease"
+		reasonReview = "utilization >90%"
+	} else if avgDelay.GreaterThan(decimal.NewFromInt(45)) {
+		recommendedLimit = limit.Mul(decimal.NewFromInt(70)).Div(decimal.NewFromInt(100))
+		action = "decrease"
+		reasonReview = "average payment delay >45 days"
+	} else if avgDelay.LessThan(decimal.NewFromInt(15)) && outstanding.LessThan(limit.Mul(decimal.NewFromInt(50)).Div(decimal.NewFromInt(100))) {
+		recommendedLimit = limit.Mul(decimal.NewFromInt(120)).Div(decimal.NewFromInt(100))
+		action = "increase"
+		reasonReview = "good payment history and low utilization"
+	}
+
+	if action != "maintain" {
+		if action == "increase" {
+			err = s.IncreaseCustomerCreditLimit(ctx, companyID, customerID, recommendedLimit.Sub(limit), reasonReview, triggeredBy)
+		} else if action == "decrease" {
+			err = s.DecreaseCustomerCreditLimit(ctx, companyID, customerID, limit.Sub(recommendedLimit), reasonReview, triggeredBy)
+		}
+		if err != nil {
+			s.logger.Error("auto credit review failed to adjust limit", zap.Error(err))
+		}
+	}
+
+	result := &CreditReviewResult{
+		CustomerID:          customerID,
+		PreviousLimit:       limit,
+		RecommendedLimit:    recommendedLimit,
+		CurrentOutstanding:  outstanding,
+		PaymentHistoryScore: decimal.NewFromInt(100).Sub(avgDelay.Mul(decimal.NewFromInt(2))),
+		ActionTaken:         action,
+		Reason:              reasonReview,
+	}
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, result); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return result, tx.Commit()
 }

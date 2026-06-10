@@ -17,7 +17,7 @@ import (
 )
 
 // -------------------------------------------------------------------------
-// Interface & Filter (added to fix compilation)
+// Interface & Filter
 // -------------------------------------------------------------------------
 
 type CouponRepository interface {
@@ -25,8 +25,8 @@ type CouponRepository interface {
 	GetByID(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) (*discount.Coupon, error)
 	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*discount.Coupon, error)
 	Update(ctx context.Context, db DBTX, coupon *discount.Coupon) error
-	Delete(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) error
-	// Add these to the CouponRepository interface
+	Delete(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) error // kept for interface, but implement soft delete
+
 	GetApplicableCoupons(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error)
 	GetBestCoupon(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Coupon, decimal.Decimal, error)
 
@@ -70,37 +70,27 @@ type CouponRepository interface {
 }
 
 type CouponFilter struct {
-	CompanyID uuid.UUID
-
-	CouponIDs []uuid.UUID
-
-	IsActive *bool
-
-	DiscountTypes []enums.DiscountType
-
-	Code *string
-
+	CompanyID        uuid.UUID
+	CouponIDs        []uuid.UUID
+	IsActive         *bool
+	DiscountTypes    []enums.DiscountType
+	Code             *string
 	MinDiscountValue *decimal.Decimal
 	MaxDiscountValue *decimal.Decimal
-
-	MinOrderAmount *decimal.Decimal
-	MaxOrderAmount *decimal.Decimal
-
-	StartDateFrom *time.Time
-	StartDateTo   *time.Time
-
-	EndDateFrom *time.Time
-	EndDateTo   *time.Time
-
-	CreatedFrom *time.Time
-	CreatedTo   *time.Time
-
-	UpdatedFrom *time.Time
-	UpdatedTo   *time.Time
+	MinOrderAmount   *decimal.Decimal
+	MaxOrderAmount   *decimal.Decimal
+	StartDateFrom    *time.Time
+	StartDateTo      *time.Time
+	EndDateFrom      *time.Time
+	EndDateTo        *time.Time
+	CreatedFrom      *time.Time
+	CreatedTo        *time.Time
+	UpdatedFrom      *time.Time
+	UpdatedTo        *time.Time
 }
 
 // -------------------------------------------------------------------------
-// Implementation (rest of your file)
+// Implementation
 // -------------------------------------------------------------------------
 
 type couponRepository struct {
@@ -113,10 +103,7 @@ func NewCouponRepository(logger *zap.Logger) CouponRepository {
 	}
 }
 
-// ... (all the helper functions and methods you already wrote, unchanged) ...
-// -------------------------------------------------------------------------
 // Helper functions
-// -------------------------------------------------------------------------
 
 func (r *couponRepository) nullUUIDParam(id *uuid.UUID) interface{} {
 	if id == nil || *id == uuid.Nil {
@@ -154,11 +141,14 @@ func (r *couponRepository) validatePagination(p Pagination) (int, int) {
 	return limit, offset
 }
 
-// buildCouponFilter creates WHERE clause and arguments for filtering coupons.
+// buildCouponFilter adds deleted_at IS NULL automatically
 func (r *couponRepository) buildCouponFilter(filter CouponFilter) (string, []interface{}) {
 	var conds []string
 	var args []interface{}
 	idx := 1
+
+	// Always exclude soft‑deleted coupons
+	conds = append(conds, "deleted_at IS NULL")
 
 	if filter.CompanyID != uuid.Nil {
 		conds = append(conds, fmt.Sprintf("company_id = $%d", idx))
@@ -193,6 +183,7 @@ func (r *couponRepository) buildCouponFilter(filter CouponFilter) (string, []int
 		args = append(args, *filter.Code)
 		idx++
 	}
+	// ... other filters unchanged ...
 	if filter.MinDiscountValue != nil {
 		conds = append(conds, fmt.Sprintf("discount_value >= $%d", idx))
 		args = append(args, *filter.MinDiscountValue)
@@ -260,13 +251,14 @@ func (r *couponRepository) buildCouponFilter(filter CouponFilter) (string, []int
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanCoupon maps a database row to discount.Coupon.
+// scanCoupon now includes DeletedAt
 func (r *couponRepository) scanCoupon(s scanner) (*discount.Coupon, error) {
 	var c discount.Coupon
 	var usageLimit, perUserLimit sql.NullInt32
 	var maxDiscountAmount, minOrderAmount sql.NullString
 	var applicableItems []byte
 	var createdBy, updatedBy uuid.NullUUID
+	var deletedAt sql.NullTime
 
 	err := s.Scan(
 		&c.CouponID,
@@ -286,6 +278,7 @@ func (r *couponRepository) scanCoupon(s scanner) (*discount.Coupon, error) {
 		&c.UpdatedAt,
 		&createdBy,
 		&updatedBy,
+		&deletedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -294,6 +287,9 @@ func (r *couponRepository) scanCoupon(s scanner) (*discount.Coupon, error) {
 		return nil, fmt.Errorf("scan coupon: %w", err)
 	}
 
+	if deletedAt.Valid {
+		c.DeletedAt = &deletedAt.Time
+	}
 	if maxDiscountAmount.Valid {
 		val, err := decimal.NewFromString(maxDiscountAmount.String)
 		if err == nil {
@@ -326,7 +322,6 @@ func (r *couponRepository) scanCoupon(s scanner) (*discount.Coupon, error) {
 	return &c, nil
 }
 
-// scanCouponUsage maps a database row to discount.CouponUsage.
 func (r *couponRepository) scanCouponUsage(s scanner) (*discount.CouponUsage, error) {
 	var u discount.CouponUsage
 	err := s.Scan(
@@ -420,9 +415,9 @@ func (r *couponRepository) GetByID(ctx context.Context, db DBTX, companyID, coup
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND coupon_id = $2
+		WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL
 	`
 	row := db.QueryRowContext(ctx, query, companyID, couponID)
 	return r.scanCoupon(row)
@@ -434,9 +429,9 @@ func (r *couponRepository) GetByCode(ctx context.Context, db DBTX, companyID uui
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND code = $2
+		WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL
 	`
 	row := db.QueryRowContext(ctx, query, companyID, code)
 	return r.scanCoupon(row)
@@ -456,8 +451,9 @@ func (r *couponRepository) Update(ctx context.Context, db DBTX, coupon *discount
 			min_order_amount = $11,
 			applicable_items = $12,
 			is_active = $13,
+			deleted_at = $14,
 			updated_at = NOW(),
-			updated_by = $14
+			updated_by = $15
 		WHERE coupon_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -487,6 +483,12 @@ func (r *couponRepository) Update(ctx context.Context, db DBTX, coupon *discount
 	if applicable == nil {
 		applicable = []byte("{}")
 	}
+	var deletedAt interface{}
+	if coupon.DeletedAt != nil {
+		deletedAt = *coupon.DeletedAt
+	} else {
+		deletedAt = nil
+	}
 
 	err := db.QueryRowContext(ctx, query,
 		coupon.CouponID,
@@ -502,6 +504,7 @@ func (r *couponRepository) Update(ctx context.Context, db DBTX, coupon *discount
 		minOrder,
 		applicable,
 		coupon.IsActive,
+		deletedAt,
 		r.nullUUIDParam(coupon.UpdatedBy),
 	).Scan(&coupon.UpdatedAt)
 
@@ -514,11 +517,16 @@ func (r *couponRepository) Update(ctx context.Context, db DBTX, coupon *discount
 	return nil
 }
 
+// Delete implements soft delete (sets deleted_at and is_active=false)
 func (r *couponRepository) Delete(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) error {
-	query := `DELETE FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2`
+	query := `
+		UPDATE sales.coupons
+		SET deleted_at = NOW(), is_active = false, updated_at = NOW()
+		WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL
+	`
 	result, err := db.ExecContext(ctx, query, companyID, couponID)
 	if err != nil {
-		return fmt.Errorf("delete coupon: %w", err)
+		return fmt.Errorf("soft delete coupon: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
@@ -535,7 +543,7 @@ func (r *couponRepository) SetActiveStatus(ctx context.Context, db DBTX, company
 	query := `
 		UPDATE sales.coupons
 		SET is_active = $3, updated_at = NOW(), updated_by = $4
-		WHERE company_id = $1 AND coupon_id = $2
+		WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL
 	`
 	result, err := db.ExecContext(ctx, query, companyID, couponID, isActive, r.nullUUIDParam(updatedBy))
 	if err != nil {
@@ -550,7 +558,7 @@ func (r *couponRepository) SetActiveStatus(ctx context.Context, db DBTX, company
 
 func (r *couponRepository) IsActive(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) (bool, error) {
 	var active bool
-	query := `SELECT is_active FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2`
+	query := `SELECT is_active FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL`
 	err := db.QueryRowContext(ctx, query, companyID, couponID).Scan(&active)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -563,7 +571,7 @@ func (r *couponRepository) IsActive(ctx context.Context, db DBTX, companyID, cou
 
 func (r *couponRepository) IsExpired(ctx context.Context, db DBTX, companyID, couponID uuid.UUID, at time.Time) (bool, error) {
 	var expired bool
-	query := `SELECT end_date < $3 FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2`
+	query := `SELECT end_date < $3 FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL`
 	err := db.QueryRowContext(ctx, query, companyID, couponID, at).Scan(&expired)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -576,7 +584,7 @@ func (r *couponRepository) IsExpired(ctx context.Context, db DBTX, companyID, co
 
 func (r *couponRepository) Exists(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) (bool, error) {
 	var exists bool
-	query := `SELECT EXISTS(SELECT 1 FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2)`
+	query := `SELECT EXISTS(SELECT 1 FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL)`
 	err := db.QueryRowContext(ctx, query, companyID, couponID).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("exists: %w", err)
@@ -586,7 +594,7 @@ func (r *couponRepository) Exists(ctx context.Context, db DBTX, companyID, coupo
 
 func (r *couponRepository) ExistsByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (bool, error) {
 	var exists bool
-	query := `SELECT EXISTS(SELECT 1 FROM sales.coupons WHERE company_id = $1 AND code = $2)`
+	query := `SELECT EXISTS(SELECT 1 FROM sales.coupons WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL)`
 	err := db.QueryRowContext(ctx, query, companyID, code).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("exists by code: %w", err)
@@ -595,12 +603,12 @@ func (r *couponRepository) ExistsByCode(ctx context.Context, db DBTX, companyID 
 }
 
 // -------------------------------------------------------------------------
-// VALIDATION / APPLICABILITY
+// VALIDATION / APPLICABILITY (all include deleted_at IS NULL)
 // -------------------------------------------------------------------------
 
 func (r *couponRepository) IsApplicableForOrderAmount(ctx context.Context, db DBTX, companyID, couponID uuid.UUID, orderAmount decimal.Decimal) (bool, error) {
 	var minOrder sql.NullString
-	query := `SELECT min_order_amount FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2`
+	query := `SELECT min_order_amount FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL`
 	err := db.QueryRowContext(ctx, query, companyID, couponID).Scan(&minOrder)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -619,9 +627,8 @@ func (r *couponRepository) IsApplicableForOrderAmount(ctx context.Context, db DB
 }
 
 func (r *couponRepository) IsApplicableForProduct(ctx context.Context, db DBTX, companyID, couponID, productID uuid.UUID) (bool, error) {
-	// If applicable_items is null or empty, all products are applicable.
 	var applicable []byte
-	query := `SELECT applicable_items FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2`
+	query := `SELECT applicable_items FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL`
 	err := db.QueryRowContext(ctx, query, companyID, couponID).Scan(&applicable)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -632,24 +639,21 @@ func (r *couponRepository) IsApplicableForProduct(ctx context.Context, db DBTX, 
 	if len(applicable) == 0 || string(applicable) == "{}" || string(applicable) == "null" {
 		return true, nil
 	}
-	// Simple JSON check – we could parse but assume the column contains array of product IDs.
-	// For production, better to use JSONB operators, but here we do simple substring check.
 	return strings.Contains(string(applicable), productID.String()), nil
 }
 
 func (r *couponRepository) IsCustomerEligible(ctx context.Context, db DBTX, companyID, couponID, customerID uuid.UUID) (bool, error) {
-	// No customer-specific eligibility by default; can be extended.
+	// No customer eligibility by default
 	return true, nil
 }
 
 func (r *couponRepository) CanCustomerUseCoupon(ctx context.Context, db DBTX, companyID, couponID, customerID uuid.UUID) (bool, error) {
-	// Check usage limit per customer
 	limit, err := r.GetCustomerUsageCount(ctx, db, companyID, couponID, customerID)
 	if err != nil {
 		return false, err
 	}
 	var perUserLimit int
-	query := `SELECT per_user_limit FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2`
+	query := `SELECT per_user_limit FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL`
 	err = db.QueryRowContext(ctx, query, companyID, couponID).Scan(&perUserLimit)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -692,11 +696,9 @@ func (r *couponRepository) ValidateCoupon(ctx context.Context, db DBTX, companyI
 			return nil, saleserrors.ErrCouponUsageLimit
 		}
 	}
-	// min order amount
 	if coupon.MinOrderAmount != nil && orderAmount.LessThan(*coupon.MinOrderAmount) {
 		return nil, fmt.Errorf("order amount %s below minimum %s", orderAmount.String(), coupon.MinOrderAmount.String())
 	}
-	// product applicability (if any product IDs provided, check at least one)
 	if len(productIDs) > 0 && coupon.ApplicableItems != nil && len(coupon.ApplicableItems) > 0 && string(coupon.ApplicableItems) != "{}" {
 		applicable := false
 		for _, pid := range productIDs {
@@ -717,7 +719,7 @@ func (r *couponRepository) ValidateCoupon(ctx context.Context, db DBTX, companyI
 }
 
 // -------------------------------------------------------------------------
-// USAGE TRACKING
+// USAGE TRACKING (unchanged)
 // -------------------------------------------------------------------------
 
 func (r *couponRepository) CreateUsage(ctx context.Context, db DBTX, usage *discount.CouponUsage) error {
@@ -757,7 +759,7 @@ func (r *couponRepository) GetUsagesByCoupon(ctx context.Context, db DBTX, compa
 		SELECT cu.usage_id, cu.coupon_id, cu.customer_id, cu.order_id, cu.discount_amount, cu.used_at
 		FROM sales.coupon_usages cu
 		JOIN sales.coupons c ON c.coupon_id = cu.coupon_id
-		WHERE c.company_id = $1 AND cu.coupon_id = $2
+		WHERE c.company_id = $1 AND cu.coupon_id = $2 AND c.deleted_at IS NULL
 		ORDER BY cu.used_at DESC
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, couponID)
@@ -781,7 +783,7 @@ func (r *couponRepository) GetUsagesByCustomer(ctx context.Context, db DBTX, com
 		SELECT cu.usage_id, cu.coupon_id, cu.customer_id, cu.order_id, cu.discount_amount, cu.used_at
 		FROM sales.coupon_usages cu
 		JOIN sales.coupons c ON c.coupon_id = cu.coupon_id
-		WHERE c.company_id = $1 AND cu.customer_id = $2
+		WHERE c.company_id = $1 AND cu.customer_id = $2 AND c.deleted_at IS NULL
 		ORDER BY cu.used_at DESC
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, customerID)
@@ -805,7 +807,7 @@ func (r *couponRepository) GetUsageByOrder(ctx context.Context, db DBTX, company
 		SELECT cu.usage_id, cu.coupon_id, cu.customer_id, cu.order_id, cu.discount_amount, cu.used_at
 		FROM sales.coupon_usages cu
 		JOIN sales.coupons c ON c.coupon_id = cu.coupon_id
-		WHERE c.company_id = $1 AND cu.order_id = $2
+		WHERE c.company_id = $1 AND cu.order_id = $2 AND c.deleted_at IS NULL
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, orderID)
 	if err != nil {
@@ -829,7 +831,7 @@ func (r *couponRepository) GetTotalUsageCount(ctx context.Context, db DBTX, comp
 		SELECT COUNT(*)
 		FROM sales.coupon_usages cu
 		JOIN sales.coupons c ON c.coupon_id = cu.coupon_id
-		WHERE c.company_id = $1 AND cu.coupon_id = $2
+		WHERE c.company_id = $1 AND cu.coupon_id = $2 AND c.deleted_at IS NULL
 	`
 	err := db.QueryRowContext(ctx, query, companyID, couponID).Scan(&count)
 	if err != nil {
@@ -844,7 +846,7 @@ func (r *couponRepository) GetCustomerUsageCount(ctx context.Context, db DBTX, c
 		SELECT COUNT(*)
 		FROM sales.coupon_usages cu
 		JOIN sales.coupons c ON c.coupon_id = cu.coupon_id
-		WHERE c.company_id = $1 AND cu.coupon_id = $2 AND cu.customer_id = $3
+		WHERE c.company_id = $1 AND cu.coupon_id = $2 AND cu.customer_id = $3 AND c.deleted_at IS NULL
 	`
 	err := db.QueryRowContext(ctx, query, companyID, couponID, customerID).Scan(&count)
 	if err != nil {
@@ -859,7 +861,7 @@ func (r *couponRepository) HasCustomerUsedCoupon(ctx context.Context, db DBTX, c
 		SELECT EXISTS (
 			SELECT 1 FROM sales.coupon_usages cu
 			JOIN sales.coupons c ON c.coupon_id = cu.coupon_id
-			WHERE c.company_id = $1 AND cu.coupon_id = $2 AND cu.customer_id = $3 AND cu.order_id = $4
+			WHERE c.company_id = $1 AND cu.coupon_id = $2 AND cu.customer_id = $3 AND cu.order_id = $4 AND c.deleted_at IS NULL
 		)
 	`
 	err := db.QueryRowContext(ctx, query, companyID, couponID, customerID, orderID).Scan(&exists)
@@ -900,7 +902,6 @@ func (r *couponRepository) CalculateDiscount(ctx context.Context, db DBTX, compa
 	default:
 		discount = decimal.Zero
 	}
-	// Cap by max discount amount
 	if coupon.MaxDiscountAmount != nil && discount.GreaterThan(*coupon.MaxDiscountAmount) {
 		discount = *coupon.MaxDiscountAmount
 	}
@@ -915,7 +916,7 @@ func (r *couponRepository) GetMaximumDiscount(ctx context.Context, db DBTX, comp
 	if err != nil {
 		return decimal.Zero, err
 	}
-	max := orderAmount // cannot exceed order amount
+	max := orderAmount
 	if coupon.MaxDiscountAmount != nil && max.GreaterThan(*coupon.MaxDiscountAmount) {
 		max = *coupon.MaxDiscountAmount
 	}
@@ -932,13 +933,8 @@ func (r *couponRepository) List(ctx context.Context, db DBTX, filter CouponFilte
 		return nil, 0, fmt.Errorf("list requires at least company_id filter")
 	}
 	allowedSort := map[string]bool{
-		"code":           true,
-		"discount_value": true,
-		"start_date":     true,
-		"end_date":       true,
-		"is_active":      true,
-		"created_at":     true,
-		"updated_at":     true,
+		"code": true, "discount_value": true, "start_date": true, "end_date": true,
+		"is_active": true, "created_at": true, "updated_at": true,
 	}
 	orderBy, err := r.validateSort(s, allowedSort)
 	if err != nil {
@@ -964,7 +960,7 @@ func (r *couponRepository) List(ctx context.Context, db DBTX, filter CouponFilte
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
 		%s
 		%s
@@ -995,7 +991,7 @@ func (r *couponRepository) Search(ctx context.Context, db DBTX, companyID uuid.U
 	countQuery := `
 		SELECT COUNT(*)
 		FROM sales.coupons
-		WHERE company_id = $1 AND code ILIKE $2
+		WHERE company_id = $1 AND code ILIKE $2 AND deleted_at IS NULL
 	`
 	var total int64
 	err := db.QueryRowContext(ctx, countQuery, baseArgs...).Scan(&total)
@@ -1011,9 +1007,9 @@ func (r *couponRepository) Search(ctx context.Context, db DBTX, companyID uuid.U
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND code ILIKE $2
+		WHERE company_id = $1 AND code ILIKE $2 AND deleted_at IS NULL
 		ORDER BY code ASC
 		LIMIT $3 OFFSET $4
 	`
@@ -1040,9 +1036,9 @@ func (r *couponRepository) GetActiveCoupons(ctx context.Context, db DBTX, compan
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND is_active = true AND start_date <= $2 AND end_date >= $2
+		WHERE company_id = $1 AND is_active = true AND start_date <= $2 AND end_date >= $2 AND deleted_at IS NULL
 		ORDER BY created_at DESC
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, at)
@@ -1067,9 +1063,9 @@ func (r *couponRepository) GetExpiredCoupons(ctx context.Context, db DBTX, compa
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND end_date < $2
+		WHERE company_id = $1 AND end_date < $2 AND deleted_at IS NULL
 		ORDER BY end_date ASC
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, at)
@@ -1094,9 +1090,9 @@ func (r *couponRepository) GetCouponsExpiringSoon(ctx context.Context, db DBTX, 
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND is_active = true AND end_date < $2 AND end_date >= NOW()
+		WHERE company_id = $1 AND is_active = true AND end_date < $2 AND end_date >= NOW() AND deleted_at IS NULL
 		ORDER BY end_date ASC
 	`
 	rows, err := db.QueryContext(ctx, query, companyID, before)
@@ -1116,7 +1112,7 @@ func (r *couponRepository) GetCouponsExpiringSoon(ctx context.Context, db DBTX, 
 }
 
 // -------------------------------------------------------------------------
-// ANALYTICS / REPORTING
+// ANALYTICS / REPORTING (already join with deleted_at filter)
 // -------------------------------------------------------------------------
 
 func (r *couponRepository) GetTotalDiscountGiven(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
@@ -1126,6 +1122,7 @@ func (r *couponRepository) GetTotalDiscountGiven(ctx context.Context, db DBTX, c
 	conds = append(conds, fmt.Sprintf("c.company_id = $%d", idx))
 	args = append(args, companyID)
 	idx++
+	conds = append(conds, "c.deleted_at IS NULL")
 	if from != nil {
 		conds = append(conds, fmt.Sprintf("cu.used_at >= $%d", idx))
 		args = append(args, *from)
@@ -1158,6 +1155,7 @@ func (r *couponRepository) GetTopCouponsByUsage(ctx context.Context, db DBTX, co
 	conds = append(conds, fmt.Sprintf("c.company_id = $%d", idx))
 	args = append(args, companyID)
 	idx++
+	conds = append(conds, "c.deleted_at IS NULL")
 	if from != nil {
 		conds = append(conds, fmt.Sprintf("cu.used_at >= $%d", idx))
 		args = append(args, *from)
@@ -1174,7 +1172,7 @@ func (r *couponRepository) GetTopCouponsByUsage(ctx context.Context, db DBTX, co
 			c.coupon_id, c.company_id, c.code, c.discount_type, c.discount_value,
 			c.max_discount_amount, c.start_date, c.end_date, c.usage_limit, c.per_user_limit,
 			c.min_order_amount, c.applicable_items, c.is_active, c.created_at, c.updated_at,
-			c.created_by, c.updated_by
+			c.created_by, c.updated_by, c.deleted_at
 		FROM sales.coupons c
 		JOIN sales.coupon_usages cu ON c.coupon_id = cu.coupon_id
 		WHERE %s
@@ -1206,6 +1204,7 @@ func (r *couponRepository) GetTopCouponsByDiscountAmount(ctx context.Context, db
 	conds = append(conds, fmt.Sprintf("c.company_id = $%d", idx))
 	args = append(args, companyID)
 	idx++
+	conds = append(conds, "c.deleted_at IS NULL")
 	if from != nil {
 		conds = append(conds, fmt.Sprintf("cu.used_at >= $%d", idx))
 		args = append(args, *from)
@@ -1222,7 +1221,7 @@ func (r *couponRepository) GetTopCouponsByDiscountAmount(ctx context.Context, db
 			c.coupon_id, c.company_id, c.code, c.discount_type, c.discount_value,
 			c.max_discount_amount, c.start_date, c.end_date, c.usage_limit, c.per_user_limit,
 			c.min_order_amount, c.applicable_items, c.is_active, c.created_at, c.updated_at,
-			c.created_by, c.updated_by
+			c.created_by, c.updated_by, c.deleted_at
 		FROM sales.coupons c
 		JOIN sales.coupon_usages cu ON c.coupon_id = cu.coupon_id
 		WHERE %s
@@ -1253,10 +1252,10 @@ func (r *couponRepository) GetUnusedCoupons(ctx context.Context, db DBTX, compan
 			c.coupon_id, c.company_id, c.code, c.discount_type, c.discount_value,
 			c.max_discount_amount, c.start_date, c.end_date, c.usage_limit, c.per_user_limit,
 			c.min_order_amount, c.applicable_items, c.is_active, c.created_at, c.updated_at,
-			c.created_by, c.updated_by
+			c.created_by, c.updated_by, c.deleted_at
 		FROM sales.coupons c
 		LEFT JOIN sales.coupon_usages cu ON c.coupon_id = cu.coupon_id
-		WHERE c.company_id = $1 AND cu.usage_id IS NULL
+		WHERE c.company_id = $1 AND cu.usage_id IS NULL AND c.deleted_at IS NULL
 	`
 	rows, err := db.QueryContext(ctx, query, companyID)
 	if err != nil {
@@ -1284,25 +1283,27 @@ func (r *couponRepository) GetByIDForUpdate(ctx context.Context, db DBTX, compan
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, deleted_at
 		FROM sales.coupons
-		WHERE company_id = $1 AND coupon_id = $2
+		WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL
 		FOR UPDATE
 	`
 	row := db.QueryRowContext(ctx, query, companyID, couponID)
 	return r.scanCoupon(row)
 }
+
 func (r *couponRepository) GetApplicableCoupons(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error) {
 	query := `
         SELECT coupon_id, company_id, code, discount_type, discount_value,
                max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
                min_order_amount, applicable_items, is_active, created_at, updated_at,
-               created_by, updated_by
+               created_by, updated_by, deleted_at
         FROM sales.coupons
         WHERE company_id = $1
           AND is_active = true
           AND start_date <= $2
           AND end_date >= $2
+          AND deleted_at IS NULL
     `
 	rows, err := db.QueryContext(ctx, query, companyID, at)
 	if err != nil {

@@ -47,8 +47,8 @@ type CouponService interface {
 	ValidateCouponProducts(ctx context.Context, coupon *discount.Coupon, productIDs []uuid.UUID) error
 	CanCustomerUseCoupon(ctx context.Context, companyID, couponID, customerID uuid.UUID, at time.Time) (bool, error)
 
-	CalculateDiscount(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal) (decimal.Decimal, error)
-	CalculateDiscountForProducts(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
+	CalculateDiscount(ctx context.Context, companyID, couponID uuid.UUID, subtotal decimal.Decimal) (decimal.Decimal, error)
+	CalculateDiscountForProducts(ctx context.Context, companyID, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
 
 	ApplyCouponToOrder(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
 	ApplyCouponToQuote(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
@@ -120,7 +120,7 @@ func NewCouponService(
 }
 
 // ---------------------------------------------------------------------
-//  Validation helpers
+//  Validation helpers (private)
 // ---------------------------------------------------------------------
 
 func (s *couponService) validateCouponDates(coupon *discount.Coupon, at time.Time) error {
@@ -134,6 +134,9 @@ func (s *couponService) validateCouponDates(coupon *discount.Coupon, at time.Tim
 }
 
 func (s *couponService) validateCouponUsageLimit(ctx context.Context, tx repository.DBTX, companyID, couponID uuid.UUID) error {
+	if tx == nil {
+		tx = s.pgClient.DB
+	}
 	coupon, err := s.couponRepo.GetByID(ctx, tx, companyID, couponID)
 	if err != nil {
 		return err
@@ -152,6 +155,9 @@ func (s *couponService) validateCouponUsageLimit(ctx context.Context, tx reposit
 }
 
 func (s *couponService) validateCustomerUsageLimit(ctx context.Context, tx repository.DBTX, companyID, couponID, customerID uuid.UUID) error {
+	if tx == nil {
+		tx = s.pgClient.DB
+	}
 	coupon, err := s.couponRepo.GetByID(ctx, tx, companyID, couponID)
 	if err != nil {
 		return err
@@ -201,6 +207,7 @@ func (s *couponService) validateCouponProducts(coupon *discount.Coupon, productI
 	}
 	return nil
 }
+
 func (s *couponService) calculateDiscountAmount(coupon *discount.Coupon, subtotal decimal.Decimal) decimal.Decimal {
 	var discount decimal.Decimal
 	switch coupon.DiscountType {
@@ -264,6 +271,47 @@ func (s *couponService) emitCouponEvent(ctx context.Context, tx *sql.Tx, coupon 
 	return s.outboxRepo.Store(ctx, tx, event)
 }
 
+// emitCouponAppliedEvent sends the detailed coupon usage event for analytics.
+func (s *couponService) emitCouponAppliedEvent(
+	ctx context.Context,
+	tx *sql.Tx,
+	companyID, couponID uuid.UUID,
+	code string,
+	discountAmount, orderSubtotal decimal.Decimal,
+	entityType string,
+	entityID uuid.UUID,
+	customerID *uuid.UUID,
+	usedAt time.Time,
+) error {
+	payload := salesEvents.CouponAppliedPayload{
+		CouponID:       couponID.String(),
+		CompanyID:      companyID.String(),
+		Code:           code,
+		DiscountAmount: discountAmount.String(),
+		OrderSubtotal:  orderSubtotal.String(),
+		EntityType:     entityType,
+		EntityID:       entityID.String(),
+		UsedAt:         usedAt.Format(time.RFC3339),
+	}
+	if customerID != nil {
+		cid := customerID.String()
+		payload.CustomerID = &cid
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	event := &outbox.Event{
+		EventID:       uuid.New().String(),
+		AggregateType: "coupon",
+		AggregateID:   couponID.String(),
+		EventType:     salesEvents.EventCouponApplied,
+		Topic:         salesEvents.TopicSalesEvents,
+		Payload:       data,
+	}
+	return s.outboxRepo.Store(ctx, tx, event)
+}
+
 // ---------------------------------------------------------------------
 //  CreateCoupon
 // ---------------------------------------------------------------------
@@ -273,6 +321,12 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 		return nil, err
 	}
 
+	// Idempotency key from context (injected by handler)
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -280,8 +334,8 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 	defer tx.Rollback()
 
 	var cached *discount.Coupon
-	if err := s.idempotencyStore.Get(ctx, tx, req.IdempotencyKey, &cached); err == nil && cached != nil {
-		s.logger.Info("idempotent create coupon", zap.String("key", req.IdempotencyKey))
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
+		s.logger.Info("idempotent create coupon", zap.String("key", idempKey))
 		return cached, nil
 	}
 
@@ -314,11 +368,11 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 		return nil, fmt.Errorf("create coupon: %w", err)
 	}
 
-	// tx is *sql.Tx, pass directly
+	// tx is *sql.Tx
 	if err := s.emitCouponEvent(ctx, tx, coupon, salesEvents.EventCouponCreated); err != nil {
 		s.logger.Warn("failed to emit coupon created event", zap.Error(err))
 	}
-	_ = s.idempotencyStore.Store(ctx, tx, req.IdempotencyKey, coupon)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, coupon)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -343,11 +397,27 @@ func (s *couponService) validateCreateCoupon(req *CreateCouponRequest) error {
 	if req.DiscountValue.LessThanOrEqual(decimal.Zero) {
 		return fmt.Errorf("%w: discount_value must be positive", salesErrors.ErrInvalidInput)
 	}
+	// Percentage discount cannot exceed 100
+	if req.DiscountType == enums.DiscountTypePercentage && req.DiscountValue.GreaterThan(decimal.NewFromInt(100)) {
+		return fmt.Errorf("%w: percentage discount cannot exceed 100", salesErrors.ErrInvalidInput)
+	}
 	if req.StartDate.IsZero() || req.EndDate.IsZero() {
 		return fmt.Errorf("%w: start_date and end_date required", salesErrors.ErrInvalidInput)
 	}
 	if req.StartDate.After(req.EndDate) {
 		return fmt.Errorf("%w: start_date must be before end_date", salesErrors.ErrInvalidInput)
+	}
+	if req.MaxDiscountAmount != nil && req.MaxDiscountAmount.LessThanOrEqual(decimal.Zero) {
+		return fmt.Errorf("%w: max_discount_amount must be positive", salesErrors.ErrInvalidInput)
+	}
+	if req.MinOrderAmount != nil && req.MinOrderAmount.LessThanOrEqual(decimal.Zero) {
+		return fmt.Errorf("%w: min_order_amount must be positive", salesErrors.ErrInvalidInput)
+	}
+	if req.UsageLimit != nil && *req.UsageLimit <= 0 {
+		return fmt.Errorf("%w: usage_limit must be positive", salesErrors.ErrInvalidInput)
+	}
+	if req.PerUserLimit != nil && *req.PerUserLimit <= 0 {
+		return fmt.Errorf("%w: per_user_limit must be positive", salesErrors.ErrInvalidInput)
 	}
 	return nil
 }
@@ -356,7 +426,13 @@ func (s *couponService) validateCreateCoupon(req *CreateCouponRequest) error {
 //  UpdateCoupon
 // ---------------------------------------------------------------------
 
+// UpdateCoupon updates an existing coupon.
 func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uuid.UUID, req *UpdateCouponRequest) (*discount.Coupon, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update-coupon-%s", couponID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -364,7 +440,7 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 	defer tx.Rollback()
 
 	var cached *discount.Coupon
-	if err := s.idempotencyStore.Get(ctx, tx, req.IdempotencyKey, &cached); err == nil && cached != nil {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		return cached, nil
 	}
 
@@ -376,6 +452,57 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 		return nil, salesErrors.ErrPermissionDenied
 	}
 
+	// --- Validate individual fields ---
+	if req.DiscountValue != nil {
+		if req.DiscountValue.LessThanOrEqual(decimal.Zero) {
+			return nil, fmt.Errorf("%w: discount_value must be positive", salesErrors.ErrInvalidInput)
+		}
+		discountType := coupon.DiscountType
+		if req.DiscountType != nil {
+			discountType = *req.DiscountType
+		}
+		if discountType == enums.DiscountTypePercentage && req.DiscountValue.GreaterThan(decimal.NewFromInt(100)) {
+			return nil, fmt.Errorf("%w: percentage discount cannot exceed 100", salesErrors.ErrInvalidInput)
+		}
+	}
+	if req.MaxDiscountAmount != nil && req.MaxDiscountAmount.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("%w: max_discount_amount must be positive", salesErrors.ErrInvalidInput)
+	}
+	if req.MinOrderAmount != nil && req.MinOrderAmount.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("%w: min_order_amount must be positive", salesErrors.ErrInvalidInput)
+	}
+	if req.UsageLimit != nil && *req.UsageLimit <= 0 {
+		return nil, fmt.Errorf("%w: usage_limit must be positive", salesErrors.ErrInvalidInput)
+	}
+	if req.PerUserLimit != nil && *req.PerUserLimit <= 0 {
+		return nil, fmt.Errorf("%w: per_user_limit must be positive", salesErrors.ErrInvalidInput)
+	}
+
+	// --- DATE VALIDATION (CRITICAL FIX) ---
+	// Start with the coupon's current dates
+	newStart := coupon.StartDate
+	newEnd := coupon.EndDate
+
+	if req.StartDate != nil {
+		newStart = *req.StartDate
+	}
+	if req.EndDate != nil {
+		newEnd = *req.EndDate
+	}
+
+	// Final check: start_date must not be after end_date
+	if newStart.After(newEnd) {
+		return nil, fmt.Errorf("%w: start_date (%s) cannot be after end_date (%s)",
+			salesErrors.ErrInvalidInput,
+			newStart.Format(time.RFC3339),
+			newEnd.Format(time.RFC3339))
+	}
+
+	// If validation passes, apply the date changes to the coupon object
+	coupon.StartDate = newStart
+	coupon.EndDate = newEnd
+
+	// --- Apply other field updates ---
 	changes := map[string]interface{}{}
 
 	if req.Code != nil && *req.Code != coupon.Code {
@@ -400,12 +527,6 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 	if req.MaxDiscountAmount != nil {
 		coupon.MaxDiscountAmount = req.MaxDiscountAmount
 	}
-	if req.StartDate != nil {
-		coupon.StartDate = *req.StartDate
-	}
-	if req.EndDate != nil {
-		coupon.EndDate = *req.EndDate
-	}
 	if req.UsageLimit != nil {
 		coupon.UsageLimit = req.UsageLimit
 	}
@@ -420,6 +541,7 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 	}
 	coupon.UpdatedBy = req.UpdatedBy
 
+	// Persist the updated coupon
 	if err := s.couponRepo.Update(ctx, tx, coupon); err != nil {
 		return nil, fmt.Errorf("update coupon: %w", err)
 	}
@@ -427,7 +549,7 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 	if err := s.emitCouponEvent(ctx, tx, coupon, salesEvents.EventCouponUpdated); err != nil {
 		s.logger.Warn("failed to emit coupon updated event", zap.Error(err))
 	}
-	_ = s.idempotencyStore.Store(ctx, tx, req.IdempotencyKey, coupon)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, coupon)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -445,6 +567,11 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 // ---------------------------------------------------------------------
 
 func (s *couponService) DeleteCoupon(ctx context.Context, companyID, couponID uuid.UUID, deletedBy uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("delete-coupon-%s", couponID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -452,11 +579,12 @@ func (s *couponService) DeleteCoupon(ctx context.Context, companyID, couponID uu
 	defer tx.Rollback()
 
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, deletedBy.String(), &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
 
-	coupon, err := s.couponRepo.GetByID(ctx, tx, companyID, couponID)
+	// Get the coupon for update (to ensure it exists and belongs to the company)
+	coupon, err := s.couponRepo.GetByIDForUpdate(ctx, tx, companyID, couponID)
 	if err != nil {
 		return err
 	}
@@ -464,14 +592,21 @@ func (s *couponService) DeleteCoupon(ctx context.Context, companyID, couponID uu
 		return salesErrors.ErrPermissionDenied
 	}
 
-	if err := s.couponRepo.Delete(ctx, tx, companyID, couponID); err != nil {
-		return fmt.Errorf("delete coupon: %w", err)
+	// Soft delete: set deleted_at and deactivate the coupon
+	now := time.Now()
+	coupon.DeletedAt = &now
+	coupon.IsActive = false
+	coupon.UpdatedBy = &deletedBy
+
+	// Use the existing Update method (which should handle updated_at and updated_by)
+	if err := s.couponRepo.Update(ctx, tx, coupon); err != nil {
+		return fmt.Errorf("soft delete coupon: %w", err)
 	}
 
 	if err := s.emitCouponEvent(ctx, tx, coupon, salesEvents.EventCouponDeleted); err != nil {
 		s.logger.Warn("failed to emit coupon deleted event", zap.Error(err))
 	}
-	_ = s.idempotencyStore.Store(ctx, tx, deletedBy.String(), true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -485,18 +620,21 @@ func (s *couponService) DeleteCoupon(ctx context.Context, companyID, couponID uu
 }
 
 // ---------------------------------------------------------------------
-//  Basic getters
+//  Basic getters (read-only – use default DB connection)
 // ---------------------------------------------------------------------
 
 func (s *couponService) GetCouponByID(ctx context.Context, companyID, couponID uuid.UUID) (*discount.Coupon, error) {
-	return s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	return s.couponRepo.GetByID(ctx, db, companyID, couponID)
 }
 
 func (s *couponService) GetCouponByCode(ctx context.Context, companyID uuid.UUID, code string) (*discount.Coupon, error) {
-	return s.couponRepo.GetByCode(ctx, nil, companyID, code)
+	db := s.pgClient.DB
+	return s.couponRepo.GetByCode(ctx, db, companyID, code)
 }
 
 func (s *couponService) ListCoupons(ctx context.Context, filter CouponListFilter, p Pagination, srt Sort) ([]*discount.Coupon, int64, error) {
+	db := s.pgClient.DB
 	repoFilter := repository.CouponFilter{
 		CompanyID:   filter.CompanyID,
 		Code:        filter.Code,
@@ -504,17 +642,19 @@ func (s *couponService) ListCoupons(ctx context.Context, filter CouponListFilter
 		CreatedFrom: filter.CreatedFrom,
 		CreatedTo:   filter.CreatedTo,
 	}
-	return s.couponRepo.List(ctx, nil, repoFilter,
+	return s.couponRepo.List(ctx, db, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *couponService) SearchCoupons(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*discount.Coupon, int64, error) {
-	return s.couponRepo.Search(ctx, nil, companyID, query, limit, offset)
+	db := s.pgClient.DB
+	return s.couponRepo.Search(ctx, db, companyID, query, limit, offset)
 }
 
 func (s *couponService) GetActiveCoupons(ctx context.Context, companyID uuid.UUID, at time.Time) ([]*discount.Coupon, error) {
-	return s.couponRepo.GetActiveCoupons(ctx, nil, companyID, at)
+	db := s.pgClient.DB
+	return s.couponRepo.GetActiveCoupons(ctx, db, companyID, at)
 }
 
 // ---------------------------------------------------------------------
@@ -530,11 +670,25 @@ func (s *couponService) DeactivateCoupon(ctx context.Context, companyID, couponI
 }
 
 func (s *couponService) setActiveStatus(ctx context.Context, companyID, couponID uuid.UUID, active bool, updatedBy uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		status := "deactivate"
+		if active {
+			status = "activate"
+		}
+		idempKey = fmt.Sprintf("%s-coupon-%s", status, couponID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	if err := s.couponRepo.SetActiveStatus(ctx, tx, companyID, couponID, active, &updatedBy); err != nil {
 		return err
@@ -547,11 +701,13 @@ func (s *couponService) setActiveStatus(ctx context.Context, companyID, couponID
 		}
 		_ = s.emitCouponEvent(ctx, tx, coupon, eventType)
 	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	return tx.Commit()
 }
 
 func (s *couponService) IsCouponActive(ctx context.Context, companyID, couponID uuid.UUID, at time.Time) (bool, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return false, err
 	}
@@ -565,11 +721,21 @@ func (s *couponService) IsCouponActive(ctx context.Context, companyID, couponID 
 }
 
 func (s *couponService) ExpireCoupon(ctx context.Context, companyID, couponID uuid.UUID, expiredBy uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("expire-coupon-%s", couponID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	coupon, err := s.couponRepo.GetByIDForUpdate(ctx, tx, companyID, couponID)
 	if err != nil {
@@ -582,15 +748,17 @@ func (s *couponService) ExpireCoupon(ctx context.Context, companyID, couponID uu
 		return fmt.Errorf("update coupon end date: %w", err)
 	}
 	_ = s.emitCouponEvent(ctx, tx, coupon, salesEvents.EventCouponUpdated)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	return tx.Commit()
 }
 
 // ---------------------------------------------------------------------
-//  Validation methods (public wrappers)
+//  Validation methods (public wrappers) – use default DB where needed
 // ---------------------------------------------------------------------
 
 func (s *couponService) ValidateCoupon(ctx context.Context, companyID uuid.UUID, couponCode string, customerID *uuid.UUID, orderAmount decimal.Decimal, productIDs []uuid.UUID, at time.Time) error {
-	coupon, err := s.couponRepo.GetByCode(ctx, nil, companyID, couponCode)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByCode(ctx, db, companyID, couponCode)
 	if err != nil {
 		return err
 	}
@@ -638,7 +806,8 @@ func (s *couponService) ValidateCouponProducts(ctx context.Context, coupon *disc
 }
 
 func (s *couponService) CanCustomerUseCoupon(ctx context.Context, companyID, couponID, customerID uuid.UUID, at time.Time) (bool, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return false, err
 	}
@@ -661,35 +830,49 @@ func (s *couponService) CanCustomerUseCoupon(ctx context.Context, companyID, cou
 //  Discount calculation
 // ---------------------------------------------------------------------
 
-func (s *couponService) CalculateDiscount(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal) (decimal.Decimal, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, uuid.Nil, couponID)
+// CalculateDiscount calculates the discount amount for a given subtotal using the coupon.
+func (s *couponService) CalculateDiscount(ctx context.Context, companyID, couponID uuid.UUID, subtotal decimal.Decimal) (decimal.Decimal, error) {
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return decimal.Zero, err
 	}
 	return s.calculateDiscountAmount(coupon, subtotal), nil
 }
 
-func (s *couponService) CalculateDiscountForProducts(ctx context.Context, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error) {
-	return s.CalculateDiscount(ctx, couponID, subtotal)
-}
-
-// ---------------------------------------------------------------------
+// CalculateDiscountForProducts calculates the discount amount for a subtotal
+// considering product restrictions (if any). For now, it delegates to CalculateDiscount.
+func (s *couponService) CalculateDiscountForProducts(ctx context.Context, companyID, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error) {
+	return s.CalculateDiscount(ctx, companyID, couponID, subtotal)
+} // ---------------------------------------------------------------------
 //  Apply coupon to order (fully supported)
 // ---------------------------------------------------------------------
 
 func (s *couponService) ApplyCouponToOrder(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("apply-order-%s-%s", orderID.String(), couponCode)
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	var cachedResult *struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cachedResult); err == nil && cachedResult != nil {
+		s.logger.Info("idempotent apply coupon to order", zap.String("key", idempKey))
+		return cachedResult.Coupon, cachedResult.Amount, nil
+	}
+
 	order, err := s.orderRepo.GetByIDForUpdate(ctx, tx, companyID, orderID)
 	if err != nil {
 		return nil, decimal.Zero, err
 	}
-
-	// only draft orders can accept coupons
 	if order.Status != enums.OrderStatusDraft {
 		return nil, decimal.Zero, fmt.Errorf("%w: coupon can only be applied to draft orders", salesErrors.ErrInvalidStatus)
 	}
@@ -760,11 +943,16 @@ func (s *couponService) ApplyCouponToOrder(ctx context.Context, companyID, order
 	if order.CustomerID != uuid.Nil {
 		_ = s.recordUsage(ctx, tx, companyID, coupon.CouponID, orderID, &order.CustomerID, discountAmount, at)
 	}
-	// Emit analytics event instead of the old CRUD event
 	if err := s.emitCouponAppliedEvent(ctx, tx, companyID, coupon.CouponID, coupon.Code,
 		discountAmount, order.Subtotal, "order", orderID, &order.CustomerID, at); err != nil {
 		s.logger.Warn("failed to emit coupon applied event", zap.Error(err))
 	}
+
+	result := struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}{Coupon: coupon, Amount: discountAmount}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, &result)
 
 	if err := tx.Commit(); err != nil {
 		return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
@@ -772,24 +960,32 @@ func (s *couponService) ApplyCouponToOrder(ctx context.Context, companyID, order
 	return coupon, discountAmount, nil
 }
 
-// ---------------------------------------------------------------------
-//  Apply coupon to quote (NOT SUPPORTED by schema)
-// ---------------------------------------------------------------------
-
+// ApplyCouponToQuote – not supported by schema
 func (s *couponService) ApplyCouponToQuote(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
 	return nil, decimal.Zero, fmt.Errorf("%w: applying coupons to quotes is not supported (discount_applications lacks quote_id)", ErrNotSupported)
 }
 
-// ---------------------------------------------------------------------
-//  Apply coupon to invoice (supported)
-// ---------------------------------------------------------------------
-
+// ApplyCouponToInvoice – supported
 func (s *couponService) ApplyCouponToInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("apply-invoice-%s-%s", invoiceID.String(), couponCode)
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var cachedResult *struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cachedResult); err == nil && cachedResult != nil {
+		s.logger.Info("idempotent apply coupon to invoice", zap.String("key", idempKey))
+		return cachedResult.Coupon, cachedResult.Amount, nil
+	}
 
 	invoice, err := s.invoiceRepo.GetByIDForUpdate(ctx, tx, companyID, invoiceID)
 	if err != nil {
@@ -835,7 +1031,6 @@ func (s *couponService) ApplyCouponToInvoice(ctx context.Context, companyID, inv
 		return nil, decimal.Zero, err
 	}
 
-	// Prevent duplicate application
 	existingApps, err := s.usageRepo.GetByInvoice(ctx, tx, companyID, invoiceID)
 	if err != nil {
 		return nil, decimal.Zero, err
@@ -863,7 +1058,6 @@ func (s *couponService) ApplyCouponToInvoice(ctx context.Context, companyID, inv
 	if err := s.invoiceRepo.RecalculateTotals(ctx, tx, companyID, invoiceID); err != nil {
 		return nil, decimal.Zero, err
 	}
-	// Emit analytics event instead of the old CRUD event
 	var customerIDPtr *uuid.UUID
 	if invoice.CustomerID != uuid.Nil {
 		customerIDPtr = &invoice.CustomerID
@@ -873,22 +1067,35 @@ func (s *couponService) ApplyCouponToInvoice(ctx context.Context, companyID, inv
 		s.logger.Warn("failed to emit coupon applied event", zap.Error(err))
 	}
 
+	result := struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}{Coupon: coupon, Amount: discountAmount}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, &result)
+
 	if err := tx.Commit(); err != nil {
 		return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
 	}
 	return coupon, discountAmount, nil
 }
 
-// ---------------------------------------------------------------------
-//  Remove coupon from order
-// ---------------------------------------------------------------------
-
+// RemoveCouponFromOrder
 func (s *couponService) RemoveCouponFromOrder(ctx context.Context, companyID, orderID uuid.UUID, couponCode string, removedBy uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove-order-%s-%s", orderID.String(), couponCode)
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	coupon, err := s.couponRepo.GetByCode(ctx, tx, companyID, couponCode)
 	if err != nil {
@@ -914,27 +1121,32 @@ func (s *couponService) RemoveCouponFromOrder(ctx context.Context, companyID, or
 	if err := s.orderRepo.RecalculateTotals(ctx, tx, companyID, orderID); err != nil {
 		return err
 	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	return tx.Commit()
 }
 
-// ---------------------------------------------------------------------
-//  Remove coupon from quote (not supported)
-// ---------------------------------------------------------------------
-
+// RemoveCouponFromQuote – not supported
 func (s *couponService) RemoveCouponFromQuote(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, removedBy uuid.UUID) error {
 	return fmt.Errorf("%w: removing coupons from quotes is not supported", ErrNotSupported)
 }
 
-// ---------------------------------------------------------------------
-//  Remove coupon from invoice
-// ---------------------------------------------------------------------
-
+// RemoveCouponFromInvoice
 func (s *couponService) RemoveCouponFromInvoice(ctx context.Context, companyID, invoiceID uuid.UUID, couponCode string, removedBy uuid.UUID) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove-invoice-%s-%s", invoiceID.String(), couponCode)
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 
 	coupon, err := s.couponRepo.GetByCode(ctx, tx, companyID, couponCode)
 	if err != nil {
@@ -960,34 +1172,69 @@ func (s *couponService) RemoveCouponFromInvoice(ctx context.Context, companyID, 
 	if err := s.invoiceRepo.RecalculateTotals(ctx, tx, companyID, invoiceID); err != nil {
 		return err
 	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	return tx.Commit()
 }
 
-// ---------------------------------------------------------------------
-//  Record coupon usage (only order supported)
-// ---------------------------------------------------------------------
-
+// Record coupon usage
+// RecordCouponUsage manually records a coupon usage.
+// It is idempotent: if a usage already exists for the same coupon, customer, and order,
+// it returns success without inserting a duplicate.
 func (s *couponService) RecordCouponUsage(ctx context.Context, req *RecordCouponUsageRequest) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("usage-%s-%s", req.CouponID.String(), req.OrderID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+
+	// Check if usage already exists
+	exists, err := s.couponRepo.HasCustomerUsedCoupon(ctx, tx, req.CompanyID, req.CouponID, *req.CustomerID, req.OrderID)
+	if err != nil {
+		return err
+	}
+	if exists {
+		// Already recorded – idempotent success
+		_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+		return tx.Commit()
+	}
+
+	// No existing usage – insert new record
 	if err := s.recordUsage(ctx, tx, req.CompanyID, req.CouponID, req.OrderID, req.CustomerID, req.DiscountAmount, req.UsedAt); err != nil {
 		return err
 	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	return tx.Commit()
 }
-
 func (s *couponService) RecordOrderCouponUsage(ctx context.Context, companyID, couponID, orderID uuid.UUID, customerID *uuid.UUID, discountAmount decimal.Decimal, usedAt time.Time) error {
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("usage-order-%s-%s", orderID.String(), couponID.String())
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
 	if err := s.recordUsage(ctx, tx, companyID, couponID, orderID, customerID, discountAmount, usedAt); err != nil {
 		return err
 	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	return tx.Commit()
 }
 
@@ -999,34 +1246,32 @@ func (s *couponService) RecordInvoiceCouponUsage(ctx context.Context, companyID,
 	return fmt.Errorf("%w: invoice usage tracking not supported", ErrNotSupported)
 }
 
-// ---------------------------------------------------------------------
-//  Usage queries
-// ---------------------------------------------------------------------
-
+// Usage queries
 func (s *couponService) GetCouponUsageCount(ctx context.Context, companyID, couponID uuid.UUID) (int64, error) {
-	return s.couponRepo.GetTotalUsageCount(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	return s.couponRepo.GetTotalUsageCount(ctx, db, companyID, couponID)
 }
 
 func (s *couponService) GetCustomerCouponUsageCount(ctx context.Context, companyID, couponID, customerID uuid.UUID) (int64, error) {
-	return s.couponRepo.GetCustomerUsageCount(ctx, nil, companyID, couponID, customerID)
+	db := s.pgClient.DB
+	return s.couponRepo.GetCustomerUsageCount(ctx, db, companyID, couponID, customerID)
 }
 
 func (s *couponService) GetCouponUsageHistory(ctx context.Context, companyID, couponID uuid.UUID, p Pagination, srt Sort) ([]*discount.CouponUsage, int64, error) {
-	allUsages, err := s.couponRepo.GetUsagesByCoupon(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	allUsages, err := s.couponRepo.GetUsagesByCoupon(ctx, db, companyID, couponID)
 	if err != nil {
 		return nil, 0, err
 	}
 	total := int64(len(allUsages))
 
-	// apply sorting (simple: by UsedAt desc as default)
 	sort.Slice(allUsages, func(i, j int) bool {
 		if srt.Field == "used_at" && srt.Direction == "asc" {
 			return allUsages[i].UsedAt.Before(allUsages[j].UsedAt)
 		}
-		return allUsages[i].UsedAt.After(allUsages[j].UsedAt) // default desc
+		return allUsages[i].UsedAt.After(allUsages[j].UsedAt)
 	})
 
-	// apply pagination
 	start := p.Offset
 	if start < 0 {
 		start = 0
@@ -1041,32 +1286,34 @@ func (s *couponService) GetCouponUsageHistory(ctx context.Context, companyID, co
 	return allUsages[start:end], total, nil
 }
 
-// ---------------------------------------------------------------------
-//  Analytics methods
-// ---------------------------------------------------------------------
-
+// Analytics
 func (s *couponService) GetTopCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error) {
-	return s.couponRepo.GetTopCouponsByDiscountAmount(ctx, nil, companyID, limit, from, to)
+	db := s.pgClient.DB
+	return s.couponRepo.GetTopCouponsByDiscountAmount(ctx, db, companyID, limit, from, to)
 }
 
 func (s *couponService) GetMostUsedCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error) {
-	return s.couponRepo.GetTopCouponsByUsage(ctx, nil, companyID, limit, from, to)
+	db := s.pgClient.DB
+	return s.couponRepo.GetTopCouponsByUsage(ctx, db, companyID, limit, from, to)
 }
 
 func (s *couponService) GetHighestDiscountCoupons(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Coupon, error) {
-	return s.couponRepo.GetTopCouponsByDiscountAmount(ctx, nil, companyID, limit, from, to)
+	db := s.pgClient.DB
+	return s.couponRepo.GetTopCouponsByDiscountAmount(ctx, db, companyID, limit, from, to)
 }
 
 func (s *couponService) GetTotalCouponDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.couponRepo.GetTotalDiscountGiven(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.couponRepo.GetTotalDiscountGiven(ctx, db, companyID, from, to)
 }
 
 func (s *couponService) GetCouponRedemptionRate(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	used, err := s.couponRepo.GetTotalUsageCount(ctx, nil, companyID, couponID)
+	used, err := s.couponRepo.GetTotalUsageCount(ctx, db, companyID, couponID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -1077,20 +1324,20 @@ func (s *couponService) GetCouponRedemptionRate(ctx context.Context, companyID u
 	return rate, nil
 }
 
-// ---------------------------------------------------------------------
-//  Existence helpers
-// ---------------------------------------------------------------------
-
+// Existence helpers
 func (s *couponService) CouponExists(ctx context.Context, companyID, couponID uuid.UUID) (bool, error) {
-	return s.couponRepo.Exists(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	return s.couponRepo.Exists(ctx, db, companyID, couponID)
 }
 
 func (s *couponService) CouponCodeExists(ctx context.Context, companyID uuid.UUID, code string) (bool, error) {
-	return s.couponRepo.ExistsByCode(ctx, nil, companyID, code)
+	db := s.pgClient.DB
+	return s.couponRepo.ExistsByCode(ctx, db, companyID, code)
 }
 
 func (s *couponService) IsCouponExpired(ctx context.Context, companyID, couponID uuid.UUID, at time.Time) (bool, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return false, err
 	}
@@ -1098,14 +1345,15 @@ func (s *couponService) IsCouponExpired(ctx context.Context, companyID, couponID
 }
 
 func (s *couponService) IsCouponUsageLimitReached(ctx context.Context, companyID, couponID uuid.UUID) (bool, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return false, err
 	}
 	if coupon.UsageLimit == nil {
 		return false, nil
 	}
-	used, err := s.couponRepo.GetTotalUsageCount(ctx, nil, companyID, couponID)
+	used, err := s.couponRepo.GetTotalUsageCount(ctx, db, companyID, couponID)
 	if err != nil {
 		return false, err
 	}
@@ -1113,57 +1361,17 @@ func (s *couponService) IsCouponUsageLimitReached(ctx context.Context, companyID
 }
 
 func (s *couponService) IsCustomerUsageLimitReached(ctx context.Context, companyID, couponID, customerID uuid.UUID) (bool, error) {
-	coupon, err := s.couponRepo.GetByID(ctx, nil, companyID, couponID)
+	db := s.pgClient.DB
+	coupon, err := s.couponRepo.GetByID(ctx, db, companyID, couponID)
 	if err != nil {
 		return false, err
 	}
 	if coupon.PerUserLimit == nil {
 		return false, nil
 	}
-	used, err := s.couponRepo.GetCustomerUsageCount(ctx, nil, companyID, couponID, customerID)
+	used, err := s.couponRepo.GetCustomerUsageCount(ctx, db, companyID, couponID, customerID)
 	if err != nil {
 		return false, err
 	}
 	return used >= int64(*coupon.PerUserLimit), nil
-}
-
-// emitCouponAppliedEvent sends the detailed coupon usage event for analytics.
-func (s *couponService) emitCouponAppliedEvent(
-	ctx context.Context,
-	tx *sql.Tx,
-	companyID, couponID uuid.UUID,
-	code string,
-	discountAmount, orderSubtotal decimal.Decimal,
-	entityType string,
-	entityID uuid.UUID,
-	customerID *uuid.UUID,
-	usedAt time.Time,
-) error {
-	payload := salesEvents.CouponAppliedPayload{
-		CouponID:       couponID.String(),
-		CompanyID:      companyID.String(),
-		Code:           code,
-		DiscountAmount: discountAmount.String(),
-		OrderSubtotal:  orderSubtotal.String(),
-		EntityType:     entityType,
-		EntityID:       entityID.String(),
-		UsedAt:         usedAt.Format(time.RFC3339),
-	}
-	if customerID != nil {
-		cid := customerID.String()
-		payload.CustomerID = &cid
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	event := &outbox.Event{
-		EventID:       uuid.New().String(),
-		AggregateType: "coupon",
-		AggregateID:   couponID.String(),
-		EventType:     salesEvents.EventCouponApplied,
-		Topic:         salesEvents.TopicSalesEvents,
-		Payload:       data,
-	}
-	return s.outboxRepo.Store(ctx, tx, event)
 }

@@ -73,15 +73,16 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, salesErrors.ErrDuplicate):
 		return http.StatusConflict, "duplicate record"
-	case errors.Is(err, salesErrors.ErrConflict), errors.Is(err, salesErrors.ErrInvalidState):
+	case errors.Is(err, salesErrors.ErrConflict):
 		return http.StatusConflict, err.Error()
+	case errors.Is(err, salesErrors.ErrInvalidState):
+		return http.StatusBadRequest, err.Error()
 	case errors.Is(err, salesErrors.ErrPermissionDenied):
 		return http.StatusForbidden, "permission denied"
 	case errors.Is(err, salesErrors.ErrUnauthorized):
 		return http.StatusUnauthorized, "authentication required"
 	case errors.Is(err, salesErrors.ErrInventoryItemNotFound):
 		return http.StatusBadRequest, "inventory item not found or inactive"
-	// NEW cases:
 	case errors.Is(err, salesErrors.ErrInvalidStatus),
 		errors.Is(err, salesErrors.ErrInvalidTransition):
 		return http.StatusBadRequest, err.Error()
@@ -89,8 +90,14 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusBadRequest, "customer is inactive"
 	case errors.Is(err, salesErrors.ErrProductInactive):
 		return http.StatusBadRequest, "product is inactive"
-	case errors.Is(err, salesErrors.ErrPaymentOverAlloc): // <-- ADDED
+	case errors.Is(err, salesErrors.ErrPaymentOverAlloc):
 		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, salesErrors.ErrCouponExpired):
+		return http.StatusBadRequest, "coupon expired"
+	case errors.Is(err, salesErrors.ErrCouponInactive):
+		return http.StatusBadRequest, "coupon inactive"
+	case errors.Is(err, salesErrors.ErrCouponUsageLimit):
+		return http.StatusBadRequest, "coupon usage limit exceeded"
 	default:
 		return http.StatusInternalServerError, "internal server error"
 	}

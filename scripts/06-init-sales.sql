@@ -2099,3 +2099,6 @@ CREATE TABLE IF NOT EXISTS sales_analytics.commission_plan_unique_reps (
     sales_rep_id UUID NOT NULL,
     PRIMARY KEY (company_id, plan_id, date, sales_rep_id)
 );
+
+ALTER TABLE sales.coupons ADD COLUMN deleted_at TIMESTAMPTZ;
+CREATE INDEX idx_coupons_deleted_at ON sales.coupons(deleted_at) WHERE deleted_at IS NOT NULL;
