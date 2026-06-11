@@ -63,6 +63,7 @@ func (h *BaseHandler) respondWithError(w http.ResponseWriter, status int, messag
 
 // mapServiceError translates service-layer errors to HTTP status codes and messages.
 // mapServiceError translates service-layer errors to HTTP status codes and messages.
+// mapServiceError translates service-layer errors to HTTP status codes and messages.
 func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 	switch {
 	case errors.Is(err, salesErrors.ErrNotFound):
@@ -77,6 +78,8 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusConflict, err.Error()
 	case errors.Is(err, salesErrors.ErrInvalidState):
 		return http.StatusBadRequest, err.Error()
+	case errors.Is(err, salesErrors.ErrInvalidStateTransition): // ✅ NEW: return 409 Conflict
+		return http.StatusConflict, err.Error()
 	case errors.Is(err, salesErrors.ErrPermissionDenied):
 		return http.StatusForbidden, "permission denied"
 	case errors.Is(err, salesErrors.ErrUnauthorized):

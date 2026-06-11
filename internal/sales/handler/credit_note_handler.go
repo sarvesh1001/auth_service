@@ -1,7 +1,7 @@
-// file: internal/sales/handler/credit_note_handler.go
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,11 +29,22 @@ func NewCreditNoteHandler(creditNoteService service.CreditNoteService, logger *z
 	}
 }
 
-// Request/Response types
+// injectIdempotencyKey puts the Idempotency-Key header value into context
+func (h *CreditNoteHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
+}
+
+// ---------------------------------------------------------------------
+// Request/Response types (unchanged, only for completeness)
+// ---------------------------------------------------------------------
 
 type createCreditNoteRequest struct {
 	CustomerID     string                        `json:"customer_id"`
-	CreditNoteDate string                        `json:"credit_note_date"` // was IssueDate
+	CreditNoteDate string                        `json:"credit_note_date"`
 	Currency       *string                       `json:"currency,omitempty"`
 	Reason         *string                       `json:"reason,omitempty"`
 	Notes          *string                       `json:"notes,omitempty"`
@@ -49,7 +60,7 @@ type createCreditNoteItemRequest struct {
 
 type createCreditNoteFromInvoiceRequest struct {
 	InvoiceID string   `json:"invoice_id"`
-	Items     []string `json:"items,omitempty"` // invoice item IDs to credit (nil = full invoice)
+	Items     []string `json:"items,omitempty"`
 	Reason    *string  `json:"reason,omitempty"`
 	Notes     *string  `json:"notes,omitempty"`
 }
@@ -63,6 +74,29 @@ type createCreditNoteFromReturnRequest struct {
 type updateCreditNoteRequest struct {
 	Reason *string `json:"reason,omitempty"`
 	Notes  *string `json:"notes,omitempty"`
+}
+
+type voidCreditNoteRequest struct {
+	Reason string `json:"reason"`
+}
+
+type applyToInvoiceRequest struct {
+	InvoiceID string `json:"invoice_id"`
+	Amount    string `json:"amount"`
+}
+
+type applyToInvoicesRequest struct {
+	Applications []creditNoteApplicationRequest `json:"applications"`
+}
+
+type creditNoteApplicationRequest struct {
+	InvoiceID string `json:"invoice_id"`
+	Amount    string `json:"amount"`
+}
+
+type convertToRefundRequest struct {
+	PaymentID string `json:"payment_id"`
+	Reason    string `json:"reason"`
 }
 
 type creditNoteResponse struct {
@@ -114,41 +148,6 @@ type creditNoteApplicationResponse struct {
 	AppliedBy     *string `json:"applied_by,omitempty"`
 }
 
-type addCreditNoteItemsRequest struct {
-	Items []createCreditNoteItemRequest `json:"items"`
-}
-
-type replaceCreditNoteItemsRequest struct {
-	Items []createCreditNoteItemRequest `json:"items"`
-}
-
-type creditNoteUpdateStatusRequest struct {
-	Status string `json:"status"`
-}
-
-type voidCreditNoteRequest struct {
-	Reason string `json:"reason"`
-}
-
-type applyToInvoiceRequest struct {
-	InvoiceID string `json:"invoice_id"`
-	Amount    string `json:"amount"`
-}
-
-type applyToInvoicesRequest struct {
-	Applications []creditNoteApplicationRequest `json:"applications"`
-}
-
-type creditNoteApplicationRequest struct {
-	InvoiceID string `json:"invoice_id"`
-	Amount    string `json:"amount"`
-}
-
-type convertToRefundRequest struct {
-	PaymentID string `json:"payment_id"`
-	Reason    string `json:"reason"`
-}
-
 type listCreditNotesResponse struct {
 	CreditNotes []creditNoteSummary `json:"credit_notes"`
 	Total       int64               `json:"total"`
@@ -173,9 +172,12 @@ type creditNoteTotalsResponse struct {
 	RemainingAmount string `json:"remaining_amount"`
 }
 
+// ---------------------------------------------------------------------
 // Conversion helpers
+// ---------------------------------------------------------------------
 
 func (h *CreditNoteHandler) toCreditNoteResponse(cn *models.CreditNote) creditNoteResponse {
+	remaining := cn.TotalAmount.Sub(cn.AmountApplied)
 	resp := creditNoteResponse{
 		CreditNoteID:     cn.CreditNoteID.String(),
 		CompanyID:        cn.CompanyID.String(),
@@ -188,7 +190,7 @@ func (h *CreditNoteHandler) toCreditNoteResponse(cn *models.CreditNote) creditNo
 		TaxTotal:         cn.TaxTotal.String(),
 		TotalAmount:      cn.TotalAmount.String(),
 		AmountApplied:    cn.AmountApplied.String(),
-		RemainingAmount:  cn.RemainingAmount.String(),
+		RemainingAmount:  remaining.String(),
 		Reason:           cn.Reason,
 		Notes:            cn.Notes,
 		CreatedAt:        cn.CreatedAt.Format(time.RFC3339),
@@ -265,7 +267,9 @@ func (h *CreditNoteHandler) toCreditNoteApplicationResponse(app *models.CreditNo
 	return resp
 }
 
-// Handlers
+// ---------------------------------------------------------------------
+// Handlers – Create (idempotent via context)
+// ---------------------------------------------------------------------
 
 func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -274,7 +278,6 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
@@ -286,34 +289,28 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.CustomerID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "customer_id is required")
 		return
 	}
-
 	customerID, err := uuid.Parse(req.CustomerID)
 	if err != nil || customerID == uuid.Nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
 		return
 	}
-
 	creditNoteDate, err := time.Parse(time.RFC3339, req.CreditNoteDate)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit_note_date (use RFC3339)")
 		return
 	}
-
 	var currency *string
 	if req.Currency != nil && *req.Currency != "" {
 		currency = req.Currency
 	}
-
 	if len(req.Items) == 0 {
 		h.respondWithError(w, http.StatusBadRequest, "at least one item is required")
 		return
 	}
-
 	items := make([]*service.CreateCreditNoteItemRequest, len(req.Items))
 	for i, it := range req.Items {
 		quantity, err := decimal.NewFromString(it.Quantity)
@@ -347,18 +344,18 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 			TaxRate:   taxRate,
 		}
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
+	// Idempotency: header must be present
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CreateCreditNoteRequest{
 		CompanyID:      companyID,
@@ -370,7 +367,6 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 		Notes:          req.Notes,
 		CreatedBy:      &userID,
 	}
-
 	creditNote, err := h.creditNoteService.CreateDraftCreditNote(ctx, svcReq)
 	if err != nil {
 		h.logger.Error("failed to create draft credit note", zap.Error(err))
@@ -378,7 +374,6 @@ func (h *CreditNoteHandler) CreateDraftCreditNote(w http.ResponseWriter, r *http
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditNoteResponse(creditNote)
 	location := fmt.Sprintf("/credit-notes/%s", creditNote.CreditNoteID)
 	w.Header().Set("Location", location)
@@ -395,41 +390,35 @@ func (h *CreditNoteHandler) CreateFromInvoice(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	var req createCreditNoteFromInvoiceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.InvoiceID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "invoice_id is required")
 		return
 	}
-
 	invoiceID, err := uuid.Parse(req.InvoiceID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid invoice_id")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	var itemIDs []uuid.UUID
 	for _, idStr := range req.Items {
@@ -440,7 +429,6 @@ func (h *CreditNoteHandler) CreateFromInvoice(w http.ResponseWriter, r *http.Req
 		}
 		itemIDs = append(itemIDs, id)
 	}
-
 	svcReq := &service.CreateCreditNoteFromInvoiceRequest{
 		Items:  itemIDs,
 		Reason: req.Reason,
@@ -453,7 +441,6 @@ func (h *CreditNoteHandler) CreateFromInvoice(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditNoteResponse(creditNote)
 	location := fmt.Sprintf("/credit-notes/%s", creditNote.CreditNoteID)
 	w.Header().Set("Location", location)
@@ -470,41 +457,35 @@ func (h *CreditNoteHandler) CreateFromReturn(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	var req createCreditNoteFromReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.ReturnID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "return_id is required")
 		return
 	}
-
 	returnID, err := uuid.Parse(req.ReturnID)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid return_id")
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.CreateCreditNoteFromReturnRequest{
 		Reason: req.Reason,
@@ -517,7 +498,6 @@ func (h *CreditNoteHandler) CreateFromReturn(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditNoteResponse(creditNote)
 	location := fmt.Sprintf("/credit-notes/%s", creditNote.CreditNoteID)
 	w.Header().Set("Location", location)
@@ -527,6 +507,10 @@ func (h *CreditNoteHandler) CreateFromReturn(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// ---------------------------------------------------------------------
+// Update & Delete (idempotent)
+// ---------------------------------------------------------------------
+
 func (h *CreditNoteHandler) UpdateCreditNote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	creditNoteID, err := parseUUIDParamCreditNote(r, "id")
@@ -534,42 +518,36 @@ func (h *CreditNoteHandler) UpdateCreditNote(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	var req updateCreditNoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := &service.UpdateCreditNoteRequest{
 		Reason: req.Reason,
 		Notes:  req.Notes,
 	}
-
 	creditNote, err := h.creditNoteService.UpdateCreditNote(ctx, companyID, creditNoteID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update credit note", zap.Error(err))
@@ -577,7 +555,6 @@ func (h *CreditNoteHandler) UpdateCreditNote(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditNoteResponse(creditNote)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -592,30 +569,26 @@ func (h *CreditNoteHandler) DeleteCreditNote(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.DeleteCreditNote(ctx, companyID, creditNoteID, userID)
 	if err != nil {
@@ -624,12 +597,15 @@ func (h *CreditNoteHandler) DeleteCreditNote(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "credit note deleted successfully",
 	})
 }
+
+// ---------------------------------------------------------------------
+// Read handlers (no idempotency needed)
+// ---------------------------------------------------------------------
 
 func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -638,13 +614,11 @@ func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
-
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -654,7 +628,6 @@ func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	creditNote, err := h.creditNoteService.GetCreditNoteByID(ctx, companyID, creditNoteID)
 	if err != nil {
 		h.logger.Error("failed to get credit note", zap.Error(err))
@@ -662,7 +635,6 @@ func (h *CreditNoteHandler) GetCreditNoteByID(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditNoteResponse(creditNote)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -677,13 +649,11 @@ func (h *CreditNoteHandler) GetCreditNoteByNumber(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	creditNoteNumber := r.URL.Query().Get("number")
 	if creditNoteNumber == "" {
 		h.respondWithError(w, http.StatusBadRequest, "number query parameter is required")
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -693,7 +663,6 @@ func (h *CreditNoteHandler) GetCreditNoteByNumber(w http.ResponseWriter, r *http
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	creditNote, err := h.creditNoteService.GetCreditNoteByNumber(ctx, companyID, creditNoteNumber)
 	if err != nil {
 		h.logger.Error("failed to get credit note by number", zap.Error(err))
@@ -701,7 +670,6 @@ func (h *CreditNoteHandler) GetCreditNoteByNumber(w http.ResponseWriter, r *http
 		h.respondWithError(w, status, msg)
 		return
 	}
-
 	resp := h.toCreditNoteResponse(creditNote)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -716,7 +684,6 @@ func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -726,7 +693,6 @@ func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-
 	filter := service.CreditNoteListFilter{
 		CompanyID: companyID,
 	}
@@ -752,7 +718,18 @@ func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Reque
 			filter.ToDate = &t
 		}
 	}
-
+	if invIDStr := r.URL.Query().Get("invoice_id"); invIDStr != "" {
+		id, err := uuid.Parse(invIDStr)
+		if err == nil {
+			filter.InvoiceID = &id
+		}
+	}
+	if retIDStr := r.URL.Query().Get("return_id"); retIDStr != "" {
+		id, err := uuid.Parse(retIDStr)
+		if err == nil {
+			filter.ReturnID = &id
+		}
+	}
 	limit := 20
 	if lStr := r.URL.Query().Get("limit"); lStr != "" {
 		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
@@ -776,14 +753,12 @@ func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Reque
 	if sort.Direction == "" {
 		sort.Direction = "DESC"
 	}
-
 	creditNotes, total, err := h.creditNoteService.ListCreditNotes(ctx, filter, pagination, sort)
 	if err != nil {
 		h.logger.Error("failed to list credit notes", zap.Error(err))
 		h.respondWithError(w, http.StatusInternalServerError, "failed to list credit notes")
 		return
 	}
-
 	summaries := make([]creditNoteSummary, len(creditNotes))
 	for i, cn := range creditNotes {
 		summaries[i] = creditNoteSummary{
@@ -793,7 +768,7 @@ func (h *CreditNoteHandler) ListCreditNotes(w http.ResponseWriter, r *http.Reque
 			Status:           string(cn.Status),
 			IssueDate:        cn.IssueDate.Format(time.RFC3339),
 			TotalAmount:      cn.TotalAmount.String(),
-			RemainingAmount:  cn.RemainingAmount.String(),
+			RemainingAmount:  cn.TotalAmount.Sub(cn.AmountApplied).String(),
 		}
 	}
 	resp := listCreditNotesResponse{
@@ -856,7 +831,7 @@ func (h *CreditNoteHandler) SearchCreditNotes(w http.ResponseWriter, r *http.Req
 			Status:           string(cn.Status),
 			IssueDate:        cn.IssueDate.Format(time.RFC3339),
 			TotalAmount:      cn.TotalAmount.String(),
-			RemainingAmount:  cn.RemainingAmount.String(),
+			RemainingAmount:  cn.TotalAmount.Sub(cn.AmountApplied).String(),
 		}
 	}
 	resp := listCreditNotesResponse{
@@ -870,6 +845,10 @@ func (h *CreditNoteHandler) SearchCreditNotes(w http.ResponseWriter, r *http.Req
 		"data":    resp,
 	})
 }
+
+// ---------------------------------------------------------------------
+// Item management (idempotent)
+// ---------------------------------------------------------------------
 
 func (h *CreditNoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -892,7 +871,9 @@ func (h *CreditNoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	var req addCreditNoteItemsRequest
+	var req struct {
+		Items []createCreditNoteItemRequest `json:"items"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -939,7 +920,7 @@ func (h *CreditNoteHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.AddItems(ctx, companyID, creditNoteID, items, userID)
 	if err != nil {
@@ -975,7 +956,9 @@ func (h *CreditNoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	var req replaceCreditNoteItemsRequest
+	var req struct {
+		Items []createCreditNoteItemRequest `json:"items"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -1018,7 +1001,7 @@ func (h *CreditNoteHandler) ReplaceItems(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.ReplaceItems(ctx, companyID, creditNoteID, items, userID)
 	if err != nil {
@@ -1064,7 +1047,7 @@ func (h *CreditNoteHandler) RemoveItem(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.RemoveItem(ctx, companyID, creditNoteID, itemID, userID)
 	if err != nil {
@@ -1117,6 +1100,10 @@ func (h *CreditNoteHandler) GetCreditNoteItems(w http.ResponseWriter, r *http.Re
 	})
 }
 
+// ---------------------------------------------------------------------
+// Totals & calculations
+// ---------------------------------------------------------------------
+
 func (h *CreditNoteHandler) CalculateTotals(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	creditNoteID, err := parseUUIDParamCreditNote(r, "id")
@@ -1143,7 +1130,7 @@ func (h *CreditNoteHandler) CalculateTotals(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.CalculateTotals(ctx, companyID, creditNoteID)
 	if err != nil {
@@ -1183,7 +1170,6 @@ func (h *CreditNoteHandler) PreviewTotals(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	// Override company ID from header
 	req.CompanyID = companyID
 	result, err := h.creditNoteService.PreviewTotals(ctx, &req)
 	if err != nil {
@@ -1238,6 +1224,10 @@ func (h *CreditNoteHandler) GetCreditNoteTotals(w http.ResponseWriter, r *http.R
 	})
 }
 
+// ---------------------------------------------------------------------
+// Status transitions (idempotent)
+// ---------------------------------------------------------------------
+
 func (h *CreditNoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	creditNoteID, err := parseUUIDParamCreditNote(r, "id")
@@ -1259,7 +1249,9 @@ func (h *CreditNoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	var req creditNoteUpdateStatusRequest
+	var req struct {
+		Status string `json:"status"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -1274,7 +1266,7 @@ func (h *CreditNoteHandler) UpdateStatus(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.UpdateStatus(ctx, companyID, creditNoteID, status, userID)
 	if err != nil {
@@ -1315,7 +1307,7 @@ func (h *CreditNoteHandler) IssueCreditNote(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.IssueCreditNote(ctx, companyID, creditNoteID, userID)
 	if err != nil {
@@ -1361,7 +1353,7 @@ func (h *CreditNoteHandler) VoidCreditNote(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.VoidCreditNote(ctx, companyID, creditNoteID, req.Reason, userID)
 	if err != nil {
@@ -1402,7 +1394,7 @@ func (h *CreditNoteHandler) MarkFullyApplied(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.MarkFullyApplied(ctx, companyID, creditNoteID, userID)
 	if err != nil {
@@ -1417,62 +1409,92 @@ func (h *CreditNoteHandler) MarkFullyApplied(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// ---------------------------------------------------------------------
+// Application handlers (idempotent)
+// ---------------------------------------------------------------------
+
 func (h *CreditNoteHandler) ApplyToInvoice(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	logger := h.logger.With(zap.String("handler", "ApplyToInvoice"))
+
 	creditNoteID, err := parseUUIDParamCreditNote(r, "id")
 	if err != nil {
+		logger.Error("invalid credit note ID", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid credit note ID")
 		return
 	}
+	logger = logger.With(zap.String("credit_note_id", creditNoteID.String()))
+
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
+		logger.Error("no user ID in context", zap.Error(err))
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	logger = logger.With(zap.String("user_id", userID.String()))
+
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
+		logger.Error("failed to get company ID from header", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	logger = logger.With(zap.String("company_id", companyID.String()))
+
 	if !h.hasPermission(ctx, companyID, userID, "credit_note:write") {
+		logger.Warn("permission denied")
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
+
 	var req applyToInvoiceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Error("invalid request body", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	logger.Info("request decoded", zap.String("invoice_id", req.InvoiceID), zap.String("amount", req.Amount))
+
 	invoiceID, err := uuid.Parse(req.InvoiceID)
 	if err != nil {
+		logger.Error("invalid invoice_id format", zap.String("invoice_id", req.InvoiceID), zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid invoice_id")
 		return
 	}
+	logger = logger.With(zap.String("invoice_id", invoiceID.String()))
+
 	amount, err := decimal.NewFromString(req.Amount)
 	if err != nil || amount.LessThanOrEqual(decimal.Zero) {
+		logger.Error("invalid amount", zap.String("amount_str", req.Amount), zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
+	logger.Info("parsed amount", zap.String("amount", amount.String()))
+
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
+		logger.Error("missing Idempotency-Key header")
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	logger = logger.With(zap.String("idempotency_key", idempotencyKey))
+	ctx = h.injectIdempotencyKey(ctx, r)
 
+	logger.Info("calling service ApplyToInvoice")
 	err = h.creditNoteService.ApplyToInvoice(ctx, companyID, creditNoteID, invoiceID, amount, userID)
 	if err != nil {
-		h.logger.Error("failed to apply credit note to invoice", zap.Error(err))
+		logger.Error("failed to apply credit note to invoice", zap.Error(err))
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, msg)
 		return
 	}
+
+	logger.Info("successfully applied credit note to invoice")
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "credit note applied to invoice",
 	})
 }
-
 func (h *CreditNoteHandler) ApplyToInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	creditNoteID, err := parseUUIDParamCreditNote(r, "id")
@@ -1525,7 +1547,7 @@ func (h *CreditNoteHandler) ApplyToInvoices(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.ApplyToInvoices(ctx, companyID, creditNoteID, apps, userID)
 	if err != nil {
@@ -1566,7 +1588,7 @@ func (h *CreditNoteHandler) AutoApplyToOutstandingInvoices(w http.ResponseWriter
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.AutoApplyToOutstandingInvoices(ctx, companyID, creditNoteID, userID)
 	if err != nil {
@@ -1612,7 +1634,7 @@ func (h *CreditNoteHandler) RemoveApplication(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.creditNoteService.RemoveApplication(ctx, companyID, creditNoteID, appID, userID)
 	if err != nil {
@@ -1664,6 +1686,10 @@ func (h *CreditNoteHandler) GetApplications(w http.ResponseWriter, r *http.Reque
 		"data":    resp,
 	})
 }
+
+// ---------------------------------------------------------------------
+// Balance & analytics
+// ---------------------------------------------------------------------
 
 func (h *CreditNoteHandler) GetRemainingBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -1804,7 +1830,7 @@ func (h *CreditNoteHandler) GetUnusedCreditNotes(w http.ResponseWriter, r *http.
 			Status:           string(cn.Status),
 			IssueDate:        cn.IssueDate.Format(time.RFC3339),
 			TotalAmount:      cn.TotalAmount.String(),
-			RemainingAmount:  cn.RemainingAmount.String(),
+			RemainingAmount:  cn.TotalAmount.Sub(cn.AmountApplied).String(),
 		}
 	}
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -1852,17 +1878,17 @@ func (h *CreditNoteHandler) ConvertToRefund(w http.ResponseWriter, r *http.Reque
 		h.respondWithError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
-	svcReq := &service.ConvertCreditNoteToRefundRequest{
-		PaymentID: paymentID,
-		Reason:    req.Reason,
-	}
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
-	_ = idempotencyKey
+	ctx = h.injectIdempotencyKey(ctx, r)
 
+	svcReq := &service.ConvertCreditNoteToRefundRequest{
+		PaymentID: paymentID,
+		Reason:    req.Reason,
+	}
 	refund, err := h.creditNoteService.ConvertToRefund(ctx, companyID, creditNoteID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to convert to refund", zap.Error(err))

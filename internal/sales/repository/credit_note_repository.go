@@ -177,6 +177,7 @@ func (r *creditNoteRepository) buildFilter(filter CreditNoteFilter) (string, []i
 }
 
 // scanCreditNote maps a database row to models.CreditNote
+// scanCreditNote maps a database row to models.CreditNote
 func (r *creditNoteRepository) scanCreditNote(s scanner) (*models.CreditNote, error) {
 	var cn models.CreditNote
 	var createdBy, updatedBy uuid.NullUUID
@@ -233,8 +234,9 @@ func (r *creditNoteRepository) scanCreditNote(s scanner) (*models.CreditNote, er
 		cn.UpdatedBy = &updatedBy.UUID
 	}
 
-	// RemainingAmount is computed, we can leave it as zero (or compute from TotalAmount - AmountApplied)
-	cn.RemainingAmount = cn.TotalAmount.Sub(cn.AmountApplied)
+	// ✅ FIX: RemainingAmount = TotalAmount + AmountApplied (both negative? TotalAmount negative, AmountApplied positive)
+	// e.g., -550 + 100 = -450 (still negative, represents remaining credit)
+	cn.RemainingAmount = cn.TotalAmount.Add(cn.AmountApplied)
 	return &cn, nil
 }
 
@@ -601,11 +603,42 @@ func (r *creditNoteRepository) Void(ctx context.Context, db DBTX, companyID, cre
 }
 
 func (r *creditNoteRepository) UpdateAppliedAmount(ctx context.Context, db DBTX, companyID, creditNoteID uuid.UUID, appliedAmount decimal.Decimal, updatedBy *uuid.UUID) error {
+	logger := r.logger.With(
+		zap.String("method", "UpdateAppliedAmount"),
+		zap.String("credit_note_id", creditNoteID.String()),
+		zap.String("applied_amount", appliedAmount.String()),
+	)
+
+	// First get current credit note to log state
+	var currentTotal, currentApplied decimal.Decimal
+	var currentStatus string
+	checkQuery := `SELECT total_amount, amount_applied, status FROM sales.credit_notes WHERE credit_note_id = $1`
+	err := db.QueryRowContext(ctx, checkQuery, creditNoteID).Scan(&currentTotal, &currentApplied, &currentStatus)
+	if err != nil {
+		logger.Error("failed to fetch current credit note state", zap.Error(err))
+		return fmt.Errorf("fetch current state: %w", err)
+	}
+	logger.Info("current credit note state",
+		zap.String("total_amount", currentTotal.String()),
+		zap.String("amount_applied", currentApplied.String()),
+		zap.String("status", currentStatus),
+	)
+
+	// Correct condition: appliedAmount + currentApplied must not exceed the absolute value of total_amount
+	absTotal := currentTotal.Abs()
+	if appliedAmount.Add(currentApplied).GreaterThan(absTotal) {
+		logger.Error("applied amount would exceed remaining balance",
+			zap.String("abs_total", absTotal.String()),
+			zap.String("new_total_applied", appliedAmount.Add(currentApplied).String()),
+		)
+		return errors.ErrInvalidStatus
+	}
+
 	query := `
 		UPDATE sales.credit_notes
 		SET amount_applied = amount_applied + $3,
 			status = CASE 
-				WHEN amount_applied + $3 >= total_amount THEN 'fully_used'
+				WHEN amount_applied + $3 >= -total_amount THEN 'fully_used'
 				WHEN amount_applied + $3 > 0 THEN 'partially_used'
 				ELSE status
 			END,
@@ -613,16 +646,23 @@ func (r *creditNoteRepository) UpdateAppliedAmount(ctx context.Context, db DBTX,
 			updated_by = $4
 		WHERE company_id = $1 AND credit_note_id = $2
 		AND status IN ('issued', 'partially_used')
-		AND amount_applied + $3 <= total_amount
+		AND amount_applied + $3 <= -total_amount
 	`
 	result, err := db.ExecContext(ctx, query, companyID, creditNoteID, appliedAmount, r.nullUUIDParam(updatedBy))
 	if err != nil {
+		logger.Error("update applied amount query failed", zap.Error(err))
 		return fmt.Errorf("update applied amount: %w", err)
 	}
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
+		logger.Error("no rows updated – condition failed",
+			zap.String("total_amount", currentTotal.String()),
+			zap.String("amount_applied", currentApplied.String()),
+			zap.String("appliedAmount", appliedAmount.String()),
+		)
 		return errors.ErrInvalidStatus
 	}
+	logger.Info("successfully updated applied amount", zap.Int64("rows_affected", rows))
 	return nil
 }
 
@@ -832,13 +872,17 @@ func (r *creditNoteRepository) GetUnusedByCustomer(ctx context.Context, db DBTX,
 // Aggregates
 // -------------------------------------------------------------------------
 
+// GetTotalCreditIssued returns the total credit amount issued in the given date range.
+// Since total_amount is stored as negative, we return the absolute value (SUM(-total_amount)).
 func (r *creditNoteRepository) GetTotalCreditIssued(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
 	var conds []string
 	var args []interface{}
 	idx := 1
+
 	conds = append(conds, fmt.Sprintf("company_id = $%d", idx))
 	args = append(args, companyID)
 	idx++
+
 	if from != nil {
 		conds = append(conds, fmt.Sprintf("issue_date >= $%d", idx))
 		args = append(args, *from)
@@ -849,9 +893,13 @@ func (r *creditNoteRepository) GetTotalCreditIssued(ctx context.Context, db DBTX
 		args = append(args, *to)
 		idx++
 	}
+	// Only include credit notes that have been issued (draft notes are not yet issued)
 	conds = append(conds, "status IN ('issued', 'partially_used', 'fully_used')")
+
 	where := "WHERE " + strings.Join(conds, " AND ")
-	query := fmt.Sprintf("SELECT COALESCE(SUM(total_amount), 0) FROM sales.credit_notes %s", where)
+	// FIX: Use SUM(-total_amount) to get positive total issued amount
+	query := fmt.Sprintf("SELECT COALESCE(SUM(-total_amount), 0) FROM sales.credit_notes %s", where)
+
 	var total decimal.Decimal
 	err := db.QueryRowContext(ctx, query, args...).Scan(&total)
 	if err != nil {
@@ -859,7 +907,6 @@ func (r *creditNoteRepository) GetTotalCreditIssued(ctx context.Context, db DBTX
 	}
 	return total, nil
 }
-
 func (r *creditNoteRepository) GetTotalCreditApplied(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
 	var conds []string
 	var args []interface{}
@@ -889,8 +936,9 @@ func (r *creditNoteRepository) GetTotalCreditApplied(ctx context.Context, db DBT
 }
 
 func (r *creditNoteRepository) GetOutstandingCredits(ctx context.Context, db DBTX, companyID uuid.UUID) (decimal.Decimal, error) {
+	// ✅ FIX: SUM(-total_amount - amount_applied) gives positive outstanding credit
 	query := `
-		SELECT COALESCE(SUM(total_amount - amount_applied), 0)
+		SELECT COALESCE(SUM(-total_amount - amount_applied), 0)
 		FROM sales.credit_notes
 		WHERE company_id = $1 AND status IN ('issued', 'partially_used')
 	`

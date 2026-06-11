@@ -614,41 +614,13 @@ type CreditReviewResult struct {
 	Reason              string          `json:"reason"`
 }
 
-type CreateCreditNoteRequest struct {
-	CompanyID      uuid.UUID
-	CustomerID     uuid.UUID
-	CreditNoteDate time.Time
-	Currency       *string
-	Items          []*CreateCreditNoteItemRequest
-	Reason         *string
-	Notes          *string
-	CreatedBy      *uuid.UUID
-}
-
 type CreateCreditNoteItemRequest struct {
-	ProductID     uuid.UUID
-	Quantity      decimal.Decimal
-	UnitPrice     decimal.Decimal
-	TaxRate       *decimal.Decimal
-	InvoiceItemID *uuid.UUID
+	ProductID     uuid.UUID        `json:"product_id"`
+	Quantity      decimal.Decimal  `json:"quantity"`
+	UnitPrice     decimal.Decimal  `json:"unit_price"`
+	TaxRate       *decimal.Decimal `json:"tax_rate,omitempty"`
+	InvoiceItemID *uuid.UUID       `json:"invoice_item_id,omitempty"`
 }
-
-type CreateCreditNoteFromInvoiceRequest struct {
-	Items  []uuid.UUID // invoice item IDs to credit (nil = full invoice)
-	Reason *string
-	Notes  *string
-}
-
-type CreateCreditNoteFromReturnRequest struct {
-	Reason *string
-	Notes  *string
-}
-
-type UpdateCreditNoteRequest struct {
-	Reason *string
-	Notes  *string
-}
-
 type CreditNoteListFilter struct {
 	CompanyID  uuid.UUID
 	CustomerID *uuid.UUID
@@ -660,11 +632,10 @@ type CreditNoteListFilter struct {
 }
 
 type CreditNotePreviewRequest struct {
-	CompanyID  uuid.UUID
-	CustomerID uuid.UUID
-	Items      []*CreateCreditNoteItemRequest
+	CompanyID  uuid.UUID                      `json:"company_id"`
+	CustomerID uuid.UUID                      `json:"customer_id"`
+	Items      []*CreateCreditNoteItemRequest `json:"items"`
 }
-
 type CreditNotePreviewResult struct {
 	Subtotal    decimal.Decimal
 	TaxTotal    decimal.Decimal
@@ -674,11 +645,6 @@ type CreditNotePreviewResult struct {
 type CreditNoteApplicationRequest struct {
 	InvoiceID uuid.UUID
 	Amount    decimal.Decimal
-}
-
-type ConvertCreditNoteToRefundRequest struct {
-	PaymentID uuid.UUID // original payment to refund against
-	Reason    string
 }
 
 type CreatePaymentRequest struct {

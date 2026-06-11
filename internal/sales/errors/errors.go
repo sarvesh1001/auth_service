@@ -36,9 +36,10 @@ var (
 	ErrPromotionInactive = errors.New("sales: promotion inactive")
 
 	// Quantity / Amount
-	ErrInvalidQuantity = errors.New("sales: invalid quantity")
-	ErrInvalidAmount   = errors.New("sales: invalid amount")
-	ErrInvalidState    = errors.New("sales: invalid state transition")
+	ErrInvalidQuantity        = errors.New("sales: invalid quantity")
+	ErrInvalidAmount          = errors.New("sales: invalid amount")
+	ErrInvalidState           = errors.New("sales: invalid state transition")
+	ErrInvalidStateTransition = errors.New("sales: invalid state transition")
 
 	// Payment Terms
 	ErrPaymentTermInactive   = errors.New("sales: payment term is inactive")
