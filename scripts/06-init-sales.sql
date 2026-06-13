@@ -2102,3 +2102,22 @@ CREATE TABLE IF NOT EXISTS sales_analytics.commission_plan_unique_reps (
 
 ALTER TABLE sales.coupons ADD COLUMN deleted_at TIMESTAMPTZ;
 CREATE INDEX idx_coupons_deleted_at ON sales.coupons(deleted_at) WHERE deleted_at IS NOT NULL;
+
+ALTER TABLE sales.customers 
+ADD COLUMN sales_rep_id UUID NULL;
+
+ALTER TABLE sales.customers 
+ADD CONSTRAINT fk_customers_sales_rep 
+FOREIGN KEY (sales_rep_id) REFERENCES sales.sales_reps(sales_rep_id) ON DELETE SET NULL;
+
+CREATE INDEX idx_customers_sales_rep ON sales.customers(sales_rep_id);
+
+ALTER TABLE sales.promotions ADD COLUMN stacking_type VARCHAR(20) NOT NULL DEFAULT 'stackable';
+ALTER TABLE sales.promotions ADD CONSTRAINT chk_stacking_type CHECK (stacking_type IN ('stackable', 'exclusive', 'none'));
+
+-- If coupons also support stacking_type:
+ALTER TABLE sales.coupons ADD COLUMN stacking_type VARCHAR(20) NOT NULL DEFAULT 'stackable';
+ALTER TABLE sales.coupons ADD CONSTRAINT chk_coupon_stacking_type CHECK (stacking_type IN ('stackable', 'exclusive', 'none'));
+
+
+ALTER TABLE sales.coupon_usages ADD CONSTRAINT uniq_coupon_order UNIQUE (coupon_id, order_id);

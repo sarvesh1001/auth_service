@@ -29,38 +29,40 @@ func NewPromotionHandler(promotionService service.PromotionService, logger *zap.
 	}
 }
 
-// ---------- Request/Response Types (CompanyID removed where present) ----------
+// ---------- Request/Response Types ----------
 
 type createPromotionRequest struct {
-	Name        string  `json:"name"`
-	Description *string `json:"description,omitempty"`
-	StartDate   string  `json:"start_date"`
-	EndDate     string  `json:"end_date"`
-	IsActive    bool    `json:"is_active"`
-	Priority    *int    `json:"priority,omitempty"`
-	// Rules are created separately via CreatePromotionRule endpoint
+	Name         string  `json:"name"`
+	Description  *string `json:"description,omitempty"`
+	StartDate    string  `json:"start_date"`
+	EndDate      string  `json:"end_date"`
+	IsActive     bool    `json:"is_active"`
+	Priority     *int    `json:"priority,omitempty"`
+	StackingType string  `json:"stacking_type,omitempty"` // NEW
 }
 
 type createPromotionResponse struct {
-	PromotionID string  `json:"promotion_id"`
-	CompanyID   string  `json:"company_id"`
-	Name        string  `json:"name"`
-	Description *string `json:"description,omitempty"`
-	StartDate   string  `json:"start_date"`
-	EndDate     string  `json:"end_date"`
-	IsActive    bool    `json:"is_active"`
-	Priority    *int    `json:"priority,omitempty"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
+	PromotionID  string  `json:"promotion_id"`
+	CompanyID    string  `json:"company_id"`
+	Name         string  `json:"name"`
+	Description  *string `json:"description,omitempty"`
+	StartDate    string  `json:"start_date"`
+	EndDate      string  `json:"end_date"`
+	IsActive     bool    `json:"is_active"`
+	Priority     *int    `json:"priority,omitempty"`
+	StackingType string  `json:"stacking_type,omitempty"` // NEW
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
 }
 
 type updatePromotionRequest struct {
-	Name        *string `json:"name,omitempty"`
-	Description *string `json:"description,omitempty"`
-	StartDate   *string `json:"start_date,omitempty"`
-	EndDate     *string `json:"end_date,omitempty"`
-	IsActive    *bool   `json:"is_active,omitempty"`
-	Priority    *int    `json:"priority,omitempty"`
+	Name         *string `json:"name,omitempty"`
+	Description  *string `json:"description,omitempty"`
+	StartDate    *string `json:"start_date,omitempty"`
+	EndDate      *string `json:"end_date,omitempty"`
+	IsActive     *bool   `json:"is_active,omitempty"`
+	Priority     *int    `json:"priority,omitempty"`
+	StackingType *string `json:"stacking_type,omitempty"` // NEW
 }
 
 type createPromotionRuleRequest struct {
@@ -88,12 +90,13 @@ type listPromotionsResponse struct {
 }
 
 type promotionSummary struct {
-	PromotionID string `json:"promotion_id"`
-	Name        string `json:"name"`
-	StartDate   string `json:"start_date"`
-	EndDate     string `json:"end_date"`
-	IsActive    bool   `json:"is_active"`
-	Priority    *int   `json:"priority,omitempty"`
+	PromotionID  string `json:"promotion_id"`
+	Name         string `json:"name"`
+	StartDate    string `json:"start_date"`
+	EndDate      string `json:"end_date"`
+	IsActive     bool   `json:"is_active"`
+	Priority     *int   `json:"priority,omitempty"`
+	StackingType string `json:"stacking_type,omitempty"` // NEW
 }
 
 type evaluatePromotionRequest struct {
@@ -170,6 +173,13 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Validate stacking_type
+	allowedStacking := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+	if req.StackingType != "" && !allowedStacking[req.StackingType] {
+		h.respondWithError(w, http.StatusBadRequest, "stacking_type must be 'stackable', 'exclusive', or 'none'")
+		return
+	}
+
 	if !h.hasPermission(ctx, companyID, userID, "promotion:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -182,14 +192,15 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 	}
 
 	svcReq := service.CreatePromotionRequest{
-		CompanyID:   companyID,
-		Name:        req.Name,
-		Description: req.Description,
-		StartDate:   startDate,
-		EndDate:     endDate,
-		IsActive:    req.IsActive,
-		Priority:    req.Priority,
-		CreatedBy:   &userID,
+		CompanyID:    companyID,
+		Name:         req.Name,
+		Description:  req.Description,
+		StartDate:    startDate,
+		EndDate:      endDate,
+		IsActive:     req.IsActive,
+		Priority:     req.Priority,
+		StackingType: req.StackingType, // NEW
+		CreatedBy:    &userID,
 	}
 
 	promotion, err := h.promotionService.CreatePromotion(ctx, &svcReq)
@@ -200,19 +211,7 @@ func (h *PromotionHandler) CreatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	resp := createPromotionResponse{
-		PromotionID: promotion.PromotionID.String(),
-		CompanyID:   promotion.CompanyID.String(),
-		Name:        promotion.Name,
-		Description: promotion.Description,
-		StartDate:   promotion.StartDate.Format(time.RFC3339),
-		EndDate:     promotion.EndDate.Format(time.RFC3339),
-		IsActive:    promotion.IsActive,
-		Priority:    promotion.Priority,
-		CreatedAt:   promotion.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:   promotion.UpdatedAt.Format(time.RFC3339),
-	}
-
+	resp := h.promotionToResponse(promotion)
 	location := fmt.Sprintf("/promotions/%s", promotion.PromotionID)
 	w.Header().Set("Location", location)
 	h.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
@@ -283,6 +282,15 @@ func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Reques
 		}
 		svcReq.EndDate = &end
 	}
+	// NEW: handle stacking_type update
+	if req.StackingType != nil {
+		allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+		if !allowed[*req.StackingType] {
+			h.respondWithError(w, http.StatusBadRequest, "stacking_type must be 'stackable', 'exclusive', or 'none'")
+			return
+		}
+		svcReq.StackingType = req.StackingType
+	}
 
 	promotion, err := h.promotionService.UpdatePromotion(ctx, companyID, promotionID, &svcReq)
 	if err != nil {
@@ -292,19 +300,7 @@ func (h *PromotionHandler) UpdatePromotion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	resp := createPromotionResponse{
-		PromotionID: promotion.PromotionID.String(),
-		CompanyID:   promotion.CompanyID.String(),
-		Name:        promotion.Name,
-		Description: promotion.Description,
-		StartDate:   promotion.StartDate.Format(time.RFC3339),
-		EndDate:     promotion.EndDate.Format(time.RFC3339),
-		IsActive:    promotion.IsActive,
-		Priority:    promotion.Priority,
-		CreatedAt:   promotion.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:   promotion.UpdatedAt.Format(time.RFC3339),
-	}
-
+	resp := h.promotionToResponse(promotion)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
@@ -392,19 +388,7 @@ func (h *PromotionHandler) GetPromotionByID(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	resp := createPromotionResponse{
-		PromotionID: promotion.PromotionID.String(),
-		CompanyID:   promotion.CompanyID.String(),
-		Name:        promotion.Name,
-		Description: promotion.Description,
-		StartDate:   promotion.StartDate.Format(time.RFC3339),
-		EndDate:     promotion.EndDate.Format(time.RFC3339),
-		IsActive:    promotion.IsActive,
-		Priority:    promotion.Priority,
-		CreatedAt:   promotion.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:   promotion.UpdatedAt.Format(time.RFC3339),
-	}
-
+	resp := h.promotionToResponse(promotion)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
@@ -445,19 +429,7 @@ func (h *PromotionHandler) GetPromotionByCode(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	resp := createPromotionResponse{
-		PromotionID: promotion.PromotionID.String(),
-		CompanyID:   promotion.CompanyID.String(),
-		Name:        promotion.Name,
-		Description: promotion.Description,
-		StartDate:   promotion.StartDate.Format(time.RFC3339),
-		EndDate:     promotion.EndDate.Format(time.RFC3339),
-		IsActive:    promotion.IsActive,
-		Priority:    promotion.Priority,
-		CreatedAt:   promotion.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:   promotion.UpdatedAt.Format(time.RFC3339),
-	}
-
+	resp := h.promotionToResponse(promotion)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
@@ -498,19 +470,7 @@ func (h *PromotionHandler) GetPromotionByName(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	resp := createPromotionResponse{
-		PromotionID: promotion.PromotionID.String(),
-		CompanyID:   promotion.CompanyID.String(),
-		Name:        promotion.Name,
-		Description: promotion.Description,
-		StartDate:   promotion.StartDate.Format(time.RFC3339),
-		EndDate:     promotion.EndDate.Format(time.RFC3339),
-		IsActive:    promotion.IsActive,
-		Priority:    promotion.Priority,
-		CreatedAt:   promotion.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:   promotion.UpdatedAt.Format(time.RFC3339),
-	}
-
+	resp := h.promotionToResponse(promotion)
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"data":    resp,
@@ -585,12 +545,13 @@ func (h *PromotionHandler) ListPromotions(w http.ResponseWriter, r *http.Request
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID: p.PromotionID.String(),
-			Name:        p.Name,
-			StartDate:   p.StartDate.Format(time.RFC3339),
-			EndDate:     p.EndDate.Format(time.RFC3339),
-			IsActive:    p.IsActive,
-			Priority:    p.Priority,
+			PromotionID:  p.PromotionID.String(),
+			Name:         p.Name,
+			StartDate:    p.StartDate.Format(time.RFC3339),
+			EndDate:      p.EndDate.Format(time.RFC3339),
+			IsActive:     p.IsActive,
+			Priority:     p.Priority,
+			StackingType: p.StackingType, // NEW
 		}
 	}
 
@@ -656,12 +617,13 @@ func (h *PromotionHandler) SearchPromotions(w http.ResponseWriter, r *http.Reque
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID: p.PromotionID.String(),
-			Name:        p.Name,
-			StartDate:   p.StartDate.Format(time.RFC3339),
-			EndDate:     p.EndDate.Format(time.RFC3339),
-			IsActive:    p.IsActive,
-			Priority:    p.Priority,
+			PromotionID:  p.PromotionID.String(),
+			Name:         p.Name,
+			StartDate:    p.StartDate.Format(time.RFC3339),
+			EndDate:      p.EndDate.Format(time.RFC3339),
+			IsActive:     p.IsActive,
+			Priority:     p.Priority,
+			StackingType: p.StackingType, // NEW
 		}
 	}
 
@@ -719,12 +681,13 @@ func (h *PromotionHandler) GetActivePromotions(w http.ResponseWriter, r *http.Re
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID: p.PromotionID.String(),
-			Name:        p.Name,
-			StartDate:   p.StartDate.Format(time.RFC3339),
-			EndDate:     p.EndDate.Format(time.RFC3339),
-			IsActive:    p.IsActive,
-			Priority:    p.Priority,
+			PromotionID:  p.PromotionID.String(),
+			Name:         p.Name,
+			StartDate:    p.StartDate.Format(time.RFC3339),
+			EndDate:      p.EndDate.Format(time.RFC3339),
+			IsActive:     p.IsActive,
+			Priority:     p.Priority,
+			StackingType: p.StackingType, // NEW
 		}
 	}
 
@@ -2216,12 +2179,13 @@ func (h *PromotionHandler) GetTopPromotions(w http.ResponseWriter, r *http.Reque
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID: p.PromotionID.String(),
-			Name:        p.Name,
-			StartDate:   p.StartDate.Format(time.RFC3339),
-			EndDate:     p.EndDate.Format(time.RFC3339),
-			IsActive:    p.IsActive,
-			Priority:    p.Priority,
+			PromotionID:  p.PromotionID.String(),
+			Name:         p.Name,
+			StartDate:    p.StartDate.Format(time.RFC3339),
+			EndDate:      p.EndDate.Format(time.RFC3339),
+			IsActive:     p.IsActive,
+			Priority:     p.Priority,
+			StackingType: p.StackingType,
 		}
 	}
 
@@ -2281,12 +2245,13 @@ func (h *PromotionHandler) GetMostUsedPromotions(w http.ResponseWriter, r *http.
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID: p.PromotionID.String(),
-			Name:        p.Name,
-			StartDate:   p.StartDate.Format(time.RFC3339),
-			EndDate:     p.EndDate.Format(time.RFC3339),
-			IsActive:    p.IsActive,
-			Priority:    p.Priority,
+			PromotionID:  p.PromotionID.String(),
+			Name:         p.Name,
+			StartDate:    p.StartDate.Format(time.RFC3339),
+			EndDate:      p.EndDate.Format(time.RFC3339),
+			IsActive:     p.IsActive,
+			Priority:     p.Priority,
+			StackingType: p.StackingType,
 		}
 	}
 
@@ -2346,12 +2311,13 @@ func (h *PromotionHandler) GetHighestRevenuePromotions(w http.ResponseWriter, r 
 	summaries := make([]promotionSummary, len(promotions))
 	for i, p := range promotions {
 		summaries[i] = promotionSummary{
-			PromotionID: p.PromotionID.String(),
-			Name:        p.Name,
-			StartDate:   p.StartDate.Format(time.RFC3339),
-			EndDate:     p.EndDate.Format(time.RFC3339),
-			IsActive:    p.IsActive,
-			Priority:    p.Priority,
+			PromotionID:  p.PromotionID.String(),
+			Name:         p.Name,
+			StartDate:    p.StartDate.Format(time.RFC3339),
+			EndDate:      p.EndDate.Format(time.RFC3339),
+			IsActive:     p.IsActive,
+			Priority:     p.Priority,
+			StackingType: p.StackingType,
 		}
 	}
 
@@ -2777,4 +2743,22 @@ func (h *PromotionHandler) IsCustomerPromotionUsageLimitReached(w http.ResponseW
 		"success": true,
 		"data":    map[string]interface{}{"usage_limit_reached": reached},
 	})
+}
+
+// ---------- Helper to convert promotion model to response ----------
+func (h *PromotionHandler) promotionToResponse(p *discount.Promotion) createPromotionResponse {
+	resp := createPromotionResponse{
+		PromotionID:  p.PromotionID.String(),
+		CompanyID:    p.CompanyID.String(),
+		Name:         p.Name,
+		Description:  p.Description,
+		StartDate:    p.StartDate.Format(time.RFC3339),
+		EndDate:      p.EndDate.Format(time.RFC3339),
+		IsActive:     p.IsActive,
+		Priority:     p.Priority,
+		StackingType: p.StackingType, // NEW
+		CreatedAt:    p.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:    p.UpdatedAt.Format(time.RFC3339),
+	}
+	return resp
 }

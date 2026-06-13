@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -34,13 +35,23 @@ const (
 	maxCustomerCodeLen = 50
 	maxNameLen         = 255
 	maxEmailLen        = 255
-	maxBillingAddrLen  = 500 // optional, TEXT in DB but good practice
+	maxBillingAddrLen  = 500
 )
 
 var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
 
 func isValidEmail(email string) bool {
 	return emailRegex.MatchString(email)
+}
+
+// injectIdempotencyKey adds the Idempotency-Key header value into the request context.
+// This follows the same pattern used in the payment handler.
+func (h *CustomerHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
 }
 
 // ---------- Request/Response Types ----------
@@ -115,6 +126,7 @@ type customerSummary struct {
 // CreateCustomer handles POST /customers
 func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r) // inject key into context
 
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
@@ -134,7 +146,7 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// ----- VALIDATION BLOCK (fail fast) -----
+	// ----- VALIDATION BLOCK -----
 	if req.CustomerCode == "" {
 		h.respondWithError(w, http.StatusBadRequest, "customer_code is required")
 		return
@@ -143,7 +155,6 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("customer_code must not exceed %d characters", maxCustomerCodeLen))
 		return
 	}
-
 	if req.Name == "" {
 		h.respondWithError(w, http.StatusBadRequest, "name is required")
 		return
@@ -152,7 +163,6 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("name must not exceed %d characters", maxNameLen))
 		return
 	}
-
 	if req.Email != nil && *req.Email != "" {
 		if len(*req.Email) > maxEmailLen {
 			h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("email must not exceed %d characters", maxEmailLen))
@@ -163,7 +173,6 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-
 	if req.BillingAddress != nil && *req.BillingAddress != "" && len(*req.BillingAddress) > maxBillingAddrLen {
 		h.respondWithError(w, http.StatusBadRequest, fmt.Sprintf("billing_address must not exceed %d characters", maxBillingAddrLen))
 		return
@@ -199,12 +208,6 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := service.CreateCustomerRequest{
 		CompanyID:      companyID,
 		CustomerCode:   req.CustomerCode,
@@ -218,7 +221,7 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 		CreatedBy:      &userID,
 	}
 
-	customer, err := h.customerService.CreateCustomer(ctx, svcReq, idempotencyKey)
+	customer, err := h.customerService.CreateCustomer(ctx, svcReq)
 	if err != nil {
 		h.logger.Error("failed to create customer", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -260,6 +263,7 @@ func (h *CustomerHandler) CreateCustomer(w http.ResponseWriter, r *http.Request)
 // UpdateCustomer handles PUT /customers/{id}
 func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -313,12 +317,6 @@ func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request)
 	}
 	// ----- END VALIDATION -----
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := service.UpdateCustomerRequest{
 		Name:           req.Name,
 		Email:          req.Email,
@@ -328,7 +326,7 @@ func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request)
 		UpdatedBy:      &userID,
 	}
 
-	updated, err := h.customerService.UpdateCustomer(ctx, companyID, customerID, svcReq, idempotencyKey)
+	updated, err := h.customerService.UpdateCustomer(ctx, companyID, customerID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update customer", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -368,6 +366,7 @@ func (h *CustomerHandler) UpdateCustomer(w http.ResponseWriter, r *http.Request)
 // DeleteCustomer handles DELETE /customers/{id}
 func (h *CustomerHandler) DeleteCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -392,13 +391,7 @@ func (h *CustomerHandler) DeleteCustomer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.DeleteCustomer(ctx, companyID, customerID, &userID, idempotencyKey)
+	err = h.customerService.DeleteCustomer(ctx, companyID, customerID, &userID)
 	if err != nil {
 		h.logger.Error("failed to delete customer", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -415,6 +408,7 @@ func (h *CustomerHandler) DeleteCustomer(w http.ResponseWriter, r *http.Request)
 // GetCustomerByID handles GET /customers/{id}
 func (h *CustomerHandler) GetCustomerByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key for read operations
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -479,6 +473,7 @@ func (h *CustomerHandler) GetCustomerByID(w http.ResponseWriter, r *http.Request
 // GetCustomerByCode handles GET /customers/by-code
 func (h *CustomerHandler) GetCustomerByCode(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key for read operations
 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
@@ -540,9 +535,10 @@ func (h *CustomerHandler) GetCustomerByCode(w http.ResponseWriter, r *http.Reque
 	})
 }
 
-// ListCustomers handles GET /customers (unchanged)
+// ListCustomers handles GET /customers
 func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key for read operations
 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
@@ -561,7 +557,6 @@ func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Build filter
 	filter := service.CustomerListFilter{
 		CompanyID: companyID,
 	}
@@ -572,7 +567,6 @@ func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Pagination -> limit/offset
 	limit := 20
 	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
 		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
@@ -587,7 +581,6 @@ func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
 	}
 	pagination := service.Pagination{Limit: limit, Offset: offset}
 
-	// Sorting
 	sort := service.Sort{
 		Field:     r.URL.Query().Get("sort_field"),
 		Direction: r.URL.Query().Get("sort_dir"),
@@ -634,9 +627,10 @@ func (h *CustomerHandler) ListCustomers(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// SearchCustomers handles GET /customers/search (unchanged)
+// SearchCustomers handles GET /customers/search
 func (h *CustomerHandler) SearchCustomers(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key for read operations
 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
@@ -709,9 +703,10 @@ func (h *CustomerHandler) SearchCustomers(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// ActivateCustomer handles PATCH /customers/{id}/activate
+// ActivateCustomer handles POST /customers/{id}/activate
 func (h *CustomerHandler) ActivateCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -736,13 +731,7 @@ func (h *CustomerHandler) ActivateCustomer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.ActivateCustomer(ctx, companyID, customerID, &userID, idempotencyKey)
+	err = h.customerService.ActivateCustomer(ctx, companyID, customerID, &userID)
 	if err != nil {
 		h.logger.Error("failed to activate customer", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -756,9 +745,10 @@ func (h *CustomerHandler) ActivateCustomer(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// DeactivateCustomer handles PATCH /customers/{id}/deactivate
+// DeactivateCustomer handles POST /customers/{id}/deactivate
 func (h *CustomerHandler) DeactivateCustomer(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -783,13 +773,7 @@ func (h *CustomerHandler) DeactivateCustomer(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.DeactivateCustomer(ctx, companyID, customerID, &userID, idempotencyKey)
+	err = h.customerService.DeactivateCustomer(ctx, companyID, customerID, &userID)
 	if err != nil {
 		h.logger.Error("failed to deactivate customer", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -803,9 +787,10 @@ func (h *CustomerHandler) DeactivateCustomer(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// UpdateCreditLimit handles PATCH /customers/{id}/credit-limit
+// UpdateCreditLimit handles PUT /customers/{id}/credit-limit
 func (h *CustomerHandler) UpdateCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -849,13 +834,7 @@ func (h *CustomerHandler) UpdateCreditLimit(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.UpdateCreditLimit(ctx, companyID, customerID, newLimit, req.Reason, &userID, idempotencyKey)
+	err = h.customerService.UpdateCreditLimit(ctx, companyID, customerID, newLimit, req.Reason, &userID)
 	if err != nil {
 		h.logger.Error("failed to update credit limit", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -872,6 +851,7 @@ func (h *CustomerHandler) UpdateCreditLimit(w http.ResponseWriter, r *http.Reque
 // GetCreditLimit handles GET /customers/{id}/credit-limit
 func (h *CustomerHandler) GetCreditLimit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -915,6 +895,7 @@ func (h *CustomerHandler) GetCreditLimit(w http.ResponseWriter, r *http.Request)
 // GetOutstandingBalance handles GET /customers/{id}/outstanding-balance
 func (h *CustomerHandler) GetOutstandingBalance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -958,6 +939,7 @@ func (h *CustomerHandler) GetOutstandingBalance(w http.ResponseWriter, r *http.R
 // CanCustomerPurchaseAmount handles GET /customers/{id}/can-purchase
 func (h *CustomerHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1016,6 +998,7 @@ func (h *CustomerHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *ht
 // AssignPaymentTerm handles POST /customers/{id}/payment-term
 func (h *CustomerHandler) AssignPaymentTerm(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1055,13 +1038,7 @@ func (h *CustomerHandler) AssignPaymentTerm(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.AssignPaymentTerm(ctx, companyID, customerID, termID, &userID, idempotencyKey)
+	err = h.customerService.AssignPaymentTerm(ctx, companyID, customerID, termID, &userID)
 	if err != nil {
 		h.logger.Error("failed to assign payment term", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1078,6 +1055,7 @@ func (h *CustomerHandler) AssignPaymentTerm(w http.ResponseWriter, r *http.Reque
 // RemovePaymentTerm handles DELETE /customers/{id}/payment-term
 func (h *CustomerHandler) RemovePaymentTerm(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1102,13 +1080,7 @@ func (h *CustomerHandler) RemovePaymentTerm(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.RemovePaymentTerm(ctx, companyID, customerID, &userID, idempotencyKey)
+	err = h.customerService.RemovePaymentTerm(ctx, companyID, customerID, &userID)
 	if err != nil {
 		h.logger.Error("failed to remove payment term", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1125,6 +1097,7 @@ func (h *CustomerHandler) RemovePaymentTerm(w http.ResponseWriter, r *http.Reque
 // AssignSalesRep handles POST /customers/{id}/sales-rep
 func (h *CustomerHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1164,13 +1137,7 @@ func (h *CustomerHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.AssignSalesRep(ctx, companyID, customerID, salesRepID, &userID, idempotencyKey)
+	err = h.customerService.AssignSalesRep(ctx, companyID, customerID, salesRepID, &userID)
 	if err != nil {
 		h.logger.Error("failed to assign sales rep", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1187,6 +1154,7 @@ func (h *CustomerHandler) AssignSalesRep(w http.ResponseWriter, r *http.Request)
 // RemoveSalesRep handles DELETE /customers/{id}/sales-rep
 func (h *CustomerHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1211,13 +1179,7 @@ func (h *CustomerHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.customerService.RemoveSalesRep(ctx, companyID, customerID, &userID, idempotencyKey)
+	err = h.customerService.RemoveSalesRep(ctx, companyID, customerID, &userID)
 	if err != nil {
 		h.logger.Error("failed to remove sales rep", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1234,6 +1196,7 @@ func (h *CustomerHandler) RemoveSalesRep(w http.ResponseWriter, r *http.Request)
 // GetCustomersWithOutstandingInvoices handles GET /customers/outstanding-invoices
 func (h *CustomerHandler) GetCustomersWithOutstandingInvoices(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
@@ -1283,6 +1246,7 @@ func (h *CustomerHandler) GetCustomersWithOutstandingInvoices(w http.ResponseWri
 // GetTopCustomersByRevenue handles GET /customers/top-revenue
 func (h *CustomerHandler) GetTopCustomersByRevenue(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
@@ -1353,6 +1317,7 @@ func (h *CustomerHandler) GetTopCustomersByRevenue(w http.ResponseWriter, r *htt
 // CustomerExists handles GET /customers/{id}/exists
 func (h *CustomerHandler) CustomerExists(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {
@@ -1394,6 +1359,7 @@ func (h *CustomerHandler) CustomerExists(w http.ResponseWriter, r *http.Request)
 // IsCustomerActive handles GET /customers/{id}/active
 func (h *CustomerHandler) IsCustomerActive(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// No idempotency key
 
 	customerID, err := parseUUIDParam(r, "id")
 	if err != nil {

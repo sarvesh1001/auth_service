@@ -25,44 +25,30 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
-// ---------------------------------------------------------------------
-// Service Interface – no transaction parameters (production‑grade pattern)
-// ---------------------------------------------------------------------
-
 type CustomerService interface {
-	CreateCustomer(ctx context.Context, req CreateCustomerRequest, idempotencyKey string) (*models.Customer, error)
-	UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest, idempotencyKey string) (*models.Customer, error)
-	DeleteCustomer(ctx context.Context, companyID, customerID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	CreateCustomer(ctx context.Context, req CreateCustomerRequest) (*models.Customer, error)
+	UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest) (*models.Customer, error)
+	DeleteCustomer(ctx context.Context, companyID, customerID uuid.UUID, deletedBy *uuid.UUID) error
 	GetCustomerByID(ctx context.Context, companyID, customerID uuid.UUID) (*models.Customer, error)
 	GetCustomerByCode(ctx context.Context, companyID uuid.UUID, code string) (*models.Customer, error)
 	ListCustomers(ctx context.Context, filter CustomerListFilter, p Pagination, s Sort) ([]*models.Customer, int64, error)
 	SearchCustomers(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Customer, int64, error)
-
-	ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-	DeactivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-
-	UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID, idempotencyKey string) error
+	ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error
+	DeactivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error
+	UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID) error
 	GetCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
 	GetOutstandingBalance(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
 	CanCustomerPurchaseAmount(ctx context.Context, companyID, customerID uuid.UUID, amount decimal.Decimal) (bool, error)
-
-	AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-	RemovePaymentTerm(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-
-	AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-	RemoveSalesRep(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-
+	AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID) error
+	RemovePaymentTerm(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error
+	AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID) error
+	RemoveSalesRep(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error
 	GetCustomersWithOutstandingInvoices(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error)
 	GetTopCustomersByRevenue(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Customer, error)
-
 	ValidateCustomer(ctx context.Context, customer *models.Customer) error
 	CustomerExists(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
 	IsCustomerActive(ctx context.Context, companyID, customerID uuid.UUID) (bool, error)
 }
-
-// ---------------------------------------------------------------------
-// Implementation
-// ---------------------------------------------------------------------
 
 type customerService struct {
 	customerRepo      repository.CustomerRepository
@@ -103,9 +89,6 @@ func NewCustomerService(
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Validation helpers
-// ----------------------------------------------------------------------------
 const (
 	maxCustomerCodeLen = 50
 	maxNameLen         = 255
@@ -124,9 +107,14 @@ func hashEmail(email string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// ----------------------------------------------------------------------------
-// Encryption helpers
-// ----------------------------------------------------------------------------
+// Helper to get idempotency key from context (similar to payment service)
+func getIDKey(ctx context.Context) string {
+	if key, ok := ctx.Value("idempotency_key").(string); ok {
+		return key
+	}
+	return ""
+}
+
 func (s *customerService) encryptField(ctx context.Context, plainText *string, fieldName string) (encrypted, dek, keyID *string, err error) {
 	if plainText == nil || *plainText == "" {
 		return nil, nil, nil, nil
@@ -202,9 +190,6 @@ func (s *customerService) decryptCustomer(ctx context.Context, c *models.Custome
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Internal helpers for credit & history
-// ----------------------------------------------------------------------------
 func (s *customerService) getOutstandingBalance(ctx context.Context, db repository.DBTX, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
 	query := `
 		SELECT COALESCE(SUM(amount_due), 0)
@@ -222,7 +207,6 @@ func (s *customerService) getOutstandingBalance(ctx context.Context, db reposito
 
 func (s *customerService) logCreditHistory(ctx context.Context, tx repository.DBTX, companyID, customerID uuid.UUID, actionType string,
 	prevLimit, newLimit *decimal.Decimal, prevOutstanding, newOutstanding *decimal.Decimal, reason *string, approvedBy, createdBy *uuid.UUID) error {
-
 	history := &models.CreditCheckHistory{
 		CreditHistoryID:     uuid.New(),
 		CompanyID:           companyID,
@@ -239,19 +223,28 @@ func (s *customerService) logCreditHistory(ctx context.Context, tx repository.DB
 	return s.creditHistoryRepo.Create(ctx, tx, history)
 }
 
-// ----------------------------------------------------------------------------
-// CRUD – writes start their own transaction
-// ----------------------------------------------------------------------------
-func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomerRequest, idempotencyKey string) (*models.Customer, error) {
-	logger := s.logger.With(zap.String("method", "CreateCustomer"), zap.String("idempotency_key", idempotencyKey))
+func (s *customerService) nullUUID(id *uuid.UUID) interface{} {
+	if id == nil || *id == uuid.Nil {
+		return nil
+	}
+	return *id
+}
 
+// ---------------------------------------------------------------------
+// CREATE
+// ---------------------------------------------------------------------
+func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomerRequest) (*models.Customer, error) {
+	logger := s.logger.With(zap.String("method", "CreateCustomer"))
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
 	if err := s.validateCreateCustomer(req); err != nil {
 		return nil, err
 	}
 	if err := s.validateCustomerInput(req); err != nil {
 		return nil, err
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -259,7 +252,7 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 	defer tx.Rollback()
 
 	var cached *models.Customer
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached customer")
 		return cached, nil
 	}
@@ -271,7 +264,6 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 	if exists {
 		return nil, fmt.Errorf("%w: customer_code %s already exists", salesErrors.ErrDuplicate, req.CustomerCode)
 	}
-
 	if req.Email != nil && *req.Email != "" {
 		emailHash := hashEmail(*req.Email)
 		hashExists, err := s.customerRepo.ExistsByEmailHash(ctx, tx, req.CompanyID, emailHash)
@@ -282,7 +274,6 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 			return nil, fmt.Errorf("%w: email already in use", salesErrors.ErrDuplicate)
 		}
 	}
-
 	if req.PaymentTermID != nil {
 		termExists, err := s.paymentTermRepo.Exists(ctx, tx, req.CompanyID, *req.PaymentTermID)
 		if err != nil {
@@ -332,30 +323,21 @@ func (s *customerService) CreateCustomer(ctx context.Context, req CreateCustomer
 		UpdatedBy:                req.CreatedBy,
 		PaymentTermID:            req.PaymentTermID,
 	}
-
 	if err := s.customerRepo.Create(ctx, tx, customer); err != nil {
 		return nil, fmt.Errorf("create customer: %w", err)
 	}
-
 	if req.CreditLimit != nil && !req.CreditLimit.IsZero() {
-		if err := s.logCreditHistory(ctx, tx, req.CompanyID, customer.CustomerID, "limit_change",
-			nil, req.CreditLimit, nil, nil, nil, nil, req.CreatedBy); err != nil {
-			logger.Warn("failed to log credit history", zap.Error(err))
-		}
+		_ = s.logCreditHistory(ctx, tx, req.CompanyID, customer.CustomerID, "limit_change",
+			nil, req.CreditLimit, nil, nil, nil, nil, req.CreatedBy)
 	}
-
 	if err := s.emitCustomerEvent(ctx, tx, customer, salesEvents.EventCustomerCreated); err != nil {
 		logger.Warn("failed to emit customer created event", zap.Error(err))
 	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, customer)
-
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, customer)
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	_ = s.decryptCustomer(ctx, customer)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "create_customer", "customer",
 			&customer.CustomerID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
@@ -399,13 +381,18 @@ func (s *customerService) validateCustomerInput(req CreateCustomerRequest) error
 	return nil
 }
 
-func (s *customerService) UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest, idempotencyKey string) (*models.Customer, error) {
-	logger := s.logger.With(zap.String("method", "UpdateCustomer"), zap.String("idempotency_key", idempotencyKey))
-
+// ---------------------------------------------------------------------
+// UPDATE
+// ---------------------------------------------------------------------
+func (s *customerService) UpdateCustomer(ctx context.Context, companyID, customerID uuid.UUID, req UpdateCustomerRequest) (*models.Customer, error) {
+	logger := s.logger.With(zap.String("method", "UpdateCustomer"))
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("update-cust-%s-%d", customerID.String(), time.Now().UnixNano())
+	}
 	if companyID == uuid.Nil || customerID == uuid.Nil {
 		return nil, salesErrors.ErrInvalidInput
 	}
-
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -413,7 +400,7 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 	defer tx.Rollback()
 
 	var cached *models.Customer
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached customer")
 		return cached, nil
 	}
@@ -425,9 +412,7 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 	if customer.CompanyID != companyID {
 		return nil, salesErrors.ErrPermissionDenied
 	}
-
 	changes := make(map[string]interface{})
-
 	if req.Name != nil && *req.Name != customer.Name {
 		if len(*req.Name) > maxNameLen {
 			return nil, fmt.Errorf("%w: name must not exceed %d characters", salesErrors.ErrInvalidInput, maxNameLen)
@@ -439,7 +424,6 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		changes["is_active"] = map[string]bool{"old": customer.IsActive, "new": *req.IsActive}
 		customer.IsActive = *req.IsActive
 	}
-
 	if req.Email != nil {
 		if len(*req.Email) > maxEmailLen {
 			return nil, fmt.Errorf("%w: email must not exceed %d characters", salesErrors.ErrInvalidInput, maxEmailLen)
@@ -466,7 +450,6 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		customer.EmailKeyID = kid
 		customer.EmailHash = &newHash
 	}
-
 	if req.Phone != nil {
 		enc, dek, kid, err := s.encryptField(ctx, req.Phone, "customer_phone")
 		if err != nil {
@@ -514,24 +497,18 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 		customer.ShippingAddressDEK = dek
 		customer.ShippingAddressKeyID = kid
 	}
-
 	customer.UpdatedBy = req.UpdatedBy
 	if err := s.customerRepo.Update(ctx, tx, customer); err != nil {
 		return nil, fmt.Errorf("update customer: %w", err)
 	}
-
 	if err := s.emitCustomerEvent(ctx, tx, customer, salesEvents.EventCustomerUpdated); err != nil {
 		logger.Warn("failed to emit customer updated event", zap.Error(err))
 	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, customer)
-
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, customer)
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
 	_ = s.decryptCustomer(ctx, customer)
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "update_customer", "customer",
 			&customerID, "user", req.UpdatedBy, nil, nil, changes)
@@ -539,9 +516,15 @@ func (s *customerService) UpdateCustomer(ctx context.Context, companyID, custome
 	return customer, nil
 }
 
-func (s *customerService) DeleteCustomer(ctx context.Context, companyID, customerID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error {
-	logger := s.logger.With(zap.String("method", "DeleteCustomer"), zap.String("idempotency_key", idempotencyKey))
-
+// ---------------------------------------------------------------------
+// DELETE (soft delete)
+// ---------------------------------------------------------------------
+func (s *customerService) DeleteCustomer(ctx context.Context, companyID, customerID uuid.UUID, deletedBy *uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "DeleteCustomer"))
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("del-cust-%s", customerID.String())
+	}
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -549,51 +532,26 @@ func (s *customerService) DeleteCustomer(ctx context.Context, companyID, custome
 	defer tx.Rollback()
 
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
-		logger.Info("idempotent – already deleted")
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – already deleted/deactivated")
 		return nil
 	}
 
-	customer, err := s.customerRepo.GetByID(ctx, tx, companyID, customerID)
-	if err != nil {
+	// Always soft delete: set is_active = false
+	if err := s.customerRepo.SetActiveStatus(ctx, tx, companyID, customerID, false, deletedBy); err != nil {
 		return err
 	}
-	if customer.CompanyID != companyID {
-		return salesErrors.ErrPermissionDenied
-	}
 
-	var hasOrders bool
-	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sales.orders WHERE company_id=$1 AND customer_id=$2 LIMIT 1)`, companyID, customerID).Scan(&hasOrders)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("check orders: %w", err)
-	}
-	var hasInvoices bool
-	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sales.invoices WHERE company_id=$1 AND customer_id=$2 LIMIT 1)`, companyID, customerID).Scan(&hasInvoices)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("check invoices: %w", err)
-	}
-
-	if hasOrders || hasInvoices {
-		if err := s.customerRepo.SetActiveStatus(ctx, tx, companyID, customerID, false, deletedBy); err != nil {
-			return fmt.Errorf("deactivate customer: %w", err)
-		}
-		logger.Info("customer has historical data, deactivated instead of hard delete")
-	} else {
-		if err := s.customerRepo.Delete(ctx, tx, companyID, customerID); err != nil {
-			return fmt.Errorf("delete customer: %w", err)
+	cust, _ := s.customerRepo.GetByID(ctx, tx, companyID, customerID)
+	if cust != nil {
+		if err := s.emitCustomerEvent(ctx, tx, cust, salesEvents.EventCustomerDeactivated); err != nil {
+			logger.Warn("failed to emit delete event", zap.Error(err))
 		}
 	}
-
-	if err := s.emitCustomerEvent(ctx, tx, customer, salesEvents.EventCustomerDeleted); err != nil {
-		logger.Warn("failed to emit delete event", zap.Error(err))
-	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
-
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
-
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "delete_customer", "customer",
 			&customerID, "user", deletedBy, nil, nil, nil)
@@ -601,18 +559,16 @@ func (s *customerService) DeleteCustomer(ctx context.Context, companyID, custome
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Read methods – use default DB connection (no transaction needed)
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// GETTERS
+// ---------------------------------------------------------------------
 func (s *customerService) GetCustomerByID(ctx context.Context, companyID, customerID uuid.UUID) (*models.Customer, error) {
 	db := s.pgClient.DB
 	customer, err := s.customerRepo.GetByID(ctx, db, companyID, customerID)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.decryptCustomer(ctx, customer); err != nil {
-		return nil, err
-	}
+	_ = s.decryptCustomer(ctx, customer)
 	return customer, nil
 }
 
@@ -622,9 +578,7 @@ func (s *customerService) GetCustomerByCode(ctx context.Context, companyID uuid.
 	if err != nil {
 		return nil, err
 	}
-	if err := s.decryptCustomer(ctx, customer); err != nil {
-		return nil, err
-	}
+	_ = s.decryptCustomer(ctx, customer)
 	return customer, nil
 }
 
@@ -663,18 +617,22 @@ func (s *customerService) SearchCustomers(ctx context.Context, companyID uuid.UU
 	return customers, total, nil
 }
 
-// ----------------------------------------------------------------------------
-// Activation – own transaction
-// ----------------------------------------------------------------------------
-func (s *customerService) ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return s.setActiveStatus(ctx, companyID, customerID, true, updatedBy, idempotencyKey)
+// ---------------------------------------------------------------------
+// ACTIVATE / DEACTIVATE
+// ---------------------------------------------------------------------
+func (s *customerService) ActivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error {
+	return s.setActiveStatus(ctx, companyID, customerID, true, updatedBy)
 }
 
-func (s *customerService) DeactivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return s.setActiveStatus(ctx, companyID, customerID, false, updatedBy, idempotencyKey)
+func (s *customerService) DeactivateCustomer(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error {
+	return s.setActiveStatus(ctx, companyID, customerID, false, updatedBy)
 }
 
-func (s *customerService) setActiveStatus(ctx context.Context, companyID, customerID uuid.UUID, active bool, updatedBy *uuid.UUID, idempotencyKey string) error {
+func (s *customerService) setActiveStatus(ctx context.Context, companyID, customerID uuid.UUID, active bool, updatedBy *uuid.UUID) error {
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("status-%s-%t", customerID.String(), active)
+	}
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -682,14 +640,12 @@ func (s *customerService) setActiveStatus(ctx context.Context, companyID, custom
 	defer tx.Rollback()
 
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
-
 	if err := s.customerRepo.SetActiveStatus(ctx, tx, companyID, customerID, active, updatedBy); err != nil {
 		return err
 	}
-
 	cust, _ := s.customerRepo.GetByID(ctx, tx, companyID, customerID)
 	if cust != nil {
 		eventType := salesEvents.EventCustomerDeactivated
@@ -698,18 +654,21 @@ func (s *customerService) setActiveStatus(ctx context.Context, companyID, custom
 		}
 		_ = s.emitCustomerEvent(ctx, tx, cust, eventType)
 	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Credit limit – writes own transaction, reads use default DB
-// ----------------------------------------------------------------------------
-func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID, idempotencyKey string) error {
+// ---------------------------------------------------------------------
+// CREDIT LIMIT
+// ---------------------------------------------------------------------
+func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, customerID uuid.UUID, newLimit decimal.Decimal, reason *string, updatedBy *uuid.UUID) error {
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("credit-%s", customerID.String())
+	}
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -717,33 +676,34 @@ func (s *customerService) UpdateCreditLimit(ctx context.Context, companyID, cust
 	defer tx.Rollback()
 
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
-
 	cust, err := s.customerRepo.GetByIDForUpdate(ctx, tx, companyID, customerID)
 	if err != nil {
 		return err
+	}
+	// NEW: enforce new limit >= outstanding balance
+	outstanding, err := s.getOutstandingBalance(ctx, tx, companyID, customerID)
+	if err != nil {
+		return err
+	}
+	if newLimit.LessThan(outstanding) {
+		return fmt.Errorf("%w: new credit limit cannot be less than current outstanding balance (%s)", salesErrors.ErrInvalidInput, outstanding.String())
 	}
 	oldLimit := decimal.Zero
 	if cust.CreditLimit != nil {
 		oldLimit = *cust.CreditLimit
 	}
-
 	cust.CreditLimit = &newLimit
 	cust.UpdatedBy = updatedBy
 	if err := s.customerRepo.Update(ctx, tx, cust); err != nil {
 		return fmt.Errorf("update credit limit: %w", err)
 	}
-
-	if err := s.logCreditHistory(ctx, tx, companyID, customerID, "limit_change",
-		&oldLimit, &newLimit, nil, nil, reason, nil, updatedBy); err != nil {
-		s.logger.Warn("failed to log credit limit change", zap.Error(err))
-	}
-
+	_ = s.logCreditHistory(ctx, tx, companyID, customerID, "limit_change",
+		&oldLimit, &newLimit, nil, nil, reason, nil, updatedBy)
 	_ = s.emitCustomerEvent(ctx, tx, cust, salesEvents.EventCustomerCreditLimitUpdated)
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -782,10 +742,14 @@ func (s *customerService) CanCustomerPurchaseAmount(ctx context.Context, company
 	return available.GreaterThanOrEqual(amount), nil
 }
 
-// ----------------------------------------------------------------------------
-// Payment term – own transaction
-// ----------------------------------------------------------------------------
-func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+// ---------------------------------------------------------------------
+// PAYMENT TERM
+// ---------------------------------------------------------------------
+func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, customerID, termID uuid.UUID, updatedBy *uuid.UUID) error {
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("assign-term-%s", customerID.String())
+	}
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -793,10 +757,9 @@ func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, cust
 	defer tx.Rollback()
 
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
-
 	term, err := s.paymentTermRepo.GetByID(ctx, tx, companyID, termID)
 	if err != nil {
 		return fmt.Errorf("payment term: %w", err)
@@ -804,19 +767,21 @@ func (s *customerService) AssignPaymentTerm(ctx context.Context, companyID, cust
 	if !term.IsActive {
 		return fmt.Errorf("%w: payment term is inactive", salesErrors.ErrInvalidInput)
 	}
-
 	if err := s.paymentTermRepo.ApplyToCustomer(ctx, tx, companyID, customerID, termID, updatedBy); err != nil {
 		return err
 	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 	return nil
 }
 
-func (s *customerService) RemovePaymentTerm(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+func (s *customerService) RemovePaymentTerm(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error {
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove-term-%s", customerID.String())
+	}
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -824,34 +789,123 @@ func (s *customerService) RemovePaymentTerm(ctx context.Context, companyID, cust
 	defer tx.Rollback()
 
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
-
+	// Check current term
+	var currentTermID uuid.NullUUID
+	queryCheck := `SELECT payment_term_id FROM sales.customers WHERE company_id = $1 AND customer_id = $2`
+	err = tx.QueryRowContext(ctx, queryCheck, companyID, customerID).Scan(&currentTermID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return salesErrors.ErrNotFound
+		}
+		return err
+	}
+	if !currentTermID.Valid {
+		// Already removed – idempotent success
+		_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+		return tx.Commit()
+	}
 	query := `UPDATE sales.customers SET payment_term_id = NULL, updated_at = NOW(), updated_by = $3 WHERE company_id = $1 AND customer_id = $2`
 	_, err = tx.ExecContext(ctx, query, companyID, customerID, s.nullUUID(updatedBy))
 	if err != nil {
 		return fmt.Errorf("remove payment term: %w", err)
 	}
-
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
-	return tx.Commit()
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Sales rep assignment – not supported
-// ----------------------------------------------------------------------------
-func (s *customerService) AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return fmt.Errorf("customer sales rep assignment not supported – assign at order/invoice level")
+// ---------------------------------------------------------------------
+// SALES REP
+// ---------------------------------------------------------------------
+func (s *customerService) AssignSalesRep(ctx context.Context, companyID, customerID, salesRepID uuid.UUID, updatedBy *uuid.UUID) error {
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("assign-rep-%s", customerID.String())
+	}
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	// Verify sales rep exists and is active
+	rep, err := s.salesRepRepo.GetByID(ctx, tx, companyID, salesRepID)
+	if err != nil {
+		return fmt.Errorf("sales rep: %w", err)
+	}
+	if !rep.IsActive {
+		return fmt.Errorf("%w: sales rep is inactive", salesErrors.ErrInvalidInput)
+	}
+	query := `UPDATE sales.customers SET sales_rep_id = $3, updated_at = NOW(), updated_by = $4 WHERE company_id = $1 AND customer_id = $2`
+	result, err := tx.ExecContext(ctx, query, companyID, customerID, salesRepID, s.nullUUID(updatedBy))
+	if err != nil {
+		return fmt.Errorf("assign sales rep: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return salesErrors.ErrNotFound
+	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
-func (s *customerService) RemoveSalesRep(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return fmt.Errorf("customer sales rep removal not supported")
+func (s *customerService) RemoveSalesRep(ctx context.Context, companyID, customerID uuid.UUID, updatedBy *uuid.UUID) error {
+	idempKey := getIDKey(ctx)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove-rep-%s", customerID.String())
+	}
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		return nil
+	}
+	// Check if customer exists and currently has a rep
+	var currentRepID uuid.NullUUID
+	queryCheck := `SELECT sales_rep_id FROM sales.customers WHERE company_id = $1 AND customer_id = $2`
+	err = tx.QueryRowContext(ctx, queryCheck, companyID, customerID).Scan(&currentRepID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return salesErrors.ErrNotFound
+		}
+		return err
+	}
+	if !currentRepID.Valid {
+		// Already removed – idempotent success
+		_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+		return tx.Commit()
+	}
+	query := `UPDATE sales.customers SET sales_rep_id = NULL, updated_at = NOW(), updated_by = $3 WHERE company_id = $1 AND customer_id = $2`
+	_, err = tx.ExecContext(ctx, query, companyID, customerID, s.nullUUID(updatedBy))
+	if err != nil {
+		return fmt.Errorf("remove sales rep: %w", err)
+	}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
 }
 
-// ----------------------------------------------------------------------------
-// Reporting – use default DB
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// ADDITIONAL QUERIES
+// ---------------------------------------------------------------------
 func (s *customerService) GetCustomersWithOutstandingInvoices(ctx context.Context, companyID uuid.UUID) ([]*models.Customer, error) {
 	db := s.pgClient.DB
 	customers, err := s.customerRepo.GetCustomersWithOutstandingInvoices(ctx, db, companyID)
@@ -876,9 +930,6 @@ func (s *customerService) GetTopCustomersByRevenue(ctx context.Context, companyI
 	return customers, nil
 }
 
-// ----------------------------------------------------------------------------
-// Validation & existence – use default DB
-// ----------------------------------------------------------------------------
 func (s *customerService) ValidateCustomer(ctx context.Context, customer *models.Customer) error {
 	if customer.CustomerCode == "" {
 		return fmt.Errorf("%w: customer_code required", salesErrors.ErrInvalidInput)
@@ -897,9 +948,9 @@ func (s *customerService) IsCustomerActive(ctx context.Context, companyID, custo
 	return s.customerRepo.IsActive(ctx, s.pgClient.DB, companyID, customerID)
 }
 
-// ----------------------------------------------------------------------------
-// Event emission – requires a transaction
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// EVENT EMITTER
+// ---------------------------------------------------------------------
 func (s *customerService) emitCustomerEvent(ctx context.Context, tx repository.DBTX, customer *models.Customer, eventType string) error {
 	sqlTx, ok := tx.(*sql.Tx)
 	if !ok {
@@ -925,12 +976,4 @@ func (s *customerService) emitCustomerEvent(ctx context.Context, tx repository.D
 		Payload:       data,
 	}
 	return s.outboxRepo.Store(ctx, sqlTx, event)
-}
-
-// Helper for nil UUID
-func (s *customerService) nullUUID(id *uuid.UUID) interface{} {
-	if id == nil || *id == uuid.Nil {
-		return nil
-	}
-	return *id
 }

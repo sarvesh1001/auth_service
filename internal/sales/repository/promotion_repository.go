@@ -18,312 +18,86 @@ import (
 	"auth-service/internal/sales/models/enums"
 )
 
-type PromotionRepository interface {
-
-	// -------------------------------------------------------------------------
-	// PROMOTION CRUD
-	// -------------------------------------------------------------------------
-
-	Create(
-		ctx context.Context,
-		db DBTX,
-		promotion *discount.Promotion,
-		rules []*discount.PromotionRule,
-	) error
-
-	GetByID(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-	) (*discount.Promotion, error)
-
-	Update(
-		ctx context.Context,
-		db DBTX,
-		promotion *discount.Promotion,
-	) error
-
-	Delete(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-	) error
-
-	Exists(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-	) (bool, error)
-
-	// -------------------------------------------------------------------------
-	// STATUS / LIFECYCLE
-	// -------------------------------------------------------------------------
-
-	SetActiveStatus(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		isActive bool,
-		updatedBy *uuid.UUID,
-	) error
-
-	IsActive(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-	) (bool, error)
-
-	IsExpired(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		at time.Time,
-	) (bool, error)
-
-	// -------------------------------------------------------------------------
-	// PROMOTION RULES
-	// -------------------------------------------------------------------------
-
-	AddRules(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		rules []*discount.PromotionRule,
-	) error
-
-	ReplaceRules(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		rules []*discount.PromotionRule,
-	) error
-
-	DeleteRule(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID, ruleID uuid.UUID,
-	) error
-
-	GetRules(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-	) ([]*discount.PromotionRule, error)
-
-	GetRuleByID(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID, ruleID uuid.UUID,
-	) (*discount.PromotionRule, error)
-
-	ExistsRule(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID, ruleID uuid.UUID,
-	) (bool, error)
-
-	// -------------------------------------------------------------------------
-	// VALIDATION / APPLICABILITY
-	// -------------------------------------------------------------------------
-
-	GetApplicablePromotions(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		customerID *uuid.UUID,
-		productIDs []uuid.UUID,
-		orderAmount decimal.Decimal,
-		at time.Time,
-	) ([]*discount.Promotion, error)
-
-	GetApplicableRules(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		customerID *uuid.UUID,
-		productIDs []uuid.UUID,
-		orderAmount decimal.Decimal,
-		at time.Time,
-	) ([]*discount.PromotionRule, error)
-
-	IsApplicableForOrderAmount(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		orderAmount decimal.Decimal,
-	) (bool, error)
-
-	IsApplicableForProduct(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID, productID uuid.UUID,
-	) (bool, error)
-
-	IsApplicableForCustomer(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID, customerID uuid.UUID,
-	) (bool, error)
-
-	ValidatePromotion(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		customerID *uuid.UUID,
-		productIDs []uuid.UUID,
-		orderAmount decimal.Decimal,
-		at time.Time,
-	) error
-
-	// -------------------------------------------------------------------------
-	// DISCOUNT CALCULATION
-	// -------------------------------------------------------------------------
-
-	CalculateDiscount(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		customerID *uuid.UUID,
-		productIDs []uuid.UUID,
-		orderAmount decimal.Decimal,
-		at time.Time,
-	) (decimal.Decimal, error)
-
-	GetMaximumDiscount(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-		orderAmount decimal.Decimal,
-	) (decimal.Decimal, error)
-
-	// -------------------------------------------------------------------------
-	// QUERYING / LISTING
-	// -------------------------------------------------------------------------
-
-	List(
-		ctx context.Context,
-		db DBTX,
-		filter PromotionFilter,
-		p Pagination,
-		s Sort,
-	) ([]*discount.Promotion, int64, error)
-
-	Search(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		query string,
-		limit int,
-		offset int,
-	) ([]*discount.Promotion, int64, error)
-
-	GetActivePromotions(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		at time.Time,
-	) ([]*discount.Promotion, error)
-
-	GetExpiredPromotions(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		at time.Time,
-	) ([]*discount.Promotion, error)
-
-	GetPromotionsStartingSoon(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		before time.Time,
-	) ([]*discount.Promotion, error)
-
-	GetPromotionsEndingSoon(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		before time.Time,
-	) ([]*discount.Promotion, error)
-
-	// -------------------------------------------------------------------------
-	// ANALYTICS / REPORTING
-	// -------------------------------------------------------------------------
-
-	GetTotalDiscountGiven(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		from *time.Time,
-		to *time.Time,
-	) (decimal.Decimal, error)
-
-	GetTopPromotionsByUsage(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		limit int,
-		from *time.Time,
-		to *time.Time,
-	) ([]*discount.Promotion, error)
-
-	GetTopPromotionsByDiscountAmount(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-		limit int,
-		from *time.Time,
-		to *time.Time,
-	) ([]*discount.Promotion, error)
-
-	GetUnusedPromotions(
-		ctx context.Context,
-		db DBTX,
-		companyID uuid.UUID,
-	) ([]*discount.Promotion, error)
-
-	// -------------------------------------------------------------------------
-	// CONCURRENCY / LOCKING
-	// -------------------------------------------------------------------------
-
-	GetByIDForUpdate(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID uuid.UUID,
-	) (*discount.Promotion, error)
-
-	GetRuleByIDForUpdate(
-		ctx context.Context,
-		db DBTX,
-		companyID, promotionID, ruleID uuid.UUID,
-	) (*discount.PromotionRule, error)
-}
-
+// -------------------------------------------------------------------------
+// Interfaces and supporting types
+// -------------------------------------------------------------------------
 type PromotionFilter struct {
-	CompanyID uuid.UUID
-
-	PromotionIDs []uuid.UUID
-
-	IsActive *bool
-
-	Name *string
-
-	MinPriority *int
-	MaxPriority *int
-
+	CompanyID     uuid.UUID
+	PromotionIDs  []uuid.UUID
+	IsActive      *bool
+	Name          *string
+	MinPriority   *int
+	MaxPriority   *int
 	DiscountTypes []enums.DiscountType
-
 	StartDateFrom *time.Time
 	StartDateTo   *time.Time
-
-	EndDateFrom *time.Time
-	EndDateTo   *time.Time
-
-	CreatedFrom *time.Time
-	CreatedTo   *time.Time
-
-	UpdatedFrom *time.Time
-	UpdatedTo   *time.Time
+	EndDateFrom   *time.Time
+	EndDateTo     *time.Time
+	CreatedFrom   *time.Time
+	CreatedTo     *time.Time
+	UpdatedFrom   *time.Time
+	UpdatedTo     *time.Time
 }
+
+type PromotionRepository interface {
+	// CRUD
+	Create(ctx context.Context, db DBTX, promotion *discount.Promotion, rules []*discount.PromotionRule) error
+	GetByID(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (*discount.Promotion, error)
+	Update(ctx context.Context, db DBTX, promotion *discount.Promotion) error
+	Delete(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) error
+	Exists(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (bool, error)
+
+	// Status / lifecycle
+	SetActiveStatus(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
+	IsActive(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (bool, error)
+	IsExpired(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, at time.Time) (bool, error)
+
+	// Stacking type
+	GetStackingType(ctx context.Context, db DBTX, promotionID uuid.UUID) (string, error)
+
+	// Promotion rules
+	AddRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error
+	ReplaceRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error
+	DeleteRule(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) error
+	GetRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) ([]*discount.PromotionRule, error)
+	GetRuleByID(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) (*discount.PromotionRule, error)
+	ExistsRule(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) (bool, error)
+
+	// Validation / applicability
+	GetApplicablePromotions(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error)
+	GetApplicableRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.PromotionRule, error)
+	IsApplicableForOrderAmount(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, orderAmount decimal.Decimal) (bool, error)
+	IsApplicableForProduct(ctx context.Context, db DBTX, companyID, promotionID, productID uuid.UUID) (bool, error)
+	IsApplicableForCustomer(ctx context.Context, db DBTX, companyID, promotionID, customerID uuid.UUID) (bool, error)
+	ValidatePromotion(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error
+
+	// Discount calculation
+	CalculateDiscount(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (decimal.Decimal, error)
+	GetMaximumDiscount(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, orderAmount decimal.Decimal) (decimal.Decimal, error)
+
+	// Listing / search
+	List(ctx context.Context, db DBTX, filter PromotionFilter, p Pagination, s Sort) ([]*discount.Promotion, int64, error)
+	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*discount.Promotion, int64, error)
+	GetActivePromotions(ctx context.Context, db DBTX, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error)
+	GetExpiredPromotions(ctx context.Context, db DBTX, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error)
+	GetPromotionsStartingSoon(ctx context.Context, db DBTX, companyID uuid.UUID, before time.Time) ([]*discount.Promotion, error)
+	GetPromotionsEndingSoon(ctx context.Context, db DBTX, companyID uuid.UUID, before time.Time) ([]*discount.Promotion, error)
+
+	// Analytics / reporting
+	GetTotalDiscountGiven(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error)
+	GetTopPromotionsByUsage(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error)
+	GetTopPromotionsByDiscountAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error)
+	GetUnusedPromotions(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*discount.Promotion, error)
+
+	// Concurrency / locking
+	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (*discount.Promotion, error)
+	GetRuleByIDForUpdate(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) (*discount.PromotionRule, error)
+}
+
+// -------------------------------------------------------------------------
+// Implementation
+// -------------------------------------------------------------------------
+
 type promotionRepository struct {
 	logger *zap.Logger
 }
@@ -335,7 +109,7 @@ func NewPromotionRepository(logger *zap.Logger) PromotionRepository {
 }
 
 // -------------------------------------------------------------------------
-// Helper functions (reuse from tx_helper or implement locally)
+// Helpers
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) nullUUIDParam(id *uuid.UUID) interface{} {
@@ -469,7 +243,7 @@ func (r *promotionRepository) buildPromotionFilter(filter PromotionFilter) (stri
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanPromotion maps a row to discount.Promotion
+// scanPromotion includes stacking_type
 func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, error) {
 	var p discount.Promotion
 	var createdBy, updatedBy uuid.NullUUID
@@ -484,6 +258,7 @@ func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, err
 		&p.EndDate,
 		&p.IsActive,
 		&priority,
+		&p.StackingType,
 		&p.CreatedAt,
 		&p.UpdatedAt,
 		&createdBy,
@@ -508,8 +283,7 @@ func (r *promotionRepository) scanPromotion(s scanner) (*discount.Promotion, err
 	return &p, nil
 }
 
-// scanPromotionRule maps a row to discount.PromotionRule
-// scanPromotionRule maps a row to discount.PromotionRule
+// scanPromotionRule unchanged
 func (r *promotionRepository) scanPromotionRule(s scanner) (*discount.PromotionRule, error) {
 	var rule discount.PromotionRule
 	var maxDiscount sql.NullString
@@ -532,7 +306,7 @@ func (r *promotionRepository) scanPromotionRule(s scanner) (*discount.PromotionR
 		return nil, fmt.Errorf("scan promotion rule: %w", err)
 	}
 	if len(ruleConfigJSON) > 0 {
-		rule.RuleConfig = datatypes.JSON(ruleConfigJSON) // ✅ fixed conversion
+		rule.RuleConfig = datatypes.JSON(ruleConfigJSON)
 	}
 	if maxDiscount.Valid {
 		val, err := decimal.NewFromString(maxDiscount.String)
@@ -544,17 +318,16 @@ func (r *promotionRepository) scanPromotionRule(s scanner) (*discount.PromotionR
 }
 
 // -------------------------------------------------------------------------
-// PROMOTION CRUD
+// CRUD
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) Create(ctx context.Context, db DBTX, promotion *discount.Promotion, rules []*discount.PromotionRule) error {
-	// Insert promotion
 	queryPromo := `
 		INSERT INTO sales.promotions (
 			promotion_id, company_id, name, description,
-			start_date, end_date, is_active, priority,
+			start_date, end_date, is_active, priority, stacking_type,
 			created_at, updated_at, created_by, updated_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9, $10)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(), $10, $11)
 		RETURNING created_at, updated_at
 	`
 	var priority interface{}
@@ -572,6 +345,7 @@ func (r *promotionRepository) Create(ctx context.Context, db DBTX, promotion *di
 		promotion.EndDate,
 		promotion.IsActive,
 		priority,
+		promotion.StackingType,
 		r.nullUUIDParam(promotion.CreatedBy),
 		r.nullUUIDParam(promotion.UpdatedBy),
 	).Scan(&promotion.CreatedAt, &promotion.UpdatedAt)
@@ -580,7 +354,6 @@ func (r *promotionRepository) Create(ctx context.Context, db DBTX, promotion *di
 		return fmt.Errorf("create promotion: %w", err)
 	}
 
-	// Insert rules (if any)
 	if len(rules) > 0 {
 		if err := r.AddRules(ctx, db, promotion.CompanyID, promotion.PromotionID, rules); err != nil {
 			return err
@@ -592,7 +365,7 @@ func (r *promotionRepository) Create(ctx context.Context, db DBTX, promotion *di
 func (r *promotionRepository) GetByID(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (*discount.Promotion, error) {
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1 AND promotion_id = $2
@@ -610,8 +383,9 @@ func (r *promotionRepository) Update(ctx context.Context, db DBTX, promotion *di
 			end_date = $6,
 			is_active = $7,
 			priority = $8,
+			stacking_type = $9,
 			updated_at = NOW(),
-			updated_by = $9
+			updated_by = $10
 		WHERE promotion_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -630,6 +404,7 @@ func (r *promotionRepository) Update(ctx context.Context, db DBTX, promotion *di
 		promotion.EndDate,
 		promotion.IsActive,
 		priority,
+		promotion.StackingType,
 		r.nullUUIDParam(promotion.UpdatedBy),
 	).Scan(&promotion.UpdatedAt)
 	if err != nil {
@@ -642,7 +417,6 @@ func (r *promotionRepository) Update(ctx context.Context, db DBTX, promotion *di
 }
 
 func (r *promotionRepository) Delete(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) error {
-	// First delete associated rules (cascade will handle if ON DELETE CASCADE exists, but we delete manually)
 	_, err := db.ExecContext(ctx, `DELETE FROM sales.promotion_rules WHERE promotion_id = $1`, promotionID)
 	if err != nil {
 		return fmt.Errorf("delete promotion rules: %w", err)
@@ -669,7 +443,7 @@ func (r *promotionRepository) Exists(ctx context.Context, db DBTX, companyID, pr
 }
 
 // -------------------------------------------------------------------------
-// STATUS / LIFECYCLE
+// Status / lifecycle
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) SetActiveStatus(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error {
@@ -715,8 +489,21 @@ func (r *promotionRepository) IsExpired(ctx context.Context, db DBTX, companyID,
 	return expired, nil
 }
 
+func (r *promotionRepository) GetStackingType(ctx context.Context, db DBTX, promotionID uuid.UUID) (string, error) {
+	var stackingType string
+	query := `SELECT stacking_type FROM sales.promotions WHERE promotion_id = $1`
+	err := db.QueryRowContext(ctx, query, promotionID).Scan(&stackingType)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", errors.ErrNotFound
+		}
+		return "", fmt.Errorf("get stacking type: %w", err)
+	}
+	return stackingType, nil
+}
+
 // -------------------------------------------------------------------------
-// PROMOTION RULES
+// Promotion rules
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) AddRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error {
@@ -754,7 +541,6 @@ func (r *promotionRepository) AddRules(ctx context.Context, db DBTX, companyID, 
 }
 
 func (r *promotionRepository) ReplaceRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error {
-	// Delete existing rules
 	_, err := db.ExecContext(ctx, `DELETE FROM sales.promotion_rules WHERE promotion_id = $1`, promotionID)
 	if err != nil {
 		return fmt.Errorf("delete old rules: %w", err)
@@ -766,7 +552,6 @@ func (r *promotionRepository) ReplaceRules(ctx context.Context, db DBTX, company
 }
 
 func (r *promotionRepository) DeleteRule(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) error {
-	// Ensure rule belongs to promotion and company (join check)
 	query := `
 		DELETE FROM sales.promotion_rules
 		WHERE rule_id = $1
@@ -838,14 +623,13 @@ func (r *promotionRepository) ExistsRule(ctx context.Context, db DBTX, companyID
 }
 
 // -------------------------------------------------------------------------
-// VALIDATION / APPLICABILITY
+// Validation / applicability
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) GetApplicablePromotions(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error) {
-	// Basic filter: active, not expired, start_date <= now, end_date >= now
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
@@ -870,28 +654,20 @@ func (r *promotionRepository) GetApplicablePromotions(ctx context.Context, db DB
 	return promotions, rows.Err()
 }
 
-// For brevity, the remaining methods are implemented with similar patterns.
-// I'll implement the essential ones fully. The rest can follow the same structure.
-
 func (r *promotionRepository) GetApplicableRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.PromotionRule, error) {
-	// All rules of the promotion (further filtering can be done by rule_config)
 	return r.GetRules(ctx, db, companyID, promotionID)
 }
 
 func (r *promotionRepository) IsApplicableForOrderAmount(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, orderAmount decimal.Decimal) (bool, error) {
-	// This would require checking promotion rules that have min_order_amount, etc.
-	// For simplicity, we return true if promotion exists.
 	exists, err := r.Exists(ctx, db, companyID, promotionID)
 	return exists, err
 }
 
 func (r *promotionRepository) IsApplicableForProduct(ctx context.Context, db DBTX, companyID, promotionID, productID uuid.UUID) (bool, error) {
-	// Return true by default; advanced checking would inspect rule_config.
 	return true, nil
 }
 
 func (r *promotionRepository) IsApplicableForCustomer(ctx context.Context, db DBTX, companyID, promotionID, customerID uuid.UUID) (bool, error) {
-	// Return true by default.
 	return true, nil
 }
 
@@ -906,12 +682,14 @@ func (r *promotionRepository) ValidatePromotion(ctx context.Context, db DBTX, co
 	if at.Before(promo.StartDate) || at.After(promo.EndDate) {
 		return errors.ErrPromotionInactive
 	}
-	// Additional checks can be added (min order, customer eligibility, etc.)
 	return nil
 }
 
+// -------------------------------------------------------------------------
+// Discount calculation
+// -------------------------------------------------------------------------
+
 func (r *promotionRepository) CalculateDiscount(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (decimal.Decimal, error) {
-	// Placeholder: apply first rule's discount value. Real implementation would check rules.
 	rules, err := r.GetRules(ctx, db, companyID, promotionID)
 	if err != nil || len(rules) == 0 {
 		return decimal.Zero, err
@@ -922,7 +700,6 @@ func (r *promotionRepository) CalculateDiscount(ctx context.Context, db DBTX, co
 		discount = *rule.MaxDiscount
 	}
 	if rule.DiscountType == enums.DiscountTypePercentage {
-		// percentage of orderAmount
 		discount = orderAmount.Mul(rule.DiscountValue.Div(decimal.NewFromInt(100)))
 	}
 	return discount, nil
@@ -950,7 +727,7 @@ func (r *promotionRepository) GetMaximumDiscount(ctx context.Context, db DBTX, c
 }
 
 // -------------------------------------------------------------------------
-// LISTING / SEARCH / ACTIVE / EXPIRED
+// Listing / search
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) List(ctx context.Context, db DBTX, filter PromotionFilter, p Pagination, s Sort) ([]*discount.Promotion, int64, error) {
@@ -987,7 +764,7 @@ func (r *promotionRepository) List(ctx context.Context, db DBTX, filter Promotio
 
 	query := fmt.Sprintf(`
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		%s
@@ -1033,7 +810,7 @@ func (r *promotionRepository) Search(ctx context.Context, db DBTX, companyID uui
 
 	dataQuery := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
@@ -1062,7 +839,7 @@ func (r *promotionRepository) Search(ctx context.Context, db DBTX, companyID uui
 func (r *promotionRepository) GetActivePromotions(ctx context.Context, db DBTX, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error) {
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
@@ -1090,7 +867,7 @@ func (r *promotionRepository) GetActivePromotions(ctx context.Context, db DBTX, 
 func (r *promotionRepository) GetExpiredPromotions(ctx context.Context, db DBTX, companyID uuid.UUID, at time.Time) ([]*discount.Promotion, error) {
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
@@ -1116,7 +893,7 @@ func (r *promotionRepository) GetExpiredPromotions(ctx context.Context, db DBTX,
 func (r *promotionRepository) GetPromotionsStartingSoon(ctx context.Context, db DBTX, companyID uuid.UUID, before time.Time) ([]*discount.Promotion, error) {
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
@@ -1144,7 +921,7 @@ func (r *promotionRepository) GetPromotionsStartingSoon(ctx context.Context, db 
 func (r *promotionRepository) GetPromotionsEndingSoon(ctx context.Context, db DBTX, companyID uuid.UUID, before time.Time) ([]*discount.Promotion, error) {
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1
@@ -1170,7 +947,7 @@ func (r *promotionRepository) GetPromotionsEndingSoon(ctx context.Context, db DB
 }
 
 // -------------------------------------------------------------------------
-// ANALYTICS / REPORTING
+// Analytics / reporting
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) GetTotalDiscountGiven(ctx context.Context, db DBTX, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
@@ -1198,21 +975,20 @@ func (r *promotionRepository) GetTotalDiscountGiven(ctx context.Context, db DBTX
 	return total, nil
 }
 
-// Top promotions by usage (number of times applied)
 func (r *promotionRepository) GetTopPromotionsByUsage(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error) {
-	// Not implemented in detail – would join discount_applications
-	// Return empty slice for now
+	// Simplified: not fully implemented – return empty slice
 	return []*discount.Promotion{}, nil
 }
 
 func (r *promotionRepository) GetTopPromotionsByDiscountAmount(ctx context.Context, db DBTX, companyID uuid.UUID, limit int, from, to *time.Time) ([]*discount.Promotion, error) {
+	// Simplified: not fully implemented – return empty slice
 	return []*discount.Promotion{}, nil
 }
 
 func (r *promotionRepository) GetUnusedPromotions(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*discount.Promotion, error) {
 	query := `
 		SELECT p.promotion_id, p.company_id, p.name, p.description,
-		       p.start_date, p.end_date, p.is_active, p.priority,
+		       p.start_date, p.end_date, p.is_active, p.priority, p.stacking_type,
 		       p.created_at, p.updated_at, p.created_by, p.updated_by
 		FROM sales.promotions p
 		LEFT JOIN sales.discount_applications da ON p.promotion_id = da.discount_id AND da.discount_type = 'promotion'
@@ -1235,13 +1011,13 @@ func (r *promotionRepository) GetUnusedPromotions(ctx context.Context, db DBTX, 
 }
 
 // -------------------------------------------------------------------------
-// CONCURRENCY / LOCKING
+// Concurrency / locking
 // -------------------------------------------------------------------------
 
 func (r *promotionRepository) GetByIDForUpdate(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID) (*discount.Promotion, error) {
 	query := `
 		SELECT promotion_id, company_id, name, description,
-		       start_date, end_date, is_active, priority,
+		       start_date, end_date, is_active, priority, stacking_type,
 		       created_at, updated_at, created_by, updated_by
 		FROM sales.promotions
 		WHERE company_id = $1 AND promotion_id = $2

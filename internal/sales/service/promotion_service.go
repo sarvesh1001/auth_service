@@ -249,6 +249,18 @@ func (s *promotionService) CreatePromotion(ctx context.Context, req *CreatePromo
 	if req.StartDate.IsZero() || req.EndDate.IsZero() || req.EndDate.Before(req.StartDate) {
 		return nil, fmt.Errorf("%w: invalid start/end date", salesErrors.ErrInvalidInput)
 	}
+
+	// Set default stacking type if not provided
+	stackingType := req.StackingType
+	if stackingType == "" {
+		stackingType = "stackable"
+	}
+	// Validate stacking type
+	allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+	if !allowed[stackingType] {
+		return nil, fmt.Errorf("%w: stacking_type must be one of 'stackable', 'exclusive', 'none'", salesErrors.ErrInvalidInput)
+	}
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -256,16 +268,17 @@ func (s *promotionService) CreatePromotion(ctx context.Context, req *CreatePromo
 	defer tx.Rollback()
 
 	promotion := &discount.Promotion{
-		PromotionID: uuid.New(),
-		CompanyID:   req.CompanyID,
-		Name:        req.Name,
-		Description: req.Description,
-		StartDate:   req.StartDate,
-		EndDate:     req.EndDate,
-		IsActive:    req.IsActive,
-		Priority:    req.Priority,
-		CreatedBy:   req.CreatedBy,
-		UpdatedBy:   req.CreatedBy,
+		PromotionID:  uuid.New(),
+		CompanyID:    req.CompanyID,
+		Name:         req.Name,
+		Description:  req.Description,
+		StartDate:    req.StartDate,
+		EndDate:      req.EndDate,
+		IsActive:     req.IsActive,
+		Priority:     req.Priority,
+		StackingType: stackingType, // NEW: set from request
+		CreatedBy:    req.CreatedBy,
+		UpdatedBy:    req.CreatedBy,
 	}
 	if err := s.promotionRepo.Create(ctx, tx, promotion, nil); err != nil {
 		return nil, fmt.Errorf("create promotion: %w", err)
@@ -304,6 +317,7 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 		return nil, salesErrors.ErrPermissionDenied
 	}
 	changes := make(map[string]interface{})
+
 	if req.Name != nil && *req.Name != promo.Name {
 		changes["name"] = map[string]string{"old": promo.Name, "new": *req.Name}
 		promo.Name = *req.Name
@@ -327,7 +341,18 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 		changes["priority"] = *req.Priority
 		promo.Priority = req.Priority
 	}
+	// NEW: update stacking_type if provided
+	if req.StackingType != nil && *req.StackingType != promo.StackingType {
+		allowed := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+		if !allowed[*req.StackingType] {
+			return nil, fmt.Errorf("%w: stacking_type must be one of 'stackable', 'exclusive', 'none'", salesErrors.ErrInvalidInput)
+		}
+		changes["stacking_type"] = map[string]string{"old": promo.StackingType, "new": *req.StackingType}
+		promo.StackingType = *req.StackingType
+	}
+
 	promo.UpdatedBy = req.UpdatedBy
+
 	if err := s.promotionRepo.Update(ctx, tx, promo); err != nil {
 		return nil, fmt.Errorf("update promotion: %w", err)
 	}
@@ -343,7 +368,6 @@ func (s *promotionService) UpdatePromotion(ctx context.Context, companyID uuid.U
 	}
 	return promo, nil
 }
-
 func (s *promotionService) DeletePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, deletedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeletePromotion"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)

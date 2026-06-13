@@ -347,6 +347,13 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 		return nil, fmt.Errorf("%w: coupon code %s already exists", salesErrors.ErrDuplicate, req.Code)
 	}
 
+	// --- NEW: set default stacking type if not provided ---
+	stackingType := req.StackingType
+	if stackingType == "" {
+		stackingType = "stackable"
+	}
+	// ----------------------------------------------------
+
 	coupon := &discount.Coupon{
 		CouponID:          uuid.New(),
 		CompanyID:         req.CompanyID,
@@ -361,6 +368,7 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 		MinOrderAmount:    req.MinOrderAmount,
 		ApplicableItems:   req.ApplicableItems,
 		IsActive:          true,
+		StackingType:      stackingType, // <-- ADDED
 		CreatedBy:         req.CreatedBy,
 		UpdatedBy:         req.CreatedBy,
 	}
@@ -368,7 +376,6 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 		return nil, fmt.Errorf("create coupon: %w", err)
 	}
 
-	// tx is *sql.Tx
 	if err := s.emitCouponEvent(ctx, tx, coupon, salesEvents.EventCouponCreated); err != nil {
 		s.logger.Warn("failed to emit coupon created event", zap.Error(err))
 	}
@@ -381,12 +388,12 @@ func (s *couponService) CreateCoupon(ctx context.Context, req *CreateCouponReque
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "create_coupon", "coupon",
 			&coupon.CouponID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
-				"code": coupon.Code,
+				"code":          coupon.Code,
+				"stacking_type": coupon.StackingType,
 			})
 	}
 	return coupon, nil
 }
-
 func (s *couponService) validateCreateCoupon(req *CreateCouponRequest) error {
 	if req.CompanyID == uuid.Nil {
 		return fmt.Errorf("%w: company_id required", salesErrors.ErrInvalidInput)
@@ -452,7 +459,7 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 		return nil, salesErrors.ErrPermissionDenied
 	}
 
-	// --- Validate individual fields ---
+	// --- Validate fields (unchanged) ---
 	if req.DiscountValue != nil {
 		if req.DiscountValue.LessThanOrEqual(decimal.Zero) {
 			return nil, fmt.Errorf("%w: discount_value must be positive", salesErrors.ErrInvalidInput)
@@ -478,27 +485,21 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 		return nil, fmt.Errorf("%w: per_user_limit must be positive", salesErrors.ErrInvalidInput)
 	}
 
-	// --- DATE VALIDATION (CRITICAL FIX) ---
-	// Start with the coupon's current dates
+	// --- DATE VALIDATION ---
 	newStart := coupon.StartDate
 	newEnd := coupon.EndDate
-
 	if req.StartDate != nil {
 		newStart = *req.StartDate
 	}
 	if req.EndDate != nil {
 		newEnd = *req.EndDate
 	}
-
-	// Final check: start_date must not be after end_date
 	if newStart.After(newEnd) {
 		return nil, fmt.Errorf("%w: start_date (%s) cannot be after end_date (%s)",
 			salesErrors.ErrInvalidInput,
 			newStart.Format(time.RFC3339),
 			newEnd.Format(time.RFC3339))
 	}
-
-	// If validation passes, apply the date changes to the coupon object
 	coupon.StartDate = newStart
 	coupon.EndDate = newEnd
 
@@ -539,9 +540,14 @@ func (s *couponService) UpdateCoupon(ctx context.Context, companyID, couponID uu
 	if req.ApplicableItems != nil {
 		coupon.ApplicableItems = req.ApplicableItems
 	}
+	// --- NEW: update stacking_type ---
+	if req.StackingType != nil && *req.StackingType != coupon.StackingType {
+		changes["stacking_type"] = map[string]string{"old": coupon.StackingType, "new": *req.StackingType}
+		coupon.StackingType = *req.StackingType
+	}
+	// --------------------------------
 	coupon.UpdatedBy = req.UpdatedBy
 
-	// Persist the updated coupon
 	if err := s.couponRepo.Update(ctx, tx, coupon); err != nil {
 		return nil, fmt.Errorf("update coupon: %w", err)
 	}

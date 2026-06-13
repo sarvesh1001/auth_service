@@ -404,6 +404,7 @@ type CreateCouponRequest struct {
 	PerUserLimit      *int               `json:"perUserLimit,omitempty"`
 	MinOrderAmount    *decimal.Decimal   `json:"minOrderAmount,omitempty"`
 	ApplicableItems   datatypes.JSON     `json:"applicableItems,omitempty"`
+	StackingType      string             `json:"stacking_type,omitempty"` // NEW: "stackable", "exclusive", "none"
 	CreatedBy         *uuid.UUID         `json:"createdBy,omitempty"`
 	IdempotencyKey    string             `json:"idempotencyKey"`
 }
@@ -419,6 +420,7 @@ type UpdateCouponRequest struct {
 	PerUserLimit      *int                `json:"perUserLimit,omitempty"`
 	MinOrderAmount    *decimal.Decimal    `json:"minOrderAmount,omitempty"`
 	ApplicableItems   datatypes.JSON      `json:"applicableItems,omitempty"`
+	StackingType      *string             `json:"stacking_type,omitempty"` // NEW: allows update
 	UpdatedBy         *uuid.UUID          `json:"updatedBy,omitempty"`
 	IdempotencyKey    string              `json:"idempotencyKey"`
 }
@@ -442,25 +444,31 @@ type RecordCouponUsageRequest struct {
 
 var ErrNotSupported = fmt.Errorf("operation not supported by current data model")
 
+// ================================
+// Promotion DTOs
+// ================================
+
 type CreatePromotionRequest struct {
-	CompanyID   uuid.UUID  `json:"companyId"`
-	Name        string     `json:"name"`
-	Description *string    `json:"description,omitempty"`
-	StartDate   time.Time  `json:"startDate"`
-	EndDate     time.Time  `json:"endDate"`
-	IsActive    bool       `json:"isActive"`
-	Priority    *int       `json:"priority,omitempty"`
-	CreatedBy   *uuid.UUID `json:"createdBy,omitempty"`
+	CompanyID    uuid.UUID  `json:"companyId"`
+	Name         string     `json:"name"`
+	Description  *string    `json:"description,omitempty"`
+	StartDate    time.Time  `json:"startDate"`
+	EndDate      time.Time  `json:"endDate"`
+	IsActive     bool       `json:"isActive"`
+	Priority     *int       `json:"priority,omitempty"`
+	StackingType string     `json:"stacking_type,omitempty"` // NEW: "stackable", "exclusive", "none"
+	CreatedBy    *uuid.UUID `json:"createdBy,omitempty"`
 }
 
 type UpdatePromotionRequest struct {
-	Name        *string    `json:"name,omitempty"`
-	Description *string    `json:"description,omitempty"`
-	StartDate   *time.Time `json:"startDate,omitempty"`
-	EndDate     *time.Time `json:"endDate,omitempty"`
-	IsActive    *bool      `json:"isActive,omitempty"`
-	Priority    *int       `json:"priority,omitempty"`
-	UpdatedBy   *uuid.UUID `json:"updatedBy,omitempty"`
+	Name         *string    `json:"name,omitempty"`
+	Description  *string    `json:"description,omitempty"`
+	StartDate    *time.Time `json:"startDate,omitempty"`
+	EndDate      *time.Time `json:"endDate,omitempty"`
+	IsActive     *bool      `json:"isActive,omitempty"`
+	Priority     *int       `json:"priority,omitempty"`
+	StackingType *string    `json:"stacking_type,omitempty"` // NEW: allows update
+	UpdatedBy    *uuid.UUID `json:"updatedBy,omitempty"`
 }
 
 type PromotionListFilter struct {

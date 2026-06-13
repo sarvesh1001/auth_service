@@ -24,9 +24,9 @@ type Coupon struct {
 	ApplicableItems   datatypes.JSON     `gorm:"type:jsonb" json:"applicableItems,omitempty"`
 	IsActive          bool               `gorm:"not null;default:true" json:"isActive"`
 	DeletedAt         *time.Time         `gorm:"index" json:"deletedAt,omitempty"` // ← ADD THIS LINE
-
-	CreatedAt time.Time  `gorm:"not null;default:now()" json:"createdAt"`
-	UpdatedAt time.Time  `gorm:"autoUpdateTime" json:"updatedAt"`
-	CreatedBy *uuid.UUID `gorm:"type:uuid" json:"createdBy,omitempty"`
-	UpdatedBy *uuid.UUID `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	StackingType      string             `gorm:"type:varchar(20);not null;default:'stackable'" json:"stackingType"`
+	CreatedAt         time.Time          `gorm:"not null;default:now()" json:"createdAt"`
+	UpdatedAt         time.Time          `gorm:"autoUpdateTime" json:"updatedAt"`
+	CreatedBy         *uuid.UUID         `gorm:"type:uuid" json:"createdBy,omitempty"`
+	UpdatedBy         *uuid.UUID         `gorm:"type:uuid" json:"updatedBy,omitempty"`
 }

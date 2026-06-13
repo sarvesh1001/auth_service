@@ -55,6 +55,7 @@ type createCouponRequest struct {
 	PerUserLimit      *int    `json:"per_user_limit,omitempty"`
 	MinOrderAmount    *string `json:"min_order_amount,omitempty"`
 	ApplicableItems   *string `json:"applicable_items,omitempty"`
+	StackingType      string  `json:"stacking_type,omitempty"` // NEW
 }
 
 type createCouponResponse struct {
@@ -70,6 +71,7 @@ type createCouponResponse struct {
 	PerUserLimit      *int    `json:"per_user_limit,omitempty"`
 	MinOrderAmount    *string `json:"min_order_amount,omitempty"`
 	ApplicableItems   *string `json:"applicable_items,omitempty"`
+	StackingType      string  `json:"stacking_type,omitempty"` // NEW
 	IsActive          bool    `json:"is_active"`
 	CreatedAt         string  `json:"created_at"`
 	UpdatedAt         string  `json:"updated_at"`
@@ -85,6 +87,7 @@ type updateCouponRequest struct {
 	PerUserLimit      *int    `json:"per_user_limit,omitempty"`
 	MinOrderAmount    *string `json:"min_order_amount,omitempty"`
 	ApplicableItems   *string `json:"applicable_items,omitempty"`
+	StackingType      *string `json:"stacking_type,omitempty"` // NEW
 }
 
 type validateCouponRequest struct {
@@ -152,6 +155,7 @@ type couponUsageHistoryResponse struct {
 
 // ---------- Handler Methods ----------
 
+// CreateCoupon handles POST /coupons
 // CreateCoupon handles POST /coupons
 func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -221,6 +225,14 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 		applicableItems = datatypes.JSON(*req.ApplicableItems)
 	}
 
+	// --- Validate stacking_type ---
+	allowedStacking := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+	if req.StackingType != "" && !allowedStacking[req.StackingType] {
+		h.respondWithError(w, http.StatusBadRequest, "stacking_type must be 'stackable', 'exclusive', or 'none'")
+		return
+	}
+	// ------------------------------
+
 	if !h.hasPermission(ctx, companyID, userID, "coupon:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -238,6 +250,7 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 		PerUserLimit:      req.PerUserLimit,
 		MinOrderAmount:    minOrderAmount,
 		ApplicableItems:   applicableItems,
+		StackingType:      req.StackingType, // may be empty – service will default
 		CreatedBy:         &userID,
 	}
 
@@ -258,6 +271,7 @@ func (h *CouponHandler) CreateCoupon(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UpdateCoupon handles PUT /coupons/{id}
 // UpdateCoupon handles PUT /coupons/{id}
 func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -291,6 +305,14 @@ func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	// --- Validate stacking_type if provided ---
+	allowedStacking := map[string]bool{"stackable": true, "exclusive": true, "none": true}
+	if req.StackingType != nil && *req.StackingType != "" && !allowedStacking[*req.StackingType] {
+		h.respondWithError(w, http.StatusBadRequest, "stacking_type must be 'stackable', 'exclusive', or 'none'")
+		return
+	}
+	// -----------------------------------------
 
 	svcReq := &service.UpdateCouponRequest{UpdatedBy: &userID}
 	if req.DiscountType != nil {
@@ -355,9 +377,11 @@ func (h *CouponHandler) UpdateCoupon(w http.ResponseWriter, r *http.Request) {
 		if *req.ApplicableItems == "" {
 			svcReq.ApplicableItems = nil
 		} else {
-			jsonData := datatypes.JSON(*req.ApplicableItems)
-			svcReq.ApplicableItems = jsonData
+			svcReq.ApplicableItems = datatypes.JSON(*req.ApplicableItems)
 		}
+	}
+	if req.StackingType != nil {
+		svcReq.StackingType = req.StackingType
 	}
 
 	coupon, err := h.couponService.UpdateCoupon(ctx, companyID, couponID, svcReq)
@@ -926,7 +950,6 @@ func (h *CouponHandler) CalculateDiscount(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// ✅ FIX: pass companyID
 	discountAmount, err := h.couponService.CalculateDiscount(ctx, companyID, couponID, subtotal)
 	if err != nil {
 		h.logger.Error("failed to calculate discount", zap.Error(err))
@@ -987,7 +1010,6 @@ func (h *CouponHandler) CalculateDiscountForProducts(w http.ResponseWriter, r *h
 		return
 	}
 
-	// ✅ FIX: pass companyID
 	discountAmount, err := h.couponService.CalculateDiscountForProducts(ctx, companyID, couponID, subtotal, productIDs)
 	if err != nil {
 		h.logger.Error("failed to calculate discount for products", zap.Error(err))
@@ -1826,6 +1848,7 @@ func (h *CouponHandler) couponToResponse(c *discount.Coupon) createCouponRespons
 		UsageLimit:    c.UsageLimit,
 		PerUserLimit:  c.PerUserLimit,
 		IsActive:      c.IsActive,
+		StackingType:  c.StackingType, // NEW
 		CreatedAt:     c.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:     c.UpdatedAt.Format(time.RFC3339),
 	}

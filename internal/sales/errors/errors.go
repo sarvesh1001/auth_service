@@ -10,6 +10,7 @@ var (
 	ErrConflict         = errors.New("sales: conflict")
 	ErrPermissionDenied = errors.New("sales: permission denied")
 	ErrUnauthorized     = errors.New("sales: unauthorized") // <-- ADD THIS
+	ErrStackingConflict = errors.New("stacking conflict")
 
 	// Status transitions
 	ErrInvalidStatus     = errors.New("sales: invalid status")

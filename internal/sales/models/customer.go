@@ -44,6 +44,7 @@ type Customer struct {
 
 	CreditLimit   *decimal.Decimal `gorm:"type:numeric(14,2);default:0" json:"creditLimit,omitempty"`
 	PaymentTermID *uuid.UUID       `gorm:"type:uuid;index" json:"paymentTermId,omitempty"`
+	SalesRepID    *uuid.UUID       `gorm:"type:uuid;index" json:"salesRepId,omitempty"` // NEW
 	IsActive      bool             `gorm:"not null;default:true" json:"isActive"`
 	CreatedAt     time.Time        `gorm:"not null;default:now()" json:"createdAt"`
 	UpdatedAt     time.Time        `gorm:"autoUpdateTime" json:"updatedAt"`

@@ -25,7 +25,7 @@ type CouponRepository interface {
 	GetByID(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) (*discount.Coupon, error)
 	GetByCode(ctx context.Context, db DBTX, companyID uuid.UUID, code string) (*discount.Coupon, error)
 	Update(ctx context.Context, db DBTX, coupon *discount.Coupon) error
-	Delete(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) error // kept for interface, but implement soft delete
+	Delete(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) error // soft delete
 
 	GetApplicableCoupons(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error)
 	GetBestCoupon(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Coupon, decimal.Decimal, error)
@@ -41,6 +41,9 @@ type CouponRepository interface {
 	IsCustomerEligible(ctx context.Context, db DBTX, companyID, couponID, customerID uuid.UUID) (bool, error)
 	CanCustomerUseCoupon(ctx context.Context, db DBTX, companyID, couponID, customerID uuid.UUID) (bool, error)
 	ValidateCoupon(ctx context.Context, db DBTX, companyID uuid.UUID, code string, customerID *uuid.UUID, orderAmount decimal.Decimal, productIDs []uuid.UUID, at time.Time) (*discount.Coupon, error)
+
+	// GetStackingType returns the stacking_type for a coupon (stackable, exclusive, none)
+	GetStackingType(ctx context.Context, db DBTX, couponID uuid.UUID) (string, error)
 
 	CreateUsage(ctx context.Context, db DBTX, usage *discount.CouponUsage) error
 	GetUsageByID(ctx context.Context, db DBTX, usageID uuid.UUID) (*discount.CouponUsage, error)
@@ -183,7 +186,6 @@ func (r *couponRepository) buildCouponFilter(filter CouponFilter) (string, []int
 		args = append(args, *filter.Code)
 		idx++
 	}
-	// ... other filters unchanged ...
 	if filter.MinDiscountValue != nil {
 		conds = append(conds, fmt.Sprintf("discount_value >= $%d", idx))
 		args = append(args, *filter.MinDiscountValue)
@@ -251,7 +253,7 @@ func (r *couponRepository) buildCouponFilter(filter CouponFilter) (string, []int
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanCoupon now includes DeletedAt
+// scanCoupon now includes stacking_type and deleted_at
 func (r *couponRepository) scanCoupon(s scanner) (*discount.Coupon, error) {
 	var c discount.Coupon
 	var usageLimit, perUserLimit sql.NullInt32
@@ -279,6 +281,7 @@ func (r *couponRepository) scanCoupon(s scanner) (*discount.Coupon, error) {
 		&createdBy,
 		&updatedBy,
 		&deletedAt,
+		&c.StackingType, // <-- ADDED stacking_type
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -342,7 +345,7 @@ func (r *couponRepository) scanCouponUsage(s scanner) (*discount.CouponUsage, er
 }
 
 // -------------------------------------------------------------------------
-// COUPON CRUD
+// COUPON CRUD (including stacking_type)
 // -------------------------------------------------------------------------
 
 func (r *couponRepository) Create(ctx context.Context, db DBTX, coupon *discount.Coupon) error {
@@ -350,10 +353,11 @@ func (r *couponRepository) Create(ctx context.Context, db DBTX, coupon *discount
 		INSERT INTO sales.coupons (
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
-			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by
+			min_order_amount, applicable_items, is_active, stacking_type,
+			created_at, updated_at, created_by, updated_by
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW(), $14, $15
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+			NOW(), NOW(), $15, $16
 		)
 		RETURNING created_at, updated_at
 	`
@@ -398,6 +402,7 @@ func (r *couponRepository) Create(ctx context.Context, db DBTX, coupon *discount
 		minOrder,
 		applicable,
 		coupon.IsActive,
+		coupon.StackingType, // <-- ADDED stacking_type
 		r.nullUUIDParam(coupon.CreatedBy),
 		r.nullUUIDParam(coupon.UpdatedBy),
 	).Scan(&coupon.CreatedAt, &coupon.UpdatedAt)
@@ -415,7 +420,7 @@ func (r *couponRepository) GetByID(ctx context.Context, db DBTX, companyID, coup
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL
 	`
@@ -429,7 +434,7 @@ func (r *couponRepository) GetByCode(ctx context.Context, db DBTX, companyID uui
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND code = $2 AND deleted_at IS NULL
 	`
@@ -452,8 +457,9 @@ func (r *couponRepository) Update(ctx context.Context, db DBTX, coupon *discount
 			applicable_items = $12,
 			is_active = $13,
 			deleted_at = $14,
+			stacking_type = $15,
 			updated_at = NOW(),
-			updated_by = $15
+			updated_by = $16
 		WHERE coupon_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -505,6 +511,7 @@ func (r *couponRepository) Update(ctx context.Context, db DBTX, coupon *discount
 		applicable,
 		coupon.IsActive,
 		deletedAt,
+		coupon.StackingType, // <-- ADDED stacking_type
 		r.nullUUIDParam(coupon.UpdatedBy),
 	).Scan(&coupon.UpdatedAt)
 
@@ -960,7 +967,7 @@ func (r *couponRepository) List(ctx context.Context, db DBTX, filter CouponFilte
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		%s
 		%s
@@ -1007,7 +1014,7 @@ func (r *couponRepository) Search(ctx context.Context, db DBTX, companyID uuid.U
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND code ILIKE $2 AND deleted_at IS NULL
 		ORDER BY code ASC
@@ -1036,7 +1043,7 @@ func (r *couponRepository) GetActiveCoupons(ctx context.Context, db DBTX, compan
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND is_active = true AND start_date <= $2 AND end_date >= $2 AND deleted_at IS NULL
 		ORDER BY created_at DESC
@@ -1063,7 +1070,7 @@ func (r *couponRepository) GetExpiredCoupons(ctx context.Context, db DBTX, compa
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND end_date < $2 AND deleted_at IS NULL
 		ORDER BY end_date ASC
@@ -1090,7 +1097,7 @@ func (r *couponRepository) GetCouponsExpiringSoon(ctx context.Context, db DBTX, 
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND is_active = true AND end_date < $2 AND end_date >= NOW() AND deleted_at IS NULL
 		ORDER BY end_date ASC
@@ -1172,7 +1179,7 @@ func (r *couponRepository) GetTopCouponsByUsage(ctx context.Context, db DBTX, co
 			c.coupon_id, c.company_id, c.code, c.discount_type, c.discount_value,
 			c.max_discount_amount, c.start_date, c.end_date, c.usage_limit, c.per_user_limit,
 			c.min_order_amount, c.applicable_items, c.is_active, c.created_at, c.updated_at,
-			c.created_by, c.updated_by, c.deleted_at
+			c.created_by, c.updated_by, c.deleted_at, c.stacking_type
 		FROM sales.coupons c
 		JOIN sales.coupon_usages cu ON c.coupon_id = cu.coupon_id
 		WHERE %s
@@ -1221,7 +1228,7 @@ func (r *couponRepository) GetTopCouponsByDiscountAmount(ctx context.Context, db
 			c.coupon_id, c.company_id, c.code, c.discount_type, c.discount_value,
 			c.max_discount_amount, c.start_date, c.end_date, c.usage_limit, c.per_user_limit,
 			c.min_order_amount, c.applicable_items, c.is_active, c.created_at, c.updated_at,
-			c.created_by, c.updated_by, c.deleted_at
+			c.created_by, c.updated_by, c.deleted_at, c.stacking_type
 		FROM sales.coupons c
 		JOIN sales.coupon_usages cu ON c.coupon_id = cu.coupon_id
 		WHERE %s
@@ -1252,7 +1259,7 @@ func (r *couponRepository) GetUnusedCoupons(ctx context.Context, db DBTX, compan
 			c.coupon_id, c.company_id, c.code, c.discount_type, c.discount_value,
 			c.max_discount_amount, c.start_date, c.end_date, c.usage_limit, c.per_user_limit,
 			c.min_order_amount, c.applicable_items, c.is_active, c.created_at, c.updated_at,
-			c.created_by, c.updated_by, c.deleted_at
+			c.created_by, c.updated_by, c.deleted_at, c.stacking_type
 		FROM sales.coupons c
 		LEFT JOIN sales.coupon_usages cu ON c.coupon_id = cu.coupon_id
 		WHERE c.company_id = $1 AND cu.usage_id IS NULL AND c.deleted_at IS NULL
@@ -1283,7 +1290,7 @@ func (r *couponRepository) GetByIDForUpdate(ctx context.Context, db DBTX, compan
 			coupon_id, company_id, code, discount_type, discount_value,
 			max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
 			min_order_amount, applicable_items, is_active, created_at, updated_at,
-			created_by, updated_by, deleted_at
+			created_by, updated_by, deleted_at, stacking_type
 		FROM sales.coupons
 		WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL
 		FOR UPDATE
@@ -1297,7 +1304,7 @@ func (r *couponRepository) GetApplicableCoupons(ctx context.Context, db DBTX, co
         SELECT coupon_id, company_id, code, discount_type, discount_value,
                max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
                min_order_amount, applicable_items, is_active, created_at, updated_at,
-               created_by, updated_by, deleted_at
+               created_by, updated_by, deleted_at, stacking_type
         FROM sales.coupons
         WHERE company_id = $1
           AND is_active = true
@@ -1364,4 +1371,18 @@ func (r *couponRepository) GetBestCoupon(ctx context.Context, db DBTX, companyID
 		}
 	}
 	return bestCoupon, bestDiscount, nil
+}
+
+// GetStackingType returns the stacking_type for a coupon
+func (r *couponRepository) GetStackingType(ctx context.Context, db DBTX, couponID uuid.UUID) (string, error) {
+	var stackingType string
+	query := `SELECT stacking_type FROM sales.coupons WHERE coupon_id = $1 AND deleted_at IS NULL`
+	err := db.QueryRowContext(ctx, query, couponID).Scan(&stackingType)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", saleserrors.ErrNotFound
+		}
+		return "", fmt.Errorf("get stacking type: %w", err)
+	}
+	return stackingType, nil
 }

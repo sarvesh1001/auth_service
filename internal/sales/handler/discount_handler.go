@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -13,18 +14,28 @@ import (
 	"auth-service/internal/sales/service"
 )
 
-// DiscountHandler handles HTTP requests for discount engine operations.
+// DiscountHandler handles all discount-related HTTP endpoints
 type DiscountHandler struct {
 	discountService service.DiscountEngineService
 	*BaseHandler
 }
 
-// NewDiscountHandler creates a new DiscountHandler.
+// NewDiscountHandler creates a new discount handler
 func NewDiscountHandler(discountService service.DiscountEngineService, logger *zap.Logger) *DiscountHandler {
 	return &DiscountHandler{
 		discountService: discountService,
 		BaseHandler:     &BaseHandler{logger: logger.Named("discount_handler")},
 	}
+}
+
+// injectIdempotencyKey reads the Idempotency-Key header and stores it in the request context.
+// Used only by mutating endpoints.
+func (h *DiscountHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
 }
 
 // ---------- Request/Response Types ----------
@@ -41,35 +52,6 @@ type evaluateInvoiceDiscountsRequest struct {
 	InvoiceID string `json:"invoice_id"`
 }
 
-// The following structs are currently unused but kept for completeness.
-type getApplicableCouponsRequest struct {
-	CustomerID  *string  `json:"customer_id,omitempty"`
-	ProductIDs  []string `json:"product_ids,omitempty"`
-	OrderAmount string   `json:"order_amount"`
-	At          string   `json:"at"`
-}
-
-type getBestCouponRequest struct {
-	CustomerID  *string  `json:"customer_id,omitempty"`
-	ProductIDs  []string `json:"product_ids,omitempty"`
-	OrderAmount string   `json:"order_amount"`
-	At          string   `json:"at"`
-}
-
-type getApplicablePromotionsRequest struct {
-	CustomerID  *string  `json:"customer_id,omitempty"`
-	ProductIDs  []string `json:"product_ids,omitempty"`
-	OrderAmount string   `json:"order_amount"`
-	At          string   `json:"at"`
-}
-
-type getBestPromotionRequest struct {
-	CustomerID  *string  `json:"customer_id,omitempty"`
-	ProductIDs  []string `json:"product_ids,omitempty"`
-	OrderAmount string   `json:"order_amount"`
-	At          string   `json:"at"`
-}
-
 type bestDiscountCombinationRequest struct {
 	CustomerID  *string  `json:"customer_id,omitempty"`
 	ProductIDs  []string `json:"product_ids,omitempty"`
@@ -81,11 +63,6 @@ type validateStackingRulesRequest struct {
 	CouponIDs            []string `json:"coupon_ids,omitempty"`
 	PromotionIDs         []string `json:"promotion_ids,omitempty"`
 	AutomaticDiscountIDs []string `json:"automatic_discount_ids,omitempty"`
-}
-
-type canStackDiscountsRequest struct {
-	FirstDiscountID  string `json:"first_discount_id"`
-	SecondDiscountID string `json:"second_discount_id"`
 }
 
 type calculateCouponDiscountRequest struct {
@@ -117,7 +94,7 @@ type applyCouponRequest struct {
 	EntityType string `json:"entity_type"` // order, quote, invoice
 	EntityID   string `json:"entity_id"`
 	CouponCode string `json:"coupon_code"`
-	AppliedBy  string `json:"applied_by"` // user ID
+	AppliedBy  string `json:"applied_by"`
 }
 
 type removeCouponRequest struct {
@@ -158,7 +135,7 @@ type trackCouponUsageRequest struct {
 	CustomerID *string `json:"customer_id,omitempty"`
 	EntityType string  `json:"entity_type"`
 	EntityID   string  `json:"entity_id"`
-	UsedAt     string  `json:"used_at"` // RFC3339
+	UsedAt     string  `json:"used_at"`
 }
 
 type trackPromotionUsageRequest struct {
@@ -169,7 +146,7 @@ type trackPromotionUsageRequest struct {
 	UsedAt      string  `json:"used_at"`
 }
 
-// ---------- Handler Methods ----------
+// ---------- Read‑only endpoints (no idempotency required) ----------
 
 // EvaluateOrderDiscounts handles POST /discounts/evaluate-order
 func (h *DiscountHandler) EvaluateOrderDiscounts(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +169,6 @@ func (h *DiscountHandler) EvaluateOrderDiscounts(w http.ResponseWriter, r *http.
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
 	if req.OrderID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "order_id is required")
 		return
@@ -205,12 +181,6 @@ func (h *DiscountHandler) EvaluateOrderDiscounts(w http.ResponseWriter, r *http.
 
 	if !h.hasPermission(ctx, companyID, userID, "discount:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -268,12 +238,6 @@ func (h *DiscountHandler) EvaluateQuoteDiscounts(w http.ResponseWriter, r *http.
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := &service.EvaluateQuoteDiscountsRequest{
 		CompanyID: companyID,
 		QuoteID:   quoteID,
@@ -325,12 +289,6 @@ func (h *DiscountHandler) EvaluateInvoiceDiscounts(w http.ResponseWriter, r *htt
 
 	if !h.hasPermission(ctx, companyID, userID, "discount:read") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -774,18 +732,16 @@ func (h *DiscountHandler) GetBestDiscountCombination(w http.ResponseWriter, r *h
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := &service.BestDiscountCombinationRequest{
-		CompanyID:   companyID,
-		CustomerID:  customerID,
-		ProductIDs:  productIDs,
-		OrderAmount: orderAmount,
-		At:          at,
+		CompanyID:         companyID,
+		CustomerID:        customerID,
+		ProductIDs:        productIDs,
+		OrderAmount:       orderAmount,
+		At:                at,
+		IncludeCoupons:    true, // <-- add this
+		IncludePromotions: true, // <-- add this
+		IncludeAutomatic:  true, // <-- add this
+		MaxCombinations:   5,    // <-- add this (or any reasonable limit)
 	}
 	result, err := h.discountService.GetBestDiscountCombination(ctx, svcReq)
 	if err != nil {
@@ -853,12 +809,6 @@ func (h *DiscountHandler) ValidateStackingRules(w http.ResponseWriter, r *http.R
 
 	if !h.hasPermission(ctx, companyID, userID, "discount:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 
@@ -978,13 +928,7 @@ func (h *DiscountHandler) CalculateCouponDiscount(w http.ResponseWriter, r *http
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	discount, err := h.discountService.CalculateCouponDiscount(ctx, couponID, subtotal, productIDs)
+	discount, err := h.discountService.CalculateCouponDiscount(ctx, companyID, couponID, subtotal, productIDs)
 	if err != nil {
 		h.logger.Error("failed to calculate coupon discount", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1048,13 +992,7 @@ func (h *DiscountHandler) CalculatePromotionDiscount(w http.ResponseWriter, r *h
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	discount, err := h.discountService.CalculatePromotionDiscount(ctx, promotionID, subtotal, productIDs)
+	discount, err := h.discountService.CalculatePromotionDiscount(ctx, companyID, promotionID, subtotal, productIDs)
 	if err != nil {
 		h.logger.Error("failed to calculate promotion discount", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1118,13 +1056,7 @@ func (h *DiscountHandler) CalculateAutomaticDiscount(w http.ResponseWriter, r *h
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	discount, err := h.discountService.CalculateAutomaticDiscount(ctx, autoID, subtotal, productIDs)
+	discount, err := h.discountService.CalculateAutomaticDiscount(ctx, companyID, autoID, subtotal, productIDs)
 	if err != nil {
 		h.logger.Error("failed to calculate automatic discount", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -1197,12 +1129,6 @@ func (h *DiscountHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *ht
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	svcReq := &service.CombinedDiscountCalculationRequest{
 		CompanyID:   companyID,
 		CustomerID:  customerID,
@@ -1223,6 +1149,8 @@ func (h *DiscountHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *ht
 		"data":    result,
 	})
 }
+
+// ---------- Mutating endpoints (require Idempotency-Key header) ----------
 
 // ApplyCoupon handles POST /discounts/apply-coupon
 func (h *DiscountHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
@@ -1270,6 +1198,7 @@ func (h *DiscountHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	coupon, discount, err := h.discountService.ApplyCoupon(ctx, companyID, req.EntityType, entityID, req.CouponCode, appliedBy)
 	if err != nil {
@@ -1332,6 +1261,7 @@ func (h *DiscountHandler) RemoveCoupon(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.discountService.RemoveCoupon(ctx, companyID, req.EntityType, entityID, req.CouponCode, removedBy)
 	if err != nil {
@@ -1398,6 +1328,7 @@ func (h *DiscountHandler) ApplyPromotion(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	promotion, discount, err := h.discountService.ApplyPromotion(ctx, companyID, req.EntityType, entityID, promotionID, appliedBy)
 	if err != nil {
@@ -1465,6 +1396,7 @@ func (h *DiscountHandler) RemovePromotion(w http.ResponseWriter, r *http.Request
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.discountService.RemovePromotion(ctx, companyID, req.EntityType, entityID, promotionID, removedBy)
 	if err != nil {
@@ -1526,6 +1458,7 @@ func (h *DiscountHandler) ApplyBestDiscounts(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	result, err := h.discountService.ApplyBestDiscounts(ctx, companyID, req.EntityType, entityID, appliedBy)
 	if err != nil {
@@ -1587,6 +1520,7 @@ func (h *DiscountHandler) ClearDiscounts(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.discountService.ClearDiscounts(ctx, companyID, req.EntityType, entityID, clearedBy)
 	if err != nil {
@@ -1662,6 +1596,7 @@ func (h *DiscountHandler) TrackCouponUsage(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.discountService.TrackCouponUsage(ctx, companyID, couponID, customerID, req.EntityType, entityID, usedAt)
 	if err != nil {
@@ -1737,6 +1672,7 @@ func (h *DiscountHandler) TrackPromotionUsage(w http.ResponseWriter, r *http.Req
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	err = h.discountService.TrackPromotionUsage(ctx, companyID, promotionID, customerID, req.EntityType, entityID, usedAt)
 	if err != nil {
@@ -1751,6 +1687,8 @@ func (h *DiscountHandler) TrackPromotionUsage(w http.ResponseWriter, r *http.Req
 		"message": "promotion usage tracked",
 	})
 }
+
+// ---------- Read‑only analytics / reporting ----------
 
 // GetCouponUsageCount handles GET /discounts/coupon-usage-count
 func (h *DiscountHandler) GetCouponUsageCount(w http.ResponseWriter, r *http.Request) {

@@ -101,6 +101,8 @@ func (h *BaseHandler) mapServiceError(err error) (status int, message string) {
 		return http.StatusBadRequest, "coupon inactive"
 	case errors.Is(err, salesErrors.ErrCouponUsageLimit):
 		return http.StatusBadRequest, "coupon usage limit exceeded"
+	case errors.Is(err, salesErrors.ErrStackingConflict): // ✅ NEW: stacking conflict → 400 Bad Request
+		return http.StatusBadRequest, err.Error()
 	default:
 		return http.StatusInternalServerError, "internal server error"
 	}
