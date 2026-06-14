@@ -1,3 +1,5 @@
+// file: internal/sales/handler/product_handler.go
+
 package handler
 
 import (
@@ -37,6 +39,7 @@ type createProductRequest struct {
 	UnitPrice       string  `json:"unit_price"`
 	IsActive        bool    `json:"is_active"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
+	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
 }
 
 type createProductResponse struct {
@@ -48,6 +51,7 @@ type createProductResponse struct {
 	UnitPrice       string  `json:"unit_price"`
 	IsActive        bool    `json:"is_active"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
+	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
 	CreatedAt       string  `json:"created_at"`
 	UpdatedAt       string  `json:"updated_at"`
 }
@@ -58,6 +62,7 @@ type updateProductRequest struct {
 	UnitPrice       *string `json:"unit_price,omitempty"`
 	IsActive        *bool   `json:"is_active,omitempty"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
+	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
 }
 
 type updateProductStatusRequest struct {
@@ -86,6 +91,7 @@ type productSummary struct {
 	UnitPrice       string  `json:"unit_price"`
 	IsActive        bool    `json:"is_active"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
+	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
 }
 
 // ---------- Helper to extract company ID from header ----------
@@ -162,6 +168,21 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		inventoryItemID = &parsed
 	}
 
+	// NEW: parse tax_rate
+	var taxRate *decimal.Decimal
+	if req.TaxRate != nil && *req.TaxRate != "" {
+		tr, err := decimal.NewFromString(*req.TaxRate)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid tax_rate")
+			return
+		}
+		if tr.LessThan(decimal.Zero) || tr.GreaterThan(decimal.NewFromInt(100)) {
+			h.respondWithError(w, http.StatusBadRequest, "tax_rate must be between 0 and 100")
+			return
+		}
+		taxRate = &tr
+	}
+
 	if !h.hasPermission(ctx, companyID, userID, "product:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
@@ -181,6 +202,7 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		UnitPrice:       unitPrice,
 		IsActive:        &req.IsActive,
 		InventoryItemID: inventoryItemID,
+		TaxRate:         taxRate, // NEW
 		CreatedBy:       &userID,
 	}
 
@@ -206,6 +228,10 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 	if product.InventoryItemID != nil {
 		idStr := product.InventoryItemID.String()
 		resp.InventoryItemID = &idStr
+	}
+	if product.TaxRate != nil {
+		trStr := product.TaxRate.String()
+		resp.TaxRate = &trStr
 	}
 
 	location := fmt.Sprintf("/products/%s", product.ProductID)
@@ -273,6 +299,21 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		inventoryItemID = &parsed
 	}
 
+	// NEW: parse tax_rate update
+	var taxRate *decimal.Decimal
+	if req.TaxRate != nil && *req.TaxRate != "" {
+		tr, err := decimal.NewFromString(*req.TaxRate)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid tax_rate")
+			return
+		}
+		if tr.LessThan(decimal.Zero) || tr.GreaterThan(decimal.NewFromInt(100)) {
+			h.respondWithError(w, http.StatusBadRequest, "tax_rate must be between 0 and 100")
+			return
+		}
+		taxRate = &tr
+	}
+
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
@@ -285,6 +326,7 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		UnitPrice:       unitPrice,
 		IsActive:        req.IsActive,
 		InventoryItemID: inventoryItemID,
+		TaxRate:         taxRate, // NEW
 		UpdatedBy:       &userID,
 	}
 
@@ -310,6 +352,10 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 	if updated.InventoryItemID != nil {
 		idStr := updated.InventoryItemID.String()
 		resp.InventoryItemID = &idStr
+	}
+	if updated.TaxRate != nil {
+		trStr := updated.TaxRate.String()
+		resp.TaxRate = &trStr
 	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -415,6 +461,10 @@ func (h *ProductHandler) GetProductByID(w http.ResponseWriter, r *http.Request) 
 		idStr := product.InventoryItemID.String()
 		resp.InventoryItemID = &idStr
 	}
+	if product.TaxRate != nil {
+		trStr := product.TaxRate.String()
+		resp.TaxRate = &trStr
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -472,6 +522,10 @@ func (h *ProductHandler) GetProductBySKU(w http.ResponseWriter, r *http.Request)
 		idStr := product.InventoryItemID.String()
 		resp.InventoryItemID = &idStr
 	}
+	if product.TaxRate != nil {
+		trStr := product.TaxRate.String()
+		resp.TaxRate = &trStr
+	}
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -511,6 +565,19 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	}
 	if search := r.URL.Query().Get("search"); search != "" {
 		filter.Search = &search
+	}
+	// NEW: tax rate filters
+	if minTaxRateStr := r.URL.Query().Get("min_tax_rate"); minTaxRateStr != "" {
+		minTaxRate, err := decimal.NewFromString(minTaxRateStr)
+		if err == nil {
+			filter.MinTaxRate = &minTaxRate
+		}
+	}
+	if maxTaxRateStr := r.URL.Query().Get("max_tax_rate"); maxTaxRateStr != "" {
+		maxTaxRate, err := decimal.NewFromString(maxTaxRateStr)
+		if err == nil {
+			filter.MaxTaxRate = &maxTaxRate
+		}
 	}
 
 	limit := 20
@@ -557,6 +624,10 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 		if p.InventoryItemID != nil {
 			idStr := p.InventoryItemID.String()
 			summaries[i].InventoryItemID = &idStr
+		}
+		if p.TaxRate != nil {
+			trStr := p.TaxRate.String()
+			summaries[i].TaxRate = &trStr
 		}
 	}
 

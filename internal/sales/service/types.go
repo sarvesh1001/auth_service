@@ -67,14 +67,15 @@ type CustomerListFilter struct {
 // ================================
 
 type CreateProductRequest struct {
-	CompanyID       uuid.UUID       `json:"companyId"`
-	SKU             string          `json:"sku"`
-	Name            string          `json:"name"`
-	Description     *string         `json:"description,omitempty"`
-	UnitPrice       decimal.Decimal `json:"unitPrice"`
-	InventoryItemID *uuid.UUID      `json:"inventoryItemId,omitempty"`
-	IsActive        *bool           `json:"isActive,omitempty"`
-	CreatedBy       *uuid.UUID      `json:"createdBy,omitempty"`
+	CompanyID       uuid.UUID        `json:"companyId"`
+	SKU             string           `json:"sku"`
+	Name            string           `json:"name"`
+	Description     *string          `json:"description,omitempty"`
+	UnitPrice       decimal.Decimal  `json:"unitPrice"`
+	InventoryItemID *uuid.UUID       `json:"inventoryItemId,omitempty"`
+	IsActive        *bool            `json:"isActive,omitempty"`
+	TaxRate         *decimal.Decimal `json:"taxRate,omitempty"` // NEW
+	CreatedBy       *uuid.UUID       `json:"createdBy,omitempty"`
 }
 
 type UpdateProductRequest struct {
@@ -83,9 +84,9 @@ type UpdateProductRequest struct {
 	UnitPrice       *decimal.Decimal `json:"unitPrice,omitempty"`
 	InventoryItemID *uuid.UUID       `json:"inventoryItemId,omitempty"`
 	IsActive        *bool            `json:"isActive,omitempty"`
+	TaxRate         *decimal.Decimal `json:"taxRate,omitempty"` // NEW
 	UpdatedBy       *uuid.UUID       `json:"updatedBy,omitempty"`
 }
-
 type ProductListFilter struct {
 	CompanyID       uuid.UUID        `json:"companyId"`
 	IsActive        *bool            `json:"isActive,omitempty"`
@@ -93,6 +94,8 @@ type ProductListFilter struct {
 	MinPrice        *decimal.Decimal `json:"minPrice,omitempty"`
 	MaxPrice        *decimal.Decimal `json:"maxPrice,omitempty"`
 	Search          *string          `json:"search,omitempty"` // searches SKU, Name
+	MinTaxRate      *decimal.Decimal `json:"minTaxRate,omitempty"`
+	MaxTaxRate      *decimal.Decimal `json:"maxTaxRate,omitempty"`
 }
 
 // ================================
@@ -283,11 +286,10 @@ type QuotePricingPreviewRequest struct {
 type InvoicePricingPreviewRequest struct {
 	CompanyID   uuid.UUID
 	CustomerID  *uuid.UUID
-	Items       []*CreateOrderItemRequest // reuse same item structure
+	Items       []CreateInvoiceItemRequest // ✅ includes TaxRate
 	CouponCodes []string
 	At          *time.Time
 }
-
 type PricingPreviewResult struct {
 	Subtotal          decimal.Decimal
 	DiscountTotal     decimal.Decimal
@@ -1741,6 +1743,16 @@ type TaxBreakdownLine struct {
 	TaxAmount     decimal.Decimal
 }
 
+type CreateInvoiceItemRequest struct {
+	OrderItemID *uuid.UUID
+	ProductID   uuid.UUID
+	Quantity    decimal.Decimal
+	UnitPrice   *decimal.Decimal
+	Discount    *decimal.Decimal
+	TaxRate     *decimal.Decimal // NEW: percentage (e.g., 10 for 10%)
+	Metadata    models.JSONB
+}
+
 type CreateInvoiceRequest struct {
 	CompanyID            uuid.UUID
 	CustomerID           uuid.UUID
@@ -1760,35 +1772,24 @@ type CreateInvoiceRequest struct {
 	EarlyDiscountDays    *int
 }
 
-type CreateInvoiceItemRequest struct {
-	ProductID   uuid.UUID
-	Quantity    decimal.Decimal
-	UnitPrice   *decimal.Decimal
-	Discount    *decimal.Decimal
-	OrderItemID *uuid.UUID // NEW – links to sales.order_items for partial invoicing & reversal
-	Metadata    models.JSONB
-}
-type CreateInvoiceFromOrderRequest struct {
-	OrderID     string                    `json:"order_id"`
-	Items       []PartialInvoiceItemInput `json:"items,omitempty"` // NEW – if empty, invoice all remaining quantities
-	InvoiceDate string                    `json:"invoice_date,omitempty"`
-	DueDate     string                    `json:"due_date,omitempty"`
-	Notes       *string                   `json:"notes,omitempty"`
-	CreatedBy   *uuid.UUID                `json:"-"` // set by handler
-}
-type CreateInvoiceFromQuoteRequest struct {
-	QuoteID     string     `json:"quote_id"`
-	InvoiceDate string     `json:"invoice_date,omitempty"`
-	DueDate     string     `json:"due_date,omitempty"`
-	Notes       *string    `json:"notes,omitempty"`
-	CreatedBy   *uuid.UUID `json:"-"`
+type UpdateInvoiceRequest struct {
+	DueDate   *time.Time
+	Currency  *string
+	Notes     *string
+	UpdatedBy *uuid.UUID
 }
 
-type UpdateInvoiceRequest struct {
-	DueDate   *time.Time `json:"due_date,omitempty"`
-	Currency  *string    `json:"currency,omitempty"`
-	Notes     *string    `json:"notes,omitempty"`
-	UpdatedBy *uuid.UUID
+type CreateInvoiceFromOrderRequest struct {
+	InvoiceDate string
+	DueDate     string
+	Notes       *string
+	Items       []PartialInvoiceItemInput
+	CreatedBy   *uuid.UUID
+}
+
+type PartialInvoiceItemInput struct {
+	OrderItemID uuid.UUID
+	Quantity    decimal.Decimal
 }
 
 type RegisterInvoicePaymentRequest struct {
@@ -1797,6 +1798,12 @@ type RegisterInvoicePaymentRequest struct {
 	PaymentID   uuid.UUID
 	Amount      decimal.Decimal
 	AllocatedBy *uuid.UUID
+}
+
+type InvoicePayment struct {
+	PaymentID   uuid.UUID
+	Amount      decimal.Decimal
+	AllocatedAt time.Time
 }
 
 type InvoiceListFilter struct {
@@ -1836,15 +1843,7 @@ type InvoicePricingLineDetail struct {
 	TaxAmount      decimal.Decimal
 	LineTotal      decimal.Decimal
 }
-
-type InvoicePayment struct {
-	PaymentID   uuid.UUID
-	Amount      decimal.Decimal
-	AllocatedAt time.Time
-}
-
-// PartialInvoiceItemInput specifies which order items and how much to invoice.
-type PartialInvoiceItemInput struct {
-	OrderItemID uuid.UUID       `json:"order_item_id"`
-	Quantity    decimal.Decimal `json:"quantity"`
+type CreateInvoiceFromQuoteRequest struct {
+	Notes     *string    `json:"notes,omitempty"`
+	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
 }

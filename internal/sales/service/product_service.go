@@ -93,14 +93,12 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 	}
 	defer tx.Rollback()
 
-	// Idempotency check
 	var cached *models.Product
 	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached product")
 		return cached, nil
 	}
 
-	// Check SKU uniqueness
 	exists, err := s.productRepo.ExistsBySKU(ctx, tx, req.CompanyID, req.SKU)
 	if err != nil {
 		return nil, fmt.Errorf("check sku existence: %w", err)
@@ -109,7 +107,6 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 		return nil, fmt.Errorf("%w: sku %s already exists", salesErrors.ErrDuplicate, req.SKU)
 	}
 
-	// Validate inventory item if provided
 	if req.InventoryItemID != nil {
 		if err := s.validateInventoryItem(ctx, tx, *req.InventoryItemID, req.CompanyID); err != nil {
 			return nil, err
@@ -130,6 +127,7 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 		UnitPrice:       req.UnitPrice,
 		IsActive:        isActive,
 		InventoryItemID: req.InventoryItemID,
+		TaxRate:         req.TaxRate, // NEW: set tax rate
 		CreatedBy:       req.CreatedBy,
 		UpdatedBy:       req.CreatedBy,
 	}
@@ -138,24 +136,22 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 		return nil, fmt.Errorf("create product: %w", err)
 	}
 
-	// Emit creation event
 	if err := s.emitProductEvent(ctx, tx, product, salesEvents.EventProductCreated); err != nil {
 		logger.Warn("failed to emit product created event", zap.Error(err))
 	}
 
-	// Store idempotency result
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, product)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Audit log
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "create_product", "product",
 			&product.ProductID, "user", req.CreatedBy, nil, nil, map[string]interface{}{
-				"sku":  product.SKU,
-				"name": product.Name,
+				"sku":      product.SKU,
+				"name":     product.Name,
+				"tax_rate": product.TaxRate,
 			})
 	}
 
@@ -189,7 +185,6 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 		return nil, salesErrors.ErrPermissionDenied
 	}
 
-	// Validate inventory item if being changed to a non-nil value
 	if req.InventoryItemID != nil && *req.InventoryItemID != uuid.Nil {
 		if err := s.validateInventoryItem(ctx, tx, *req.InventoryItemID, companyID); err != nil {
 			return nil, err
@@ -221,10 +216,13 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 	if req.InventoryItemID != nil {
 		old := product.InventoryItemID
 		product.InventoryItemID = req.InventoryItemID
-		changes["inventory_item_id"] = map[string]interface{}{
-			"old": old,
-			"new": req.InventoryItemID,
-		}
+		changes["inventory_item_id"] = map[string]interface{}{"old": old, "new": req.InventoryItemID}
+	}
+	// NEW: handle tax_rate update
+	if req.TaxRate != nil && !req.TaxRate.Equal(decimal.Zero) {
+		old := product.TaxRate
+		product.TaxRate = req.TaxRate
+		changes["tax_rate"] = map[string]interface{}{"old": old, "new": req.TaxRate}
 	}
 
 	product.UpdatedBy = req.UpdatedBy
@@ -233,7 +231,6 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 		return nil, fmt.Errorf("update product: %w", err)
 	}
 
-	// Emit appropriate events
 	if err := s.emitProductEvent(ctx, tx, product, salesEvents.EventProductUpdated); err != nil {
 		logger.Warn("failed to emit product updated event", zap.Error(err))
 	}
@@ -249,7 +246,6 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 			_ = s.emitProductEvent(ctx, tx, product, salesEvents.EventProductInventoryUnlinked)
 		}
 	}
-
 	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, product)
 
 	if err := tx.Commit(); err != nil {
@@ -287,14 +283,12 @@ func (s *productService) DeleteProduct(ctx context.Context, companyID, productID
 		return salesErrors.ErrPermissionDenied
 	}
 
-	// Check if product is referenced in any sales documents
 	hasReferences, err := s.hasSalesReferences(ctx, tx, companyID, productID)
 	if err != nil {
 		return fmt.Errorf("check references: %w", err)
 	}
 
 	if hasReferences {
-		// Soft delete: deactivate instead
 		if product.IsActive {
 			if err := s.productRepo.SetActiveStatus(ctx, tx, companyID, productID, false, deletedBy); err != nil {
 				return fmt.Errorf("deactivate product: %w", err)
@@ -345,6 +339,8 @@ func (s *productService) ListProducts(ctx context.Context, filter ProductListFil
 		MinUnitPrice:     filter.MinPrice,
 		MaxUnitPrice:     filter.MaxPrice,
 		SearchTerm:       filter.Search,
+		MinTaxRate:       filter.MinTaxRate, // NEW: pass tax rate filters
+		MaxTaxRate:       filter.MaxTaxRate, // NEW: pass tax rate filters
 	}
 	return s.productRepo.List(ctx, nil, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
@@ -469,7 +465,6 @@ func (s *productService) UpdateUnitPrice(ctx context.Context, companyID, product
 }
 
 func (s *productService) LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	// Validate inventory item exists and is active before linking
 	txCheck, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx for validation: %w", err)
@@ -478,7 +473,7 @@ func (s *productService) LinkInventoryItem(ctx context.Context, companyID, produ
 		txCheck.Rollback()
 		return err
 	}
-	txCheck.Rollback() // validation passed, no need to keep this tx
+	txCheck.Rollback()
 
 	return s.updateInventoryLink(ctx, companyID, productID, &inventoryItemID, updatedBy, idempotencyKey, salesEvents.EventProductInventoryLinked)
 }
@@ -562,7 +557,6 @@ func (s *productService) validateCreateProduct(req CreateProductRequest) error {
 	return nil
 }
 
-// validateInventoryItem checks that the given item ID exists, is active, and belongs to the company.
 func (s *productService) validateInventoryItem(ctx context.Context, tx repository.DBTX, itemID, companyID uuid.UUID) error {
 	if itemID == uuid.Nil {
 		return fmt.Errorf("%w: inventory_item_id cannot be all-zero UUID", salesErrors.ErrInvalidInput)

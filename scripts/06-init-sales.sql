@@ -2121,3 +2121,26 @@ ALTER TABLE sales.coupons ADD CONSTRAINT chk_coupon_stacking_type CHECK (stackin
 
 
 ALTER TABLE sales.coupon_usages ADD CONSTRAINT uniq_coupon_order UNIQUE (coupon_id, order_id);
+-- Add tax_rate column to store the tax percentage applied to this line item
+ALTER TABLE sales.invoice_items 
+ADD COLUMN tax_rate NUMERIC(5,2);
+
+-- (Optional) Add a check constraint to ensure tax_rate is between 0 and 100
+ALTER TABLE sales.invoice_items 
+ADD CONSTRAINT chk_invoice_item_tax_rate CHECK (tax_rate IS NULL OR (tax_rate >= 0 AND tax_rate <= 100));
+
+-- Create an index for faster queries on tax_rate (if needed)
+CREATE INDEX idx_invoice_items_tax_rate ON sales.invoice_items(tax_rate) WHERE tax_rate IS NOT NULL;
+
+-- Note: The generated column "total_price" already uses COALESCE(tax_amount, 0).
+-- No change needed to total_price because tax_amount will be computed from tax_rate.
+
+
+-- Add tax_rate column (percentage, e.g., 10 for 10%)
+ALTER TABLE sales.products ADD COLUMN tax_rate NUMERIC(5,2);
+
+-- Optional: constrain tax_rate between 0 and 100
+ALTER TABLE sales.products ADD CONSTRAINT chk_product_tax_rate CHECK (tax_rate IS NULL OR (tax_rate >= 0 AND tax_rate <= 100));
+
+-- Index for faster lookups (optional)
+CREATE INDEX idx_products_tax_rate ON sales.products(tax_rate) WHERE tax_rate IS NOT NULL;

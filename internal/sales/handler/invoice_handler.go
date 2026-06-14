@@ -49,6 +49,7 @@ type createInvoiceItemRequest struct {
 	Quantity            string       `json:"quantity"`
 	UnitPrice           string       `json:"unit_price"`
 	Discount            *string      `json:"discount,omitempty"`
+	TaxRate             *string      `json:"tax_rate,omitempty"` // NEW: percentage (e.g., "10")
 	Metadata            models.JSONB `json:"metadata,omitempty"`
 }
 
@@ -383,11 +384,26 @@ func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Reque
 			}
 			productID = parsed
 		}
+		// Parse tax_rate if provided
+		var taxRate *decimal.Decimal
+		if it.TaxRate != nil && *it.TaxRate != "" {
+			tr, err := decimal.NewFromString(*it.TaxRate)
+			if err != nil {
+				h.respondWithError(w, http.StatusBadRequest, "invalid tax_rate for item")
+				return
+			}
+			if tr.LessThan(decimal.Zero) || tr.GreaterThan(decimal.NewFromInt(100)) {
+				h.respondWithError(w, http.StatusBadRequest, "tax_rate must be between 0 and 100")
+				return
+			}
+			taxRate = &tr
+		}
 		items[i] = service.CreateInvoiceItemRequest{
 			ProductID: productID,
 			Quantity:  quantity,
 			UnitPrice: &unitPrice,
 			Discount:  discount,
+			TaxRate:   taxRate,
 			Metadata:  it.Metadata,
 		}
 	}
@@ -433,32 +449,27 @@ func (h *InvoiceHandler) CreateDraftInvoice(w http.ResponseWriter, r *http.Reque
 }
 
 // CreateInvoiceFromOrder handles POST /invoices/from-order
-// This is the method that now supports partial invoicing.
 func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Get authenticated user ID
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 
-	// Get company ID from header
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Decode request body
 	var req createInvoiceFromOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Validate required fields
 	if req.OrderID == "" {
 		h.respondWithError(w, http.StatusBadRequest, "order_id is required")
 		return
@@ -469,7 +480,6 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Parse partial invoicing items if present
 	var partialItems []service.PartialInvoiceItemInput
 	if len(req.Items) > 0 {
 		partialItems = make([]service.PartialInvoiceItemInput, 0, len(req.Items))
@@ -491,13 +501,11 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// Permission check
 	if !h.hasPermission(ctx, companyID, userID, "invoice:write") {
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
 
-	// Idempotency key (optional, can be used by service)
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
@@ -505,17 +513,14 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 	}
 	_ = idempotencyKey
 
-	// Build service request with all fields from the incoming request
 	svcReq := service.CreateInvoiceFromOrderRequest{
-		OrderID:     req.OrderID,     // keep as string, service will parse if needed
-		Items:       partialItems,    // ✅ new: partial invoicing items
-		InvoiceDate: req.InvoiceDate, // ✅ passed to service
-		DueDate:     req.DueDate,     // ✅ passed to service
+		Items:       partialItems,
+		InvoiceDate: req.InvoiceDate,
+		DueDate:     req.DueDate,
 		Notes:       req.Notes,
-		CreatedBy:   &userID, // set the authenticated user
+		CreatedBy:   &userID,
 	}
 
-	// Call service
 	invoice, err := h.invoiceService.CreateInvoiceFromOrder(ctx, companyID, orderID, &svcReq)
 	if err != nil {
 		h.logger.Error("failed to create invoice from order", zap.Error(err))
@@ -524,7 +529,6 @@ func (h *InvoiceHandler) CreateInvoiceFromOrder(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Build response
 	resp := h.toInvoiceResponse(invoice)
 	location := fmt.Sprintf("/invoices/%s", invoice.InvoiceID)
 	w.Header().Set("Location", location)
@@ -1123,11 +1127,25 @@ func (h *InvoiceHandler) AddItems(w http.ResponseWriter, r *http.Request) {
 			}
 			productID = pid
 		}
+		var taxRate *decimal.Decimal
+		if it.TaxRate != nil && *it.TaxRate != "" {
+			tr, err := decimal.NewFromString(*it.TaxRate)
+			if err != nil {
+				h.respondWithError(w, http.StatusBadRequest, "invalid tax_rate")
+				return
+			}
+			if tr.LessThan(decimal.Zero) || tr.GreaterThan(decimal.NewFromInt(100)) {
+				h.respondWithError(w, http.StatusBadRequest, "tax_rate must be between 0 and 100")
+				return
+			}
+			taxRate = &tr
+		}
 		items[i] = service.CreateInvoiceItemRequest{
 			ProductID: productID,
 			Quantity:  quantity,
 			UnitPrice: &unitPrice,
 			Discount:  discount,
+			TaxRate:   taxRate,
 			Metadata:  it.Metadata,
 		}
 	}
@@ -1207,11 +1225,25 @@ func (h *InvoiceHandler) ReplaceItems(w http.ResponseWriter, r *http.Request) {
 			}
 			productID = pid
 		}
+		var taxRate *decimal.Decimal
+		if it.TaxRate != nil && *it.TaxRate != "" {
+			tr, err := decimal.NewFromString(*it.TaxRate)
+			if err != nil {
+				h.respondWithError(w, http.StatusBadRequest, "invalid tax_rate")
+				return
+			}
+			if tr.LessThan(decimal.Zero) || tr.GreaterThan(decimal.NewFromInt(100)) {
+				h.respondWithError(w, http.StatusBadRequest, "tax_rate must be between 0 and 100")
+				return
+			}
+			taxRate = &tr
+		}
 		items[i] = service.CreateInvoiceItemRequest{
 			ProductID: productID,
 			Quantity:  quantity,
 			UnitPrice: &unitPrice,
 			Discount:  discount,
+			TaxRate:   taxRate,
 			Metadata:  it.Metadata,
 		}
 	}

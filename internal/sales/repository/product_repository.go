@@ -1,3 +1,6 @@
+// package repository
+// filename: product_repository.go
+
 package repository
 
 import (
@@ -37,7 +40,7 @@ type ProductRepository interface {
 	GetByInventoryItemID(ctx context.Context, db DBTX, companyID, inventoryItemID uuid.UUID) (*models.Product, error)
 	ExistsByInventoryItemID(ctx context.Context, db DBTX, companyID, inventoryItemID uuid.UUID) (bool, error)
 	UpdateInventoryItemLink(ctx context.Context, db DBTX, companyID, productID uuid.UUID, inventoryItemID *uuid.UUID, updatedBy *uuid.UUID) error
-	ExistsInventoryItemByIDAndCompany(ctx context.Context, db DBTX, itemID, companyID uuid.UUID) (bool, error) // NEW
+	ExistsInventoryItemByIDAndCompany(ctx context.Context, db DBTX, itemID, companyID uuid.UUID) (bool, error)
 
 	// Pricing
 	UpdateUnitPrice(ctx context.Context, db DBTX, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID) error
@@ -64,17 +67,20 @@ type ProductFilter struct {
 	ProductIDs       []uuid.UUID
 	SKU              *string
 	Name             *string
-	InventoryItemID  *uuid.UUID // exact match
-	HasInventoryItem *bool      // true = inventory_item_id IS NOT NULL, false = IS NULL
+	InventoryItemID  *uuid.UUID
+	HasInventoryItem *bool
 	MinUnitPrice     *decimal.Decimal
 	MaxUnitPrice     *decimal.Decimal
-	SearchTerm       *string // searches across sku, name, description
+	SearchTerm       *string
 	CreatedFrom      *time.Time
 	CreatedTo        *time.Time
 	UpdatedFrom      *time.Time
 	UpdatedTo        *time.Time
-}
 
+	// NEW: tax rate filters
+	MinTaxRate *decimal.Decimal `json:"minTaxRate,omitempty"`
+	MaxTaxRate *decimal.Decimal `json:"maxTaxRate,omitempty"`
+}
 type productRepository struct {
 	logger *zap.Logger
 }
@@ -94,6 +100,13 @@ func (r *productRepository) nullUUIDParam(id *uuid.UUID) interface{} {
 		return nil
 	}
 	return *id
+}
+
+func (r *productRepository) nullDecimalParam(d *decimal.Decimal) interface{} {
+	if d == nil {
+		return nil
+	}
+	return d.String()
 }
 
 func (r *productRepository) validateSort(s Sort, allowed map[string]bool) (string, error) {
@@ -207,18 +220,28 @@ func (r *productRepository) buildFilter(filter ProductFilter) (string, []interfa
 		args = append(args, *filter.UpdatedTo)
 		idx++
 	}
-
+	if filter.MinTaxRate != nil {
+		conds = append(conds, fmt.Sprintf("tax_rate >= $%d", idx))
+		args = append(args, *filter.MinTaxRate)
+		idx++
+	}
+	if filter.MaxTaxRate != nil {
+		conds = append(conds, fmt.Sprintf("tax_rate <= $%d", idx))
+		args = append(args, *filter.MaxTaxRate)
+		idx++
+	}
 	if len(conds) == 0 {
 		return "", args
 	}
 	return "WHERE " + strings.Join(conds, " AND "), args
 }
 
-// scanProduct maps a database row to models.Product
+// scanProduct maps a database row to models.Product (including tax_rate)
 func (r *productRepository) scanProduct(s scanner) (*models.Product, error) {
 	var p models.Product
 	var createdBy, updatedBy uuid.NullUUID
 	var description sql.NullString
+	var taxRate sql.NullString // tax_rate is NUMERIC(5,2), can be NULL
 
 	err := s.Scan(
 		&p.ProductID,
@@ -229,6 +252,7 @@ func (r *productRepository) scanProduct(s scanner) (*models.Product, error) {
 		&p.UnitPrice,
 		&p.IsActive,
 		&p.InventoryItemID,
+		&taxRate, // NEW: scan tax_rate
 		&p.CreatedAt,
 		&p.UpdatedAt,
 		&createdBy,
@@ -242,6 +266,12 @@ func (r *productRepository) scanProduct(s scanner) (*models.Product, error) {
 	}
 	if description.Valid {
 		p.Description = &description.String
+	}
+	if taxRate.Valid {
+		rate, err := decimal.NewFromString(taxRate.String)
+		if err == nil {
+			p.TaxRate = &rate
+		}
 	}
 	if createdBy.Valid {
 		p.CreatedBy = &createdBy.UUID
@@ -260,12 +290,12 @@ func (r *productRepository) Create(ctx context.Context, db DBTX, product *models
 	query := `
 		INSERT INTO sales.products (
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		) VALUES (
 			$1, $2, $3, $4, $5,
-			$6, $7, $8,
-			NOW(), NOW(), $9, $10
+			$6, $7, $8, $9,
+			NOW(), NOW(), $10, $11
 		)
 		RETURNING created_at, updated_at
 	`
@@ -278,6 +308,7 @@ func (r *productRepository) Create(ctx context.Context, db DBTX, product *models
 		product.UnitPrice,
 		product.IsActive,
 		r.nullUUIDParam(product.InventoryItemID),
+		r.nullDecimalParam(product.TaxRate), // NEW
 		r.nullUUIDParam(product.CreatedBy),
 		r.nullUUIDParam(product.UpdatedBy),
 	).Scan(&product.CreatedAt, &product.UpdatedAt)
@@ -292,7 +323,7 @@ func (r *productRepository) GetByID(ctx context.Context, db DBTX, companyID, pro
 	query := `
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		WHERE company_id = $1 AND product_id = $2
@@ -305,7 +336,7 @@ func (r *productRepository) GetBySKU(ctx context.Context, db DBTX, companyID uui
 	query := `
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		WHERE company_id = $1 AND sku = $2
@@ -323,8 +354,9 @@ func (r *productRepository) Update(ctx context.Context, db DBTX, product *models
 			unit_price = $6,
 			is_active = $7,
 			inventory_item_id = $8,
+			tax_rate = $9,
 			updated_at = NOW(),
-			updated_by = $9
+			updated_by = $10
 		WHERE product_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -337,6 +369,7 @@ func (r *productRepository) Update(ctx context.Context, db DBTX, product *models
 		product.UnitPrice,
 		product.IsActive,
 		r.nullUUIDParam(product.InventoryItemID),
+		r.nullDecimalParam(product.TaxRate), // NEW
 		r.nullUUIDParam(product.UpdatedBy),
 	).Scan(&product.UpdatedAt)
 	if err != nil {
@@ -423,7 +456,7 @@ func (r *productRepository) GetByInventoryItemID(ctx context.Context, db DBTX, c
 	query := `
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		WHERE company_id = $1 AND inventory_item_id = $2
@@ -516,7 +549,7 @@ func (r *productRepository) GetProductsByPriceRange(ctx context.Context, db DBTX
 	query := fmt.Sprintf(`
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		WHERE %s
@@ -571,7 +604,7 @@ func (r *productRepository) GetTopSellingProducts(ctx context.Context, db DBTX, 
 	query := fmt.Sprintf(`
 		SELECT 
 			p.product_id, p.company_id, p.sku, p.name, p.description,
-			p.unit_price, p.is_active, p.inventory_item_id,
+			p.unit_price, p.is_active, p.inventory_item_id, p.tax_rate,
 			p.created_at, p.updated_at, p.created_by, p.updated_by
 		FROM sales.products p
 		JOIN (
@@ -610,7 +643,7 @@ func (r *productRepository) GetProductsNeverSold(ctx context.Context, db DBTX, c
 	query := `
 		SELECT 
 			p.product_id, p.company_id, p.sku, p.name, p.description,
-			p.unit_price, p.is_active, p.inventory_item_id,
+			p.unit_price, p.is_active, p.inventory_item_id, p.tax_rate,
 			p.created_at, p.updated_at, p.created_by, p.updated_by
 		FROM sales.products p
 		LEFT JOIN sales_analytics.product_sales_fact f 
@@ -662,7 +695,7 @@ func (r *productRepository) GetProductsWithReturns(ctx context.Context, db DBTX,
 	query := fmt.Sprintf(`
 		SELECT DISTINCT
 			p.product_id, p.company_id, p.sku, p.name, p.description,
-			p.unit_price, p.is_active, p.inventory_item_id,
+			p.unit_price, p.is_active, p.inventory_item_id, p.tax_rate,
 			p.created_at, p.updated_at, p.created_by, p.updated_by
 		FROM sales.products p
 		JOIN sales_analytics.product_returns_fact rf ON p.product_id = rf.product_id
@@ -726,7 +759,7 @@ func (r *productRepository) List(ctx context.Context, db DBTX, filter ProductFil
 	query := fmt.Sprintf(`
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		%s
@@ -773,7 +806,7 @@ func (r *productRepository) Search(ctx context.Context, db DBTX, companyID uuid.
 	dataQuery := `
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		WHERE company_id = $1
@@ -807,7 +840,7 @@ func (r *productRepository) GetByIDForUpdate(ctx context.Context, db DBTX, compa
 	query := `
 		SELECT 
 			product_id, company_id, sku, name, description,
-			unit_price, is_active, inventory_item_id,
+			unit_price, is_active, inventory_item_id, tax_rate,
 			created_at, updated_at, created_by, updated_by
 		FROM sales.products
 		WHERE company_id = $1 AND product_id = $2

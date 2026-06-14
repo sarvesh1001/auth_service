@@ -382,7 +382,7 @@ func (s *pricingService) PreviewInvoicePricing(ctx context.Context, req *Invoice
 			ProductID:      it.ProductID,
 			Quantity:       it.Quantity,
 			UnitPrice:      it.UnitPrice,
-			DiscountAmount: it.DiscountAmount,
+			DiscountAmount: it.Discount,
 			Metadata:       it.Metadata,
 		}
 	}

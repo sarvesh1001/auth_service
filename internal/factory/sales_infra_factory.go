@@ -431,6 +431,8 @@ func (f *SalesInfraFactory) InvoiceService() service.InvoiceService {
 			f.OrderRepo(),
 			f.ProductRepo(),
 			f.CustomerService(),
+			f.QuoteService(), // <-- add this
+
 			f.PricingRepo(),
 			f.DiscountEngineService(),
 			f.TaxSnapshotRepo(),
