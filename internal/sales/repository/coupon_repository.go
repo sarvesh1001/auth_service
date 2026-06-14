@@ -703,8 +703,9 @@ func (r *couponRepository) ValidateCoupon(ctx context.Context, db DBTX, companyI
 			return nil, saleserrors.ErrCouponUsageLimit
 		}
 	}
+	// ✅ FIX: Wrap min order amount error with ErrInvalidInput → 400 Bad Request
 	if coupon.MinOrderAmount != nil && orderAmount.LessThan(*coupon.MinOrderAmount) {
-		return nil, fmt.Errorf("order amount %s below minimum %s", orderAmount.String(), coupon.MinOrderAmount.String())
+		return nil, fmt.Errorf("%w: order amount %s below minimum %s", saleserrors.ErrInvalidInput, orderAmount.String(), coupon.MinOrderAmount.String())
 	}
 	if len(productIDs) > 0 && coupon.ApplicableItems != nil && len(coupon.ApplicableItems) > 0 && string(coupon.ApplicableItems) != "{}" {
 		applicable := false
@@ -719,7 +720,8 @@ func (r *couponRepository) ValidateCoupon(ctx context.Context, db DBTX, companyI
 			}
 		}
 		if !applicable {
-			return nil, fmt.Errorf("coupon not applicable for any product in the order")
+			// ✅ FIX: Wrap product applicability error with ErrInvalidInput → 400 Bad Request
+			return nil, fmt.Errorf("%w: coupon not applicable for any product in the order", saleserrors.ErrInvalidInput)
 		}
 	}
 	return coupon, nil

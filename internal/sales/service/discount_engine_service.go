@@ -48,13 +48,13 @@ type DiscountEngineService interface {
 	CanStackDiscounts(ctx context.Context, firstDiscountID uuid.UUID, secondDiscountID uuid.UUID) (bool, error)
 	GetStackableDiscounts(ctx context.Context, companyID uuid.UUID, discountID uuid.UUID) ([]uuid.UUID, error)
 
-	// Discount calculations (UPDATED – now accept companyID)
+	// Discount calculations
 	CalculateCouponDiscount(ctx context.Context, companyID, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
 	CalculatePromotionDiscount(ctx context.Context, companyID, promotionID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
 	CalculateAutomaticDiscount(ctx context.Context, companyID, automaticDiscountID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error)
 	CalculateCombinedDiscount(ctx context.Context, req *CombinedDiscountCalculationRequest) (*DiscountCalculationResult, error)
 
-	// State‑changing operations (with idempotency & events)
+	// State‑changing operations (with idempotency & events) – original versions (create own transaction)
 	ApplyCoupon(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
 	RemoveCoupon(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, removedBy uuid.UUID) error
 	ApplyPromotion(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, promotionID uuid.UUID, appliedBy uuid.UUID) (*discount.Promotion, decimal.Decimal, error)
@@ -62,7 +62,11 @@ type DiscountEngineService interface {
 	ApplyBestDiscounts(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, appliedBy uuid.UUID) (*DiscountApplicationResult, error)
 	ClearDiscounts(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, clearedBy uuid.UUID) error
 
-	// Validation (UPDATED – ValidateDiscountUsageLimits now accepts companyID)
+	// New transaction‑aware methods (for callers that already hold a transaction)
+	ApplyCouponWithTx(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error)
+	RemoveCouponWithTx(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, removedBy uuid.UUID) error
+
+	// Validation
 	ValidateCoupon(ctx context.Context, companyID uuid.UUID, couponCode string, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error
 	ValidatePromotion(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) error
 	ValidateDiscountEligibility(ctx context.Context, req *DiscountEligibilityRequest) error
@@ -485,7 +489,7 @@ func (s *discountEngineService) GetStackableDiscounts(ctx context.Context, compa
 }
 
 // ----------------------------------------------------------------------
-// Discount calculations (read‑only) – UPDATED
+// Discount calculations (read‑only)
 // ----------------------------------------------------------------------
 
 func (s *discountEngineService) CalculateCouponDiscount(ctx context.Context, companyID, couponID uuid.UUID, subtotal decimal.Decimal, productIDs []uuid.UUID) (decimal.Decimal, error) {
@@ -588,7 +592,7 @@ func (s *discountEngineService) CalculateCombinedDiscount(ctx context.Context, r
 }
 
 // ----------------------------------------------------------------------
-// Mutating methods (with transaction and idempotency)
+// Original mutating methods (create their own transaction)
 // ----------------------------------------------------------------------
 
 func (s *discountEngineService) ApplyCoupon(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
@@ -1029,6 +1033,198 @@ func (s *discountEngineService) ClearDiscounts(ctx context.Context, companyID uu
 }
 
 // ----------------------------------------------------------------------
+// New transaction‑aware methods (for callers that already hold a transaction)
+// ----------------------------------------------------------------------
+
+func (s *discountEngineService) ApplyCouponWithTx(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, appliedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
+	logger := s.logger.With(zap.String("method", "ApplyCouponWithTx"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("apply_coupon:%s:%s:%s", entityType, entityID.String(), couponCode)
+	}
+
+	var ownTx bool
+	if tx == nil {
+		var err error
+		tx, err = s.pgClient.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
+		}
+		ownTx = true
+		defer func() {
+			if ownTx {
+				tx.Rollback()
+			}
+		}()
+	}
+
+	// Idempotency check – use the same tx (tx is *sql.Tx)
+	var cachedResult struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cachedResult); err == nil && cachedResult.Coupon != nil {
+		logger.Info("idempotent – returning cached result")
+		return cachedResult.Coupon, cachedResult.Amount, nil
+	}
+
+	// Get coupon and validate (tx implements DBTX)
+	coupon, err := s.couponRepo.GetByCode(ctx, tx, companyID, couponCode)
+	if err != nil {
+		return nil, decimal.Zero, fmt.Errorf("get coupon: %w", err)
+	}
+	if err := s.validateCouponForEntity(ctx, tx, companyID, coupon, entityType, entityID); err != nil {
+		return nil, decimal.Zero, err
+	}
+
+	subtotal, err := s.getEntitySubtotal(ctx, tx, companyID, entityType, entityID)
+	if err != nil {
+		return nil, decimal.Zero, err
+	}
+	discountAmount, err := s.couponRepo.CalculateDiscount(ctx, tx, companyID, coupon.CouponID, subtotal)
+	if err != nil {
+		return nil, decimal.Zero, fmt.Errorf("calculate discount: %w", err)
+	}
+
+	application := &discount.DiscountApplication{
+		ApplicationID: uuid.New(),
+		CompanyID:     companyID,
+		DiscountType:  "coupon",
+		DiscountID:    &coupon.CouponID,
+		DiscountName:  &coupon.Code,
+		Amount:        discountAmount,
+	}
+	switch entityType {
+	case "order":
+		application.OrderID = &entityID
+	case "invoice":
+		application.InvoiceID = &entityID
+	default:
+		return nil, decimal.Zero, fmt.Errorf("unsupported entity type: %s", entityType)
+	}
+	if err := s.discountUsageRepo.Create(ctx, tx, application); err != nil {
+		return nil, decimal.Zero, fmt.Errorf("record discount application: %w", err)
+	}
+
+	if err := s.updateEntityTotals(ctx, tx, companyID, entityType, entityID, appliedBy); err != nil {
+		return nil, decimal.Zero, fmt.Errorf("update totals: %w", err)
+	}
+
+	customerID := s.getCustomerIDFromEntity(ctx, tx, companyID, entityType, entityID)
+	orderID := s.getOrderIDFromEntity(tx, companyID, entityType, entityID)
+	_ = s.couponRepo.CreateUsage(ctx, tx, &discount.CouponUsage{
+		UsageID:        uuid.New(),
+		CouponID:       coupon.CouponID,
+		CustomerID:     customerID,
+		OrderID:        orderID,
+		DiscountAmount: discountAmount,
+		UsedAt:         time.Now(),
+	})
+
+	_ = s.emitDiscountAppliedEvent(ctx, tx, companyID, entityType, entityID, "coupon", coupon.CouponID, discountAmount, appliedBy)
+
+	cachedResult = struct {
+		Coupon *discount.Coupon
+		Amount decimal.Decimal
+	}{Coupon: coupon, Amount: discountAmount}
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, cachedResult)
+
+	if ownTx {
+		if err := tx.Commit(); err != nil {
+			return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
+		}
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "apply_coupon", entityType,
+			&entityID, "user", &appliedBy, nil, nil, map[string]interface{}{
+				"coupon_code": coupon.Code,
+				"amount":      discountAmount.String(),
+			})
+	}
+
+	return coupon, discountAmount, nil
+}
+
+func (s *discountEngineService) RemoveCouponWithTx(ctx context.Context, tx *sql.Tx, companyID uuid.UUID, entityType string, entityID uuid.UUID, couponCode string, removedBy uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "RemoveCouponWithTx"))
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("remove_coupon:%s:%s:%s", entityType, entityID.String(), couponCode)
+	}
+
+	var ownTx bool
+	if tx == nil {
+		var err error
+		tx, err = s.pgClient.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin tx: %w", err)
+		}
+		ownTx = true
+		defer func() {
+			if ownTx {
+				tx.Rollback()
+			}
+		}()
+	}
+
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		logger.Info("idempotent – already removed")
+		return nil
+	}
+
+	var applications []*discount.DiscountApplication
+	var err error
+	switch entityType {
+	case "order":
+		applications, err = s.discountUsageRepo.GetByOrder(ctx, tx, companyID, entityID)
+	case "invoice":
+		applications, err = s.discountUsageRepo.GetByInvoice(ctx, tx, companyID, entityID)
+	default:
+		return fmt.Errorf("unsupported entity type: %s", entityType)
+	}
+	if err != nil {
+		return fmt.Errorf("get discount applications: %w", err)
+	}
+
+	var toDelete *discount.DiscountApplication
+	for _, app := range applications {
+		if app.DiscountType == "coupon" && app.DiscountName != nil && *app.DiscountName == couponCode {
+			toDelete = app
+			break
+		}
+	}
+	if toDelete == nil {
+		return fmt.Errorf("%w: coupon %s not applied", salesErrors.ErrNotFound, couponCode)
+	}
+
+	if err := s.discountUsageRepo.Delete(ctx, tx, toDelete.ApplicationID); err != nil {
+		return fmt.Errorf("delete discount application: %w", err)
+	}
+	if err := s.updateEntityTotals(ctx, tx, companyID, entityType, entityID, removedBy); err != nil {
+		return fmt.Errorf("update totals: %w", err)
+	}
+	_ = s.emitDiscountRemovedEvent(ctx, tx, companyID, entityType, entityID, "coupon", toDelete.DiscountID, couponCode, removedBy)
+
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
+
+	if ownTx {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit tx: %w", err)
+		}
+	}
+
+	if s.auditService != nil {
+		_ = s.auditService.LogAction(ctx, nil, &companyID, "sales", "remove_coupon", entityType,
+			&entityID, "user", &removedBy, nil, nil, map[string]interface{}{
+				"coupon_code": couponCode,
+			})
+	}
+	return nil
+}
+
+// ----------------------------------------------------------------------
 // Internal helpers for state changes (without outer idempotency)
 // ----------------------------------------------------------------------
 
@@ -1208,12 +1404,10 @@ func (s *discountEngineService) ValidateDiscountUsageLimits(ctx context.Context,
 func (s *discountEngineService) TrackCouponUsage(ctx context.Context, companyID uuid.UUID, couponID uuid.UUID, customerID *uuid.UUID, entityType string, entityID uuid.UUID, usedAt time.Time) error {
 	db := s.pgClient.DB
 
-	// For coupon tracking we only support orders (entity_type = "order")
 	if entityType != "order" {
 		return fmt.Errorf("unsupported entity type for coupon tracking: %s", entityType)
 	}
 
-	// 1. Check if a usage record already exists for this coupon + order
 	var exists bool
 	checkQuery := `SELECT EXISTS(SELECT 1 FROM sales.coupon_usages WHERE coupon_id = $1 AND order_id = $2)`
 	err := db.QueryRowContext(ctx, checkQuery, couponID, entityID).Scan(&exists)
@@ -1221,11 +1415,9 @@ func (s *discountEngineService) TrackCouponUsage(ctx context.Context, companyID 
 		return fmt.Errorf("check existing coupon usage: %w", err)
 	}
 	if exists {
-		// Use the existing duplicate error (defined in salesErrors)
 		return salesErrors.ErrDuplicate
 	}
 
-	// 2. If customerID is nil, try to fetch it from the order (optional)
 	custID := customerID
 	if custID == nil || *custID == uuid.Nil {
 		var cid uuid.UUID
@@ -1237,8 +1429,6 @@ func (s *discountEngineService) TrackCouponUsage(ctx context.Context, companyID 
 		custID = &cid
 	}
 
-	// 3. Retrieve the discount amount that was actually applied to this order
-	//    (we can sum the amount from discount_applications for this coupon+order)
 	var discountAmount decimal.Decimal
 	amountQuery := `
         SELECT COALESCE(SUM(amount), 0)
@@ -1247,11 +1437,9 @@ func (s *discountEngineService) TrackCouponUsage(ctx context.Context, companyID 
     `
 	err = db.QueryRowContext(ctx, amountQuery, companyID, couponID, entityID).Scan(&discountAmount)
 	if err != nil {
-		// If we can't find the amount, default to 0 (should not happen)
 		discountAmount = decimal.Zero
 	}
 
-	// 4. Create the usage record
 	usage := &discount.CouponUsage{
 		UsageID:        uuid.New(),
 		CouponID:       couponID,
@@ -1263,20 +1451,16 @@ func (s *discountEngineService) TrackCouponUsage(ctx context.Context, companyID 
 	if err := s.couponRepo.CreateUsage(ctx, db, usage); err != nil {
 		return fmt.Errorf("create coupon usage: %w", err)
 	}
-
 	return nil
 }
 
 func (s *discountEngineService) TrackPromotionUsage(ctx context.Context, companyID uuid.UUID, promotionID uuid.UUID, customerID *uuid.UUID, entityType string, entityID uuid.UUID, usedAt time.Time) error {
 	db := s.pgClient.DB
 
-	// For promotion tracking we also support only "order" (or "invoice" if needed)
 	if entityType != "order" {
-		// You can extend to "invoice" later
 		return nil
 	}
 
-	// 1. Check if we already tracked this promotion for the same order
 	var exists bool
 	checkQuery := `
         SELECT EXISTS(
@@ -1286,7 +1470,6 @@ func (s *discountEngineService) TrackPromotionUsage(ctx context.Context, company
     `
 	err := db.QueryRowContext(ctx, checkQuery, companyID, promotionID, entityID).Scan(&exists)
 	if err != nil {
-		// If the analytics table doesn't exist (older schema), just skip check
 		if strings.Contains(err.Error(), "relation") {
 			exists = false
 		} else {
@@ -1297,7 +1480,6 @@ func (s *discountEngineService) TrackPromotionUsage(ctx context.Context, company
 		return salesErrors.ErrDuplicate
 	}
 
-	// 2. Get customer ID if not provided
 	custID := customerID
 	if custID == nil || *custID == uuid.Nil {
 		var cid uuid.UUID
@@ -1309,7 +1491,6 @@ func (s *discountEngineService) TrackPromotionUsage(ctx context.Context, company
 		custID = &cid
 	}
 
-	// 3. Get the discount amount applied from this promotion
 	var discountAmount decimal.Decimal
 	amountQuery := `
         SELECT COALESCE(SUM(amount), 0)
@@ -1321,24 +1502,20 @@ func (s *discountEngineService) TrackPromotionUsage(ctx context.Context, company
 		discountAmount = decimal.Zero
 	}
 
-	// 4. Insert into promotion_usage_fact (analytics table)
 	insertQuery := `
         INSERT INTO sales_analytics.promotion_usage_fact
         (company_id, promotion_id, entity_type, entity_id, customer_id, discount_amount, order_subtotal, used_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     `
-	// We don't have order_subtotal here; we can leave NULL or fetch it
 	_, err = db.ExecContext(ctx, insertQuery,
 		companyID, promotionID, entityType, entityID, custID, discountAmount, nil, usedAt)
 	if err != nil {
-		// If table doesn't exist, just log and return nil (non‑critical)
 		if strings.Contains(err.Error(), "relation") {
 			s.logger.Warn("promotion_usage_fact table not found, skipping tracking", zap.Error(err))
 			return nil
 		}
 		return fmt.Errorf("insert promotion usage: %w", err)
 	}
-
 	return nil
 }
 
