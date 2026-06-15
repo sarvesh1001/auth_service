@@ -7,11 +7,12 @@ import (
 	"strconv"
 	"time"
 
+	"auth-service/internal/sales/service"
+	"context"
+
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
-
-	"auth-service/internal/sales/service"
 )
 
 // PaymentTermHandler handles HTTP requests for payment term management.
@@ -35,9 +36,9 @@ type createPaymentTermRequest struct {
 	TermName        string  `json:"term_name"`
 	Description     *string `json:"description,omitempty"`
 	DueDays         int     `json:"due_days"`
-	DiscountPercent string  `json:"discount_percent,omitempty"` // optional, defaults to "0"
+	DiscountPercent string  `json:"discount_percent,omitempty"`
 	DiscountDays    int     `json:"discount_days,omitempty"`
-	IsActive        *bool   `json:"is_active,omitempty"` // pointer to distinguish omitted vs false
+	IsActive        *bool   `json:"is_active,omitempty"`
 }
 
 type createPaymentTermResponse struct {
@@ -107,7 +108,7 @@ type paymentTermSummary struct {
 	Description     *string `json:"description,omitempty"`
 }
 
-// ---------- Handler Methods ----------
+// ---------- Mutating Handlers (with idempotency) ----------
 
 // CreatePaymentTerm handles POST /payment-terms
 func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Request) {
@@ -156,13 +157,11 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "discount_days cannot be negative")
 		return
 	}
-	// Business rule: discount_days cannot exceed due_days
 	if req.DiscountDays > req.DueDays {
 		h.respondWithError(w, http.StatusBadRequest, "discount_days cannot exceed due_days")
 		return
 	}
 
-	// Default discount_percent to "0" if not provided
 	discountPercentStr := req.DiscountPercent
 	if discountPercentStr == "" {
 		discountPercentStr = "0"
@@ -177,7 +176,6 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Default is_active to true if omitted
 	isActive := true
 	if req.IsActive != nil {
 		isActive = *req.IsActive
@@ -188,11 +186,13 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Idempotency: inject key into context
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := service.CreatePaymentTermRequest{
 		CompanyID:       companyID,
@@ -203,9 +203,10 @@ func (h *PaymentTermHandler) CreatePaymentTerm(w http.ResponseWriter, r *http.Re
 		DiscountPercent: discountPercent,
 		DiscountDays:    req.DiscountDays,
 		IsActive:        &isActive,
+		CreatedBy:       &userID,
 	}
 
-	term, err := h.paymentTermService.CreatePaymentTerm(ctx, &svcReq, idempotencyKey)
+	term, err := h.paymentTermService.CreatePaymentTerm(ctx, &svcReq) // no explicit key
 	if err != nil {
 		h.logger.Error("failed to create payment term", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -287,6 +288,7 @@ func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := service.UpdatePaymentTermRequest{
 		TermName:        req.TermName,
@@ -295,9 +297,10 @@ func (h *PaymentTermHandler) UpdatePaymentTerm(w http.ResponseWriter, r *http.Re
 		DiscountPercent: discountPercent,
 		DiscountDays:    req.DiscountDays,
 		IsActive:        req.IsActive,
+		UpdatedBy:       &userID,
 	}
 
-	updated, err := h.paymentTermService.UpdatePaymentTerm(ctx, companyID, termID, &svcReq, idempotencyKey)
+	updated, err := h.paymentTermService.UpdatePaymentTerm(ctx, companyID, termID, &svcReq)
 	if err != nil {
 		h.logger.Error("failed to update payment term", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -357,8 +360,9 @@ func (h *PaymentTermHandler) DeletePaymentTerm(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
-	err = h.paymentTermService.DeletePaymentTerm(ctx, companyID, termID, userID, idempotencyKey)
+	err = h.paymentTermService.DeletePaymentTerm(ctx, companyID, termID, userID)
 	if err != nil {
 		h.logger.Error("failed to delete payment term", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -371,6 +375,185 @@ func (h *PaymentTermHandler) DeletePaymentTerm(w http.ResponseWriter, r *http.Re
 		"message": "payment term deleted",
 	})
 }
+
+// UpdatePaymentTermStatus handles PATCH /payment-terms/{id}/status
+func (h *PaymentTermHandler) UpdatePaymentTermStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	termID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
+		return
+	}
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req updateStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	var actErr error
+	if req.IsActive {
+		actErr = h.paymentTermService.ActivatePaymentTerm(ctx, companyID, termID, userID)
+	} else {
+		actErr = h.paymentTermService.DeactivatePaymentTerm(ctx, companyID, termID, userID)
+	}
+	if actErr != nil {
+		h.logger.Error("failed to update payment term status", zap.Error(actErr))
+		status, msg := h.mapServiceError(actErr)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("payment term %s", map[bool]string{true: "activated", false: "deactivated"}[req.IsActive]),
+	})
+}
+
+// AssignPaymentTermToCustomer handles POST /payment-terms/{id}/assign-customer
+func (h *PaymentTermHandler) AssignPaymentTermToCustomer(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	termID, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
+		return
+	}
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignCustomerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	customerID, err := uuid.Parse(req.CustomerID)
+	if err != nil || customerID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.paymentTermService.AssignPaymentTermToCustomer(ctx, companyID, customerID, termID, userID)
+	if err != nil {
+		h.logger.Error("failed to assign payment term to customer", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "payment term assigned to customer",
+	})
+}
+
+// RemovePaymentTermFromCustomer handles DELETE /payment-terms/{id}/assign-customer
+func (h *PaymentTermHandler) RemovePaymentTermFromCustomer(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	_, err := h.parseUUIDParam(r, "id")
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
+		return
+	}
+
+	userID, err := h.getUserIDFromContext(ctx)
+	if err != nil {
+		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
+	companyID, err := h.getCompanyIDFromHeader(r)
+	if err != nil {
+		h.respondWithError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
+		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
+		return
+	}
+
+	var req assignCustomerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	customerID, err := uuid.Parse(req.CustomerID)
+	if err != nil || customerID == uuid.Nil {
+		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+		return
+	}
+
+	idempotencyKey := h.getIdempotencyKey(r)
+	if idempotencyKey == "" {
+		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	ctx = h.injectIdempotencyKey(ctx, r)
+
+	err = h.paymentTermService.RemovePaymentTermFromCustomer(ctx, companyID, customerID, userID)
+	if err != nil {
+		h.logger.Error("failed to remove payment term from customer", zap.Error(err))
+		status, msg := h.mapServiceError(err)
+		h.respondWithError(w, status, msg)
+		return
+	}
+
+	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "payment term removed from customer",
+	})
+}
+
+// ---------- Read‑Only Handlers (no idempotency required) ----------
 
 // GetPaymentTermByID handles GET /payment-terms/{id}
 func (h *PaymentTermHandler) GetPaymentTermByID(w http.ResponseWriter, r *http.Request) {
@@ -750,64 +933,8 @@ func (h *PaymentTermHandler) GetActivePaymentTerms(w http.ResponseWriter, r *htt
 	})
 }
 
-// UpdatePaymentTermStatus handles PATCH /payment-terms/{id}/status
-func (h *PaymentTermHandler) UpdatePaymentTermStatus(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	termID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req updateStatusRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	if req.IsActive {
-		err = h.paymentTermService.ActivatePaymentTerm(ctx, companyID, termID, userID, idempotencyKey)
-	} else {
-		err = h.paymentTermService.DeactivatePaymentTerm(ctx, companyID, termID, userID, idempotencyKey)
-	}
-	if err != nil {
-		h.logger.Error("failed to update payment term status", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("payment term %s", map[bool]string{true: "activated", false: "deactivated"}[req.IsActive]),
-	})
-}
-
 // CalculateDueDate handles POST /payment-terms/{id}/calculate-due-date
+// Idempotency key is NOT required because this is a read‑only calculation.
 func (h *PaymentTermHandler) CalculateDueDate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -844,12 +971,6 @@ func (h *PaymentTermHandler) CalculateDueDate(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	dueDate, err := h.paymentTermService.CalculateDueDate(ctx, companyID, termID, invoiceDate)
 	if err != nil {
 		h.logger.Error("failed to calculate due date", zap.Error(err))
@@ -869,6 +990,7 @@ func (h *PaymentTermHandler) CalculateDueDate(w http.ResponseWriter, r *http.Req
 }
 
 // CalculateEarlyPaymentDiscount handles POST /payment-terms/{id}/calculate-early-discount
+// Idempotency key is NOT required because this is a read‑only calculation.
 func (h *PaymentTermHandler) CalculateEarlyPaymentDiscount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -921,12 +1043,6 @@ func (h *PaymentTermHandler) CalculateEarlyPaymentDiscount(w http.ResponseWriter
 		return
 	}
 
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
 	discount, err := h.paymentTermService.CalculateEarlyPaymentDiscount(ctx, companyID, termID, invoiceAmount, paymentDate, invoiceDate)
 	if err != nil {
 		h.logger.Error("failed to calculate early payment discount", zap.Error(err))
@@ -944,119 +1060,10 @@ func (h *PaymentTermHandler) CalculateEarlyPaymentDiscount(w http.ResponseWriter
 		"data":    resp,
 	})
 }
-
-// AssignPaymentTermToCustomer handles POST /payment-terms/{id}/assign-customer
-func (h *PaymentTermHandler) AssignPaymentTermToCustomer(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	termID, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
-		return
+func (h *PaymentTermHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
 	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignCustomerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	customerID, err := uuid.Parse(req.CustomerID)
-	if err != nil || customerID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.paymentTermService.AssignPaymentTermToCustomer(ctx, companyID, customerID, termID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to assign payment term to customer", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "payment term assigned to customer",
-	})
-}
-
-// RemovePaymentTermFromCustomer handles DELETE /payment-terms/{id}/assign-customer
-func (h *PaymentTermHandler) RemovePaymentTermFromCustomer(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	_, err := h.parseUUIDParam(r, "id")
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid payment term ID")
-		return
-	}
-
-	userID, err := h.getUserIDFromContext(ctx)
-	if err != nil {
-		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-
-	companyID, err := h.getCompanyIDFromHeader(r)
-	if err != nil {
-		h.respondWithError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !h.hasPermission(ctx, companyID, userID, "payment_term:write") {
-		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
-		return
-	}
-
-	var req assignCustomerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	customerID, err := uuid.Parse(req.CustomerID)
-	if err != nil || customerID == uuid.Nil {
-		h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
-		return
-	}
-
-	idempotencyKey := h.getIdempotencyKey(r)
-	if idempotencyKey == "" {
-		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
-		return
-	}
-
-	err = h.paymentTermService.RemovePaymentTermFromCustomer(ctx, companyID, customerID, userID, idempotencyKey)
-	if err != nil {
-		h.logger.Error("failed to remove payment term from customer", zap.Error(err))
-		status, msg := h.mapServiceError(err)
-		h.respondWithError(w, status, msg)
-		return
-	}
-
-	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "payment term removed from customer",
-	})
+	return ctx
 }

@@ -33,6 +33,7 @@ type PaymentTermRepository interface {
 	Search(ctx context.Context, db DBTX, companyID uuid.UUID, query string, limit, offset int) ([]*models.PaymentTerm, int64, error)
 	GetActiveTerms(ctx context.Context, db DBTX, companyID uuid.UUID) ([]*models.PaymentTerm, error)
 	GetByIDForUpdate(ctx context.Context, db DBTX, companyID, termID uuid.UUID) (*models.PaymentTerm, error)
+	ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, termName string) (bool, error)
 }
 
 type PaymentTermFilter struct {
@@ -561,4 +562,13 @@ func (r *paymentTermRepository) GetByIDForUpdate(ctx context.Context, db DBTX, c
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+func (r *paymentTermRepository) ExistsByName(ctx context.Context, db DBTX, companyID uuid.UUID, termName string) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM sales.payment_terms WHERE company_id = $1 AND term_name = $2)`
+	err := db.QueryRowContext(ctx, query, companyID, termName).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("exists by name: %w", err)
+	}
+	return exists, nil
 }
