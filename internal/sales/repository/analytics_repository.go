@@ -30,7 +30,11 @@ type AnalyticsRepository interface {
 	IncrementUniqueCustomers(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, customerID uuid.UUID) error
 	UpsertPaymentMethodDaily(ctx context.Context, db DBTX, record *sales_analytics.PaymentMethodDaily) error
 	IncrementPaymentMethodDaily(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, method enums.PaymentMethod, amount decimal.Decimal) error
+	// UpsertPaymentAllocationFact inserts or updates a record of payment allocation to an invoice.
+	UpsertPaymentAllocationFact(ctx context.Context, tx DBTX, fact *sales_analytics.PaymentAllocationFact) error
 
+	// IncrementDailyAllocatedAmount updates the total amount allocated on a given day.
+	IncrementDailyAllocatedAmount(ctx context.Context, tx DBTX, companyID uuid.UUID, date time.Time, amount decimal.Decimal) error
 	UpsertRefundMetrics(ctx context.Context, db DBTX, metrics *sales_analytics.RefundMetrics) error
 	IncrementRefundMetrics(ctx context.Context, db DBTX, companyID uuid.UUID, date time.Time, amount decimal.Decimal, isFullRefund bool) error
 	// Coupon analytics
@@ -3102,6 +3106,45 @@ func (r *analyticsRepository) RefreshCurrentCustomerCredit(ctx context.Context, 
 	_, err := db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("refresh current customer credit materialized view: %w", err)
+	}
+	return nil
+}
+
+// UpsertPaymentAllocationFact inserts or updates a payment allocation fact.
+func (r *analyticsRepository) UpsertPaymentAllocationFact(ctx context.Context, tx DBTX, fact *sales_analytics.PaymentAllocationFact) error {
+	query := `
+        INSERT INTO sales_analytics.payment_allocation_fact
+            (company_id, payment_id, invoice_id, allocated_amount, allocated_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (payment_id, invoice_id) DO UPDATE SET
+            allocated_amount = EXCLUDED.allocated_amount,
+            allocated_at = EXCLUDED.allocated_at
+    `
+	_, err := tx.ExecContext(ctx, query,
+		fact.CompanyID,
+		fact.PaymentID,
+		fact.InvoiceID,
+		fact.AllocatedAmount,
+		fact.AllocatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert payment allocation fact: %w", err)
+	}
+	return nil
+}
+
+// IncrementDailyAllocatedAmount adds the given amount to the total allocated for the date.
+func (r *analyticsRepository) IncrementDailyAllocatedAmount(ctx context.Context, tx DBTX, companyID uuid.UUID, date time.Time, amount decimal.Decimal) error {
+	query := `
+        INSERT INTO sales_analytics.daily_allocated_amount (company_id, date, total_allocated, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (company_id, date) DO UPDATE SET
+            total_allocated = daily_allocated_amount.total_allocated + EXCLUDED.total_allocated,
+            updated_at = NOW()
+    `
+	_, err := tx.ExecContext(ctx, query, companyID, date, amount)
+	if err != nil {
+		return fmt.Errorf("increment daily allocated amount: %w", err)
 	}
 	return nil
 }

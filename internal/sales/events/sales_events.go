@@ -136,6 +136,8 @@ const (
 	EventPaymentFailed            = "sales.payment.failed"
 	EventPaymentRefunded          = "sales.payment.refunded"
 	EventPaymentPartiallyRefunded = "sales.payment.partially_refunded"
+	EventPaymentAllocated         = "sales.payment.allocated" // <-- ADD THIS
+
 )
 
 type PaymentAllocation struct {

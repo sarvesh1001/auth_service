@@ -4,14 +4,14 @@ import "errors"
 
 var (
 	// General errors
-	ErrNotFound         = errors.New("sales: record not found")
-	ErrInvalidInput     = errors.New("sales: invalid input")
-	ErrDuplicate        = errors.New("sales: duplicate record")
-	ErrConflict         = errors.New("sales: conflict")
-	ErrPermissionDenied = errors.New("sales: permission denied")
-	ErrUnauthorized     = errors.New("sales: unauthorized") // <-- ADD THIS
-	ErrStackingConflict = errors.New("stacking conflict")
-
+	ErrNotFound                 = errors.New("sales: record not found")
+	ErrInvalidInput             = errors.New("sales: invalid input")
+	ErrDuplicate                = errors.New("sales: duplicate record")
+	ErrConflict                 = errors.New("sales: conflict")
+	ErrPermissionDenied         = errors.New("sales: permission denied")
+	ErrUnauthorized             = errors.New("sales: unauthorized") // <-- ADD THIS
+	ErrStackingConflict         = errors.New("stacking conflict")
+	ErrAllocationExceedsInvoice = errors.New("sales: allocation amount exceeds invoice outstanding balance")
 	// Status transitions
 	ErrInvalidStatus     = errors.New("sales: invalid status")
 	ErrInvalidTransition = errors.New("sales: invalid status transition")

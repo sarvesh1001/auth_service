@@ -657,18 +657,6 @@ type CreditNoteApplicationRequest struct {
 	Amount    decimal.Decimal
 }
 
-type CreatePaymentRequest struct {
-	CompanyID       uuid.UUID
-	PaymentNumber   string
-	ExternalRef     *string
-	PaymentDate     time.Time
-	Amount          decimal.Decimal
-	PaymentMethod   enums.PaymentMethod
-	Reference       *string
-	GatewayResponse models.JSONB
-	CreatedBy       *uuid.UUID
-}
-
 type UpdatePaymentRequest struct {
 	ExternalRef     *string
 	PaymentDate     *time.Time
@@ -694,74 +682,6 @@ type PaymentListFilter struct {
 type PaymentAllocationRequest struct {
 	InvoiceID uuid.UUID
 	Amount    decimal.Decimal
-}
-
-type RegisterCashPaymentRequest struct {
-	CompanyID   uuid.UUID
-	CustomerID  uuid.UUID
-	Amount      decimal.Decimal
-	PaymentDate time.Time
-	Reference   *string
-	Allocations []PaymentAllocationRequest
-	CreatedBy   uuid.UUID
-}
-
-type RegisterCardPaymentRequest struct {
-	CompanyID       uuid.UUID
-	CustomerID      uuid.UUID
-	Amount          decimal.Decimal
-	PaymentDate     time.Time
-	CardLast4       string
-	CardBrand       string
-	GatewayTxID     string
-	GatewayResponse models.JSONB
-	Allocations     []PaymentAllocationRequest
-	CreatedBy       uuid.UUID
-}
-
-type RegisterBankTransferPaymentRequest struct {
-	CompanyID       uuid.UUID
-	CustomerID      uuid.UUID
-	Amount          decimal.Decimal
-	PaymentDate     time.Time
-	ReferenceNumber string
-	BankName        *string
-	Allocations     []PaymentAllocationRequest
-	CreatedBy       uuid.UUID
-}
-
-type RegisterChequePaymentRequest struct {
-	CompanyID    uuid.UUID
-	CustomerID   uuid.UUID
-	Amount       decimal.Decimal
-	PaymentDate  time.Time
-	ChequeNumber string
-	BankName     *string
-	Allocations  []PaymentAllocationRequest
-	CreatedBy    uuid.UUID
-}
-
-type RegisterWalletPaymentRequest struct {
-	CompanyID      uuid.UUID
-	CustomerID     uuid.UUID
-	Amount         decimal.Decimal
-	PaymentDate    time.Time
-	WalletProvider string
-	WalletTxID     string
-	Allocations    []PaymentAllocationRequest
-	CreatedBy      uuid.UUID
-}
-
-type ProcessGatewayPaymentRequest struct {
-	CompanyID      uuid.UUID
-	CustomerID     uuid.UUID
-	Amount         decimal.Decimal
-	PaymentMethod  enums.PaymentMethod
-	GatewayName    string
-	GatewayToken   string
-	IdempotencyKey string
-	Allocations    []PaymentAllocationRequest
-	CreatedBy      uuid.UUID
 }
 
 type ProcessGatewayWebhookRequest struct {
@@ -1846,4 +1766,89 @@ type InvoicePricingLineDetail struct {
 type CreateInvoiceFromQuoteRequest struct {
 	Notes     *string    `json:"notes,omitempty"`
 	CreatedBy *uuid.UUID `json:"created_by,omitempty"`
+}
+
+// ================================
+// Payment DTOs (updated)
+// ================================
+
+type CreatePaymentRequest struct {
+	CompanyID       uuid.UUID
+	PaymentNumber   string
+	ExternalRef     *string
+	PaymentDate     time.Time
+	Amount          decimal.Decimal
+	PaymentMethod   enums.PaymentMethod
+	Reference       *string
+	GatewayResponse models.JSONB
+	CreatedBy       *uuid.UUID
+	CustomerID      *uuid.UUID // <-- added (nullable)
+}
+
+type RegisterCashPaymentRequest struct {
+	CompanyID   uuid.UUID
+	CustomerID  *uuid.UUID // was uuid.UUID → changed to pointer
+	Amount      decimal.Decimal
+	PaymentDate time.Time
+	Reference   *string
+	Allocations []PaymentAllocationRequest
+	CreatedBy   uuid.UUID
+}
+
+type RegisterCardPaymentRequest struct {
+	CompanyID       uuid.UUID
+	CustomerID      *uuid.UUID // was uuid.UUID → changed to pointer
+	Amount          decimal.Decimal
+	PaymentDate     time.Time
+	CardLast4       string
+	CardBrand       string
+	GatewayTxID     string
+	GatewayResponse models.JSONB
+	Allocations     []PaymentAllocationRequest
+	CreatedBy       uuid.UUID
+}
+
+type RegisterBankTransferPaymentRequest struct {
+	CompanyID       uuid.UUID
+	CustomerID      *uuid.UUID // was uuid.UUID → changed to pointer
+	Amount          decimal.Decimal
+	PaymentDate     time.Time
+	ReferenceNumber string
+	BankName        *string
+	Allocations     []PaymentAllocationRequest
+	CreatedBy       uuid.UUID
+}
+
+type RegisterChequePaymentRequest struct {
+	CompanyID    uuid.UUID
+	CustomerID   *uuid.UUID // was uuid.UUID → changed to pointer
+	Amount       decimal.Decimal
+	PaymentDate  time.Time
+	ChequeNumber string
+	BankName     *string
+	Allocations  []PaymentAllocationRequest
+	CreatedBy    uuid.UUID
+}
+
+type RegisterWalletPaymentRequest struct {
+	CompanyID      uuid.UUID
+	CustomerID     *uuid.UUID // was uuid.UUID → changed to pointer
+	Amount         decimal.Decimal
+	PaymentDate    time.Time
+	WalletProvider string
+	WalletTxID     string
+	Allocations    []PaymentAllocationRequest
+	CreatedBy      uuid.UUID
+}
+
+type ProcessGatewayPaymentRequest struct {
+	CompanyID      uuid.UUID
+	CustomerID     *uuid.UUID // was uuid.UUID → changed to pointer
+	Amount         decimal.Decimal
+	PaymentMethod  enums.PaymentMethod
+	GatewayName    string
+	GatewayToken   string
+	IdempotencyKey string
+	Allocations    []PaymentAllocationRequest
+	CreatedBy      uuid.UUID
 }

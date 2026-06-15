@@ -2144,3 +2144,32 @@ ALTER TABLE sales.products ADD CONSTRAINT chk_product_tax_rate CHECK (tax_rate I
 
 -- Index for faster lookups (optional)
 CREATE INDEX idx_products_tax_rate ON sales.products(tax_rate) WHERE tax_rate IS NOT NULL;
+
+-- Add customer_id column (nullable because some payments may come from external sources)
+ALTER TABLE sales.payments ADD COLUMN customer_id UUID;
+
+-- Add foreign key constraint
+ALTER TABLE sales.payments 
+ADD CONSTRAINT fk_payments_customer 
+FOREIGN KEY (customer_id) REFERENCES sales.customers(customer_id) ON DELETE SET NULL;
+
+-- Create index for lookups
+CREATE INDEX idx_payments_customer ON sales.payments(customer_id);
+
+-- payment_allocation_fact table
+CREATE TABLE sales_analytics.payment_allocation_fact (
+    company_id UUID NOT NULL,
+    payment_id UUID NOT NULL,
+    invoice_id UUID NOT NULL,
+    allocated_amount NUMERIC(14,4) NOT NULL,
+    allocated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (payment_id, invoice_id)
+);
+
+-- daily_allocated_amount table
+CREATE TABLE sales_analytics.daily_allocated_amount (
+    company_id UUID NOT NULL,
+    date DATE NOT NULL,
+    total_allocated NUMERIC(14,4) NOT NULL DEFAULT 0,
+    PRIMARY KEY (company_id, date)
+);

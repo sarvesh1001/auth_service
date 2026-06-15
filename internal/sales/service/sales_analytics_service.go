@@ -137,7 +137,12 @@ func (s *salesAnalyticsService) ProcessSalesEvent(ctx context.Context, eventType
 			return fmt.Errorf("unmarshal order payload: %w", err)
 		}
 		return s.onOrderCancelled(ctx, order)
-
+	case salesEvents.EventPaymentAllocated:
+		var pay salesEvents.PaymentPayload
+		if err := json.Unmarshal(payload, &pay); err != nil {
+			return fmt.Errorf("unmarshal payment allocated payload: %w", err)
+		}
+		return s.onPaymentAllocated(ctx, pay)
 	// Payment & return events
 	case salesEvents.EventPaymentCompleted:
 		var pay salesEvents.PaymentPayload
@@ -2545,4 +2550,73 @@ func (s *salesAnalyticsService) updateCustomerSpent(ctx context.Context, tx repo
     `
 	_, err := tx.ExecContext(ctx, query, companyID, customerID, delta)
 	return err
+}
+
+// onPaymentAllocated processes payment allocation events for analytics.
+// It records the allocation amount and timing, which can be used to measure
+// how quickly payments are applied to invoices after creation.
+func (s *salesAnalyticsService) onPaymentAllocated(ctx context.Context, pay salesEvents.PaymentPayload) error {
+	if len(pay.Allocations) == 0 {
+		return nil
+	}
+
+	companyID, err := uuid.Parse(pay.CompanyID)
+	if err != nil {
+		return fmt.Errorf("invalid company_id: %w", err)
+	}
+
+	paymentID, err := uuid.Parse(pay.PaymentID)
+	if err != nil {
+		return fmt.Errorf("invalid payment_id: %w", err)
+	}
+
+	paymentDate, err := time.Parse(time.RFC3339, pay.PaymentDate)
+	if err != nil {
+		paymentDate = time.Now()
+	}
+
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// For each allocation, record the allocation fact.
+	for _, alloc := range pay.Allocations {
+		invoiceID, err := uuid.Parse(alloc.InvoiceID)
+		if err != nil {
+			s.logger.Warn("invalid invoice_id in allocation", zap.String("invoice_id", alloc.InvoiceID), zap.Error(err))
+			continue
+		}
+
+		amount, err := decimal.NewFromString(alloc.Amount)
+		if err != nil {
+			s.logger.Warn("invalid amount in allocation", zap.String("amount", alloc.Amount), zap.Error(err))
+			continue
+		}
+
+		// Check if this invoice already has an allocation from this payment
+		// (idempotency is handled by the event source, but we can upsert)
+		fact := &sales_analytics.PaymentAllocationFact{
+			CompanyID:       companyID,
+			PaymentID:       paymentID,
+			InvoiceID:       invoiceID,
+			AllocatedAmount: amount,
+			AllocatedAt:     time.Now(), // or use event timestamp? PaymentPayload doesn't have one.
+		}
+		// The PaymentPayload doesn't contain the allocation timestamp,
+		// so we use current time. Alternatively, you could add an `allocated_at` field to the event.
+		if err := s.analyticsRepo.UpsertPaymentAllocationFact(ctx, tx, fact); err != nil {
+			s.logger.Error("failed to upsert payment allocation fact", zap.Error(err))
+			continue
+		}
+
+		// Optionally, update daily metrics: total allocated amount per day.
+		date := paymentDate.Truncate(24 * time.Hour)
+		if err := s.analyticsRepo.IncrementDailyAllocatedAmount(ctx, tx, companyID, date, amount); err != nil {
+			s.logger.Warn("failed to increment daily allocated amount", zap.Error(err))
+		}
+	}
+
+	return tx.Commit()
 }

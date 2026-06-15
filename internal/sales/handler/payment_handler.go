@@ -40,6 +40,7 @@ type createPaymentRequest struct {
 	PaymentMethod   string        `json:"payment_method"`
 	Reference       *string       `json:"reference,omitempty"`
 	GatewayResponse *models.JSONB `json:"gateway_response,omitempty"`
+	CustomerID      string        `json:"customer_id,omitempty"`
 }
 
 type registerCashPaymentRequest struct {
@@ -47,6 +48,7 @@ type registerCashPaymentRequest struct {
 	Amount      string                     `json:"amount"`
 	Reference   *string                    `json:"reference,omitempty"`
 	Allocations []paymentAllocationRequest `json:"allocations,omitempty"`
+	CustomerID  string                     `json:"customer_id,omitempty"`
 }
 
 type registerCardPaymentRequest struct {
@@ -57,6 +59,7 @@ type registerCardPaymentRequest struct {
 	GatewayTxID string                     `json:"gateway_tx_id"`
 	Reference   *string                    `json:"reference,omitempty"`
 	Allocations []paymentAllocationRequest `json:"allocations,omitempty"`
+	CustomerID  string                     `json:"customer_id,omitempty"`
 }
 
 type registerBankTransferPaymentRequest struct {
@@ -65,6 +68,7 @@ type registerBankTransferPaymentRequest struct {
 	BankName        string                     `json:"bank_name"`
 	ReferenceNumber string                     `json:"reference_number"`
 	Allocations     []paymentAllocationRequest `json:"allocations,omitempty"`
+	CustomerID      string                     `json:"customer_id,omitempty"`
 }
 
 type registerChequePaymentRequest struct {
@@ -73,6 +77,7 @@ type registerChequePaymentRequest struct {
 	ChequeNumber string                     `json:"cheque_number"`
 	BankName     string                     `json:"bank_name"`
 	Allocations  []paymentAllocationRequest `json:"allocations,omitempty"`
+	CustomerID   string                     `json:"customer_id,omitempty"`
 }
 
 type registerWalletPaymentRequest struct {
@@ -81,6 +86,7 @@ type registerWalletPaymentRequest struct {
 	WalletProvider string                     `json:"wallet_provider"`
 	WalletTxID     string                     `json:"wallet_tx_id"`
 	Allocations    []paymentAllocationRequest `json:"allocations,omitempty"`
+	CustomerID     string                     `json:"customer_id,omitempty"`
 }
 
 type processGatewayPaymentRequest struct {
@@ -90,6 +96,7 @@ type processGatewayPaymentRequest struct {
 	PaymentMethod  string                     `json:"payment_method"`
 	IdempotencyKey string                     `json:"idempotency_key"`
 	Allocations    []paymentAllocationRequest `json:"allocations,omitempty"`
+	CustomerID     string                     `json:"customer_id,omitempty"`
 }
 
 type processGatewayWebhookRequest struct {
@@ -275,7 +282,17 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx = h.injectIdempotencyKey(ctx, r)
 
-	// Fix: safely handle optional gateway_response
+	// Parse optional customer_id
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	gatewayResp := models.JSONB{}
 	if req.GatewayResponse != nil {
 		gatewayResp = *req.GatewayResponse
@@ -291,6 +308,7 @@ func (h *PaymentHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		Reference:       req.Reference,
 		GatewayResponse: gatewayResp,
 		CreatedBy:       &userID,
+		CustomerID:      customerID,
 	}
 
 	payment, err := h.paymentService.CreatePayment(ctx, svcReq)
@@ -614,6 +632,12 @@ func (h *PaymentHandler) ListPayments(w http.ResponseWriter, r *http.Request) {
 			filter.MaxAmount = &amt
 		}
 	}
+	if customerIDStr := r.URL.Query().Get("customer_id"); customerIDStr != "" {
+		cid, err := uuid.Parse(customerIDStr)
+		if err == nil {
+			filter.CustomerID = &cid
+		}
+	}
 
 	limit := 20
 	if lStr := r.URL.Query().Get("limit"); lStr != "" {
@@ -929,6 +953,16 @@ func (h *PaymentHandler) RegisterCashPayment(w http.ResponseWriter, r *http.Requ
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	svcReq := &service.RegisterCashPaymentRequest{
 		CompanyID:   companyID,
 		PaymentDate: paymentDate,
@@ -936,6 +970,7 @@ func (h *PaymentHandler) RegisterCashPayment(w http.ResponseWriter, r *http.Requ
 		Reference:   req.Reference,
 		Allocations: allocations,
 		CreatedBy:   userID,
+		CustomerID:  customerID,
 	}
 
 	payment, err := h.paymentService.RegisterCashPayment(ctx, svcReq)
@@ -1011,6 +1046,16 @@ func (h *PaymentHandler) RegisterCardPayment(w http.ResponseWriter, r *http.Requ
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	svcReq := &service.RegisterCardPaymentRequest{
 		CompanyID:   companyID,
 		PaymentDate: paymentDate,
@@ -1020,6 +1065,7 @@ func (h *PaymentHandler) RegisterCardPayment(w http.ResponseWriter, r *http.Requ
 		GatewayTxID: req.GatewayTxID,
 		Allocations: allocations,
 		CreatedBy:   userID,
+		CustomerID:  customerID,
 	}
 
 	payment, err := h.paymentService.RegisterCardPayment(ctx, svcReq)
@@ -1095,6 +1141,16 @@ func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *h
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	bankNameCopy := req.BankName
 	svcReq := &service.RegisterBankTransferPaymentRequest{
 		CompanyID:       companyID,
@@ -1104,6 +1160,7 @@ func (h *PaymentHandler) RegisterBankTransferPayment(w http.ResponseWriter, r *h
 		ReferenceNumber: req.ReferenceNumber,
 		Allocations:     allocations,
 		CreatedBy:       userID,
+		CustomerID:      customerID,
 	}
 
 	payment, err := h.paymentService.RegisterBankTransferPayment(ctx, svcReq)
@@ -1179,6 +1236,16 @@ func (h *PaymentHandler) RegisterChequePayment(w http.ResponseWriter, r *http.Re
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	bankNameCopy := req.BankName
 	svcReq := &service.RegisterChequePaymentRequest{
 		CompanyID:    companyID,
@@ -1188,6 +1255,7 @@ func (h *PaymentHandler) RegisterChequePayment(w http.ResponseWriter, r *http.Re
 		BankName:     &bankNameCopy,
 		Allocations:  allocations,
 		CreatedBy:    userID,
+		CustomerID:   customerID,
 	}
 
 	payment, err := h.paymentService.RegisterChequePayment(ctx, svcReq)
@@ -1263,6 +1331,16 @@ func (h *PaymentHandler) RegisterWalletPayment(w http.ResponseWriter, r *http.Re
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	svcReq := &service.RegisterWalletPaymentRequest{
 		CompanyID:      companyID,
 		PaymentDate:    paymentDate,
@@ -1271,6 +1349,7 @@ func (h *PaymentHandler) RegisterWalletPayment(w http.ResponseWriter, r *http.Re
 		WalletTxID:     req.WalletTxID,
 		Allocations:    allocations,
 		CreatedBy:      userID,
+		CustomerID:     customerID,
 	}
 
 	payment, err := h.paymentService.RegisterWalletPayment(ctx, svcReq)
@@ -1349,6 +1428,16 @@ func (h *PaymentHandler) ProcessGatewayPayment(w http.ResponseWriter, r *http.Re
 		allocations[i] = service.PaymentAllocationRequest{InvoiceID: invID, Amount: amt}
 	}
 
+	var customerID *uuid.UUID
+	if req.CustomerID != "" {
+		cid, err := uuid.Parse(req.CustomerID)
+		if err != nil {
+			h.respondWithError(w, http.StatusBadRequest, "invalid customer_id")
+			return
+		}
+		customerID = &cid
+	}
+
 	svcReq := &service.ProcessGatewayPaymentRequest{
 		CompanyID:      companyID,
 		GatewayName:    req.GatewayName,
@@ -1358,6 +1447,7 @@ func (h *PaymentHandler) ProcessGatewayPayment(w http.ResponseWriter, r *http.Re
 		IdempotencyKey: idempotencyKey,
 		Allocations:    allocations,
 		CreatedBy:      userID,
+		CustomerID:     customerID,
 	}
 
 	payment, err := h.paymentService.ProcessGatewayPayment(ctx, svcReq)

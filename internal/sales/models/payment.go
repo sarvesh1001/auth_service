@@ -27,4 +27,5 @@ type Payment struct {
 	UpdatedAt       time.Time           `gorm:"autoUpdateTime" json:"updatedAt"`
 	CreatedBy       *uuid.UUID          `gorm:"type:uuid" json:"createdBy,omitempty"`
 	UpdatedBy       *uuid.UUID          `gorm:"type:uuid" json:"updatedBy,omitempty"`
+	CustomerID      *uuid.UUID          `gorm:"type:uuid" json:"customerId,omitempty"`
 }

@@ -107,6 +107,8 @@ type PaymentFilter struct {
 
 	UpdatedFrom *time.Time
 	UpdatedTo   *time.Time
+
+	CustomerID *uuid.UUID // added for filtering by customer
 }
 
 // -------------------------------------------------------------------------
@@ -249,6 +251,11 @@ func (r *paymentRepository) buildFilter(filter PaymentFilter) (string, []interfa
 		args = append(args, *filter.UpdatedTo)
 		idx++
 	}
+	if filter.CustomerID != nil {
+		conds = append(conds, fmt.Sprintf("customer_id = $%d", idx))
+		args = append(args, *filter.CustomerID)
+		idx++
+	}
 
 	if len(conds) == 0 {
 		return "", args
@@ -265,6 +272,7 @@ func (r *paymentRepository) scanPayment(s scanner) (*models.Payment, error) {
 	var createdBy, updatedBy uuid.NullUUID
 	var exchangeRate, refundedAmount sql.NullString
 	var completedAt sql.NullTime
+	var customerID uuid.NullUUID
 
 	err := s.Scan(
 		&p.PaymentID,
@@ -285,6 +293,7 @@ func (r *paymentRepository) scanPayment(s scanner) (*models.Payment, error) {
 		&p.UpdatedAt,
 		&createdBy,
 		&updatedBy,
+		&customerID,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -313,6 +322,9 @@ func (r *paymentRepository) scanPayment(s scanner) (*models.Payment, error) {
 	}
 	if updatedBy.Valid {
 		p.UpdatedBy = &updatedBy.UUID
+	}
+	if customerID.Valid {
+		p.CustomerID = &customerID.UUID
 	}
 	return &p, nil
 }
@@ -346,13 +358,13 @@ func (r *paymentRepository) Create(ctx context.Context, db DBTX, payment *models
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8,
 			$9, $10, $11, $12,
 			$13, $14, NOW(), NOW(),
-			$15, $16
+			$15, $16, $17
 		)
 		RETURNING created_at, updated_at
 	`
@@ -379,6 +391,7 @@ func (r *paymentRepository) Create(ctx context.Context, db DBTX, payment *models
 		payment.RefundedAmount,
 		r.nullUUIDParam(payment.CreatedBy),
 		r.nullUUIDParam(payment.UpdatedBy),
+		r.nullUUIDParam(payment.CustomerID),
 	).Scan(&payment.CreatedAt, &payment.UpdatedAt)
 	if err != nil {
 		r.logger.Error("failed to create payment", zap.Error(err))
@@ -400,7 +413,7 @@ func (r *paymentRepository) GetByID(ctx context.Context, db DBTX, companyID, pay
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		WHERE company_id = $1 AND payment_id = $2
 	`
@@ -415,7 +428,7 @@ func (r *paymentRepository) GetByNumber(ctx context.Context, db DBTX, companyID 
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		WHERE company_id = $1 AND payment_number = $2
 	`
@@ -430,7 +443,7 @@ func (r *paymentRepository) GetByReference(ctx context.Context, db DBTX, company
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		WHERE company_id = $1 AND reference = $2
 	`
@@ -453,8 +466,9 @@ func (r *paymentRepository) Update(ctx context.Context, db DBTX, payment *models
 			failure_reason = $12,
 			completed_at = $13,
 			refunded_amount = $14,
+			customer_id = $15,
 			updated_at = NOW(),
-			updated_by = $15
+			updated_by = $16
 		WHERE payment_id = $1 AND company_id = $2
 		RETURNING updated_at
 	`
@@ -479,6 +493,7 @@ func (r *paymentRepository) Update(ctx context.Context, db DBTX, payment *models
 		payment.FailureReason,
 		payment.CompletedAt,
 		payment.RefundedAmount,
+		r.nullUUIDParam(payment.CustomerID),
 		r.nullUUIDParam(payment.UpdatedBy),
 	).Scan(&payment.UpdatedAt)
 	if err != nil {
@@ -873,7 +888,7 @@ func (r *paymentRepository) List(ctx context.Context, db DBTX, filter PaymentFil
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		%s
 		%s
@@ -922,7 +937,7 @@ func (r *paymentRepository) Search(ctx context.Context, db DBTX, companyID uuid.
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		WHERE company_id = $1
 		AND (payment_number ILIKE $2 OR reference ILIKE $3 OR external_ref ILIKE $4)
@@ -952,7 +967,7 @@ func (r *paymentRepository) GetByInvoice(ctx context.Context, db DBTX, companyID
 			p.payment_date, p.amount, p.payment_method, p.status,
 			p.exchange_rate, p.reference, p.gateway_response, p.failure_reason,
 			p.completed_at, p.refunded_amount, p.created_at, p.updated_at,
-			p.created_by, p.updated_by
+			p.created_by, p.updated_by, p.customer_id
 		FROM sales.payments p
 		JOIN sales.payment_allocations a ON p.payment_id = a.payment_id
 		WHERE p.company_id = $1 AND a.invoice_id = $2
@@ -980,7 +995,7 @@ func (r *paymentRepository) GetUnallocatedPayments(ctx context.Context, db DBTX,
 			p.payment_date, p.amount, p.payment_method, p.status,
 			p.exchange_rate, p.reference, p.gateway_response, p.failure_reason,
 			p.completed_at, p.refunded_amount, p.created_at, p.updated_at,
-			p.created_by, p.updated_by
+			p.created_by, p.updated_by, p.customer_id
 		FROM sales.payments p
 		WHERE p.company_id = $1
 		AND p.status = 'completed'
@@ -1010,7 +1025,7 @@ func (r *paymentRepository) GetFailedPayments(ctx context.Context, db DBTX, comp
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		WHERE company_id = $1 AND status = 'failed'
 		ORDER BY created_at DESC
@@ -1157,7 +1172,7 @@ func (r *paymentRepository) GetTopPayments(ctx context.Context, db DBTX, company
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		%s
 		ORDER BY amount DESC
@@ -1191,7 +1206,7 @@ func (r *paymentRepository) GetByIDForUpdate(ctx context.Context, db DBTX, compa
 			payment_date, amount, payment_method, status,
 			exchange_rate, reference, gateway_response, failure_reason,
 			completed_at, refunded_amount, created_at, updated_at,
-			created_by, updated_by
+			created_by, updated_by, customer_id
 		FROM sales.payments
 		WHERE company_id = $1 AND payment_id = $2
 		FOR UPDATE

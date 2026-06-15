@@ -23,11 +23,11 @@ import (
 )
 
 // =============================================================================
-// Request/Response DTOs (unchanged)
+// Request/Response DTOs (assumed to exist – not changed)
 // =============================================================================
 
 // =============================================================================
-// Service Interface (unchanged)
+// Service Interface (unchanged – includes all methods)
 // =============================================================================
 
 type PaymentService interface {
@@ -201,12 +201,13 @@ func (s *paymentService) validateStatusTransition(current, next enums.PaymentSta
 }
 
 // applyAllocations validates and persists allocations inside a transaction.
-// It also updates invoice paid amounts and marks invoices as paid if fully covered.
+// It updates invoice paid amounts incrementally and marks invoices as paid if fully covered.
 func (s *paymentService) applyAllocations(ctx context.Context, tx repository.DBTX, companyID, paymentID uuid.UUID, allocations []PaymentAllocationRequest, updatedBy *uuid.UUID) error {
 	if len(allocations) == 0 {
 		return nil
 	}
 
+	// 1. Get payment and check it is completed
 	payment, err := s.paymentRepo.GetByIDForUpdate(ctx, tx, companyID, paymentID)
 	if err != nil {
 		return err
@@ -215,6 +216,7 @@ func (s *paymentService) applyAllocations(ctx context.Context, tx repository.DBT
 		return fmt.Errorf("%w: allocations can only be applied to completed payments", salesErrors.ErrInvalidStatus)
 	}
 
+	// 2. Check total allocation does not exceed payment amount
 	allocatedSoFar, err := s.paymentRepo.GetTotalAllocated(ctx, tx, companyID, paymentID)
 	if err != nil {
 		return err
@@ -227,12 +229,12 @@ func (s *paymentService) applyAllocations(ctx context.Context, tx repository.DBT
 		totalToAllocate = totalToAllocate.Add(a.Amount)
 	}
 	if allocatedSoFar.Add(totalToAllocate).GreaterThan(payment.Amount) {
-		return salesErrors.ErrPaymentOverAlloc // "total allocated amount exceeds payment amount"
+		return salesErrors.ErrPaymentOverAlloc
 	}
 
-	allocModels := make([]*models.PaymentAllocation, 0, len(allocations))
+	// 3. Process each allocation
 	for _, a := range allocations {
-		// Check invoice existence and status
+		// Fetch invoice with current amounts
 		invoice, err := s.invoiceRepo.GetByID(ctx, tx, companyID, a.InvoiceID)
 		if err != nil {
 			return fmt.Errorf("invoice %s: %w", a.InvoiceID, err)
@@ -240,15 +242,37 @@ func (s *paymentService) applyAllocations(ctx context.Context, tx repository.DBT
 		if invoice.Status == enums.InvoiceStatusPaid || invoice.Status == enums.InvoiceStatusCancelled {
 			return fmt.Errorf("%w: invoice %s is already %s", salesErrors.ErrInvalidStatus, invoice.InvoiceNumber, invoice.Status)
 		}
-		// Check that allocation does not exceed invoice due amount
+
+		// Check allocation does not exceed invoice due amount
 		due, err := s.invoiceRepo.GetAmountDue(ctx, tx, companyID, a.InvoiceID)
 		if err != nil {
 			return err
 		}
 		if a.Amount.GreaterThan(due) {
-			return fmt.Errorf("allocation amount %s exceeds invoice outstanding amount %s", a.Amount.String(), due.String())
+			return fmt.Errorf("%w: requested %s, outstanding %s", salesErrors.ErrAllocationExceedsInvoice, a.Amount.String(), due.String())
 		}
 
+		// Incrementally update invoice paid and due amounts
+		newPaid := invoice.AmountPaid.Add(a.Amount)
+		newDue := invoice.AmountDue.Sub(a.Amount)
+		if newDue.LessThan(decimal.Zero) {
+			newDue = decimal.Zero
+		}
+		if err := s.invoiceRepo.UpdateAmounts(ctx, tx, companyID, a.InvoiceID, newPaid, newDue, updatedBy); err != nil {
+			return err
+		}
+
+		// If invoice becomes fully paid, mark it as paid
+		if newDue.LessThanOrEqual(decimal.Zero) {
+			if err := s.invoiceRepo.MarkPaid(ctx, tx, companyID, a.InvoiceID, time.Now(), updatedBy); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 4. Store allocation records
+	allocModels := make([]*models.PaymentAllocation, 0, len(allocations))
+	for _, a := range allocations {
 		allocModels = append(allocModels, &models.PaymentAllocation{
 			AllocationID: uuid.New(),
 			PaymentID:    paymentID,
@@ -256,24 +280,8 @@ func (s *paymentService) applyAllocations(ctx context.Context, tx repository.DBT
 			Amount:       a.Amount,
 		})
 	}
-
 	if err := s.paymentRepo.AddAllocations(ctx, tx, companyID, paymentID, allocModels); err != nil {
 		return err
-	}
-
-	for _, a := range allocations {
-		if err := s.invoiceRepo.UpdateAmounts(ctx, tx, companyID, a.InvoiceID, a.Amount, decimal.Zero, updatedBy); err != nil {
-			return err
-		}
-		due, err := s.invoiceRepo.GetAmountDue(ctx, tx, companyID, a.InvoiceID)
-		if err != nil {
-			return err
-		}
-		if due.LessThanOrEqual(decimal.Zero) {
-			if err := s.invoiceRepo.MarkPaid(ctx, tx, companyID, a.InvoiceID, time.Now(), updatedBy); err != nil {
-				return err
-			}
-		}
 	}
 	return nil
 }
@@ -294,10 +302,9 @@ func (s *paymentService) CreatePayment(ctx context.Context, req *CreatePaymentRe
 	}
 	defer tx.Rollback()
 
-	// Retrieve idempotency key from context (set by middleware)
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
-		idempKey = uuid.New().String() // fallback, though middleware should enforce it
+		idempKey = uuid.New().String()
 	}
 
 	var cached *models.Payment
@@ -343,6 +350,7 @@ func (s *paymentService) CreatePayment(ctx context.Context, req *CreatePaymentRe
 		GatewayResponse: req.GatewayResponse,
 		CreatedBy:       req.CreatedBy,
 		UpdatedBy:       req.CreatedBy,
+		CustomerID:      req.CustomerID,
 	}
 	if payment.PaymentDate.IsZero() {
 		payment.PaymentDate = time.Now()
@@ -438,7 +446,7 @@ func (s *paymentService) UpdatePayment(ctx context.Context, companyID uuid.UUID,
 		payment.Reference = req.Reference
 		changes["reference"] = req.Reference
 	}
-	if req.GatewayResponse != nil {
+	if req.GatewayResponse != nil && len(req.GatewayResponse) > 0 {
 		payment.GatewayResponse = req.GatewayResponse
 		changes["gateway_response"] = req.GatewayResponse
 	}
@@ -511,7 +519,7 @@ func (s *paymentService) DeletePayment(ctx context.Context, companyID uuid.UUID,
 }
 
 // --------------------------------------------------------------------------
-// Retrieval methods (read‑only) - now use the default DB connection
+// Retrieval methods (read‑only)
 // --------------------------------------------------------------------------
 
 func (s *paymentService) GetPaymentByID(ctx context.Context, companyID uuid.UUID, paymentID uuid.UUID) (*models.Payment, error) {
@@ -564,7 +572,6 @@ func (s *paymentService) SearchPayments(ctx context.Context, companyID uuid.UUID
 
 func (s *paymentService) GetPaymentsByCustomer(ctx context.Context, companyID, customerID uuid.UUID, p Pagination, srt Sort) ([]*models.Payment, int64, error) {
 	db := s.pgClient.DB
-	// As in original – but using db instead of nil
 	invoices, _, err := s.invoiceRepo.GetByCustomer(ctx, db, companyID, customerID,
 		repository.Pagination{Limit: 1000, Offset: 0},
 		repository.Sort{Field: "invoice_date", Direction: "DESC"})
@@ -617,7 +624,6 @@ func (s *paymentService) GetPaymentsByInvoice(ctx context.Context, companyID, in
 func (s *paymentService) RegisterCashPayment(ctx context.Context, req *RegisterCashPaymentRequest) (*models.Payment, error) {
 	logger := s.logger.With(zap.String("method", "RegisterCashPayment"))
 
-	// Validate request
 	if req.Amount.LessThanOrEqual(decimal.Zero) {
 		return nil, fmt.Errorf("%w: amount must be positive", salesErrors.ErrInvalidAmount)
 	}
@@ -625,27 +631,23 @@ func (s *paymentService) RegisterCashPayment(ctx context.Context, req *RegisterC
 		req.PaymentDate = time.Now()
 	}
 
-	// Begin a transaction for the entire operation
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Idempotency key (from context or generate new)
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = uuid.New().String()
 	}
 
-	// Check if already processed
 	var cached *models.Payment
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached payment")
 		return cached, nil
 	}
 
-	// --- Step 1: Create the payment (status = pending) ---
 	paymentNumber, err := s.generatePaymentNumber(tx, req.CompanyID)
 	if err != nil {
 		return nil, fmt.Errorf("generate payment number: %w", err)
@@ -669,12 +671,12 @@ func (s *paymentService) RegisterCashPayment(ctx context.Context, req *RegisterC
 		Reference:     req.Reference,
 		CreatedBy:     &req.CreatedBy,
 		UpdatedBy:     &req.CreatedBy,
+		CustomerID:    req.CustomerID,
 	}
 	if err := s.paymentRepo.Create(ctx, tx, payment, nil); err != nil {
 		return nil, fmt.Errorf("create payment: %w", err)
 	}
 
-	// --- Step 2: Mark as completed (same transaction) ---
 	completedAt := time.Now()
 	if err := s.paymentRepo.MarkCompleted(ctx, tx, req.CompanyID, payment.PaymentID, completedAt, &req.CreatedBy); err != nil {
 		return nil, fmt.Errorf("mark completed: %w", err)
@@ -682,29 +684,21 @@ func (s *paymentService) RegisterCashPayment(ctx context.Context, req *RegisterC
 	payment.Status = enums.PaymentStatusCompleted
 	payment.CompletedAt = &completedAt
 
-	// --- Step 3: Apply allocations (if any) ---
 	if len(req.Allocations) > 0 {
 		if err := s.applyAllocations(ctx, tx, req.CompanyID, payment.PaymentID, req.Allocations, &req.CreatedBy); err != nil {
 			return nil, err
 		}
 	}
 
-	// --- Step 4: Emit event ---
 	if err := s.emitPaymentEvent(ctx, tx, payment, salesEvents.EventPaymentCompleted, nil); err != nil {
 		logger.Warn("failed to emit payment completed event", zap.Error(err))
 	}
-
-	// --- Step 5: Store idempotency result ---
 	if err := s.idempotencyStore.Store(ctx, tx, idempKey, payment); err != nil {
 		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
-
-	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
-
-	// Audit log (outside transaction)
 	if s.auditService != nil {
 		_ = s.auditService.LogAction(ctx, nil, &req.CompanyID, "sales", "register_cash_payment", "payment",
 			&payment.PaymentID, "user", &req.CreatedBy, nil, nil, map[string]interface{}{
@@ -728,7 +722,8 @@ func (s *paymentService) RegisterCardPayment(ctx context.Context, req *RegisterC
 			"card_brand":    req.CardBrand,
 			"gateway_tx_id": req.GatewayTxID,
 		},
-		CreatedBy: &req.CreatedBy,
+		CreatedBy:  &req.CreatedBy,
+		CustomerID: req.CustomerID,
 	}
 	payment, err := s.CreatePayment(ctx, createReq)
 	if err != nil {
@@ -742,7 +737,6 @@ func (s *paymentService) RegisterCardPayment(ctx context.Context, req *RegisterC
 			return nil, err
 		}
 	}
-	// Re-fetch the payment to get updated status and allocations (using default DB)
 	db := s.pgClient.DB
 	return s.paymentRepo.GetByID(ctx, db, req.CompanyID, payment.PaymentID)
 }
@@ -757,7 +751,8 @@ func (s *paymentService) RegisterBankTransferPayment(ctx context.Context, req *R
 		GatewayResponse: models.JSONB{
 			"bank_name": req.BankName,
 		},
-		CreatedBy: &req.CreatedBy,
+		CreatedBy:  &req.CreatedBy,
+		CustomerID: req.CustomerID,
 	}
 	payment, err := s.CreatePayment(ctx, createReq)
 	if err != nil {
@@ -785,7 +780,8 @@ func (s *paymentService) RegisterChequePayment(ctx context.Context, req *Registe
 			"cheque_number": req.ChequeNumber,
 			"bank_name":     req.BankName,
 		},
-		CreatedBy: &req.CreatedBy,
+		CreatedBy:  &req.CreatedBy,
+		CustomerID: req.CustomerID,
 	}
 	payment, err := s.CreatePayment(ctx, createReq)
 	if err != nil {
@@ -813,7 +809,8 @@ func (s *paymentService) RegisterWalletPayment(ctx context.Context, req *Registe
 			"wallet_provider": req.WalletProvider,
 			"wallet_tx_id":    req.WalletTxID,
 		},
-		CreatedBy: &req.CreatedBy,
+		CreatedBy:  &req.CreatedBy,
+		CustomerID: req.CustomerID,
 	}
 	payment, err := s.CreatePayment(ctx, createReq)
 	if err != nil {
@@ -831,7 +828,7 @@ func (s *paymentService) RegisterWalletPayment(ctx context.Context, req *Registe
 }
 
 // --------------------------------------------------------------------------
-// Gateway integration (idempotency via context)
+// Gateway integration
 // --------------------------------------------------------------------------
 
 func (s *paymentService) ProcessGatewayPayment(ctx context.Context, req *ProcessGatewayPaymentRequest) (*models.Payment, error) {
@@ -862,7 +859,8 @@ func (s *paymentService) ProcessGatewayPayment(ctx context.Context, req *Process
 			"gateway": req.GatewayName,
 			"token":   req.GatewayToken,
 		},
-		CreatedBy: &req.CreatedBy,
+		CreatedBy:  &req.CreatedBy,
+		CustomerID: req.CustomerID,
 	}
 	payment, err := s.CreatePayment(ctx, createReq)
 	if err != nil {
@@ -914,7 +912,7 @@ func (s *paymentService) ValidateGatewaySignature(ctx context.Context, gateway s
 }
 
 // --------------------------------------------------------------------------
-// Idempotency helpers (read‑only)
+// Idempotency helpers
 // --------------------------------------------------------------------------
 
 func (s *paymentService) EnsureIdempotentPayment(ctx context.Context, companyID uuid.UUID, idempotencyKey string) (*models.Payment, bool, error) {
@@ -994,9 +992,120 @@ func (s *paymentService) AllocatePaymentToInvoices(ctx context.Context, companyI
 	return tx.Commit()
 }
 
+// AutoAllocatePayment automatically allocates the unallocated amount of a payment to the oldest outstanding invoices of the customer.
 func (s *paymentService) AutoAllocatePayment(ctx context.Context, companyID, paymentID uuid.UUID, allocatedBy uuid.UUID) error {
-	// Not implemented – would require customer link on payment
-	return fmt.Errorf("auto-allocation not implemented without customer link on payment")
+	tx, err := s.pgClient.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("autoalloc-%s", paymentID.String())
+	}
+	var processed bool
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
+		s.logger.Info("idempotent – auto-allocation already applied")
+		return nil
+	}
+
+	// 1. Get payment with lock
+	payment, err := s.paymentRepo.GetByIDForUpdate(ctx, tx, companyID, paymentID)
+	if err != nil {
+		return err
+	}
+	if payment.Status != enums.PaymentStatusCompleted {
+		return fmt.Errorf("%w: only completed payments can be auto-allocated", salesErrors.ErrInvalidStatus)
+	}
+
+	// 2. Determine customer ID
+	var customerID uuid.UUID
+	if payment.CustomerID != nil && *payment.CustomerID != uuid.Nil {
+		customerID = *payment.CustomerID
+	} else {
+		// Fallback: try to get customer from first existing allocation
+		allocs, err := s.paymentRepo.GetAllocations(ctx, tx, companyID, paymentID)
+		if err != nil {
+			return err
+		}
+		if len(allocs) > 0 {
+			inv, err := s.invoiceRepo.GetByID(ctx, tx, companyID, allocs[0].InvoiceID)
+			if err != nil {
+				return err
+			}
+			customerID = inv.CustomerID
+		} else {
+			return fmt.Errorf("%w: cannot auto-allocate – no customer linked to payment or allocations", salesErrors.ErrInvalidInput)
+		}
+	}
+
+	// 3. Get unallocated amount
+	allocated, err := s.paymentRepo.GetTotalAllocated(ctx, tx, companyID, paymentID)
+	if err != nil {
+		return err
+	}
+	unallocated := payment.Amount.Sub(allocated)
+	if unallocated.LessThanOrEqual(decimal.Zero) {
+		return nil // nothing to allocate
+	}
+
+	// 4. Get outstanding invoices for this customer (oldest due date first)
+	invoices, _, err := s.invoiceRepo.GetByCustomer(ctx, tx, companyID, customerID,
+		repository.Pagination{Limit: 100, Offset: 0},
+		repository.Sort{Field: "due_date", Direction: "ASC"})
+	if err != nil {
+		return err
+	}
+
+	var toAllocate []PaymentAllocationRequest
+	remaining := unallocated
+	for _, inv := range invoices {
+		// Skip invoices that are already paid or cancelled/voided
+		if inv.Status == enums.InvoiceStatusPaid || inv.Status == enums.InvoiceStatusCancelled {
+			continue
+		}
+		due, err := s.invoiceRepo.GetAmountDue(ctx, tx, companyID, inv.InvoiceID)
+		if err != nil {
+			return err
+		}
+		if due.LessThanOrEqual(decimal.Zero) {
+			continue
+		}
+		amount := due
+		if amount.GreaterThan(remaining) {
+			amount = remaining
+		}
+		toAllocate = append(toAllocate, PaymentAllocationRequest{
+			InvoiceID: inv.InvoiceID,
+			Amount:    amount,
+		})
+		remaining = remaining.Sub(amount)
+		if remaining.LessThanOrEqual(decimal.Zero) {
+			break
+		}
+	}
+
+	if len(toAllocate) == 0 {
+		return nil
+	}
+
+	// 5. Apply allocations
+	if err := s.applyAllocations(ctx, tx, companyID, paymentID, toAllocate, &allocatedBy); err != nil {
+		return err
+	}
+
+	// 6. Emit event
+	if err := s.emitPaymentEvent(ctx, tx, payment, salesEvents.EventPaymentAllocated, map[string]interface{}{
+		"allocations": toAllocate,
+	}); err != nil {
+		s.logger.Warn("failed to emit auto-allocated event", zap.Error(err))
+	}
+
+	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
+		s.logger.Warn("failed to store idempotency record", zap.Error(err))
+	}
+	return tx.Commit()
 }
 
 func (s *paymentService) RemoveAllocation(ctx context.Context, companyID, paymentID, allocationID uuid.UUID, removedBy uuid.UUID) error {
@@ -1020,27 +1129,34 @@ func (s *paymentService) RemoveAllocation(ctx context.Context, companyID, paymen
 	if err != nil {
 		return err
 	}
-	if err := s.invoiceRepo.UpdateAmounts(ctx, tx, companyID, alloc.InvoiceID, decimal.Zero, alloc.Amount.Neg(), &removedBy); err != nil {
-		return err
-	}
-	if err := s.paymentRepo.DeleteAllocation(ctx, tx, companyID, paymentID, allocationID); err != nil {
-		return err
-	}
+
+	// Get current invoice state
 	invoice, err := s.invoiceRepo.GetByID(ctx, tx, companyID, alloc.InvoiceID)
 	if err != nil {
 		return err
 	}
-	if invoice.Status == enums.InvoiceStatusPaid {
-		due, err := s.invoiceRepo.GetAmountDue(ctx, tx, companyID, alloc.InvoiceID)
-		if err != nil {
+
+	// Reverse the allocation: subtract from paid, add back to due
+	newPaid := invoice.AmountPaid.Sub(alloc.Amount)
+	newDue := invoice.AmountDue.Add(alloc.Amount)
+	if newPaid.LessThan(decimal.Zero) {
+		newPaid = decimal.Zero
+	}
+	if err := s.invoiceRepo.UpdateAmounts(ctx, tx, companyID, alloc.InvoiceID, newPaid, newDue, &removedBy); err != nil {
+		return err
+	}
+
+	// If invoice was fully paid and now has a due amount, revert its status to issued
+	if invoice.Status == enums.InvoiceStatusPaid && newDue.GreaterThan(decimal.Zero) {
+		if err := s.invoiceRepo.UpdateStatus(ctx, tx, companyID, alloc.InvoiceID, enums.InvoiceStatusIssued, &removedBy); err != nil {
 			return err
 		}
-		if due.GreaterThan(decimal.Zero) {
-			if err := s.invoiceRepo.UpdateStatus(ctx, tx, companyID, alloc.InvoiceID, enums.InvoiceStatusIssued, &removedBy); err != nil {
-				return err
-			}
-		}
 	}
+
+	if err := s.paymentRepo.DeleteAllocation(ctx, tx, companyID, paymentID, allocationID); err != nil {
+		return err
+	}
+
 	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
 		s.logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
@@ -1077,16 +1193,17 @@ func (s *paymentService) IsFullyAllocated(ctx context.Context, companyID, paymen
 // Refunds (with idempotency via context)
 // --------------------------------------------------------------------------
 
+// CreateRefund creates a refund for a payment, ensuring that only completed or partially refunded payments can be refunded,
+// and that the refund amount does not exceed the remaining refundable amount. It is idempotent.
 func (s *paymentService) CreateRefund(ctx context.Context, req *CreateRefundRequest) (*models.PaymentRefund, error) {
-	if err := s.validateRefund(ctx, req.CompanyID, req.PaymentID, req.Amount); err != nil {
-		return nil, err
-	}
+	// Begin transaction
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
+	// Idempotency key
 	idempKey, _ := ctx.Value("idempotency_key").(string)
 	if idempKey == "" {
 		idempKey = fmt.Sprintf("refund-%s", req.PaymentID.String())
@@ -1097,14 +1214,30 @@ func (s *paymentService) CreateRefund(ctx context.Context, req *CreateRefundRequ
 		return cached, nil
 	}
 
+	// Lock the payment row for update
 	payment, err := s.paymentRepo.GetByIDForUpdate(ctx, tx, req.CompanyID, req.PaymentID)
 	if err != nil {
 		return nil, err
 	}
-	newRefunded := payment.RefundedAmount.Add(req.Amount)
-	if newRefunded.GreaterThan(payment.Amount) {
+
+	// ------------------ VALIDATION (inside transaction) ------------------
+	// 1. Status check
+	if payment.Status != enums.PaymentStatusCompleted && payment.Status != enums.PaymentStatusPartiallyRefunded {
+		return nil, fmt.Errorf("%w: only completed or partially refunded payments can be refunded", salesErrors.ErrInvalidStatus)
+	}
+	// 2. Amount positive
+	if req.Amount.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("%w: refund amount must be positive", salesErrors.ErrInvalidAmount)
+	}
+	// 3. Amount not exceeding remaining refundable
+	refundable := payment.Amount.Sub(payment.RefundedAmount)
+	if req.Amount.GreaterThan(refundable) {
 		return nil, salesErrors.ErrOverRefund
 	}
+	// --------------------------------------------------------------------
+
+	newRefunded := payment.RefundedAmount.Add(req.Amount)
+
 	refund := &models.PaymentRefund{
 		RefundID:   uuid.New(),
 		CompanyID:  req.CompanyID,
@@ -1114,12 +1247,15 @@ func (s *paymentService) CreateRefund(ctx context.Context, req *CreateRefundRequ
 		RefundedBy: &req.RefundedBy,
 		Status:     "completed",
 	}
+
 	if err := s.refundRepo.Create(ctx, tx, refund); err != nil {
 		return nil, err
 	}
 	if err := s.paymentRepo.UpdateRefundedAmount(ctx, tx, req.CompanyID, req.PaymentID, newRefunded, &req.RefundedBy); err != nil {
 		return nil, err
 	}
+
+	// Update payment status based on new total refunded amount
 	if newRefunded.Equal(payment.Amount) {
 		if err := s.paymentRepo.UpdateStatus(ctx, tx, req.CompanyID, req.PaymentID, enums.PaymentStatusRefunded, &req.RefundedBy); err != nil {
 			return nil, err
@@ -1129,35 +1265,44 @@ func (s *paymentService) CreateRefund(ctx context.Context, req *CreateRefundRequ
 			return nil, err
 		}
 	}
+
+	// Emit event
 	if err := s.emitPaymentEvent(ctx, tx, payment, salesEvents.EventPaymentRefunded, map[string]interface{}{
 		"refund_amount": req.Amount.String(),
 	}); err != nil {
 		s.logger.Warn("failed to emit refund event", zap.Error(err))
 	}
+
 	if err := s.idempotencyStore.Store(ctx, tx, idempKey, refund); err != nil {
 		s.logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return refund, nil
 }
 
+// RefundFullPayment refunds the entire remaining amount of a payment (original amount - already refunded).
 func (s *paymentService) RefundFullPayment(ctx context.Context, companyID, paymentID uuid.UUID, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error) {
+	// Get current payment (read‑only, fine because CreateRefund will lock it)
 	db := s.pgClient.DB
 	payment, err := s.paymentRepo.GetByID(ctx, db, companyID, paymentID)
 	if err != nil {
 		return nil, err
 	}
+	remaining := payment.Amount.Sub(payment.RefundedAmount)
+	if remaining.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("%w: no remaining amount to refund", salesErrors.ErrInvalidAmount)
+	}
 	return s.CreateRefund(ctx, &CreateRefundRequest{
 		CompanyID:  companyID,
 		PaymentID:  paymentID,
-		Amount:     payment.Amount,
+		Amount:     remaining,
 		Reason:     reason,
 		RefundedBy: refundedBy,
 	})
 }
-
 func (s *paymentService) RefundPartialPayment(ctx context.Context, companyID, paymentID uuid.UUID, amount decimal.Decimal, reason string, refundedBy uuid.UUID) (*models.PaymentRefund, error) {
 	return s.CreateRefund(ctx, &CreateRefundRequest{
 		CompanyID:  companyID,
