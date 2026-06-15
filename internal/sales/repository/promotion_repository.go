@@ -54,8 +54,8 @@ type PromotionRepository interface {
 
 	// Stacking type
 	GetStackingType(ctx context.Context, db DBTX, promotionID uuid.UUID) (string, error)
-
-	// Promotion rules
+	// in coupon_repository.go interface
+	FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Promotion, error) // Promotion rules
 	AddRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error
 	ReplaceRules(ctx context.Context, db DBTX, companyID, promotionID uuid.UUID, rules []*discount.PromotionRule) error
 	DeleteRule(ctx context.Context, db DBTX, companyID, promotionID, ruleID uuid.UUID) error
@@ -1038,4 +1038,61 @@ func (r *promotionRepository) GetRuleByIDForUpdate(ctx context.Context, db DBTX,
 	`
 	row := db.QueryRowContext(ctx, query, companyID, promotionID, ruleID)
 	return r.scanPromotionRule(row)
+}
+
+// FindByIDs retrieves multiple promotions by their IDs (ignoring company_id).
+// Returns a slice of promotions, order is not guaranteed. If no promotions found, returns empty slice.
+func (r *promotionRepository) FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Promotion, error) {
+	if len(ids) == 0 {
+		return []*discount.Promotion{}, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, 0, len(ids)+1)
+	args = append(args, companyID)
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(`
+        SELECT promotion_id, company_id, name, description,
+               start_date, end_date, is_active, priority, stacking_type,
+               created_at, updated_at, created_by, updated_by
+        FROM sales.promotions
+        WHERE company_id = $1 AND promotion_id IN (%s)
+    `, strings.Join(placeholders, ","))
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("find promotions by ids: %w", err)
+	}
+	defer rows.Close()
+
+	var promotions []*discount.Promotion
+	for rows.Next() {
+		p := &discount.Promotion{}
+		var priority sql.NullInt32
+		var createdBy, updatedBy uuid.NullUUID
+		err := rows.Scan(
+			&p.PromotionID, &p.CompanyID, &p.Name, &p.Description,
+			&p.StartDate, &p.EndDate, &p.IsActive, &priority, &p.StackingType,
+			&p.CreatedAt, &p.UpdatedAt, &createdBy, &updatedBy,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan promotion: %w", err)
+		}
+		if priority.Valid {
+			p.Priority = new(int)
+			*p.Priority = int(priority.Int32)
+		}
+		if createdBy.Valid {
+			p.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			p.UpdatedBy = &updatedBy.UUID
+		}
+		promotions = append(promotions, p)
+	}
+	return promotions, rows.Err()
 }

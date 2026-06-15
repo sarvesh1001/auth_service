@@ -7,9 +7,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
-
 	"go.uber.org/zap"
 
+	"auth-service/internal/client"
 	salesErrors "auth-service/internal/sales/errors"
 	"auth-service/internal/sales/models/discount"
 	"auth-service/internal/sales/repository"
@@ -50,7 +50,7 @@ type PricingService interface {
 	GetApplicablePromotions(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error)
 	GetBestPromotion(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Promotion, decimal.Decimal, error)
 	CalculateCombinedDiscount(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*DiscountCalculationResult, error)
-	ValidateDiscountCombination(ctx context.Context, couponIDs, promotionIDs []uuid.UUID) error
+	ValidateDiscountCombination(ctx context.Context, companyID uuid.UUID, couponIDs, promotionIDs []uuid.UUID) error // FIXED: added companyID
 
 	// Credit validation
 	GetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error)
@@ -79,6 +79,7 @@ type pricingService struct {
 	quoteRepo     repository.QuoteRepository
 	invoiceRepo   repository.InvoiceRepository
 	customerSvc   CustomerService
+	pgClient      *client.PostgresClient
 	logger        *zap.Logger
 }
 
@@ -92,6 +93,7 @@ func NewPricingService(
 	quoteRepo repository.QuoteRepository,
 	invoiceRepo repository.InvoiceRepository,
 	customerSvc CustomerService,
+	pgClient *client.PostgresClient,
 	logger *zap.Logger,
 ) PricingService {
 	return &pricingService{
@@ -103,6 +105,7 @@ func NewPricingService(
 		quoteRepo:     quoteRepo,
 		invoiceRepo:   invoiceRepo,
 		customerSvc:   customerSvc,
+		pgClient:      pgClient,
 		logger:        logger.Named("pricing_service"),
 	}
 }
@@ -112,13 +115,15 @@ func NewPricingService(
 // ---------------------------------------------------------------------
 
 func (s *pricingService) GetProductBasePrice(ctx context.Context, companyID, productID uuid.UUID) (decimal.Decimal, error) {
-	return s.productRepo.GetUnitPrice(ctx, nil, companyID, productID)
+	db := s.pgClient.DB
+	return s.productRepo.GetUnitPrice(ctx, db, companyID, productID)
 }
 
 func (s *pricingService) GetProductsBasePrices(ctx context.Context, companyID uuid.UUID, productIDs []uuid.UUID) (map[uuid.UUID]decimal.Decimal, error) {
+	db := s.pgClient.DB
 	result := make(map[uuid.UUID]decimal.Decimal, len(productIDs))
 	for _, pid := range productIDs {
-		price, err := s.productRepo.GetUnitPrice(ctx, nil, companyID, pid)
+		price, err := s.productRepo.GetUnitPrice(ctx, db, companyID, pid)
 		if err != nil {
 			return nil, fmt.Errorf("get price for product %s: %w", pid, err)
 		}
@@ -140,13 +145,15 @@ func (s *pricingService) CalculateOrderPricing(ctx context.Context, req *Calcula
 		at = time.Now()
 	}
 
+	db := s.pgClient.DB
+
 	// 1. Compute subtotal from lines (using base price if UnitPrice not given)
 	linesRes := make([]*PricingLineResult, 0, len(req.Lines))
 	var subtotal decimal.Decimal
 	for _, line := range req.Lines {
 		unitPrice := line.UnitPrice
 		if unitPrice == nil {
-			base, err := s.productRepo.GetUnitPrice(ctx, nil, req.CompanyID, line.ProductID)
+			base, err := s.productRepo.GetUnitPrice(ctx, db, req.CompanyID, line.ProductID)
 			if err != nil {
 				return nil, fmt.Errorf("get base price for product %s: %w", line.ProductID, err)
 			}
@@ -159,7 +166,7 @@ func (s *pricingService) CalculateOrderPricing(ctx context.Context, req *Calcula
 			ProductID:       line.ProductID,
 			Quantity:        line.Quantity,
 			BasePrice:       *unitPrice,
-			FinalLineAmount: lineSubtotal, // will be updated after discount/tax
+			FinalLineAmount: lineSubtotal,
 		})
 	}
 
@@ -173,7 +180,7 @@ func (s *pricingService) CalculateOrderPricing(ctx context.Context, req *Calcula
 		return nil, fmt.Errorf("calculate combined discount: %w", err)
 	}
 
-	// 3. Apply discount to each line proportionally (simple proportional split)
+	// 3. Apply discount to each line proportionally
 	discountRemaining := discountRes.DiscountTotal
 	for _, lineRes := range linesRes {
 		lineSubtotal := lineRes.BasePrice.Mul(lineRes.Quantity)
@@ -193,7 +200,7 @@ func (s *pricingService) CalculateOrderPricing(ctx context.Context, req *Calcula
 	var taxTotal decimal.Decimal
 	if req.CalculateTax {
 		for i, lineRes := range linesRes {
-			tax, err := s.pricingRepo.CalculateLineTax(ctx, nil, req.CompanyID, linesRes[i].ProductID, lineRes.FinalLineAmount)
+			tax, err := s.pricingRepo.CalculateLineTax(ctx, db, req.CompanyID, linesRes[i].ProductID, lineRes.FinalLineAmount)
 			if err != nil {
 				return nil, fmt.Errorf("calculate line tax for product %s: %w", lineRes.ProductID, err)
 			}
@@ -216,21 +223,41 @@ func (s *pricingService) CalculateOrderPricing(ctx context.Context, req *Calcula
 	}, nil
 }
 
+// PreviewOrderPricing calculates a pricing preview using the repository.
 func (s *pricingService) PreviewOrderPricing(ctx context.Context, req *OrderPricingPreviewRequest) (*PricingPreviewResult, error) {
+	logger := s.logger.With(
+		zap.String("method", "PreviewOrderPricing"),
+		zap.String("company_id", req.CompanyID.String()),
+	)
+	logger.Info("service entry")
+
+	// 1. Set pricing timestamp
 	at := req.At
 	if at == nil || at.IsZero() {
 		now := time.Now()
 		at = &now
+		logger.Debug("using current time for pricing", zap.Time("at", *at))
+	} else {
+		logger.Debug("using provided timestamp", zap.Time("at", *at))
 	}
+
+	db := s.pgClient.DB
+
+	// 2. Build product lines with unit prices
 	lines := make([]*repository.PricingProductLine, len(req.Items))
 	for i, it := range req.Items {
 		unitPrice := it.UnitPrice
 		if unitPrice == nil {
-			base, err := s.productRepo.GetUnitPrice(ctx, nil, req.CompanyID, it.ProductID)
+			logger.Debug("no unit price provided, fetching base price", zap.String("product_id", it.ProductID.String()))
+			base, err := s.productRepo.GetUnitPrice(ctx, db, req.CompanyID, it.ProductID)
 			if err != nil {
-				return nil, err
+				logger.Error("failed to get base price", zap.Error(err), zap.String("product_id", it.ProductID.String()))
+				return nil, fmt.Errorf("get base price for product %s: %w", it.ProductID, err)
 			}
 			unitPrice = &base
+			logger.Debug("base price fetched", zap.String("product_id", it.ProductID.String()), zap.String("base_price", base.String()))
+		} else {
+			logger.Debug("using provided unit price", zap.String("product_id", it.ProductID.String()), zap.String("unit_price", unitPrice.String()))
 		}
 		lines[i] = &repository.PricingProductLine{
 			ProductID: it.ProductID,
@@ -238,6 +265,8 @@ func (s *pricingService) PreviewOrderPricing(ctx context.Context, req *OrderPric
 			UnitPrice: *unitPrice,
 		}
 	}
+
+	// 3. Prepare repository input
 	input := &repository.PricingPreviewInput{
 		CompanyID:    req.CompanyID,
 		CustomerID:   req.CustomerID,
@@ -245,10 +274,22 @@ func (s *pricingService) PreviewOrderPricing(ctx context.Context, req *OrderPric
 		CouponCodes:  req.CouponCodes,
 		PricedAt:     *at,
 	}
-	preview, err := s.pricingRepo.PreviewOrderPricing(ctx, nil, input)
+	logger.Debug("calling pricingRepo.PreviewOrderPricing",
+		zap.Int("product_count", len(input.ProductLines)),
+		zap.Strings("coupon_codes", input.CouponCodes))
+
+	// 4. Call repository
+	preview, err := s.pricingRepo.PreviewOrderPricing(ctx, db, input)
 	if err != nil {
+		logger.Error("repository error", zap.Error(err))
 		return nil, err
 	}
+
+	logger.Info("service returning success",
+		zap.String("subtotal", preview.Subtotal.String()),
+		zap.String("discount_total", preview.DiscountTotal.String()),
+		zap.String("grand_total", preview.GrandTotal.String()))
+
 	return &PricingPreviewResult{
 		Subtotal:          preview.Subtotal,
 		DiscountTotal:     preview.DiscountTotal,
@@ -258,17 +299,18 @@ func (s *pricingService) PreviewOrderPricing(ctx context.Context, req *OrderPric
 		AppliedPromotions: preview.AppliedPromotions,
 	}, nil
 }
-
 func (s *pricingService) CalculateOrderTax(ctx context.Context, companyID, orderID uuid.UUID) (decimal.Decimal, error) {
-	return s.pricingRepo.CalculateOrderTax(ctx, nil, companyID, orderID)
+	db := s.pgClient.DB
+	return s.pricingRepo.CalculateOrderTax(ctx, db, companyID, orderID)
 }
 
 func (s *pricingService) CalculateOrderDiscounts(ctx context.Context, companyID, orderID uuid.UUID, at time.Time) (*DiscountCalculationResult, error) {
-	order, err := s.orderRepo.GetByID(ctx, nil, companyID, orderID)
+	db := s.pgClient.DB
+	order, err := s.orderRepo.GetByID(ctx, db, companyID, orderID)
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.orderRepo.GetItems(ctx, nil, companyID, orderID)
+	items, err := s.orderRepo.GetItems(ctx, db, companyID, orderID)
 	if err != nil {
 		return nil, err
 	}
@@ -284,8 +326,6 @@ func (s *pricingService) CalculateOrderDiscounts(ctx context.Context, companyID,
 // ---------------------------------------------------------------------
 
 func (s *pricingService) CalculateQuotePricing(ctx context.Context, req *CalculateQuotePricingRequest) (*PricingCalculationResult, error) {
-	// Same logic as CalculateOrderPricing, but for quotes.
-	// Reuse the same helper.
 	orderReq := &CalculateOrderPricingRequest{
 		CompanyID:    req.CompanyID,
 		CustomerID:   req.CustomerID,
@@ -318,17 +358,18 @@ func (s *pricingService) PreviewQuotePricing(ctx context.Context, req *QuotePric
 }
 
 func (s *pricingService) CalculateQuoteTax(ctx context.Context, companyID, quoteID uuid.UUID) (decimal.Decimal, error) {
-	_, err := s.quoteRepo.GetByID(ctx, nil, companyID, quoteID)
+	db := s.pgClient.DB
+	_, err := s.quoteRepo.GetByID(ctx, db, companyID, quoteID)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	items, err := s.quoteRepo.GetItems(ctx, nil, companyID, quoteID)
+	items, err := s.quoteRepo.GetItems(ctx, db, companyID, quoteID)
 	if err != nil {
 		return decimal.Zero, err
 	}
 	var taxTotal decimal.Decimal
 	for _, it := range items {
-		tax, err := s.pricingRepo.CalculateLineTax(ctx, nil, companyID, it.ProductID, it.UnitPrice.Mul(it.Quantity).Sub(it.DiscountAmount))
+		tax, err := s.pricingRepo.CalculateLineTax(ctx, db, companyID, it.ProductID, it.UnitPrice.Mul(it.Quantity).Sub(it.DiscountAmount))
 		if err != nil {
 			return decimal.Zero, err
 		}
@@ -338,11 +379,12 @@ func (s *pricingService) CalculateQuoteTax(ctx context.Context, companyID, quote
 }
 
 func (s *pricingService) CalculateQuoteDiscounts(ctx context.Context, companyID, quoteID uuid.UUID, at time.Time) (*DiscountCalculationResult, error) {
-	quote, err := s.quoteRepo.GetByID(ctx, nil, companyID, quoteID)
+	db := s.pgClient.DB
+	quote, err := s.quoteRepo.GetByID(ctx, db, companyID, quoteID)
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.quoteRepo.GetItems(ctx, nil, companyID, quoteID)
+	items, err := s.quoteRepo.GetItems(ctx, db, companyID, quoteID)
 	if err != nil {
 		return nil, err
 	}
@@ -390,11 +432,12 @@ func (s *pricingService) PreviewInvoicePricing(ctx context.Context, req *Invoice
 }
 
 func (s *pricingService) CalculateInvoiceTax(ctx context.Context, companyID, invoiceID uuid.UUID) (decimal.Decimal, error) {
-	_, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	db := s.pgClient.DB
+	_, err := s.invoiceRepo.GetByID(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return decimal.Zero, err
 	}
-	items, err := s.invoiceRepo.GetItems(ctx, nil, companyID, invoiceID)
+	items, err := s.invoiceRepo.GetItems(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return decimal.Zero, err
 	}
@@ -404,7 +447,7 @@ func (s *pricingService) CalculateInvoiceTax(ctx context.Context, companyID, inv
 		if it.DiscountAmount != nil {
 			discount = *it.DiscountAmount
 		}
-		tax, err := s.pricingRepo.CalculateLineTax(ctx, nil, companyID, *it.ProductID, it.UnitPrice.Mul(it.Quantity).Sub(discount))
+		tax, err := s.pricingRepo.CalculateLineTax(ctx, db, companyID, *it.ProductID, it.UnitPrice.Mul(it.Quantity).Sub(discount))
 		if err != nil {
 			return decimal.Zero, err
 		}
@@ -414,11 +457,12 @@ func (s *pricingService) CalculateInvoiceTax(ctx context.Context, companyID, inv
 }
 
 func (s *pricingService) CalculateInvoiceDiscounts(ctx context.Context, companyID, invoiceID uuid.UUID, at time.Time) (*DiscountCalculationResult, error) {
-	invoice, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	db := s.pgClient.DB
+	invoice, err := s.invoiceRepo.GetByID(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.invoiceRepo.GetItems(ctx, nil, companyID, invoiceID)
+	items, err := s.invoiceRepo.GetItems(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return nil, err
 	}
@@ -436,11 +480,13 @@ func (s *pricingService) CalculateInvoiceDiscounts(ctx context.Context, companyI
 // ---------------------------------------------------------------------
 
 func (s *pricingService) CalculateLineTax(ctx context.Context, companyID, productID uuid.UUID, lineAmount decimal.Decimal) (decimal.Decimal, error) {
-	return s.pricingRepo.CalculateLineTax(ctx, nil, companyID, productID, lineAmount)
+	db := s.pgClient.DB
+	return s.pricingRepo.CalculateLineTax(ctx, db, companyID, productID, lineAmount)
 }
 
 func (s *pricingService) CalculateTaxAmount(ctx context.Context, companyID uuid.UUID, entityType string, entityID uuid.UUID, taxableAmount decimal.Decimal) (decimal.Decimal, error) {
-	return s.pricingRepo.CalculateTaxAmount(ctx, nil, companyID, entityType, entityID, taxableAmount)
+	db := s.pgClient.DB
+	return s.pricingRepo.CalculateTaxAmount(ctx, db, companyID, entityType, entityID, taxableAmount)
 }
 
 // ---------------------------------------------------------------------
@@ -448,23 +494,28 @@ func (s *pricingService) CalculateTaxAmount(ctx context.Context, companyID uuid.
 // ---------------------------------------------------------------------
 
 func (s *pricingService) GetApplicableCoupons(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error) {
-	return s.pricingRepo.GetApplicableCoupons(ctx, nil, companyID, customerID, productIDs, orderAmount, at)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetApplicableCoupons(ctx, db, companyID, customerID, productIDs, orderAmount, at)
 }
 
 func (s *pricingService) GetBestCoupon(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Coupon, decimal.Decimal, error) {
-	return s.pricingRepo.GetBestCoupon(ctx, nil, companyID, customerID, productIDs, orderAmount, at)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetBestCoupon(ctx, db, companyID, customerID, productIDs, orderAmount, at)
 }
 
 func (s *pricingService) GetApplicablePromotions(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Promotion, error) {
-	return s.pricingRepo.GetApplicablePromotions(ctx, nil, companyID, customerID, productIDs, orderAmount, at)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetApplicablePromotions(ctx, db, companyID, customerID, productIDs, orderAmount, at)
 }
 
 func (s *pricingService) GetBestPromotion(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Promotion, decimal.Decimal, error) {
-	return s.pricingRepo.GetBestPromotion(ctx, nil, companyID, customerID, productIDs, orderAmount, at)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetBestPromotion(ctx, db, companyID, customerID, productIDs, orderAmount, at)
 }
 
 func (s *pricingService) CalculateCombinedDiscount(ctx context.Context, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*DiscountCalculationResult, error) {
-	totalDiscount, coupons, promos, err := s.pricingRepo.CalculateCombinedDiscount(ctx, nil, companyID, customerID, productIDs, orderAmount, at)
+	db := s.pgClient.DB
+	totalDiscount, coupons, promos, err := s.pricingRepo.CalculateCombinedDiscount(ctx, db, companyID, customerID, productIDs, orderAmount, at)
 	if err != nil {
 		return nil, err
 	}
@@ -475,13 +526,68 @@ func (s *pricingService) CalculateCombinedDiscount(ctx context.Context, companyI
 	}, nil
 }
 
-func (s *pricingService) ValidateDiscountCombination(ctx context.Context, couponIDs, promotionIDs []uuid.UUID) error {
-	return s.pricingRepo.ValidateDiscountCombination(ctx, nil, couponIDs, promotionIDs)
+// ValidateDiscountCombination enforces exclusive discount rules (stackingType = "exclusive")
+func (s *pricingService) ValidateDiscountCombination(ctx context.Context, companyID uuid.UUID, couponIDs, promotionIDs []uuid.UUID) error {
+	db := s.pgClient.DB
+
+	// 1. Fetch all coupons with company isolation
+	var coupons []*discount.Coupon
+	if len(couponIDs) > 0 {
+		var err error
+		coupons, err = s.couponRepo.FindByIDs(ctx, db, companyID, couponIDs)
+		if err != nil {
+			return fmt.Errorf("fetch coupons: %w", err)
+		}
+		if len(coupons) != len(couponIDs) {
+			return salesErrors.ErrNotFound
+		}
+	}
+
+	// 2. Fetch all promotions with company isolation
+	var promotions []*discount.Promotion
+	if len(promotionIDs) > 0 {
+		var err error
+		promotions, err = s.promotionRepo.FindByIDs(ctx, db, companyID, promotionIDs)
+		if err != nil {
+			return fmt.Errorf("fetch promotions: %w", err)
+		}
+		if len(promotions) != len(promotionIDs) {
+			return salesErrors.ErrNotFound
+		}
+	}
+
+	// 3. Count exclusive discounts (StackingType == "exclusive")
+	exclusiveCount := 0
+	for _, c := range coupons {
+		if c.StackingType == "exclusive" {
+			exclusiveCount++
+		}
+	}
+	for _, p := range promotions {
+		if p.StackingType == "exclusive" {
+			exclusiveCount++
+		}
+	}
+
+	// 4. If more than one exclusive discount, reject
+	if exclusiveCount > 1 {
+		return fmt.Errorf("%w: cannot combine two or more exclusive discounts", salesErrors.ErrInvalidInput)
+	}
+
+	// 5. If exactly one exclusive discount, ensure no other discount exists
+	if exclusiveCount == 1 && (len(coupons)+len(promotions) > 1) {
+		return fmt.Errorf("%w: exclusive discount cannot be combined with any other discount", salesErrors.ErrInvalidInput)
+	}
+
+	// 6. Delegate to repository for any additional stacking rules (e.g., stacking groups)
+	// Note: repository method does NOT require companyID
+	return s.pricingRepo.ValidateDiscountCombination(ctx, db, couponIDs, promotionIDs)
 }
 
 // ---------------------------------------------------------------------
 // Credit validation (delegated to CustomerService)
 // ---------------------------------------------------------------------
+
 func (s *pricingService) GetCustomerCreditLimit(ctx context.Context, companyID, customerID uuid.UUID) (decimal.Decimal, error) {
 	return s.customerSvc.GetCreditLimit(ctx, companyID, customerID)
 }
@@ -517,7 +623,8 @@ func (s *pricingService) ValidatePricing(ctx context.Context, req *PricingValida
 }
 
 func (s *pricingService) ValidateOrderPricing(ctx context.Context, companyID, orderID uuid.UUID) error {
-	items, err := s.orderRepo.GetItems(ctx, nil, companyID, orderID)
+	db := s.pgClient.DB
+	items, err := s.orderRepo.GetItems(ctx, db, companyID, orderID)
 	if err != nil {
 		return err
 	}
@@ -532,7 +639,7 @@ func (s *pricingService) ValidateOrderPricing(ctx context.Context, companyID, or
 			computedTax = computedTax.Add(*it.TaxAmount)
 		}
 	}
-	order, err := s.orderRepo.GetByID(ctx, nil, companyID, orderID)
+	order, err := s.orderRepo.GetByID(ctx, db, companyID, orderID)
 	if err != nil {
 		return err
 	}
@@ -545,7 +652,8 @@ func (s *pricingService) ValidateOrderPricing(ctx context.Context, companyID, or
 }
 
 func (s *pricingService) ValidateQuotePricing(ctx context.Context, companyID, quoteID uuid.UUID) error {
-	items, err := s.quoteRepo.GetItems(ctx, nil, companyID, quoteID)
+	db := s.pgClient.DB
+	items, err := s.quoteRepo.GetItems(ctx, db, companyID, quoteID)
 	if err != nil {
 		return err
 	}
@@ -556,7 +664,7 @@ func (s *pricingService) ValidateQuotePricing(ctx context.Context, companyID, qu
 		computedDiscount = computedDiscount.Add(it.DiscountAmount)
 		computedTax = computedTax.Add(it.TaxAmount)
 	}
-	quote, err := s.quoteRepo.GetByID(ctx, nil, companyID, quoteID)
+	quote, err := s.quoteRepo.GetByID(ctx, db, companyID, quoteID)
 	if err != nil {
 		return err
 	}
@@ -569,7 +677,8 @@ func (s *pricingService) ValidateQuotePricing(ctx context.Context, companyID, qu
 }
 
 func (s *pricingService) ValidateInvoicePricing(ctx context.Context, companyID, invoiceID uuid.UUID) error {
-	items, err := s.invoiceRepo.GetItems(ctx, nil, companyID, invoiceID)
+	db := s.pgClient.DB
+	items, err := s.invoiceRepo.GetItems(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -584,7 +693,7 @@ func (s *pricingService) ValidateInvoicePricing(ctx context.Context, companyID, 
 			computedTax = computedTax.Add(*it.TaxAmount)
 		}
 	}
-	invoice, err := s.invoiceRepo.GetByID(ctx, nil, companyID, invoiceID)
+	invoice, err := s.invoiceRepo.GetByID(ctx, db, companyID, invoiceID)
 	if err != nil {
 		return err
 	}
@@ -601,15 +710,18 @@ func (s *pricingService) ValidateInvoicePricing(ctx context.Context, companyID, 
 // ---------------------------------------------------------------------
 
 func (s *pricingService) GetAverageDiscountRate(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.pricingRepo.GetAverageDiscountRate(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetAverageDiscountRate(ctx, db, companyID, from, to)
 }
 
 func (s *pricingService) GetTotalDiscountAmount(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.pricingRepo.GetTotalDiscountAmount(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetTotalDiscountAmount(ctx, db, companyID, from, to)
 }
 
 func (s *pricingService) GetEffectiveRevenueAfterDiscounts(ctx context.Context, companyID uuid.UUID, from, to *time.Time) (decimal.Decimal, error) {
-	return s.pricingRepo.GetEffectiveRevenueAfterDiscounts(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.pricingRepo.GetEffectiveRevenueAfterDiscounts(ctx, db, companyID, from, to)
 }
 
 // ---------------------------------------------------------------------

@@ -13,24 +13,104 @@ import (
 	"auth-service/internal/sales/service"
 )
 
+// ---------------------------------------------------------------------
+// Request / response types used only by this handler
+// ---------------------------------------------------------------------
+
+type pricingLineInput struct {
+	ProductID string  `json:"product_id"`
+	Quantity  string  `json:"quantity"`
+	UnitPrice *string `json:"unit_price,omitempty"`
+}
+
+type calculateOrderPricingRequest struct {
+	CustomerID   *string            `json:"customer_id,omitempty"`
+	Lines        []pricingLineInput `json:"lines"`
+	CouponCodes  []string           `json:"coupon_codes,omitempty"`
+	CalculateTax bool               `json:"calculate_tax"`
+	At           *time.Time         `json:"at,omitempty"`
+}
+
+type calculateTaxAmountRequest struct {
+	EntityType    string `json:"entity_type"`
+	EntityID      string `json:"entity_id"`
+	TaxableAmount string `json:"taxable_amount"`
+}
+
+type calculateCombinedDiscountRequest struct {
+	CustomerID  *string    `json:"customer_id,omitempty"`
+	ProductIDs  []string   `json:"product_ids"`
+	OrderAmount string     `json:"order_amount"`
+	At          *time.Time `json:"at,omitempty"`
+}
+
+type validateDiscountCombinationRequest struct {
+	CouponIDs    []string `json:"coupon_ids"`
+	PromotionIDs []string `json:"promotion_ids"`
+}
+
+type validatePricingRequest struct {
+	CustomerID   *string            `json:"customer_id,omitempty"`
+	Lines        []pricingLineInput `json:"lines"`
+	CouponIDs    []string           `json:"coupon_ids"`
+	PromotionIDs []string           `json:"promotion_ids"`
+}
+
+// ---------------------------------------------------------------------
+// Response summaries (shared with other handlers)
+// ---------------------------------------------------------------------
+
+type pricingLineResultResponse struct {
+	ProductID       string `json:"product_id"`
+	Quantity        string `json:"quantity"`
+	BasePrice       string `json:"base_price"`
+	DiscountAmount  string `json:"discount_amount"`
+	TaxAmount       string `json:"tax_amount"`
+	FinalLineAmount string `json:"final_line_amount"`
+}
+
+type pricingCalculationResultResponse struct {
+	Subtotal          string                      `json:"subtotal"`
+	DiscountTotal     string                      `json:"discount_total"`
+	TaxTotal          string                      `json:"tax_total"`
+	GrandTotal        string                      `json:"grand_total"`
+	LineResults       []pricingLineResultResponse `json:"line_results"`
+	AppliedCoupons    []couponSummary             `json:"applied_coupons"`
+	AppliedPromotions []promotionSummary          `json:"applied_promotions"`
+}
+
+type pricingPreviewResultResponse struct {
+	Subtotal          string             `json:"subtotal"`
+	DiscountTotal     string             `json:"discount_total"`
+	TaxTotal          string             `json:"tax_total"`
+	GrandTotal        string             `json:"grand_total"`
+	AppliedCoupons    []couponSummary    `json:"applied_coupons"`
+	AppliedPromotions []promotionSummary `json:"applied_promotions"`
+}
+
+type discountCalculationResultResponse struct {
+	DiscountTotal     string             `json:"discount_total"`
+	AppliedCoupons    []couponSummary    `json:"applied_coupons"`
+	AppliedPromotions []promotionSummary `json:"applied_promotions"`
+}
+
+// ---------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------
+
 type PricingHandler struct {
 	pricingService service.PricingService
 	*BaseHandler
-	// Simple idempotency cache (replace with real store)
 	idempotencyCache map[string]interface{}
 }
 
 func NewPricingHandler(pricingService service.PricingService, logger *zap.Logger) *PricingHandler {
 	return &PricingHandler{
 		pricingService:   pricingService,
-		BaseHandler:      &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:      &BaseHandler{logger: logger.Named("pricing_handler")},
 		idempotencyCache: make(map[string]interface{}),
 	}
 }
-
-// ---------------------------------------------------------------------
-// Helper methods
-// ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
 // GET /pricing/product-base-price
@@ -121,36 +201,6 @@ func (h *PricingHandler) GetProductsBasePrices(w http.ResponseWriter, r *http.Re
 // ---------------------------------------------------------------------
 // POST /pricing/order
 // ---------------------------------------------------------------------
-type calculateOrderPricingRequest struct {
-	CustomerID   *string            `json:"customer_id,omitempty"`
-	Lines        []pricingLineInput `json:"lines"`
-	CouponCodes  []string           `json:"coupon_codes,omitempty"`
-	CalculateTax bool               `json:"calculate_tax"`
-	At           *time.Time         `json:"at,omitempty"`
-}
-type pricingLineInput struct {
-	ProductID string  `json:"product_id"`
-	Quantity  string  `json:"quantity"`
-	UnitPrice *string `json:"unit_price,omitempty"`
-}
-type pricingCalculationResultResponse struct {
-	Subtotal          string                      `json:"subtotal"`
-	DiscountTotal     string                      `json:"discount_total"`
-	TaxTotal          string                      `json:"tax_total"`
-	GrandTotal        string                      `json:"grand_total"`
-	LineResults       []pricingLineResultResponse `json:"line_results"`
-	AppliedCoupons    []couponSummary             `json:"applied_coupons"`
-	AppliedPromotions []promotionSummary          `json:"applied_promotions"`
-}
-type pricingLineResultResponse struct {
-	ProductID       string `json:"product_id"`
-	Quantity        string `json:"quantity"`
-	BasePrice       string `json:"base_price"`
-	DiscountAmount  string `json:"discount_amount"`
-	TaxAmount       string `json:"tax_amount"`
-	FinalLineAmount string `json:"final_line_amount"`
-}
-
 func (h *PricingHandler) CalculateOrderPricing(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -220,7 +270,6 @@ func (h *PricingHandler) CalculateOrderPricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
-	// Idempotency: check cache (simple)
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
@@ -255,52 +304,93 @@ func (h *PricingHandler) CalculateOrderPricing(w http.ResponseWriter, r *http.Re
 // ---------------------------------------------------------------------
 // POST /pricing/preview-order
 // ---------------------------------------------------------------------
+// PreviewOrderPricing calculates a pricing preview for an order without persisting it.
+// POST /api/v1/sales/pricing/order/preview
 func (h *PricingHandler) PreviewOrderPricing(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	logger := h.logger.With(
+		zap.String("handler", "PreviewOrderPricing"),
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+	)
+
+	logger.Info("handler entry")
+
+	// 1. Get user ID from context
 	userID, err := h.getUserIDFromContext(ctx)
 	if err != nil {
+		logger.Error("failed to get user ID", zap.Error(err))
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
+	logger.Debug("user authenticated", zap.String("user_id", userID.String()))
+
+	// 2. Decode request body
 	var req service.OrderPricingPreviewRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Error("failed to decode request body", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	logger.Debug("request decoded", zap.Any("request", req))
+
+	// 3. Get company ID from header
 	companyID, err := h.getCompanyIDFromHeader(r)
 	if err != nil {
+		logger.Error("failed to get company ID", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	req.CompanyID = companyID
+	logger.Debug("company ID set", zap.String("company_id", companyID.String()))
+
+	// 4. Validate at least one item
 	if len(req.Items) == 0 {
+		logger.Warn("no items in request")
 		h.respondWithError(w, http.StatusBadRequest, "at least one item required")
 		return
 	}
+
+	// 5. Permission check
 	if !h.hasPermission(ctx, req.CompanyID, userID, "pricing:write") {
+		logger.Warn("insufficient permissions", zap.String("user_id", userID.String()), zap.String("company_id", req.CompanyID.String()))
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
+
+	// 6. Idempotency handling
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey != "" {
 		if cached, ok := h.idempotencyCache[idempotencyKey]; ok {
+			logger.Info("idempotent – returning cached response", zap.String("idempotency_key", idempotencyKey))
 			h.respondWithJSON(w, http.StatusOK, cached)
 			return
 		}
 	}
+	logger.Debug("idempotency key", zap.String("key", idempotencyKey))
+
+	// 7. Call service
+	logger.Info("calling pricingService.PreviewOrderPricing")
 	res, err := h.pricingService.PreviewOrderPricing(ctx, &req)
 	if err != nil {
+		logger.Error("service returned error", zap.Error(err))
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, msg)
 		return
 	}
+	logger.Info("service call successful", zap.Any("result", res))
+
+	// 8. Build response
 	responseData := map[string]interface{}{
 		"success": true,
 		"data":    convertPricingPreviewResult(res),
 	}
 	if idempotencyKey != "" {
 		h.idempotencyCache[idempotencyKey] = responseData
+		logger.Debug("response cached", zap.String("idempotency_key", idempotencyKey))
 	}
+
+	logger.Info("handler returning success")
 	h.respondWithJSON(w, http.StatusOK, responseData)
 }
 
@@ -395,7 +485,7 @@ func (h *PricingHandler) CalculateQuotePricing(w http.ResponseWriter, r *http.Re
 		h.respondWithError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	var req calculateOrderPricingRequest // same structure
+	var req calculateOrderPricingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -852,7 +942,6 @@ func (h *PricingHandler) CalculateInvoiceDiscounts(w http.ResponseWriter, r *htt
 // ---------------------------------------------------------------------
 // POST /pricing/line-tax
 // ---------------------------------------------------------------------
-
 func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -910,12 +999,6 @@ func (h *PricingHandler) CalculateLineTax(w http.ResponseWriter, r *http.Request
 // ---------------------------------------------------------------------
 // POST /pricing/tax-amount
 // ---------------------------------------------------------------------
-type calculateTaxAmountRequest struct {
-	EntityType    string `json:"entity_type"`
-	EntityID      string `json:"entity_id"`
-	TaxableAmount string `json:"taxable_amount"`
-}
-
 func (h *PricingHandler) CalculateTaxAmount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1301,13 +1384,6 @@ func (h *PricingHandler) GetBestPromotion(w http.ResponseWriter, r *http.Request
 // ---------------------------------------------------------------------
 // POST /pricing/combined-discount
 // ---------------------------------------------------------------------
-type calculateCombinedDiscountRequest struct {
-	CustomerID  *string    `json:"customer_id,omitempty"`
-	ProductIDs  []string   `json:"product_ids"`
-	OrderAmount string     `json:"order_amount"`
-	At          *time.Time `json:"at,omitempty"`
-}
-
 func (h *PricingHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1382,11 +1458,6 @@ func (h *PricingHandler) CalculateCombinedDiscount(w http.ResponseWriter, r *htt
 // ---------------------------------------------------------------------
 // POST /pricing/validate-discount-combination
 // ---------------------------------------------------------------------
-type validateDiscountCombinationRequest struct {
-	CouponIDs    []string `json:"coupon_ids"`
-	PromotionIDs []string `json:"promotion_ids"`
-}
-
 func (h *PricingHandler) ValidateDiscountCombination(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -1433,7 +1504,7 @@ func (h *PricingHandler) ValidateDiscountCombination(w http.ResponseWriter, r *h
 			return
 		}
 	}
-	err = h.pricingService.ValidateDiscountCombination(ctx, couponIDs, promotionIDs)
+	err = h.pricingService.ValidateDiscountCombination(ctx, companyID, couponIDs, promotionIDs)
 	if err != nil {
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, msg)
@@ -1570,13 +1641,6 @@ func (h *PricingHandler) CanCustomerPurchaseAmount(w http.ResponseWriter, r *htt
 // ---------------------------------------------------------------------
 // POST /pricing/validate
 // ---------------------------------------------------------------------
-type validatePricingRequest struct {
-	CustomerID   *string            `json:"customer_id,omitempty"`
-	Lines        []pricingLineInput `json:"lines"`
-	CouponIDs    []string           `json:"coupon_ids"`
-	PromotionIDs []string           `json:"promotion_ids"`
-}
-
 func (h *PricingHandler) ValidatePricing(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	userID, err := h.getUserIDFromContext(ctx)
@@ -2032,15 +2096,6 @@ func convertPricingPreviewResult(res *service.PricingPreviewResult) *pricingPrev
 	}
 }
 
-type pricingPreviewResultResponse struct {
-	Subtotal          string             `json:"subtotal"`
-	DiscountTotal     string             `json:"discount_total"`
-	TaxTotal          string             `json:"tax_total"`
-	GrandTotal        string             `json:"grand_total"`
-	AppliedCoupons    []couponSummary    `json:"applied_coupons"`
-	AppliedPromotions []promotionSummary `json:"applied_promotions"`
-}
-
 func convertDiscountCalculationResult(res *service.DiscountCalculationResult) *discountCalculationResultResponse {
 	coupons := make([]couponSummary, len(res.AppliedCoupons))
 	for i, c := range res.AppliedCoupons {
@@ -2056,16 +2111,9 @@ func convertDiscountCalculationResult(res *service.DiscountCalculationResult) *d
 			Name:        p.Name,
 		}
 	}
-	// AppliedAutomatic omitted for brevity
 	return &discountCalculationResultResponse{
 		DiscountTotal:     res.DiscountTotal.String(),
 		AppliedCoupons:    coupons,
 		AppliedPromotions: promos,
 	}
-}
-
-type discountCalculationResultResponse struct {
-	DiscountTotal     string             `json:"discount_total"`
-	AppliedCoupons    []couponSummary    `json:"applied_coupons"`
-	AppliedPromotions []promotionSummary `json:"applied_promotions"`
 }

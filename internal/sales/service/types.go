@@ -163,14 +163,6 @@ type UpdateOrderRequest struct {
 	UpdatedBy       *uuid.UUID
 }
 
-type CreateOrderItemRequest struct {
-	ProductID      uuid.UUID
-	Quantity       decimal.Decimal
-	UnitPrice      *decimal.Decimal
-	DiscountAmount *decimal.Decimal
-	Metadata       models.JSONB
-}
-
 type OrderListFilter struct {
 	CompanyID    uuid.UUID
 	CustomerID   *uuid.UUID
@@ -265,14 +257,6 @@ type PricingValidationRequest struct {
 	Lines        []PricingLineInput
 	CouponIDs    []uuid.UUID
 	PromotionIDs []uuid.UUID
-}
-
-type OrderPricingPreviewRequest struct {
-	CompanyID   uuid.UUID
-	CustomerID  *uuid.UUID
-	Items       []*CreateOrderItemRequest
-	CouponCodes []string
-	At          *time.Time
 }
 
 type QuotePricingPreviewRequest struct {
@@ -1851,4 +1835,19 @@ type ProcessGatewayPaymentRequest struct {
 	IdempotencyKey string
 	Allocations    []PaymentAllocationRequest
 	CreatedBy      uuid.UUID
+}
+type OrderPricingPreviewRequest struct {
+	CompanyID   uuid.UUID                 `json:"company_id"`
+	CustomerID  *uuid.UUID                `json:"customer_id,omitempty"`
+	Items       []*CreateOrderItemRequest `json:"items"`
+	CouponCodes []string                  `json:"coupon_codes,omitempty"`
+	At          *time.Time                `json:"at,omitempty"`
+}
+
+type CreateOrderItemRequest struct {
+	ProductID      uuid.UUID        `json:"product_id"`
+	Quantity       decimal.Decimal  `json:"quantity"`
+	UnitPrice      *decimal.Decimal `json:"unit_price,omitempty"`
+	DiscountAmount *decimal.Decimal `json:"discount_amount,omitempty"`
+	Metadata       models.JSONB     `json:"metadata,omitempty"`
 }

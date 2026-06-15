@@ -29,6 +29,7 @@ type CouponRepository interface {
 
 	GetApplicableCoupons(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) ([]*discount.Coupon, error)
 	GetBestCoupon(ctx context.Context, db DBTX, companyID uuid.UUID, customerID *uuid.UUID, productIDs []uuid.UUID, orderAmount decimal.Decimal, at time.Time) (*discount.Coupon, decimal.Decimal, error)
+	FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Coupon, error)
 
 	SetActiveStatus(ctx context.Context, db DBTX, companyID, couponID uuid.UUID, isActive bool, updatedBy *uuid.UUID) error
 	IsActive(ctx context.Context, db DBTX, companyID, couponID uuid.UUID) (bool, error)
@@ -1387,4 +1388,74 @@ func (r *couponRepository) GetStackingType(ctx context.Context, db DBTX, couponI
 		return "", fmt.Errorf("get stacking type: %w", err)
 	}
 	return stackingType, nil
+}
+
+// FindByIDs retrieves multiple coupons by their IDs (ignoring company_id).
+// Returns a slice of coupons, order is not guaranteed. Empty slice if none found.
+// FindByIDs retrieves coupons by their IDs, respecting company isolation.
+// FindByIDs retrieves coupons by their IDs, respecting company isolation.
+func (r *couponRepository) FindByIDs(ctx context.Context, db DBTX, companyID uuid.UUID, ids []uuid.UUID) ([]*discount.Coupon, error) {
+	if len(ids) == 0 {
+		return []*discount.Coupon{}, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, 0, len(ids)+1)
+	args = append(args, companyID)
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+2)
+		args = append(args, id)
+	}
+
+	query := fmt.Sprintf(`
+        SELECT coupon_id, company_id, code, discount_type, discount_value,
+               max_discount_amount, start_date, end_date, usage_limit, per_user_limit,
+               min_order_amount, applicable_items, is_active, stacking_type,
+               created_at, updated_at, created_by, updated_by
+        FROM sales.coupons
+        WHERE company_id = $1 AND coupon_id IN (%s) AND deleted_at IS NULL
+    `, strings.Join(placeholders, ","))
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("find coupons by ids: %w", err)
+	}
+	defer rows.Close()
+
+	var coupons []*discount.Coupon
+	for rows.Next() {
+		c := &discount.Coupon{}
+		var maxDiscount, minOrder sql.NullString
+		var applicableItems []byte
+		var createdBy, updatedBy uuid.NullUUID
+		var stackingType string
+
+		err := rows.Scan(
+			&c.CouponID, &c.CompanyID, &c.Code, &c.DiscountType, &c.DiscountValue,
+			&maxDiscount, &c.StartDate, &c.EndDate, &c.UsageLimit, &c.PerUserLimit,
+			&minOrder, &applicableItems, &c.IsActive, &stackingType,
+			&c.CreatedAt, &c.UpdatedAt, &createdBy, &updatedBy,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan coupon: %w", err)
+		}
+		if maxDiscount.Valid {
+			val, _ := decimal.NewFromString(maxDiscount.String)
+			c.MaxDiscountAmount = &val
+		}
+		if minOrder.Valid {
+			val, _ := decimal.NewFromString(minOrder.String)
+			c.MinOrderAmount = &val
+		}
+		c.ApplicableItems = applicableItems // ✅ direct assignment works (datatypes.JSON = []byte)
+		c.StackingType = stackingType
+		if createdBy.Valid {
+			c.CreatedBy = &createdBy.UUID
+		}
+		if updatedBy.Valid {
+			c.UpdatedBy = &updatedBy.UUID
+		}
+		coupons = append(coupons, c)
+	}
+	return coupons, rows.Err()
 }

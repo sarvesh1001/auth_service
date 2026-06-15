@@ -511,6 +511,7 @@ func (f *SalesInfraFactory) PricingService() service.PricingService {
 			f.QuoteRepo(),
 			f.InvoiceRepo(),
 			f.CustomerService(),
+			f.pgClient, // <-- added here
 			f.logger,
 		)
 	}

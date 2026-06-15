@@ -1211,7 +1211,6 @@ func RegisterSalesRoutes(
 			Get("/product-base-price", handlers.PricingHandler.GetProductBasePrice)
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.view", logger)).
 			Get("/products-base-prices", handlers.PricingHandler.GetProductsBasePrices)
-
 		// Order pricing
 		r.With(middleware.BitmaskPermissionMiddleware("sales.deal.create", logger)).
 			Post("/order/calculate", handlers.PricingHandler.CalculateOrderPricing)
