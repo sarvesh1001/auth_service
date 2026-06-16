@@ -1,8 +1,8 @@
 // file: internal/sales/handler/product_handler.go
-
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,8 +26,17 @@ type ProductHandler struct {
 func NewProductHandler(productService service.ProductService, logger *zap.Logger) *ProductHandler {
 	return &ProductHandler{
 		productService: productService,
-		BaseHandler:    &BaseHandler{logger: logger.Named("commission_handler")},
+		BaseHandler:    &BaseHandler{logger: logger.Named("product_handler")},
 	}
+}
+
+// ---------- Helper to inject idempotency key into context ----------
+func (h *ProductHandler) injectIdempotencyKey(ctx context.Context, r *http.Request) context.Context {
+	key := h.getIdempotencyKey(r)
+	if key != "" {
+		return context.WithValue(ctx, "idempotency_key", key)
+	}
+	return ctx
 }
 
 // ---------- Request/Response Types ----------
@@ -39,7 +48,7 @@ type createProductRequest struct {
 	UnitPrice       string  `json:"unit_price"`
 	IsActive        bool    `json:"is_active"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
-	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
+	TaxRate         *string `json:"tax_rate,omitempty"`
 }
 
 type createProductResponse struct {
@@ -51,7 +60,7 @@ type createProductResponse struct {
 	UnitPrice       string  `json:"unit_price"`
 	IsActive        bool    `json:"is_active"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
-	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
+	TaxRate         *string `json:"tax_rate,omitempty"`
 	CreatedAt       string  `json:"created_at"`
 	UpdatedAt       string  `json:"updated_at"`
 }
@@ -62,7 +71,7 @@ type updateProductRequest struct {
 	UnitPrice       *string `json:"unit_price,omitempty"`
 	IsActive        *bool   `json:"is_active,omitempty"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
-	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
+	TaxRate         *string `json:"tax_rate,omitempty"`
 }
 
 type updateProductStatusRequest struct {
@@ -91,20 +100,7 @@ type productSummary struct {
 	UnitPrice       string  `json:"unit_price"`
 	IsActive        bool    `json:"is_active"`
 	InventoryItemID *string `json:"inventory_item_id,omitempty"`
-	TaxRate         *string `json:"tax_rate,omitempty"` // NEW
-}
-
-// ---------- Helper to extract company ID from header ----------
-func (h *ProductHandler) getCompanyIDFromHeader(r *http.Request) (uuid.UUID, error) {
-	header := r.Header.Get("X-Company-ID")
-	if header == "" {
-		return uuid.Nil, fmt.Errorf("X-Company-ID header is required")
-	}
-	companyID, err := uuid.Parse(header)
-	if err != nil || companyID == uuid.Nil {
-		return uuid.Nil, fmt.Errorf("invalid X-Company-ID header")
-	}
-	return companyID, nil
+	TaxRate         *string `json:"tax_rate,omitempty"`
 }
 
 // ---------- Handler Methods ----------
@@ -168,7 +164,6 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		inventoryItemID = &parsed
 	}
 
-	// NEW: parse tax_rate
 	var taxRate *decimal.Decimal
 	if req.TaxRate != nil && *req.TaxRate != "" {
 		tr, err := decimal.NewFromString(*req.TaxRate)
@@ -193,6 +188,7 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := service.CreateProductRequest{
 		CompanyID:       companyID,
@@ -202,11 +198,11 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		UnitPrice:       unitPrice,
 		IsActive:        &req.IsActive,
 		InventoryItemID: inventoryItemID,
-		TaxRate:         taxRate, // NEW
+		TaxRate:         taxRate,
 		CreatedBy:       &userID,
 	}
 
-	product, err := h.productService.CreateProduct(ctx, svcReq, idempotencyKey)
+	product, err := h.productService.CreateProduct(ctx, svcReq)
 	if err != nil {
 		h.logger.Error("failed to create product", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -246,7 +242,7 @@ func (h *ProductHandler) CreateProduct(w http.ResponseWriter, r *http.Request) {
 func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -299,7 +295,6 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		inventoryItemID = &parsed
 	}
 
-	// NEW: parse tax_rate update
 	var taxRate *decimal.Decimal
 	if req.TaxRate != nil && *req.TaxRate != "" {
 		tr, err := decimal.NewFromString(*req.TaxRate)
@@ -319,6 +314,7 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	svcReq := service.UpdateProductRequest{
 		Name:            req.Name,
@@ -326,11 +322,11 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		UnitPrice:       unitPrice,
 		IsActive:        req.IsActive,
 		InventoryItemID: inventoryItemID,
-		TaxRate:         taxRate, // NEW
+		TaxRate:         taxRate,
 		UpdatedBy:       &userID,
 	}
 
-	updated, err := h.productService.UpdateProduct(ctx, companyID, productID, svcReq, idempotencyKey)
+	updated, err := h.productService.UpdateProduct(ctx, companyID, productID, svcReq)
 	if err != nil {
 		h.logger.Error("failed to update product", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -368,7 +364,7 @@ func (h *ProductHandler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 func (h *ProductHandler) DeleteProduct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -396,8 +392,9 @@ func (h *ProductHandler) DeleteProduct(w http.ResponseWriter, r *http.Request) {
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
-	err = h.productService.DeleteProduct(ctx, companyID, productID, &userID, idempotencyKey)
+	err = h.productService.DeleteProduct(ctx, companyID, productID, &userID)
 	if err != nil {
 		h.logger.Error("failed to delete product", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -415,7 +412,7 @@ func (h *ProductHandler) DeleteProduct(w http.ResponseWriter, r *http.Request) {
 func (h *ProductHandler) GetProductByID(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -472,7 +469,7 @@ func (h *ProductHandler) GetProductByID(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// GetProductBySKU handles GET /products/by-sku
+// GetProductBySKU handles GET /products/by-sku?sku=...
 func (h *ProductHandler) GetProductBySKU(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -566,7 +563,6 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 	if search := r.URL.Query().Get("search"); search != "" {
 		filter.Search = &search
 	}
-	// NEW: tax rate filters
 	if minTaxRateStr := r.URL.Query().Get("min_tax_rate"); minTaxRateStr != "" {
 		minTaxRate, err := decimal.NewFromString(minTaxRateStr)
 		if err == nil {
@@ -648,7 +644,7 @@ func (h *ProductHandler) ListProducts(w http.ResponseWriter, r *http.Request) {
 func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -682,11 +678,12 @@ func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
 	if req.IsActive {
-		err = h.productService.ActivateProduct(ctx, companyID, productID, &userID, idempotencyKey)
+		err = h.productService.ActivateProduct(ctx, companyID, productID, &userID)
 	} else {
-		err = h.productService.DeactivateProduct(ctx, companyID, productID, &userID, idempotencyKey)
+		err = h.productService.DeactivateProduct(ctx, companyID, productID, &userID)
 	}
 	if err != nil {
 		h.logger.Error("failed to update product status", zap.Error(err))
@@ -705,7 +702,7 @@ func (h *ProductHandler) UpdateProductStatus(w http.ResponseWriter, r *http.Requ
 func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -752,8 +749,9 @@ func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request)
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
-	err = h.productService.UpdateUnitPrice(ctx, companyID, productID, unitPrice, &userID, idempotencyKey)
+	err = h.productService.UpdateUnitPrice(ctx, companyID, productID, unitPrice, &userID)
 	if err != nil {
 		h.logger.Error("failed to update unit price", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -771,7 +769,7 @@ func (h *ProductHandler) UpdateUnitPrice(w http.ResponseWriter, r *http.Request)
 func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -818,8 +816,9 @@ func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Reques
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
-	err = h.productService.LinkInventoryItem(ctx, companyID, productID, inventoryItemID, &userID, idempotencyKey)
+	err = h.productService.LinkInventoryItem(ctx, companyID, productID, inventoryItemID, &userID)
 	if err != nil {
 		h.logger.Error("failed to link inventory item", zap.Error(err))
 		status, msg := h.mapServiceError(err)
@@ -837,7 +836,7 @@ func (h *ProductHandler) LinkInventoryItem(w http.ResponseWriter, r *http.Reques
 func (h *ProductHandler) UnlinkInventoryItem(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	productID, err := parseUUIDParam(r, "id")
+	productID, err := h.parseUUIDParam(r, "id")
 	if err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid product ID")
 		return
@@ -865,8 +864,9 @@ func (h *ProductHandler) UnlinkInventoryItem(w http.ResponseWriter, r *http.Requ
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
+	ctx = h.injectIdempotencyKey(ctx, r)
 
-	err = h.productService.UnlinkInventoryItem(ctx, companyID, productID, &userID, idempotencyKey)
+	err = h.productService.UnlinkInventoryItem(ctx, companyID, productID, &userID)
 	if err != nil {
 		h.logger.Error("failed to unlink inventory item", zap.Error(err))
 		status, msg := h.mapServiceError(err)

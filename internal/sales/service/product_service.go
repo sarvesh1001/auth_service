@@ -24,21 +24,21 @@ import (
 
 // ProductService defines the interface for product management operations.
 type ProductService interface {
-	CreateProduct(ctx context.Context, req CreateProductRequest, idempotencyKey string) (*models.Product, error)
-	UpdateProduct(ctx context.Context, companyID, productID uuid.UUID, req UpdateProductRequest, idempotencyKey string) (*models.Product, error)
-	DeleteProduct(ctx context.Context, companyID, productID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error
+	CreateProduct(ctx context.Context, req CreateProductRequest) (*models.Product, error)
+	UpdateProduct(ctx context.Context, companyID, productID uuid.UUID, req UpdateProductRequest) (*models.Product, error)
+	DeleteProduct(ctx context.Context, companyID, productID uuid.UUID, deletedBy *uuid.UUID) error
 	GetProductByID(ctx context.Context, companyID, productID uuid.UUID) (*models.Product, error)
 	GetProductBySKU(ctx context.Context, companyID uuid.UUID, sku string) (*models.Product, error)
 	ListProducts(ctx context.Context, filter ProductListFilter, p Pagination, s Sort) ([]*models.Product, int64, error)
 	SearchProducts(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Product, int64, error)
-	ActivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-	DeactivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	ActivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID) error
+	DeactivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID) error
 	IsProductActive(ctx context.Context, companyID, productID uuid.UUID) (bool, error)
-	UpdateUnitPrice(ctx context.Context, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID, idempotencyKey string) error
+	UpdateUnitPrice(ctx context.Context, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID) error
 	GetUnitPrice(ctx context.Context, companyID, productID uuid.UUID) (decimal.Decimal, error)
 	GetProductsByPriceRange(ctx context.Context, companyID uuid.UUID, minPrice, maxPrice *decimal.Decimal) ([]*models.Product, error)
-	LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
-	UnlinkInventoryItem(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error
+	LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID) error
+	UnlinkInventoryItem(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID) error
 	GetByInventoryItemID(ctx context.Context, companyID, inventoryItemID uuid.UUID) (*models.Product, error)
 	GetTopSellingProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Product, error)
 	GetProductsNeverSold(ctx context.Context, companyID uuid.UUID) ([]*models.Product, error)
@@ -77,11 +77,11 @@ func NewProductService(
 }
 
 // ----------------------------------------------------------------------------
-// Core CRUD operations
+// Core CRUD operations (with idempotency from context)
 // ----------------------------------------------------------------------------
 
-func (s *productService) CreateProduct(ctx context.Context, req CreateProductRequest, idempotencyKey string) (*models.Product, error) {
-	logger := s.logger.With(zap.String("method", "CreateProduct"), zap.String("idempotency_key", idempotencyKey))
+func (s *productService) CreateProduct(ctx context.Context, req CreateProductRequest) (*models.Product, error) {
+	logger := s.logger.With(zap.String("method", "CreateProduct"))
 
 	if err := s.validateCreateProduct(req); err != nil {
 		return nil, err
@@ -93,8 +93,13 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 	}
 	defer tx.Rollback()
 
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = uuid.New().String()
+	}
+
 	var cached *models.Product
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached product")
 		return cached, nil
 	}
@@ -127,7 +132,7 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 		UnitPrice:       req.UnitPrice,
 		IsActive:        isActive,
 		InventoryItemID: req.InventoryItemID,
-		TaxRate:         req.TaxRate, // NEW: set tax rate
+		TaxRate:         req.TaxRate,
 		CreatedBy:       req.CreatedBy,
 		UpdatedBy:       req.CreatedBy,
 	}
@@ -140,7 +145,7 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 		logger.Warn("failed to emit product created event", zap.Error(err))
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, product)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, product)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -158,8 +163,8 @@ func (s *productService) CreateProduct(ctx context.Context, req CreateProductReq
 	return product, nil
 }
 
-func (s *productService) UpdateProduct(ctx context.Context, companyID, productID uuid.UUID, req UpdateProductRequest, idempotencyKey string) (*models.Product, error) {
-	logger := s.logger.With(zap.String("method", "UpdateProduct"), zap.String("idempotency_key", idempotencyKey))
+func (s *productService) UpdateProduct(ctx context.Context, companyID, productID uuid.UUID, req UpdateProductRequest) (*models.Product, error) {
+	logger := s.logger.With(zap.String("method", "UpdateProduct"))
 
 	if companyID == uuid.Nil || productID == uuid.Nil {
 		return nil, salesErrors.ErrInvalidInput
@@ -171,8 +176,13 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 	}
 	defer tx.Rollback()
 
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = productID.String()
+	}
+
 	var cached *models.Product
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &cached); err == nil && cached != nil {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached product")
 		return cached, nil
 	}
@@ -218,7 +228,6 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 		product.InventoryItemID = req.InventoryItemID
 		changes["inventory_item_id"] = map[string]interface{}{"old": old, "new": req.InventoryItemID}
 	}
-	// NEW: handle tax_rate update
 	if req.TaxRate != nil && !req.TaxRate.Equal(decimal.Zero) {
 		old := product.TaxRate
 		product.TaxRate = req.TaxRate
@@ -246,7 +255,7 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 			_ = s.emitProductEvent(ctx, tx, product, salesEvents.EventProductInventoryUnlinked)
 		}
 	}
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, product)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, product)
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
@@ -260,8 +269,8 @@ func (s *productService) UpdateProduct(ctx context.Context, companyID, productID
 	return product, nil
 }
 
-func (s *productService) DeleteProduct(ctx context.Context, companyID, productID uuid.UUID, deletedBy *uuid.UUID, idempotencyKey string) error {
-	logger := s.logger.With(zap.String("method", "DeleteProduct"), zap.String("idempotency_key", idempotencyKey))
+func (s *productService) DeleteProduct(ctx context.Context, companyID, productID uuid.UUID, deletedBy *uuid.UUID) error {
+	logger := s.logger.With(zap.String("method", "DeleteProduct"))
 
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
@@ -269,8 +278,13 @@ func (s *productService) DeleteProduct(ctx context.Context, companyID, productID
 	}
 	defer tx.Rollback()
 
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = productID.String()
+	}
+
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – already deleted")
 		return nil
 	}
@@ -305,7 +319,7 @@ func (s *productService) DeleteProduct(ctx context.Context, companyID, productID
 		logger.Warn("failed to emit delete event", zap.Error(err))
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -320,18 +334,21 @@ func (s *productService) DeleteProduct(ctx context.Context, companyID, productID
 }
 
 // ----------------------------------------------------------------------------
-// Queries
+// Queries (read‑only, always use s.pgClient.DB)
 // ----------------------------------------------------------------------------
 
 func (s *productService) GetProductByID(ctx context.Context, companyID, productID uuid.UUID) (*models.Product, error) {
-	return s.productRepo.GetByID(ctx, nil, companyID, productID)
+	db := s.pgClient.DB
+	return s.productRepo.GetByID(ctx, db, companyID, productID)
 }
 
 func (s *productService) GetProductBySKU(ctx context.Context, companyID uuid.UUID, sku string) (*models.Product, error) {
-	return s.productRepo.GetBySKU(ctx, nil, companyID, sku)
+	db := s.pgClient.DB
+	return s.productRepo.GetBySKU(ctx, db, companyID, sku)
 }
 
 func (s *productService) ListProducts(ctx context.Context, filter ProductListFilter, p Pagination, srt Sort) ([]*models.Product, int64, error) {
+	db := s.pgClient.DB
 	repoFilter := repository.ProductFilter{
 		CompanyID:        filter.CompanyID,
 		IsActive:         filter.IsActive,
@@ -339,75 +356,90 @@ func (s *productService) ListProducts(ctx context.Context, filter ProductListFil
 		MinUnitPrice:     filter.MinPrice,
 		MaxUnitPrice:     filter.MaxPrice,
 		SearchTerm:       filter.Search,
-		MinTaxRate:       filter.MinTaxRate, // NEW: pass tax rate filters
-		MaxTaxRate:       filter.MaxTaxRate, // NEW: pass tax rate filters
+		MinTaxRate:       filter.MinTaxRate,
+		MaxTaxRate:       filter.MaxTaxRate,
 	}
-	return s.productRepo.List(ctx, nil, repoFilter,
+	return s.productRepo.List(ctx, db, repoFilter,
 		repository.Pagination{Limit: p.Limit, Offset: p.Offset},
 		repository.Sort{Field: srt.Field, Direction: srt.Direction})
 }
 
 func (s *productService) SearchProducts(ctx context.Context, companyID uuid.UUID, query string, limit, offset int) ([]*models.Product, int64, error) {
-	return s.productRepo.Search(ctx, nil, companyID, query, limit, offset)
+	db := s.pgClient.DB
+	return s.productRepo.Search(ctx, db, companyID, query, limit, offset)
 }
 
 func (s *productService) IsProductActive(ctx context.Context, companyID, productID uuid.UUID) (bool, error) {
-	return s.productRepo.IsActive(ctx, nil, companyID, productID)
+	db := s.pgClient.DB
+	return s.productRepo.IsActive(ctx, db, companyID, productID)
 }
 
 func (s *productService) GetUnitPrice(ctx context.Context, companyID, productID uuid.UUID) (decimal.Decimal, error) {
-	return s.productRepo.GetUnitPrice(ctx, nil, companyID, productID)
+	db := s.pgClient.DB
+	return s.productRepo.GetUnitPrice(ctx, db, companyID, productID)
 }
 
 func (s *productService) GetProductsByPriceRange(ctx context.Context, companyID uuid.UUID, minPrice, maxPrice *decimal.Decimal) ([]*models.Product, error) {
-	return s.productRepo.GetProductsByPriceRange(ctx, nil, companyID, minPrice, maxPrice)
+	db := s.pgClient.DB
+	return s.productRepo.GetProductsByPriceRange(ctx, db, companyID, minPrice, maxPrice)
 }
 
 func (s *productService) GetByInventoryItemID(ctx context.Context, companyID, inventoryItemID uuid.UUID) (*models.Product, error) {
-	return s.productRepo.GetByInventoryItemID(ctx, nil, companyID, inventoryItemID)
+	db := s.pgClient.DB
+	return s.productRepo.GetByInventoryItemID(ctx, db, companyID, inventoryItemID)
 }
 
 func (s *productService) GetTopSellingProducts(ctx context.Context, companyID uuid.UUID, limit int, from, to *time.Time) ([]*models.Product, error) {
-	return s.productRepo.GetTopSellingProducts(ctx, nil, companyID, limit, from, to)
+	db := s.pgClient.DB
+	return s.productRepo.GetTopSellingProducts(ctx, db, companyID, limit, from, to)
 }
 
 func (s *productService) GetProductsNeverSold(ctx context.Context, companyID uuid.UUID) ([]*models.Product, error) {
-	return s.productRepo.GetProductsNeverSold(ctx, nil, companyID)
+	db := s.pgClient.DB
+	return s.productRepo.GetProductsNeverSold(ctx, db, companyID)
 }
 
 func (s *productService) GetProductsWithReturns(ctx context.Context, companyID uuid.UUID, from, to *time.Time) ([]*models.Product, error) {
-	return s.productRepo.GetProductsWithReturns(ctx, nil, companyID, from, to)
+	db := s.pgClient.DB
+	return s.productRepo.GetProductsWithReturns(ctx, db, companyID, from, to)
 }
 
 func (s *productService) ProductExists(ctx context.Context, companyID, productID uuid.UUID) (bool, error) {
-	return s.productRepo.Exists(ctx, nil, companyID, productID)
+	db := s.pgClient.DB
+	return s.productRepo.Exists(ctx, db, companyID, productID)
 }
 
 func (s *productService) ProductSKUExists(ctx context.Context, companyID uuid.UUID, sku string) (bool, error) {
-	return s.productRepo.ExistsBySKU(ctx, nil, companyID, sku)
+	db := s.pgClient.DB
+	return s.productRepo.ExistsBySKU(ctx, db, companyID, sku)
 }
 
 // ----------------------------------------------------------------------------
-// State transitions
+// State transitions (idempotent)
 // ----------------------------------------------------------------------------
 
-func (s *productService) ActivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return s.setActiveStatus(ctx, companyID, productID, true, updatedBy, idempotencyKey, salesEvents.EventProductActivated)
+func (s *productService) ActivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID) error {
+	return s.setActiveStatus(ctx, companyID, productID, true, updatedBy, salesEvents.EventProductActivated)
 }
 
-func (s *productService) DeactivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return s.setActiveStatus(ctx, companyID, productID, false, updatedBy, idempotencyKey, salesEvents.EventProductDeactivated)
+func (s *productService) DeactivateProduct(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID) error {
+	return s.setActiveStatus(ctx, companyID, productID, false, updatedBy, salesEvents.EventProductDeactivated)
 }
 
-func (s *productService) setActiveStatus(ctx context.Context, companyID, productID uuid.UUID, active bool, updatedBy *uuid.UUID, idempotencyKey, eventType string) error {
+func (s *productService) setActiveStatus(ctx context.Context, companyID, productID uuid.UUID, active bool, updatedBy *uuid.UUID, eventType string) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("status-%s", productID.String())
+	}
+
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
 
@@ -420,7 +452,7 @@ func (s *productService) setActiveStatus(ctx context.Context, companyID, product
 		_ = s.emitProductEvent(ctx, tx, product, eventType)
 	}
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -428,15 +460,20 @@ func (s *productService) setActiveStatus(ctx context.Context, companyID, product
 	return nil
 }
 
-func (s *productService) UpdateUnitPrice(ctx context.Context, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID, idempotencyKey string) error {
+func (s *productService) UpdateUnitPrice(ctx context.Context, companyID, productID uuid.UUID, unitPrice decimal.Decimal, updatedBy *uuid.UUID) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("price-%s", productID.String())
+	}
+
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
 
@@ -456,7 +493,7 @@ func (s *productService) UpdateUnitPrice(ctx context.Context, companyID, product
 	product.UpdatedBy = updatedBy
 	_ = s.emitProductEvent(ctx, tx, product, salesEvents.EventProductPriceChanged)
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -464,7 +501,7 @@ func (s *productService) UpdateUnitPrice(ctx context.Context, companyID, product
 	return nil
 }
 
-func (s *productService) LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
+func (s *productService) LinkInventoryItem(ctx context.Context, companyID, productID, inventoryItemID uuid.UUID, updatedBy *uuid.UUID) error {
 	txCheck, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx for validation: %w", err)
@@ -475,22 +512,27 @@ func (s *productService) LinkInventoryItem(ctx context.Context, companyID, produ
 	}
 	txCheck.Rollback()
 
-	return s.updateInventoryLink(ctx, companyID, productID, &inventoryItemID, updatedBy, idempotencyKey, salesEvents.EventProductInventoryLinked)
+	return s.updateInventoryLink(ctx, companyID, productID, &inventoryItemID, updatedBy, salesEvents.EventProductInventoryLinked)
 }
 
-func (s *productService) UnlinkInventoryItem(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID, idempotencyKey string) error {
-	return s.updateInventoryLink(ctx, companyID, productID, nil, updatedBy, idempotencyKey, salesEvents.EventProductInventoryUnlinked)
+func (s *productService) UnlinkInventoryItem(ctx context.Context, companyID, productID uuid.UUID, updatedBy *uuid.UUID) error {
+	return s.updateInventoryLink(ctx, companyID, productID, nil, updatedBy, salesEvents.EventProductInventoryUnlinked)
 }
 
-func (s *productService) updateInventoryLink(ctx context.Context, companyID, productID uuid.UUID, inventoryItemID *uuid.UUID, updatedBy *uuid.UUID, idempotencyKey, eventType string) error {
+func (s *productService) updateInventoryLink(ctx context.Context, companyID, productID uuid.UUID, inventoryItemID *uuid.UUID, updatedBy *uuid.UUID, eventType string) error {
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	idempKey, _ := ctx.Value("idempotency_key").(string)
+	if idempKey == "" {
+		idempKey = fmt.Sprintf("invlink-%s", productID.String())
+	}
+
 	var processed bool
-	if err := s.idempotencyStore.Get(ctx, tx, idempotencyKey, &processed); err == nil && processed {
+	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		return nil
 	}
 
@@ -510,7 +552,7 @@ func (s *productService) updateInventoryLink(ctx context.Context, companyID, pro
 	product.UpdatedBy = updatedBy
 	_ = s.emitProductEvent(ctx, tx, product, eventType)
 
-	_ = s.idempotencyStore.Store(ctx, tx, idempotencyKey, true)
+	_ = s.idempotencyStore.Store(ctx, tx, idempKey, true)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -572,22 +614,30 @@ func (s *productService) validateInventoryItem(ctx context.Context, tx repositor
 }
 
 func (s *productService) hasSalesReferences(ctx context.Context, tx repository.DBTX, companyID, productID uuid.UUID) (bool, error) {
-	var count int
+	var exists bool
 	query := `
 		SELECT EXISTS (
-			SELECT 1 FROM sales.order_items WHERE company_id = $1 AND product_id = $2
+			SELECT 1 FROM sales.order_items oi
+			JOIN sales.orders o ON o.order_id = oi.order_id
+			WHERE o.company_id = $1 AND oi.product_id = $2
 			UNION ALL
-			SELECT 1 FROM sales.invoice_items WHERE company_id = $1 AND product_id = $2
+			SELECT 1 FROM sales.invoice_items ii
+			JOIN sales.invoices i ON i.invoice_id = ii.invoice_id
+			WHERE i.company_id = $1 AND ii.product_id = $2
 			UNION ALL
-			SELECT 1 FROM sales.return_items WHERE company_id = $1 AND product_id = $2
+			SELECT 1 FROM sales.return_items ri
+			JOIN sales.returns r ON r.return_id = ri.return_id
+			WHERE r.company_id = $1 AND ri.product_id = $2
 			UNION ALL
-			SELECT 1 FROM sales.quote_items WHERE company_id = $1 AND product_id = $2
+			SELECT 1 FROM sales.quote_items qi
+			JOIN sales.quotes q ON q.quote_id = qi.quote_id
+			WHERE q.company_id = $1 AND qi.product_id = $2
 		)`
-	err := tx.QueryRowContext(ctx, query, companyID, productID).Scan(&count)
+	err := tx.QueryRowContext(ctx, query, companyID, productID).Scan(&exists)
 	if err != nil && err != sql.ErrNoRows {
-		return false, err
+		return false, fmt.Errorf("check references: %w", err)
 	}
-	return count > 0, nil
+	return exists, nil
 }
 
 // ----------------------------------------------------------------------------
