@@ -1204,6 +1204,7 @@ func (h *QuoteHandler) GetQuoteItems(w http.ResponseWriter, r *http.Request) {
 }
 
 // ApplyCoupon handles POST /quotes/{id}/coupons
+// ApplyCoupon handles POST /quotes/{id}/coupons
 func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -1225,7 +1226,15 @@ func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Log the request
+	h.logger.Info("ApplyCoupon request",
+		zap.String("quote_id", quoteID.String()),
+		zap.String("company_id", companyID.String()),
+		zap.String("user_id", userID.String()),
+	)
+
 	if !h.hasPermission(ctx, companyID, userID, "quote:write") {
+		h.logger.Warn("permission denied", zap.String("user_id", userID.String()))
 		h.respondWithError(w, http.StatusForbidden, "insufficient permissions")
 		return
 	}
@@ -1234,28 +1243,50 @@ func (h *QuoteHandler) ApplyCoupon(w http.ResponseWriter, r *http.Request) {
 		CouponCode string `json:"coupon_code"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.logger.Warn("invalid request body", zap.Error(err))
 		h.respondWithError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.CouponCode == "" {
+		h.logger.Warn("coupon_code missing")
 		h.respondWithError(w, http.StatusBadRequest, "coupon_code is required")
 		return
 	}
 
+	// Log the coupon code
+	h.logger.Info("coupon code received", zap.String("coupon_code", req.CouponCode))
+
+	// Get idempotency key from header
 	idempotencyKey := h.getIdempotencyKey(r)
 	if idempotencyKey == "" {
+		h.logger.Warn("idempotency key missing")
 		h.respondWithError(w, http.StatusBadRequest, "Idempotency-Key header is required")
 		return
 	}
 	ctx = context.WithValue(ctx, "idempotency_key", idempotencyKey)
 
+	h.logger.Info("calling service ApplyCoupon",
+		zap.String("quote_id", quoteID.String()),
+		zap.String("coupon_code", req.CouponCode),
+		zap.String("idempotency_key", idempotencyKey),
+	)
+
 	coupon, discount, err := h.quoteService.ApplyCoupon(ctx, companyID, quoteID, req.CouponCode, userID)
 	if err != nil {
-		h.logger.Error("failed to apply coupon", zap.Error(err))
+		h.logger.Error("failed to apply coupon",
+			zap.Error(err),
+			zap.String("quote_id", quoteID.String()),
+			zap.String("coupon_code", req.CouponCode),
+		)
 		status, msg := h.mapServiceError(err)
 		h.respondWithError(w, status, msg)
 		return
 	}
+
+	h.logger.Info("coupon applied successfully",
+		zap.String("coupon_code", coupon.Code),
+		zap.String("discount_amount", discount.String()),
+	)
 
 	h.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,

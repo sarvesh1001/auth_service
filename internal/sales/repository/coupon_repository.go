@@ -660,7 +660,7 @@ func (r *couponRepository) CanCustomerUseCoupon(ctx context.Context, db DBTX, co
 	if err != nil {
 		return false, err
 	}
-	var perUserLimit int
+	var perUserLimit sql.NullInt32
 	query := `SELECT per_user_limit FROM sales.coupons WHERE company_id = $1 AND coupon_id = $2 AND deleted_at IS NULL`
 	err = db.QueryRowContext(ctx, query, companyID, couponID).Scan(&perUserLimit)
 	if err != nil {
@@ -669,12 +669,12 @@ func (r *couponRepository) CanCustomerUseCoupon(ctx context.Context, db DBTX, co
 		}
 		return false, fmt.Errorf("get per_user_limit: %w", err)
 	}
-	if perUserLimit <= 0 {
+	// If NULL or <= 0, no limit
+	if !perUserLimit.Valid || perUserLimit.Int32 <= 0 {
 		return true, nil
 	}
-	return limit < int64(perUserLimit), nil
+	return limit < int64(perUserLimit.Int32), nil
 }
-
 func (r *couponRepository) ValidateCoupon(ctx context.Context, db DBTX, companyID uuid.UUID, code string, customerID *uuid.UUID, orderAmount decimal.Decimal, productIDs []uuid.UUID, at time.Time) (*discount.Coupon, error) {
 	coupon, err := r.GetByCode(ctx, db, companyID, code)
 	if err != nil {

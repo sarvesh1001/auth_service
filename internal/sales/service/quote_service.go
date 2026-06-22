@@ -26,7 +26,7 @@ import (
 	"auth-service/internal/sales/repository"
 )
 
-// ------------------------ DTOs ------------------------
+// ------------------------ DTOs (Request/Response) ------------------------
 
 type Order struct {
 	OrderID     uuid.UUID
@@ -131,7 +131,7 @@ func NewQuoteService(
 	}
 }
 
-// ------------------------ Helpers ------------------------
+// ------------------------ Helpers (unchanged) ------------------------
 
 func (s *quoteService) generateQuoteNumber(tx repository.DBTX, companyID uuid.UUID) (string, error) {
 	prefix := companyID.String()[:8]
@@ -227,23 +227,54 @@ func (s *quoteService) addQuoteItems(ctx context.Context, tx repository.DBTX, qu
 }
 
 func (s *quoteService) applyCouponInternal(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID, couponCode string) (*discount.Coupon, decimal.Decimal, error) {
-	coupon, err := s.couponRepo.ValidateCoupon(ctx, tx, companyID, couponCode, nil, decimal.Zero, nil, time.Now())
+	logger := s.logger.With(
+		zap.String("method", "applyCouponInternal"),
+		zap.String("company_id", companyID.String()),
+		zap.String("quote_id", quoteID.String()),
+		zap.String("coupon_code", couponCode),
+	)
+
+	// 1. Get the quote to retrieve customer ID and subtotal
+	quote, err := s.quoteRepo.GetByID(ctx, tx, companyID, quoteID)
 	if err != nil {
+		logger.Error("failed to get quote", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
+	logger.Debug("quote retrieved", zap.String("customer_id", quote.CustomerID.String()))
+
+	// 2. Get the subtotal (or grand total – use subtotal for min_order_amount)
 	subtotal, _, _, _, err := s.quoteRepo.GetTotals(ctx, tx, companyID, quoteID)
 	if err != nil {
+		logger.Error("failed to get totals", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
+	logger.Debug("subtotal retrieved", zap.String("subtotal", subtotal.String()))
+
+	// 3. Validate the coupon with the actual customer and subtotal
+	coupon, err := s.couponRepo.ValidateCoupon(ctx, tx, companyID, couponCode, &quote.CustomerID, subtotal, nil, time.Now())
+	if err != nil {
+		logger.Error("ValidateCoupon failed",
+			zap.Error(err),
+			zap.String("customer_id", quote.CustomerID.String()),
+			zap.String("subtotal", subtotal.String()),
+		)
+		return nil, decimal.Zero, err
+	}
+	logger.Debug("coupon validated", zap.String("coupon_id", coupon.CouponID.String()), zap.String("code", coupon.Code))
+
+	// 4. Calculate discount amount based on the subtotal
 	discountAmount, err := s.couponRepo.CalculateDiscount(ctx, tx, companyID, coupon.CouponID, subtotal)
 	if err != nil {
+		logger.Error("CalculateDiscount failed", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
+	logger.Debug("discount calculated", zap.String("discount_amount", discountAmount.String()))
+
 	return coupon, discountAmount, nil
 }
 
 func (s *quoteService) removeCouponInternal(ctx context.Context, tx repository.DBTX, companyID, quoteID uuid.UUID, couponCode string) error {
-	// Implementation depends on discount application storage – placeholder
+	// Placeholder – actual removal depends on discount application storage
 	return nil
 }
 
@@ -327,8 +358,9 @@ func (s *quoteService) calcSubtotalFromItems(items []*models.QuoteItem) decimal.
 	return total
 }
 
-// ------------------------ Core Operations ------------------------
+// ------------------------ Core Operations (with idempotency fixes) ------------------------
 
+// CreateQuote – already correct, uses context key
 func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest) (*models.Quote, error) {
 	logger := s.logger.With(zap.String("method", "CreateQuote"))
 	if err := s.validateCreateQuoteRequest(ctx, req); err != nil {
@@ -341,10 +373,10 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 	}
 	defer tx.Rollback()
 
-	// Idempotency
-	idempKey, _ := ctx.Value("idempotency_key").(string)
-	if idempKey == "" {
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
 		idempKey = uuid.New().String()
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
 	}
 	var cached *models.Quote
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
@@ -406,12 +438,10 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 	if err := s.recalculateQuoteTotals(ctx, tx, req.CompanyID, quote.QuoteID); err != nil {
 		return nil, fmt.Errorf("recalculate totals: %w", err)
 	}
-	// ---- FIX 1: Reload quote after recalc to get correct totals for cache ----
 	quote, err = s.quoteRepo.GetByID(ctx, tx, req.CompanyID, quote.QuoteID)
 	if err != nil {
 		return nil, fmt.Errorf("reload quote after recalculation: %w", err)
 	}
-	// -------------------------------------------------------------------------
 	for _, code := range req.CouponCodes {
 		if _, _, err := s.applyCouponInternal(ctx, tx, req.CompanyID, quote.QuoteID, code); err != nil {
 			logger.Warn("failed to apply coupon", zap.String("code", code), zap.Error(err))
@@ -424,7 +454,6 @@ func (s *quoteService) CreateQuote(ctx context.Context, req *CreateQuoteRequest)
 		logger.Warn("failed to emit quote created event", zap.Error(err))
 	}
 
-	// Store idempotency result before commit
 	if err := s.idempotencyStore.Store(ctx, tx, idempKey, quote); err != nil {
 		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
@@ -453,13 +482,13 @@ func (s *quoteService) validateCreateQuoteRequest(ctx context.Context, req *Crea
 	if len(req.Items) == 0 {
 		return fmt.Errorf("%w: at least one item required", salesErrors.ErrInvalidInput)
 	}
-	// FIX 2: notes length validation (defense in depth)
 	if req.Notes != nil && len(*req.Notes) > 1000 {
 		return fmt.Errorf("%w: notes must not exceed 1000 characters", salesErrors.ErrInvalidInput)
 	}
 	return s.ValidateQuoteItems(ctx, req.CompanyID, req.Items)
 }
 
+// UpdateQuote – fixed: uses context key
 func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.UUID, req *UpdateQuoteRequest) (*models.Quote, error) {
 	logger := s.logger.With(zap.String("method", "UpdateQuote"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -468,7 +497,11 @@ func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.
 	}
 	defer tx.Rollback()
 
-	idempKey := quoteID.String()
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("update-quote-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var cached *models.Quote
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached quote")
@@ -527,6 +560,7 @@ func (s *quoteService) UpdateQuote(ctx context.Context, companyID, quoteID uuid.
 	return quote, nil
 }
 
+// DeleteQuote – fixed: uses context key
 func (s *quoteService) DeleteQuote(ctx context.Context, companyID, quoteID uuid.UUID, deletedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "DeleteQuote"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -535,7 +569,11 @@ func (s *quoteService) DeleteQuote(ctx context.Context, companyID, quoteID uuid.
 	}
 	defer tx.Rollback()
 
-	idempKey := quoteID.String()
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("delete-quote-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – already deleted")
@@ -616,7 +654,11 @@ func (s *quoteService) AddItems(ctx context.Context, companyID, quoteID uuid.UUI
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("add-items-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("add-items-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – items already added")
@@ -657,7 +699,11 @@ func (s *quoteService) ReplaceItems(ctx context.Context, companyID, quoteID uuid
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("replace-items-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("replace-items-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – items already replaced")
@@ -703,7 +749,11 @@ func (s *quoteService) RemoveItem(ctx context.Context, companyID, quoteID, quote
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("remove-item-%s-%s", quoteID.String(), quoteItemID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("remove-item-%s-%s-%s", quoteID.String(), quoteItemID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – item already removed")
@@ -742,15 +792,28 @@ func (s *quoteService) GetQuoteItems(ctx context.Context, companyID, quoteID uui
 
 // ------------------------ Coupons & Discounts (with idempotency) ------------------------
 
+// ApplyCoupon applies a coupon to a quote.
 func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, updatedBy uuid.UUID) (*discount.Coupon, decimal.Decimal, error) {
-	logger := s.logger.With(zap.String("method", "ApplyCoupon"))
+	logger := s.logger.With(
+		zap.String("method", "ApplyCoupon"),
+		zap.String("company_id", companyID.String()),
+		zap.String("quote_id", quoteID.String()),
+		zap.String("coupon_code", couponCode),
+	)
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, decimal.Zero, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("apply-coupon-%s-%s", quoteID.String(), couponCode)
+	// Retrieve idempotency key from context
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("apply-coupon-%s-%s-%s", quoteID.String(), couponCode, uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
+
 	var cachedResult struct {
 		Coupon *discount.Coupon
 		Amount decimal.Decimal
@@ -760,8 +823,10 @@ func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.
 		return cachedResult.Coupon, cachedResult.Amount, nil
 	}
 
+	// Fetch quote to ensure it exists and is in draft status
 	quote, err := s.quoteRepo.GetByIDForUpdate(ctx, tx, companyID, quoteID)
 	if err != nil {
+		logger.Error("failed to get quote", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
 	if quote.CompanyID != companyID {
@@ -770,18 +835,26 @@ func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.
 	if quote.Status != enums.QuoteStatusDraft {
 		return nil, decimal.Zero, fmt.Errorf("%w: cannot apply coupon to quote with status %s", salesErrors.ErrInvalidStatus, quote.Status)
 	}
+
+	// Call the internal helper with logging
 	coupon, discountAmount, err := s.applyCouponInternal(ctx, tx, companyID, quoteID, couponCode)
 	if err != nil {
+		logger.Error("applyCouponInternal failed", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
+
+	// Recalculate totals after coupon application
 	if err := s.recalculateQuoteTotals(ctx, tx, companyID, quoteID); err != nil {
+		logger.Error("recalculate totals failed", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
 	quote.UpdatedBy = &updatedBy
 	if err := s.quoteRepo.Update(ctx, tx, quote); err != nil {
+		logger.Error("update quote failed", zap.Error(err))
 		return nil, decimal.Zero, err
 	}
-	// Store result before commit
+
+	// Cache the result
 	result := struct {
 		Coupon *discount.Coupon
 		Amount decimal.Decimal
@@ -789,12 +862,14 @@ func (s *quoteService) ApplyCoupon(ctx context.Context, companyID, quoteID uuid.
 	if err := s.idempotencyStore.Store(ctx, tx, idempKey, &result); err != nil {
 		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, decimal.Zero, fmt.Errorf("commit tx: %w", err)
 	}
+
+	logger.Info("coupon applied successfully", zap.String("discount_amount", discountAmount.String()))
 	return coupon, discountAmount, nil
 }
-
 func (s *quoteService) RemoveCoupon(ctx context.Context, companyID, quoteID uuid.UUID, couponCode string, updatedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "RemoveCoupon"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -803,7 +878,11 @@ func (s *quoteService) RemoveCoupon(ctx context.Context, companyID, quoteID uuid
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("remove-coupon-%s-%s", quoteID.String(), couponCode)
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("remove-coupon-%s-%s-%s", quoteID.String(), couponCode, uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – coupon already removed")
@@ -844,7 +923,11 @@ func (s *quoteService) ApplyBestDiscounts(ctx context.Context, companyID, quoteI
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("best-discounts-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("best-discounts-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – best discounts already applied")
@@ -939,7 +1022,11 @@ func (s *quoteService) RecalculateTotals(ctx context.Context, companyID, quoteID
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("recalc-totals-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("recalc-totals-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – totals already recalculated")
@@ -980,7 +1067,11 @@ func (s *quoteService) CreateRevision(ctx context.Context, companyID, quoteID uu
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("create-revision-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("create-revision-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var cached *models.Quote
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached revision")
@@ -1086,18 +1177,25 @@ func (s *quoteService) GetLatestRevision(ctx context.Context, companyID uuid.UUI
 
 // ------------------------ Status Transitions (with idempotency) ------------------------
 
+// UpdateStatus – fixed: uses context key
 func (s *quoteService) UpdateStatus(ctx context.Context, companyID, quoteID uuid.UUID, status enums.QuoteStatus, updatedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "UpdateStatus"))
+
 	tx, err := s.pgClient.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("update-status-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("update-status-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing from context, generated fallback", zap.String("fallback_key", idempKey))
+	}
+
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
-		logger.Info("idempotent – status already updated")
+		logger.Info("idempotent – status already updated", zap.String("key", idempKey))
 		return nil
 	}
 
@@ -1115,13 +1213,18 @@ func (s *quoteService) UpdateStatus(ctx context.Context, companyID, quoteID uuid
 		return err
 	}
 	quote.Status = status
+
 	if err := s.emitQuoteEvent(ctx, tx, quote, s.mapStatusToEvent(status), nil); err != nil {
 		logger.Warn("failed to emit status change event", zap.Error(err))
 	}
 	if err := s.idempotencyStore.Store(ctx, tx, idempKey, true); err != nil {
 		logger.Warn("failed to store idempotency record", zap.Error(err))
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	logger.Info("status updated successfully", zap.String("new_status", string(status)))
+	return nil
 }
 
 func (s *quoteService) MarkSent(ctx context.Context, companyID, quoteID uuid.UUID, updatedBy uuid.UUID) error {
@@ -1132,6 +1235,7 @@ func (s *quoteService) AcceptQuote(ctx context.Context, companyID, quoteID uuid.
 	return s.UpdateStatus(ctx, companyID, quoteID, enums.QuoteStatusAccepted, updatedBy)
 }
 
+// RejectQuote – fixed: uses context key
 func (s *quoteService) RejectQuote(ctx context.Context, companyID, quoteID uuid.UUID, reason *string, updatedBy uuid.UUID) error {
 	logger := s.logger.With(zap.String("method", "RejectQuote"))
 	tx, err := s.pgClient.BeginTx(ctx, nil)
@@ -1140,7 +1244,11 @@ func (s *quoteService) RejectQuote(ctx context.Context, companyID, quoteID uuid.
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("reject-quote-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("reject-quote-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – quote already rejected")
@@ -1196,7 +1304,11 @@ func (s *quoteService) ConvertToOrder(ctx context.Context, companyID, quoteID uu
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("convert-quote-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("convert-quote-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var cached *Order
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &cached); err == nil && cached != nil {
 		logger.Info("idempotent – returning cached order")
@@ -1288,7 +1400,11 @@ func (s *quoteService) AssignSalesRep(ctx context.Context, companyID, quoteID, s
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("assign-salesrep-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("assign-salesrep-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – sales rep already assigned")
@@ -1321,7 +1437,11 @@ func (s *quoteService) RemoveSalesRep(ctx context.Context, companyID, quoteID uu
 	}
 	defer tx.Rollback()
 
-	idempKey := fmt.Sprintf("remove-salesrep-%s", quoteID.String())
+	idempKey, ok := ctx.Value("idempotency_key").(string)
+	if !ok || idempKey == "" {
+		idempKey = fmt.Sprintf("remove-salesrep-%s-%s", quoteID.String(), uuid.New().String())
+		logger.Warn("idempotency key missing, generated fallback", zap.String("fallback_key", idempKey))
+	}
 	var processed bool
 	if err := s.idempotencyStore.Get(ctx, tx, idempKey, &processed); err == nil && processed {
 		logger.Info("idempotent – sales rep already removed")
@@ -1370,7 +1490,6 @@ func (s *quoteService) ValidateQuoteStatusTransition(ctx context.Context, curren
 	return s.validateStatusTransition(currentStatus, nextStatus)
 }
 
-// FIX 3: Add overflow prevention in ValidateQuoteItems
 func (s *quoteService) ValidateQuoteItems(ctx context.Context, companyID uuid.UUID, items []*CreateQuoteItemRequest) error {
 	const maxQuantity = 999999
 	const maxUnitPrice = 999999.9999
